@@ -14,6 +14,7 @@ CURRENT_LINK="$STANDALONE_ROOT/current"
 LOCK_FILE="$STANDALONE_ROOT/install.lock"
 LOCK_DIR="$STANDALONE_ROOT/install.lock.d"
 LOCK_STALE_AFTER_SECS=600
+INSTALL_METADATA_FILE="codex-install.env"
 
 path_action="already"
 path_profile=""
@@ -21,6 +22,12 @@ conflict_manager=""
 conflict_path=""
 lock_kind=""
 tmp_dir=""
+download_cmd=""
+sha256_cmd=""
+release_json_cache=""
+release_json_version=""
+resolved_version_result=""
+visible_command_preverified="false"
 
 step() {
   printf '==> %s\n' "$1"
@@ -94,30 +101,43 @@ download_file() {
   url="$1"
   output="$2"
 
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$output"
-    return
-  fi
-
-  if command -v wget >/dev/null 2>&1; then
-    wget -q -O "$output" "$url"
-    return
-  fi
-
-  echo "curl or wget is required to install Codex." >&2
-  exit 1
+  ensure_downloader
+  case "$download_cmd" in
+    curl)
+      curl -fsSL "$url" -o "$output"
+      ;;
+    wget)
+      wget -q -O "$output" "$url"
+      ;;
+  esac
 }
 
 download_text() {
   url="$1"
 
+  ensure_downloader
+  case "$download_cmd" in
+    curl)
+      curl -fsSL "$url"
+      ;;
+    wget)
+      wget -q -O - "$url"
+      ;;
+  esac
+}
+
+ensure_downloader() {
+  if [ -n "$download_cmd" ]; then
+    return
+  fi
+
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url"
+    download_cmd="curl"
     return
   fi
 
   if command -v wget >/dev/null 2>&1; then
-    wget -q -O - "$url"
+    download_cmd="wget"
     return
   fi
 
@@ -138,38 +158,12 @@ release_metadata_url() {
   printf 'https://api.github.com/repos/openai/codex/releases/tags/rust-v%s\n' "$resolved_version"
 }
 
-resolve_release() {
-  normalized_version="$(normalize_version "$RELEASE")"
-  validate_version "$normalized_version"
-
-  if [ "$normalized_version" = "latest" ]; then
-    requested_release="latest"
-    metadata_url="https://api.github.com/repos/openai/codex/releases/latest"
-  else
-    resolved_version="$normalized_version"
-    requested_release="$resolved_version"
-    metadata_url="$(release_metadata_url "$resolved_version")"
-  fi
-
-  if ! release_json="$(download_text "$metadata_url")"; then
-    echo "Could not fetch GitHub release metadata for Codex $requested_release. GitHub API may be unavailable or rate limited." >&2
-    exit 1
-  fi
-
-  if [ "$normalized_version" = "latest" ]; then
-    resolved_version="$(printf '%s\n' "$release_json" | sed -n 's/.*"tag_name":[[:space:]]*"rust-v\([^"]*\)".*/\1/p' | head -n 1)"
-    if [ -z "$resolved_version" ]; then
-      echo "Failed to resolve the latest Codex release version." >&2
-      exit 1
-    fi
-    validate_version "$resolved_version"
-  fi
-}
-
 release_asset_digest_or_empty() {
   asset="$1"
+  resolved_version="$2"
+  ensure_release_metadata "$resolved_version"
 
-  digest="$(printf '%s\n' "$release_json" | awk -v asset="$asset" '
+  digest="$(printf '%s\n' "$release_json_cache" | awk -v asset="$asset" '
     /"name":[[:space:]]*"[^"]+"/ {
       name = $0
       sub(/^.*"name":[[:space:]]*"/, "", name)
@@ -214,16 +208,29 @@ release_asset_digest_or_empty() {
   esac
 }
 
+ensure_release_metadata() {
+  resolved_version="$1"
+
+  if [ "$release_json_version" = "$resolved_version" ] && [ -n "$release_json_cache" ]; then
+    return
+  fi
+
+  release_json_cache="$(download_text "$(release_metadata_url "$resolved_version")")"
+  release_json_version="$resolved_version"
+}
+
 release_asset_exists() {
   asset="$1"
+  resolved_version="$2"
 
-  release_asset_digest_or_empty "$asset" >/dev/null 2>&1
+  release_asset_digest_or_empty "$asset" "$resolved_version" >/dev/null 2>&1
 }
 
 release_asset_digest() {
   asset="$1"
+  resolved_version="$2"
 
-  digest="$(release_asset_digest_or_empty "$asset" || true)"
+  digest="$(release_asset_digest_or_empty "$asset" "$resolved_version" || true)"
   if [ -z "$digest" ]; then
     echo "Could not find SHA-256 digest for release asset $asset." >&2
     exit 1
@@ -237,7 +244,7 @@ package_archive_digest() {
   manifest_path="$2"
 
   digest="$(awk -v asset="$asset" '
-    $2 == asset && length($1) == 64 && $1 !~ /[^0-9a-fA-F]/ {
+    $2 == asset && $1 ~ /^[0-9a-fA-F]{64}$/ {
       print tolower($1)
       found = 1
       exit
@@ -260,18 +267,37 @@ package_archive_digest() {
 file_sha256() {
   path="$1"
 
+  ensure_sha256
+  case "$sha256_cmd" in
+    sha256sum)
+      sha256sum "$path" | awk '{print $1}'
+      ;;
+    shasum)
+      shasum -a 256 "$path" | awk '{print $1}'
+      ;;
+    openssl)
+      openssl dgst -sha256 "$path" | sed 's/^.*= //'
+      ;;
+  esac
+}
+
+ensure_sha256() {
+  if [ -n "$sha256_cmd" ]; then
+    return
+  fi
+
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$path" | awk '{print $1}'
+    sha256_cmd="sha256sum"
     return
   fi
 
   if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$path" | awk '{print $1}'
+    sha256_cmd="shasum"
     return
   fi
 
   if command -v openssl >/dev/null 2>&1; then
-    openssl dgst -sha256 "$path" | sed 's/^.*= //'
+    sha256_cmd="openssl"
     return
   fi
 
@@ -292,11 +318,44 @@ verify_archive_digest() {
   fi
 }
 
+wait_for_download() {
+  pid="$1"
+  asset="$2"
+
+  if ! wait "$pid"; then
+    echo "Failed to download $asset." >&2
+    exit 1
+  fi
+}
+
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "$1 is required to install Codex." >&2
     exit 1
   fi
+}
+
+resolve_version() {
+  normalized_version="$(normalize_version "$RELEASE")"
+  validate_version "$normalized_version"
+
+  if [ "$normalized_version" != "latest" ]; then
+    resolved_version_result="$normalized_version"
+    return
+  fi
+
+  release_json="$(download_text "https://api.github.com/repos/openai/codex/releases/latest")"
+  resolved="$(printf '%s\n' "$release_json" | sed -n 's/.*"tag_name":[[:space:]]*"rust-v\([^"]*\)".*/\1/p' | head -n 1)"
+
+  if [ -z "$resolved" ]; then
+    echo "Failed to resolve the latest Codex release version." >&2
+    exit 1
+  fi
+
+  validate_version "$resolved"
+  release_json_cache="$release_json"
+  release_json_version="$resolved"
+  resolved_version_result="$resolved"
 }
 
 pick_profile() {
@@ -345,6 +404,11 @@ add_to_path() {
       return
     fi
 
+    if profile_has_equivalent_path_line "$profile" "$BIN_DIR"; then
+      path_action="configured"
+      return
+    fi
+
     if grep -F "$end_marker" "$profile" >/dev/null 2>&1; then
       rewrite_path_block "$profile" "$begin_marker" "$end_marker" "$path_line"
       path_action="updated"
@@ -354,6 +418,34 @@ add_to_path() {
 
   append_path_block "$profile" "$begin_marker" "$end_marker" "$path_line"
   path_action="added"
+}
+
+profile_has_equivalent_path_line() {
+  profile="$1"
+  expected_dir="$2"
+
+  awk -v expected="$expected_dir" '
+    function normalize(path) {
+      while (length(path) > 1 && substr(path, length(path), 1) == "/") {
+        path = substr(path, 1, length(path) - 1)
+      }
+      return path
+    }
+    /^export PATH="/ {
+      line = $0
+      sub(/^export PATH="/, "", line)
+      sub(/:\$PATH"$/, "", line)
+      if (normalize(line) == normalize(expected)) {
+        found = 1
+      }
+    }
+    END {
+      if (found) {
+        exit 0
+      }
+      exit 1
+    }
+  ' "$profile"
 }
 
 append_path_block() {
@@ -477,12 +569,37 @@ release_install_lock() {
 cleanup_stale_install_artifacts() {
   mkdir -p "$RELEASES_DIR" "$STANDALONE_ROOT"
 
-  find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -name '.staging.*' -exec rm -rf {} +
-  find "$STANDALONE_ROOT" -mindepth 1 -maxdepth 1 -name '.current.*' -exec rm -f {} +
+  remove_matching_children "$RELEASES_DIR" '.staging.*' directory
+  remove_matching_children "$STANDALONE_ROOT" '.current.*' file
 
   if [ -d "$BIN_DIR" ]; then
-    find "$BIN_DIR" -mindepth 1 -maxdepth 1 -name '.codex.*' -exec rm -f {} +
+    remove_matching_children "$BIN_DIR" '.codex.*' file
   fi
+}
+
+remove_matching_children() {
+  directory="$1"
+  pattern="$2"
+  kind="$3"
+
+  [ -d "$directory" ] || return
+  found="false"
+  for path in "$directory"/$pattern; do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      found="true"
+      break
+    fi
+  done
+  [ "$found" = "true" ] || return
+
+  case "$kind" in
+    directory)
+      find "$directory" -mindepth 1 -maxdepth 1 -name "$pattern" -exec rm -rf {} +
+      ;;
+    *)
+      find "$directory" -mindepth 1 -maxdepth 1 -name "$pattern" -exec rm -f {} +
+      ;;
+  esac
 }
 
 replace_path_with_symlink() {
@@ -516,6 +633,12 @@ version_from_binary() {
 }
 
 current_installed_version() {
+  version="$(install_metadata_field "$CURRENT_LINK" version || true)"
+  if [ -n "$version" ]; then
+    printf '%s\n' "$version"
+    return 0
+  fi
+
   version="$(version_from_binary "$CURRENT_LINK/bin/codex" || true)"
   if [ -n "$version" ]; then
     printf '%s\n' "$version"
@@ -529,6 +652,27 @@ current_installed_version() {
   fi
 
   return 0
+}
+
+install_metadata_field() {
+  release_dir="$1"
+  field="$2"
+  metadata_path="$release_dir/$INSTALL_METADATA_FILE"
+
+  [ -f "$metadata_path" ] || return 1
+  awk -F= -v field="$field" '
+    $1 == field {
+      print substr($0, length(field) + 2)
+      found = 1
+      exit
+    }
+    END {
+      if (found) {
+        exit 0
+      }
+      exit 1
+    }
+  ' "$metadata_path"
 }
 
 resolve_existing_codex() {
@@ -674,20 +818,24 @@ handle_conflicting_install() {
 install_package_release() {
   release_dir="$1"
   archive_path="$2"
+  resolved_version="$3"
+  target="$4"
+  layout="$5"
   stage_release="$RELEASES_DIR/.staging.$(basename "$release_dir").$$"
 
   mkdir -p "$RELEASES_DIR"
   rm -rf "$stage_release"
   mkdir -p "$stage_release"
   tar -xzf "$archive_path" -C "$stage_release"
-  chmod 0755 \
-    "$stage_release/bin/codex" \
-    "$stage_release/bin/codex-code-mode-host" \
-    "$stage_release/codex-path/rg"
+  chmod 0755 "$stage_release/bin/codex" "$stage_release/codex-path/rg"
   if [ -f "$stage_release/codex-resources/bwrap" ]; then
     chmod 0755 "$stage_release/codex-resources/bwrap"
   fi
+  if [ -f "$stage_release/codex-resources/zsh/bin/zsh" ]; then
+    chmod 0755 "$stage_release/codex-resources/zsh/bin/zsh"
+  fi
   ln -sf "bin/codex" "$stage_release/codex"
+  write_install_metadata "$stage_release" "$resolved_version" "$target" "$layout"
 
   if [ -e "$release_dir" ] || [ -L "$release_dir" ]; then
     rm -rf "$release_dir"
@@ -699,27 +847,48 @@ install_legacy_platform_npm_release() {
   release_dir="$1"
   archive_path="$2"
   target="$3"
+  resolved_version="$4"
+  layout="$5"
   stage_release="$RELEASES_DIR/.staging.$(basename "$release_dir").$$"
-  extract_dir="$tmp_dir/extract"
-  vendor_root="$extract_dir/package/vendor/$target"
+  vendor_root="package/vendor/$target"
 
   mkdir -p "$RELEASES_DIR"
-  rm -rf "$stage_release" "$extract_dir"
-  mkdir -p "$stage_release/codex-resources" "$extract_dir"
-  tar -xzf "$archive_path" -C "$extract_dir"
+  rm -rf "$stage_release"
+  mkdir -p "$stage_release/codex-resources"
+  tar -xzf "$archive_path" -C "$stage_release" \
+    "$vendor_root/codex/codex" \
+    "$vendor_root/path/rg"
 
-  cp "$vendor_root/codex/codex" "$stage_release/codex"
-  cp "$vendor_root/path/rg" "$stage_release/codex-resources/rg"
+  mv "$stage_release/$vendor_root/codex/codex" "$stage_release/codex"
+  mv "$stage_release/$vendor_root/path/rg" "$stage_release/codex-resources/rg"
   chmod 0755 "$stage_release/codex" "$stage_release/codex-resources/rg"
-  if [ -f "$vendor_root/codex-resources/bwrap" ]; then
-    cp "$vendor_root/codex-resources/bwrap" "$stage_release/codex-resources/bwrap"
+  if tar -tzf "$archive_path" "$vendor_root/codex-resources/bwrap" >/dev/null 2>&1; then
+    tar -xzf "$archive_path" -C "$stage_release" "$vendor_root/codex-resources/bwrap"
+    mv "$stage_release/$vendor_root/codex-resources/bwrap" "$stage_release/codex-resources/bwrap"
     chmod 0755 "$stage_release/codex-resources/bwrap"
   fi
+  rm -rf "$stage_release/package"
+  write_install_metadata "$stage_release" "$resolved_version" "$target" "$layout"
 
   if [ -e "$release_dir" ] || [ -L "$release_dir" ]; then
     rm -rf "$release_dir"
   fi
   mv "$stage_release" "$release_dir"
+}
+
+write_install_metadata() {
+  release_dir="$1"
+  resolved_version="$2"
+  target="$3"
+  layout="$4"
+  tmp_metadata="$release_dir/$INSTALL_METADATA_FILE.$$"
+
+  {
+    printf 'version=%s\n' "$resolved_version"
+    printf 'target=%s\n' "$target"
+    printf 'layout=%s\n' "$layout"
+  } >"$tmp_metadata"
+  mv "$tmp_metadata" "$release_dir/$INSTALL_METADATA_FILE"
 }
 
 release_dir_is_complete() {
@@ -732,11 +901,17 @@ release_dir_is_complete() {
     [ "$(basename "$release_dir")" = "$expected_version-$expected_target" ] ||
     return 1
 
+  [ -f "$release_dir/$INSTALL_METADATA_FILE" ] ||
+    return 1
+  [ "$(install_metadata_field "$release_dir" version || true)" = "$expected_version" ] &&
+    [ "$(install_metadata_field "$release_dir" target || true)" = "$expected_target" ] &&
+    [ "$(install_metadata_field "$release_dir" layout || true)" = "$layout" ] ||
+    return 1
+
   case "$layout" in
     package)
       [ -f "$release_dir/codex-package.json" ] &&
         [ -x "$release_dir/bin/codex" ] &&
-        [ -x "$release_dir/bin/codex-code-mode-host" ] &&
         [ -x "$release_dir/codex" ] &&
         [ -x "$release_dir/codex-path/rg" ] ||
         return 1
@@ -752,7 +927,12 @@ release_dir_is_complete() {
   esac
 
   case "$layout:$expected_target" in
-    package:*linux* | legacy-platform-npm:*linux*) [ -x "$release_dir/codex-resources/bwrap" ] ;;
+    package:*linux* | legacy-platform-npm:*linux*) [ -x "$release_dir/codex-resources/bwrap" ] || return 1 ;;
+    *) true ;;
+  esac
+
+  case "$layout:$expected_target" in
+    package:*linux* | package:*apple-darwin) [ -x "$release_dir/codex-resources/zsh/bin/zsh" ] || return 1 ;;
     *) true ;;
   esac
 }
@@ -846,24 +1026,36 @@ else
   fi
 fi
 
-resolve_release
+resolve_version
+resolved_version="$resolved_version_result"
 package_asset="codex-package-$vendor_target.tar.gz"
 checksum_asset="codex-package_SHA256SUMS"
-if release_asset_exists "$package_asset" &&
-  release_asset_exists "$checksum_asset"; then
+release_name="$resolved_version-$vendor_target"
+release_dir="$RELEASES_DIR/$release_name"
+install_layout=""
+asset=""
+
+if release_dir_is_complete "$release_dir" "$resolved_version" "$vendor_target" "package"; then
   install_layout="package"
   asset="$package_asset"
-elif release_asset_exists "codex-npm-$npm_tag-$resolved_version.tgz"; then
+elif release_dir_is_complete "$release_dir" "$resolved_version" "$vendor_target" "legacy-platform-npm"; then
   install_layout="legacy-platform-npm"
   asset="codex-npm-$npm_tag-$resolved_version.tgz"
 else
-  echo "Could not find Codex package or platform npm release assets for Codex $resolved_version." >&2
-  exit 1
+  if release_asset_exists "$package_asset" "$resolved_version" &&
+    release_asset_exists "$checksum_asset" "$resolved_version"; then
+    install_layout="package"
+    asset="$package_asset"
+  elif release_asset_exists "codex-npm-$npm_tag-$resolved_version.tgz" "$resolved_version"; then
+    install_layout="legacy-platform-npm"
+    asset="codex-npm-$npm_tag-$resolved_version.tgz"
+  else
+    echo "Could not find Codex package or platform npm release assets for Codex $resolved_version." >&2
+    exit 1
+  fi
 fi
 download_url="$(release_url_for_asset "$asset" "$resolved_version")"
 checksum_url="$(release_url_for_asset "$checksum_asset" "$resolved_version")"
-release_name="$resolved_version-$vendor_target"
-release_dir="$RELEASES_DIR/$release_name"
 current_version="$(current_installed_version)"
 
 if [ -n "$current_version" ] && [ "$current_version" != "$resolved_version" ]; then
@@ -900,21 +1092,29 @@ if ! release_dir_is_complete "$release_dir" "$resolved_version" "$vendor_target"
 
   step "Downloading Codex CLI"
   if [ "$install_layout" = "package" ]; then
-    checksum_digest="$(release_asset_digest "$checksum_asset")"
-    download_file "$checksum_url" "$checksum_path"
+    checksum_digest="$(release_asset_digest "$checksum_asset" "$resolved_version")"
+    ensure_downloader
+    download_file "$checksum_url" "$checksum_path" &
+    checksum_download_pid="$!"
+    download_file "$download_url" "$archive_path" &
+    archive_download_pid="$!"
+    wait_for_download "$checksum_download_pid" "$checksum_asset"
     verify_archive_digest "$checksum_path" "$checksum_digest"
     expected_digest="$(package_archive_digest "$asset" "$checksum_path")"
+    wait_for_download "$archive_download_pid" "$asset"
   else
-    expected_digest="$(release_asset_digest "$asset")"
+    expected_digest="$(release_asset_digest "$asset" "$resolved_version")"
+    download_file "$download_url" "$archive_path" &
+    archive_download_pid="$!"
+    wait_for_download "$archive_download_pid" "$asset"
   fi
-  download_file "$download_url" "$archive_path"
   verify_archive_digest "$archive_path" "$expected_digest"
 
   step "Installing standalone package to $release_dir"
   if [ "$install_layout" = "package" ]; then
-    install_package_release "$release_dir" "$archive_path"
+    install_package_release "$release_dir" "$archive_path" "$resolved_version" "$vendor_target" "$install_layout"
   else
-    install_legacy_platform_npm_release "$release_dir" "$archive_path" "$vendor_target"
+    install_legacy_platform_npm_release "$release_dir" "$archive_path" "$vendor_target" "$resolved_version" "$install_layout"
   fi
 fi
 update_current_link "$release_dir"

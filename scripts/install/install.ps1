@@ -12,6 +12,7 @@ if ([string]::IsNullOrWhiteSpace($Release)) {
 }
 
 $NonInteractive = $env:CODEX_NON_INTERACTIVE -match "^(?i:1|true|yes)$"
+$InstallMetadataFile = "codex-install.env"
 
 function Write-Step {
     param(
@@ -79,10 +80,11 @@ function Assert-ValidReleaseVersion {
 function Find-ReleaseAssetMetadata {
     param(
         [string]$AssetName,
-        [object]$ReleaseMetadata
+        [string]$ResolvedVersion
     )
 
-    $asset = $ReleaseMetadata.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/openai/codex/releases/tags/rust-v$ResolvedVersion"
+    $asset = $release.assets | Where-Object { $_.name -eq $AssetName } | Select-Object -First 1
     if ($null -eq $asset) {
         return $null
     }
@@ -96,6 +98,20 @@ function Find-ReleaseAssetMetadata {
         Url = $asset.browser_download_url
         Sha256 = $digestMatch.Groups[1].Value.ToLowerInvariant()
     }
+}
+
+function Get-ReleaseAssetMetadata {
+    param(
+        [string]$AssetName,
+        [string]$ResolvedVersion
+    )
+
+    $metadata = Find-ReleaseAssetMetadata -AssetName $AssetName -ResolvedVersion $ResolvedVersion
+    if ($null -eq $metadata) {
+        throw "Could not find release asset $AssetName for Codex $ResolvedVersion."
+    }
+
+    return $metadata
 }
 
 function Test-ArchiveDigest {
@@ -201,38 +217,22 @@ function Remove-StaleInstallArtifacts {
     }
 }
 
-function Resolve-Release {
+function Resolve-Version {
     $normalizedVersion = Normalize-Version -RawVersion $Release
     Assert-ValidReleaseVersion -Version $normalizedVersion
-
-    if ($normalizedVersion -eq "latest") {
-        $requestedRelease = "latest"
-        $metadataUri = "https://api.github.com/repos/openai/codex/releases/latest"
-    } else {
-        $resolvedVersion = $normalizedVersion
-        $requestedRelease = $resolvedVersion
-        $metadataUri = "https://api.github.com/repos/openai/codex/releases/tags/rust-v$resolvedVersion"
+    if ($normalizedVersion -ne "latest") {
+        return $normalizedVersion
     }
 
-    try {
-        $releaseMetadata = Invoke-RestMethod -Uri $metadataUri
-    } catch {
-        throw "Could not fetch GitHub release metadata for Codex $requestedRelease. GitHub API may be unavailable or rate limited. $($_.Exception.Message)"
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/openai/codex/releases/latest"
+    if (-not $release.tag_name) {
+        Write-Error "Failed to resolve the latest Codex release version."
+        exit 1
     }
 
-    if ($normalizedVersion -eq "latest") {
-        if (-not $releaseMetadata.tag_name) {
-            throw "Failed to resolve the latest Codex release version."
-        }
-
-        $resolvedVersion = Normalize-Version -RawVersion $releaseMetadata.tag_name
-        Assert-ValidReleaseVersion -Version $resolvedVersion
-    }
-
-    return [PSCustomObject]@{
-        Version = $resolvedVersion
-        Metadata = $releaseMetadata
-    }
+    $resolvedVersion = Normalize-Version -RawVersion $release.tag_name
+    Assert-ValidReleaseVersion -Version $resolvedVersion
+    return $resolvedVersion
 }
 
 function Get-VersionFromBinary {
@@ -244,10 +244,17 @@ function Get-VersionFromBinary {
         return $null
     }
 
+    # Windows PowerShell 5.1 turns redirected native stderr into terminating
+    # errors while $ErrorActionPreference is "Stop"; a stderr warning from a
+    # healthy binary must not discard the version it printed to stdout.
+    $oldErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
     try {
         $versionOutput = & $CodexPath --version 2>$null
     } catch {
         return $null
+    } finally {
+        $ErrorActionPreference = $oldErrorActionPreference
     }
 
     if ($versionOutput -match '([0-9][0-9A-Za-z.+-]*)$') {
@@ -538,7 +545,8 @@ function Test-PackageContentsAreComplete {
     $expectedFiles = @(
         "codex-package.json",
         "bin\codex.exe",
-        "bin\codex-code-mode-host.exe",
+        "codex-path\apply_patch.bat",
+        "codex-path\applypatch.bat",
         "codex-path\rg.exe",
         "codex-resources\codex-command-runner.exe",
         "codex-resources\codex-windows-sandbox-setup.exe"
@@ -576,6 +584,44 @@ function Test-LegacyPlatformNpmContentsAreComplete {
     return $true
 }
 
+function Write-InstallMetadata {
+    param(
+        [string]$ReleaseDir,
+        [string]$ResolvedVersion,
+        [string]$Target,
+        [string]$Layout
+    )
+
+    $metadataPath = Join-Path $ReleaseDir $InstallMetadataFile
+    $tmpMetadataPath = "$metadataPath.$PID"
+    @(
+        "version=$ResolvedVersion"
+        "target=$Target"
+        "layout=$Layout"
+    ) | Set-Content -LiteralPath $tmpMetadataPath -Encoding UTF8
+    Move-Item -LiteralPath $tmpMetadataPath -Destination $metadataPath -Force
+}
+
+function Get-InstallMetadataField {
+    param(
+        [string]$ReleaseDir,
+        [string]$Name
+    )
+
+    $metadataPath = Join-Path $ReleaseDir $InstallMetadataFile
+    if (-not (Test-Path -LiteralPath $metadataPath -PathType Leaf)) {
+        return $null
+    }
+
+    foreach ($line in Get-Content -LiteralPath $metadataPath) {
+        if ($line.StartsWith("$Name=")) {
+            return $line.Substring($Name.Length + 1)
+        }
+    }
+
+    return $null
+}
+
 function Test-ReleaseIsComplete {
     param(
         [string]$ReleaseDir,
@@ -600,7 +646,13 @@ function Test-ReleaseIsComplete {
         }
     }
 
-    return (Split-Path -Leaf $ReleaseDir) -eq "$ExpectedVersion-$ExpectedTarget"
+    if ((Split-Path -Leaf $ReleaseDir) -ne "$ExpectedVersion-$ExpectedTarget") {
+        return $false
+    }
+
+    return (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "version") -eq $ExpectedVersion -and
+        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "target") -eq $ExpectedTarget -and
+        (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "layout") -eq $Layout
 }
 
 function Get-ExistingCodexCommand {
@@ -748,9 +800,7 @@ if ([string]::IsNullOrWhiteSpace($env:CODEX_INSTALL_DIR)) {
 }
 
 $currentVersion = Get-CurrentInstalledVersion -StandaloneCurrentDir $currentDir
-$resolvedRelease = Resolve-Release
-$resolvedVersion = $resolvedRelease.Version
-$releaseMetadata = $resolvedRelease.Metadata
+$resolvedVersion = Resolve-Version
 $releaseName = "$resolvedVersion-$target"
 $releaseDir = Join-Path $releasesDir $releaseName
 
@@ -769,12 +819,12 @@ $oldStandaloneBackup = $null
 
 $packageAsset = "codex-package-$target.tar.gz"
 $checksumAsset = "codex-package_SHA256SUMS"
-$packageMetadata = Find-ReleaseAssetMetadata -AssetName $packageAsset -ReleaseMetadata $releaseMetadata
-$checksumMetadata = Find-ReleaseAssetMetadata -AssetName $checksumAsset -ReleaseMetadata $releaseMetadata
+$packageMetadata = Find-ReleaseAssetMetadata -AssetName $packageAsset -ResolvedVersion $resolvedVersion
+$checksumMetadata = Find-ReleaseAssetMetadata -AssetName $checksumAsset -ResolvedVersion $resolvedVersion
 $installLayout = "Package"
 if ($null -eq $packageMetadata -or $null -eq $checksumMetadata) {
     $packageAsset = "codex-npm-$npmTag-$resolvedVersion.tgz"
-    $packageMetadata = Find-ReleaseAssetMetadata -AssetName $packageAsset -ReleaseMetadata $releaseMetadata
+    $packageMetadata = Find-ReleaseAssetMetadata -AssetName $packageAsset -ResolvedVersion $resolvedVersion
     if ($null -ne $packageMetadata) {
         $installLayout = "LegacyPlatformNpm"
     } else {
@@ -842,6 +892,8 @@ try {
                     throw "Downloaded Codex npm archive did not contain the expected legacy platform package layout."
                 }
             }
+
+            Write-InstallMetadata -ReleaseDir $stagingDir -ResolvedVersion $resolvedVersion -Target $target -Layout $installLayout
 
             if (Test-Path -LiteralPath $releaseDir) {
                 Remove-Item -LiteralPath $releaseDir -Recurse -Force

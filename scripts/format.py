@@ -12,12 +12,18 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.root_maintenance import PRETTIER_TARGETS
+from scripts.tool_versions import RUSTFMT_TOOLCHAIN
 
 
 @dataclass(frozen=True)
 class Command:
     args: tuple[str, ...]
     cwd: Path = REPO_ROOT
+    discard_stderr: bool = False
 
 
 @dataclass(frozen=True)
@@ -41,10 +47,13 @@ def just_formatter_group(*, check: bool) -> FormatterGroup:
 
 
 def rust_formatter_group(*, check: bool) -> FormatterGroup:
-    args = ["cargo", "fmt", "--", "--config", "imports_granularity=Item"]
+    args = ["cargo", f"+{RUSTFMT_TOOLCHAIN}", "fmt"]
     if check:
         args.append("--check")
-    command = Command(tuple(args), REPO_ROOT / "codex-rs")
+    command = Command(
+        tuple(args),
+        REPO_ROOT / "codex-rs",
+    )
     return FormatterGroup("Rust", (command,))
 
 
@@ -78,6 +87,14 @@ def buildifier_formatter_group(*, check: bool) -> FormatterGroup:
         *buildifier_files,
     ]
     return FormatterGroup("Bazel/Starlark", (Command(tuple(buildifier_args)),))
+
+
+def prettier_formatter_group(*, check: bool) -> FormatterGroup:
+    mode = "--check" if check else "--write"
+    return FormatterGroup(
+        "Prettier",
+        (Command(("pnpm", "exec", "prettier", mode, *PRETTIER_TARGETS)),),
+    )
 
 
 def python_sdk_formatter_group(*, check: bool) -> FormatterGroup:
@@ -133,39 +150,60 @@ def python_scripts_formatter_group(*, check: bool) -> FormatterGroup:
     return FormatterGroup("Python scripts", (Command(tuple(args)),))
 
 
-def formatter_groups(*, check: bool) -> tuple[FormatterGroup, ...]:
-    return (
+def formatter_groups(
+    *,
+    check: bool,
+    fast_local: bool = False,
+    selected_groups: set[str] | None = None,
+) -> tuple[FormatterGroup, ...]:
+    fast_groups = (
         just_formatter_group(check=check),
         rust_formatter_group(check=check),
-        buildifier_formatter_group(check=check),
-        python_sdk_formatter_group(check=check),
-        python_scripts_formatter_group(check=check),
     )
+    if fast_local:
+        groups = fast_groups
+    else:
+        groups = (
+            *fast_groups,
+            prettier_formatter_group(check=check),
+            buildifier_formatter_group(check=check),
+            python_sdk_formatter_group(check=check),
+            python_scripts_formatter_group(check=check),
+        )
+    if selected_groups is None:
+        return groups
+    return tuple(group for group in groups if group.name.lower() in selected_groups)
 
 
 def run_formatter_group(group: FormatterGroup) -> FormatterResult:
     """Run one formatter group sequentially and return its buffered output."""
+    output: list[str] = []
     for command in group.commands:
+        output.append(f"$ {shlex.join(command.args)}\n")
         try:
             process = subprocess.run(
                 command.args,
                 cwd=command.cwd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.DEVNULL
+                if command.discard_stderr
+                else subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
             )
         except OSError as error:
-            output = f"$ {shlex.join(command.args)}\n{error}\n"
-            return FormatterResult(group.name, output, 1)
+            output.append(f"{error}\n")
+            return FormatterResult(group.name, "".join(output), 1)
 
+        output.append(process.stdout)
+        if process.stdout and not process.stdout.endswith("\n"):
+            output.append("\n")
         if process.returncode != 0:
-            output = f"$ {shlex.join(command.args)}\n{process.stdout}"
-            if process.stdout and not process.stdout.endswith("\n"):
-                output += "\n"
-            return FormatterResult(group.name, output, process.returncode)
+            return FormatterResult(group.name, "".join(output), process.returncode)
 
-    return FormatterResult(group.name, "", 0)
+    return FormatterResult(group.name, "".join(output), 0)
 
 
 def main() -> int:
@@ -175,18 +213,47 @@ def main() -> int:
         action="store_true",
         help="check formatting without modifying files",
     )
+    parser.add_argument(
+        "--fast-local",
+        action="store_true",
+        help="format only the high-frequency local edit surfaces: justfile and Rust",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        choices=(
+            "just",
+            "rust",
+            "prettier",
+            "bazel/starlark",
+            "python sdk",
+            "python scripts",
+        ),
+        help="run only the named formatter group; may be provided multiple times",
+    )
     args = parser.parse_args()
-    groups = formatter_groups(check=args.check)
+    selected_groups = {name.lower() for name in args.only} if args.only else None
+    groups = formatter_groups(
+        check=args.check,
+        fast_local=args.fast_local,
+        selected_groups=selected_groups,
+    )
+    if not groups:
+        print("No formatter groups selected.", file=sys.stderr)
+        return 1
 
     failures: list[str] = []
     with ThreadPoolExecutor(max_workers=len(groups)) as executor:
-        futures = [executor.submit(run_formatter_group, group) for group in groups]
+        futures = {}
+        for group in groups:
+            print(f"Starting {group.name} formatter...", flush=True)
+            futures[executor.submit(run_formatter_group, group)] = group.name
         for future in as_completed(futures):
             result = future.result()
+            print(f"==> {result.name} formatter finished")
+            print(result.output, end="")
             if result.returncode != 0:
                 failures.append(result.name)
-                print(f"==> {result.name} formatter failed", file=sys.stderr)
-                print(result.output, end="", file=sys.stderr)
 
     if failures:
         print(f"Formatting failed: {', '.join(failures)}", file=sys.stderr)

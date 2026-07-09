@@ -5,54 +5,58 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import cache
 import importlib.util
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
+import threading
+import time
+import uuid
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import urlparse
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.codex_package.targets import BINARY_TARGETS  # noqa: E402
+
 BUILD_SCRIPT = REPO_ROOT / "codex-cli" / "scripts" / "build_npm_package.py"
 WORKFLOW_NAME = ".github/workflows/rust-release.yml"
-GITHUB_REPO = "openai/codex"
-BINARY_TARGETS = (
-    "x86_64-unknown-linux-musl",
-    "aarch64-unknown-linux-musl",
-    "x86_64-apple-darwin",
-    "aarch64-apple-darwin",
-    "x86_64-pc-windows-msvc",
-    "aarch64-pc-windows-msvc",
-)
-
-_SPEC = importlib.util.spec_from_file_location("codex_build_npm_package", BUILD_SCRIPT)
-if _SPEC is None or _SPEC.loader is None:
-    raise RuntimeError(f"Unable to load module from {BUILD_SCRIPT}")
-_BUILD_MODULE = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_BUILD_MODULE)
-PACKAGE_NATIVE_COMPONENTS = getattr(_BUILD_MODULE, "PACKAGE_NATIVE_COMPONENTS", {})
-PACKAGE_EXPANSIONS = getattr(_BUILD_MODULE, "PACKAGE_EXPANSIONS", {})
-CODEX_PLATFORM_PACKAGES = getattr(_BUILD_MODULE, "CODEX_PLATFORM_PACKAGES", {})
-CODEX_PACKAGE_COMPONENT = getattr(
-    _BUILD_MODULE, "CODEX_PACKAGE_COMPONENT", "codex-package"
-)
+DEFAULT_GITHUB_REPO = "openai/codex"
+COMPLETE_MARKER = ".complete"
+LOCK_POLL_SECONDS = 0.1
+LOCK_STALE_SECONDS = 60 * 60
+DEFAULT_GHA_DOWNLOAD_WORKERS = 8
+VENDOR_COPY_MODES = ("auto", "copy", "hardlink")
+MAX_CAPTURED_LOG_CHARS = 20_000
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BinaryComponent:
     artifact_prefix: str
     dest_dir: str
     binary_basename: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class WorkflowArtifact:
     name: str
     size_in_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class StagePackageResult:
+    package: str
+    pack_output: Path
+    log: str
 
 
 BINARY_COMPONENTS = {
@@ -102,9 +106,17 @@ def parse_args() -> argparse.Namespace:
         help="Optional workflow URL to reuse for native artifacts.",
     )
     parser.add_argument(
-        "--artifacts-dir",
-        type=Path,
-        help="Directory containing previously downloaded workflow artifacts.",
+        "--github-repo",
+        default=os.environ.get("CODEX_STAGE_GITHUB_REPO"),
+        help=(
+            "GitHub repository to query for release artifacts, in owner/name form. "
+            "Defaults to CODEX_STAGE_GITHUB_REPO, then the current gh repo, then openai/codex."
+        ),
+    )
+    parser.add_argument(
+        "--workflow-name",
+        default=os.environ.get("CODEX_STAGE_WORKFLOW_NAME", WORKFLOW_NAME),
+        help="GitHub Actions workflow name/path to query when --workflow-url is not provided.",
     )
     parser.add_argument(
         "--output-dir",
@@ -117,47 +129,162 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Retain temporary staging directories instead of deleting them.",
     )
+    parser.add_argument(
+        "--max-download-workers",
+        type=int,
+        default=None,
+        help=(
+            "Maximum parallel GitHub artifact downloads "
+            f"(default: {DEFAULT_GHA_DOWNLOAD_WORKERS} on GitHub Actions, "
+            "otherwise CPU count)."
+        ),
+    )
+    parser.add_argument(
+        "--max-stage-workers",
+        type=int,
+        default=1,
+        help="Maximum packages to stage in parallel (default: 1).",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Persistent native artifact cache directory. By default a per-run "
+            "temporary cache is used and deleted."
+        ),
+    )
+    parser.add_argument(
+        "--vendor-copy-mode",
+        choices=VENDOR_COPY_MODES,
+        default="auto",
+        help=(
+            "How cached vendor trees are materialized: auto uses hardlinks with "
+            "copy fallback (default), copy always copies, hardlink requires links."
+        ),
+    )
     return parser.parse_args()
 
 
+def resolve_github_repo(override: str | None) -> str:
+    if override:
+        return override
+    try:
+        repo = subprocess.check_output(
+            ["gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"],
+            cwd=REPO_ROOT,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        repo = ""
+    return repo or DEFAULT_GITHUB_REPO
+
+
+def github_repo_cache_key(github_repo: str) -> str:
+    return github_repo.replace("/", "__")
+
+
+def github_repo_from_workflow_url(workflow_url: str) -> str | None:
+    parsed = urlparse(workflow_url)
+    if parsed.netloc.lower() != "github.com":
+        return None
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 4 and parts[2] == "actions" and parts[3] == "runs":
+        return f"{parts[0]}/{parts[1]}"
+    return None
+
+
+@cache
+def load_build_module():
+    spec = importlib.util.spec_from_file_location(
+        "codex_build_npm_package", BUILD_SCRIPT
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load module from {BUILD_SCRIPT}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def package_native_components() -> dict[str, set[str]]:
+    return getattr(load_build_module(), "PACKAGE_NATIVE_COMPONENTS", {})
+
+
+def package_expansions() -> dict[str, list[str]]:
+    return getattr(load_build_module(), "PACKAGE_EXPANSIONS", {})
+
+
+def codex_platform_packages() -> dict[str, dict[str, str]]:
+    return getattr(load_build_module(), "CODEX_PLATFORM_PACKAGES", {})
+
+
+def package_target_filters() -> dict[str, set[str]]:
+    return getattr(load_build_module(), "PACKAGE_TARGET_FILTERS", {})
+
+
+def codex_package_component() -> str:
+    return getattr(load_build_module(), "CODEX_PACKAGE_COMPONENT", "codex-package")
+
+
 def native_components_for_package(package: str) -> tuple[str, ...]:
-    return tuple(sorted(PACKAGE_NATIVE_COMPONENTS.get(package, [])))
+    return tuple(sorted(package_native_components().get(package, [])))
 
 
-def collect_native_component_sets(packages: list[str]) -> list[tuple[str, ...]]:
-    component_sets: list[tuple[str, ...]] = []
-    seen: set[tuple[str, ...]] = set()
+def native_targets_for_package(package: str) -> tuple[str, ...]:
+    target_filter = package_target_filters().get(package)
+    if target_filter is None:
+        return tuple(BINARY_TARGETS)
+    return tuple(target for target in BINARY_TARGETS if target in target_filter)
+
+
+def native_component_key_for_package(
+    package: str,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    return native_components_for_package(package), native_targets_for_package(package)
+
+
+def collect_native_component_sets(
+    packages: list[str],
+) -> list[tuple[tuple[str, ...], tuple[str, ...]]]:
+    component_sets: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    seen: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
     for package in packages:
-        components = native_components_for_package(package)
-        if not components or components in seen:
+        key = native_component_key_for_package(package)
+        components, _targets = key
+        if not components or key in seen:
             continue
-        seen.add(components)
-        component_sets.append(components)
+        seen.add(key)
+        component_sets.append(key)
     return component_sets
 
 
 def expand_packages(packages: list[str]) -> list[str]:
     expanded: list[str] = []
     for package in packages:
-        for expanded_package in PACKAGE_EXPANSIONS.get(package, [package]):
+        for expanded_package in package_expansions().get(package, [package]):
             if expanded_package in expanded:
                 continue
             expanded.append(expanded_package)
     return expanded
 
 
-def resolve_release_workflow(version: str) -> dict:
+def resolve_release_workflow(
+    version: str, github_repo: str, workflow_name: str
+) -> dict:
     stdout = subprocess.check_output(
         [
             "gh",
             "run",
             "list",
+            "--repo",
+            github_repo,
             "--branch",
             f"rust-v{version}",
             "--json",
             "workflowName,url,headSha",
             "--workflow",
-            WORKFLOW_NAME,
+            workflow_name,
             "--jq",
             "first(.[])",
         ],
@@ -172,19 +299,56 @@ def resolve_release_workflow(version: str) -> dict:
     return workflow
 
 
-def resolve_workflow_url(version: str, override: str | None) -> tuple[str, str | None]:
+def resolve_workflow_url(
+    version: str, override: str | None, github_repo: str, workflow_name: str
+) -> tuple[str, str | None]:
     if override:
         return override, None
 
-    workflow = resolve_release_workflow(version)
+    workflow = resolve_release_workflow(version, github_repo, workflow_name)
     return workflow["url"], workflow.get("headSha")
+
+
+def workflow_id_from_url(workflow_url: str) -> str:
+    return workflow_url.rstrip("/").split("/")[-1]
+
+
+@cache
+def list_workflow_artifacts(
+    workflow_id: str, github_repo: str
+) -> tuple[WorkflowArtifact, ...]:
+    stdout = subprocess.check_output(
+        [
+            "gh",
+            "api",
+            f"repos/{github_repo}/actions/runs/{workflow_id}/artifacts",
+            "--paginate",
+            "--jq",
+            ".artifacts[] | [.name, .size_in_bytes] | @tsv",
+        ],
+        cwd=REPO_ROOT,
+        text=True,
+    )
+    artifacts = []
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        name, size_in_bytes = line.split("\t", 1)
+        artifacts.append(WorkflowArtifact(name, int(size_in_bytes)))
+    return tuple(artifacts)
 
 
 def install_native_components(
     workflow_url: str,
+    github_repo: str,
     components: set[str],
+    targets: Sequence[str],
     vendor_root: Path,
     artifacts_dir: Path,
+    *,
+    extracted_cache_dir: Path | None = None,
+    max_download_workers: int | None = None,
+    vendor_copy_mode: str = "auto",
 ) -> None:
     if not components:
         return
@@ -192,51 +356,74 @@ def install_native_components(
     vendor_dir = vendor_root / "vendor"
     vendor_dir.mkdir(parents=True, exist_ok=True)
 
-    workflow_id = workflow_url.rstrip("/").split("/")[-1]
+    workflow_id = workflow_id_from_url(workflow_url)
     print(f"Downloading native artifacts from workflow {workflow_id}...", flush=True)
     with _gha_group(f"Download native artifacts from workflow {workflow_id}"):
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         install_from_workflow_artifacts(
             workflow_id,
+            github_repo,
             artifacts_dir,
             sorted(components),
+            targets,
             vendor_dir,
+            extracted_cache_dir=extracted_cache_dir,
+            max_download_workers=max_download_workers,
+            vendor_copy_mode=vendor_copy_mode,
         )
     print(f"Installed native dependencies into {vendor_dir}", flush=True)
 
 
 def install_from_workflow_artifacts(
     workflow_id: str,
+    github_repo: str,
     artifacts_dir: Path,
     components: Sequence[str],
+    targets: Sequence[str],
     vendor_dir: Path,
+    *,
+    extracted_cache_dir: Path | None = None,
+    max_download_workers: int | None = None,
+    vendor_copy_mode: str = "auto",
 ) -> None:
-    artifacts = select_target_artifacts(workflow_id, components)
-    download_artifacts(workflow_id, artifacts_dir, artifacts)
-    if CODEX_PACKAGE_COMPONENT in components:
-        install_codex_package_archives(artifacts_dir, vendor_dir, BINARY_TARGETS)
+    artifacts = select_target_artifacts(workflow_id, github_repo, components, targets)
+    download_artifacts(
+        workflow_id, github_repo, artifacts_dir, artifacts, max_download_workers
+    )
+    if codex_package_component() in components:
+        install_codex_package_archives(
+            artifacts_dir,
+            vendor_dir,
+            targets,
+            extracted_cache_dir,
+            vendor_copy_mode=vendor_copy_mode,
+        )
     install_binary_components(
         artifacts_dir,
         vendor_dir,
         [BINARY_COMPONENTS[name] for name in components if name in BINARY_COMPONENTS],
+        targets,
     )
 
 
 def select_target_artifacts(
     workflow_id: str,
+    github_repo: str,
     components: Sequence[str],
+    targets: Sequence[str] = BINARY_TARGETS,
 ) -> list[WorkflowArtifact]:
-    needs_target_artifacts = CODEX_PACKAGE_COMPONENT in components or any(
+    needs_target_artifacts = codex_package_component() in components or any(
         component in BINARY_COMPONENTS for component in components
     )
     if not needs_target_artifacts:
         return []
 
     artifacts_by_name = {
-        artifact.name: artifact for artifact in list_workflow_artifacts(workflow_id)
+        artifact.name: artifact
+        for artifact in list_workflow_artifacts(workflow_id, github_repo)
     }
     selected_artifacts: list[WorkflowArtifact] = []
-    for target in BINARY_TARGETS:
+    for target in targets:
         for artifact_name in [target, f"{target}-unsigned"]:
             artifact = artifacts_by_name.get(artifact_name)
             if artifact is not None:
@@ -250,69 +437,159 @@ def select_target_artifacts(
     return selected_artifacts
 
 
-def list_workflow_artifacts(workflow_id: str) -> list[WorkflowArtifact]:
-    stdout = subprocess.check_output(
-        [
-            "gh",
-            "api",
-            f"repos/{GITHUB_REPO}/actions/runs/{workflow_id}/artifacts",
-            "--paginate",
-            "--jq",
-            ".artifacts[] | [.name, .size_in_bytes] | @tsv",
-        ],
-        text=True,
-    )
-    artifacts: list[WorkflowArtifact] = []
-    for line in stdout.splitlines():
-        name, size_in_bytes = line.split("\t", 1)
-        artifacts.append(WorkflowArtifact(name=name, size_in_bytes=int(size_in_bytes)))
-    return artifacts
-
-
 def download_artifacts(
     workflow_id: str,
+    github_repo: str,
     dest_dir: Path,
     artifacts: Sequence[WorkflowArtifact],
+    max_workers: int | None = None,
 ) -> None:
     total_bytes = sum(artifact.size_in_bytes for artifact in artifacts)
     print(
         f"Downloading {len(artifacts)} artifacts ({format_bytes(total_bytes)})",
         flush=True,
     )
-    for artifact in artifacts:
-        artifact_dir = dest_dir / artifact.name
-        if artifact_dir.is_dir() and any(artifact_dir.iterdir()):
+    if not artifacts:
+        return
+
+    worker_count = download_worker_count_for(len(artifacts), max_workers)
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(
+                download_single_artifact, workflow_id, github_repo, dest_dir, artifact
+            )
+            for artifact in artifacts
+        ]
+        for future in as_completed(futures):
+            future.result()
+
+
+def download_single_artifact(
+    workflow_id: str, github_repo: str, dest_dir: Path, artifact: WorkflowArtifact
+) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir = dest_dir / artifact.name
+    if artifact_is_complete(artifact_dir, artifact):
+        print(
+            f"  using cached {artifact.name} ({format_bytes(artifact.size_in_bytes)})",
+            flush=True,
+        )
+        return
+
+    lock_path = dest_dir / f".{artifact.name}.lock"
+    with exclusive_file_lock(lock_path):
+        if artifact_is_complete(artifact_dir, artifact):
             print(
                 f"  using cached {artifact.name} ({format_bytes(artifact.size_in_bytes)})",
                 flush=True,
             )
-            continue
+            return
 
-        artifact_dir.mkdir(parents=True, exist_ok=True)
-        print(
-            f"  downloading {artifact.name} ({format_bytes(artifact.size_in_bytes)})",
-            flush=True,
+        temp_dir = (
+            dest_dir / f".{artifact.name}.tmp-{os.getpid()}-{threading.get_ident()}"
         )
-        subprocess.check_call(
-            [
-                "gh",
-                "run",
-                "download",
-                "--name",
-                artifact.name,
-                "--dir",
-                str(artifact_dir),
-                "--repo",
-                GITHUB_REPO,
-                workflow_id,
-            ]
-        )
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            print(
+                f"  downloading {artifact.name} ({format_bytes(artifact.size_in_bytes)})",
+                flush=True,
+            )
+            subprocess.check_call(
+                [
+                    "gh",
+                    "run",
+                    "download",
+                    "--name",
+                    artifact.name,
+                    "--dir",
+                    str(temp_dir),
+                    "--repo",
+                    github_repo,
+                    workflow_id,
+                ]
+            )
+            if artifact_dir.exists():
+                shutil.rmtree(artifact_dir)
+            temp_dir.rename(artifact_dir)
+            write_complete_marker(artifact_dir, artifact)
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+
+
+def artifact_is_complete(artifact_dir: Path, artifact: WorkflowArtifact) -> bool:
+    marker_path = artifact_dir / COMPLETE_MARKER
+    if not marker_path.is_file():
+        return False
+    try:
+        marker = marker_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return (
+        f"name={artifact.name}\n" in marker
+        and f"size_in_bytes={artifact.size_in_bytes}\n" in marker
+    )
+
+
+def write_complete_marker(artifact_dir: Path, artifact: WorkflowArtifact) -> None:
+    (artifact_dir / COMPLETE_MARKER).write_text(
+        f"name={artifact.name}\nsize_in_bytes={artifact.size_in_bytes}\n",
+        encoding="utf-8",
+    )
+
+
+@contextmanager
+def exclusive_file_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd: int | None = None
+    while fd is None:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(
+                fd,
+                f"pid={os.getpid()} thread={threading.get_ident()}\n".encode("utf-8"),
+            )
+        except FileExistsError:
+            try:
+                if time.time() - lock_path.stat().st_mtime > LOCK_STALE_SECONDS:
+                    lock_path.unlink()
+            except (FileNotFoundError, PermissionError):
+                # On Windows, unlinking a lock whose holder still has the fd
+                # open raises PermissionError — keep waiting, don't crash.
+                pass
+            time.sleep(LOCK_POLL_SECONDS)
+
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+        lock_path.unlink(missing_ok=True)
+
+
+def worker_count_for(item_count: int, requested: int | None = None) -> int:
+    item_count = max(1, item_count)
+    if requested is not None:
+        return max(1, min(item_count, requested))
+    return min(item_count, max(1, (os.cpu_count() or 1)))
+
+
+def download_worker_count_for(item_count: int, requested: int | None = None) -> int:
+    if requested is not None:
+        return worker_count_for(item_count, requested)
+    if _gha_enabled():
+        return min(item_count, DEFAULT_GHA_DOWNLOAD_WORKERS)
+    return worker_count_for(item_count)
 
 
 def install_codex_package_archives(
     artifacts_dir: Path,
     vendor_dir: Path,
     targets: Sequence[str],
+    extracted_cache_dir: Path | None = None,
+    *,
+    vendor_copy_mode: str = "auto",
 ) -> None:
     if not targets:
         return
@@ -329,6 +606,8 @@ def install_codex_package_archives(
                 artifacts_dir,
                 vendor_dir,
                 target,
+                extracted_cache_dir,
+                vendor_copy_mode=vendor_copy_mode,
             ): target
             for target in targets
         }
@@ -341,6 +620,9 @@ def install_single_codex_package_archive(
     artifacts_dir: Path,
     vendor_dir: Path,
     target: str,
+    extracted_cache_dir: Path | None = None,
+    *,
+    vendor_copy_mode: str = "auto",
 ) -> Path:
     artifact_subdir = artifact_dir_for_target(artifacts_dir, target)
     archive_path = artifact_subdir / f"codex-package-{target}.tar.gz"
@@ -348,23 +630,162 @@ def install_single_codex_package_archive(
         raise FileNotFoundError(f"Expected package archive not found: {archive_path}")
 
     dest_dir = vendor_dir / target
-    if dest_dir.exists():
-        shutil.rmtree(dest_dir)
-    dest_dir.mkdir(parents=True, exist_ok=True)
+    vendor_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = vendor_dir / f".{target}.{uuid.uuid4().hex}.tmp"
+    backup_dir = vendor_dir / f".{target}.{uuid.uuid4().hex}.old"
 
-    with tarfile.open(archive_path, "r:gz") as archive:
-        archive.extractall(dest_dir, filter="data")
+    try:
+        temp_dir.mkdir(parents=True)
+        if extracted_cache_dir is None:
+            extract_tar_data(archive_path, temp_dir)
+        else:
+            cached_dir = cached_codex_package_archive(
+                archive_path,
+                target,
+                extracted_cache_dir,
+            )
+            materialize_cached_tree(cached_dir, temp_dir, vendor_copy_mode)
+
+        if dest_dir.exists():
+            dest_dir.replace(backup_dir)
+        temp_dir.replace(dest_dir)
+        if backup_dir.exists():
+            shutil.rmtree(backup_dir)
+    except Exception:
+        if not dest_dir.exists() and backup_dir.exists():
+            backup_dir.replace(dest_dir)
+        raise
+    finally:
+        if temp_dir.exists():
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        if backup_dir.exists():
+            shutil.rmtree(backup_dir, ignore_errors=True)
 
     return dest_dir
+
+
+def materialize_cached_tree(
+    cached_dir: Path,
+    dest_dir: Path,
+    vendor_copy_mode: str,
+) -> None:
+    if vendor_copy_mode in {"auto", "hardlink"}:
+        try:
+            hardlink_tree(cached_dir, dest_dir, ignored_names={COMPLETE_MARKER})
+            return
+        except OSError:
+            if vendor_copy_mode == "hardlink":
+                raise
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+
+    shutil.copytree(
+        cached_dir,
+        dest_dir,
+        dirs_exist_ok=True,
+        ignore=shutil.ignore_patterns(COMPLETE_MARKER),
+    )
+
+
+def hardlink_tree(
+    src_dir: Path,
+    dest_dir: Path,
+    *,
+    ignored_names: set[str],
+) -> None:
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    for src in src_dir.iterdir():
+        if src.name in ignored_names:
+            continue
+
+        dest = dest_dir / src.name
+        if src.is_dir():
+            hardlink_tree(src, dest, ignored_names=ignored_names)
+        elif src.is_file():
+            os.link(src, dest)
+        else:
+            shutil.copy2(src, dest)
+
+
+def cached_codex_package_archive(
+    archive_path: Path,
+    target: str,
+    cache_root: Path,
+) -> Path:
+    cache_root.mkdir(parents=True, exist_ok=True)
+    stat = archive_path.stat()
+    cache_dir = cache_root / f"{target}-{stat.st_size}-{stat.st_mtime_ns}"
+    marker_path = cache_dir / COMPLETE_MARKER
+    if marker_path.is_file():
+        return cache_dir
+
+    lock_path = cache_root / f".{cache_dir.name}.lock"
+    with exclusive_file_lock(lock_path):
+        if marker_path.is_file():
+            return cache_dir
+
+        temp_dir = (
+            cache_root / f".{cache_dir.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+        )
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            extract_tar_data(archive_path, temp_dir)
+            (temp_dir / COMPLETE_MARKER).write_text(
+                f"source={archive_path}\n"
+                f"size={stat.st_size}\n"
+                f"mtime_ns={stat.st_mtime_ns}\n",
+                encoding="utf-8",
+            )
+            if cache_dir.exists():
+                shutil.rmtree(cache_dir)
+            temp_dir.rename(cache_dir)
+        except Exception:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+
+    return cache_dir
+
+
+def extract_tar_data(archive_path: Path, dest_dir: Path) -> None:
+    with tarfile.open(archive_path, "r:gz") as archive:
+        try:
+            archive.extractall(dest_dir, filter="data")
+        except TypeError:
+            validate_tar_members_for_legacy_python(archive, dest_dir)
+            archive.extractall(dest_dir)
+
+
+def validate_tar_members_for_legacy_python(
+    archive: tarfile.TarFile, dest_dir: Path
+) -> None:
+    dest_root = dest_dir.resolve()
+    for member in archive.getmembers():
+        member_path = (dest_dir / member.name).resolve()
+        if not is_relative_to(member_path, dest_root):
+            raise RuntimeError(f"unsafe archive member path: {member.name}")
+        if member.issym() or member.islnk():
+            raise RuntimeError(
+                f"archive links require Python tarfile data_filter support: {member.name}"
+            )
+
+
+def is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
 
 
 def install_binary_components(
     artifacts_dir: Path,
     vendor_dir: Path,
     selected_components: Sequence[BinaryComponent],
+    targets: Sequence[str] = BINARY_TARGETS,
 ) -> None:
     for component in selected_components:
-        component_targets = list(BINARY_TARGETS)
+        component_targets = list(targets)
 
         print(
             f"Installing {component.binary_basename} binaries for targets: "
@@ -450,11 +871,14 @@ def artifact_dir_for_target(artifacts_dir: Path, target: str) -> Path:
 def extract_zstd_archive(archive_path: Path, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
 
-    output_path = archive_path.parent / dest.name
-    subprocess.check_call(
-        ["zstd", "-f", "-d", str(archive_path), "-o", str(output_path)]
-    )
-    shutil.move(str(output_path), dest)
+    temp_path = dest.parent / f".{dest.name}.{uuid.uuid4().hex}.tmp"
+    try:
+        subprocess.check_call(
+            ["zstd", "-f", "-d", str(archive_path), "-o", str(temp_path)]
+        )
+        temp_path.replace(dest)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def format_bytes(size_in_bytes: int) -> str:
@@ -466,16 +890,170 @@ def format_bytes(size_in_bytes: int) -> str:
     return f"{value:.1f} GiB"
 
 
+def format_command(cmd: list[str]) -> str:
+    return "+ " + " ".join(cmd)
+
+
 def run_command(cmd: list[str]) -> None:
-    print("+", " ".join(cmd), flush=True)
+    print(format_command(cmd), flush=True)
     subprocess.run(cmd, cwd=REPO_ROOT, check=True)
 
 
+def run_command_capture(cmd: list[str]) -> str:
+    result = subprocess.run(
+        cmd,
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        # node/npm emit UTF-8 unconditionally; Windows would otherwise decode
+        # as cp1252 and can hard-crash on undecodable bytes.
+        encoding="utf-8",
+        errors="replace",
+    )
+    log = format_command(cmd) + "\n" + bounded_log(result.stdout or "")
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Command failed with exit code {result.returncode}:\n{log.rstrip()}"
+        )
+    return log
+
+
+def bounded_log(text: str, *, max_chars: int = MAX_CAPTURED_LOG_CHARS) -> str:
+    if len(text) <= max_chars:
+        return text
+    half = max_chars // 2
+    omitted = len(text) - (half * 2)
+    return text[:half] + f"\n...[truncated {omitted} chars]...\n" + text[-half:]
+
+
 def tarball_name_for_package(package: str, version: str) -> str:
-    if package in CODEX_PLATFORM_PACKAGES:
+    if package in codex_platform_packages():
         platform = package.removeprefix("codex-")
         return f"codex-npm-{platform}-{version}.tgz"
     return f"{package}-npm-{version}.tgz"
+
+
+def build_stage_command(
+    package: str,
+    release_version: str,
+    output_dir: Path,
+    staging_dir: Path,
+    vendor_src_by_native_key: dict[tuple[tuple[str, ...], tuple[str, ...]], Path],
+) -> tuple[Path, list[str]]:
+    pack_output = output_dir / tarball_name_for_package(package, release_version)
+    # Launch via the running interpreter: CreateProcess cannot exec a .py file
+    # directly on Windows (WinError 193), so shebang-exec only works on POSIX.
+    cmd = [
+        sys.executable,
+        str(BUILD_SCRIPT),
+        "--package",
+        package,
+        "--release-version",
+        release_version,
+        "--staging-dir",
+        str(staging_dir),
+        "--pack-output",
+        str(pack_output),
+    ]
+
+    vendor_src = vendor_src_by_native_key.get(native_component_key_for_package(package))
+    if vendor_src is not None:
+        cmd.extend(["--vendor-src", str(vendor_src)])
+
+    return pack_output, cmd
+
+
+def stage_package(
+    package: str,
+    release_version: str,
+    output_dir: Path,
+    runner_temp: Path,
+    vendor_src_by_native_key: dict[tuple[tuple[str, ...], tuple[str, ...]], Path],
+    keep_staging_dirs: bool,
+    *,
+    capture_output: bool,
+) -> StagePackageResult:
+    staging_dir = Path(
+        tempfile.mkdtemp(prefix=f"npm-stage-{package}-", dir=runner_temp)
+    )
+    pack_output, cmd = build_stage_command(
+        package,
+        release_version,
+        output_dir,
+        staging_dir,
+        vendor_src_by_native_key,
+    )
+    log = f"Staging {package} in {staging_dir}\n"
+
+    try:
+        if capture_output:
+            log += run_command_capture(cmd)
+        else:
+            print(log, end="", flush=True)
+            run_command(cmd)
+            log = ""
+    finally:
+        if not keep_staging_dirs:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+    return StagePackageResult(package=package, pack_output=pack_output, log=log)
+
+
+def stage_packages(
+    packages: Sequence[str],
+    release_version: str,
+    output_dir: Path,
+    runner_temp: Path,
+    vendor_src_by_native_key: dict[tuple[tuple[str, ...], tuple[str, ...]], Path],
+    keep_staging_dirs: bool,
+    max_stage_workers: int | None,
+) -> list[StagePackageResult]:
+    worker_count = worker_count_for(len(packages), max_stage_workers)
+    if worker_count == 1:
+        return [
+            stage_package(
+                package,
+                release_version,
+                output_dir,
+                runner_temp,
+                vendor_src_by_native_key,
+                keep_staging_dirs,
+                capture_output=False,
+            )
+            for package in packages
+        ]
+
+    print(
+        f"Staging {len(packages)} packages with {worker_count} workers",
+        flush=True,
+    )
+    results_by_package: dict[str, StagePackageResult] = {}
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {
+            executor.submit(
+                stage_package,
+                package,
+                release_version,
+                output_dir,
+                runner_temp,
+                vendor_src_by_native_key,
+                keep_staging_dirs,
+                capture_output=True,
+            ): package
+            for package in packages
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            if result.log:
+                print(
+                    result.log,
+                    end="" if result.log.endswith("\n") else "\n",
+                    flush=True,
+                )
+            results_by_package[result.package] = result
+
+    return [results_by_package[package] for package in packages]
 
 
 def main() -> int:
@@ -485,42 +1063,61 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     runner_temp = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()))
+    github_repo = args.github_repo or (
+        github_repo_from_workflow_url(args.workflow_url) if args.workflow_url else None
+    )
+    github_repo = resolve_github_repo(github_repo)
 
     packages = expand_packages(list(args.packages))
     native_component_sets = collect_native_component_sets(packages)
     print("Expanded packages: " + ", ".join(packages), flush=True)
     if native_component_sets:
         component_sets = [
-            "(" + ", ".join(components) + ")" for components in native_component_sets
+            "(" + ", ".join(components) + ") -> " + ", ".join(targets)
+            for components, targets in native_component_sets
         ]
         print(
             "Native component sets: " + ", ".join(component_sets),
             flush=True,
         )
-
+    vendor_src_by_native_key: dict[tuple[tuple[str, ...], tuple[str, ...]], Path] = {}
     vendor_temp_roots: list[Path] = []
-    vendor_src_by_components: dict[tuple[str, ...], Path] = {}
     artifacts_temp_root: Path | None = None
-    remove_artifacts_temp_root = False
+    cleanup_artifacts_root = False
     resolved_head_sha: str | None = None
-    staging_jobs: list[tuple[Path, list[str], str]] = []
+
+    final_messages = []
 
     try:
         if native_component_sets:
             workflow_url, resolved_head_sha = resolve_workflow_url(
-                args.release_version, args.workflow_url
+                args.release_version,
+                args.workflow_url,
+                github_repo,
+                args.workflow_name,
             )
+            workflow_id = workflow_id_from_url(workflow_url)
             print(f"Using native artifacts from {workflow_url}", flush=True)
-            if args.artifacts_dir is not None:
-                artifacts_temp_root = args.artifacts_dir.resolve()
-                artifacts_temp_root.mkdir(parents=True, exist_ok=True)
-            else:
+            if args.cache_dir is None:
                 artifacts_temp_root = Path(
                     tempfile.mkdtemp(prefix="npm-native-artifacts-", dir=runner_temp)
                 )
-                remove_artifacts_temp_root = True
-            print(f"Using artifact cache at {artifacts_temp_root}", flush=True)
-            for components in native_component_sets:
+                cleanup_artifacts_root = True
+                print(
+                    f"Caching downloaded artifacts in {artifacts_temp_root}",
+                    flush=True,
+                )
+            else:
+                artifacts_temp_root = (
+                    args.cache_dir / github_repo_cache_key(github_repo) / workflow_id
+                ).resolve()
+                artifacts_temp_root.mkdir(parents=True, exist_ok=True)
+                print(
+                    f"Using persistent native artifact cache {artifacts_temp_root}",
+                    flush=True,
+                )
+            extracted_cache_dir = artifacts_temp_root / "_extracted-codex-packages"
+            for components, targets in native_component_sets:
                 vendor_temp_root = Path(
                     tempfile.mkdtemp(prefix="npm-native-", dir=runner_temp)
                 )
@@ -528,74 +1125,48 @@ def main() -> int:
                 print(
                     "Installing native components "
                     + ", ".join(components)
+                    + " for targets "
+                    + ", ".join(targets)
                     + f" into {vendor_temp_root}",
                     flush=True,
                 )
                 install_native_components(
                     workflow_url,
+                    github_repo,
                     set(components),
+                    targets,
                     vendor_temp_root,
                     artifacts_temp_root,
+                    extracted_cache_dir=extracted_cache_dir,
+                    max_download_workers=args.max_download_workers,
+                    vendor_copy_mode=args.vendor_copy_mode,
                 )
-                vendor_src_by_components[components] = vendor_temp_root / "vendor"
+                vendor_src_by_native_key[(components, targets)] = (
+                    vendor_temp_root / "vendor"
+                )
 
         if resolved_head_sha:
             print(f"should `git checkout {resolved_head_sha}`", flush=True)
 
-        for package in packages:
-            staging_dir = Path(
-                tempfile.mkdtemp(prefix=f"npm-stage-{package}-", dir=runner_temp)
-            )
-            pack_output = output_dir / tarball_name_for_package(
-                package, args.release_version
-            )
-            print(f"Staging {package} in {staging_dir}", flush=True)
-
-            cmd = [
-                str(BUILD_SCRIPT),
-                "--package",
-                package,
-                "--release-version",
-                args.release_version,
-                "--staging-dir",
-                str(staging_dir),
-                "--pack-output",
-                str(pack_output),
-            ]
-
-            vendor_src = vendor_src_by_components.get(
-                native_components_for_package(package)
-            )
-            if vendor_src is not None:
-                cmd.extend(["--vendor-src", str(vendor_src)])
-
-            staging_jobs.append(
-                (staging_dir, cmd, f"Staged {package} at {pack_output}")
-            )
-
-        max_workers = min(len(staging_jobs), os.cpu_count() or 1)
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(run_command, cmd): staging_dir
-                for staging_dir, cmd, _message in staging_jobs
-            }
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                finally:
-                    if not args.keep_staging_dirs:
-                        shutil.rmtree(futures[future], ignore_errors=True)
+        for result in stage_packages(
+            packages,
+            args.release_version,
+            output_dir,
+            runner_temp,
+            vendor_src_by_native_key,
+            args.keep_staging_dirs,
+            args.max_stage_workers,
+        ):
+            final_messages.append(f"Staged {result.package} at {result.pack_output}")
     finally:
         if not args.keep_staging_dirs:
-            for staging_dir, _cmd, _message in staging_jobs:
-                shutil.rmtree(staging_dir, ignore_errors=True)
             for vendor_temp_root in vendor_temp_roots:
                 shutil.rmtree(vendor_temp_root, ignore_errors=True)
-        if remove_artifacts_temp_root and artifacts_temp_root is not None:
+        if cleanup_artifacts_root and artifacts_temp_root is not None:
             shutil.rmtree(artifacts_temp_root, ignore_errors=True)
 
-    for _staging_dir, _cmd, message in staging_jobs:
-        print(message, flush=True)
+    for msg in final_messages:
+        print(msg, flush=True)
 
     return 0
 
