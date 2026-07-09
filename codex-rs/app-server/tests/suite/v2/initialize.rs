@@ -57,6 +57,7 @@ async fn initialize_uses_client_info_name_as_originator() -> Result<()> {
         codex_home: response_codex_home,
         platform_family,
         platform_os,
+        ..
     } = to_response::<InitializeResponse>(response)?;
 
     assert!(user_agent.starts_with("codex_vscode/"));
@@ -163,12 +164,74 @@ async fn initialize_respects_originator_override_env_var() -> Result<()> {
         codex_home: response_codex_home,
         platform_family,
         platform_os,
+        ..
     } = to_response::<InitializeResponse>(response)?;
 
     assert!(user_agent.starts_with("codex_originator_via_env_var/"));
     assert_eq!(response_codex_home, expected_codex_home);
     assert_eq!(platform_family, std::env::consts::FAMILY);
     assert_eq!(platform_os, std::env::consts::OS);
+    Ok(())
+}
+
+#[tokio::test]
+async fn initialize_response_includes_local_runtime_metadata() -> Result<()> {
+    let responses = Vec::new();
+    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build()
+        .await?;
+
+    let message = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.initialize_with_client_info(ClientInfo {
+            name: "codex_vscode".to_string(),
+            title: Some("Codex VS Code Extension".to_string()),
+            version: "0.1.0".to_string(),
+        }),
+    )
+    .await??;
+
+    let JSONRPCMessage::Response(response) = message else {
+        anyhow::bail!("expected initialize response, got {message:?}");
+    };
+    let InitializeResponse {
+        build_info,
+        runtime_info,
+        server_capabilities,
+        local_watermark,
+        ..
+    } = to_response::<InitializeResponse>(response)?;
+
+    let build_info = build_info.expect("initialize response should include build info");
+    assert_eq!(build_info.version, env!("CARGO_PKG_VERSION"));
+    assert!(!build_info.commit.is_empty());
+    assert!(!build_info.dirty.is_empty());
+    assert!(!build_info.profile.is_empty());
+    assert!(!build_info.built.is_empty());
+
+    let runtime_info = runtime_info.expect("initialize response should include runtime info");
+    assert!(!runtime_info.install_method.is_empty());
+    assert!(
+        runtime_info
+            .warnings
+            .iter()
+            .all(|warning| !warning.code.is_empty() && !warning.message.is_empty())
+    );
+
+    let server_capabilities =
+        server_capabilities.expect("initialize response should include capabilities");
+    assert!(server_capabilities.enabled_features.is_sorted());
+
+    let local_watermark = local_watermark.expect("initialize response should include watermark");
+    assert_eq!(local_watermark.version, "kd4");
+    assert_eq!(local_watermark.label, "Codex KD4");
+    assert!(local_watermark.detail.contains("Local Codex KD4"));
+
     Ok(())
 }
 

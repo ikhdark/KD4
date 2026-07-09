@@ -83,6 +83,8 @@ use output::redact_detail;
 use output::render_human_report;
 use progress::DoctorProgress;
 use progress::doctor_progress;
+use runtime::desktop_runtime_chain_check;
+use runtime::local_publish_check;
 use runtime::runtime_check;
 use runtime::search_check;
 use system::system_check;
@@ -344,6 +346,12 @@ async fn build_report(
         installation_check(!command.summary)
     }));
     checks.push(run_sync_check("runtime", progress.clone(), runtime_check));
+    checks.push(run_sync_check("local publish", progress.clone(), || {
+        local_publish_check(!command.summary)
+    }));
+    checks.push(run_sync_check("desktop", progress.clone(), || {
+        desktop_runtime_chain_check(!command.summary)
+    }));
     checks.push(run_sync_check("search", progress.clone(), search_check));
 
     progress.begin("config");

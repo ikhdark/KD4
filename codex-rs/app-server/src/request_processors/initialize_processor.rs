@@ -135,11 +135,26 @@ impl InitializeRequestProcessor {
         }
 
         let user_agent = get_codex_user_agent();
+        let mut enabled_features: Vec<_> = self
+            .config
+            .features
+            .enabled_features()
+            .into_iter()
+            .map(|feature| feature.key().to_string())
+            .collect();
+        enabled_features.sort();
+        let local_watermark = crate::local_watermark::local_watermark(codex_home.as_path()).await;
         let response = InitializeResponse {
             user_agent,
             codex_home,
             platform_family: std::env::consts::FAMILY.to_string(),
             platform_os: std::env::consts::OS.to_string(),
+            build_info: Some(crate::build_info::BuildInfo::current().into()),
+            runtime_info: Some(crate::runtime_provenance::current()),
+            server_capabilities: Some(codex_app_server_protocol::ServerCapabilities {
+                enabled_features,
+            }),
+            local_watermark: Some(local_watermark),
         };
 
         self.outgoing

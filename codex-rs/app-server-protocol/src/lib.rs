@@ -15,6 +15,7 @@ pub use export::generate_types;
 pub use protocol::common::*;
 pub use protocol::event_mapping::*;
 pub use protocol::item_builders::*;
+pub use protocol::server_info::*;
 pub use protocol::thread_history::*;
 pub use protocol::v1::ApplyPatchApprovalParams;
 pub use protocol::v1::ApplyPatchApprovalResponse;

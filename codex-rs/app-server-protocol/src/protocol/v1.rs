@@ -22,6 +22,10 @@ use serde::Serialize;
 use ts_rs::TS;
 
 use crate::protocol::common::AuthMode;
+use crate::protocol::server_info::ServerBuildInfo;
+use crate::protocol::server_info::ServerCapabilities;
+use crate::protocol::server_info::ServerLocalWatermark;
+use crate::protocol::server_info::ServerRuntimeInfo;
 use crate::protocol::v2::ForcedChatgptWorkspaceIds;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default, JsonSchema, TS)]
@@ -71,6 +75,22 @@ pub struct InitializeResponse {
     /// Operating system for the running app-server target, for example
     /// `"macos"`, `"linux"`, or `"windows"`.
     pub platform_os: String,
+    /// Build metadata for the running app-server binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub build_info: Option<ServerBuildInfo>,
+    /// Runtime provenance for the running app-server process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub runtime_info: Option<ServerRuntimeInfo>,
+    /// Effective app-server capabilities advertised at initialize time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub server_capabilities: Option<ServerCapabilities>,
+    /// Local fork watermark for desktop-visible runtime proof.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub local_watermark: Option<ServerLocalWatermark>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
