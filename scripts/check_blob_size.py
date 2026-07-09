@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 DEFAULT_MAX_BYTES = 500 * 1024
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,6 +32,7 @@ class ChangedPath:
 def run_git(*args: str, input_text: str | None = None) -> str:
     result = subprocess.run(
         ["git", *args],
+        cwd=REPO_ROOT,
         check=True,
         capture_output=True,
         text=True,

@@ -17,7 +17,8 @@ keeping changes reviewable, local-build focused, and easy to validate.
 
 This repo currently has this root `AGENTS.md`, nested `.codex/AGENTS.md`,
 `codex-rs/AGENTS.md`, scoped nested `AGENTS.md` files under `codex-rs` where
-present, and `scripts/AGENTS.md` for script tooling.
+present, `scripts/AGENTS.md` for script tooling, plus scoped script policy in
+`scripts/codex_package/AGENTS.md` and `scripts/install/AGENTS.md`.
 Do not refer to nested `AGENTS.md` files unless they are present in the working tree.
 
 Repo-local Codex guidance and workflows live under `.codex` when present,
@@ -32,6 +33,9 @@ especially:
 
 If durable guidance becomes specific to one package or directory, add a nested
 `AGENTS.md` there instead of expanding this root file.
+README files are not automatically loaded as agent guidance; when README content
+becomes operational editing policy, promote it into the closest scoped
+`AGENTS.md` and leave the README focused on usage, architecture, and background.
 
 ## Default workflow
 
@@ -180,10 +184,16 @@ publish/install behavior, or desktop-visible runtime behavior.
 - Rust crate changes: run the focused crate check/test from `codex-rs`, using a
   local `just` recipe when one exists.
 - App-server schema or protocol changes: run focused app-server tests and
-  regenerate schema artifacts with `just write-app-server-schema` when the wire
-  contract changed.
-- Config schema changes: run focused config/core tests and regenerate
-  `codex-rs/core/config.schema.json` with `just write-config-schema`.
+  `just app-server-schema-check` by default. Use
+  `just app-server-schema-check-force` only when intentionally regenerating
+  schema artifacts for a wire contract change; use direct
+  `just write-app-server-schema` only when the owning workflow explicitly needs
+  the raw generator.
+- Config schema changes: run focused config/core tests and
+  `just config-schema-check` by default. Use `just config-schema-check-force`
+  only when intentionally regenerating `codex-rs/core/config.schema.json`; use
+  direct `just write-config-schema` only when the owning workflow explicitly
+  needs the raw generator.
 - Python SDK changes: use the SDK's focused `uv run pytest`,
   `uv run ruff check .`, lock checks, and artifact regeneration only for touched
   SDK surfaces.

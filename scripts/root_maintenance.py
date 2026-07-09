@@ -46,6 +46,8 @@ PYTHON_RUFF_TARGETS = python_source_targets()
 
 PYTHON_UNITTEST_TARGETS = python_unittest_targets()
 
+UV_RUN_SCRIPTS = ["uv", "run", "--frozen", "--project", "scripts"]
+
 
 def script_python_path(path_text: str) -> Path | None:
     path = Path(path_text)
@@ -200,13 +202,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return run(["pnpm", "exec", "prettier", mode, *PRETTIER_TARGETS])
 
     if args.command == "format-python":
-        command = ["uv", "run", "--project", "scripts", "ruff", "format"]
+        command = [*UV_RUN_SCRIPTS, "ruff", "format"]
         if not args.write:
             command.append("--check")
         return run([*command, *python_lint_targets(expand_changed_paths(args.changed))])
 
     if args.command == "lint-python":
-        command = ["uv", "run", "--project", "scripts", "ruff", "check"]
+        command = [*UV_RUN_SCRIPTS, "ruff", "check"]
         if args.fix:
             command.append("--fix")
         return run([*command, *python_lint_targets(expand_changed_paths(args.changed))])
@@ -214,10 +216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "test-python":
         return run(
             [
-                "uv",
-                "run",
-                "--project",
-                "scripts",
+                *UV_RUN_SCRIPTS,
                 "python",
                 "-m",
                 "unittest",

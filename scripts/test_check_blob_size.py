@@ -6,12 +6,23 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts import check_blob_size
 from scripts.check_blob_size import ChangedBlob
 
 
 class CheckBlobSizeTest(unittest.TestCase):
+    def test_run_git_is_anchored_at_repo_root(self) -> None:
+        with mock.patch.object(check_blob_size.subprocess, "run") as run:
+            run.return_value.stdout = "ok\n"
+
+            output = check_blob_size.run_git("status", "--short")
+
+        self.assertEqual(output, "ok\n")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs["cwd"], check_blob_size.REPO_ROOT)
+
     def test_collect_changed_blobs_batches_diff_and_cat_file(self) -> None:
         calls: list[tuple[tuple[str, ...], str | None]] = []
 

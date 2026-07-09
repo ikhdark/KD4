@@ -6,6 +6,7 @@ import os
 import shlex
 import subprocess
 import sys
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,8 +16,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.root_maintenance import PRETTIER_TARGETS
-from scripts.tool_versions import RUSTFMT_TOOLCHAIN
+from scripts.root_maintenance import PRETTIER_TARGETS  # noqa: E402
+from scripts.tool_versions import RUSTFMT_TOOLCHAIN  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -37,6 +38,9 @@ class FormatterResult:
     name: str
     output: str
     returncode: int
+
+
+FormatterGroupFactory = tuple[str, Callable[[], FormatterGroup]]
 
 
 def just_formatter_group(*, check: bool) -> FormatterGroup:
@@ -156,23 +160,26 @@ def formatter_groups(
     fast_local: bool = False,
     selected_groups: set[str] | None = None,
 ) -> tuple[FormatterGroup, ...]:
-    fast_groups = (
-        just_formatter_group(check=check),
-        rust_formatter_group(check=check),
-    )
-    if fast_local:
-        groups = fast_groups
-    else:
-        groups = (
-            *fast_groups,
-            prettier_formatter_group(check=check),
-            buildifier_formatter_group(check=check),
-            python_sdk_formatter_group(check=check),
-            python_scripts_formatter_group(check=check),
+    factories: list[FormatterGroupFactory] = [
+        ("just", lambda: just_formatter_group(check=check)),
+        ("rust", lambda: rust_formatter_group(check=check)),
+    ]
+    if not fast_local:
+        factories.extend(
+            [
+                ("prettier", lambda: prettier_formatter_group(check=check)),
+                ("bazel/starlark", lambda: buildifier_formatter_group(check=check)),
+                ("python sdk", lambda: python_sdk_formatter_group(check=check)),
+                ("python scripts", lambda: python_scripts_formatter_group(check=check)),
+            ]
         )
     if selected_groups is None:
-        return groups
-    return tuple(group for group in groups if group.name.lower() in selected_groups)
+        selected_factories = factories
+    else:
+        selected_factories = [
+            factory for factory in factories if factory[0].lower() in selected_groups
+        ]
+    return tuple(create_group() for _name, create_group in selected_factories)
 
 
 def run_formatter_group(group: FormatterGroup) -> FormatterResult:

@@ -6,6 +6,8 @@ policy from the root `AGENTS.md`.
 Keep this parent file compact. Put crate-specific rules in nested `AGENTS.md`
 files only when they are important enough to load automatically for that subtree.
 For background architecture, examples, and reference material, use README files.
+README files are not automatically loaded as agent guidance; operational editing
+policy that agents must see belongs in the closest scoped `AGENTS.md`.
 
 ## Scoped Policy
 
@@ -13,6 +15,9 @@ Known scoped instruction files include:
 
 - `core/AGENTS.md`: core runtime, model context, tool execution, evidence, and
   session flow.
+- `prompts/AGENTS.md`: model-visible prompt text and template rendering.
+- `protocol/AGENTS.md`: shared CLI/TUI/core/app-server protocol types and
+  compatibility contracts.
 - `shell-command/AGENTS.md`: shell command execution and environment handling.
 
 Do not assume other nested `AGENTS.md` files exist unless they are present in the
@@ -92,8 +97,8 @@ stay non-mutating unless the user explicitly asks for edits.
   paths, stop and compare the versions. Keep or add the better version for the
   requested behavior, integrate compatible improvements where practical, and
   continue without reverting unrelated work.
-- Prefer `SOURCE_MAP.md`, crate-local README files, Cargo workspace metadata, and
-  manifest entrypoints before hard-coded path heuristics.
+- Prefer `SOURCE_MAP.md` when present, crate-local README files, Cargo workspace
+  metadata, and manifest entrypoints before hard-coded path heuristics.
 - If the user says no tests, do not run Rust/Cargo/nextest test commands. Use
   relevant non-test checks and report skipped test commands.
 - Do not launch multiple normal Cargo/`just test`/`just fix` commands concurrently
@@ -142,11 +147,17 @@ Choose the smallest useful proof for the touched surface:
 
 - Focused Rust crate changes: use `just test-fast -p <crate>` or the closest
   focused recipe/test filter.
-- Config schema changes: run focused config/core validation and regenerate with
-  `just write-config-schema`.
+- Config schema changes: run focused config/core validation and
+  `just config-schema-check` by default. Use `just config-schema-check-force`
+  only when intentionally regenerating schema artifacts; use direct
+  `just write-config-schema` only when the owning workflow explicitly needs the
+  raw generator.
 - App-server protocol/schema changes: run focused app-server/app-server-protocol
-  validation and regenerate with `just write-app-server-schema` when the wire
-  contract changed.
+  validation and `just app-server-schema-check` by default. Use
+  `just app-server-schema-check-force` only when intentionally regenerating
+  schema artifacts for a wire contract change; use direct
+  `just write-app-server-schema` only when the owning workflow explicitly needs
+  the raw generator.
 - Dependency changes: run the relevant Rust check/test plus Bazel lock update/check
   recipes.
 - Formatting-only or docs-only changes: use `git diff --check` on touched files;

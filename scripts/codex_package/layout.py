@@ -1,6 +1,7 @@
 """Canonical Codex package directory layout."""
 
 import json
+import inspect
 import os
 import platform
 import shutil
@@ -55,11 +56,24 @@ def clean_managed_package_paths(package_dir: Path) -> None:
 def remove_tree_allow_readonly(path: Path) -> None:
     # Windows rmtree aborts on read-only files (e.g. git pack files); clear
     # the attribute and retry.
-    def _onexc(func, failed_path, _exc):
+    def _retry_after_chmod(func, failed_path):
         os.chmod(failed_path, stat.S_IWRITE)
         func(failed_path)
 
-    shutil.rmtree(path, onexc=_onexc)
+    def _onexc(func, failed_path, _exc):
+        _retry_after_chmod(func, failed_path)
+
+    def _onerror(func, failed_path, _exc_info):
+        _retry_after_chmod(func, failed_path)
+
+    if rmtree_supports_onexc():
+        shutil.rmtree(path, onexc=_onexc)
+    else:
+        shutil.rmtree(path, onerror=_onerror)
+
+
+def rmtree_supports_onexc() -> bool:
+    return "onexc" in inspect.signature(shutil.rmtree).parameters
 
 
 def build_package_dir(

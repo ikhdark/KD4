@@ -6,6 +6,17 @@ the root `AGENTS.md`.
 Keep this file focused on script editing, ownership, and validation. Put long
 background or usage examples in README files or script help text.
 
+## Scoped Policy
+
+Known scoped instruction files include:
+
+- `codex_package/AGENTS.md`: canonical package directory/archive builder for CLI
+  and app-server artifacts.
+- `install/AGENTS.md`: standalone shell and PowerShell installer entrypoints.
+
+Do not assume other nested `AGENTS.md` files exist unless they are present in the
+working tree.
+
 ## Ownership
 
 - Python utilities own repository maintenance, package staging, README/table
@@ -30,8 +41,10 @@ background or usage examples in README files or script help text.
   `cargo-lane-trash-cleanup.ps1`, `rust_build_status.py`, `common-rust-env.ps1`,
   `invoke-rust-perf-env.ps1`, `sccache-perf.ps1`.
 - Package assembly and npm staging: `build_codex_package.py`,
-  `stage_npm_packages.py`, `codex_package/`.
-- Platform install flows: `install/install.sh`, `install/install.ps1`.
+  `stage_npm_packages.py`, `codex_package/`; read
+  `codex_package/AGENTS.md` for package-contract work.
+- Platform install flows: `install/install.sh`, `install/install.ps1`; read
+  `install/AGENTS.md` for installer-contract work.
 - Root maintenance commands: `root_maintenance.py`, synchronized with root
   `package.json` script names.
 - Repository checks: `format.py`, `asciicheck.py`, `readme_toc.py`,

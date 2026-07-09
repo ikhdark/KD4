@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 from shutil import which
 import signal
 import subprocess
@@ -33,6 +34,21 @@ VERIFY_LOCAL_CONTROL_PATHS = {
     "justfile",
     "scripts/verify_local_rules.toml",
 }
+POWERSHELL_PARSE_SCRIPT = (
+    "& { "
+    "param($path) "
+    "$tokens = $null; "
+    "$errors = $null; "
+    "$resolved = (Resolve-Path -LiteralPath $path).Path; "
+    "[System.Management.Automation.Language.Parser]::ParseFile("
+    "$resolved, [ref]$tokens, [ref]$errors) > $null; "
+    "if ($errors.Count -gt 0) { "
+    "$errors | ForEach-Object { Write-Error $_ }; "
+    "exit 1 "
+    "}"
+    " }"
+)
+BASH_PARSE_SCRIPT_TEMPLATE = "set -o pipefail; sed 's/\\r$//' {path} | bash -n"
 
 VERIFIED = "VERIFIED"
 VERIFIED_NO_PROOF = "VERIFIED (no proof needed)"
@@ -404,6 +420,14 @@ def stable_unique(paths: Iterable[Path]) -> list[Path]:
             seen.add(key)
             result.append(path)
     return result
+
+
+def path_id(path: Path) -> str:
+    return "".join(ch if ch.isalnum() else "-" for ch in path.as_posix()).strip("-")
+
+
+def bash_parse_script(path: Path) -> str:
+    return BASH_PARSE_SCRIPT_TEMPLATE.format(path=shlex.quote(path.as_posix()))
 
 
 def git_name_list(args: Sequence[str]) -> list[Path]:
@@ -990,6 +1014,22 @@ def script_paths(scope: Scope) -> list[Path]:
     ]
 
 
+def powershell_script_paths(scope: Scope) -> list[Path]:
+    return [
+        path
+        for path in scope.active_files
+        if path.parts and path.parts[0] == "scripts" and path.suffix == ".ps1"
+    ]
+
+
+def shell_script_paths(scope: Scope) -> list[Path]:
+    return [
+        path
+        for path in scope.active_files
+        if path.parts and path.parts[0] == "scripts" and path.suffix == ".sh"
+    ]
+
+
 def verify_local_control_paths(scope: Scope) -> list[Path]:
     return [
         path
@@ -1014,13 +1054,41 @@ def script_validation_commands(scope: Scope) -> list[CommandSpec]:
     from scripts.root_maintenance import test_module_for_changed_path
 
     paths = script_paths(scope)
+    ps_paths = powershell_script_paths(scope)
+    sh_paths = shell_script_paths(scope)
     control_paths = verify_local_control_paths(scope)
-    if not paths and not control_paths:
+    if not paths and not ps_paths and not sh_paths and not control_paths:
         return []
     changed_args: list[str] = []
     for path in paths:
         changed_args.extend(["--changed", path.as_posix()])
     commands: list[CommandSpec] = []
+    for path in ps_paths:
+        commands.append(
+            CommandSpec(
+                id=f"script-syntax:powershell:{path_id(path)}",
+                kind="script_syntax",
+                args=(
+                    "pwsh",
+                    "-NoProfile",
+                    "-Command",
+                    POWERSHELL_PARSE_SCRIPT,
+                    path.as_posix(),
+                ),
+                timeout=TIMEOUTS["script"],
+                reason="PowerShell script parse check",
+            )
+        )
+    for path in sh_paths:
+        commands.append(
+            CommandSpec(
+                id=f"script-syntax:shell:{path_id(path)}",
+                kind="script_syntax",
+                args=("bash", "-lc", bash_parse_script(path)),
+                timeout=TIMEOUTS["script"],
+                reason="shell script parse check",
+            )
+        )
     if paths:
         commands.append(
             CommandSpec(

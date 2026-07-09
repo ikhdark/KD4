@@ -69,6 +69,27 @@ class CopyFileForStagingTest(unittest.TestCase):
             self.assertFalse((package_dir / "codex-package.json").exists())
             self.assertTrue(keep.is_file())
 
+    def test_remove_tree_uses_onerror_on_python_without_onexc(self) -> None:
+        path = Path("package")
+
+        with (
+            mock.patch.object(layout, "rmtree_supports_onexc", return_value=False),
+            mock.patch.object(layout.shutil, "rmtree") as rmtree,
+            mock.patch.object(layout.os, "chmod") as chmod,
+        ):
+            layout.remove_tree_allow_readonly(path)
+            rmtree.assert_called_once()
+            self.assertEqual(rmtree.call_args.args, (path,))
+            self.assertNotIn("onexc", rmtree.call_args.kwargs)
+            onerror = rmtree.call_args.kwargs["onerror"]
+            retry = mock.Mock()
+            failed_path = Path("readonly")
+
+            onerror(retry, failed_path, (PermissionError, PermissionError(), None))
+
+            chmod.assert_called_once_with(failed_path, layout.stat.S_IWRITE)
+            retry.assert_called_once_with(failed_path)
+
     def test_package_layout_prefers_hardlink_for_ripgrep(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

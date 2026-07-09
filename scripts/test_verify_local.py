@@ -497,6 +497,37 @@ class VerifyLocalPlannerTest(unittest.TestCase):
             ),
         )
 
+    def test_script_scope_adds_powershell_and_shell_syntax_validation(self) -> None:
+        changed = [
+            Path("scripts/publish-local-codex.ps1"),
+            Path("scripts/start-codex-exec.sh"),
+        ]
+        scope = self.v.build_scope(
+            "script-syntax", "changed", changed, changed, self.graph, []
+        )
+
+        plan = self.v.plan_commands(args(fast=True, plan=False), scope, [])
+
+        commands = {command.id: command.args for command in plan.commands}
+        self.assertEqual(
+            commands["script-syntax:powershell:scripts-publish-local-codex-ps1"],
+            (
+                "pwsh",
+                "-NoProfile",
+                "-Command",
+                self.v.POWERSHELL_PARSE_SCRIPT,
+                "scripts/publish-local-codex.ps1",
+            ),
+        )
+        self.assertEqual(
+            commands["script-syntax:shell:scripts-start-codex-exec-sh"],
+            (
+                "bash",
+                "-lc",
+                self.v.bash_parse_script(Path("scripts/start-codex-exec.sh")),
+            ),
+        )
+
     def test_verify_local_rules_change_runs_router_tests(self) -> None:
         changed = [Path("scripts/verify_local_rules.toml")]
         scope = self.v.build_scope("rules", "changed", changed, changed, self.graph, [])

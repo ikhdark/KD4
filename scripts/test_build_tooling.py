@@ -590,9 +590,9 @@ class BuildToolingTest(unittest.TestCase):
 
     def test_default_test_recipe_uses_upstream_nextest_defaults(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
-        nextest = (
-            REPO_ROOT / "codex-rs" / ".config" / "nextest.toml"
-        ).read_text(encoding="utf-8")
+        nextest = (REPO_ROOT / "codex-rs" / ".config" / "nextest.toml").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn(
             "RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast",
@@ -602,7 +602,7 @@ class BuildToolingTest(unittest.TestCase):
             '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast',
             justfile,
         )
-        self.assertIn("[profile.fast]\ninherits = \"local\"", nextest)
+        self.assertIn('[profile.fast]\ninherits = "local"', nextest)
         self.assertIn("retries = 0", nextest)
         self.assertIn(
             "RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=fast cargo nextest run",
@@ -687,6 +687,21 @@ class BuildToolingTest(unittest.TestCase):
         self.assertIn("docs/*.md", command.args)
         self.assertIn("codex-cli/**/*.js", command.args)
         self.assertIn("sdk/typescript/**/*.ts", command.args)
+
+    def test_formatter_only_constructs_selected_group_lazily(self) -> None:
+        format_script = load_format_module()
+
+        with mock.patch.object(
+            format_script,
+            "buildifier_formatter_group",
+            side_effect=AssertionError("buildifier should not be constructed"),
+        ):
+            groups = format_script.formatter_groups(
+                check=True,
+                selected_groups={"python scripts"},
+            )
+
+        self.assertEqual([group.name for group in groups], ["Python scripts"])
 
     def test_ci_formatter_jobs_install_and_use_pinned_nightly_rustfmt(self) -> None:
         workflow_paths = [
@@ -982,6 +997,37 @@ class BuildToolingTest(unittest.TestCase):
             root_maintenance.test_module_for_changed_path("docs/example.md"),
             None,
         )
+
+    def test_root_maintenance_uv_commands_use_frozen_lock(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+        calls: list[tuple[str, ...]] = []
+
+        def fake_run(command: list[str]) -> int:
+            calls.append(tuple(command))
+            return 0
+
+        with mock.patch.object(root_maintenance, "run", side_effect=fake_run):
+            self.assertEqual(
+                root_maintenance.main(
+                    ["format-python", "--changed", "scripts/verify_local.py"]
+                ),
+                0,
+            )
+            self.assertEqual(
+                root_maintenance.main(
+                    ["lint-python", "--changed", "scripts/verify_local.py"]
+                ),
+                0,
+            )
+            self.assertEqual(
+                root_maintenance.main(
+                    ["test-python", "--module", "scripts.test_verify_local"]
+                ),
+                0,
+            )
+
+        for command in calls:
+            self.assertEqual(command[:4], ("uv", "run", "--frozen", "--project"))
 
     def test_codex_cli_launcher_parses_under_node(self) -> None:
         node = shutil.which("node")
