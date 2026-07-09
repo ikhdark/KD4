@@ -13,6 +13,160 @@ Purpose:
   Identify KD2 changes that are worth porting into the newer upstream-based fork,
   while avoiding older KD2 rollbacks that would overwrite better v0.143.0 code.
 
+Follow-up status on KD4 main, 2026-07-09
+---------------------------------------
+- PORT #1, Local runtime provenance, local watermark, and publish/build doctor:
+  covered by current KD4. The protocol-visible initialize metadata and server
+  info structs are already present, and KD4 has fork-local improvements beyond
+  KD2: default LOCAL-KD publish target discovery, pnpm install-method labeling,
+  newer doctor auth handling, remote MCP stdio checks, and current WebSocket
+  reachability wiring. Do not port KD2's older doctor/runtime files over current
+  KD4.
+
+  Confirmed current KD4 paths:
+    codex-rs/build_info.rs
+    codex-rs/app-server/src/build_info.rs
+    codex-rs/app-server/src/runtime_provenance.rs
+    codex-rs/app-server/src/local_watermark.rs
+    codex-rs/app-server/src/request_processors/initialize_processor.rs
+    codex-rs/app-server-protocol/src/protocol/server_info.rs
+    codex-rs/app-server-protocol/src/protocol/v1.rs
+    codex-rs/cli/src/build_info.rs
+    codex-rs/cli/src/doctor.rs
+    codex-rs/cli/src/doctor/runtime.rs
+    codex-rs/cli/src/doctor/git.rs
+    codex-rs/cli/src/doctor/output/detail.rs
+
+  Inspection result:
+    app-server-protocol/src/protocol/server_info.rs is equivalent to KD2
+    app-server-protocol/src/protocol/v1.rs is equivalent to KD2 for the
+      buildInfo/runtimeInfo/localWatermark initialize response fields
+    KD4 runtime_provenance/local_watermark/doctor files should be kept because
+      their differences are current-fork improvements rather than regressions
+
+- PORT #2, Enterprise/custom CA HTTP and WebSocket transport:
+  covered by current KD4. KD4 has the KD2 custom CA behavior in the newer
+  codex-rs/http-client crate, plus newer WebSocket wiring through
+  codex-rs/websocket-client. Do not port KD2's older codex-client/codex-api
+  transport files over current KD4. This pass also routed local MCP OAuth
+  discovery/status call sites through the shared ReqwestHttpClient so custom CA
+  handling reaches the default MCP OAuth support path.
+
+  Confirmed current KD4 paths:
+    codex-rs/http-client/src/custom_ca.rs
+    codex-rs/http-client/src/lib.rs
+    codex-rs/http-client/tests/ca_env.rs
+    codex-rs/http-client/src/bin/custom_ca_probe.rs
+    codex-rs/websocket-client/src/lib.rs
+    codex-rs/websocket-client/src/dialer.rs
+    codex-rs/codex-api/src/endpoint/responses_websocket.rs
+    codex-rs/codex-api/src/endpoint/realtime_websocket/methods.rs
+    codex-rs/backend-client/src/client.rs
+    codex-rs/codex-api/src/files.rs
+    codex-rs/cloud-tasks/src/env_detect.rs
+    codex-rs/exec-server/src/client/reqwest_http_client.rs
+    codex-rs/login/src/auth/default_client.rs
+    codex-rs/codex-mcp/src/mcp/auth.rs
+    codex-rs/cli/src/mcp_cmd.rs
+    codex-rs/app-server/src/request_processors/plugins.rs
+    codex-rs/core/src/mcp_skill_dependencies.rs
+
+  Validation run:
+    cargo test -p codex-http-client --test ca_env
+    cargo test -p codex-websocket-client
+    cargo check -p codex-websocket-client -p codex-api -p codex-backend-client -p codex-exec-server -p codex-mcp -p codex-cli -p codex-app-server -p codex-core
+    cargo check -p codex-mcp -p codex-cli -p codex-app-server -p codex-core
+    cargo test -p codex-mcp
+
+- PORT #3, Source discovery, source evidence, and path-aware search tools:
+  confirmed still missing from current KD4. KD2 has real code here, but it is
+  not a narrow file copy. The KD2 source tools depend on KD2-only support modules
+  and protocol/config pieces:
+    codex-rs/core/src/tools/handlers/source.rs
+    codex-rs/core/src/tools/handlers/source_spec.rs
+    codex-rs/core/src/source_evidence.rs
+    codex-rs/core/src/path_aware_search.rs
+    codex-rs/core/src/discovery_ledger.rs
+    codex-rs/core/src/turn_route.rs
+    codex-rs/core/src/workspace_index.rs
+    codex-rs/core/src/repo_guidance_evidence.rs
+    codex-rs/core/src/context/repo_guidance_evidence.rs
+    codex-rs/core/tests/suite/repo_guidance_evidence.rs
+    codex-rs/file-search/src/source_search.rs
+    codex-rs/file-search/src/source_routes.rs
+    codex-rs/file-search/src/source_search_main.rs
+    codex-rs/features/src/lib.rs
+    codex-rs/protocol/src/source_citation.rs
+    codex-rs/config/src/coding_budgets.rs
+
+  Current KD4 lacks the source-tool modules, protocol citation type, source
+  budget constants, source-search file-search binary/module, and the KD2
+  SourceTools feature gate. Stage this separately as a model-visible runtime
+  change: first port or recreate the supporting protocol/types and bounded
+  handler contracts, then wire tool registration, then validate registration,
+  path normalization, bounded reads/searches, ranking, output shape, and
+  code-mode/tool-search visibility.
+
+- PORT #4, verify_local validation tool and local verifier routing:
+  partially covered in current KD4. The repo-local script layer is already here,
+  and KD4's script version is newer than KD2's because it adds PowerShell and
+  shell script syntax validation. Keep KD4's script layer; do not overwrite it
+  with KD2.
+
+  Confirmed current KD4 paths:
+    scripts/verify_local.py
+    scripts/verify_local_rules.toml
+    scripts/test_verify_local.py
+
+  Still missing from current KD4:
+    codex-rs/core/src/tools/handlers/verify_local.rs
+    codex-rs/core/src/tools/handlers/verify_local_spec.rs
+    codex-rs/core/src/tools/handlers/verify_local_tests.rs
+    codex-rs/core/src/tools/handlers/verify_local_spec_tests.rs
+    core tool registration in codex-rs/core/src/tools/spec_plan.rs
+    proof-bearing session-memory recording from verify_local results
+
+  Validation run:
+    python -m unittest scripts.test_verify_local
+
+  Next safe stage:
+    Port the core verify_local tool separately, using current KD4's existing
+    scripts as the source of truth. Do not port KD2's session-memory integration
+    in the same patch unless session memory is being ported too.
+
+- PORT #5, Command preflight diagnostics, command shape, and PowerShell guidance:
+  partially covered in current KD4. The PowerShell wrapper scripts already match
+  KD2, and current codex-rs/shell-command already has PowerShell parsing/safety
+  tests. KD4 is missing the model-visible command-shape and preflight layer that
+  KD2 added to the core shell tools.
+
+  Confirmed current KD4 paths that should be kept:
+    scripts/run-powershell-script.ps1
+    scripts/test_run_powershell_script.py
+    codex-rs/shell-command/src/powershell.rs
+    codex-rs/shell-command/src/command_safety/powershell_parser.rs
+
+  Still missing from current KD4:
+    codex-rs/core/src/tools/handlers/command_shape.rs
+    codex-rs/core/src/tools/handlers/command_shape_tests.rs
+    codex-rs/core/src/tools/handlers/command_preflight.rs
+    codex-rs/core/src/tools/handlers/command_preflight_tests.rs
+    command_shape integration in codex-rs/core/src/tools/handlers/unified_exec.rs
+    preflight rejection/advisory integration in
+      codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
+    schema fields for kind/program/args/script_body in
+      codex-rs/core/src/tools/handlers/shell_spec.rs
+
+  Validation run:
+    cargo test -p codex-shell-command powershell
+
+  Next safe stage:
+    Do not copy KD2's unified_exec files over KD4; KD4 has newer environment,
+    remote-path, sandbox, and process-id behavior there. Recreate the command
+    shape/preflight layer against current KD4 entrypoints, with focused tests for
+    schema shape, argv mode, powershell_script mode, and rejected unsafe command
+    forms.
+
 Method and coverage
 -------------------
 - Compared both complete codex-rs trees, excluding .git, target, and vendor.

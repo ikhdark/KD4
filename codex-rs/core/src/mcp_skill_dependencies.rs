@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use codex_config::ConfigEditsBuilder;
 use codex_config::McpServerConfig;
 use codex_config::McpServerTransportConfig;
 use codex_config::load_global_mcp_servers;
+use codex_exec_server::ReqwestHttpClient;
 use codex_login::default_client::is_first_party_originator;
 use codex_login::default_client::originator;
 use codex_protocol::request_user_input::RequestUserInputArgs;
@@ -23,7 +25,7 @@ use codex_mcp::ElicitationReviewerHandle;
 use codex_mcp::McpOAuthLoginSupport;
 use codex_mcp::McpPermissionPromptAutoApproveContext;
 use codex_mcp::mcp_permission_prompt_is_auto_approved;
-use codex_mcp::oauth_login_support;
+use codex_mcp::oauth_login_support_with_http_client;
 use codex_mcp::resolve_oauth_scopes;
 use codex_mcp::should_retry_without_scopes;
 
@@ -133,7 +135,12 @@ pub(crate) async fn maybe_install_mcp_dependencies(
     }
 
     for (name, server_config) in added {
-        let oauth_config = match oauth_login_support(&server_config.transport).await {
+        let oauth_config = match oauth_login_support_with_http_client(
+            &server_config.transport,
+            Arc::new(ReqwestHttpClient),
+        )
+        .await
+        {
             McpOAuthLoginSupport::Supported(config) => config,
             McpOAuthLoginSupport::Unsupported => continue,
             McpOAuthLoginSupport::Unknown(err) => {

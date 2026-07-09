@@ -19,13 +19,14 @@ use codex_core::config::find_codex_home;
 use codex_core::config::load_global_mcp_servers;
 use codex_core_plugins::PluginsManager;
 use codex_exec_server::EnvironmentManager;
+use codex_exec_server::ReqwestHttpClient;
 use codex_login::AuthManager;
 use codex_mcp::McpOAuthLoginSupport;
 use codex_mcp::McpRuntimeContext;
 use codex_mcp::ResolvedMcpOAuthScopes;
 use codex_mcp::compute_auth_statuses;
 use codex_mcp::discover_supported_scopes;
-use codex_mcp::oauth_login_support;
+use codex_mcp::oauth_login_support_with_http_client;
 use codex_mcp::resolve_oauth_scopes;
 use codex_mcp::should_retry_without_scopes;
 use codex_protocol::protocol::McpAuthStatus;
@@ -379,7 +380,7 @@ async fn run_add(config_overrides: &CliConfigOverrides, add_args: AddArgs) -> Re
 
     println!("Added global MCP server '{name}'.");
 
-    match oauth_login_support(&transport).await {
+    match oauth_login_support_with_http_client(&transport, Arc::new(ReqwestHttpClient)).await {
         McpOAuthLoginSupport::Supported(oauth_config) => {
             println!("Detected OAuth support. Starting OAuth flow…");
             let resolved_scopes = resolve_oauth_scopes(
