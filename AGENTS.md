@@ -1,8 +1,14 @@
 # KD4 fork policy
 
-This checkout is the user's local fork of OpenAI Codex at
-`C:\Users\kuh\Desktop\kd4`. Treat work here as fork-local unless the user
-explicitly asks for upstream, product-facing, or distribution-ready changes.
+This checkout is the user's local fork of
+[`openai/codex`](https://github.com/openai/codex) at
+`C:\Users\kuh\Desktop\kd4`. Its home repository is
+[`ikhdark/KD4`](https://github.com/ikhdark/KD4).
+
+KD4 is intended to be a modified version of Codex for the user's own
+improvements, experiments, local workflows, and fork-specific tooling. Treat
+work here as fork-local unless the user explicitly asks for upstream,
+product-facing, or distribution-ready changes.
 
 The standing objective is to improve, audit, and optimize this checkout while
 keeping changes reviewable, local-build focused, and easy to validate.
