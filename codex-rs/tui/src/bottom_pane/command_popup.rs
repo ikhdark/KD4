@@ -321,21 +321,6 @@ mod tests {
     }
 
     #[test]
-    fn selecting_ideas_by_exact_match() {
-        let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
-        popup.on_composer_text_change("/ideas".to_string());
-
-        let selected = popup.selected_item();
-        match selected {
-            Some(CommandItem::Builtin(cmd)) => assert_eq!(cmd.command(), "ideas"),
-            Some(CommandItem::ServiceTier(command)) => {
-                panic!("expected ideas command, got service tier {command:?}")
-            }
-            None => panic!("expected a selected command for exact match"),
-        }
-    }
-
-    #[test]
     fn model_is_first_suggestion_for_mo() {
         let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
         popup.on_composer_text_change("/mo".to_string());

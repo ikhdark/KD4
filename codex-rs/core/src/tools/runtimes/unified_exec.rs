@@ -62,7 +62,7 @@ use tracing::error;
 #[derive(Clone, Debug)]
 pub struct UnifiedExecRequest {
     pub command: Vec<String>,
-    pub shell_type: Option<ShellType>,
+    pub shell_type: ShellType,
     pub hook_command: String,
     pub process_id: i32,
     pub cwd: PathUri,
@@ -363,7 +363,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
         };
         #[cfg(not(unix))]
         let runtime_path_prepends = RuntimePathPrepends::default();
-        let command = if environment_is_remote || req.shell_type.is_none() {
+        let command = if environment_is_remote {
             base_command.to_vec()
         } else {
             maybe_wrap_shell_lc_with_snapshot(
@@ -377,11 +377,11 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
         };
         let command = disable_powershell_profile_for_elevated_windows_sandbox(
             &command,
-            req.shell_type.as_ref(),
+            Some(&req.shell_type),
             attempt.sandbox,
             attempt.windows_sandbox_level,
         );
-        let command = if matches!(req.shell_type, Some(ShellType::PowerShell)) {
+        let command = if matches!(req.shell_type, ShellType::PowerShell) {
             prefix_powershell_script_with_utf8(&command)
         } else {
             command
@@ -561,7 +561,7 @@ mod tests {
         let runtime = UnifiedExecRuntime::new(&manager, UnifiedExecShellMode::Direct);
         let request = UnifiedExecRequest {
             command: vec!["pwd".to_string()],
-            shell_type: Some(ShellType::Sh),
+            shell_type: ShellType::Sh,
             hook_command: "pwd".to_string(),
             process_id: 1000,
             cwd: cwd.into(),
@@ -663,7 +663,7 @@ mod tests {
             .expect("current dir is absolute");
         UnifiedExecRequest {
             command: vec!["zsh".to_string(), "-c".to_string(), "echo hi".to_string()],
-            shell_type: Some(ShellType::Zsh),
+            shell_type: ShellType::Zsh,
             hook_command: "echo hi".to_string(),
             process_id: 1000,
             cwd: cwd.clone().into(),

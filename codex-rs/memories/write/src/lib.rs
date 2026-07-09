@@ -6,7 +6,6 @@
 
 mod control;
 mod extensions;
-mod generated_files;
 mod guard;
 mod metrics;
 mod phase1;

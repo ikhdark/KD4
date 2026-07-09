@@ -3,7 +3,6 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
-use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
@@ -128,7 +127,6 @@ pub(crate) async fn emit_exec_command_begin(
 pub(crate) enum ToolEmitter {
     Shell {
         command: Vec<String>,
-        display_command: Option<String>,
         cwd: PathUri,
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
@@ -140,7 +138,6 @@ pub(crate) enum ToolEmitter {
     },
     UnifiedExec {
         command: Vec<String>,
-        display_command: Option<String>,
         cwd: PathUri,
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
@@ -149,21 +146,10 @@ pub(crate) enum ToolEmitter {
 }
 
 impl ToolEmitter {
-    #[allow(dead_code)]
     pub fn shell(command: Vec<String>, cwd: AbsolutePathBuf, source: ExecCommandSource) -> Self {
-        Self::shell_with_display_command(command, None, cwd, source)
-    }
-
-    pub fn shell_with_display_command(
-        command: Vec<String>,
-        display_command: Option<String>,
-        cwd: AbsolutePathBuf,
-        source: ExecCommandSource,
-    ) -> Self {
         let parsed_cmd = parse_command(&command);
         Self::Shell {
             command,
-            display_command,
             cwd: PathUri::from_abs_path(&cwd),
             source,
             parsed_cmd,
@@ -182,9 +168,8 @@ impl ToolEmitter {
         }
     }
 
-    pub fn unified_exec_with_display_command(
+    pub fn unified_exec(
         command: &[String],
-        display_command: Option<String>,
         cwd: PathUri,
         source: ExecCommandSource,
         process_id: Option<String>,
@@ -192,7 +177,6 @@ impl ToolEmitter {
         let parsed_cmd = parse_command(command);
         Self::UnifiedExec {
             command: command.to_vec(),
-            display_command,
             cwd,
             source,
             parsed_cmd,
@@ -205,7 +189,6 @@ impl ToolEmitter {
             (
                 Self::Shell {
                     command,
-                    display_command,
                     cwd,
                     source,
                     parsed_cmd,
@@ -216,13 +199,8 @@ impl ToolEmitter {
                 emit_exec_stage(
                     ctx,
                     ExecCommandInput::new(
-                        command,
-                        cwd,
-                        parsed_cmd,
-                        *source,
-                        /*interaction_input*/ None,
+                        command, cwd, parsed_cmd, *source, /*interaction_input*/ None,
                         /*process_id*/ None,
-                        display_command.as_deref(),
                     ),
                     stage,
                 )
@@ -340,7 +318,6 @@ impl ToolEmitter {
             (
                 Self::UnifiedExec {
                     command,
-                    display_command,
                     cwd,
                     source,
                     parsed_cmd,
@@ -357,7 +334,6 @@ impl ToolEmitter {
                         *source,
                         /*interaction_input*/ None,
                         process_id.as_deref(),
-                        display_command.as_deref(),
                     ),
                     stage,
                 )
@@ -466,7 +442,6 @@ struct ExecCommandInput<'a> {
     source: ExecCommandSource,
     interaction_input: Option<&'a str>,
     process_id: Option<&'a str>,
-    display_command: Option<&'a str>,
 }
 
 impl<'a> ExecCommandInput<'a> {
@@ -477,7 +452,6 @@ impl<'a> ExecCommandInput<'a> {
         source: ExecCommandSource,
         interaction_input: Option<&'a str>,
         process_id: Option<&'a str>,
-        display_command: Option<&'a str>,
     ) -> Self {
         Self {
             command,
@@ -486,7 +460,6 @@ impl<'a> ExecCommandInput<'a> {
             source,
             interaction_input,
             process_id,
-            display_command,
         }
     }
 }
@@ -499,7 +472,6 @@ struct ExecCommandResult {
     duration: Duration,
     formatted_output: String,
     status: ExecCommandStatus,
-    timed_out: bool,
 }
 
 async fn emit_exec_stage(
@@ -509,15 +481,9 @@ async fn emit_exec_stage(
 ) {
     match stage {
         ToolEventStage::Begin => {
-            let display_command = exec_input
-                .display_command
-                .map(|command| command.to_string());
-            let command = display_command
-                .as_ref()
-                .map_or(exec_input.command, |command| std::slice::from_ref(command));
             emit_exec_command_begin(
                 ctx,
-                command,
+                exec_input.command,
                 exec_input.cwd,
                 exec_input.parsed_cmd,
                 exec_input.source,
@@ -543,7 +509,6 @@ async fn emit_exec_stage(
                 } else {
                     ExecCommandStatus::Failed
                 },
-                timed_out: output.timed_out,
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
         }
@@ -557,7 +522,6 @@ async fn emit_exec_stage(
                 duration: Duration::ZERO,
                 formatted_output: text,
                 status: ExecCommandStatus::Failed,
-                timed_out: false,
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
         }
@@ -571,7 +535,6 @@ async fn emit_exec_stage(
                 duration: Duration::ZERO,
                 formatted_output: text,
                 status: ExecCommandStatus::Declined,
-                timed_out: false,
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
         }
@@ -583,25 +546,6 @@ async fn emit_exec_end(
     exec_input: ExecCommandInput<'_>,
     exec_result: ExecCommandResult,
 ) {
-    if let Some(tracker) = ctx.turn_diff_tracker {
-        let command_for_validation = exec_input
-            .display_command
-            .map(|command| vec![command.to_string()])
-            .unwrap_or_else(|| exec_input.command.to_vec());
-        let mut tracker = tracker.lock().await;
-        if exec_result.exit_code == 0
-            && !exec_result.timed_out
-            && TurnDiffTracker::command_looks_like_mutating(&command_for_validation)
-        {
-            tracker.record_unknown_mutation();
-        }
-        tracker.record_exec_command_end(
-            &command_for_validation,
-            exec_result.exit_code,
-            exec_result.timed_out,
-        );
-    }
-
     ctx.session
         .emit_turn_item_completed(
             ctx.turn,
@@ -684,7 +628,6 @@ mod tests {
     use super::*;
     use crate::session::tests::make_session_and_context_with_dynamic_tools_and_rx;
     use crate::turn_diff_tracker::TurnDiffTracker;
-    use crate::turn_diff_tracker::ValidationFreshnessStatus;
     use codex_exec_server::LOCAL_FS;
     use codex_protocol::error::CodexErr;
     use codex_protocol::error::SandboxErr;
@@ -780,144 +723,6 @@ mod tests {
             PatchApplyStatus::Declined,
         )
         .await;
-    }
-
-    #[tokio::test]
-    async fn shell_validation_tracker_uses_display_command_not_encoded_transport() {
-        let (session, turn, _rx_event) =
-            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-        let dir = tempdir().expect("tempdir");
-        let cwd = AbsolutePathBuf::from_absolute_path(dir.path()).expect("absolute cwd");
-        let transport_command = vec![
-            "pwsh".to_string(),
-            "-NoLogo".to_string(),
-            "-EncodedCommand".to_string(),
-            "YwBhAHIAZwBvACAAdABlAHMAdAA=".to_string(),
-        ];
-
-        ToolEmitter::shell_with_display_command(
-            transport_command,
-            Some("cargo test".to_string()),
-            cwd,
-            ExecCommandSource::Agent,
-        )
-        .finish(
-            ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", Some(&tracker)),
-            Ok(ExecToolCallOutput::default()),
-            None,
-        )
-        .await
-        .expect("successful command");
-
-        assert_eq!(
-            tracker.lock().await.validation_freshness_status(),
-            ValidationFreshnessStatus::PassedAfterLastMutation
-        );
-    }
-
-    #[tokio::test]
-    async fn unified_exec_validation_tracker_uses_display_command_not_encoded_transport() {
-        let (session, turn, _rx_event) =
-            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-        let dir = tempdir().expect("tempdir");
-        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute cwd");
-        let transport_command = vec![
-            "pwsh".to_string(),
-            "-NoLogo".to_string(),
-            "-EncodedCommand".to_string(),
-            "YwBhAHIAZwBvACAAYwBoAGUAYwBrAA==".to_string(),
-        ];
-
-        ToolEmitter::unified_exec_with_display_command(
-            &transport_command,
-            Some("cargo check".to_string()),
-            cwd,
-            ExecCommandSource::UnifiedExecStartup,
-            Some("proc-1".to_string()),
-        )
-        .finish(
-            ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", Some(&tracker)),
-            Ok(ExecToolCallOutput::default()),
-            None,
-        )
-        .await
-        .expect("successful command");
-
-        assert_eq!(
-            tracker.lock().await.validation_freshness_status(),
-            ValidationFreshnessStatus::PassedAfterLastMutation
-        );
-    }
-
-    #[tokio::test]
-    async fn formatter_command_opens_format_only_validation_gap() {
-        let (session, turn, _rx_event) =
-            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-        let dir = tempdir().expect("tempdir");
-        let cwd = AbsolutePathBuf::from_absolute_path(dir.path()).expect("absolute cwd");
-
-        ToolEmitter::shell_with_display_command(
-            vec!["cargo".to_string(), "fmt".to_string()],
-            None,
-            cwd,
-            ExecCommandSource::Agent,
-        )
-        .finish(
-            ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", Some(&tracker)),
-            Ok(ExecToolCallOutput::default()),
-            None,
-        )
-        .await
-        .expect("successful command");
-
-        let tracker = tracker.lock().await;
-        assert!(tracker.has_unvalidated_mutation());
-        assert_eq!(
-            tracker.validation_freshness_status(),
-            ValidationFreshnessStatus::FormatOnly
-        );
-    }
-
-    #[tokio::test]
-    async fn unified_exec_begin_event_uses_display_command_not_encoded_transport() {
-        let (session, turn, rx_event) =
-            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
-        let dir = tempdir().expect("tempdir");
-        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute cwd");
-        let transport_command = vec![
-            "pwsh".to_string(),
-            "-NoLogo".to_string(),
-            "-EncodedCommand".to_string(),
-            "RwBlAHQALQBDAGgAaQBsAGQASQB0AGUAbQA=".to_string(),
-        ];
-
-        ToolEmitter::unified_exec_with_display_command(
-            &transport_command,
-            Some("Get-ChildItem".to_string()),
-            cwd,
-            ExecCommandSource::UnifiedExecStartup,
-            Some("proc-1".to_string()),
-        )
-        .begin(ToolEventCtx::new(
-            session.as_ref(),
-            turn.as_ref(),
-            "call-id",
-            Some(&tracker),
-        ))
-        .await;
-
-        let started = rx_event.recv().await.expect("item started event");
-        let EventMsg::ItemStarted(started) = started.msg else {
-            panic!("expected item started event");
-        };
-        let TurnItem::CommandExecution(item) = started.item else {
-            panic!("expected command execution item");
-        };
-        assert_eq!(item.command, vec!["Get-ChildItem".to_string()]);
     }
 
     #[tokio::test]

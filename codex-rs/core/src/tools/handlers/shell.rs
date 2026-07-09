@@ -16,7 +16,6 @@ use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
-use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
@@ -42,19 +41,7 @@ fn shell_command_payload_command(payload: &ToolPayload) -> Option<String> {
 
     parse_arguments::<ShellCommandToolCallParams>(arguments)
         .ok()
-        .and_then(|params| {
-            CommandInvocation::from_parts(
-                "shell_command",
-                "command",
-                params.command.as_deref(),
-                params.kind.as_deref(),
-                params.program.as_deref(),
-                params.args.as_deref(),
-                params.script_body.as_deref(),
-            )
-            .ok()
-            .map(|command| command.display_command())
-        })
+        .map(|params| params.command)
 }
 
 struct RunExecLikeArgs {
@@ -62,7 +49,6 @@ struct RunExecLikeArgs {
     exec_params: ExecParams,
     cancellation_token: CancellationToken,
     hook_command: String,
-    safety_command: Vec<String>,
     shell_type: Option<ShellType>,
     additional_permissions: Option<AdditionalPermissionProfile>,
     prefix_rule: Option<Vec<String>>,
@@ -80,7 +66,6 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         exec_params,
         cancellation_token,
         hook_command,
-        safety_command,
         shell_type,
         additional_permissions,
         prefix_rule,
@@ -171,13 +156,13 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
     }
 
     let source = ExecCommandSource::Agent;
-    let emitter = ToolEmitter::shell_with_display_command(
-        exec_params.command.clone(),
-        Some(hook_command.clone()),
-        exec_params.cwd.clone(),
-        source,
+    let emitter = ToolEmitter::shell(exec_params.command.clone(), exec_params.cwd.clone(), source);
+    let event_ctx = ToolEventCtx::new(
+        session.as_ref(),
+        turn.as_ref(),
+        &call_id,
+        /*turn_diff_tracker*/ None,
     );
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, Some(&tracker));
     emitter.begin(event_ctx).await;
 
     let exec_approval_requirement = session
@@ -185,7 +170,6 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         .exec_policy
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &exec_params.command,
-            command_for_safety: Some(&safety_command),
             approval_policy: turn.approval_policy.value(),
             permission_profile: turn.permission_profile(),
             windows_sandbox_level: turn.windows_sandbox_level,
@@ -235,7 +219,12 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         )
         .await
         .map(|result| result.output);
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, Some(&tracker));
+    let event_ctx = ToolEventCtx::new(
+        session.as_ref(),
+        turn.as_ref(),
+        &call_id,
+        /*turn_diff_tracker*/ None,
+    );
     let post_tool_use_response = out
         .as_ref()
         .ok()

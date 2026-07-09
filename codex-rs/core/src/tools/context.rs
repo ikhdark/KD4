@@ -320,7 +320,6 @@ pub struct ExecCommandToolOutput {
     pub exit_code: Option<i32>,
     pub original_token_count: Option<usize>,
     pub hook_command: Option<String>,
-    pub advisory: Option<String>,
 }
 
 impl ToolOutput for ExecCommandToolOutput {
@@ -379,8 +378,6 @@ impl ToolOutput for ExecCommandToolOutput {
             session_id: Option<i32>,
             #[serde(skip_serializing_if = "Option::is_none")]
             original_token_count: Option<usize>,
-            #[serde(skip_serializing_if = "Option::is_none")]
-            advisory: Option<String>,
             output: String,
         }
 
@@ -390,7 +387,6 @@ impl ToolOutput for ExecCommandToolOutput {
             exit_code: self.exit_code,
             session_id: self.process_id,
             original_token_count: self.original_token_count,
-            advisory: self.advisory.clone(),
             output: match self.max_output_tokens {
                 Some(max_tokens) => self.truncated_output(max_tokens),
                 None => String::from_utf8_lossy(&self.raw_output).to_string(),
@@ -433,10 +429,6 @@ impl ExecCommandToolOutput {
 
         if let Some(original_token_count) = self.original_token_count {
             sections.push(format!("Original token count: {original_token_count}"));
-        }
-
-        if let Some(advisory) = &self.advisory {
-            sections.push(advisory.clone());
         }
 
         sections.push("Output:".to_string());

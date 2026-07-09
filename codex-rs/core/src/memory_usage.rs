@@ -1,7 +1,6 @@
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::flat_tool_name;
-use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::unified_exec::ExecCommandArgs;
 use codex_memories_read::usage::MEMORIES_USAGE_METRIC;
 use codex_memories_read::usage::memories_usage_kinds_from_command;
@@ -38,23 +37,10 @@ fn shell_script_for_invocation(invocation: &ToolInvocation) -> Option<String> {
     ) {
         (None, "shell_command") => serde_json::from_str::<ShellCommandToolCallParams>(arguments)
             .ok()
-            .and_then(|params| {
-                CommandInvocation::from_parts(
-                    "shell_command",
-                    "command",
-                    params.command.as_deref(),
-                    params.kind.as_deref(),
-                    params.program.as_deref(),
-                    params.args.as_deref(),
-                    params.script_body.as_deref(),
-                )
-                .ok()
-            })
-            .map(|command| command.display_command()),
+            .map(|params| params.command),
         (None, "exec_command") => serde_json::from_str::<ExecCommandArgs>(arguments)
             .ok()
-            .and_then(|params| params.command_invocation().ok())
-            .map(|command| command.display_command()),
+            .map(|params| params.cmd),
         (Some(_), _) | (None, _) => None,
     }
 }

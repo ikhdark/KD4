@@ -638,42 +638,6 @@ async fn slash_init_does_not_depend_on_loaded_instruction_sources() {
 }
 
 #[tokio::test]
-async fn slash_ideas_submits_ranked_backlog_prompt() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    submit_composer_text(&mut chat, "/ideas");
-
-    assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
-    assert!(drain_insert_history(&mut rx).is_empty());
-    let queued = chat.input_queue.queued_user_messages.front().unwrap();
-    assert!(queued.text.contains("You are in Ideas mode."));
-    assert!(
-        queued
-            .text
-            .contains("| Rank | Idea | Impact | Risk | Affected files |")
-    );
-    assert!(!queued.text.contains("Scope:"));
-    assert_eq!(recall_latest_after_clearing(&mut chat), "/ideas");
-}
-
-#[tokio::test]
-async fn slash_ideas_with_scope_appends_scope_to_prompt() {
-    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
-
-    submit_composer_text(&mut chat, "/ideas tui performance");
-
-    assert_eq!(chat.input_queue.queued_user_messages.len(), 1);
-    assert!(drain_insert_history(&mut rx).is_empty());
-    let queued = chat.input_queue.queued_user_messages.front().unwrap();
-    assert!(queued.text.contains("You are in Ideas mode."));
-    assert!(queued.text.contains("Scope: tui performance"));
-    assert_eq!(
-        recall_latest_after_clearing(&mut chat),
-        "/ideas tui performance"
-    );
-}
-
-#[tokio::test]
 async fn bare_slash_command_is_available_from_local_recall_after_dispatch() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 

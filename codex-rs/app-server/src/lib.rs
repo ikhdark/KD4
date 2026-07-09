@@ -85,7 +85,6 @@ mod app_server_tracing;
 mod attestation;
 mod auth_mode;
 mod bespoke_event_handling;
-mod build_info;
 mod command_exec;
 mod config;
 mod config_layer;
@@ -103,7 +102,6 @@ mod fs_watch;
 mod fuzzy_file_search;
 mod image_url;
 pub mod in_process;
-mod local_watermark;
 mod mcp_refresh;
 mod message_processor;
 mod models;
@@ -111,7 +109,6 @@ mod models_refresh_worker;
 mod outgoing_message;
 mod request_processors;
 mod request_serialization;
-mod runtime_provenance;
 mod server_request_error;
 mod skills_watcher;
 mod thread_state;
@@ -119,10 +116,7 @@ mod thread_status;
 mod transport;
 
 pub use crate::error_code::INPUT_TOO_LARGE_ERROR_CODE;
-pub use crate::error_code::INVALID_TEXT_ELEMENT_RANGE_ERROR_CODE;
 pub use crate::error_code::INVALID_PARAMS_ERROR_CODE;
-pub use crate::error_code::TURN_START_INVALID_ENVIRONMENT_ERROR_CODE;
-pub use crate::error_code::TURN_START_INVALID_THREAD_SETTINGS_ERROR_CODE;
 pub use crate::transport::AppServerTransport;
 pub use crate::transport::RemoteControlStartupMode;
 pub use crate::transport::app_server_control_socket_path;
@@ -149,17 +143,6 @@ fn configured_thread_config_loader(config: &Config) -> Arc<dyn ThreadConfigLoade
         Some(endpoint) => Arc::new(RemoteThreadConfigLoader::new(endpoint)),
         None => Arc::new(NoopThreadConfigLoader),
     }
-}
-
-async fn install_config_loaders_from_config(config_manager: &ConfigManager, config: &Config) {
-    let discovered_thread_config_loader = configured_thread_config_loader(config);
-    config_manager.replace_thread_config_loader(Arc::clone(&discovered_thread_config_loader));
-    let auth_manager =
-        AuthManager::shared_from_config(config, /*enable_codex_api_key_env*/ false).await;
-    config_manager.replace_cloud_config_bundle_loader(
-        auth_manager,
-        config.chatgpt_base_url.clone(),
-    );
 }
 
 /// Control-plane messages from the processor/transport side to the outbound router task.
@@ -512,39 +495,32 @@ pub async fn run_main_with_transport_options(
         arg0_paths.clone(),
         Arc::new(NoopThreadConfigLoader),
     );
-    let mut config_warnings = Vec::new();
     match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await
     {
         Ok(config) => {
-            install_config_loaders_from_config(&config_manager, &config).await;
+            let discovered_thread_config_loader = configured_thread_config_loader(&config);
+            config_manager
+                .replace_thread_config_loader(Arc::clone(&discovered_thread_config_loader));
+            let auth_manager =
+                AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await;
+            config_manager
+                .replace_cloud_config_bundle_loader(auth_manager, config.chatgpt_base_url);
         }
         Err(err) => {
-            warn!(
-                error = %err,
-                "failed to preload startup config; managed config loaders will use the effective startup configuration if startup continues"
-            );
-            if !strict_config {
-                config_warnings.push(config_warning_from_error(
-                    "Startup configuration preload failed; managed config loaders will use the effective startup configuration if startup continues.",
-                    &err,
-                ));
-            }
-            // Non-strict startup reports the configuration error below and falls back to
-            // defaults. The effective startup config still installs loader handles before
-            // request processing starts, so a preload failure does not leave the manager
-            // permanently on the bootstrap no-op loaders.
+            warn!(error = %err, "Failed to preload config for cloud config bundle");
+            // TODO: Decide whether bootstrap config preload failures should block startup.
+            // If this fails, we cannot install cloud/thread config loaders, so non-strict
+            // startup may continue without managed cloud config.
         }
     };
+    let mut config_warnings = Vec::new();
     let (mut config, should_run_personality_migration) = match config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await
     {
-        Ok(config) => {
-            install_config_loaders_from_config(&config_manager, &config).await;
-            (config, true)
-        }
+        Ok(config) => (config, true),
         Err(err) => {
             if strict_config {
                 return Err(err);
@@ -552,14 +528,15 @@ pub async fn run_main_with_transport_options(
 
             let message = config_warning_from_error("Invalid configuration; using defaults.", &err);
             config_warnings.push(message);
-            let default_config = config_manager.load_default_config().await.map_err(|e| {
-                std::io::Error::new(
-                    ErrorKind::InvalidData,
-                    format!("error loading default config after config error: {e}"),
-                )
-            })?;
-            install_config_loaders_from_config(&config_manager, &default_config).await;
-            (default_config, false)
+            (
+                config_manager.load_default_config().await.map_err(|e| {
+                    std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("error loading default config after config error: {e}"),
+                    )
+                })?,
+                false,
+            )
         }
     };
 

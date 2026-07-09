@@ -1,6 +1,7 @@
 use super::*;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
+use codex_analytics::PluginInstallSource;
 use codex_app_server_protocol::PluginAvailability;
 use codex_app_server_protocol::PluginInstallPolicy;
 use codex_app_server_protocol::PluginSharePrincipalRole;
@@ -19,9 +20,8 @@ use codex_core_plugins::remote::RemoteAppTemplateUnavailableReason;
 use codex_core_plugins::remote::is_valid_remote_plugin_id;
 use codex_core_plugins::remote::validate_remote_plugin_id;
 use codex_core_plugins::remote_bundle::RemotePluginBundleInstallError;
-use codex_exec_server::ReqwestHttpClient;
 use codex_mcp::McpOAuthLoginSupport;
-use codex_mcp::oauth_login_support_with_http_client;
+use codex_mcp::oauth_login_support;
 use codex_mcp::should_retry_without_scopes;
 use codex_plugin::PluginId;
 use codex_plugin::PluginTelemetryMetadata;
@@ -1761,8 +1761,11 @@ impl PluginRequestProcessor {
                 capability_summary: None,
             }
         };
-        self.analytics_events_client
-            .track_plugin_install_failed(plugin, error_type.to_string());
+        self.analytics_events_client.track_plugin_install_failed(
+            plugin,
+            PluginInstallSource::Manual,
+            error_type.to_string(),
+        );
     }
 
     async fn plugin_apps_needing_auth_for_install(
@@ -1836,12 +1839,7 @@ impl PluginRequestProcessor {
         plugin_mcp_servers: HashMap<String, McpServerConfig>,
     ) {
         for (name, server) in plugin_mcp_servers {
-            let oauth_config = match oauth_login_support_with_http_client(
-                &server.transport,
-                Arc::new(ReqwestHttpClient),
-            )
-            .await
-            {
+            let oauth_config = match oauth_login_support(&server.transport).await {
                 McpOAuthLoginSupport::Supported(config) => config,
                 McpOAuthLoginSupport::Unsupported => continue,
                 McpOAuthLoginSupport::Unknown(err) => {

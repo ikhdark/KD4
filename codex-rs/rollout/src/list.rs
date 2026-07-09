@@ -22,12 +22,13 @@ use crate::protocol::EventMsg;
 use crate::state_db;
 use codex_file_search as file_search;
 use codex_protocol::ThreadId;
+use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
-use codex_protocol::protocol::USER_MESSAGE_BEGIN;
+use codex_protocol::protocol::user_message_preview;
 use serde_json::Value;
 
 /// Returned page of thread (thread) summaries.
@@ -291,25 +292,6 @@ impl<'a> RolloutFileVisitor for FilesByUpdatedAtVisitor<'a> {
             id,
             updated_at,
         });
-        ControlFlow::Continue(())
-    }
-}
-
-struct DiscoverRolloutFilesVisitor {
-    files: Vec<compression::RolloutFile>,
-}
-
-impl RolloutFileVisitor for DiscoverRolloutFilesVisitor {
-    async fn visit(
-        &mut self,
-        _ts: OffsetDateTime,
-        _id: Uuid,
-        path: PathBuf,
-        _scanned: usize,
-    ) -> ControlFlow<()> {
-        if let Some(rollout_file) = compression::RolloutFile::from_path(path) {
-            self.files.push(rollout_file);
-        }
         ControlFlow::Continue(())
     }
 }
@@ -965,48 +947,6 @@ async fn collect_flat_rollout_files(
     Ok(collected)
 }
 
-pub(crate) async fn discover_rollout_files(
-    root: &Path,
-    layout: ThreadListLayout,
-) -> io::Result<Vec<compression::RolloutFile>> {
-    let mut scanned_files = 0usize;
-    match layout {
-        ThreadListLayout::Flat => discover_flat_rollout_files(root, &mut scanned_files).await,
-        ThreadListLayout::NestedByDate => {
-            let mut visitor = DiscoverRolloutFilesVisitor { files: Vec::new() };
-            walk_rollout_files(root, &mut scanned_files, &mut visitor).await?;
-            Ok(visitor.files)
-        }
-    }
-}
-
-async fn discover_flat_rollout_files(
-    root: &Path,
-    scanned_files: &mut usize,
-) -> io::Result<Vec<compression::RolloutFile>> {
-    let mut dir = tokio::fs::read_dir(root).await?;
-    let mut files = Vec::new();
-    while let Some(entry) = dir.next_entry().await? {
-        if *scanned_files >= MAX_SCAN_FILES {
-            break;
-        }
-        if !entry
-            .file_type()
-            .await
-            .map(|ft| ft.is_file())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let Some(rollout_file) = compression::RolloutFile::from_path(entry.path()) else {
-            continue;
-        };
-        *scanned_files += 1;
-        files.push(rollout_file);
-    }
-    Ok(files)
-}
-
 async fn collect_rollout_day_files(
     day_path: &Path,
 ) -> io::Result<Vec<(OffsetDateTime, Uuid, PathBuf)>> {
@@ -1245,12 +1185,19 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
             }
             RolloutItem::EventMsg(ev) => {
                 if let Some(preview) = event_msg_preview(&ev) {
+                    // Legacy rollouts persist UserMessage while paginated rollouts persist
+                    // ItemCompleted(UserMessage), so summaries must recognize both formats.
+                    let is_user_message = match &ev {
+                        EventMsg::UserMessage(_) => true,
+                        EventMsg::ItemCompleted(event) => {
+                            matches!(event.item, TurnItem::UserMessage(_))
+                        }
+                        _ => false,
+                    };
                     if summary.preview.is_none() {
                         summary.preview = Some(preview.clone());
                     }
-                    if let EventMsg::UserMessage(_) = ev
-                        && summary.first_user_message.is_none()
-                    {
+                    if is_user_message && summary.first_user_message.is_none() {
                         summary.first_user_message = Some(preview);
                     }
                 }
@@ -1311,30 +1258,15 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
     Ok(head)
 }
 
-fn strip_user_message_prefix(text: &str) -> &str {
-    match text.find(USER_MESSAGE_BEGIN) {
-        Some(idx) => text[idx + USER_MESSAGE_BEGIN.len()..].trim(),
-        None => text.trim(),
-    }
-}
-
 fn event_msg_preview(event: &EventMsg) -> Option<String> {
     match event {
-        EventMsg::UserMessage(user) => {
-            let message = strip_user_message_prefix(user.message.as_str());
-            if !message.is_empty() {
-                return Some(message.to_string());
+        EventMsg::UserMessage(user) => user_message_preview(user),
+        EventMsg::ItemCompleted(event) => match &event.item {
+            TurnItem::UserMessage(user) => {
+                user_message_preview(&user.as_legacy_user_message_event())
             }
-            if user
-                .images
-                .as_ref()
-                .is_some_and(|images| !images.is_empty())
-                || !user.local_images.is_empty()
-            {
-                return Some("[Image]".to_string());
-            }
-            None
-        }
+            _ => None,
+        },
         EventMsg::ThreadGoalUpdated(event) => {
             let objective = event.goal.objective.trim();
             (!objective.is_empty()).then(|| objective.to_string())

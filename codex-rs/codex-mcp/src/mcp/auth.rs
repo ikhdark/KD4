@@ -8,11 +8,12 @@ use codex_config::McpServerTransportConfig;
 use codex_config::types::AuthKeyringBackendKind;
 use codex_config::types::OAuthCredentialsStoreMode;
 use codex_exec_server::HttpClient;
-use codex_exec_server::ReqwestHttpClient;
 use codex_login::CodexAuth;
 use codex_rmcp_client::McpAuthState;
 use codex_rmcp_client::OAuthProviderError;
+use codex_rmcp_client::determine_streamable_http_auth_status;
 use codex_rmcp_client::determine_streamable_http_auth_status_with_http_client;
+use codex_rmcp_client::discover_streamable_http_oauth;
 use codex_rmcp_client::discover_streamable_http_oauth_with_http_client;
 use futures::FutureExt;
 use futures::future::join_all;
@@ -57,7 +58,23 @@ pub struct McpAuthStatusEntry {
 }
 
 pub async fn oauth_login_support(transport: &McpServerTransportConfig) -> McpOAuthLoginSupport {
-    oauth_login_support_with_http_client(transport, Arc::new(ReqwestHttpClient)).await
+    let Some(mut config) = oauth_login_candidate(transport) else {
+        return McpOAuthLoginSupport::Unsupported;
+    };
+    match discover_streamable_http_oauth(
+        &config.url,
+        config.http_headers.clone(),
+        config.env_http_headers.clone(),
+    )
+    .await
+    {
+        Ok(Some(discovery)) => {
+            config.discovered_scopes = discovery.scopes_supported;
+            McpOAuthLoginSupport::Supported(config)
+        }
+        Ok(None) => McpOAuthLoginSupport::Unsupported,
+        Err(err) => McpOAuthLoginSupport::Unknown(err),
+    }
 }
 
 pub async fn oauth_login_support_with_http_client(
@@ -108,7 +125,7 @@ fn oauth_login_candidate(transport: &McpServerTransportConfig) -> Option<McpOAut
 pub async fn discover_supported_scopes(
     transport: &McpServerTransportConfig,
 ) -> Option<Vec<String>> {
-    match oauth_login_support_with_http_client(transport, Arc::new(ReqwestHttpClient)).await {
+    match oauth_login_support(transport).await {
         McpOAuthLoginSupport::Supported(config) => config.discovered_scopes,
         McpOAuthLoginSupport::Unsupported | McpOAuthLoginSupport::Unknown(_) => None,
     }
@@ -247,7 +264,7 @@ async fn compute_auth_status(
             env_http_headers,
         } => {
             if config.is_local_environment() {
-                determine_streamable_http_auth_status_with_http_client(
+                determine_streamable_http_auth_status(
                     server_name,
                     url,
                     bearer_token_env_var.as_deref(),
@@ -255,7 +272,6 @@ async fn compute_auth_status(
                     env_http_headers.clone(),
                     store_mode,
                     keyring_backend_kind,
-                    Arc::new(ReqwestHttpClient),
                 )
                 .boxed()
                 .await

@@ -6,9 +6,6 @@ pub const INVALID_PARAMS_ERROR_CODE: i64 = -32602;
 pub(crate) const INTERNAL_ERROR_CODE: i64 = -32603;
 pub(crate) const OVERLOADED_ERROR_CODE: i64 = -32001;
 pub const INPUT_TOO_LARGE_ERROR_CODE: &str = "input_too_large";
-pub const INVALID_TEXT_ELEMENT_RANGE_ERROR_CODE: &str = "invalid_text_element_range";
-pub const TURN_START_INVALID_ENVIRONMENT_ERROR_CODE: &str = "invalid_environment_selection";
-pub const TURN_START_INVALID_THREAD_SETTINGS_ERROR_CODE: &str = "invalid_thread_settings";
 
 pub(crate) fn invalid_request(message: impl Into<String>) -> JSONRPCErrorError {
     error(INVALID_REQUEST_ERROR_CODE, message)

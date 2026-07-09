@@ -41,7 +41,6 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
-use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::network_approval::DeferredNetworkApproval;
 
 mod async_watcher;
@@ -77,21 +76,14 @@ pub(crate) struct UnifiedExecContext {
     pub session: Arc<Session>,
     pub turn: Arc<TurnContext>,
     pub call_id: String,
-    pub tracker: Option<SharedTurnDiffTracker>,
 }
 
 impl UnifiedExecContext {
-    pub fn new(
-        session: Arc<Session>,
-        turn: Arc<TurnContext>,
-        call_id: String,
-        tracker: Option<SharedTurnDiffTracker>,
-    ) -> Self {
+    pub fn new(session: Arc<Session>, turn: Arc<TurnContext>, call_id: String) -> Self {
         Self {
             session,
             turn,
             call_id,
-            tracker,
         }
     }
 }
@@ -99,8 +91,7 @@ impl UnifiedExecContext {
 #[derive(Debug)]
 pub(crate) struct ExecCommandRequest {
     pub command: Vec<String>,
-    pub command_for_safety: Vec<String>,
-    pub shell_type: Option<ShellType>,
+    pub shell_type: ShellType,
     pub hook_command: String,
     pub process_id: i32,
     pub yield_time_ms: u64,
@@ -168,7 +159,6 @@ struct ProcessEntry {
     cwd: PathUri,
     initial_exec_command_active: Arc<std::sync::atomic::AtomicBool>,
     hook_command: String,
-    shell_type: Option<ShellType>,
     tty: bool,
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,

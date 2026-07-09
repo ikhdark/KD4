@@ -37,16 +37,6 @@ const SIDE_SLASH_COMMAND_UNAVAILABLE_HINT: &str =
 const GOAL_USAGE_HINT: &str = "Example: /goal improve benchmark coverage";
 const RAW_USAGE: &str = "Usage: /raw [on|off]";
 const USAGE_CHATGPT_LOGIN_REQUIRED: &str = "Sign in with ChatGPT to use /usage.";
-const IDEAS_PROMPT: &str = include_str!("../../prompt_for_ideas_command.md");
-
-fn ideas_prompt(scope: Option<&str>) -> String {
-    let mut prompt = IDEAS_PROMPT.trim_end().to_string();
-    if let Some(scope) = scope.map(str::trim).filter(|scope| !scope.is_empty()) {
-        prompt.push_str("\n\nScope: ");
-        prompt.push_str(scope);
-    }
-    prompt
-}
 
 impl ChatWidget {
     /// Dispatch a bare slash command and record its staged local-history entry.
@@ -272,9 +262,6 @@ impl ChatWidget {
             }
             SlashCommand::Review => {
                 self.open_review_popup();
-            }
-            SlashCommand::Ideas => {
-                self.submit_user_message(ideas_prompt(None).into());
             }
             SlashCommand::Rename => {
                 self.session_telemetry
@@ -748,7 +735,7 @@ impl ChatWidget {
                 );
                 if self.is_session_configured() {
                     self.reasoning_buffer.clear();
-                    self.full_reasoning_buffer.clear();
+                    self.reasoning_summary_parts.clear();
                     self.set_status_header(String::from("Working"));
                     self.submit_user_message(user_message);
                 } else {
@@ -884,10 +871,6 @@ impl ChatWidget {
                     instructions: args,
                 }));
             }
-            SlashCommand::Ideas if !trimmed.is_empty() => {
-                self.submit_user_message(ideas_prompt(Some(trimmed)).into());
-            }
-            SlashCommand::Ideas => self.dispatch_command(cmd),
             SlashCommand::Resume if !trimmed.is_empty() => {
                 self.app_event_tx
                     .send(AppEvent::ResumeSessionByIdOrName(args));
@@ -1086,7 +1069,6 @@ impl ChatWidget {
             | SlashCommand::Init
             | SlashCommand::Compact
             | SlashCommand::Review
-            | SlashCommand::Ideas
             | SlashCommand::Model
             | SlashCommand::Personality
             | SlashCommand::Plan

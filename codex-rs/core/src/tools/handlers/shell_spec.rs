@@ -5,8 +5,6 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 
-const VALIDATION_COMMAND_GUIDANCE: &str = "For validation commands, report the exact command and whether it passed or failed; formatting-only commands do not prove build/test/lint correctness by themselves.";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandToolOptions {
     pub allow_login_shell: bool,
@@ -28,44 +26,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
     let mut properties = BTreeMap::from([
         (
             "cmd".to_string(),
-            JsonSchema::string(Some(
-                "Legacy shell script to execute. Use this for pipes, redirects, variable expansion, here-docs, compound shell syntax, and PowerShell cmdlets. For simple standalone executables, prefer `kind: \"argv\"` with `program` and `args`; for complex PowerShell, prefer `kind: \"powershell_script\"` with `script_body`."
-                    .to_string(),
-            )),
-        ),
-        (
-            "kind".to_string(),
-            JsonSchema::string_enum(
-                vec![json!("script"), json!("argv"), json!("powershell_script")],
-                Some(
-                    "Command encoding. `script` uses the legacy `cmd` shell string; `argv` launches `program` directly with `args`; `powershell_script` launches PowerShell with a runtime-encoded `script_body` to avoid nested quoting."
-                        .to_string(),
-                ),
-            ),
-        ),
-        (
-            "program".to_string(),
-            JsonSchema::string(Some(
-                "Program to launch directly when `kind` is `argv`, for example `rg` or `git`. PowerShell cmdlets are not standalone executables; run them with `kind: \"script\"` or through PowerShell."
-                    .to_string(),
-            )),
-        ),
-        (
-            "args".to_string(),
-            JsonSchema::array(
-                JsonSchema::string(/*description*/ None),
-                Some(
-                    "Argument vector for direct argv mode. Do not include the program name."
-                        .to_string(),
-                ),
-            ),
-        ),
-        (
-            "script_body".to_string(),
-            JsonSchema::string(Some(
-                "Plain PowerShell script text for `kind: \"powershell_script\"`; the runtime encodes it for PowerShell instead of asking the model to quote or base64-encode it."
-                    .to_string(),
-            )),
+            JsonSchema::string(Some("Shell command to execute.".to_string())),
         ),
         (
             "workdir".to_string(),
@@ -124,23 +85,24 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         options.exec_permission_approvals_enabled,
     ));
 
-    let description = if cfg!(windows) {
-        format!(
-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\nExamples:\n- Simple executable: `kind: \"argv\"`, `program: \"rg\"`, `args: [\"--files\"]`.\n- Complex PowerShell: `kind: \"powershell_script\"` with plain `script_body`; do not hand-build `-EncodedCommand`.\n\n{}\n\n{VALIDATION_COMMAND_GUIDANCE}",
-            windows_shell_guidance(),
-        )
-    } else {
-        format!(
-            "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\nExamples:\n- Simple executable: `kind: \"argv\"`, `program: \"rg\"`, `args: [\"--files\"]`.\n- Complex PowerShell: `kind: \"powershell_script\"` with plain `script_body`; do not hand-build `-EncodedCommand`.\n\n{VALIDATION_COMMAND_GUIDANCE}",
-        )
-    };
-
     ToolSpec::Function(ResponsesApiTool {
         name: "exec_command".to_string(),
-        description,
+        description: if cfg!(windows) {
+            format!(
+                "Runs a command in a PTY, returning output or a session ID for ongoing interaction.\n\n{}",
+                windows_shell_guidance()
+            )
+        } else {
+            "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
+                .to_string()
+        },
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["cmd".to_string()]),
+            Some(false.into()),
+        ),
         output_schema: Some(unified_exec_output_schema()),
     })
 }
@@ -194,42 +156,7 @@ pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
         (
             "command".to_string(),
             JsonSchema::string(Some(
-                "Legacy shell script to run in the user's default shell. Use this for pipes, redirects, variable expansion, here-docs, compound shell syntax, and PowerShell cmdlets. For simple standalone executables, prefer `kind: \"argv\"` with `program` and `args`; for complex PowerShell, prefer `kind: \"powershell_script\"` with `script_body`."
-                    .to_string(),
-            )),
-        ),
-        (
-            "kind".to_string(),
-            JsonSchema::string_enum(
-                vec![json!("script"), json!("argv"), json!("powershell_script")],
-                Some(
-                    "Command encoding. `script` uses the legacy `command` shell string; `argv` launches `program` directly with `args`; `powershell_script` launches PowerShell with a runtime-encoded `script_body` to avoid nested quoting."
-                        .to_string(),
-                ),
-            ),
-        ),
-        (
-            "program".to_string(),
-            JsonSchema::string(Some(
-                "Program to launch directly when `kind` is `argv`, for example `rg` or `git`. PowerShell cmdlets are not standalone executables; run them with `kind: \"script\"` or through PowerShell."
-                    .to_string(),
-            )),
-        ),
-        (
-            "args".to_string(),
-            JsonSchema::array(
-                JsonSchema::string(/*description*/ None),
-                Some(
-                    "Argument vector for direct argv mode. Do not include the program name."
-                        .to_string(),
-                ),
-            ),
-        ),
-        (
-            "script_body".to_string(),
-            JsonSchema::string(Some(
-                "Plain PowerShell script text for `kind: \"powershell_script\"`; the runtime encodes it for PowerShell instead of asking the model to quote or base64-encode it."
-                    .to_string(),
+                "Shell script to run in the user's default shell.".to_string(),
             )),
         ),
         (
@@ -285,7 +212,11 @@ Examples of valid command strings:
         description,
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["command".to_string()]),
+            Some(false.into()),
+        ),
         output_schema: None,
     })
 }
@@ -392,7 +323,7 @@ fn create_approval_parameters(
         (
             "prefix_rule".to_string(),
             JsonSchema::array(JsonSchema::string(/*description*/ None), Some(
-                    r#"Reusable approval prefix for the resolved command, only with `sandbox_permissions: "require_escalated"`; for example ["git", "pull"]."#.to_string(),
+                    r#"Reusable approval prefix for `cmd`, only with `sandbox_permissions: "require_escalated"`; for example ["git", "pull"]."#.to_string(),
                 )),
         ),
     ]);

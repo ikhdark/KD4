@@ -435,7 +435,6 @@ fn exec_command_tool_output_formats_truncated_response() {
         exit_code: Some(0),
         original_token_count: Some(10),
         hook_command: None,
-        advisory: None,
     }
     .to_response_item("call-42", &payload);
 
@@ -461,42 +460,4 @@ fn exec_command_tool_output_formats_truncated_response() {
         }
         other => panic!("expected FunctionCallOutput, got {other:?}"),
     }
-}
-
-#[test]
-fn exec_command_tool_output_includes_advisory_when_present() {
-    let payload = ToolPayload::Function {
-        arguments: "{}".to_string(),
-    };
-    let output = ExecCommandToolOutput {
-        event_call_id: "call-42".to_string(),
-        chunk_id: String::new(),
-        wall_time: std::time::Duration::from_millis(1250),
-        raw_output: b"Measure-Object failed".to_vec(),
-        truncation_policy: TruncationPolicy::Tokens(10_000),
-        max_output_tokens: None,
-        process_id: None,
-        exit_code: Some(1),
-        original_token_count: None,
-        hook_command: None,
-        advisory: Some("Hint: retry with kind: \"powershell_script\".".to_string()),
-    };
-    let response = output.to_response_item("call-42", &payload);
-
-    match response {
-        ResponseInputItem::FunctionCallOutput { output, .. } => {
-            let text = output
-                .body
-                .to_text()
-                .expect("exec output should serialize as text");
-            assert!(text.contains("Hint: retry with kind: \"powershell_script\"."));
-            assert!(text.contains("Output:\nMeasure-Object failed"));
-        }
-        other => panic!("expected function output, got {other:?}"),
-    }
-
-    assert_eq!(
-        output.code_mode_result(&payload)["advisory"],
-        json!("Hint: retry with kind: \"powershell_script\".")
-    );
 }

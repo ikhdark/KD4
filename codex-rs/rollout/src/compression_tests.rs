@@ -130,41 +130,6 @@ async fn search_rollout_matches_uses_logical_path_for_compressed_rollout() -> an
 }
 
 #[tokio::test]
-async fn search_rollout_matches_fallback_covers_plain_and_compressed_rollouts() -> anyhow::Result<()>
-{
-    let home = TempDir::new()?;
-    let plain_uuid = Uuid::from_u128(16);
-    let plain_id = ThreadId::from_string(&plain_uuid.to_string())?;
-    let plain_path = rollout_path(home.path(), "2025-01-03T12-00-00", plain_uuid);
-    write_rollout(&plain_path, plain_id, "plain targeted search term")?;
-
-    let compressed_uuid = Uuid::from_u128(17);
-    let compressed_id = ThreadId::from_string(&compressed_uuid.to_string())?;
-    let compressed_path = rollout_path(home.path(), "2025-01-04T12-00-00", compressed_uuid);
-    write_rollout(
-        &compressed_path,
-        compressed_id,
-        "compressed targeted search term",
-    )?;
-    compress_now(&compressed_path)?;
-
-    let matches = search_rollout_matches(
-        std::path::Path::new("missing-rg-for-test"),
-        home.path(),
-        /*archived*/ false,
-        "targeted search term",
-    )
-    .await?;
-
-    assert_eq!(matches.get(plain_path.as_path()), Some(&None));
-    assert_eq!(
-        matches.get(compressed_path.as_path()),
-        Some(&Some("compressed targeted search term".to_string()))
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let active_uuid = Uuid::from_u128(3);

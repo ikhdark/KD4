@@ -4,191 +4,9 @@
     "AbsolutePathBuf": {
       "description": "A path that is guaranteed to be absolute and normalized (though it is not guaranteed to be canonicalized or exist on the filesystem).\n\nIMPORTANT: When deserializing an `AbsolutePathBuf`, a base path must be set using [AbsolutePathBufGuard::new]. If no base path is set, the deserialization will fail unless the path being deserialized is already absolute.",
       "type": "string"
-    },
-    "ServerBuildInfo": {
-      "properties": {
-        "built": {
-          "type": "string"
-        },
-        "commit": {
-          "type": "string"
-        },
-        "dirty": {
-          "type": "string"
-        },
-        "profile": {
-          "type": "string"
-        },
-        "version": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "built",
-        "commit",
-        "dirty",
-        "profile",
-        "version"
-      ],
-      "type": "object"
-    },
-    "ServerCapabilities": {
-      "properties": {
-        "enabledFeatures": {
-          "description": "Effective feature keys enabled for this app-server process.",
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "enabledFeatures"
-      ],
-      "type": "object"
-    },
-    "ServerLocalWatermark": {
-      "properties": {
-        "detail": {
-          "type": "string"
-        },
-        "label": {
-          "type": "string"
-        },
-        "version": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "detail",
-        "label",
-        "version"
-      ],
-      "type": "object"
-    },
-    "ServerPackageLayout": {
-      "properties": {
-        "binDir": {
-          "$ref": "#/definitions/AbsolutePathBuf"
-        },
-        "packageDir": {
-          "$ref": "#/definitions/AbsolutePathBuf"
-        },
-        "pathDir": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/AbsolutePathBuf"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "resourcesDir": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/AbsolutePathBuf"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "required": [
-        "binDir",
-        "packageDir"
-      ],
-      "type": "object"
-    },
-    "ServerRuntimeInfo": {
-      "properties": {
-        "executablePath": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/AbsolutePathBuf"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "expectedLocalBinaryPath": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/AbsolutePathBuf"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "installMethod": {
-          "type": "string"
-        },
-        "localBinaryMatch": {
-          "type": [
-            "boolean",
-            "null"
-          ]
-        },
-        "packageLayout": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/ServerPackageLayout"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
-        "warnings": {
-          "items": {
-            "$ref": "#/definitions/ServerRuntimeWarning"
-          },
-          "type": "array"
-        }
-      },
-      "required": [
-        "installMethod",
-        "warnings"
-      ],
-      "type": "object"
-    },
-    "ServerRuntimeWarning": {
-      "properties": {
-        "action": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "code": {
-          "type": "string"
-        },
-        "message": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "code",
-        "message"
-      ],
-      "type": "object"
     }
   },
   "properties": {
-    "buildInfo": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/ServerBuildInfo"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Build metadata for the running app-server binary."
-    },
     "codexHome": {
       "allOf": [
         {
@@ -197,17 +15,6 @@
       ],
       "description": "Absolute path to the server's $CODEX_HOME directory."
     },
-    "localWatermark": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/ServerLocalWatermark"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Local fork watermark for desktop-visible runtime proof."
-    },
     "platformFamily": {
       "description": "Platform family for the running app-server target, for example `\"unix\"` or `\"windows\"`.",
       "type": "string"
@@ -215,28 +22,6 @@
     "platformOs": {
       "description": "Operating system for the running app-server target, for example `\"macos\"`, `\"linux\"`, or `\"windows\"`.",
       "type": "string"
-    },
-    "runtimeInfo": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/ServerRuntimeInfo"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Runtime provenance for the running app-server process."
-    },
-    "serverCapabilities": {
-      "anyOf": [
-        {
-          "$ref": "#/definitions/ServerCapabilities"
-        },
-        {
-          "type": "null"
-        }
-      ],
-      "description": "Effective app-server capabilities advertised at initialize time."
     },
     "userAgent": {
       "type": "string"

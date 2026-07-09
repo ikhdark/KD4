@@ -9,14 +9,12 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
-use crate::tools::handlers::command_preflight::preflight_command;
-use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_tool_environment;
-use crate::tools::handlers::rewrite_function_script_argument;
+use crate::tools::handlers::rewrite_function_string_argument;
 use crate::tools::handlers::updated_hook_command;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
@@ -129,12 +127,7 @@ impl ExecCommandHandler {
         };
 
         let manager: &UnifiedExecProcessManager = &session.services.unified_exec_manager;
-        let context = UnifiedExecContext::new(
-            session.clone(),
-            turn.clone(),
-            call_id.clone(),
-            Some(tracker.clone()),
-        );
+        let context = UnifiedExecContext::new(session.clone(), turn.clone(), call_id.clone());
         let environment_args: ExecCommandEnvironmentArgs = parse_arguments(&arguments)?;
         let Some(turn_environment) = resolve_tool_environment(
             &step_context.environments,
@@ -196,10 +189,7 @@ impl ExecCommandHandler {
                 parse_arguments(&arguments)?
             }
         };
-        let command_invocation = args
-            .command_invocation()
-            .map_err(FunctionCallError::RespondToModel)?;
-        let hook_command = command_invocation.display_command();
+        let hook_command = args.cmd.clone();
         // TODO(anp) wire PathUri through implicit skills instead of skipping on foreign paths
         if let Some(native_cwd) = native_cwd.as_ref() {
             maybe_emit_implicit_skill_invocation(
@@ -210,27 +200,18 @@ impl ExecCommandHandler {
             )
             .await;
         }
-        let mut shell_mode =
+        let shell_mode =
             shell_mode_for_environment(&turn.unified_exec_shell_mode, environment.as_ref());
-        if command_invocation.is_argv() || command_invocation.is_powershell_script() {
-            shell_mode = codex_tools::UnifiedExecShellMode::Direct;
-        }
         // Remote environments may use a different OS and must build commands with their native
         // shell; fall back to the session shell when the environment did not report one.
-        let shell = match turn_environment.shell.clone() {
-            Some(shell) => Arc::new(shell),
-            None if environment.is_remote() && command_invocation.is_powershell_script() => {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "environment `{}` does not report a PowerShell shell",
-                    turn_environment.environment_id
-                )));
-            }
-            None => session.user_shell(),
-        };
+        let shell = turn_environment
+            .shell
+            .clone()
+            .map(Arc::new)
+            .unwrap_or_else(|| session.user_shell());
         // TODO(anp): Resolve requested shells in remote environments instead of restricting
         // commands to the reported default shell.
         if environment.is_remote()
-            && !command_invocation.is_argv()
             && let Some(requested_shell) = args.shell.take()
         {
             let Some(remote_shell) = turn_environment.shell.as_ref() else {
@@ -247,22 +228,16 @@ impl ExecCommandHandler {
                 )));
             }
         }
+        let process_id = manager.allocate_process_id().await;
         let resolved_command = get_command(
             &args,
             shell,
             &shell_mode,
             turn.config.permissions.allow_login_shell,
-            environment.is_remote(),
         )
         .map_err(FunctionCallError::RespondToModel)?;
         let command = resolved_command.command;
-        let safety_command = resolved_command.safety_command;
         let shell_type = resolved_command.shell_type;
-        preflight_command(&safety_command, shell_type).map_err(|message| {
-            FunctionCallError::RespondToModel(format!(
-                "{message}\nRegenerate the command and call `exec_command` again."
-            ))
-        })?;
         let command_for_display = codex_shell_command::parse_command::shlex_join(&command);
 
         let ExecCommandArgs {
@@ -305,6 +280,7 @@ impl ExecCommandHandler {
             )
         {
             let approval_policy = context.turn.approval_policy.value();
+            manager.release_process_id(process_id).await;
             return Err(FunctionCallError::RespondToModel(format!(
                 "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
             )));
@@ -330,6 +306,7 @@ impl ExecCommandHandler {
         ) {
             Ok(normalized) => normalized,
             Err(err) => {
+                manager.release_process_id(process_id).await;
                 return Err(FunctionCallError::RespondToModel(err));
             }
         };
@@ -347,6 +324,7 @@ impl ExecCommandHandler {
         )
         .await?
         {
+            manager.release_process_id(process_id).await;
             return Ok(boxed_tool_output(ExecCommandToolOutput {
                 event_call_id: String::new(),
                 chunk_id: String::new(),
@@ -358,17 +336,14 @@ impl ExecCommandHandler {
                 exit_code: None,
                 original_token_count: None,
                 hook_command: None,
-                advisory: None,
             }));
         }
 
-        let process_id = manager.allocate_process_id().await;
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
         match manager
             .exec_command(
                 ExecCommandRequest {
                     command,
-                    command_for_safety: safety_command,
                     shell_type,
                     hook_command: hook_command.clone(),
                     process_id,
@@ -395,12 +370,6 @@ impl ExecCommandHandler {
             Err(UnifiedExecError::SandboxDenied { output, .. }) => {
                 let output_text = output.aggregated_output.text;
                 let original_token_count = approx_token_count(&output_text);
-                let advisory = powershell_script_failure_advisory(
-                    shell_type,
-                    Some(output.exit_code),
-                    &output_text,
-                )
-                .map(str::to_string);
                 Ok(boxed_tool_output(ExecCommandToolOutput {
                     event_call_id: context.call_id.clone(),
                     chunk_id: generate_chunk_id(),
@@ -414,7 +383,6 @@ impl ExecCommandHandler {
                     exit_code: Some(output.exit_code),
                     original_token_count: Some(original_token_count),
                     hook_command: Some(hook_command),
-                    advisory,
                 }))
             }
             Err(err) => Err(FunctionCallError::RespondToModel(format!(
@@ -436,10 +404,9 @@ impl CoreToolRuntime for ExecCommandHandler {
 
         parse_arguments::<ExecCommandArgs>(arguments)
             .ok()
-            .and_then(|args| args.command_invocation().ok())
-            .map(|command| PreToolUsePayload {
+            .map(|args| PreToolUsePayload {
                 tool_name: HookToolName::bash(),
-                tool_input: serde_json::json!({ "command": command.display_command() }),
+                tool_input: serde_json::json!({ "command": args.cmd }),
             })
     }
 
@@ -454,7 +421,7 @@ impl CoreToolRuntime for ExecCommandHandler {
             ));
         };
         invocation.payload = ToolPayload::Function {
-            arguments: rewrite_function_script_argument(
+            arguments: rewrite_function_string_argument(
                 &arguments,
                 "exec_command",
                 "cmd",

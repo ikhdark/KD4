@@ -11,7 +11,6 @@ use super::process::UnifiedExecProcess;
 use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventFailure;
@@ -111,10 +110,8 @@ pub(crate) fn spawn_exit_watcher(
     turn_ref: Arc<TurnContext>,
     call_id: String,
     command: Vec<String>,
-    display_command: Option<String>,
     cwd: PathUri,
     process_id: i32,
-    tracker: Option<SharedTurnDiffTracker>,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
 ) {
@@ -132,10 +129,8 @@ pub(crate) fn spawn_exit_watcher(
                 turn_ref,
                 call_id,
                 command,
-                display_command.clone(),
                 cwd,
                 Some(process_id.to_string()),
-                tracker.clone(),
                 transcript,
                 String::new(),
                 message,
@@ -149,10 +144,8 @@ pub(crate) fn spawn_exit_watcher(
                 turn_ref,
                 call_id,
                 command,
-                display_command,
                 cwd,
                 Some(process_id.to_string()),
-                tracker,
                 transcript,
                 String::new(),
                 exit_code,
@@ -204,10 +197,8 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     turn_ref: Arc<TurnContext>,
     call_id: String,
     command: Vec<String>,
-    display_command: Option<String>,
     cwd: PathUri,
     process_id: Option<String>,
-    tracker: Option<SharedTurnDiffTracker>,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     fallback_output: String,
     exit_code: i32,
@@ -226,11 +217,10 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         session_ref.as_ref(),
         turn_ref.as_ref(),
         &call_id,
-        tracker.as_ref(),
+        /*turn_diff_tracker*/ None,
     );
-    let emitter = ToolEmitter::unified_exec_with_display_command(
+    let emitter = ToolEmitter::unified_exec(
         &command,
-        display_command,
         cwd,
         ExecCommandSource::UnifiedExecStartup,
         process_id,
@@ -252,10 +242,8 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     turn_ref: Arc<TurnContext>,
     call_id: String,
     command: Vec<String>,
-    display_command: Option<String>,
     cwd: PathUri,
     process_id: Option<String>,
-    tracker: Option<SharedTurnDiffTracker>,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     fallback_output: String,
     message: String,
@@ -283,11 +271,10 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         session_ref.as_ref(),
         turn_ref.as_ref(),
         &call_id,
-        tracker.as_ref(),
+        /*turn_diff_tracker*/ None,
     );
-    let emitter = ToolEmitter::unified_exec_with_display_command(
+    let emitter = ToolEmitter::unified_exec(
         &command,
-        display_command,
         cwd,
         ExecCommandSource::UnifiedExecStartup,
         process_id,

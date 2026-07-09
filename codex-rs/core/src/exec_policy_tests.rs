@@ -1363,7 +1363,6 @@ async fn mixed_rule_and_sandbox_prompt_prioritizes_rule_for_rejection_decision()
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
-            command_for_safety: None,
             approval_policy: AskForApproval::Granular(GranularApprovalConfig {
                 sandbox_approval: true,
                 rules: true,
@@ -1401,7 +1400,6 @@ async fn mixed_rule_and_sandbox_prompt_rejects_when_granular_rules_are_disabled(
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
-            command_for_safety: None,
             approval_policy: AskForApproval::Granular(GranularApprovalConfig {
                 sandbox_approval: true,
                 rules: false,
@@ -1432,7 +1430,6 @@ async fn exec_approval_requirement_falls_back_to_heuristics() {
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
-            command_for_safety: None,
             approval_policy: AskForApproval::UnlessTrusted,
             permission_profile: PermissionProfile::read_only(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -1451,39 +1448,6 @@ async fn exec_approval_requirement_falls_back_to_heuristics() {
 }
 
 #[tokio::test]
-async fn exec_approval_requirement_uses_command_for_safety_for_policy() {
-    let policy_src = r#"prefix_rule(pattern=["rm"], decision="forbidden")"#;
-    let mut parser = PolicyParser::new();
-    parser
-        .parse("test.rules", policy_src)
-        .expect("parse policy");
-    let manager = ExecPolicyManager::new(Arc::new(parser.build()));
-    let encoded_command = vec![
-        "pwsh".to_string(),
-        "-EncodedCommand".to_string(),
-        "opaque".to_string(),
-    ];
-    let safety_command = vec!["rm".to_string(), "-rf".to_string(), "target".to_string()];
-
-    let requirement = manager
-        .create_exec_approval_requirement_for_command(ExecApprovalRequest {
-            command: &encoded_command,
-            command_for_safety: Some(&safety_command),
-            approval_policy: AskForApproval::UnlessTrusted,
-            permission_profile: PermissionProfile::read_only(),
-            windows_sandbox_level: WindowsSandboxLevel::Disabled,
-            sandbox_permissions: SandboxPermissions::UseDefault,
-            prefix_rule: None,
-        })
-        .await;
-
-    assert!(matches!(
-        requirement,
-        ExecApprovalRequirement::Forbidden { .. }
-    ));
-}
-
-#[tokio::test]
 async fn empty_bash_lc_script_falls_back_to_original_command() {
     let command = vec!["bash".to_string(), "-lc".to_string(), "".to_string()];
 
@@ -1491,7 +1455,6 @@ async fn empty_bash_lc_script_falls_back_to_original_command() {
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
-            command_for_safety: None,
             approval_policy: AskForApproval::UnlessTrusted,
             permission_profile: PermissionProfile::read_only(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -1521,7 +1484,6 @@ async fn whitespace_bash_lc_script_falls_back_to_original_command() {
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
-            command_for_safety: None,
             approval_policy: AskForApproval::UnlessTrusted,
             permission_profile: PermissionProfile::read_only(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -1551,7 +1513,6 @@ async fn request_rule_uses_prefix_rule() {
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
-            command_for_safety: None,
             approval_policy: AskForApproval::OnRequest,
             permission_profile: PermissionProfile::read_only(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -1584,7 +1545,6 @@ async fn request_rule_falls_back_when_prefix_rule_does_not_approve_all_commands(
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
-            command_for_safety: None,
             approval_policy: AskForApproval::OnRequest,
             permission_profile: PermissionProfile::Disabled,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -1624,7 +1584,6 @@ async fn heuristics_apply_when_other_commands_match_policy() {
         ExecPolicyManager::new(policy)
             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
                 command: &command,
-                command_for_safety: None,
                 approval_policy: AskForApproval::UnlessTrusted,
                 permission_profile: PermissionProfile::Disabled,
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -2106,7 +2065,6 @@ async fn verify_approval_requirement_for_unsafe_powershell_command() {
         policy
             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
                 command: &sneaky_command,
-                command_for_safety: None,
                 approval_policy: AskForApproval::OnRequest,
                 permission_profile: PermissionProfile::read_only(),
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -2131,7 +2089,6 @@ async fn verify_approval_requirement_for_unsafe_powershell_command() {
         policy
             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
                 command: &dangerous_command,
-                command_for_safety: None,
                 approval_policy: AskForApproval::OnRequest,
                 permission_profile: PermissionProfile::read_only(),
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -2152,7 +2109,6 @@ async fn verify_approval_requirement_for_unsafe_powershell_command() {
         policy
             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
                 command: &dangerous_command,
-                command_for_safety: None,
                 approval_policy: AskForApproval::Never,
                 permission_profile: PermissionProfile::read_only(),
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -2248,7 +2204,6 @@ async fn exec_approval_requirement_for_command(
     ExecPolicyManager::new(policy)
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
-            command_for_safety: None,
             approval_policy,
             permission_profile,
             windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,

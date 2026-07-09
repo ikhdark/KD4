@@ -12,15 +12,12 @@ pub(crate) mod registry;
 pub(crate) mod router;
 pub(crate) mod runtimes;
 pub(crate) mod sandboxing;
-pub(crate) mod shell_output_summary;
 pub(crate) mod spec_plan;
 pub(crate) mod tool_dispatch_trace;
 
 use std::borrow::Cow;
 
 use crate::session::turn_context::TurnContext;
-use codex_config::coding_budgets::TOOL_TELEMETRY_PREVIEW_MAX_BYTES;
-use codex_config::coding_budgets::TOOL_TELEMETRY_PREVIEW_MAX_LINES;
 use codex_features::Feature;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::openai_models::ToolMode;
@@ -29,12 +26,10 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::truncate_text;
 pub use router::ToolRouter;
-use shell_output_summary::ShellOutputSummaryOptions;
-use shell_output_summary::summarize_shell_output_for_model;
 
 // Telemetry preview limits: keep log events smaller than model budgets.
-pub(crate) const TELEMETRY_PREVIEW_MAX_BYTES: usize = TOOL_TELEMETRY_PREVIEW_MAX_BYTES;
-pub(crate) const TELEMETRY_PREVIEW_MAX_LINES: usize = TOOL_TELEMETRY_PREVIEW_MAX_LINES;
+pub(crate) const TELEMETRY_PREVIEW_MAX_BYTES: usize = 2 * 1024; // 2 KiB
+pub(crate) const TELEMETRY_PREVIEW_MAX_LINES: usize = 64; // lines
 pub(crate) const TELEMETRY_PREVIEW_TRUNCATION_NOTICE: &str =
     "[... telemetry preview truncated ...]";
 
@@ -90,18 +85,7 @@ pub fn format_exec_output_for_model(
     // round to 1 decimal place
     let duration_seconds = ((exec_output.duration.as_secs_f32()) * 10.0).round() / 10.0;
 
-    let raw_content = build_content_with_timeout(exec_output);
-    let content = summarize_shell_output_for_model(
-        &raw_content,
-        exec_output.exit_code,
-        exec_output.timed_out,
-        ShellOutputSummaryOptions {
-            enabled: true,
-            turn_cost_guard: false,
-            command_text: None,
-        },
-    )
-    .unwrap_or(raw_content);
+    let content = build_content_with_timeout(exec_output);
 
     let total_lines = content.lines().count();
 
@@ -125,18 +109,7 @@ pub fn format_exec_output_str(
     exec_output: &ExecToolCallOutput,
     truncation_policy: TruncationPolicy,
 ) -> String {
-    let raw_content = build_content_with_timeout(exec_output);
-    let content = summarize_shell_output_for_model(
-        &raw_content,
-        exec_output.exit_code,
-        exec_output.timed_out,
-        ShellOutputSummaryOptions {
-            enabled: true,
-            turn_cost_guard: false,
-            command_text: None,
-        },
-    )
-    .unwrap_or(raw_content);
+    let content = build_content_with_timeout(exec_output);
 
     // Truncate for model consumption before serialization.
     formatted_truncate_text(&content, truncation_policy)

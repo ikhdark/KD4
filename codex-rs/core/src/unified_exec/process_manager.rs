@@ -21,12 +21,10 @@ use crate::exec_policy::ExecApprovalRequest;
 use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecRequest;
 use crate::sandboxing::ExecServerEnvConfig;
-use crate::shell::ShellType;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventStage;
-use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::network_approval::DeferredNetworkApproval;
 use crate::tools::network_approval::finish_deferred_network_approval;
 use crate::tools::orchestrator::ToolOrchestrator;
@@ -210,7 +208,6 @@ struct PreparedProcessHandles {
     network_approval: Option<DeferredNetworkApproval>,
     call_id: String,
     hook_command: String,
-    shell_type: Option<ShellType>,
     process_id: i32,
     tty: bool,
 }
@@ -222,38 +219,6 @@ struct InitialExecCommandGuard {
 impl Drop for InitialExecCommandGuard {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn completed_exec_command_tool_output(
-    event_call_id: String,
-    chunk_id: String,
-    wall_time: Duration,
-    raw_output: Vec<u8>,
-    truncation_policy: codex_utils_output_truncation::TruncationPolicy,
-    max_output_tokens: Option<usize>,
-    process_id: Option<i32>,
-    exit_code: Option<i32>,
-    hook_command: String,
-    shell_type: Option<ShellType>,
-) -> ExecCommandToolOutput {
-    let text = String::from_utf8_lossy(&raw_output).to_string();
-    let original_token_count = approx_token_count(&text);
-    let advisory =
-        powershell_script_failure_advisory(shell_type, exit_code, &text).map(str::to_string);
-    ExecCommandToolOutput {
-        event_call_id,
-        chunk_id,
-        wall_time,
-        raw_output,
-        truncation_policy,
-        max_output_tokens,
-        process_id,
-        exit_code,
-        original_token_count: Some(original_token_count),
-        hook_command: Some(hook_command),
-        advisory,
     }
 }
 
@@ -369,10 +334,8 @@ async fn emit_failed_initial_exec_end_if_unstored(
         Arc::clone(&context.turn),
         context.call_id.clone(),
         request.command.clone(),
-        Some(request.hook_command.clone()),
         cwd,
         Some(request.process_id.to_string()),
-        context.tracker.clone(),
         transcript,
         fallback_output,
         message,
@@ -474,11 +437,10 @@ impl UnifiedExecProcessManager {
             context.session.as_ref(),
             context.turn.as_ref(),
             &context.call_id,
-            context.tracker.as_ref(),
+            /*turn_diff_tracker*/ None,
         );
-        let emitter = ToolEmitter::unified_exec_with_display_command(
+        let emitter = ToolEmitter::unified_exec(
             &request.command,
-            Some(request.hook_command.clone()),
             cwd.clone(),
             ExecCommandSource::UnifiedExecStartup,
             Some(request.process_id.to_string()),
@@ -500,7 +462,6 @@ impl UnifiedExecProcessManager {
                 cwd.clone(),
                 start,
                 request.process_id,
-                request.shell_type,
                 request.tty,
                 deferred_network_approval.clone(),
                 Arc::clone(&transcript),
@@ -641,10 +602,8 @@ impl UnifiedExecProcessManager {
                 Arc::clone(&context.turn),
                 context.call_id.clone(),
                 request.command.clone(),
-                Some(request.hook_command.clone()),
                 cwd.clone(),
                 Some(process_id.to_string()),
-                context.tracker.clone(),
                 Arc::clone(&transcript),
                 text.clone(),
                 exit,
@@ -657,18 +616,19 @@ impl UnifiedExecProcessManager {
             (None, exit_code)
         };
 
-        let response = completed_exec_command_tool_output(
-            context.call_id.clone(),
+        let original_token_count = approx_token_count(&text);
+        let response = ExecCommandToolOutput {
+            event_call_id: context.call_id.clone(),
             chunk_id,
             wall_time,
-            collected,
-            context.turn.model_info.truncation_policy.into(),
-            request.max_output_tokens,
-            response_process_id,
+            raw_output: collected,
+            truncation_policy: context.turn.model_info.truncation_policy.into(),
+            max_output_tokens: request.max_output_tokens,
+            process_id: response_process_id,
             exit_code,
-            request.hook_command.clone(),
-            request.shell_type,
-        );
+            original_token_count: Some(original_token_count),
+            hook_command: Some(request.hook_command.clone()),
+        };
 
         Ok(response)
     }
@@ -691,7 +651,6 @@ impl UnifiedExecProcessManager {
             network_approval,
             call_id,
             hook_command,
-            shell_type,
             process_id,
             tty,
             ..
@@ -752,6 +711,8 @@ impl UnifiedExecProcessManager {
         .await;
         let wall_time = Instant::now().saturating_duration_since(start);
 
+        let text = String::from_utf8_lossy(&collected).to_string();
+        let original_token_count = approx_token_count(&text);
         let chunk_id = generate_chunk_id();
         if network_approval
             .as_ref()
@@ -811,18 +772,18 @@ impl UnifiedExecProcessManager {
             }
         };
 
-        let response = completed_exec_command_tool_output(
+        let response = ExecCommandToolOutput {
             event_call_id,
             chunk_id,
             wall_time,
-            collected,
-            request.truncation_policy,
-            request.max_output_tokens,
+            raw_output: collected,
+            truncation_policy: request.truncation_policy,
+            max_output_tokens: request.max_output_tokens,
             process_id,
             exit_code,
-            hook_command,
-            shell_type,
-        );
+            original_token_count: Some(original_token_count),
+            hook_command: Some(hook_command),
+        };
 
         Ok(response)
     }
@@ -888,7 +849,6 @@ impl UnifiedExecProcessManager {
             network_approval: entry.network_approval.clone(),
             call_id: entry.call_id.clone(),
             hook_command: entry.hook_command.clone(),
-            shell_type: entry.shell_type,
             process_id: entry.process_id,
             tty: entry.tty,
         })
@@ -904,13 +864,11 @@ impl UnifiedExecProcessManager {
         cwd: PathUri,
         started_at: Instant,
         process_id: i32,
-        shell_type: Option<ShellType>,
         tty: bool,
         network_approval: Option<DeferredNetworkApproval>,
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
         initial_exec_command_active: Arc<AtomicBool>,
     ) {
-        let watcher_display_command = hook_command.clone();
         let entry = ProcessEntry {
             process: Arc::clone(&process),
             call_id: context.call_id.clone(),
@@ -918,7 +876,6 @@ impl UnifiedExecProcessManager {
             cwd: cwd.clone(),
             initial_exec_command_active,
             hook_command,
-            shell_type,
             tty,
             network_approval,
             session: Arc::downgrade(&context.session),
@@ -943,10 +900,8 @@ impl UnifiedExecProcessManager {
             Arc::clone(&context.turn),
             context.call_id.clone(),
             command.to_vec(),
-            Some(watcher_display_command),
             cwd,
             process_id,
-            context.tracker.clone(),
             transcript,
             started_at,
         );
@@ -1176,7 +1131,6 @@ impl UnifiedExecProcessManager {
             .exec_policy
             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
                 command: &request.command,
-                command_for_safety: Some(&request.command_for_safety),
                 approval_policy: context.turn.approval_policy.value(),
                 permission_profile: context.turn.permission_profile(),
                 windows_sandbox_level: context.turn.windows_sandbox_level,

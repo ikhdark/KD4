@@ -1,12 +1,10 @@
 use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
 use crate::shell::ShellType;
-use crate::shell::get_shell;
 use crate::shell::get_shell_by_model_provided_path;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
-use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::PostToolUsePayload;
 use codex_exec_server::Environment;
@@ -28,16 +26,7 @@ pub use write_stdin::WriteStdinHandler;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ExecCommandArgs {
-    #[serde(default)]
-    pub(crate) cmd: Option<String>,
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    program: Option<String>,
-    #[serde(default)]
-    args: Option<Vec<String>>,
-    #[serde(default)]
-    script_body: Option<String>,
+    pub(crate) cmd: String,
     #[serde(default)]
     shell: Option<String>,
     #[serde(default)]
@@ -56,25 +45,6 @@ pub(crate) struct ExecCommandArgs {
     justification: Option<String>,
     #[serde(default)]
     prefix_rule: Option<Vec<String>>,
-}
-
-impl ExecCommandArgs {
-    pub(crate) fn command_invocation(&self) -> Result<CommandInvocation, String> {
-        CommandInvocation::from_parts(
-            "exec_command",
-            "cmd",
-            self.cmd.as_deref(),
-            self.kind.as_deref(),
-            self.program.as_deref(),
-            self.args.as_deref(),
-            self.script_body.as_deref(),
-        )
-        .map_err(|err| err.to_string())
-    }
-
-    fn has_explicit_shell(&self) -> bool {
-        self.shell.is_some()
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,8 +72,7 @@ fn default_tty() -> bool {
 #[derive(Debug)]
 pub(crate) struct ResolvedCommand {
     pub(crate) command: Vec<String>,
-    pub(crate) safety_command: Vec<String>,
-    pub(crate) shell_type: Option<ShellType>,
+    pub(crate) shell_type: ShellType,
 }
 
 fn post_unified_exec_tool_use_payload(
@@ -130,7 +99,6 @@ pub(crate) fn get_command(
     session_shell: Arc<Shell>,
     shell_mode: &UnifiedExecShellMode,
     allow_login_shell: bool,
-    environment_is_remote: bool,
 ) -> Result<ResolvedCommand, String> {
     let use_login_shell = match args.login {
         Some(true) if !allow_login_shell => {
@@ -141,31 +109,6 @@ pub(crate) fn get_command(
         Some(use_login_shell) => use_login_shell,
         None => allow_login_shell,
     };
-    let invocation = args.command_invocation()?;
-
-    if invocation.is_powershell_script() {
-        let powershell =
-            resolve_powershell_script_shell(args, session_shell.as_ref(), environment_is_remote)?;
-        return Ok(ResolvedCommand {
-            command: invocation.to_exec_args(&powershell, use_login_shell),
-            safety_command: invocation.to_safety_args(&powershell, use_login_shell),
-            shell_type: Some(ShellType::PowerShell),
-        });
-    }
-
-    if invocation.is_argv() {
-        if args.has_explicit_shell() {
-            return Err(
-                "`shell` is only valid for script commands; omit it when `kind` is `argv`."
-                    .to_string(),
-            );
-        }
-        return Ok(ResolvedCommand {
-            command: invocation.to_exec_args(session_shell.as_ref(), use_login_shell),
-            safety_command: invocation.to_safety_args(session_shell.as_ref(), use_login_shell),
-            shell_type: None,
-        });
-    }
 
     match shell_mode {
         UnifiedExecShellMode::Direct => {
@@ -175,63 +118,27 @@ pub(crate) fn get_command(
                 .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)));
             let shell = model_shell.as_ref().unwrap_or(session_shell.as_ref());
             Ok(ResolvedCommand {
-                command: invocation.to_exec_args(shell, use_login_shell),
-                safety_command: invocation.to_safety_args(shell, use_login_shell),
-                shell_type: Some(shell.shell_type),
+                command: shell.derive_exec_args(&args.cmd, use_login_shell),
+                shell_type: shell.shell_type,
             })
         }
         UnifiedExecShellMode::ZshFork(zsh_fork_config) => {
-            if args.has_explicit_shell() {
+            if args.shell.is_some() {
                 return Err(
                     "`shell` is not supported for local zsh-fork exec; omit `shell` to use zsh-fork, or target a remote environment where `shell` is supported.".to_string(),
                 );
             }
 
-            let command = vec![
-                zsh_fork_config.shell_zsh_path.to_string_lossy().to_string(),
-                if use_login_shell { "-lc" } else { "-c" }.to_string(),
-                invocation.display_command(),
-            ];
             Ok(ResolvedCommand {
-                safety_command: command.clone(),
-                command,
-                shell_type: Some(ShellType::Zsh),
+                command: vec![
+                    zsh_fork_config.shell_zsh_path.to_string_lossy().to_string(),
+                    if use_login_shell { "-lc" } else { "-c" }.to_string(),
+                    args.cmd.clone(),
+                ],
+                shell_type: ShellType::Zsh,
             })
         }
     }
-}
-
-fn resolve_powershell_script_shell(
-    args: &ExecCommandArgs,
-    session_shell: &Shell,
-    environment_is_remote: bool,
-) -> Result<Shell, String> {
-    let selected_shell = args
-        .shell
-        .as_ref()
-        .map(|shell_str| get_shell_by_model_provided_path(&PathBuf::from(shell_str)));
-
-    let powershell = selected_shell
-        .or_else(|| {
-            (session_shell.shell_type == ShellType::PowerShell).then(|| session_shell.clone())
-        })
-        .or_else(|| {
-            (!environment_is_remote)
-                .then(|| get_shell(ShellType::PowerShell, /*path*/ None))
-                .flatten()
-        })
-        .ok_or_else(|| {
-            "`kind: \"powershell_script\"` requires PowerShell in this environment; use `kind: \"script\"` with an available shell instead.".to_string()
-        })?;
-
-    if powershell.shell_type != ShellType::PowerShell {
-        return Err(format!(
-            "`kind: \"powershell_script\"` requires a PowerShell shell; `{}` was selected.",
-            powershell.shell_type.name()
-        ));
-    }
-
-    Ok(powershell)
 }
 
 pub(crate) fn shell_mode_for_environment(

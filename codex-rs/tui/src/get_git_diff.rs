@@ -5,7 +5,6 @@
 //! untracked files. When the current directory is not inside a Git
 //! repository, the function returns `Ok((false, String::new()))`.
 
-use std::fmt::Write as _;
 use std::path::Path;
 use std::time::Duration;
 
@@ -23,7 +22,6 @@ const DISABLE_HOOKS_CONFIG: &str = if cfg!(windows) {
     "core.hooksPath=/dev/null"
 };
 const EXECUTABLE_FILTER_CONFIG_PATTERN: &str = r"^filter\..*\.(clean|process)$";
-const MAX_UNTRACKED_FILE_DIFFS: usize = 50;
 
 // `/diff` may execute Git through a remote workspace, so git-utils owns the
 // probe policy while this adapter keeps command execution in the TUI layer.
@@ -96,14 +94,11 @@ pub(crate) async fn get_git_diff(
     };
 
     let null_path = null_device.to_str().unwrap_or("/dev/null");
-    let untracked_files = untracked_output
+    for file in untracked_output
         .split('\n')
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
-    let (files_to_diff, omitted_files) =
-        untracked_files.split_at(untracked_files.len().min(MAX_UNTRACKED_FILE_DIFFS));
-    for file in files_to_diff {
+    {
         let args = [
             "diff",
             "--no-textconv",
@@ -120,25 +115,8 @@ pub(crate) async fn get_git_diff(
             run_git_capture_diff(runner, cwd, fsmonitor, &diff_config_overrides, &args).await?;
         untracked_diff.push_str(&diff);
     }
-    append_omitted_untracked_diff_notice(&mut untracked_diff, omitted_files);
 
     Ok((true, format!("{tracked_diff}{untracked_diff}")))
-}
-
-fn append_omitted_untracked_diff_notice(diff: &mut String, omitted_files: &[&str]) {
-    if omitted_files.is_empty() {
-        return;
-    }
-    if !diff.ends_with('\n') {
-        diff.push('\n');
-    }
-    let _ = writeln!(
-        diff,
-        "\n# Untracked file diffs omitted after first {MAX_UNTRACKED_FILE_DIFFS} files:"
-    );
-    for file in omitted_files {
-        let _ = writeln!(diff, "# - {file}");
-    }
 }
 
 /// Helper that executes `git` with the given `args` and returns `stdout` as a
@@ -554,101 +532,6 @@ mod tests {
 
         assert_eq!(result, Ok((true, "tracked\n".to_string())));
         assert_command_metadata(&runner.commands(), &cwd);
-    }
-
-    #[tokio::test]
-    async fn get_git_diff_caps_untracked_file_diffs_and_lists_omitted_paths() {
-        let cwd = PathBuf::from("/workspace");
-        let untracked = (0..=MAX_UNTRACKED_FILE_DIFFS)
-            .map(|index| format!("new-{index:02}.txt"))
-            .collect::<Vec<_>>();
-        let untracked_output = format!("{}\n", untracked.join("\n"));
-        let mut responses = vec![
-            response(
-                git_command(
-                    FsmonitorOverride::Disabled,
-                    &["rev-parse", "--is-inside-work-tree"],
-                ),
-                /*exit_code*/ 0,
-                "true\n",
-            ),
-            response(
-                git_probe_command(&["config", "--null", "--get", "core.fsmonitor"]),
-                /*exit_code*/ 1,
-                "",
-            ),
-            response(
-                git_command(
-                    FsmonitorOverride::Disabled,
-                    &[
-                        "config",
-                        "--null",
-                        "--name-only",
-                        "--get-regexp",
-                        EXECUTABLE_FILTER_CONFIG_PATTERN,
-                    ],
-                ),
-                /*exit_code*/ 1,
-                "",
-            ),
-            response(
-                git_command(
-                    FsmonitorOverride::Disabled,
-                    &[
-                        "diff",
-                        "--no-textconv",
-                        "--no-ext-diff",
-                        "--submodule=short",
-                        "--ignore-submodules=dirty",
-                        "--color",
-                    ],
-                ),
-                /*exit_code*/ 1,
-                "tracked\n",
-            ),
-            response(
-                git_command(
-                    FsmonitorOverride::Disabled,
-                    &["ls-files", "--others", "--exclude-standard"],
-                ),
-                /*exit_code*/ 0,
-                &untracked_output,
-            ),
-        ];
-        for (index, file) in untracked.iter().take(MAX_UNTRACKED_FILE_DIFFS).enumerate() {
-            responses.push(response(
-                git_command(
-                    FsmonitorOverride::Disabled,
-                    &[
-                        "diff",
-                        "--no-textconv",
-                        "--no-ext-diff",
-                        "--submodule=short",
-                        "--ignore-submodules=dirty",
-                        "--color",
-                        "--no-index",
-                        "--",
-                        null_device(),
-                        file,
-                    ],
-                ),
-                /*exit_code*/ 1,
-                &format!("untracked-{index:02}\n"),
-            ));
-        }
-        let runner = FakeRunner::new(responses);
-
-        let result = get_git_diff(&runner, &cwd).await.expect("diff result");
-
-        assert!(result.1.contains("tracked\nuntracked-00\n"));
-        assert!(result.1.contains("untracked-49\n"));
-        assert!(result.1.contains("# - new-50.txt"));
-        let commands = runner.commands();
-        assert!(
-            !commands
-                .iter()
-                .any(|command| command.argv.iter().any(|arg| arg == "new-50.txt"))
-        );
     }
 
     #[tokio::test]

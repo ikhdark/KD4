@@ -119,11 +119,7 @@ async fn shell_command_handler_to_exec_params_uses_selected_environment() {
     inject_permission_profile_env(&mut expected_env, active_permission_profile.as_ref());
 
     let params = ShellCommandToolCallParams {
-        command: Some(command.clone()),
-        kind: None,
-        program: None,
-        args: None,
-        script_body: None,
+        command,
         workdir,
         login,
         timeout_ms,
@@ -135,7 +131,6 @@ async fn shell_command_handler_to_exec_params_uses_selected_environment() {
 
     let exec_params = ShellCommandHandler::to_exec_params(
         &params,
-        &crate::tools::handlers::command_shape::CommandInvocation::Script(command),
         &session,
         &turn_context,
         &selected_environment,
@@ -205,11 +200,7 @@ async fn shell_command_handler_defaults_to_non_login_when_disallowed() {
         .to_abs_path()
         .expect("native environment cwd");
     let params = ShellCommandToolCallParams {
-        command: Some("echo hello".to_string()),
-        kind: None,
-        program: None,
-        args: None,
-        script_body: None,
+        command: "echo hello".to_string(),
         workdir: None,
         login: None,
         timeout_ms: None,
@@ -221,7 +212,6 @@ async fn shell_command_handler_defaults_to_non_login_when_disallowed() {
 
     let exec_params = ShellCommandHandler::to_exec_params(
         &params,
-        &crate::tools::handlers::command_shape::CommandInvocation::Script("echo hello".to_string()),
         &session,
         &turn_context,
         turn_environment,
@@ -275,39 +265,6 @@ async fn shell_command_pre_tool_use_payload_uses_raw_command() {
         Some(crate::tools::registry::PreToolUsePayload {
             tool_name: HookToolName::bash(),
             tool_input: json!({ "command": "printf shell command" }),
-        })
-    );
-}
-
-#[tokio::test]
-async fn shell_command_pre_tool_use_payload_uses_command_shape_display() {
-    let payload = ToolPayload::Function {
-        arguments: json!({
-            "kind": "argv",
-            "program": "rg",
-            "args": ["--files", "src"]
-        })
-        .to_string(),
-    };
-    let (session, turn) = make_session_and_context().await;
-    let turn = Arc::new(turn);
-    let handler = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic);
-
-    assert_eq!(
-        handler.pre_tool_use_payload(&ToolInvocation {
-            session: session.into(),
-            step_context: StepContext::for_test(Arc::clone(&turn)),
-            turn,
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
-            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-            call_id: "call-43".to_string(),
-            tool_name: codex_tools::ToolName::plain("shell_command"),
-            source: crate::tools::context::ToolCallSource::Direct,
-            payload,
-        }),
-        Some(crate::tools::registry::PreToolUsePayload {
-            tool_name: HookToolName::bash(),
-            tool_input: json!({ "command": "rg --files src" }),
         })
     );
 }

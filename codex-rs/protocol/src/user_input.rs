@@ -101,12 +101,6 @@ impl TextElement {
             .as_deref()
             .or_else(|| text.get(self.byte_range.start..self.byte_range.end))
     }
-
-    pub fn validate_for_text(&self, text: &str) -> Result<(), String> {
-        self.byte_range
-            .validate_for_text(text)
-            .map_err(|err| format!("text element range is invalid: {err}"))
-    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, TS, JsonSchema)]
@@ -117,25 +111,6 @@ pub struct ByteRange {
     pub end: usize,
 }
 
-impl ByteRange {
-    pub fn new(start: usize, end: usize) -> Self {
-        Self { start, end }
-    }
-
-    pub fn validate_for_text(&self, text: &str) -> Result<(), String> {
-        if self.start > self.end {
-            return Err("start must be less than or equal to end".to_string());
-        }
-        if self.end > text.len() {
-            return Err("range end is outside the text".to_string());
-        }
-        if !text.is_char_boundary(self.start) || !text.is_char_boundary(self.end) {
-            return Err("range must fall on a UTF-8 character boundary".to_string());
-        }
-        Ok(())
-    }
-}
-
 impl From<std::ops::Range<usize>> for ByteRange {
     fn from(range: std::ops::Range<usize>) -> Self {
         Self {
@@ -144,57 +119,3 @@ impl From<std::ops::Range<usize>> for ByteRange {
         }
     }
 }
-
-impl UserInput {
-    pub fn validate(&self) -> Result<(), String> {
-        match self {
-            UserInput::Text {
-                text,
-                text_elements,
-            } => {
-                for (idx, element) in text_elements.iter().enumerate() {
-                    element
-                        .validate_for_text(text)
-                        .map_err(|err| format!("text element {idx}: {err}"))?;
-                }
-                Ok(())
-            }
-            UserInput::Image { image_url, .. } => {
-                if image_url.trim().is_empty() {
-                    Err("image_url cannot be empty".to_string())
-                } else {
-                    Ok(())
-                }
-            }
-            UserInput::LocalImage { path, .. } => {
-                if path.as_os_str().is_empty() {
-                    Err("path cannot be empty".to_string())
-                } else {
-                    Ok(())
-                }
-            }
-            UserInput::Skill { name, path } => {
-                if name.trim().is_empty() {
-                    Err("skill name cannot be empty".to_string())
-                } else if path.as_os_str().is_empty() {
-                    Err("skill path cannot be empty".to_string())
-                } else {
-                    Ok(())
-                }
-            }
-            UserInput::Mention { name, path } => {
-                if name.trim().is_empty() {
-                    Err("mention name cannot be empty".to_string())
-                } else if path.trim().is_empty() {
-                    Err("mention path cannot be empty".to_string())
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-#[path = "user_input_tests.rs"]
-mod tests;

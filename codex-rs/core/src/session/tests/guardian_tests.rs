@@ -68,75 +68,8 @@ where
     }
 }
 
-type GuardianTestFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'static>>;
-
-const GUARDIAN_STACK_CHILD_ENV: &str = "CODEX_GUARDIAN_STACK_CHILD";
-
-fn run_guardian_stack_test(name: &'static str, test: fn() -> GuardianTestFuture) {
-    let handle = std::thread::Builder::new()
-        .name(name.to_string())
-        .stack_size(128 * 1024 * 1024)
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_stack_size(128 * 1024 * 1024)
-                .enable_all()
-                .build()
-                .expect("test runtime");
-            runtime.block_on(test());
-        })
-        .expect("spawn test thread");
-    if let Err(payload) = handle.join() {
-        std::panic::resume_unwind(payload);
-    }
-}
-
-fn run_guardian_stack_subprocess_if_needed(test_name: &str) -> bool {
-    if std::env::var_os(GUARDIAN_STACK_CHILD_ENV).is_some() {
-        return false;
-    }
-
-    let exe = std::env::current_exe().expect("current test executable");
-    let output = std::process::Command::new(exe)
-        .env(GUARDIAN_STACK_CHILD_ENV, "1")
-        .env("RUST_MIN_STACK", "67108864")
-        .arg("--exact")
-        .arg(test_name)
-        .arg("--nocapture")
-        .output()
-        .expect("run guardian stack child test");
-
-    if !output.status.success() {
-        panic!(
-            "guardian stack child test failed with status {}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    true
-}
-
-#[test]
-fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
-    if run_guardian_stack_subprocess_if_needed(
-        "session::tests::guardian_tests::request_permissions_routes_to_guardian_when_reviewer_is_enabled",
-    ) {
-        return;
-    }
-
-    run_guardian_stack_test(
-        "request_permissions_routes_to_guardian_when_reviewer_is_enabled",
-        request_permissions_routes_to_guardian_when_reviewer_is_enabled_future,
-    );
-}
-
-fn request_permissions_routes_to_guardian_when_reviewer_is_enabled_future() -> GuardianTestFuture {
-    Box::pin(request_permissions_routes_to_guardian_when_reviewer_is_enabled_impl())
-}
-
-async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled_impl() {
+#[tokio::test]
+async fn request_permissions_routes_to_guardian_when_reviewer_is_enabled() {
     let server = start_mock_server().await;
     let guardian_request_log = mount_sse_once(
         &server,
@@ -432,20 +365,8 @@ async fn guardian_allows_shell_command_additional_permissions_requests_past_poli
     assert!(output.contains("hi"));
 }
 
-#[test]
-fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_skip() {
-    run_guardian_stack_test(
-        "strict_auto_review_shell_command_policy_skip",
-        strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_skip_future,
-    );
-}
-
-fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_skip_future()
--> GuardianTestFuture {
-    Box::pin(strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_skip_impl())
-}
-
-async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_skip_impl() {
+#[tokio::test]
+async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_skip() {
     let server = start_mock_server().await;
     let guardian_request_log = mount_sse_once(
         &server,

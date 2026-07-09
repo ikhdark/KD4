@@ -29,7 +29,6 @@ pub enum SlashCommand {
     Import,
     Hooks,
     Review,
-    Ideas,
     Rename,
     New,
     Archive,
@@ -88,9 +87,6 @@ impl SlashCommand {
             SlashCommand::Init => "create an AGENTS.md file with instructions for Codex",
             SlashCommand::Compact => "summarize conversation to prevent hitting the context limit",
             SlashCommand::Review => "review my current changes and find issues",
-            SlashCommand::Ideas => {
-                "rank repo improvements by impact, risk, affected files, and size"
-            }
             SlashCommand::Rename => "rename the current thread",
             SlashCommand::Resume => "resume a saved chat",
             SlashCommand::Archive => "archive this session and exit",
@@ -158,7 +154,6 @@ impl SlashCommand {
         matches!(
             self,
             SlashCommand::Review
-                | SlashCommand::Ideas
                 | SlashCommand::Rename
                 | SlashCommand::Plan
                 | SlashCommand::Goal
@@ -206,7 +201,6 @@ impl SlashCommand {
             | SlashCommand::Memories
             | SlashCommand::Import
             | SlashCommand::Review
-            | SlashCommand::Ideas
             | SlashCommand::Plan
             | SlashCommand::Clear
             | SlashCommand::Logout
