@@ -3025,7 +3025,7 @@ dependencies = [
 
 [[package]]
 name = "codex-extension-items"
-version = "0.0.0"
+version = "0.143.0"
 dependencies = [
  "codex-utils-absolute-path",
  "pretty_assertions",
@@ -4493,7 +4493,7 @@ dependencies = [
 
 [[package]]
 name = "codex-websocket-client"
-version = "0.0.0"
+version = "0.143.0"
 dependencies = [
  "codex-http-client",
  "codex-utils-rustls-provider",
