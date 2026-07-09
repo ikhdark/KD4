@@ -13,7 +13,12 @@ RG_MANIFEST = REPO_ROOT / "scripts" / "codex_package" / "rg"
 
 def resolve_rg_bin(spec: TargetSpec, rg_bin: Path | None) -> Path:
     if rg_bin is not None:
-        return resolve_input_path(rg_bin, "ripgrep executable", "--rg-bin")
+        return resolve_input_path(
+            rg_bin,
+            "ripgrep executable",
+            "--rg-bin",
+            canonicalize=False,
+        )
 
     return fetch_rg(spec)
 

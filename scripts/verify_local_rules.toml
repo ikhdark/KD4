@@ -1,0 +1,227 @@
+# Special verify-local surfaces. Keep ordinary Rust ownership in cargo metadata.
+
+[[surface]]
+id = "command-safety-shape"
+owned_packages = ["codex-core"]
+paths = [
+  "codex-rs/core/src/tools/handlers/command_shape.rs",
+  "codex-rs/core/src/tools/handlers/command_shape_tests.rs",
+]
+test_expr = """
+test(command_shape)
+"""
+
+[[surface]]
+id = "command-safety-shell"
+owned_packages = ["codex-core"]
+paths = [
+  "codex-rs/core/src/tools/handlers/shell/shell_command.rs",
+  "codex-rs/core/src/tools/handlers/shell.rs",
+  "codex-rs/core/src/tools/handlers/shell_tests.rs",
+]
+test_expr = """
+test(shell_command_handler_supports_powershell_script_body_mode)
+| test(test_get_command_supports_powershell_script_body_mode)
+| test(runtime_encoded_powershell_uses_plain_script_for_safety)
+| test(shell_command_handler)
+"""
+
+[[surface]]
+id = "command-safety-unified-exec"
+owned_packages = ["codex-core"]
+paths = [
+  "codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs",
+  "codex-rs/core/src/tools/handlers/unified_exec.rs",
+  "codex-rs/core/src/tools/runtimes/unified_exec.rs",
+]
+test_expr = """
+test(test_get_command_supports_powershell_script_body_mode)
+| test(runtime_encoded_powershell_uses_plain_script_for_safety)
+"""
+
+[[surface]]
+id = "command-safety-exec-policy"
+owned_packages = ["codex-core"]
+paths = [
+  "codex-rs/core/src/exec_policy.rs",
+  "codex-rs/core/src/exec_policy_tests.rs",
+  "codex-rs/core/src/exec_policy_windows_tests.rs",
+]
+test_expr = """
+test(opaque_powershell_commands_require_approval)
+| test(exec_approval_requirement)
+"""
+
+[[surface]]
+id = "app-server-schema"
+owned_packages = ["codex-app-server", "codex-app-server-protocol"]
+paths = [
+  "codex-rs/app-server-protocol/src",
+  "codex-rs/app-server-protocol/schema",
+  "scripts/app_server_schema_runtime_check.py",
+]
+validation_command = ["just", "app-server-schema-check"]
+regen_command = ["just", "app-server-schema-check-force"]
+skip_owner_tests = true
+# Mirrors SCHEMA_INPUTS in scripts/app_server_schema_runtime_check.py.
+hash_paths = [
+  "codex-rs/app-server-protocol/Cargo.toml",
+  "codex-rs/protocol/Cargo.toml",
+  "codex-rs/protocol/src",
+]
+
+[[surface]]
+id = "app-server-command-exec"
+owned_packages = ["codex-app-server"]
+paths = [
+  "codex-rs/app-server/src/command_exec.rs",
+  "codex-rs/app-server/src/output_batcher.rs",
+  "codex-rs/app-server/tests/suite/v2/command_exec.rs",
+]
+validation_command = ["just", "app-server-command-exec-check"]
+skip_owner_tests = true
+
+[[surface]]
+id = "app-server-process-exec"
+owned_packages = ["codex-app-server"]
+paths = [
+  "codex-rs/app-server/src/request_processors/process_exec_processor.rs",
+  "codex-rs/app-server/tests/suite/v2/process_exec.rs",
+]
+validation_command = ["just", "app-server-process-exec-check"]
+skip_owner_tests = true
+
+[[surface]]
+id = "app-server-thread-status"
+owned_packages = ["codex-app-server"]
+paths = [
+  "codex-rs/app-server/src/thread_status.rs",
+  "codex-rs/app-server/src/request_processors/thread_processor.rs",
+  "codex-rs/app-server/src/request_processors/turn_processor.rs",
+  "codex-rs/app-server/tests/suite/v2/thread_status.rs",
+  "codex-rs/app-server/tests/suite/v2/thread_resume.rs",
+  "codex-rs/app-server/tests/suite/v2/turn_start.rs",
+]
+validation_command = ["just", "app-server-thread-status-check"]
+skip_owner_tests = true
+
+[[surface]]
+id = "app-server-runtime-shared"
+owned_packages = ["codex-app-server"]
+paths = [
+  "codex-rs/app-server/src/lib.rs",
+  "codex-rs/app-server/src/request_processors.rs",
+  "codex-rs/app-server/src/request_processors/mod.rs",
+]
+validation_command = ["just", "app-server-runtime-check"]
+skip_owner_tests = true
+
+[[surface]]
+id = "config-schema"
+owned_packages = ["codex-core", "codex-config"]
+paths = [
+  "codex-rs/config/src",
+  "codex-rs/config/AGENTS.md",
+  "codex-rs/core/src/config/schema.rs",
+  "codex-rs/core/src/config/schema_tests.rs",
+  "codex-rs/core/src/bin/config_schema.rs",
+  "codex-rs/core/config.schema.json",
+  "scripts/config_schema_check.py",
+]
+validation_command = ["just", "config-schema-check"]
+regen_command = ["just", "config-schema-check-force"]
+skip_owner_tests = true
+# Mirrors SCHEMA_INPUTS in scripts/config_schema_check.py.
+hash_paths = [
+  "codex-rs/config/Cargo.toml",
+  "codex-rs/core/Cargo.toml",
+  "codex-rs/features/Cargo.toml",
+  "codex-rs/features/src",
+  "codex-rs/protocol/Cargo.toml",
+  "codex-rs/protocol/src",
+]
+
+[[surface]]
+id = "vscode-runtime-proof"
+owned_packages = []
+paths = [
+  "docs/local-build-publish-map.md",
+  "docs/install.md",
+  "scripts/vscode_runtime_proof.py",
+]
+validation_command = ["python", "scripts/vscode_runtime_proof.py", "--no-run-codex"]
+skip_owner_tests = true
+
+[[surface]]
+id = "tui-large-widget-risk"
+owned_packages = ["codex-tui"]
+paths = [
+  "codex-rs/tui/src/bottom_pane/chat_composer.rs",
+  "codex-rs/tui/src/bottom_pane/chat_composer",
+  "codex-rs/tui/src/resume_picker.rs",
+  "codex-rs/tui/src/resume_picker",
+]
+validation_command = ["just", "tui-large-widget-check"]
+skip_owner_tests = true
+
+[[surface]]
+id = "source-discovery"
+owned_packages = ["codex-core", "codex-file-search"]
+paths = [
+  "codex-rs/core/src/tools/handlers/source.rs",
+  "codex-rs/core/src/tools/handlers/source_spec.rs",
+  "codex-rs/core/src/source_evidence.rs",
+  "codex-rs/file-search/src/source_search.rs",
+  "codex-rs/file-search/src/source_routes.rs",
+  "codex-rs/SOURCE_MAP.md",
+]
+validation_command = ["just", "source-discovery-check"]
+skip_owner_tests = true
+
+[[surface]]
+id = "sdk-typescript"
+owned_packages = []
+paths = [
+  "sdk/typescript",
+]
+hash_paths = [
+  "pnpm-workspace.yaml",
+  "pnpm-lock.yaml",
+]
+validation_command = ["just", "sdk-ts-check"]
+skip_owner_tests = true
+
+[[surface]]
+id = "sdk-python"
+owned_packages = []
+paths = [
+  "sdk/python",
+]
+validation_command = ["just", "sdk-python-check"]
+skip_owner_tests = true
+
+[[surface]]
+id = "codex-cli-wrapper"
+owned_packages = []
+paths = [
+  "codex-cli/bin/codex.js",
+  "codex-cli/package.json",
+]
+hash_paths = [
+  "eslint.config.mjs",
+  "package.json",
+]
+validation_command = ["just", "codex-cli-wrapper-check"]
+skip_owner_tests = true
+
+[[surface]]
+id = "dependency-cleanup"
+owned_packages = ["codex-cli"]
+paths = [
+  "codex-rs/deny.toml",
+  "codex-rs/Cargo.toml",
+  "codex-rs/Cargo.lock",
+  "docs/dependency-cleanup.md",
+]
+validation_command = ["just", "deps-policy-check"]
+skip_owner_tests = true

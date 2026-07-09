@@ -19,11 +19,23 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+query_command=(bazel)
+if [[ -n "${BAZEL_OUTPUT_USER_ROOT:-}" ]]; then
+  query_command+=("--output_user_root=${BAZEL_OUTPUT_USER_ROOT}")
+fi
+query_command+=(--noexperimental_remote_repo_contents_cache query)
+if [[ -n "${BAZEL_REPO_CONTENTS_CACHE:-}" ]]; then
+  query_command+=("--repo_contents_cache=${BAZEL_REPO_CONTENTS_CACHE}")
+fi
+if [[ -n "${BAZEL_REPOSITORY_CACHE:-}" ]]; then
+  query_command+=("--repository_cache=${BAZEL_REPOSITORY_CACHE}")
+fi
+
 # Resolve the dynamic targets before printing anything so callers do not
 # continue with a partial list if `bazel query` fails. Target discovery is
 # local on all platforms.
 manual_rust_test_targets="$(
-  ./.github/scripts/run-bazel-query-ci.sh \
+  "${query_command[@]}" \
     --output=label \
     -- 'kind("rust_test rule", attr(tags, "manual", //codex-rs/... except //codex-rs/v8-poc/...))'
 )"

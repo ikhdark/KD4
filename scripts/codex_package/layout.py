@@ -1,9 +1,12 @@
 """Canonical Codex package directory layout."""
 
 import json
+import os
+import platform
 import shutil
 import stat
 from pathlib import Path
+from pathlib import PureWindowsPath
 
 from .targets import PackageInputs
 from .targets import PackageVariant
@@ -12,23 +15,51 @@ from .zsh import ZSH_RESOURCE_PATH
 
 
 LAYOUT_VERSION = 1
+APPLY_PATCH_ALIASES = ("apply_patch", "applypatch")
+CODEX_CORE_APPLY_PATCH_ARG1 = "--codex-run-as-apply-patch"
 
 
-def prepare_package_dir(package_dir: Path, *, force: bool) -> None:
+def prepare_package_dir(package_dir: Path, *, force: bool, reuse: bool = False) -> None:
     if package_dir.exists():
         if not package_dir.is_dir():
             raise RuntimeError(
                 f"Package output exists and is not a directory: {package_dir}"
             )
-        if any(package_dir.iterdir()):
+        if reuse:
+            clean_managed_package_paths(package_dir)
+        if any(package_dir.iterdir()) and not reuse:
             if not force:
                 raise RuntimeError(
                     f"Package output directory is not empty: {package_dir}. "
                     "Pass --force to replace it."
                 )
-            shutil.rmtree(package_dir)
+            remove_tree_allow_readonly(package_dir)
 
     package_dir.mkdir(parents=True, exist_ok=True)
+
+
+def clean_managed_package_paths(package_dir: Path) -> None:
+    for relative_path in [
+        Path("bin"),
+        Path("codex-resources"),
+        Path("codex-path"),
+        Path("codex-package.json"),
+    ]:
+        path = package_dir / relative_path
+        if path.is_dir():
+            remove_tree_allow_readonly(path)
+        else:
+            path.unlink(missing_ok=True)
+
+
+def remove_tree_allow_readonly(path: Path) -> None:
+    # Windows rmtree aborts on read-only files (e.g. git pack files); clear
+    # the attribute and retry.
+    def _onexc(func, failed_path, _exc):
+        os.chmod(failed_path, stat.S_IWRITE)
+        func(failed_path)
+
+    shutil.rmtree(path, onexc=_onexc)
 
 
 def build_package_dir(
@@ -41,9 +72,9 @@ def build_package_dir(
     bin_dir = package_dir / "bin"
     resources_dir = package_dir / "codex-resources"
     path_dir = package_dir / "codex-path"
-    bin_dir.mkdir()
-    resources_dir.mkdir()
-    path_dir.mkdir()
+    bin_dir.mkdir(exist_ok=True)
+    resources_dir.mkdir(exist_ok=True)
+    path_dir.mkdir(exist_ok=True)
 
     entrypoint_name = variant.entrypoint_name(spec)
     copy_executable(
@@ -52,11 +83,17 @@ def build_package_dir(
         is_windows=spec.is_windows,
     )
     copy_executable(
-        inputs.code_mode_host_bin,
-        bin_dir / f"codex-code-mode-host{spec.exe_suffix}",
+        inputs.rg_bin,
+        path_dir / spec.rg_name,
         is_windows=spec.is_windows,
+        prefer_hardlink=True,
     )
-    copy_executable(inputs.rg_bin, path_dir / spec.rg_name, is_windows=spec.is_windows)
+    if spec.is_windows:
+        for alias in APPLY_PATCH_ALIASES:
+            write_windows_apply_patch_alias(
+                path_dir / f"{alias}.bat",
+                PureWindowsPath("..") / "bin" / entrypoint_name,
+            )
 
     if inputs.zsh_bin is not None:
         copy_executable(
@@ -99,7 +136,9 @@ def validate_package_dir(
     variant: PackageVariant,
     spec: TargetSpec,
     *,
+    expected_version: str | None = None,
     include_zsh: bool,
+    fast: bool = False,
 ) -> None:
     required_dirs = [
         Path("bin"),
@@ -126,6 +165,8 @@ def validate_package_dir(
         "resourcesDir": "codex-resources",
         "pathDir": "codex-path",
     }
+    if expected_version is not None:
+        expected_metadata["version"] = expected_version
     for key, expected in expected_metadata.items():
         actual = metadata.get(key)
         if actual != expected:
@@ -135,7 +176,6 @@ def validate_package_dir(
 
     required_files = [
         Path("bin") / variant.entrypoint_name(spec),
-        Path("bin") / f"codex-code-mode-host{spec.exe_suffix}",
         Path("codex-path") / spec.rg_name,
     ]
     executable_files = list(required_files)
@@ -154,6 +194,7 @@ def validate_package_dir(
             [
                 Path("codex-resources") / "codex-command-runner.exe",
                 Path("codex-resources") / "codex-windows-sandbox-setup.exe",
+                *[Path("codex-path") / f"{alias}.bat" for alias in APPLY_PATCH_ALIASES],
             ]
         )
 
@@ -162,19 +203,69 @@ def validate_package_dir(
         if not path.is_file():
             raise RuntimeError(f"Missing package file: {relative_file}")
 
-    if not spec.is_windows:
+    if spec.is_windows:
+        expected_alias_text = windows_apply_patch_alias_text(
+            PureWindowsPath("..") / "bin" / variant.entrypoint_name(spec)
+        )
+        for alias in APPLY_PATCH_ALIASES:
+            relative_file = Path("codex-path") / f"{alias}.bat"
+            actual = (package_dir / relative_file).read_text(encoding="utf-8")
+            if actual != expected_alias_text:
+                raise RuntimeError(f"Invalid package file contents: {relative_file}")
+
+    if not spec.is_windows and not fast:
         for relative_file in executable_files:
             path = package_dir / relative_file
             if not is_executable(path):
                 raise RuntimeError(f"Package file is not executable: {relative_file}")
 
 
-def copy_executable(src: Path, dest: Path, *, is_windows: bool) -> None:
+def copy_executable(
+    src: Path,
+    dest: Path,
+    *,
+    is_windows: bool,
+    prefer_hardlink: bool | None = None,
+) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, dest)
+    copy_file_for_staging(
+        src,
+        dest,
+        prefer_hardlink=is_windows if prefer_hardlink is None else prefer_hardlink,
+    )
     if not is_windows:
         mode = dest.stat().st_mode
         dest.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def write_windows_apply_patch_alias(
+    path: Path, entrypoint_relative_path: PureWindowsPath
+) -> None:
+    path.write_text(
+        windows_apply_patch_alias_text(entrypoint_relative_path),
+        encoding="utf-8",
+    )
+
+
+def windows_apply_patch_alias_text(entrypoint_relative_path: PureWindowsPath) -> str:
+    return "\n".join(
+        [
+            "@echo off",
+            f'"%~dp0{entrypoint_relative_path}" {CODEX_CORE_APPLY_PATCH_ARG1} %*',
+            "",
+        ]
+    )
+
+
+def copy_file_for_staging(src: Path, dest: Path, *, prefer_hardlink: bool) -> None:
+    dest.unlink(missing_ok=True)
+    if prefer_hardlink:
+        try:
+            os.link(src, dest)
+            return
+        except OSError:
+            pass
+    shutil.copyfile(src, dest)
 
 
 def write_json(path: Path, value: object) -> None:
@@ -184,4 +275,7 @@ def write_json(path: Path, value: object) -> None:
 
 
 def is_executable(path: Path) -> bool:
-    return bool(path.stat().st_mode & stat.S_IXUSR)
+    if platform.system().lower() == "windows":
+        return path.is_file()
+
+    return bool(path.stat().st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH))

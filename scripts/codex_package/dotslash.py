@@ -1,5 +1,7 @@
 """Fetch executable artifacts from checked-in DotSlash manifests."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import shutil
@@ -8,6 +10,7 @@ import tarfile
 import tempfile
 import zipfile
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen
@@ -16,6 +19,13 @@ from .targets import TargetSpec
 
 
 DOWNLOAD_TIMEOUT_SECS = 60
+HASH_CHUNK_BYTES = 8 * 1024 * 1024
+
+
+_FETCHED_EXECUTABLES: dict[
+    tuple[str, Path, str, str, bool], tuple[Path, DotSlashArtifact] | None
+] = {}
+_JSON_STAMP_CACHE: dict[Path, tuple[tuple[int, int] | None, dict | None]] = {}
 
 
 @dataclass(frozen=True)
@@ -36,6 +46,22 @@ def fetch_dotslash_executable(
     dest_name: str,
     missing_ok: bool = False,
 ) -> Path | None:
+    cache_key_tuple = (
+        spec.target,
+        manifest_path,
+        cache_key,
+        dest_name,
+        missing_ok,
+    )
+    if cache_key_tuple in _FETCHED_EXECUTABLES:
+        cached = _FETCHED_EXECUTABLES[cache_key_tuple]
+        if cached is None:
+            return None
+        cached_dest, cached_artifact = cached
+        if extracted_member_is_valid(cached_dest, cached_artifact):
+            return cached_dest
+        _FETCHED_EXECUTABLES.pop(cache_key_tuple, None)
+
     artifact = artifact_for_target(
         spec,
         manifest_path,
@@ -43,10 +69,16 @@ def fetch_dotslash_executable(
         missing_ok=missing_ok,
     )
     if artifact is None:
+        _FETCHED_EXECUTABLES[cache_key_tuple] = None
         return None
 
     cache_dir = default_cache_root() / cache_key
     archive_path = cache_dir / archive_filename(artifact.url)
+    dest = cache_dir / dest_name
+
+    if extracted_member_is_valid(dest, artifact):
+        _FETCHED_EXECUTABLES[cache_key_tuple] = (dest, artifact)
+        return dest
 
     if not archive_is_valid(archive_path, artifact, artifact_label):
         download_archive(artifact.url, archive_path)
@@ -56,12 +88,19 @@ def fetch_dotslash_executable(
             archive_path.unlink(missing_ok=True)
             raise
 
-    dest = cache_dir / dest_name
     extract_archive_member(archive_path, artifact, dest, artifact_label)
     if not spec.is_windows:
         mode = dest.stat().st_mode
         dest.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    write_extracted_member_stamp(dest, artifact)
+    _FETCHED_EXECUTABLES[cache_key_tuple] = (dest, artifact)
     return dest
+
+
+def clear_runtime_caches() -> None:
+    _FETCHED_EXECUTABLES.clear()
+    _JSON_STAMP_CACHE.clear()
+    load_manifest.cache_clear()
 
 
 def artifact_for_target(
@@ -104,6 +143,7 @@ def artifact_for_target(
     )
 
 
+@lru_cache(maxsize=None)
 def load_manifest(manifest_path: Path) -> dict:
     text = manifest_path.read_text(encoding="utf-8")
     if text.startswith("#!"):
@@ -129,6 +169,8 @@ def archive_is_valid(
 ) -> bool:
     if not archive_path.is_file():
         return False
+    if verified_archive_stamp_matches(archive_path, artifact):
+        return True
     try:
         verify_archive(archive_path, artifact, artifact_label)
     except RuntimeError:
@@ -151,7 +193,7 @@ def verify_archive(
 
     digest = hashlib.sha256()
     with open(archive_path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+        for chunk in iter(lambda: fh.read(HASH_CHUNK_BYTES), b""):
             digest.update(chunk)
 
     actual_digest = digest.hexdigest()
@@ -160,19 +202,128 @@ def verify_archive(
             f"{artifact_label} archive {archive_path} has sha256 {actual_digest}, "
             f"expected {artifact.digest}"
         )
+    write_verified_archive_stamp(archive_path, artifact)
 
 
 def download_archive(url: str, archive_path: Path) -> None:
     archive_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = archive_path.with_suffix(f"{archive_path.suffix}.tmp")
-    temp_path.unlink(missing_ok=True)
+    temp_file = tempfile.NamedTemporaryFile(
+        prefix=f"{archive_path.name}.",
+        suffix=".tmp",
+        dir=archive_path.parent,
+        delete=False,
+    )
+    temp_path = Path(temp_file.name)
     try:
-        with urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECS) as response:
-            with open(temp_path, "wb") as out:
-                shutil.copyfileobj(response, out)
+        with temp_file as out:
+            with urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECS) as response:
+                shutil.copyfileobj(response, out, length=HASH_CHUNK_BYTES)
         temp_path.replace(archive_path)
     finally:
         temp_path.unlink(missing_ok=True)
+
+
+def verified_archive_stamp_matches(
+    archive_path: Path,
+    artifact: DotSlashArtifact,
+) -> bool:
+    stamp = read_json_stamp(verified_archive_stamp_path(archive_path))
+    return stamp == {
+        "kind": "dotslash-archive",
+        "url": artifact.url,
+        "size": artifact.size,
+        "digest": artifact.digest,
+        "file": file_stamp(archive_path),
+    }
+
+
+def write_verified_archive_stamp(
+    archive_path: Path,
+    artifact: DotSlashArtifact,
+) -> None:
+    write_json_stamp(
+        verified_archive_stamp_path(archive_path),
+        {
+            "kind": "dotslash-archive",
+            "url": artifact.url,
+            "size": artifact.size,
+            "digest": artifact.digest,
+            "file": file_stamp(archive_path),
+        },
+    )
+
+
+def verified_archive_stamp_path(archive_path: Path) -> Path:
+    return archive_path.with_name(f"{archive_path.name}.verified.json")
+
+
+def extracted_member_is_valid(dest: Path, artifact: DotSlashArtifact) -> bool:
+    if not dest.is_file():
+        return False
+    stamp = read_json_stamp(extracted_member_stamp_path(dest))
+    return stamp == {
+        "kind": "dotslash-extracted-member",
+        "archive_digest": artifact.digest,
+        "archive_format": artifact.archive_format,
+        "archive_member": artifact.archive_member,
+        "url": artifact.url,
+        "file": file_stamp(dest),
+    }
+
+
+def write_extracted_member_stamp(dest: Path, artifact: DotSlashArtifact) -> None:
+    write_json_stamp(
+        extracted_member_stamp_path(dest),
+        {
+            "kind": "dotslash-extracted-member",
+            "archive_digest": artifact.digest,
+            "archive_format": artifact.archive_format,
+            "archive_member": artifact.archive_member,
+            "url": artifact.url,
+            "file": file_stamp(dest),
+        },
+    )
+
+
+def extracted_member_stamp_path(dest: Path) -> Path:
+    return dest.with_name(f"{dest.name}.extracted.json")
+
+
+def file_stamp(path: Path) -> dict[str, int]:
+    stat_result = path.stat()
+    return {
+        "size": stat_result.st_size,
+        "mtime_ns": stat_result.st_mtime_ns,
+    }
+
+
+def stamp_cache_key(path: Path) -> tuple[int, int] | None:
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return None
+    return stat_result.st_size, stat_result.st_mtime_ns
+
+
+def read_json_stamp(path: Path) -> dict | None:
+    cache_key = stamp_cache_key(path)
+    cached = _JSON_STAMP_CACHE.get(path)
+    if cached is not None and cached[0] == cache_key:
+        return cached[1]
+
+    try:
+        stamp = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        stamp = None
+    _JSON_STAMP_CACHE[path] = (cache_key, stamp)
+    return stamp
+
+
+def write_json_stamp(path: Path, value: dict) -> None:
+    path.write_text(
+        json.dumps(value, sort_keys=True, indent=2) + "\n", encoding="utf-8"
+    )
+    _JSON_STAMP_CACHE[path] = (stamp_cache_key(path), value)
 
 
 def extract_archive_member(
