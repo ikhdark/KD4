@@ -16,6 +16,9 @@ use app_test_support::write_mock_responses_config_toml_with_chatgpt_base_url;
 use app_test_support::write_models_cache;
 use codex_app_server::INPUT_TOO_LARGE_ERROR_CODE;
 use codex_app_server::INVALID_PARAMS_ERROR_CODE;
+use codex_app_server::INVALID_TEXT_ELEMENT_RANGE_ERROR_CODE;
+use codex_app_server::TURN_START_INVALID_ENVIRONMENT_ERROR_CODE;
+use codex_app_server::TURN_START_INVALID_THREAD_SETTINGS_ERROR_CODE;
 use codex_app_server_protocol::AdditionalContextEntry;
 use codex_app_server_protocol::AdditionalContextKind;
 use codex_app_server_protocol::ByteRange;
@@ -576,6 +579,87 @@ async fn turn_start_emits_user_message_item_with_text_elements() -> Result<()> {
         mcp.read_stream_until_notification_message("turn/completed"),
     )
     .await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn turn_start_rejects_invalid_text_element_range_before_starting_turn() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    create_config_toml(
+        codex_home.path(),
+        "http://localhost/unused",
+        "never",
+        &BTreeMap::from([(Feature::Personality, true)]),
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let thread_req = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            model: Some("mock-model".to_string()),
+            thread_source: Some(ThreadSource::User),
+            ..Default::default()
+        })
+        .await?;
+    let thread_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_req)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response::<ThreadStartResponse>(thread_resp)?;
+
+    let turn_req = mcp
+        .send_turn_start_request(TurnStartParams {
+            thread_id: thread.id,
+            client_user_message_id: None,
+            input: vec![V2UserInput::Text {
+                text: "é".to_string(),
+                text_elements: vec![TextElement::new(
+                    ByteRange { start: 1, end: 2 },
+                    Some("<partial>".to_string()),
+                )],
+            }],
+            ..Default::default()
+        })
+        .await?;
+    let err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(turn_req)),
+    )
+    .await??;
+
+    assert_eq!(err.error.code, INVALID_PARAMS_ERROR_CODE);
+    assert!(
+        err.error.message.contains("not_char_boundary"),
+        "unexpected error message: {}",
+        err.error.message
+    );
+    let data = err.error.data.expect("expected structured error data");
+    assert_eq!(
+        data["input_error_code"],
+        INVALID_TEXT_ELEMENT_RANGE_ERROR_CODE
+    );
+    assert_eq!(data["input_index"], 0);
+    assert_eq!(data["text_element_index"], 0);
+    assert_eq!(data["start"], 1);
+    assert_eq!(data["end"], 2);
+    assert_eq!(data["text_bytes"], 2);
+    assert_eq!(data["reason"], "not_char_boundary");
+
+    let turn_started = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        mcp.read_stream_until_notification_message("turn/started"),
+    )
+    .await;
+    assert!(
+        turn_started.is_err(),
+        "did not expect a turn/started notification for invalid text element range"
+    );
 
     Ok(())
 }
@@ -1321,6 +1405,15 @@ async fn turn_start_rejects_invalid_permission_selection_before_starting_turn() 
         "unexpected error message: {}",
         err.error.message
     );
+    let data = err
+        .error
+        .data
+        .expect("expected structured turn/start error data");
+    assert_eq!(
+        data["turn_start_error_code"],
+        TURN_START_INVALID_THREAD_SETTINGS_ERROR_CODE
+    );
+    assert_eq!(data["stage"], "thread_settings");
     let turn_started = tokio::time::timeout(
         std::time::Duration::from_millis(250),
         mcp.read_stream_until_notification_message("turn/started"),
@@ -1391,6 +1484,15 @@ async fn turn_start_rejects_unknown_environment_before_starting_turn() -> Result
     assert_eq!(err.id, RequestId::Integer(turn_req));
     assert_eq!(err.error.code, INVALID_REQUEST_ERROR_CODE);
     assert_eq!(err.error.message, "unknown turn environment id `missing`");
+    let data = err
+        .error
+        .data
+        .expect("expected structured turn/start error data");
+    assert_eq!(
+        data["turn_start_error_code"],
+        TURN_START_INVALID_ENVIRONMENT_ERROR_CODE
+    );
+    assert_eq!(data["stage"], "environments");
     let turn_started = tokio::time::timeout(
         std::time::Duration::from_millis(250),
         mcp.read_stream_until_notification_message("turn/started"),

@@ -160,7 +160,6 @@ impl TurnRequestProcessor {
         app_server_client_version: Option<String>,
         supports_openai_form_elicitation: bool,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        validate_user_input_image_urls(&params.input)?;
         self.turn_start_inner(
             request_id,
             params,
@@ -431,12 +430,91 @@ impl TurnRequestProcessor {
         error
     }
 
+    fn invalid_text_element_range_error(
+        input_index: usize,
+        text_element_index: usize,
+        text_bytes: usize,
+        start: usize,
+        end: usize,
+        reason: &'static str,
+    ) -> JSONRPCErrorError {
+        let mut error = invalid_params(format!(
+            "textElements[{text_element_index}] byte range is invalid for input[{input_index}]: {reason}"
+        ));
+        error.data = Some(serde_json::json!({
+            "input_error_code": INVALID_TEXT_ELEMENT_RANGE_ERROR_CODE,
+            "input_index": input_index,
+            "text_element_index": text_element_index,
+            "start": start,
+            "end": end,
+            "text_bytes": text_bytes,
+            "reason": reason,
+        }));
+        error
+    }
+
     fn validate_v2_input_limit(items: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
         let actual_chars: usize = items.iter().map(V2UserInput::text_char_count).sum();
         if actual_chars > MAX_USER_INPUT_TEXT_CHARS {
             return Err(Self::input_too_large_error(actual_chars));
         }
         Ok(())
+    }
+
+    fn validate_v2_text_element_ranges(items: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
+        for (input_index, item) in items.iter().enumerate() {
+            let V2UserInput::Text {
+                text,
+                text_elements,
+            } = item
+            else {
+                continue;
+            };
+            let text_bytes = text.len();
+            for (text_element_index, text_element) in text_elements.iter().enumerate() {
+                let start = text_element.byte_range.start;
+                let end = text_element.byte_range.end;
+                let reason = if start > end {
+                    Some("start_after_end")
+                } else if end > text_bytes {
+                    Some("end_out_of_bounds")
+                } else if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+                    Some("not_char_boundary")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    return Err(Self::invalid_text_element_range_error(
+                        input_index,
+                        text_element_index,
+                        text_bytes,
+                        start,
+                        end,
+                        reason,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn turn_start_preflight_error_data(
+        mut error: JSONRPCErrorError,
+        error_code: &'static str,
+        stage: &'static str,
+    ) -> JSONRPCErrorError {
+        let details = error.data.take();
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "turn_start_error_code".to_string(),
+            serde_json::json!(error_code),
+        );
+        data.insert("stage".to_string(), serde_json::json!(stage));
+        if let Some(details) = details {
+            data.insert("details".to_string(), details);
+        }
+        error.data = Some(serde_json::Value::Object(data));
+        error
     }
 
     async fn turn_start_inner(
@@ -463,6 +541,14 @@ impl TurnRequestProcessor {
             );
             return Err(error);
         }
+        if let Err(error) = Self::validate_v2_text_element_ranges(&params.input) {
+            self.track_error_response(&request_id, &error, /*error_type*/ None);
+            return Err(error);
+        }
+        if let Err(error) = validate_user_input_image_urls(&params.input) {
+            self.track_error_response(&request_id, &error, /*error_type*/ None);
+            return Err(error);
+        }
         Self::set_app_server_client_info(
             thread.as_ref(),
             app_server_client_name,
@@ -482,7 +568,16 @@ impl TurnRequestProcessor {
             })?;
 
         let environment_selections =
-            resolve_turn_environment_selections(self.thread_manager.as_ref(), params.environments)?;
+            resolve_turn_environment_selections(self.thread_manager.as_ref(), params.environments)
+                .map_err(|error| {
+                    let error = Self::turn_start_preflight_error_data(
+                        error,
+                        TURN_START_INVALID_ENVIRONMENT_ERROR_CODE,
+                        "environments",
+                    );
+                    self.track_error_response(&request_id, &error, /*error_type*/ None);
+                    error
+                })?;
 
         // Map v2 input items to core input items.
         let mapped_items: Vec<CoreInputItem> = params
@@ -516,7 +611,16 @@ impl TurnRequestProcessor {
                     personality: params.personality,
                 },
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                let error = Self::turn_start_preflight_error_data(
+                    error,
+                    TURN_START_INVALID_THREAD_SETTINGS_ERROR_CODE,
+                    "thread_settings",
+                );
+                self.track_error_response(&request_id, &error, /*error_type*/ None);
+                error
+            })?;
 
         // Start the turn by submitting the user input. Return its submission id as turn_id.
         let turn_op = Op::UserInput {

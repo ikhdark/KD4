@@ -131,27 +131,7 @@ fn is_safe_to_call_with_exec(command: &[String]) -> bool {
         }
 
         // Ripgrep
-        Some("rg") => {
-            const UNSAFE_RIPGREP_OPTIONS_WITH_ARGS: &[&str] = &[
-                // Takes an arbitrary command that is executed for each match.
-                "--pre",
-                // Takes a command that can be used to obtain the local hostname.
-                "--hostname-bin",
-            ];
-            const UNSAFE_RIPGREP_OPTIONS_WITHOUT_ARGS: &[&str] = &[
-                // Calls out to other decompression tools, so do not auto-approve
-                // out of an abundance of caution.
-                "--search-zip",
-                "-z",
-            ];
-
-            !command.iter().any(|arg| {
-                UNSAFE_RIPGREP_OPTIONS_WITHOUT_ARGS.contains(&arg.as_str())
-                    || UNSAFE_RIPGREP_OPTIONS_WITH_ARGS
-                        .iter()
-                        .any(|&opt| arg == opt || arg.starts_with(&format!("{opt}=")))
-            })
-        }
+        Some("rg") => !command.iter().any(|arg| crate::rg::is_unsafe_option(arg)),
 
         // Git
         Some("git") => is_safe_git_command(command),

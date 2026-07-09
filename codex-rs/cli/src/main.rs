@@ -165,6 +165,9 @@ enum Subcommand {
     /// Diagnose local Codex installation, config, auth, and runtime health.
     Doctor(DoctorCommand),
 
+    /// Inspect Codex configuration options.
+    Config(ConfigCommand),
+
     /// Run commands within a Codex-provided sandbox.
     Sandbox(HostSandboxArgs),
 
@@ -218,6 +221,24 @@ struct CompletionCommand {
     /// Shell to generate completions for
     #[clap(value_enum, default_value_t = Shell::Bash)]
     shell: Shell,
+}
+
+#[derive(Debug, Parser)]
+struct ConfigCommand {
+    #[command(subcommand)]
+    subcommand: ConfigSubcommand,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ConfigSubcommand {
+    /// Explain config.toml options in plain English.
+    Explain(ConfigExplainCommand),
+}
+
+#[derive(Debug, Parser)]
+struct ConfigExplainCommand {
+    /// Optional option name, group, or text to filter by.
+    filter: Option<String>,
 }
 
 #[derive(Debug, Parser)]
@@ -1424,6 +1445,19 @@ async fn cli_main(
             )
             .await?;
         }
+        Some(Subcommand::Config(ConfigCommand { subcommand })) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                "config",
+            )?;
+            match subcommand {
+                ConfigSubcommand::Explain(cmd) => {
+                    let rendered = codex_config::render_config_explain(cmd.filter.as_deref());
+                    println!("{}", rendered.trim_end());
+                }
+            }
+        }
         Some(Subcommand::Cloud(mut cloud_cli)) => {
             reject_remote_mode_for_subcommand(
                 root_remote.as_deref(),
@@ -2129,6 +2163,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::Logout(_)) => Some("logout"),
         Some(Subcommand::Completion(_)) => Some("completion"),
         Some(Subcommand::Update) => Some("update"),
+        Some(Subcommand::Config(_)) => Some("config"),
         Some(Subcommand::Cloud(_)) => Some("cloud"),
         Some(Subcommand::Sandbox(_)) => Some("sandbox"),
         Some(Subcommand::Debug(_)) => Some("debug"),
@@ -3994,6 +4029,17 @@ mod tests {
             panic!("expected features disable");
         };
         assert_eq!(feature, "shell_tool");
+    }
+
+    #[test]
+    fn config_explain_parses_optional_filter() {
+        let cli = MultitoolCli::try_parse_from(["codex", "config", "explain", "sandbox_mode"])
+            .expect("parse should succeed");
+        let Some(Subcommand::Config(ConfigCommand { subcommand })) = cli.subcommand else {
+            panic!("expected config subcommand");
+        };
+        let ConfigSubcommand::Explain(ConfigExplainCommand { filter }) = subcommand;
+        assert_eq!(filter.as_deref(), Some("sandbox_mode"));
     }
 
     #[test]

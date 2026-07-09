@@ -71,6 +71,7 @@ coverage/
 
 # personal files
 personal/
+.codex/harness/runs/
 
 # os
 .DS_Store

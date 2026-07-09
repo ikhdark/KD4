@@ -208,17 +208,10 @@ pub(crate) fn is_safe_powershell_words(words: &[String]) -> bool {
 
 /// Checks that an `rg` invocation avoids options that can spawn arbitrary executables.
 fn is_safe_ripgrep(words: &[String]) -> bool {
-    const UNSAFE_RIPGREP_OPTIONS_WITH_ARGS: &[&str] = &["--pre", "--hostname-bin"];
-    const UNSAFE_RIPGREP_OPTIONS_WITHOUT_ARGS: &[&str] = &["--search-zip", "-z"];
-
-    !words.iter().skip(1).any(|arg| {
-        let arg_lc = arg.to_ascii_lowercase();
-        // Examples rejected here: "pwsh -Command 'rg --pre cat pattern'" and "pwsh -Command 'rg --search-zip pattern'".
-        UNSAFE_RIPGREP_OPTIONS_WITHOUT_ARGS.contains(&arg_lc.as_str())
-            || UNSAFE_RIPGREP_OPTIONS_WITH_ARGS
-                .iter()
-                .any(|opt| arg_lc == *opt || arg_lc.starts_with(&format!("{opt}=")))
-    })
+    words
+        .iter()
+        .skip(1)
+        .all(|arg| !crate::rg::is_unsafe_option(arg))
 }
 
 #[cfg(all(test, windows))]

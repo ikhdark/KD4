@@ -108,37 +108,68 @@ Follow-up status on KD4 main, 2026-07-09
   code-mode/tool-search visibility.
 
 - PORT #4, verify_local validation tool and local verifier routing:
-  partially covered in current KD4. The repo-local script layer is already here,
-  and KD4's script version is newer than KD2's because it adds PowerShell and
-  shell script syntax validation. Keep KD4's script layer; do not overwrite it
-  with KD2.
+  first-stage core tool port is now in this working tree. The repo-local script
+  layer was already here, and KD4's script version is newer than KD2's because
+  it adds PowerShell and shell script syntax validation. Keep KD4's script layer;
+  do not overwrite it with KD2.
 
   Confirmed current KD4 paths:
     scripts/verify_local.py
     scripts/verify_local_rules.toml
     scripts/test_verify_local.py
-
-  Still missing from current KD4:
     codex-rs/core/src/tools/handlers/verify_local.rs
     codex-rs/core/src/tools/handlers/verify_local_spec.rs
     codex-rs/core/src/tools/handlers/verify_local_tests.rs
     codex-rs/core/src/tools/handlers/verify_local_spec_tests.rs
-    core tool registration in codex-rs/core/src/tools/spec_plan.rs
-    proof-bearing session-memory recording from verify_local results
+    codex-rs/core/src/tools/handlers/mod.rs
+    codex-rs/core/src/tools/spec_plan.rs
+    codex-rs/core/src/tools/spec_plan_tests.rs
+
+  Added in this pass:
+    per-turn proof-bearing freshness recording in TurnDiffTracker from
+    verify_local VERIFIED results, successful validation command completion,
+    failed/timed-out validation command completion, broad-filter advisory
+    commands, formatting-only commands, and later write/mutation evidence.
+    Final turn completion now emits a warning when changed files do not have
+    fresh post-change validation evidence, and invalidated diff tracking now
+    falls back to git diff for a best-effort turn diff.
+
+  Still not ported from KD2:
+    KD2's full session_memory.rs cross-turn/compaction memento and richer
+    verification capsule are not present in current KD4. The current fix covers
+    the runtime freshness gap for this turn's tracker without introducing a new
+    model-visible memory subsystem. Treat the full session-memory system as a
+    separate broader stage if still wanted.
 
   Validation run:
     python -m unittest scripts.test_verify_local
+    cargo test -p codex-core verify_local --lib
+    cargo test -p codex-core turn_diff_tracker --lib
+    cargo test -p codex-core unified_exec --lib
+    cargo test -p codex-core command_shape --lib
+    cargo test -p codex-core command_preflight --lib
+    cargo test -p codex-core shell_command --lib
+    cargo test -p codex-core guardian_tests --lib
+    cargo test -p codex-core shell_spec --lib
+    cargo test -p codex-core exec_approval_requirement_uses_command_for_safety_for_policy --lib
+    cargo test -p codex-protocol --lib
+    cargo check -p codex-core
+    just verify-local --plan --changed=codex-rs/core/src/tools/handlers/verify_local.rs --json
+    git diff --check
+    wiring_guard.py --session-id kd4-port-audit-fix-1-5 check --ledger --ledger-mode summary --intent-only
 
   Next safe stage:
-    Port the core verify_local tool separately, using current KD4's existing
-    scripts as the source of truth. Do not port KD2's session-memory integration
-    in the same patch unless session memory is being ported too.
+    If full KD2 validation memory is still wanted, port or recreate the
+    session-memory and compaction-visible verification capsule pieces as a
+    separate model-visible stage. Do not mix that with command-preflight or
+    source-tool ports.
 
 - PORT #5, Command preflight diagnostics, command shape, and PowerShell guidance:
-  partially covered in current KD4. The PowerShell wrapper scripts already match
-  KD2, and current codex-rs/shell-command already has PowerShell parsing/safety
-  tests. KD4 is missing the model-visible command-shape and preflight layer that
-  KD2 added to the core shell tools.
+  first-stage core port is now in this working tree. The PowerShell wrapper
+  scripts already matched KD2, and current codex-rs/shell-command already had
+  PowerShell parsing/safety tests. This stage adds KD2's model-visible command
+  shape fields and command preflight layer to KD4's current unified-exec path
+  instead of replacing KD4's newer environment, sandbox, and process handling.
 
   Confirmed current KD4 paths that should be kept:
     scripts/run-powershell-script.ps1
@@ -146,26 +177,204 @@ Follow-up status on KD4 main, 2026-07-09
     codex-rs/shell-command/src/powershell.rs
     codex-rs/shell-command/src/command_safety/powershell_parser.rs
 
-  Still missing from current KD4:
+  Ported into current KD4:
     codex-rs/core/src/tools/handlers/command_shape.rs
     codex-rs/core/src/tools/handlers/command_shape_tests.rs
     codex-rs/core/src/tools/handlers/command_preflight.rs
     codex-rs/core/src/tools/handlers/command_preflight_tests.rs
-    command_shape integration in codex-rs/core/src/tools/handlers/unified_exec.rs
-    preflight rejection/advisory integration in
-      codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
-    schema fields for kind/program/args/script_body in
-      codex-rs/core/src/tools/handlers/shell_spec.rs
+    codex-rs/core/src/tools/handlers/shell.rs
+    codex-rs/core/src/tools/handlers/shell/shell_command.rs
+    codex-rs/core/src/tools/handlers/unified_exec.rs
+    codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs
+    codex-rs/core/src/tools/handlers/unified_exec_tests.rs
+    codex-rs/core/src/tools/handlers/shell_spec.rs
+    codex-rs/core/src/tools/handlers/shell_spec_tests.rs
+    codex-rs/core/src/tools/handlers/shell_tests.rs
+    codex-rs/core/src/tools/events.rs
+    codex-rs/core/src/exec_policy.rs
+    codex-rs/core/src/exec_policy_tests.rs
+    codex-rs/core/src/unified_exec/mod.rs
+    codex-rs/core/src/unified_exec/async_watcher.rs
+    codex-rs/core/src/unified_exec/process_manager.rs
+    codex-rs/core/src/tools/runtimes/unified_exec.rs
+    codex-rs/protocol/src/models.rs
 
   Validation run:
-    cargo test -p codex-shell-command powershell
+    cargo test -p codex-core command_shape --lib
+    cargo test -p codex-core command_preflight --lib
+    cargo test -p codex-core unified_exec --lib
+    cargo test -p codex-core shell_command --lib
+    cargo test -p codex-core guardian_tests --lib
+    cargo test -p codex-core shell_spec --lib
+    cargo test -p codex-core exec_approval_requirement_uses_command_for_safety_for_policy --lib
+    cargo test -p codex-core verify_local --lib
+    cargo test -p codex-core turn_diff_tracker --lib
+    cargo test -p codex-protocol --lib
+    cargo check -p codex-core
+    git diff --check
+    wiring_guard.py --session-id kd4-port-audit-fix-1-5 check --ledger --ledger-mode summary --intent-only
+
+  Remaining caveats:
+    KD2's PowerShell post-failure advisory is covered by command_shape tests but
+    is not production-wired because current KD4 ExecCommandToolOutput has no
+    advisory field. Keep that as a separate output-contract decision if wanted.
+    The legacy shell_command path is now on the same command-shape/preflight
+    track as unified exec, including display-command proof for hooks and
+    validation freshness. No other missing command-shape or preflight core code
+    was found in the local recheck; the current caveat is the explicit
+    output-contract choice above.
 
   Next safe stage:
-    Do not copy KD2's unified_exec files over KD4; KD4 has newer environment,
-    remote-path, sandbox, and process-id behavior there. Recreate the command
-    shape/preflight layer against current KD4 entrypoints, with focused tests for
-    schema shape, argv mode, powershell_script mode, and rejected unsafe command
-    forms.
+    After final whitespace/wiring checks, move to PORT #3 source tools if that
+    large model-visible runtime feature is still wanted.
+
+Harness recheck on KD4 main, 2026-07-09
+---------------------------------------
+- Used the KD4 harness workflow as the check gate for PORT #1-#5.
+- PORT #1 runtime provenance/local watermark/doctor: focused initialize
+  metadata test passed; listed implementation paths still exist.
+- PORT #2 custom CA HTTP/WebSocket: custom CA tests, websocket-client tests, and
+  cross-crate call-site compile check passed.
+- PORT #3 source tools: still not implemented. Exact listed source-tool files
+  remain absent, and no half-wired source-tool registration was found. This is
+  still a separate broad model-visible stage.
+- PORT #4 verify_local/freshness and PORT #5 command shape/preflight: focused
+  core/protocol/script tests passed, and Wiring Guard reported WIRED for the
+  declared runtime edges.
+- Cleanup during this recheck: removed an unused ToolEmitter::unified_exec
+  wrapper after cargo check showed the display-command path had replaced all
+  call sites.
+
+  Validation run:
+    cargo test -p codex-app-server initialize_response_includes_local_runtime_metadata
+    cargo test -p codex-http-client --test ca_env
+    cargo test -p codex-websocket-client
+    cargo check -p codex-websocket-client -p codex-api -p codex-backend-client -p codex-exec-server -p codex-mcp -p codex-cli -p codex-app-server -p codex-core
+    cargo test -p codex-core command_shape --lib
+    cargo test -p codex-core command_preflight --lib
+    cargo test -p codex-core shell_command --lib
+    cargo test -p codex-core shell_spec --lib
+    cargo test -p codex-core unified_exec --lib
+    cargo test -p codex-core verify_local --lib
+    cargo test -p codex-core turn_diff_tracker --lib
+    cargo test -p codex-core guardian_tests --lib
+    cargo test -p codex-core exec_approval_requirement_uses_command_for_safety_for_policy --lib
+    cargo test -p codex-protocol --lib
+    cargo check -p codex-core
+    python -m unittest scripts.test_verify_local
+    just verify-local --plan --changed=codex-rs/core/src/tools/handlers/verify_local.rs --json
+    wiring_guard.py --session-id kd4-port-audit-fix-1-5 check --ledger --ledger-mode summary --intent-only
+    git diff --check
+
+  Subagent result:
+    PORT #3 review returned no audit fix and confirmed the feature is still
+    absent. PORT #1/#2 and PORT #4/#5 subagents did not return before timeout
+    and were interrupted; root validation above is the completion evidence.
+
+Harness implementation status for PORT #5-#15 on KD4 main, 2026-07-09
+---------------------------------------------------------------------
+- Used the KD4 harness workflow for this pass. The root AGENTS policy,
+  `.codex/AGENTS.md`, `.codex/harness/workflow.md`, and the skill references
+  `.codex/skills/kd4-harness/references/quality-gates.md` and
+  `.codex/skills/kd4-harness/references/task-artifacts.md` were the active
+  finish and artifact gates.
+
+- PORT #5, command preflight/shape/output:
+  implemented and rechecked. The remaining KD2 gap from the earlier note is now
+  closed: PowerShell script-body failure advisories are wired into
+  ExecCommandToolOutput and the one-shot unified-exec completion path. The
+  preflight layer also keeps KD4's newer command safety path while adding
+  stronger Windows/cmd/PowerShell segmentation and shell-output summary tests.
+
+- PORT #6, config explain, requirements, MCP requirements, and coding budgets:
+  implemented/present and rechecked. Current KD4 has the config requirements
+  stack, MCP requirements, config explain, and coding budget modules wired from
+  `codex-rs/config/src/lib.rs`. This pass aligned memory budget constants to
+  the shared coding budget constants and validated both config requirements and
+  schema drift.
+
+- PORT #7, session/evidence memory:
+  not completed in this pass. A subagent feasibility check found this is not a
+  narrow transplant: KD2's session memory depends on missing source tools,
+  `protocol::source_citation`, source evidence/discovery ledger plumbing,
+  execution receipts, dirty-worktree baselines, and older session context paths.
+  Current KD4 also has newer WorldState/StepContext and turn diff attribution
+  paths that would need an integration design. Treat #7 as a separate blocked
+  model-visible stage, not as implemented.
+
+- PORT #8, app-server startup config fallback:
+  implemented/present and rechecked. Non-strict startup now installs managed
+  config/cloud/thread loaders from the effective fallback/default config instead
+  of leaving bootstrap no-op loaders active after preload failure.
+
+- PORT #9, structured turn-start validation:
+  implemented/present and rechecked. V2 text-element byte ranges are validated
+  before turn start, image URL validation is still preserved, and invalid
+  environment/thread-settings paths now return stable error data.
+
+- PORT #10, remote-control enrollment and refresh lifecycle:
+  current KD4 is already at least as good as KD2 for this area. The remote
+  control server_api/websocket/enrollment lifecycle and refresh tests are
+  present and passed the focused validation.
+
+- PORT #11, state and persistence indexes:
+  implemented/present and rechecked. The job/thread, feedback-log, and memory
+  selection index migrations are present under `codex-rs/state`.
+
+- PORT #12, rollout read-repair and search snippets:
+  implemented/present and rechecked. Rollout read-repair loads full rollout
+  items before reconciliation, rollout search discovers current rollout files,
+  parses ripgrep JSON snippets, and still scans compressed rollouts.
+
+- PORT #13, generated memory-file writes:
+  implemented/present and rechecked. Generated memory artifacts use temp-file
+  plus rename and skip byte-for-byte unchanged writes.
+
+- PORT #14, TUI `/diff` untracked cap:
+  implemented/present and rechecked. `/diff` caps untracked file diffs and
+  reports omitted paths.
+
+- PORT #15, `/ideas` slash command:
+  implemented/present and rechecked. The prompt asset, slash command, dispatch,
+  and exact-match popup selection are covered.
+
+  Validation run for this #5-#15 harness pass:
+    cargo test -p codex-shell-command parse_command --lib
+    cargo test -p codex-core command_preflight --lib
+    cargo test -p codex-core command_shape --lib
+    cargo test -p codex-core shell_output_summary --lib
+    cargo test -p codex-core exec_command_tool_output --lib
+    cargo test -p codex-core unified_exec --lib
+    cargo test -p codex-config config_explain --lib
+    cargo test -p codex-cli config_explain
+    cargo test -p codex-config requirements --lib
+    just config-schema-check
+    cargo test -p codex-app-server --test all initialize_reports_non_strict_config_preload_failure
+    cargo test -p codex-protocol user_input --lib
+    cargo test -p codex-app-server --test all turn_start_rejects_invalid_text_element_range_before_starting_turn
+    cargo test -p codex-app-server --test all turn_start_rejects_invalid_permission_selection_before_starting_turn
+    cargo test -p codex-app-server --test all turn_start_rejects_unknown_environment_before_starting_turn
+    just app-server-schema-check
+    cargo test -p codex-app-server-transport remote_control --lib
+    cargo test -p codex-state migration --lib
+    cargo test -p codex-rollout search --lib
+    cargo test -p codex-memories-write generated_file --lib
+    cargo test -p codex-tui get_git_diff_caps_untracked_file_diffs_and_lists_omitted_paths --lib
+    cargo test -p codex-tui selecting_ideas_by_exact_match --lib
+    git diff --check
+
+  Validation caveats:
+    cargo test -p codex-app-server turn_start --lib still stack-overflows in
+    message_processor::message_processor_tracing_tests::turn_start_jsonrpc_span_parents_core_turn_spans.
+    The focused v2 turn_start integration tests above passed.
+
+    Wiring Guard proved the representative must-reach symbols for #5, #8, #9,
+    #10, #12, #13, #14, and #15, but the broad verdict stayed INCONCLUSIVE
+    because the scan budget was exceeded in this large dirty working tree.
+
+  Desktop visibility:
+    Source changes are not installed into the desktop app. Desktop-visible proof
+    still requires `just publish-local-codex-final` and a Codex Desktop restart.
 
 Method and coverage
 -------------------
@@ -178,6 +387,9 @@ Method and coverage
   - runtime/core/config/tools/shell/apply-patch/protocol
   - app-server/protocol/state/thread/session/persistence/MCP/remote-control
   - UI/CLI/plugins/models/memory/prompts/utils/client transports
+- Spawned three additional subagents for the #1-#5 implementation recheck on
+  2026-07-09. They did not deliver actionable findings before being interrupted;
+  the final fixes and validation above came from the local deterministic recheck.
 - Treated generated schemas, generated TypeScript, snapshots, lockfiles, and
   broad delete-heavy rollbacks as evidence, not as direct port candidates.
 - KD4 had a pre-existing tracked dirty file before this audit:
@@ -314,16 +526,25 @@ Paths and pieces:
   KD2 root scripts/verify_local.py
   KD2 root scripts/verify_local_rules.toml
 
-Why KD2 is better:
-  Routes validation through local rules, rejects broadening or mutating verifier
-  arguments, parses verifier verdicts, and records only proof-bearing VERIFIED
-  evidence into session memory. This matches KD4's "prove local behavior"
-  policy.
+Current port status:
+  Core tool routing and first-turn freshness handling are now ported in this
+  working tree. The verify_local model tool is registered only when a selected
+  local environment is inside a repo with scripts/verify_local.py and justfile
+  markers. It runs current KD4's just verify-local wrapper, rejects broadening
+  or mutating verifier arguments, parses verifier verdicts, records proof-
+  bearing VERIFIED evidence into TurnDiffTracker, and keeps KD4's newer script
+  layer.
+
+Remaining KD2 advantage:
+  KD2 also has a full cross-turn session_memory.rs verification capsule and
+  richer compaction-visible memento. That subsystem is not present in current
+  KD4 and was intentionally not ported in this patch.
 
 Port caveats:
-  This depends on files outside codex-rs. Port the scripts/recipes and runtime
-  tool wiring together. Do not expose it without tests for rejected broadening
-  arguments and memory recording rules.
+  Keep the full session-memory piece separate unless current KD4 restores that
+  subsystem. Do not overwrite KD4's scripts/verify_local.py or
+  scripts/verify_local_rules.toml with KD2 because KD4's script layer has newer
+  local shell validation behavior.
 
 5. Command preflight diagnostics, command shape, and PowerShell guidance
 
@@ -1009,3 +1230,203 @@ config diagnostics, memory/evidence discipline, and selected app-server fixes.
 KD2 also contains many older rollbacks relative to v0.143.0. Do not copy KD2
 wholesale. Port narrowly by feature slice, keep v0.143.0's newer behavior where
 it is richer, and regenerate generated outputs only from source changes.
+
+Harnessed #5-#15 implementation status (2026-07-09)
+---------------------------------------------------
+
+Scope:
+  Used the KD4 harness workflow for audit items #5 through #15. Validation below
+  is from the KD4 checkout at C:\Users\kuh\Desktop\kd4.
+
+Implemented or confirmed:
+  #5 command preflight diagnostics, command shape, PowerShell/rg guidance, and
+  shell output summaries are present and wired. The shell output summary tests
+  were corrected to cross the configured default summary threshold.
+
+  #6 config explain and coding budget constants are present and tested.
+
+  #8 app-server startup config fallback repair is present. Added a regression
+  test for non-strict preload failure warnings and fallback config behavior.
+
+  #9 structured turn-start validation and stable app-server error data are
+  present. App-server schema fixtures were regenerated through the owning
+  `just app-server-schema-check` recipe and then verified stable.
+
+  #10 remote-control enrollment/refresh lifecycle is present in KD4's newer
+  server_api/enroll/websocket split. Kept KD4's newer structure and validated
+  Retry-After, proactive/required refresh, unauthorized recovery, and token
+  preservation paths.
+
+  #11 state/log/memory indexes are added. KD2's unwired FTS thread_search table
+  was intentionally not ported.
+
+  #12 rollout read-repair and search snippets are ported. Read-repair now loads
+  full rollout items before reconciliation. A cwd normalization bug found during
+  validation was fixed so loaded SessionMeta cwd values do not make repaired
+  SQLite rows invisible to normalized cwd filters.
+
+  #13 memory generated-file writes are atomic/idempotent through a generated
+  file helper, and storage sync/rebuild paths use it.
+
+  #14 TUI `/diff` caps untracked file diffs at 50 and lists omitted paths.
+
+  #15 `/ideas` slash command is wired through command metadata, dispatch, prompt
+  asset, scoped prompt arguments, queue-drain behavior, and popup exact-match
+  selection.
+
+Blocked:
+  #7 full session/evidence memory, dirty-worktree baseline, execution receipts,
+  source evidence, discovery ledger, and working context brief is not complete.
+  A dedicated feasibility pass found KD2's #7 depends on source-tool and
+  source-citation surfaces that are not in current KD4, including
+  `tools/handlers/source.rs`, `path_aware_search.rs`, `protocol::source_citation`,
+  and `Feature::SourceTools`. It also collides with KD4's newer WorldState and
+  StepContext model-input path. Do not claim #7 complete until the source-tool
+  slice is ported and #7 is implemented as its own runtime-critical design.
+
+Validation run:
+  cargo test -p codex-shell-command rg --lib
+  cargo test -p codex-core command_preflight --lib
+  cargo test -p codex-core command_shape --lib
+  cargo test -p codex-core shell_output_summary --lib
+  cargo test -p codex-config config_explain --lib
+  just config-schema-check
+  cargo test -p codex-protocol user_input --lib
+  cargo test -p codex-app-server --test all initialize_reports_non_strict_config_preload_failure
+  cargo test -p codex-app-server --test all turn_start_rejects_invalid_text_element_range_before_starting_turn
+  cargo test -p codex-app-server --test all turn_start_rejects_invalid_permission_selection_before_starting_turn
+  cargo test -p codex-app-server --test all turn_start_rejects_unknown_environment_before_starting_turn
+  just app-server-schema-check
+  cargo test -p codex-app-server-transport server_api --lib
+  cargo test -p codex-app-server-transport refresh --lib
+  cargo test -p codex-state migrations --lib
+  cargo test -p codex-rollout state_db --lib
+  cargo test -p codex-rollout search_rollout_matches_fallback_covers_plain_and_compressed_rollouts --lib
+  cargo test -p codex-memories-write generated_files --lib
+  cargo test -p codex-memories-write sync_rollout_summaries_and_raw_memories_file_keeps_latest_memories_only --lib
+  cargo test -p codex-tui get_git_diff_caps_untracked_file_diffs_and_lists_omitted_paths --lib
+  cargo test -p codex-tui slash_ideas --lib
+  cargo test -p codex-tui selecting_ideas_by_exact_match --lib
+  python C:\Users\kuh\Desktop\LOCAL-KD\plugins\cache\local-wiring-guards\wiring-guard\0.1.10\runtime\wiring_guard.py --session-id kd4-port-5-15-finish check --ledger --ledger-mode summary --intent-only
+  git diff --check
+
+Harnessed #1-#15 double-check excluding #7 (2026-07-09)
+--------------------------------------------------------
+
+Scope:
+  Used the updated KD4 harness workflow for audit items #1 through #15,
+  excluding #7 by request. Evidence artifacts are under:
+  .codex/harness/runs/2026-07-09-port-1-15-double-check/
+
+Confirmed with current KD4 source and validation:
+  #1 local runtime provenance is wired through app-server initialize metadata
+  and CLI build-info/version proof. Focused validation included
+  `cargo test -p codex-cli long_version_lists_build_stamp_fields --bin codex`
+  and app-server initialize metadata coverage.
+
+  #2 custom CA support is implemented in `codex-rs/http-client`, shared by
+  HTTP and WebSocket transports, and keeps KD4's newer transport structure.
+  Focused validation covered unit tests, CA env integration tests, and
+  WebSocket dialer tests.
+
+  #4 verify_local is implemented, registered only for eligible local repo
+  markers, and records proof-bearing validation. Rust handler/spec-plan tests
+  and `scripts.test_verify_local` passed.
+
+  #5 command preflight, command shape, PowerShell/rg guidance, and shell output
+  summaries are present on shell/unified-exec paths. Focused command tests
+  passed.
+
+  #6 config explain, requirements, and coding budgets match current config
+  schema. `just config-schema-check` passed after a solo rerun; the earlier
+  parallel attempt timed out rather than failing semantically.
+
+  #8 app-server startup fallback and #9 turn-start structured validation are
+  covered by focused app-server/protocol tests. `just app-server-schema-check`
+  passed with generated outputs already up to date.
+
+  #10 remote-control refresh/enrollment behavior is covered by server API and
+  refresh tests.
+
+  #11 targeted state/log/memory indexes are present. KD2's unwired FTS
+  `thread_search` table is still intentionally absent.
+
+  #12 rollout read-repair/search snippets, #13 memory generated-file
+  atomic/idempotent writes, #14 TUI `/diff` untracked cap, and #15 `/ideas`
+  all passed focused owner tests.
+
+Not implemented / not claimed:
+  #3 source discovery/source evidence/path-aware search is not implemented in
+  this KD4 checkout. The expected KD2 files are absent:
+  `core/src/tools/handlers/source.rs`, `source_spec.rs`,
+  `source_evidence.rs`, `path_aware_search.rs`, `workspace_index.rs`,
+  `repo_guidance_evidence.rs`, and `file-search/src/source_search.rs`.
+  Search found only unrelated MCP resource code and one `read_file_span` string
+  in turn-diff tracking. Treat #3 as the next separate source-tool slice, not
+  as complete.
+
+  #7 was excluded by request and remains unclaimed.
+
+Fixes made during this double-check:
+  `codex-rs/core/src/tools/runtimes/shell/unix_escalation.rs` now imports
+  `UnifiedExecRequest` directly for the unified-exec zsh-fork helper.
+  `codex-rs/tui/src/chatwidget/slash_dispatch.rs` now has an explicit no-args
+  `SlashCommand::Ideas` arm in inline slash dispatch so `/ideas` is not left to
+  the wildcard fallback.
+
+Final validation:
+  Focused Rust and script tests listed in the harness evidence file passed.
+  `git diff --check` exited 0 with only LF-to-CRLF normalization warnings.
+  Wiring Guard session `kd4-port-1-15-double-check` passed in scoped
+  intent-only mode with `Verdict: WIRED`.
+
+Desktop visibility:
+  No local publish or Codex Desktop restart was performed in this pass. Any
+  desktop-visible claim still requires local publish/restart proof from this
+  checkout.
+
+Harnessed #1-#15 double-check excluding #3 and #7 (2026-07-09)
+--------------------------------------------------------------
+
+Scope:
+  User requested a mandatory subagent-assisted double check for #1 through #15,
+  explicitly ignoring #3 and #7. Evidence artifacts are under:
+  .codex/harness/runs/2026-07-09-port-1-15-excluding-3-7-subagent-audit/
+
+Subagents:
+  Subagents were attempted for app/protocol/transport and core command/config.
+  The current agent pool prevented a third fresh subagent, and the started
+  subagents stalled or were interrupted without returning usable findings. The
+  final closure is therefore based on root source review, closure sweeps,
+  focused validation, and scoped Wiring Guard proof.
+
+Confirmed included scope:
+  #1, #2, #4, #5, #6, #8, #9, #10, #11, #12, #13, #14, and #15 were reviewed
+  against current KD4 source. #3 and #7 remain intentionally excluded and are
+  not claimed complete.
+
+Fix made:
+  #13 had one confirmed replacement-safety issue. The memory generated-file
+  writer now uses `tempfile::NamedTempFile::new_in(parent)`, flushes the temp
+  file, and persists it to the target path in `spawn_blocking`. Storage paths
+  for raw memory rebuilds and rollout summary generation call this helper.
+  Added `write_generated_file_replaces_existing_file` regression coverage and
+  moved `tempfile` to normal dependencies for `codex-memories-write`.
+
+Validation:
+  Focused Rust/script/schema validation passed for app-server initialize and
+  turn-start validation, custom CA HTTP/WebSocket transport, verify_local,
+  command preflight/shape/output summary, config explain/MCP requirements/
+  budgets, state migrations, rollout state/search, memories write, TUI `/diff`,
+  and `/ideas`. `just app-server-schema-check`, `just config-schema-check`,
+  `python -m unittest scripts.test_verify_local`, and `git diff --check` passed.
+  `git diff --check` only printed LF-to-CRLF normalization warnings.
+
+Wiring:
+  Scoped Wiring Guard session
+  `kd4-port-1-15-excluding-3-7-subagent-audit` passed with `Verdict: WIRED` for
+  resolvable changed targets. Direct `rg` source proof records the #13 runtime
+  chain from `phase2.rs` to `storage.rs` to `generated_files.rs`.
+
+Desktop visibility:
+  No local publish or Codex Desktop restart was performed in this audit pass.

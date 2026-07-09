@@ -15,6 +15,7 @@ pub use codex_state::LogEntry;
 use codex_state::ThreadMetadataBuilder;
 use codex_utils_path::normalize_for_path_comparison;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -608,17 +609,36 @@ pub async fn read_repair_rollout_path(
     if !saw_existing_metadata {
         warn!("state db discrepancy during read_repair_rollout_path: upsert_needed (slow path)");
     }
-    let default_provider = crate::list::read_session_meta_line(rollout_path)
-        .await
-        .ok()
-        .and_then(|meta| meta.meta.model_provider)
+    let (items, _, _) =
+        match crate::recorder::RolloutRecorder::load_rollout_items(rollout_path).await {
+            Ok(loaded) => loaded,
+            Err(err) => {
+                warn!(
+                    "state db read-repair failed to load rollout {}: {err}",
+                    rollout_path.display()
+                );
+                return;
+            }
+        };
+    let default_provider = items
+        .iter()
+        .find_map(|item| match item {
+            RolloutItem::SessionMeta(meta_line) => meta_line.meta.model_provider.clone(),
+            RolloutItem::ResponseItem(_)
+            | RolloutItem::InterAgentCommunication(_)
+            | RolloutItem::InterAgentCommunicationMetadata { .. }
+            | RolloutItem::Compacted(_)
+            | RolloutItem::TurnContext(_)
+            | RolloutItem::WorldState(_)
+            | RolloutItem::EventMsg(_) => None,
+        })
         .unwrap_or_default();
     reconcile_rollout(
         Some(ctx),
         rollout_path,
         default_provider.as_str(),
         /*builder*/ None,
-        &[],
+        &items,
         archived_only,
         /*new_thread_memory_mode*/ None,
     )
@@ -659,14 +679,41 @@ pub async fn apply_rollout_items(
     }
     builder.rollout_path = rollout_path.to_path_buf();
     builder.cwd = normalize_cwd_for_state_db(&builder.cwd);
+    let normalized_items = normalize_item_cwds_for_state_db(items);
     if let Err(err) = ctx
-        .apply_rollout_items(&builder, items, new_thread_memory_mode, updated_at_override)
+        .apply_rollout_items(
+            &builder,
+            normalized_items.as_ref(),
+            new_thread_memory_mode,
+            updated_at_override,
+        )
         .await
     {
         warn!(
             "state db apply_rollout_items failed during {stage} for {}: {err}",
             rollout_path.display()
         );
+    }
+}
+
+fn normalize_item_cwds_for_state_db(items: &[RolloutItem]) -> Cow<'_, [RolloutItem]> {
+    let mut normalized = None;
+    for (index, item) in items.iter().enumerate() {
+        let RolloutItem::SessionMeta(meta_line) = item else {
+            continue;
+        };
+        let cwd = normalize_cwd_for_state_db(&meta_line.meta.cwd);
+        if cwd == meta_line.meta.cwd {
+            continue;
+        }
+        let normalized_items = normalized.get_or_insert_with(|| items.to_vec());
+        if let RolloutItem::SessionMeta(meta_line) = &mut normalized_items[index] {
+            meta_line.meta.cwd = cwd;
+        }
+    }
+    match normalized {
+        Some(items) => Cow::Owned(items),
+        None => Cow::Borrowed(items),
     }
 }
 

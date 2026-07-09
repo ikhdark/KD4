@@ -61,6 +61,26 @@ becomes operational editing policy, promote it into the closest scoped
   approval, permission, sandbox, validation, test-gating, or execution-safety
   behavior as part of unrelated work unless the user names that safety surface.
 
+## Implementation Completion Rule
+
+Before claiming an implementation is complete, verify that the changed code is
+reached through the intended runtime path, is wired into expected callers/config,
+has no new or task-relevant placeholder/stub markers in changed code or the
+intended runtime path, and has nearest practical validation run or explicitly
+skipped with reason.
+
+Final implementation answers must include completion gate status, wiring proof,
+validation run, and remaining unverified risk. Do not claim complete if the gate
+is partial or blocked.
+
+## Wiring proof
+
+When the Wiring Guard/KDWG plugin is active, use it as the static reachability
+proof layer for implementation changes. Declare wiring intent before
+implementation-shaped edits when required, run the wiring check before claiming
+completion, and use `--no-wiring-targets` only for docs, templates, planning,
+or config-only changes with no runtime call-site wiring target.
+
 ## Task lanes
 
 Choose the lightest lane that can safely satisfy the request. When in doubt,

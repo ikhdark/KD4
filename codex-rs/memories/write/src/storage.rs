@@ -51,7 +51,8 @@ async fn rebuild_raw_memories_file(
 
     if retained.is_empty() {
         body.push_str("No raw memories yet.\n");
-        return tokio::fs::write(raw_memories_file(root), body).await;
+        let path = raw_memories_file(root);
+        return crate::generated_files::write_generated_file(&path, &body).await;
     }
 
     body.push_str("Merged stage-1 raw memories (stable ascending thread-id order):\n\n");
@@ -74,7 +75,8 @@ async fn rebuild_raw_memories_file(
         body.push_str("\n\n");
     }
 
-    tokio::fs::write(raw_memories_file(root), body).await
+    let path = raw_memories_file(root);
+    crate::generated_files::write_generated_file(&path, &body).await
 }
 
 async fn prune_rollout_summaries(root: &Path, keep: &HashSet<String>) -> std::io::Result<()> {
@@ -132,7 +134,7 @@ async fn write_rollout_summary_for_thread(
     body.push_str(&memory.rollout_summary);
     body.push('\n');
 
-    tokio::fs::write(path, body).await
+    crate::generated_files::write_generated_file(&path, &body).await
 }
 
 fn retained_memories(

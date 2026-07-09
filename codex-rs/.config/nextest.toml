@@ -11,6 +11,10 @@ path = "junit.xml"
 [profile.local]
 inherits = "default"
 
+[profile.fast]
+inherits = "local"
+retries = 0
+
 [test-groups.app_server_protocol_codegen]
 max-threads = 1
 

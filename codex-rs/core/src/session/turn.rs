@@ -2462,9 +2462,17 @@ async fn try_run_sampling_request(
     }
 
     if should_emit_turn_diff {
-        let unified_diff = {
+        let (unified_diff, needs_fallback) = {
             let tracker = turn_diff_tracker.lock().await;
-            tracker.get_unified_diff()
+            (
+                tracker.get_unified_diff(),
+                tracker.needs_unified_diff_fallback(),
+            )
+        };
+        let unified_diff = match unified_diff {
+            Some(unified_diff) => Some(unified_diff),
+            None if needs_fallback => fallback_unified_diff_for_turn(&turn_context).await,
+            None => None,
         };
         if let Some(unified_diff) = unified_diff {
             let msg = EventMsg::TurnDiff(TurnDiffEvent { unified_diff });
@@ -2472,7 +2480,37 @@ async fn try_run_sampling_request(
         }
     }
 
+    if let Ok(result) = &outcome
+        && !result.needs_follow_up
+    {
+        let validation_warning = {
+            let tracker = turn_diff_tracker.lock().await;
+            tracker
+                .final_validation_warning_message()
+                .map(str::to_string)
+        };
+        if let Some(message) = validation_warning {
+            sess.send_event(&turn_context, EventMsg::Warning(WarningEvent { message }))
+                .await;
+        }
+    }
+
     outcome
+}
+
+async fn fallback_unified_diff_for_turn(turn_context: &TurnContext) -> Option<String> {
+    let cwd = turn_context.environments.single_local_environment_cwd()?;
+    let output = tokio::process::Command::new("git")
+        .args(["diff", "--no-ext-diff", "HEAD", "--"])
+        .current_dir(cwd.as_path())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let diff = String::from_utf8_lossy(&output.stdout).into_owned();
+    (!diff.is_empty()).then_some(diff)
 }
 
 pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<String> {

@@ -295,6 +295,25 @@ impl<'a> RolloutFileVisitor for FilesByUpdatedAtVisitor<'a> {
     }
 }
 
+struct DiscoverRolloutFilesVisitor {
+    files: Vec<compression::RolloutFile>,
+}
+
+impl RolloutFileVisitor for DiscoverRolloutFilesVisitor {
+    async fn visit(
+        &mut self,
+        _ts: OffsetDateTime,
+        _id: Uuid,
+        path: PathBuf,
+        _scanned: usize,
+    ) -> ControlFlow<()> {
+        if let Some(rollout_file) = compression::RolloutFile::from_path(path) {
+            self.files.push(rollout_file);
+        }
+        ControlFlow::Continue(())
+    }
+}
+
 impl serde::Serialize for Cursor {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -944,6 +963,48 @@ async fn collect_flat_rollout_files(
     }
     collected.sort_by_key(|(ts, sid, _path)| (Reverse(*ts), Reverse(*sid)));
     Ok(collected)
+}
+
+pub(crate) async fn discover_rollout_files(
+    root: &Path,
+    layout: ThreadListLayout,
+) -> io::Result<Vec<compression::RolloutFile>> {
+    let mut scanned_files = 0usize;
+    match layout {
+        ThreadListLayout::Flat => discover_flat_rollout_files(root, &mut scanned_files).await,
+        ThreadListLayout::NestedByDate => {
+            let mut visitor = DiscoverRolloutFilesVisitor { files: Vec::new() };
+            walk_rollout_files(root, &mut scanned_files, &mut visitor).await?;
+            Ok(visitor.files)
+        }
+    }
+}
+
+async fn discover_flat_rollout_files(
+    root: &Path,
+    scanned_files: &mut usize,
+) -> io::Result<Vec<compression::RolloutFile>> {
+    let mut dir = tokio::fs::read_dir(root).await?;
+    let mut files = Vec::new();
+    while let Some(entry) = dir.next_entry().await? {
+        if *scanned_files >= MAX_SCAN_FILES {
+            break;
+        }
+        if !entry
+            .file_type()
+            .await
+            .map(|ft| ft.is_file())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Some(rollout_file) = compression::RolloutFile::from_path(entry.path()) else {
+            continue;
+        };
+        *scanned_files += 1;
+        files.push(rollout_file);
+    }
+    Ok(files)
 }
 
 async fn collect_rollout_day_files(

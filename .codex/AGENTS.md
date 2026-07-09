@@ -17,12 +17,18 @@ Durable files include, when present:
 - `.codex/AGENTS.md`
 - `.codex/environments/README.md`
 - `.codex/environments/setup.py`
+- `.codex/harness/README.md`
+- `.codex/harness/context-modes.md`
+- `.codex/harness/workflow.md`
+- `.codex/harness/templates/**`
 - `.codex/skills/**/SKILL.md`
 - `.codex/skills/**/openai.yaml`
+- `.codex/skills/**/references/**`
 
 Generated or local runtime state includes:
 
 - `.codex/environments/environment.toml`
+- `.codex/harness/runs/**`
 - `.codex/verify-local/**`
 - `.codex/app-asar-backups/**`
 - `.codex/app-asar-work/**`, except durable instructions explicitly kept there

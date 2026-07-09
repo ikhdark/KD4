@@ -28,6 +28,8 @@ use codex_tools::ToolExposure;
 use codex_tools::ToolName;
 use codex_tools::ToolOutput;
 use codex_tools::ToolSpec;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
@@ -638,6 +640,7 @@ async fn environment_count_controls_environment_backed_tools() {
         "exec_command",
         "apply_patch",
         "view_image",
+        "verify_local",
         "request_permissions",
     ]);
     no_environment.assert_registered_lacks(&[
@@ -645,6 +648,7 @@ async fn environment_count_controls_environment_backed_tools() {
         "exec_command",
         "apply_patch",
         "view_image",
+        "verify_local",
         "request_permissions",
     ]);
 
@@ -705,6 +709,96 @@ async fn environment_tools_follow_the_step_context() {
     ));
 
     plan.assert_visible_contains(&["exec_command", "apply_patch", "view_image"]);
+}
+
+fn set_primary_cwd(turn: &mut TurnContext, cwd: AbsolutePathBuf) {
+    let current = turn.environments.turn_environments[0].clone();
+    turn.environments.turn_environments[0] = crate::session::turn_context::TurnEnvironment::new(
+        current.environment_id,
+        current.environment,
+        PathUri::from_abs_path(&cwd),
+        current.shell,
+    );
+}
+
+fn set_primary_remote_environment(turn: &mut TurnContext, cwd: AbsolutePathBuf) {
+    let current = turn.environments.turn_environments[0].clone();
+    turn.environments.turn_environments[0] = crate::session::turn_context::TurnEnvironment::new(
+        current.environment_id,
+        Arc::new(
+            codex_exec_server::Environment::create_for_tests(Some(
+                "ws://127.0.0.1:1/remote-exec-server".to_string(),
+            ))
+            .expect("remote test environment"),
+        ),
+        PathUri::from_abs_path(&cwd),
+        /*shell*/ None,
+    );
+}
+
+#[tokio::test]
+async fn verify_local_registers_only_for_local_repo_markers() {
+    let temp = tempfile::tempdir().expect("temp repo");
+    let repo = temp.path();
+    std::fs::create_dir_all(repo.join("scripts")).expect("scripts dir");
+    std::fs::write(repo.join("scripts").join("verify_local.py"), "").expect("verifier marker");
+    std::fs::write(repo.join("justfile"), "").expect("justfile marker");
+
+    let repo_root = AbsolutePathBuf::from_absolute_path(repo).expect("absolute temp repo");
+    let present = probe(|turn| {
+        set_primary_cwd(turn, repo_root.clone());
+    })
+    .await;
+    present.assert_visible_contains(&["verify_local"]);
+    present.assert_registered_contains(&["verify_local"]);
+    assert!(!has_parameter(
+        present.visible_spec("verify_local"),
+        "environment_id"
+    ));
+
+    let remote_primary = probe(|turn| {
+        set_primary_remote_environment(turn, repo_root.clone());
+    })
+    .await;
+    remote_primary.assert_visible_lacks(&["verify_local"]);
+    remote_primary.assert_registered_lacks(&["verify_local"]);
+
+    let remote_primary_with_local_repo = probe(|turn| {
+        duplicate_primary_environment(turn);
+        set_primary_remote_environment(turn, repo_root.clone());
+        let current = turn.environments.turn_environments[1].clone();
+        turn.environments.turn_environments[1] = crate::session::turn_context::TurnEnvironment::new(
+            current.environment_id,
+            current.environment,
+            PathUri::from_abs_path(&repo_root),
+            current.shell,
+        );
+    })
+    .await;
+    remote_primary_with_local_repo.assert_visible_contains(&["verify_local"]);
+    remote_primary_with_local_repo.assert_registered_contains(&["verify_local"]);
+    assert!(has_parameter(
+        remote_primary_with_local_repo.visible_spec("verify_local"),
+        "environment_id"
+    ));
+
+    std::fs::remove_file(repo.join("justfile")).expect("remove justfile marker");
+    let missing_justfile = probe(|turn| {
+        set_primary_cwd(turn, repo_root.clone());
+    })
+    .await;
+    missing_justfile.assert_visible_lacks(&["verify_local"]);
+    missing_justfile.assert_registered_lacks(&["verify_local"]);
+
+    std::fs::write(repo.join("justfile"), "").expect("restore justfile marker");
+    std::fs::remove_file(repo.join("scripts").join("verify_local.py"))
+        .expect("remove verifier marker");
+    let missing_verifier = probe(|turn| {
+        set_primary_cwd(turn, repo_root);
+    })
+    .await;
+    missing_verifier.assert_visible_lacks(&["verify_local"]);
+    missing_verifier.assert_registered_lacks(&["verify_local"]);
 }
 
 #[tokio::test]

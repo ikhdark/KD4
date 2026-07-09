@@ -263,6 +263,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         Arc::clone(&session),
         Arc::clone(&turn),
         "call-unified-denied".to_string(),
+        None,
     );
     let request = ExecCommandRequest {
         command: vec![
@@ -270,7 +271,12 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
             "-lc".to_string(),
             "echo before".to_string(),
         ],
-        shell_type: crate::shell::ShellType::Sh,
+        command_for_safety: vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "echo before".to_string(),
+        ],
+        shell_type: Some(crate::shell::ShellType::Sh),
         hook_command: "echo before".to_string(),
         process_id: 123,
         yield_time_ms: 1000,
@@ -333,6 +339,31 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
     assert_eq!(
         item.aggregated_output.as_deref(),
         Some("PRE_DENIAL_MARKER\nNetwork access denied")
+    );
+}
+
+#[test]
+fn completed_exec_command_output_includes_powershell_failure_advisory() {
+    let output = completed_exec_command_tool_output(
+        "powershell-call".to_string(),
+        "chunk-1".to_string(),
+        Duration::from_millis(5),
+        b"Measure-Object : Cannot bind parameter Property\n".to_vec(),
+        codex_utils_output_truncation::TruncationPolicy::Tokens(10_000),
+        /*max_output_tokens*/ None,
+        /*process_id*/ None,
+        Some(1),
+        "Measure-Object failing command".to_string(),
+        Some(crate::shell::ShellType::PowerShell),
+    );
+
+    assert_eq!(output.exit_code, Some(1));
+    assert!(
+        output
+            .advisory
+            .as_deref()
+            .is_some_and(|advisory| advisory.contains("Measure-Object expects property names")),
+        "PowerShell failure advisory should be included in completed output: {output:?}"
     );
 }
 

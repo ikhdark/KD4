@@ -1,7 +1,83 @@
 use super::*;
 use crate::ModelsManagerConfig;
+use codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT;
 use codex_protocol::openai_models::ApprovalMessages;
 use pretty_assertions::assert_eq;
+
+const REQUIRED_PROMPT_RULE_ANCHORS: &[(&str, &str)] = &[
+    (
+        "nearest sufficient completion",
+        "nearest sufficient completion point",
+    ),
+    ("user-work protection", "first protect user work"),
+    (
+        "patch success is not validation",
+        "Patch success means the patch applied",
+    ),
+    ("concurrent edit convergence", "Concurrent Edit Convergence"),
+    (
+        "implementation self-repair",
+        "implementation self-repair is mandatory",
+    ),
+    (
+        "scoped nearest-sufficient validation",
+        "nearest sufficient tests or checks",
+    ),
+];
+
+fn assert_prompt_rules(label: &str, prompt: &str) {
+    for (rule, anchor) in REQUIRED_PROMPT_RULE_ANCHORS {
+        assert!(
+            prompt.contains(anchor),
+            "{label} should include {rule} rule anchor: {anchor}"
+        );
+    }
+}
+
+#[test]
+fn base_instructions_include_prompt_rules_anchors() {
+    assert_prompt_rules("BASE_INSTRUCTIONS", BASE_INSTRUCTIONS);
+}
+
+#[test]
+fn bundled_catalog_prompts_include_prompt_rules_anchors() {
+    let response = crate::bundled_models_response().expect("bundled models.json should parse");
+    assert!(
+        !response.models.is_empty(),
+        "bundled models.json should contain models"
+    );
+
+    let mut template_count = 0;
+    for model in &response.models {
+        assert_prompt_rules(
+            &format!("{}.base_instructions", model.slug),
+            &model.base_instructions,
+        );
+
+        if let Some(model_messages) = &model.model_messages
+            && let Some(template) = &model_messages.instructions_template
+        {
+            template_count += 1;
+            assert_prompt_rules(
+                &format!("{}.model_messages.instructions_template", model.slug),
+                template,
+            );
+        }
+    }
+
+    assert!(
+        template_count > 0,
+        "bundled models should include template-backed prompts"
+    );
+}
+
+#[test]
+fn protocol_default_base_instructions_include_prompt_rules_anchors() {
+    assert_prompt_rules(
+        "codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT",
+        BASE_INSTRUCTIONS_DEFAULT,
+    );
+}
 
 #[test]
 fn reasoning_summaries_override_true_enables_support() {

@@ -109,6 +109,29 @@ requires `just publish-local-codex-final` and a Codex Desktop restart.
 If the user forbids tests or validation, skip those commands and state
 exactly what remains unproven.
 
+## Apply the Implementation Completion Gate
+
+Before the final response for implementation, debugging, refactoring,
+integration, migration, or repo-behavior work, use the KD4 incomplete
+implementation finish gate from `.codex/harness/workflow.md`.
+
+The gate requires Codex to identify the intended runtime path, confirm the
+changed code is reached from that path, sweep for no new or task-relevant
+placeholder/stub markers in changed code or the intended runtime path, check
+new public functions, types, config fields, commands, or workflow entries are
+wired into expected callers, and run the nearest sufficient validation or state
+why validation was skipped or not applicable.
+
+Final implementation answers must include:
+
+- completion gate: `passed`, `partial`, or `blocked`;
+- wiring proof;
+- validation run;
+- remaining unverified risk.
+
+Do not claim the implementation is complete when the gate is `partial` or
+`blocked`.
+
 ## Report What Was Proven
 
 Do not describe work as fixed, done, wired, complete, working, supported, or

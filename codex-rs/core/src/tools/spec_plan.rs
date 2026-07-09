@@ -28,6 +28,7 @@ use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
 use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
+use crate::tools::handlers::VerifyLocalHandler;
 use crate::tools::handlers::ViewImageHandler;
 use crate::tools::handlers::WaitForEnvironmentHandler;
 use crate::tools::handlers::WriteStdinHandler;
@@ -803,6 +804,13 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     }
 
     if environment_mode.has_environment() {
+        if VerifyLocalHandler::is_available_for_step(context.step_context) {
+            let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
+            planned_tools.add(VerifyLocalHandler::for_verify_local_environment_id(
+                include_environment_id,
+            ));
+        }
+
         let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
         planned_tools.add(ViewImageHandler::new(ViewImageToolOptions {
             can_request_original_image_detail: can_request_original_image_detail(

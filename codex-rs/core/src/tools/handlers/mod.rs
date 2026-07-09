@@ -2,6 +2,8 @@ pub(crate) mod agent_jobs;
 pub(crate) mod agent_jobs_spec;
 pub(crate) mod apply_patch;
 pub(crate) mod apply_patch_spec;
+mod command_preflight;
+pub(crate) mod command_shape;
 mod current_time;
 mod dynamic;
 pub(crate) mod extension_tools;
@@ -33,6 +35,8 @@ pub(crate) mod test_sync_spec;
 mod tool_search;
 pub(crate) mod tool_search_spec;
 pub(crate) mod unified_exec;
+mod verify_local;
+pub(crate) mod verify_local_spec;
 mod view_image;
 pub(crate) mod view_image_spec;
 mod wait_for_environment;
@@ -78,6 +82,7 @@ pub(crate) use tool_search::ToolSearchHandlerCache;
 pub use unified_exec::ExecCommandHandler;
 pub(crate) use unified_exec::ExecCommandHandlerOptions;
 pub use unified_exec::WriteStdinHandler;
+pub use verify_local::VerifyLocalHandler;
 pub use view_image::ViewImageHandler;
 pub(crate) use wait_for_environment::WaitForEnvironmentHandler;
 
@@ -120,7 +125,7 @@ fn rewrite_function_arguments(
     })
 }
 
-fn rewrite_function_string_argument(
+fn rewrite_function_script_argument(
     arguments: &str,
     tool_name: &str,
     field_name: &str,
@@ -128,6 +133,10 @@ fn rewrite_function_string_argument(
 ) -> Result<String, FunctionCallError> {
     rewrite_function_arguments(arguments, tool_name, |arguments| {
         arguments.insert(field_name.to_string(), Value::String(value.to_string()));
+        arguments.remove("kind");
+        arguments.remove("program");
+        arguments.remove("args");
+        arguments.remove("script_body");
     })
 }
 

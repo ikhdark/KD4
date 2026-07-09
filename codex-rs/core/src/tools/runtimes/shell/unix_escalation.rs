@@ -17,6 +17,7 @@ use crate::shell::ShellType;
 use crate::tools::runtimes::build_sandbox_command;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::prepend_zsh_fork_bin_to_path;
+use crate::tools::runtimes::unified_exec::UnifiedExecRequest;
 use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
@@ -263,7 +264,7 @@ pub(super) async fn try_run_zsh_fork(
 }
 
 pub(crate) async fn prepare_unified_exec_zsh_fork(
-    req: &crate::tools::runtimes::unified_exec::UnifiedExecRequest,
+    req: &UnifiedExecRequest,
     _attempt: &SandboxAttempt<'_>,
     ctx: &ToolCtx,
     exec_request: ExecRequest,

@@ -55,6 +55,7 @@ fn test_get_command_uses_default_shell_when_unspecified() -> anyhow::Result<()> 
         Arc::new(default_user_shell()),
         &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ true,
+        /*environment_is_remote*/ false,
     )
     .map_err(anyhow::Error::msg)?;
     let command = resolved.command;
@@ -77,6 +78,7 @@ fn test_get_command_respects_explicit_bash_shell() -> anyhow::Result<()> {
         Arc::new(default_user_shell()),
         &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ true,
+        /*environment_is_remote*/ false,
     )
     .map_err(anyhow::Error::msg)?;
     let command = resolved.command;
@@ -118,12 +120,13 @@ fn test_get_command_respects_explicit_powershell_shell() -> anyhow::Result<()> {
         Arc::new(default_user_shell()),
         &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ true,
+        /*environment_is_remote*/ false,
     )
     .map_err(anyhow::Error::msg)?;
     let command = resolved.command;
 
     assert_eq!(command[2], "echo hello");
-    assert_eq!(resolved.shell_type, ShellType::PowerShell);
+    assert_eq!(resolved.shell_type, Some(ShellType::PowerShell));
     Ok(())
 }
 
@@ -140,6 +143,7 @@ fn test_get_command_respects_explicit_cmd_shell() -> anyhow::Result<()> {
         Arc::new(default_user_shell()),
         &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ true,
+        /*environment_is_remote*/ false,
     )
     .map_err(anyhow::Error::msg)?;
     let command = resolved.command;
@@ -158,6 +162,7 @@ fn test_get_command_rejects_explicit_login_when_disallowed() -> anyhow::Result<(
         Arc::new(default_user_shell()),
         &UnifiedExecShellMode::Direct,
         /*allow_login_shell*/ false,
+        /*environment_is_remote*/ false,
     )
     .expect_err("explicit login should be rejected");
 
@@ -191,6 +196,7 @@ fn test_get_command_rejects_explicit_shell_in_zsh_fork_mode() -> anyhow::Result<
         Arc::new(default_user_shell()),
         &shell_mode,
         /*allow_login_shell*/ true,
+        /*environment_is_remote*/ false,
     )
     .expect_err("explicit shell should be rejected");
 
@@ -198,6 +204,120 @@ fn test_get_command_rejects_explicit_shell_in_zsh_fork_mode() -> anyhow::Result<
         err.contains("`shell` is not supported for local zsh-fork exec"),
         "unexpected error: {err}"
     );
+    Ok(())
+}
+
+#[test]
+fn test_get_command_supports_direct_argv_mode() -> anyhow::Result<()> {
+    let json = r#"{"kind": "argv", "program": "rg", "args": ["--files", "src"]}"#;
+    let args: ExecCommandArgs = parse_arguments(json)?;
+
+    let resolved = get_command(
+        &args,
+        Arc::new(default_user_shell()),
+        &UnifiedExecShellMode::Direct,
+        /*allow_login_shell*/ true,
+        /*environment_is_remote*/ false,
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(
+        resolved.command,
+        vec!["rg".to_string(), "--files".to_string(), "src".to_string()]
+    );
+    assert_eq!(resolved.safety_command, resolved.command);
+    assert_eq!(resolved.shell_type, None);
+    Ok(())
+}
+
+#[test]
+fn test_get_command_infers_argv_mode_from_program() -> anyhow::Result<()> {
+    let json = r#"{"program": "git", "args": ["status", "--short"]}"#;
+    let args: ExecCommandArgs = parse_arguments(json)?;
+
+    let resolved = get_command(
+        &args,
+        Arc::new(default_user_shell()),
+        &UnifiedExecShellMode::Direct,
+        /*allow_login_shell*/ true,
+        /*environment_is_remote*/ false,
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(
+        resolved.command,
+        vec![
+            "git".to_string(),
+            "status".to_string(),
+            "--short".to_string()
+        ]
+    );
+    assert_eq!(resolved.shell_type, None);
+    Ok(())
+}
+
+#[test]
+fn test_get_command_supports_powershell_script_body_mode() -> anyhow::Result<()> {
+    let temp_dir = tempfile::tempdir()?;
+    let powershell_path = temp_dir.path().join(if cfg!(windows) {
+        "powershell.exe"
+    } else {
+        "pwsh"
+    });
+    std::fs::write(&powershell_path, "")?;
+    let script_body = "$value = 'quoted value'; Write-Output $value";
+    let json = serde_json::json!({
+        "kind": "powershell_script",
+        "script_body": script_body,
+        "shell": powershell_path,
+    })
+    .to_string();
+    let args: ExecCommandArgs = parse_arguments(&json)?;
+
+    let resolved = get_command(
+        &args,
+        Arc::new(default_user_shell()),
+        &UnifiedExecShellMode::Direct,
+        /*allow_login_shell*/ true,
+        /*environment_is_remote*/ false,
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    assert_eq!(
+        resolved.command.first().map(String::as_str),
+        Some(powershell_path.to_string_lossy().as_ref())
+    );
+    assert!(resolved.command.contains(&"-NoLogo".to_string()));
+    assert!(resolved.command.contains(&"-EncodedCommand".to_string()));
+    assert!(!resolved.command.contains(&script_body.to_string()));
+    assert_eq!(
+        resolved.safety_command,
+        vec![
+            powershell_path.to_string_lossy().to_string(),
+            "-NoLogo".to_string(),
+            "-Command".to_string(),
+            script_body.to_string(),
+        ]
+    );
+    assert_eq!(resolved.shell_type, Some(ShellType::PowerShell));
+    Ok(())
+}
+
+#[test]
+fn test_get_command_rejects_shell_fields_in_argv_mode() -> anyhow::Result<()> {
+    let json = r#"{"kind": "argv", "program": "rg", "shell": "bash"}"#;
+    let args: ExecCommandArgs = parse_arguments(json)?;
+
+    let err = get_command(
+        &args,
+        Arc::new(default_user_shell()),
+        &UnifiedExecShellMode::Direct,
+        /*allow_login_shell*/ true,
+        /*environment_is_remote*/ false,
+    )
+    .expect_err("shell fields should be rejected in argv mode");
+
+    assert!(err.contains("only valid for script commands"), "{err}");
     Ok(())
 }
 
@@ -302,6 +422,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
+        advisory: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-43", payload).await;
     let handler = ExecCommandHandler::default();
@@ -332,6 +453,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
+        advisory: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-44", payload).await;
     let handler = ExecCommandHandler::default();
@@ -363,6 +485,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         exit_code: None,
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
+        advisory: None,
     };
     let invocation = invocation_for_payload("exec_command", "call-45", payload).await;
     let handler = ExecCommandHandler::default();
@@ -389,6 +512,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("sleep 1; echo finished".to_string()),
+        advisory: None,
     };
     let invocation = invocation_for_payload("write_stdin", "write-stdin-call", payload).await;
     let handler = WriteStdinHandler;
@@ -420,6 +544,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("sleep 2; echo alpha".to_string()),
+        advisory: None,
     };
     let output_b = ExecCommandToolOutput {
         event_call_id: "exec-call-b".to_string(),
@@ -432,6 +557,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         exit_code: Some(0),
         original_token_count: None,
         hook_command: Some("sleep 1; echo beta".to_string()),
+        advisory: None,
     };
     let invocation_b = invocation_for_payload("write_stdin", "write-call-b", payload.clone()).await;
     let invocation_a = invocation_for_payload("write_stdin", "write-call-a", payload).await;

@@ -1613,6 +1613,67 @@ fn positional_operands<'a>(args: &'a [String], flags_with_vals: &[&str]) -> Vec<
     out
 }
 
+fn parse_rg_like(main_cmd: &[String], args: &[String]) -> ParsedCommand {
+    let args_no_connector = trim_at_connector(args);
+    let has_files_flag = args_no_connector.iter().any(|a| a == "--files");
+    let mut operands = Vec::new();
+    let mut query: Option<String> = None;
+    let mut query_from_pattern = false;
+    let mut after_double_dash = false;
+    let mut iter = args_no_connector.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if after_double_dash {
+            operands.push(arg);
+            continue;
+        }
+        if arg == "--" {
+            after_double_dash = true;
+            continue;
+        }
+        if let Some((flag, value)) = crate::rg::split_long_equals(arg) {
+            if crate::rg::is_pattern_value_option(flag) && query.is_none() {
+                query = Some(value.to_string());
+                query_from_pattern = true;
+            }
+            continue;
+        }
+        if crate::rg::is_pattern_value_option(arg) {
+            if let Some(value) = iter.next()
+                && query.is_none()
+            {
+                query = Some(value.clone());
+                query_from_pattern = true;
+            }
+            continue;
+        }
+        if crate::rg::is_value_option(arg) {
+            iter.next();
+            continue;
+        }
+        if arg.starts_with('-') {
+            continue;
+        }
+        operands.push(arg);
+    }
+
+    if has_files_flag {
+        let path = operands.first().map(|s| short_display_path(s));
+        ParsedCommand::ListFiles {
+            cmd: shlex_join(main_cmd),
+            path,
+        }
+    } else {
+        let query = query.or_else(|| operands.first().cloned().map(String::from));
+        let path_index = usize::from(!query_from_pattern);
+        let path = operands.get(path_index).map(|s| short_display_path(s));
+        ParsedCommand::Search {
+            cmd: shlex_join(main_cmd),
+            query,
+            path,
+        }
+    }
+}
+
 fn parse_grep_like(main_cmd: &[String], args: &[String]) -> ParsedCommand {
     let args_no_connector = trim_at_connector(args);
     let mut operands = Vec::new();
@@ -1626,6 +1687,12 @@ fn parse_grep_like(main_cmd: &[String], args: &[String]) -> ParsedCommand {
         }
         if arg == "--" {
             after_double_dash = true;
+            continue;
+        }
+        if let Some((flag, value)) = crate::rg::split_long_equals(arg) {
+            if crate::rg::is_pattern_value_option(flag) && pattern.is_none() {
+                pattern = Some(value.to_string());
+            }
             continue;
         }
         match arg.as_str() {
@@ -2135,46 +2202,7 @@ fn summarize_main_tokens(main_cmd: &[String]) -> ParsedCommand {
             }
         }
         Some((head, tail)) if head == "rg" || head == "rga" || head == "ripgrep-all" => {
-            let args_no_connector = trim_at_connector(tail);
-            let has_files_flag = args_no_connector.iter().any(|a| a == "--files");
-            let candidates = skip_flag_values(
-                &args_no_connector,
-                &[
-                    "-g",
-                    "--glob",
-                    "--iglob",
-                    "-t",
-                    "--type",
-                    "--type-add",
-                    "--type-not",
-                    "-m",
-                    "--max-count",
-                    "-A",
-                    "-B",
-                    "-C",
-                    "--context",
-                    "--max-depth",
-                ],
-            );
-            let non_flags: Vec<&String> = candidates
-                .into_iter()
-                .filter(|p| !p.starts_with('-'))
-                .collect();
-            if has_files_flag {
-                let path = non_flags.first().map(|s| short_display_path(s));
-                ParsedCommand::ListFiles {
-                    cmd: shlex_join(main_cmd),
-                    path,
-                }
-            } else {
-                let query = non_flags.first().cloned().map(String::from);
-                let path = non_flags.get(1).map(|s| short_display_path(s));
-                ParsedCommand::Search {
-                    cmd: shlex_join(main_cmd),
-                    query,
-                    path,
-                }
-            }
+            parse_rg_like(main_cmd, tail)
         }
         Some((head, tail)) if head == "git" => match tail.split_first() {
             Some((subcmd, sub_tail)) if subcmd == "grep" => parse_grep_like(main_cmd, sub_tail),

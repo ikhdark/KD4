@@ -1,0 +1,4 @@
+interface:
+  display_name: "KD4 Harness"
+  short_description: "Plan, audit, and run KD4-local harness and wiring-guarded implementation tasks"
+  default_prompt: "Use $kd4-harness to create, update, audit, or run KD4 harness artifacts for this task. Also use it when KD4 implementation work invokes Wiring Guard/KDWG, wire-implementations, or static wiring proof; default to lightweight harness mode unless durable artifacts are useful. For implementation work, apply $kd4-crosscheck-and-finish and use Wiring Guard/KDWG when active. Keep changes fork-local, inspect the relevant AGENTS.md scope, define evals or handoff artifacts when useful, and validate with the nearest sufficient proof."

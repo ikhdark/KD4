@@ -45,6 +45,61 @@ struct DiffCacheKey {
     right_revision: Option<u64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidationRecord {
+    kind: ValidationCommandKind,
+    command: Vec<String>,
+    covered_paths: HashSet<TrackedPath>,
+    covered_unknown_mutation: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ValidationFreshnessStatus {
+    None,
+    StaleAfterLastMutation,
+    FormatOnly,
+    AdvisoryBroadFilter,
+    PassedAfterLastMutation,
+    FailedAfterLastMutation,
+    TimedOut,
+}
+
+impl ValidationFreshnessStatus {
+    pub(crate) fn final_warning_message(&self) -> Option<&'static str> {
+        match self {
+            Self::PassedAfterLastMutation => None,
+            Self::None => Some(
+                "Changed files have not been followed by post-change validation evidence. Final answers should state what commands passed, failed, or were skipped; formatting-only commands do not count as correctness validation.",
+            ),
+            Self::StaleAfterLastMutation => Some(
+                "Changed files were modified after the last successful validation evidence, so that evidence is stale. State what passed before the later edit and what remains unvalidated.",
+            ),
+            Self::FormatOnly => Some(
+                "Changed files have only been followed by formatting commands. Formatting-only commands do not prove correctness or runtime reachability.",
+            ),
+            Self::AdvisoryBroadFilter => Some(
+                "Changed files have only been followed by broad validation evidence. Broad test filters are advisory and do not prove focused correctness by themselves.",
+            ),
+            Self::FailedAfterLastMutation => Some(
+                "Changed files were followed by validation that failed. State what passed, what failed, and what remains unvalidated.",
+            ),
+            Self::TimedOut => Some(
+                "Changed files were followed by validation that timed out. State what passed, what timed out, and what remains unvalidated.",
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ValidationCommandKind {
+    Test,
+    Check,
+    Build,
+    Lint,
+    Typecheck,
+    DependencyHygiene,
+}
+
 /// Tracks the net text diff for the current turn from committed apply_patch
 /// mutations, without rereading the workspace filesystem.
 pub struct TurnDiffTracker {
@@ -56,6 +111,11 @@ pub struct TurnDiffTracker {
     next_revision: u64,
     rendered_diffs: HashMap<DiffCacheKey, Option<String>>,
     unified_diff: Option<String>,
+    unified_diff_fallback_needed: bool,
+    unvalidated_paths: HashSet<TrackedPath>,
+    unvalidated_unknown_mutation: bool,
+    validation_records: Vec<ValidationRecord>,
+    last_post_mutation_validation_status: ValidationFreshnessStatus,
     #[cfg(test)]
     rendered_diff_count: std::cell::Cell<usize>,
 }
@@ -71,6 +131,11 @@ impl Default for TurnDiffTracker {
             next_revision: 0,
             rendered_diffs: HashMap::new(),
             unified_diff: None,
+            unified_diff_fallback_needed: false,
+            unvalidated_paths: HashSet::new(),
+            unvalidated_unknown_mutation: false,
+            validation_records: Vec::new(),
+            last_post_mutation_validation_status: ValidationFreshnessStatus::None,
             #[cfg(test)]
             rendered_diff_count: std::cell::Cell::new(0),
         }
@@ -91,6 +156,10 @@ impl TurnDiffTracker {
     }
 
     pub fn track_delta(&mut self, environment_id: &str, delta: &AppliedPatchDelta) {
+        if !delta.is_empty() {
+            self.record_mutation(paths_touched_by_delta(environment_id, delta));
+        }
+
         if !self.valid {
             return;
         }
@@ -107,9 +176,197 @@ impl TurnDiffTracker {
     }
 
     pub fn invalidate(&mut self) {
+        if self.has_unvalidated_mutation() {
+            self.unified_diff_fallback_needed = true;
+        }
         self.valid = false;
         self.rendered_diffs.clear();
         self.unified_diff = None;
+    }
+
+    pub(crate) fn record_unknown_mutation(&mut self) {
+        self.record_unknown_mutation_index();
+        self.invalidate();
+    }
+
+    pub(crate) fn record_exec_command_end(
+        &mut self,
+        command: &[String],
+        exit_code: i32,
+        timed_out: bool,
+    ) {
+        let is_post_mutation = self.has_unvalidated_mutation();
+        let validation_kind = classify_validation_command(command);
+        let format_only = is_format_only_command(command);
+        let broad_filter = is_broad_validation_filter_command(command);
+
+        if is_post_mutation {
+            self.last_post_mutation_validation_status = if format_only {
+                ValidationFreshnessStatus::FormatOnly
+            } else if timed_out && validation_kind.is_some() {
+                ValidationFreshnessStatus::TimedOut
+            } else if validation_kind.is_some() && exit_code == 0 && broad_filter {
+                ValidationFreshnessStatus::AdvisoryBroadFilter
+            } else if validation_kind.is_some() && exit_code == 0 {
+                ValidationFreshnessStatus::PassedAfterLastMutation
+            } else if validation_kind.is_some() {
+                ValidationFreshnessStatus::FailedAfterLastMutation
+            } else {
+                self.last_post_mutation_validation_status.clone()
+            };
+        }
+
+        if exit_code == 0
+            && !timed_out
+            && !broad_filter
+            && let Some(kind) = validation_kind
+        {
+            self.validation_records.push(ValidationRecord {
+                kind,
+                command: command.to_vec(),
+                covered_paths: self.unvalidated_paths.clone(),
+                covered_unknown_mutation: self.unvalidated_unknown_mutation,
+            });
+            self.unvalidated_paths.clear();
+            self.unvalidated_unknown_mutation = false;
+        }
+    }
+
+    pub(crate) fn record_verified_validation(
+        &mut self,
+        command: Vec<String>,
+        environment_id: &str,
+        active_files: &[PathBuf],
+        clear_unknown_mutation: bool,
+    ) -> bool {
+        let covered_candidates = active_files
+            .iter()
+            .flat_map(|path| {
+                let mut candidates = vec![TrackedPath::new(environment_id, path)];
+                if path.is_relative()
+                    && let Some(root) = self.display_roots_by_environment.get(environment_id)
+                {
+                    let absolute_path = root.join(path);
+                    candidates.push(TrackedPath::new(environment_id, absolute_path.as_path()));
+                }
+                candidates
+            })
+            .collect::<HashSet<_>>();
+        let covered_paths = self
+            .unvalidated_paths
+            .intersection(&covered_candidates)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let covered_unknown_mutation = clear_unknown_mutation && self.unvalidated_unknown_mutation;
+
+        self.validation_records.push(ValidationRecord {
+            kind: ValidationCommandKind::Check,
+            command,
+            covered_paths: covered_paths.clone(),
+            covered_unknown_mutation,
+        });
+        for path in covered_paths {
+            self.unvalidated_paths.remove(&path);
+        }
+        if covered_unknown_mutation {
+            self.unvalidated_unknown_mutation = false;
+        }
+        let all_current_mutations_covered = !self.has_unvalidated_mutation();
+        if all_current_mutations_covered {
+            self.last_post_mutation_validation_status =
+                ValidationFreshnessStatus::PassedAfterLastMutation;
+        }
+        all_current_mutations_covered
+    }
+
+    pub(crate) fn has_unvalidated_mutation(&self) -> bool {
+        self.unvalidated_unknown_mutation || !self.unvalidated_paths.is_empty()
+    }
+
+    pub(crate) fn needs_unified_diff_fallback(&self) -> bool {
+        self.unified_diff.is_none() && self.unified_diff_fallback_needed
+    }
+
+    pub(crate) fn validation_freshness_status(&self) -> ValidationFreshnessStatus {
+        if self.has_unvalidated_mutation() {
+            self.last_post_mutation_validation_status.clone()
+        } else if self.validation_records.is_empty() {
+            ValidationFreshnessStatus::None
+        } else {
+            ValidationFreshnessStatus::PassedAfterLastMutation
+        }
+    }
+
+    pub(crate) fn final_validation_warning_message(&self) -> Option<&'static str> {
+        if !self.has_unvalidated_mutation() && self.validation_records.is_empty() {
+            return None;
+        }
+        self.validation_freshness_status().final_warning_message()
+    }
+
+    pub(crate) fn command_looks_like_mutating(command: &[String]) -> bool {
+        if classify_validation_command(command).is_some() || looks_like_context_evidence(command) {
+            return false;
+        }
+        if is_format_only_command(command) {
+            return true;
+        }
+
+        let lower = command.join(" ").to_ascii_lowercase();
+        if lower.contains(">>") || lower.contains(" > ") || lower.contains("| out-file") {
+            return true;
+        }
+
+        let tokens = normalized_command_tokens(command);
+        if tokens.iter().any(|token| {
+            matches!(
+                token.as_str(),
+                "apply_patch"
+                    | "add-content"
+                    | "copy-item"
+                    | "cp"
+                    | "del"
+                    | "erase"
+                    | "md"
+                    | "mkdir"
+                    | "move-item"
+                    | "mv"
+                    | "new-item"
+                    | "ni"
+                    | "out-file"
+                    | "rd"
+                    | "reg"
+                    | "remove-item"
+                    | "ren"
+                    | "rename-item"
+                    | "rm"
+                    | "rmdir"
+                    | "set-content"
+                    | "set-item"
+                    | "set-itemproperty"
+                    | "tee"
+                    | "tee-object"
+            )
+        }) {
+            return true;
+        }
+
+        tokens.windows(2).any(|window| {
+            matches!(
+                window,
+                [first, second]
+                    if first == "git"
+                        && matches!(
+                            second.as_str(),
+                            "add" | "apply" | "checkout" | "clean" | "commit" | "merge" | "mv" | "rebase" | "reset" | "restore" | "rm" | "switch"
+                        )
+            ) || matches!(
+                window,
+                [first, second]
+                    if matches!(first.as_str(), "npm" | "pnpm" | "yarn")
+                        && matches!(second.as_str(), "add" | "install" | "remove" | "uninstall" | "update")
+            )
+        })
     }
 
     pub fn get_unified_diff(&self) -> Option<String> {
@@ -118,6 +375,34 @@ impl TurnDiffTracker {
 
     pub(crate) fn has_unified_diff(&self) -> bool {
         self.unified_diff.is_some()
+    }
+
+    fn record_mutation(&mut self, paths: HashSet<TrackedPath>) {
+        self.last_post_mutation_validation_status = if self.validation_records.is_empty() {
+            ValidationFreshnessStatus::None
+        } else {
+            ValidationFreshnessStatus::StaleAfterLastMutation
+        };
+        if !self.valid {
+            self.unified_diff_fallback_needed = true;
+        }
+        if paths.is_empty() {
+            self.unvalidated_unknown_mutation = true;
+        } else {
+            self.unvalidated_paths.extend(paths);
+        }
+    }
+
+    fn record_unknown_mutation_index(&mut self) {
+        self.last_post_mutation_validation_status = if self.validation_records.is_empty() {
+            ValidationFreshnessStatus::None
+        } else {
+            ValidationFreshnessStatus::StaleAfterLastMutation
+        };
+        self.unvalidated_unknown_mutation = true;
+        if !self.valid {
+            self.unified_diff_fallback_needed = true;
+        }
     }
 
     fn refresh_unified_diff(&mut self) {
@@ -180,6 +465,9 @@ impl TurnDiffTracker {
 
         self.rendered_diffs = rendered_diffs;
         self.unified_diff = (!aggregated.is_empty()).then_some(aggregated);
+        if self.unified_diff.is_some() {
+            self.unified_diff_fallback_needed = false;
+        }
     }
 
     fn apply_change(&mut self, environment_id: &str, change: &AppliedPatchChange) {
@@ -383,6 +671,271 @@ impl TurnDiffTracker {
             display
         }
     }
+}
+
+fn paths_touched_by_delta(environment_id: &str, delta: &AppliedPatchDelta) -> HashSet<TrackedPath> {
+    let mut paths = HashSet::new();
+    for change in delta.changes() {
+        paths.insert(TrackedPath::new(environment_id, change.path.as_path()));
+        if let AppliedPatchFileChange::Update {
+            move_path: Some(move_path),
+            ..
+        } = &change.change
+        {
+            paths.insert(TrackedPath::new(environment_id, move_path));
+        }
+    }
+    paths
+}
+
+fn classify_validation_command(command: &[String]) -> Option<ValidationCommandKind> {
+    let tokens = normalized_command_tokens(command);
+    classify_validation_tokens(&tokens).or_else(|| {
+        known_powershell_logical_validation_tokens(command)
+            .as_deref()
+            .and_then(classify_validation_tokens)
+    })
+}
+
+fn is_broad_validation_filter_command(command: &[String]) -> bool {
+    let tokens = normalized_command_tokens(command);
+    if classify_validation_tokens(&tokens).is_none() {
+        return false;
+    }
+    let Some(expression) = filter_expression_after_flag(command, "-e")
+        .or_else(|| filter_expression_after_flag(command, "--filter-expr"))
+    else {
+        return false;
+    };
+    let expression = expression.to_ascii_lowercase();
+    expression.contains('|')
+        || expression.contains(" or ")
+        || expression.contains("package(")
+        || expression.contains("kind(")
+        || expression.contains("all()")
+}
+
+fn filter_expression_after_flag(command: &[String], flag: &str) -> Option<String> {
+    command
+        .windows(2)
+        .find_map(|window| match window {
+            [candidate, expression] if candidate.eq_ignore_ascii_case(flag) => {
+                Some(expression.clone())
+            }
+            _ => None,
+        })
+        .or_else(|| filter_expression_after_flag_in_joined_command(command, flag))
+}
+
+fn filter_expression_after_flag_in_joined_command(
+    command: &[String],
+    flag: &str,
+) -> Option<String> {
+    let joined = command.join(" ");
+    let tokens = shell_filter_tokens(&joined);
+    tokens.windows(2).find_map(|window| match window {
+        [candidate, expression] if candidate.eq_ignore_ascii_case(flag) => Some(expression.clone()),
+        _ => None,
+    })
+}
+
+fn shell_filter_tokens(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for ch in command.chars() {
+        match quote {
+            Some(q) if ch == q => {
+                quote = None;
+                push_filter_token(&mut tokens, &mut current);
+            }
+            Some(_) => current.push(ch),
+            None if matches!(ch, '\'' | '"') => {
+                push_filter_token(&mut tokens, &mut current);
+                quote = Some(ch);
+            }
+            None if ch.is_whitespace() => {
+                push_filter_token(&mut tokens, &mut current);
+            }
+            None => current.push(ch),
+        }
+    }
+    push_filter_token(&mut tokens, &mut current);
+    tokens
+}
+
+fn push_filter_token(tokens: &mut Vec<String>, current: &mut String) {
+    if !current.is_empty() {
+        tokens.push(std::mem::take(current));
+    }
+}
+
+fn is_format_only_command(command: &[String]) -> bool {
+    let tokens = normalized_command_tokens(command);
+    match tokens.as_slice() {
+        [first, second, ..] if first == "just" && second == "fmt" => true,
+        [first, second, ..] if first == "cargo" && second == "fmt" => true,
+        [first, ..] if matches!(first.as_str(), "rustfmt" | "prettier") => true,
+        _ => false,
+    }
+}
+
+fn looks_like_context_evidence(command: &[String]) -> bool {
+    let lower = command.join(" ").to_ascii_lowercase();
+    lower.contains("rg ")
+        || lower.starts_with("rg ")
+        || lower.contains("select-string")
+        || lower.contains("findstr")
+        || lower.contains("git status")
+        || lower.contains("git diff")
+        || lower.contains("git show")
+        || lower.contains("get-content")
+        || lower.contains("readlines")
+        || lower.contains("read_file_span")
+}
+
+fn normalized_command_tokens(command: &[String]) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for token in command {
+        for part in token.split_whitespace() {
+            let cleaned = part
+                .trim_matches(|ch: char| {
+                    matches!(
+                        ch,
+                        '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ';' | '&' | '|'
+                    )
+                })
+                .to_ascii_lowercase();
+            if !cleaned.is_empty() {
+                tokens.push(cleaned);
+            }
+        }
+    }
+    tokens
+}
+
+fn known_powershell_logical_validation_tokens(command: &[String]) -> Option<Vec<String>> {
+    let script = command.join("\n");
+    let lower = script.to_ascii_lowercase();
+    if !(lower.contains("$lastexitcode") && lower.contains("exit $code")) {
+        return None;
+    }
+
+    script.lines().find_map(|line| {
+        let trimmed = line.trim();
+        let rest = trimmed
+            .strip_prefix("$out = &")
+            .or_else(|| trimmed.strip_prefix("$output = &"))?
+            .trim();
+        let mut tokens = shell_filter_tokens(rest);
+        while tokens
+            .last()
+            .is_some_and(|token| token == "2>&1" || token == "2>&")
+        {
+            tokens.pop();
+        }
+        let tokens = tokens
+            .into_iter()
+            .map(|token| {
+                token
+                    .trim_matches(|ch: char| {
+                        matches!(
+                            ch,
+                            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ';' | '&' | '|'
+                        )
+                    })
+                    .to_ascii_lowercase()
+            })
+            .filter(|token| !token.is_empty())
+            .collect::<Vec<_>>();
+        matches!(tokens.first().map(String::as_str), Some("just")).then_some(tokens)
+    })
+}
+
+fn classify_validation_tokens(tokens: &[String]) -> Option<ValidationCommandKind> {
+    let first = tokens.first()?.as_str();
+    if matches!(first, "echo" | "printf" | "write-output" | "#" | "rem") {
+        return None;
+    }
+    if matches!(
+        first,
+        "pwsh" | "powershell" | "powershell.exe" | "cmd" | "cmd.exe"
+    ) && let Some(position) = tokens
+        .iter()
+        .position(|token| matches!(token.as_str(), "-command" | "-c" | "/c"))
+    {
+        return classify_validation_tokens(&tokens[position.saturating_add(1)..]);
+    }
+
+    match first {
+        "just" => classify_just_validation(tokens),
+        "cargo" => classify_cargo_validation(tokens),
+        "nextest" if token_at(tokens, 1) == Some("run") => Some(ValidationCommandKind::Test),
+        "npm" | "pnpm" | "yarn" => classify_node_validation(tokens),
+        "pytest" | "vitest" | "jest" => Some(ValidationCommandKind::Test),
+        "python" if token_at(tokens, 1) == Some("-m") && token_at(tokens, 2) == Some("pytest") => {
+            Some(ValidationCommandKind::Test)
+        }
+        "python"
+            if token_at(tokens, 1) == Some("-m") && token_at(tokens, 2) == Some("unittest") =>
+        {
+            Some(ValidationCommandKind::Test)
+        }
+        "uv" if token_at(tokens, 1) == Some("run") => classify_validation_tokens(&tokens[2..]),
+        "ruff" if token_at(tokens, 1) == Some("check") => Some(ValidationCommandKind::Lint),
+        "mypy" | "tsc" => Some(ValidationCommandKind::Typecheck),
+        "eslint" => Some(ValidationCommandKind::Lint),
+        "playwright" if token_at(tokens, 1) == Some("test") => Some(ValidationCommandKind::Test),
+        "go" if token_at(tokens, 1) == Some("test") => Some(ValidationCommandKind::Test),
+        "dotnet" if token_at(tokens, 1) == Some("test") => Some(ValidationCommandKind::Test),
+        "dotnet" if token_at(tokens, 1) == Some("build") => Some(ValidationCommandKind::Build),
+        "mvn" if token_at(tokens, 1) == Some("test") => Some(ValidationCommandKind::Test),
+        "gradle" if token_at(tokens, 1) == Some("test") => Some(ValidationCommandKind::Test),
+        _ => None,
+    }
+}
+
+fn classify_just_validation(tokens: &[String]) -> Option<ValidationCommandKind> {
+    match token_at(tokens, 1)? {
+        "test" | "test-fast" | "test-lane" | "test-lane-fast" => Some(ValidationCommandKind::Test),
+        "check" | "check-lane" => Some(ValidationCommandKind::Check),
+        "fix" => Some(ValidationCommandKind::Lint),
+        _ => None,
+    }
+}
+
+fn classify_cargo_validation(tokens: &[String]) -> Option<ValidationCommandKind> {
+    match token_at(tokens, 1)? {
+        "test" | "nextest" => Some(ValidationCommandKind::Test),
+        "check" => Some(ValidationCommandKind::Check),
+        "shear" | "audit" | "deny" => Some(ValidationCommandKind::DependencyHygiene),
+        "clippy" => Some(ValidationCommandKind::Lint),
+        "build" => Some(ValidationCommandKind::Build),
+        _ => None,
+    }
+}
+
+fn classify_node_validation(tokens: &[String]) -> Option<ValidationCommandKind> {
+    let script = if token_at(tokens, 1) == Some("run") {
+        token_at(tokens, 2)?
+    } else {
+        token_at(tokens, 1)?
+    };
+    if script.contains("test") {
+        Some(ValidationCommandKind::Test)
+    } else if script.contains("lint") {
+        Some(ValidationCommandKind::Lint)
+    } else if script.contains("typecheck") {
+        Some(ValidationCommandKind::Typecheck)
+    } else if script.contains("build") {
+        Some(ValidationCommandKind::Build)
+    } else {
+        None
+    }
+}
+
+fn token_at(tokens: &[String], index: usize) -> Option<&str> {
+    tokens.get(index).map(String::as_str)
 }
 
 fn git_blob_oid(data: &[u8]) -> String {
