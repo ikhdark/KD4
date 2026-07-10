@@ -41,11 +41,14 @@ fn legacy_process_test_guard() -> MutexGuard<'static, ()> {
         .expect("legacy Windows sandbox process test lock poisoned")
 }
 
-fn legacy_process_sandbox_available() -> bool {
+fn legacy_process_sandbox_available_or_asserts_fail_closed() -> bool {
     let available = crate::legacy_restricted_token_enforces_delete_child();
     if !available {
-        eprintln!(
-            "skipping legacy process test: this Windows kernel does not safely restrict FILE_DELETE_CHILD"
+        let err = crate::ensure_legacy_delete_child_safety(false)
+            .expect_err("unsupported kernels must fail closed");
+        assert_eq!(
+            err.to_string(),
+            crate::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR
         );
     }
     available
@@ -58,10 +61,23 @@ fn current_thread_runtime() -> tokio::runtime::Runtime {
         .expect("build tokio runtime")
 }
 
-fn pwsh_path() -> Option<PathBuf> {
-    let program_files = std::env::var_os("ProgramFiles")?;
-    let path = PathBuf::from(program_files).join("PowerShell\\7\\pwsh.exe");
-    path.is_file().then_some(path)
+fn powershell_path() -> PathBuf {
+    if let Some(program_files) = std::env::var_os("ProgramFiles") {
+        let pwsh = PathBuf::from(program_files).join("PowerShell\\7\\pwsh.exe");
+        if pwsh.is_file() {
+            return pwsh;
+        }
+    }
+
+    let system_root = std::env::var_os("SystemRoot").expect("SystemRoot must be set on Windows");
+    let powershell =
+        PathBuf::from(system_root).join("System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    assert!(
+        powershell.is_file(),
+        "Windows PowerShell is missing: {}",
+        powershell.display()
+    );
+    powershell
 }
 
 fn sandbox_cwd() -> PathBuf {
@@ -161,7 +177,7 @@ async fn collect_stdout_and_exit(
 
 #[test]
 fn legacy_non_tty_cmd_emits_output() {
-    if !legacy_process_sandbox_available() {
+    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
         return;
     }
     let _guard = legacy_process_test_guard();
@@ -204,7 +220,7 @@ fn legacy_non_tty_cmd_emits_output() {
 
 #[test]
 fn legacy_non_tty_cmd_rejects_deny_read_overrides() {
-    if !legacy_process_sandbox_available() {
+    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
         return;
     }
     let _guard = legacy_process_test_guard();
@@ -248,10 +264,8 @@ fn legacy_non_tty_cmd_rejects_deny_read_overrides() {
 
 #[test]
 fn legacy_non_tty_powershell_emits_output() {
-    let Some(pwsh) = pwsh_path() else {
-        return;
-    };
-    if !legacy_process_sandbox_available() {
+    let pwsh = powershell_path();
+    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
         return;
     }
     let _guard = legacy_process_test_guard();
@@ -441,10 +455,8 @@ fn runner_resizer_sends_resize_frame() {
 
 #[test]
 fn legacy_capture_powershell_emits_output() {
-    let Some(pwsh) = pwsh_path() else {
-        return;
-    };
-    if !legacy_process_sandbox_available() {
+    let pwsh = powershell_path();
+    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
         return;
     }
     let _guard = legacy_process_test_guard();
@@ -628,11 +640,8 @@ fn legacy_workspace_write_delete_is_limited_to_writable_roots() {
 
 #[test]
 fn legacy_capture_cancellation_is_not_reported_as_timeout() {
-    let Some(pwsh) = pwsh_path() else {
-        eprintln!("skipping cancellation regression test: PowerShell 7 is not installed");
-        return;
-    };
-    if !legacy_process_sandbox_available() {
+    let pwsh = powershell_path();
+    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
         return;
     }
     let _guard = legacy_process_test_guard();
@@ -683,10 +692,8 @@ fn legacy_capture_cancellation_is_not_reported_as_timeout() {
 
 #[test]
 fn legacy_tty_powershell_emits_output_and_accepts_input() {
-    let Some(pwsh) = pwsh_path() else {
-        return;
-    };
-    if !legacy_process_sandbox_available() {
+    let pwsh = powershell_path();
+    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
         return;
     }
     let _guard = legacy_process_test_guard();
@@ -745,7 +752,7 @@ fn legacy_tty_powershell_emits_output_and_accepts_input() {
 #[test]
 #[ignore = "TODO: legacy ConPTY cmd.exe exits with STATUS_DLL_INIT_FAILED in CI"]
 fn legacy_tty_cmd_emits_output_and_accepts_input() {
-    if !legacy_process_sandbox_available() {
+    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
         return;
     }
     let _guard = legacy_process_test_guard();
@@ -801,7 +808,7 @@ fn legacy_tty_cmd_emits_output_and_accepts_input() {
 #[test]
 #[ignore = "TODO: legacy ConPTY cmd.exe exits with STATUS_DLL_INIT_FAILED in CI"]
 fn legacy_tty_cmd_default_desktop_emits_output_and_accepts_input() {
-    if !legacy_process_sandbox_available() {
+    if !legacy_process_sandbox_available_or_asserts_fail_closed() {
         return;
     }
     let _guard = legacy_process_test_guard();

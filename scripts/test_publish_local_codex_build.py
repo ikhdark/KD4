@@ -108,12 +108,18 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             install_dir = temp_path / "install"
             fake_bin = temp_path / "bin"
             fake_bin.mkdir()
+            built_dir = (
+                self.repo_root / "codex-rs" / "target" / "publish-release" / "release"
+            )
             fake_cargo = fake_bin / "cargo.cmd"
             fake_cargo.write_text(
                 "\r\n".join(
                     [
                         "@echo off",
                         "echo fake cargo %*",
+                        f'if not exist "{built_dir}" mkdir "{built_dir}"',
+                        f'copy /y "%ComSpec%" "{built_dir / "codex.exe"}" >nul',
+                        f'copy /y "%ComSpec%" "{built_dir / "codex-code-mode-host.exe"}" >nul',
                         "exit /b 0",
                     ]
                 ),
@@ -178,6 +184,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                 ),
                 encoding="utf-8",
             )
+            self.write_build_stamp("release", FIXTURE_TIME, fake_codex)
             fake_bin = temp_path / "bin"
             fake_bin.mkdir()
             fake_cargo = fake_bin / "cargo.cmd"
@@ -214,7 +221,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertIn("testRun: true", result.stdout)
             self.assertIn("autoSkipBuild: true", result.stdout)
             self.assertIn(
-                "autoSkipBuildReason: source build is current for tracked publish inputs",
+                "autoSkipBuildReason: source artifacts and tracked publish inputs match build stamp",
                 result.stdout,
             )
             self.assertIn("buildCommand: <skipped>", result.stdout)

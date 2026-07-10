@@ -238,7 +238,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
         bin_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(CODEX_CLI_ROOT / "bin" / "codex.js", bin_dir / "codex.js")
 
-        readme_src = REPO_ROOT / "SOURCEMAP.md"
+        readme_src = CODEX_CLI_ROOT / "README.npm.md"
         if readme_src.exists():
             shutil.copy2(readme_src, staging_dir / "README.md")
 
@@ -248,7 +248,7 @@ def stage_sources(staging_dir: Path, version: str, package: str) -> None:
         platform_npm_tag = platform_package["npm_tag"]
         platform_version = compute_platform_package_version(version, platform_npm_tag)
 
-        readme_src = REPO_ROOT / "SOURCEMAP.md"
+        readme_src = CODEX_CLI_ROOT / "README.npm.md"
         if readme_src.exists():
             shutil.copy2(readme_src, staging_dir / "README.md")
 

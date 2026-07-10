@@ -114,30 +114,66 @@ async fn on_exec_approval_response(
     receiver: tokio::sync::oneshot::Receiver<serde_json::Value>,
     codex: Arc<CodexThread>,
 ) {
-    let response = receiver.await;
-    let value = match response {
+    let op = exec_approval_op(approval_id, event_id, receiver).await;
+
+    if let Err(err) = codex.submit(op).await {
+        error!("failed to submit ExecApproval: {err}");
+    }
+}
+
+async fn exec_approval_op(
+    approval_id: String,
+    event_id: String,
+    receiver: tokio::sync::oneshot::Receiver<serde_json::Value>,
+) -> Op {
+    let decision = exec_approval_decision(receiver).await;
+    Op::ExecApproval {
+        id: approval_id,
+        turn_id: Some(event_id),
+        decision,
+    }
+}
+
+async fn exec_approval_decision(
+    receiver: tokio::sync::oneshot::Receiver<serde_json::Value>,
+) -> ReviewDecision {
+    let value = match receiver.await {
         Ok(value) => value,
         Err(err) => {
             error!("request failed: {err:?}");
-            return;
+            return ReviewDecision::Denied;
         }
     };
 
-    let decision = review_decision_from_elicitation_response(value).unwrap_or_else(|err| {
+    review_decision_from_elicitation_response(value).unwrap_or_else(|err| {
         error!("failed to deserialize ExecApprovalResponse: {err}");
         // If we cannot deserialize the response, we deny the request to be
         // conservative.
         ReviewDecision::Denied
-    });
+    })
+}
 
-    if let Err(err) = codex
-        .submit(Op::ExecApproval {
-            id: approval_id,
-            turn_id: Some(event_id),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_exec_approval_receiver_is_denied() {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        drop(sender);
+
+        let op = exec_approval_op("approval-id".to_string(), "turn-id".to_string(), receiver).await;
+
+        let Op::ExecApproval {
+            id,
+            turn_id,
             decision,
-        })
-        .await
-    {
-        error!("failed to submit ExecApproval: {err}");
+        } = op
+        else {
+            panic!("cancelled receiver should produce an ExecApproval operation");
+        };
+        assert_eq!(id, "approval-id");
+        assert_eq!(turn_id.as_deref(), Some("turn-id"));
+        assert_eq!(decision, ReviewDecision::Denied);
     }
 }

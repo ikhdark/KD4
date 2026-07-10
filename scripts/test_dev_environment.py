@@ -14,9 +14,6 @@ from scripts import git_doctor
 from scripts import vscode_runtime_proof
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
 class DevEnvironmentDoctorTest(unittest.TestCase):
     def test_node_major_parses_version_prefix(self) -> None:
         self.assertEqual(dev_env_doctor.node_major("v22.13.1"), 22)
@@ -251,27 +248,6 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
 
         regenerate.assert_called_once_with(Path("/repo"))
         self.assertEqual(run_check.call_count, 2)
-
-
-class WslPublishBridgeTest(unittest.TestCase):
-    def test_wsl_bridge_routes_to_windows_powershell_script(self) -> None:
-        text = (REPO_ROOT / "scripts" / "publish-local-codex-wsl.sh").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn(
-            'windows_repo_root="$(wslpath -w "$repo_root")"',
-            text,
-        )
-        self.assertIn(
-            'windows_script="$(wslpath -w "$repo_root/scripts/publish-local-codex.ps1")"',
-            text,
-        )
-        self.assertRegex(
-            text,
-            r'(?m)^\s*powershell\.exe\b.*-File "\$windows_script".*-RepoRoot "\$windows_repo_root"',
-        )
-        self.assertIn("-SourceCodeModeHostExe", text)
-        self.assertIn('arg_lower="${arg,,}"', text)
 
 
 if __name__ == "__main__":

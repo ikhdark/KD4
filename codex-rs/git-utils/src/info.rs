@@ -466,7 +466,7 @@ fn safe_directory_retry_args(
     status_success: bool,
     stderr: &[u8],
 ) -> Option<Vec<OsString>> {
-    if !is_dubious_ownership_stderr(status_success, stderr) {
+    if !is_passive_git_inspection(args) || !is_dubious_ownership_stderr(status_success, stderr) {
         return None;
     }
     let repo_root = get_git_repo_root(cwd)?;
@@ -475,6 +475,26 @@ fn safe_directory_retry_args(
         fsmonitor,
         Some(repo_root.as_path()),
     ))
+}
+
+fn is_passive_git_inspection(args: &[&str]) -> bool {
+    match args {
+        ["remote"] | ["remote", "-v"] | ["remote", "get-url", _] => true,
+        [command, ..] => matches!(
+            *command,
+            "branch"
+                | "diff"
+                | "for-each-ref"
+                | "log"
+                | "ls-files"
+                | "merge-base"
+                | "rev-list"
+                | "rev-parse"
+                | "status"
+                | "symbolic-ref"
+        ),
+        [] => false,
+    }
 }
 
 fn git_inspection_args(
@@ -547,8 +567,7 @@ async fn get_git_remotes(cwd: &Path) -> Option<Vec<String>> {
 ///
 /// Preference order:
 /// 1) The symbolic ref at `refs/remotes/<remote>/HEAD` for the first remote (origin prioritized)
-/// 2) `git remote show <remote>` parsed for "HEAD branch: <name>"
-/// 3) Local fallback to existing `main` or `master` if present
+/// 2) Local fallback to existing `main` or `master` if present
 async fn get_default_branch(cwd: &Path) -> Option<String> {
     // Prefer the first remote (with origin prioritized)
     let remotes = get_git_remotes(cwd).await.unwrap_or_default();
@@ -569,23 +588,6 @@ async fn get_default_branch(cwd: &Path) -> Option<String> {
             let trimmed = sym.trim();
             if let Some((_, name)) = trimmed.rsplit_once('/') {
                 return Some(name.to_string());
-            }
-        }
-
-        // Fall back to parsing `git remote show <remote>` output
-        if let Some(show_output) =
-            run_git_command_with_timeout(&["remote", "show", &remote], cwd).await
-            && show_output.status.success()
-            && let Ok(text) = String::from_utf8(show_output.stdout)
-        {
-            for line in text.lines() {
-                let line = line.trim();
-                if let Some(rest) = line.strip_prefix("HEAD branch:") {
-                    let name = rest.trim();
-                    if !name.is_empty() {
-                        return Some(name.to_string());
-                    }
-                }
             }
         }
     }
@@ -1124,6 +1126,26 @@ mod tests {
             .is_none(),
             "do not retry unrelated git failures"
         );
+
+        for active_args in [
+            &["fetch", "origin"][..],
+            &["pull", "--ff-only"][..],
+            &["push", "origin", "HEAD"][..],
+            &["remote", "show", "origin"][..],
+            &["submodule", "update", "--init"][..],
+        ] {
+            assert!(
+                safe_directory_retry_args(
+                    active_args,
+                    &subdir,
+                    crate::FsmonitorOverride::Disabled,
+                    false,
+                    stderr,
+                )
+                .is_none(),
+                "active Git command must not receive a safe.directory retry: {active_args:?}"
+            );
+        }
     }
 
     #[tokio::test]

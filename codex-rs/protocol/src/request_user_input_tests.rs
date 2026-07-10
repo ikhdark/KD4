@@ -45,6 +45,31 @@ fn request_user_input_rejects_question_count_outside_bounds() {
 }
 
 #[test]
+fn request_user_input_rejects_empty_question_ids() {
+    for id in ["", "   "] {
+        let err = serde_json::from_value::<RequestUserInputArgs>(json!({
+            "questions": [question_json(id, "Mode", 2)]
+        }))
+        .expect_err("empty question id should fail");
+
+        assert!(err.to_string().contains("question id must not be empty"));
+    }
+}
+
+#[test]
+fn request_user_input_rejects_duplicate_question_ids() {
+    let err = serde_json::from_value::<RequestUserInputArgs>(json!({
+        "questions": [
+            question_json("mode", "First", 2),
+            question_json("mode", "Second", 2)
+        ]
+    }))
+    .expect_err("duplicate question ids should fail");
+
+    assert!(err.to_string().contains("question ids must be unique"));
+}
+
+#[test]
 fn request_user_input_counts_header_characters_not_bytes() {
     let twelve = "🦀".repeat(12);
     serde_json::from_value::<RequestUserInputArgs>(json!({

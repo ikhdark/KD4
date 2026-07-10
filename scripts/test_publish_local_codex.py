@@ -2,11 +2,9 @@
 
 import json
 from pathlib import Path
-import hashlib
 import os
 import shutil
 import subprocess
-import tempfile
 import unittest
 
 
@@ -30,10 +28,6 @@ def powershell() -> str | None:
     # stricter native-stderr and StrictMode semantics than pwsh 7 — bugs in
     # that class are invisible when the tests run under pwsh.
     return shutil.which("powershell") or shutil.which("pwsh")
-
-
-def ps_single_quote(value: str | Path) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
 
 
 PUBLISH_ENV_VARS = (
@@ -79,7 +73,7 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
         ):
             self.assertEqual(composed.count(f"function {function_name}"), 1)
 
-    def test_hashing_helper_is_dot_sourced_without_duplicate_definitions(self) -> None:
+    def test_hashing_helper_is_dot_sourced_without_unsafe_cache(self) -> None:
         publish_script = publish_source_text()
         hashing_helper = HASHING_HELPER.read_text(encoding="utf-8")
 
@@ -87,7 +81,9 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
             '. (Join-Path $PSScriptRoot "publish-local-codex.hashing.ps1")',
             publish_script,
         )
-        self.assertIn("function Get-FileSha256Cached", hashing_helper)
+        self.assertIn("function Get-FileSha256", hashing_helper)
+        self.assertNotIn("Get-FileSha256Cached", hashing_helper)
+        self.assertNotIn("FileSha256Cache", hashing_helper)
         self.assertNotIn("function Get-FileSha256Cached", publish_script)
         self.assertNotIn("function Get-CachedFileSha256", publish_script)
         self.assertNotIn("function Remove-StaleFileSha256CacheEntries", publish_script)
@@ -127,63 +123,6 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
         self.assertIn(
             'Join-Path $InstallDir "codex-code-mode-host.exe"', publish_script
         )
-
-    @unittest.skipUnless(os.name == "nt", "PowerShell helper is Windows-only")
-    def test_hashing_helper_initializes_cache_state_when_dot_sourced_directly(
-        self,
-    ) -> None:
-        shell = powershell()
-        if shell is None:
-            self.skipTest("PowerShell is not available")
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            source = temp_path / "codex.exe"
-            cache_dir = temp_path / "cache"
-            source.write_bytes(b"codex")
-            expected = hashlib.sha256(source.read_bytes()).hexdigest()
-            cache_dir.mkdir()
-            legacy_cache = cache_dir / "legacy-path-key.sha256.json"
-            legacy_cache.write_text(
-                json.dumps({"path": str(source.resolve())}), encoding="utf-8"
-            )
-
-            result = subprocess.run(
-                [
-                    shell,
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    (
-                        # Mirror the production session: the publish script
-                        # dot-sources this helper under StrictMode Latest.
-                        "Set-StrictMode -Version Latest; "
-                        "$ErrorActionPreference = 'Stop'; "
-                        f". {ps_single_quote(HASHING_HELPER)}; "
-                        f"Get-FileSha256Cached -Path {ps_single_quote(source)} "
-                        f"-CacheDir {ps_single_quote(cache_dir)}"
-                    ),
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
-                creationflags=CREATE_NO_WINDOW,
-            )
-            cache_names = sorted(path.name for path in cache_dir.iterdir())
-            expected_cache_name = (
-                hashlib.sha256(str(source.resolve()).encode("utf-8")).hexdigest()
-                + ".sha256.json"
-            )
-
-        self.assertEqual(
-            result.returncode,
-            0,
-            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-        )
-        self.assertEqual(result.stdout.strip(), expected)
-        self.assertEqual(cache_names, [expected_cache_name])
-        self.assertEqual(len(expected_cache_name), 76)
 
     def test_publish_script_uses_global_publish_mutex(self) -> None:
         publish_script = publish_source_text()

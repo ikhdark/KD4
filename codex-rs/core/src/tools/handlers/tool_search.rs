@@ -20,12 +20,16 @@ use codex_tools::ToolSpec;
 use codex_tools::coalesce_loadable_tool_specs;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::instrument;
 
 const MAX_TOOL_SEARCH_HANDLER_CACHE: usize = 4;
 const MAX_TOOL_SEARCH_RESULT_CACHE: usize = 32;
+const MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES: usize = 256 * 1024;
+const MAX_TOOL_SEARCH_QUERY_BYTES: usize = 4 * 1024;
+const MAX_TOOL_SEARCH_LIMIT: usize = 64;
 const TOOL_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
 
 pub struct ToolSearchHandler {
@@ -50,6 +54,33 @@ struct ToolSearchQueryKey {
 struct ToolSearchCacheEntry {
     key: ToolSearchQueryKey,
     tools: Vec<LoadableToolSpec>,
+}
+
+struct CacheSizeWriter {
+    remaining: usize,
+}
+
+impl CacheSizeWriter {
+    fn new(limit: usize) -> Self {
+        Self { remaining: limit }
+    }
+}
+
+impl Write for CacheSizeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() > self.remaining {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "tool search cache entry exceeds its byte budget",
+            ));
+        }
+        self.remaining -= buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl ToolSearchHandlerCache {
@@ -175,25 +206,8 @@ impl ToolSearchHandler {
             }
         };
 
-        let query = normalize_tool_search_query(&args.query);
-        if query.is_empty() {
-            return Err(FunctionCallError::RespondToModel(
-                "query must not be empty".to_string(),
-            ));
-        }
         let limit = args.limit.unwrap_or(TOOL_SEARCH_DEFAULT_LIMIT);
-
-        if limit == 0 {
-            return Err(FunctionCallError::RespondToModel(
-                "limit must be greater than zero".to_string(),
-            ));
-        }
-
-        if self.search_infos.is_empty() {
-            return Ok(boxed_tool_output(ToolSearchOutput { tools: Vec::new() }));
-        }
-
-        let tools = self.search(&query, limit)?;
+        let tools = self.search(&args.query, limit)?;
 
         Ok(boxed_tool_output(ToolSearchOutput { tools }))
     }
@@ -207,10 +221,11 @@ impl ToolSearchHandler {
         query: &str,
         limit: usize,
     ) -> Result<Vec<LoadableToolSpec>, FunctionCallError> {
-        let key = ToolSearchQueryKey {
-            query: normalize_tool_search_query(query),
-            limit,
-        };
+        let key = validate_tool_search_query(query, limit)?;
+        if self.search_infos.is_empty() {
+            return Ok(Vec::new());
+        }
+
         if let Some(tools) = self.cached_search_result(&key) {
             tracing::trace!(
                 normalized_query_bytes = key.query.len(),
@@ -224,9 +239,8 @@ impl ToolSearchHandler {
         }
 
         let candidate_limit = tool_search_candidate_limit(limit, self.search_infos.len());
-        let mut ranked_results = self
-            .search_engine
-            .search(&key.query, self.search_infos.len());
+        let mut ranked_results = self.search_engine.search(&key.query, candidate_limit);
+        debug_assert!(ranked_results.len() <= candidate_limit);
         ranked_results.sort_by(|left, right| {
             right
                 .score
@@ -259,7 +273,7 @@ impl ToolSearchHandler {
             output_source_count = loadable_tool_spec_diversity_count(&tools),
             "tool search completed"
         );
-        self.cache_search_result(key, tools.clone());
+        self.cache_search_result(key, &tools);
         Ok(tools)
     }
 
@@ -281,12 +295,25 @@ impl ToolSearchHandler {
         Some(tools)
     }
 
-    fn cache_search_result(&self, key: ToolSearchQueryKey, tools: Vec<LoadableToolSpec>) {
+    fn cache_search_result(&self, key: ToolSearchQueryKey, tools: &[LoadableToolSpec]) {
+        if !tool_search_cache_entry_fits_budget(&key, tools) {
+            tracing::trace!(
+                normalized_query_bytes = key.query.len(),
+                output_tool_count = tools.len(),
+                cache_entry_byte_limit = MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES,
+                "skipped oversized tool search cache entry"
+            );
+            return;
+        }
+
         let mut cache = self.result_cache();
         if let Some(index) = cache.iter().position(|entry| entry.key == key) {
             cache.remove(index);
         }
-        cache.push_back(ToolSearchCacheEntry { key, tools });
+        cache.push_back(ToolSearchCacheEntry {
+            key,
+            tools: tools.to_vec(),
+        });
         while cache.len() > MAX_TOOL_SEARCH_RESULT_CACHE {
             cache.pop_front();
         }
@@ -313,10 +340,51 @@ fn normalize_tool_search_query(query: &str) -> String {
         .to_ascii_lowercase()
 }
 
+fn validate_tool_search_query(
+    query: &str,
+    limit: usize,
+) -> Result<ToolSearchQueryKey, FunctionCallError> {
+    if query.len() > MAX_TOOL_SEARCH_QUERY_BYTES {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "query must not exceed {MAX_TOOL_SEARCH_QUERY_BYTES} bytes"
+        )));
+    }
+    if limit == 0 {
+        return Err(FunctionCallError::RespondToModel(
+            "limit must be greater than zero".to_string(),
+        ));
+    }
+    if limit > MAX_TOOL_SEARCH_LIMIT {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "limit must not exceed {MAX_TOOL_SEARCH_LIMIT}"
+        )));
+    }
+
+    let query = normalize_tool_search_query(query);
+    if query.is_empty() {
+        return Err(FunctionCallError::RespondToModel(
+            "query must not be empty".to_string(),
+        ));
+    }
+
+    Ok(ToolSearchQueryKey { query, limit })
+}
+
 fn tool_search_candidate_limit(effective_limit: usize, inventory_size: usize) -> usize {
     effective_limit
         .saturating_mul(TOOL_SEARCH_CANDIDATE_MULTIPLIER)
         .min(inventory_size)
+}
+
+fn tool_search_cache_entry_fits_budget(
+    key: &ToolSearchQueryKey,
+    tools: &[LoadableToolSpec],
+) -> bool {
+    let Some(tool_budget) = MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES.checked_sub(key.query.len()) else {
+        return false;
+    };
+    let mut writer = CacheSizeWriter::new(tool_budget);
+    serde_json::to_writer(&mut writer, tools).is_ok()
 }
 
 fn diversify_search_results(results: Vec<&ToolSearchInfo>, limit: usize) -> Vec<&ToolSearchInfo> {
@@ -560,6 +628,68 @@ mod tests {
         assert_eq!(tool_search_candidate_limit(3, 100), 9);
         assert_eq!(tool_search_candidate_limit(10, 5), 5);
         assert_eq!(tool_search_candidate_limit(usize::MAX, 7), 7);
+    }
+
+    #[test]
+    fn search_rejects_oversized_queries_and_limits() {
+        let handler = ToolSearchHandler::new(vec![search_info(
+            "calendar",
+            None,
+            "calendar",
+            "create_event",
+        )]);
+
+        let oversized_query = "q".repeat(MAX_TOOL_SEARCH_QUERY_BYTES + 1);
+        let query_error = handler
+            .search(&oversized_query, TOOL_SEARCH_DEFAULT_LIMIT)
+            .expect_err("oversized query should fail");
+        assert!(
+            query_error
+                .to_string()
+                .contains("query must not exceed 4096 bytes")
+        );
+
+        let limit_error = handler
+            .search("calendar", MAX_TOOL_SEARCH_LIMIT + 1)
+            .expect_err("oversized limit should fail");
+        assert!(limit_error.to_string().contains("limit must not exceed 64"));
+    }
+
+    #[test]
+    fn search_bounds_the_ranked_candidate_window() {
+        let search_infos = (0..20)
+            .map(|idx| {
+                search_info_with_source(
+                    &format!("shared capability {idx}"),
+                    &format!("source-{idx}"),
+                    &format!("tool-{idx}"),
+                )
+            })
+            .collect();
+        let handler = ToolSearchHandler::new(search_infos);
+
+        let tools = handler
+            .search("shared capability", 1)
+            .expect("bounded search should succeed");
+
+        assert_eq!(tools.len(), 1);
+    }
+
+    #[test]
+    fn search_skips_oversized_cache_entries_before_cloning_them() {
+        let mut search_info = search_info("calendar", None, "calendar", "create_event");
+        let LoadableToolSpec::Namespace(namespace) = &mut search_info.entry.output else {
+            panic!("test search info should be a namespace");
+        };
+        namespace.description = "x".repeat(MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES);
+        let handler = ToolSearchHandler::new(vec![search_info]);
+
+        let tools = handler
+            .search("calendar", TOOL_SEARCH_DEFAULT_LIMIT)
+            .expect("oversized result should still be returned");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(handler.result_cache_len(), 0);
     }
 
     #[test]

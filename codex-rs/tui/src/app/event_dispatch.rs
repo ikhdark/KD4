@@ -1282,36 +1282,60 @@ impl App {
 
                     self.chat_widget.show_windows_sandbox_setup_status();
                     tokio::task::spawn_blocking(move || {
-                        if let Err(err) =
-                            codex_windows_sandbox::run_windows_sandbox_legacy_preflight(
+                        let event =
+                            match codex_windows_sandbox::run_windows_sandbox_legacy_preflight(
                                 &permission_profile,
                                 workspace_roots.as_slice(),
                                 codex_home.as_path(),
                                 command_cwd.as_path(),
                                 &env_map,
-                            )
-                        {
-                            session_telemetry.counter(
-                                "codex.windows_sandbox.legacy_setup_preflight_failed",
-                                /*inc*/ 1,
-                                &[],
-                            );
-                            tracing::warn!(
-                                error = %err,
-                                "failed to preflight non-admin Windows sandbox setup"
-                            );
-                        }
-                        tx.send(AppEvent::EnableWindowsSandboxForAgentMode {
-                            preset,
-                            mode: WindowsSandboxEnableMode::Legacy,
-                            profile_selection,
-                        });
+                            ) {
+                                Ok(()) => AppEvent::EnableWindowsSandboxForAgentMode {
+                                    preset,
+                                    mode: WindowsSandboxEnableMode::Legacy,
+                                    profile_selection,
+                                },
+                                Err(err) => {
+                                    session_telemetry.counter(
+                                        "codex.windows_sandbox.legacy_setup_preflight_failed",
+                                        /*inc*/ 1,
+                                        &[],
+                                    );
+                                    tracing::warn!(
+                                        error = %err,
+                                        "failed to preflight non-admin Windows sandbox setup"
+                                    );
+                                    AppEvent::WindowsSandboxLegacySetupFailed {
+                                        preset,
+                                        profile_selection,
+                                        error: err.to_string(),
+                                    }
+                                }
+                            };
+                        tx.send(event);
                     });
                 }
                 #[cfg(not(target_os = "windows"))]
                 {
                     let _ = (preset, profile_selection);
                 }
+            }
+            AppEvent::WindowsSandboxLegacySetupFailed {
+                preset,
+                profile_selection,
+                error,
+            } => {
+                tracing::warn!(
+                    error = %error,
+                    "non-admin Windows sandbox setup failed closed; configuration was not changed"
+                );
+                self.chat_widget.clear_windows_sandbox_setup_status();
+                self.chat_widget.add_error_message(
+                    "Non-admin sandbox is not safely available on this Windows build. No settings were changed."
+                        .to_string(),
+                );
+                self.chat_widget
+                    .open_windows_sandbox_legacy_unavailable_prompt(preset, profile_selection);
             }
             AppEvent::BeginWindowsSandboxGrantReadRoot { path } => {
                 #[cfg(target_os = "windows")]
@@ -1389,6 +1413,23 @@ impl App {
                         WindowsSandboxEnableMode::Elevated => WindowsSandboxModeToml::Elevated,
                         WindowsSandboxEnableMode::Legacy => WindowsSandboxModeToml::Unelevated,
                     };
+                    if selected_mode == WindowsSandboxModeToml::Unelevated
+                        && !codex_windows_sandbox::legacy_restricted_token_enforces_delete_child()
+                    {
+                        tracing::warn!(
+                            "refusing to enable the non-admin Windows sandbox because the kernel safety probe failed"
+                        );
+                        self.chat_widget.add_error_message(
+                            "Non-admin sandbox is not safely available on this Windows build. No settings were changed."
+                                .to_string(),
+                        );
+                        self.chat_widget
+                            .open_windows_sandbox_legacy_unavailable_prompt(
+                                preset,
+                                profile_selection,
+                            );
+                        return Ok(AppRunControl::Continue);
+                    }
                     let elevated_enabled = selected_mode == WindowsSandboxModeToml::Elevated;
                     if !self.chat_widget.windows_sandbox_mode_allowed(selected_mode) {
                         tracing::warn!(

@@ -131,51 +131,51 @@ if ($TestRun -and $SkipBuild) {
 }
 
 if ($AutoSkipBuild -and -not $SkipBuild -and -not $BuildOnly) {
-    $sourceTreeNewestForAutoSkip = Get-SourceNewestWriteUtcForSkipBuild `
+    $autoSkipBuildDecision = Get-AutoSkipBuildDecision `
         -RepoRoot $repoRoot `
-        -StampPath $buildStampPath
-    $sourceLastWriteForAutoSkip = Get-FileLastWriteUtc $SourceExe
-    $sourceCodeModeHostLastWriteForAutoSkip = Get-FileLastWriteUtc $SourceCodeModeHostExe
-    if (
-        (Test-Path -LiteralPath $SourceExe -PathType Leaf) -and
-        (Test-Path -LiteralPath $SourceCodeModeHostExe -PathType Leaf) -and
-        $null -ne $sourceTreeNewestForAutoSkip -and
-        $null -ne $sourceLastWriteForAutoSkip -and
-        $null -ne $sourceCodeModeHostLastWriteForAutoSkip -and
-        -not (Test-FileStaleAgainstSource -SourceNewestUtc $sourceTreeNewestForAutoSkip -FileLastWriteUtc $sourceLastWriteForAutoSkip) -and
-        -not (Test-FileStaleAgainstSource -SourceNewestUtc $sourceTreeNewestForAutoSkip -FileLastWriteUtc $sourceCodeModeHostLastWriteForAutoSkip)
-    ) {
+        -StampPath $buildStampPath `
+        -Profile $Profile `
+        -SourceExe $SourceExe `
+        -SourceCodeModeHostExe $SourceCodeModeHostExe
+    if ($autoSkipBuildDecision.CanSkip) {
         $SkipBuild = $true
         Write-ProofLine "autoSkipBuild" "true"
-        Write-ProofLine "autoSkipBuildReason" "source build is current for tracked publish inputs"
+        Write-ProofLine "autoSkipBuildReason" $autoSkipBuildDecision.Reason
     }
     else {
         Write-ProofLine "autoSkipBuild" "false"
-        if (
-            -not (Test-Path -LiteralPath $SourceExe -PathType Leaf) -or
-            -not (Test-Path -LiteralPath $SourceCodeModeHostExe -PathType Leaf)
-        ) {
-            Write-ProofLine "autoSkipBuildReason" "source artifact missing"
-        }
-        elseif ($null -eq $sourceTreeNewestForAutoSkip) {
-            Write-ProofLine "autoSkipBuildReason" "tracked source freshness unknown"
-        }
-        elseif ($null -eq $sourceLastWriteForAutoSkip) {
-            Write-ProofLine "autoSkipBuildReason" "source binary timestamp unavailable"
-        }
-        else {
-            Write-ProofLine "autoSkipBuildReason" "tracked source is newer than source build"
-        }
+        Write-ProofLine "autoSkipBuildReason" $autoSkipBuildDecision.Reason
     }
 }
 
 if (-not $SkipBuild) {
-    Invoke-CodexBuild -RepoRoot $repoRoot -Profile $Profile -DryRun:$DryRun
+    $buildInputFingerprintBefore = $null
     if (-not $DryRun) {
+        Remove-BuildStamp -StampPath $buildStampPath
+        $buildInputFingerprintBefore = Get-LocalPublishBuildInputFingerprint -RepoRoot $repoRoot
+        if (-not (Test-Sha256Text -Value $buildInputFingerprintBefore)) {
+            Write-ProofLine "buildStamp" "disabled: publish input fingerprint unavailable"
+            $buildInputFingerprintBefore = $null
+        }
+    }
+    Invoke-CodexBuild -RepoRoot $repoRoot -Profile $Profile -DryRun:$DryRun
+    if (-not $DryRun -and $null -ne $buildInputFingerprintBefore) {
+        $buildInputFingerprintAfter = Get-LocalPublishBuildInputFingerprint -RepoRoot $repoRoot
+        if (-not (Test-Sha256Text -Value $buildInputFingerprintAfter)) {
+            throw "Could not fingerprint local publish inputs after build; refusing to publish an unbound build."
+        }
+        if ($buildInputFingerprintBefore -cne $buildInputFingerprintAfter) {
+            throw "Local publish inputs changed during the build; rerun publish so the artifacts match one source snapshot."
+        }
         $builtSourceNewestUtc = Get-TrackedSourceNewestWriteUtc -RepoRoot $repoRoot
         Write-BuildStamp `
             -StampPath (Get-BuildStampPath -RepoRoot $repoRoot -Profile $Profile) `
+            -Profile $Profile `
+            -SourceFingerprint $buildInputFingerprintAfter `
+            -SourceExe $SourceExe `
+            -SourceCodeModeHostExe $SourceCodeModeHostExe `
             -SourceNewestUtc $builtSourceNewestUtc
+        Write-ProofLine "buildStamp" "written: content and artifact hashes recorded"
     }
 }
 else {
@@ -257,7 +257,7 @@ Write-ProofLine "sourceSha256Mode" $sourceSha256Mode
 Write-ProofLine "sourceSha256" $sourceSha256
 Write-ProofLine "sourceCodeModeHostSha256" $sourceCodeModeHostSha256
 $sourceTreeNewestUtc = if ($SkipBuild) {
-    Get-SourceNewestWriteUtcForSkipBuild `
+    Get-SourceNewestWriteUtcForProof `
         -RepoRoot $repoRoot `
         -StampPath $buildStampPath
 }

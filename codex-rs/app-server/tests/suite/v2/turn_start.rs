@@ -328,8 +328,12 @@ async fn turn_start_with_empty_input_runs_model_request() -> Result<()> {
 
 #[tokio::test]
 async fn turn_start_additional_context_flows_to_model_input() -> Result<()> {
-    let responses = vec![create_final_assistant_message_sse_response("Done")?];
-    let server = create_mock_responses_server_sequence_unchecked(responses).await;
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_sse_once(
+        &server,
+        create_final_assistant_message_sse_response("Done")?,
+    )
+    .await;
 
     let codex_home = TempDir::new()?;
     create_config_toml(
@@ -387,20 +391,15 @@ async fn turn_start_additional_context_flows_to_model_input() -> Result<()> {
     )
     .await??;
 
-    let requests = server
-        .received_requests()
-        .await
-        .context("failed to fetch received requests")?;
-    let request = requests
-        .iter()
-        .find(|request| request.url.path().ends_with("/responses"))
-        .context("expected model request")?;
-    let body = request
-        .body_json::<Value>()
-        .context("request body should be JSON")?;
     assert!(
-        body.to_string()
-            .contains("<external_custom_source>source value</external_custom_source>")
+        response_mock
+            .single_request()
+            .message_input_texts("user")
+            .iter()
+            .any(|text| {
+                text
+                    == "<external_context source=\"custom_source\" kind=\"untrusted\">\nsource value\n</external_context>"
+            })
     );
 
     Ok(())

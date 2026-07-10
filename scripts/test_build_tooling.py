@@ -669,9 +669,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
     def test_default_test_recipe_uses_upstream_nextest_defaults(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
-        nextest = (REPO_ROOT / "codex-rs" / ".config" / "nextest.toml").read_text(
-            encoding="utf-8"
-        )
+        nextest = load_toml(REPO_ROOT / "codex-rs" / ".config" / "nextest.toml")
 
         self.assertIn(
             "RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast",
@@ -681,8 +679,18 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast',
             justfile,
         )
-        self.assertIn('[profile.fast]\ninherits = "local"', nextest)
-        self.assertIn("retries = 0", nextest)
+        fast_profile = nextest["profile"]["fast"]
+        self.assertEqual(fast_profile["inherits"], "local")
+        self.assertEqual(fast_profile["retries"], 0)
+        local_app_server_override = {
+            "filter": "package(codex-app-server) & kind(test)",
+            "test-group": "app_server_integration_local",
+        }
+        self.assertIn(
+            local_app_server_override,
+            nextest["profile"]["local"]["overrides"],
+        )
+        self.assertIn(local_app_server_override, fast_profile["overrides"])
         self.assertIn(
             "RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=fast cargo nextest run",
             justfile,
@@ -715,15 +723,51 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             justfile,
         )
 
-    def test_windows_msvc_cargo_config_uses_upstream_static_crt(
+    def test_cargo_config_uses_adaptive_jobs_and_nonduplicated_windows_flags(
         self,
     ) -> None:
-        cargo_config = (REPO_ROOT / "codex-rs" / ".cargo" / "config.toml").read_text(
-            encoding="utf-8"
+        cargo_config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+
+        self.assertEqual(cargo_config["build"]["jobs"], -2)
+        self.assertIn(
+            'env_var_or_default("CARGO_BUILD_JOBS", "-2")',
+            justfile,
         )
 
-        self.assertIn("link-arg=/STACK:8388608", cargo_config)
-        self.assertIn("target-feature=+crt-static", cargo_config)
+        targets = cargo_config["target"]
+        msvc_flags = targets['cfg(all(windows, target_env = "msvc"))']["rustflags"]
+        arm64_flags = targets["aarch64-pc-windows-msvc"]["rustflags"]
+        self.assertEqual(
+            msvc_flags,
+            [
+                "-C",
+                "link-arg=/STACK:8388608",
+                "-C",
+                "target-feature=+crt-static",
+            ],
+        )
+        self.assertEqual(arm64_flags, ["-C", "link-arg=/arm64hazardfree"])
+
+        effective_arm64_flags = [*msvc_flags, *arm64_flags]
+        self.assertEqual(effective_arm64_flags.count("link-arg=/STACK:8388608"), 1)
+        self.assertEqual(effective_arm64_flags.count("target-feature=+crt-static"), 1)
+        self.assertEqual(effective_arm64_flags.count("link-arg=/arm64hazardfree"), 1)
+
+    def test_cargo_audit_policy_is_wired_and_synchronized(self) -> None:
+        audit = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "audit.toml")
+        deny = load_toml(REPO_ROOT / "codex-rs" / "deny.toml")
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+
+        audit_ignores = audit["advisories"]["ignore"]
+        deny_ignores = [entry["id"] for entry in deny["advisories"]["ignore"]]
+        self.assertEqual(len(audit_ignores), len(set(audit_ignores)))
+        self.assertEqual(set(audit_ignores), set(deny_ignores))
+        self.assertEqual(audit["output"]["deny"], ["yanked"])
+        self.assertFalse(audit["output"]["quiet"])
+        self.assertFalse(audit["output"]["show_tree"])
+        self.assertIn("deps-audit:\n    cargo audit", justfile)
+        self.assertNotIn(".github/workflows/cargo-audit.yml", justfile)
 
     def test_rust_toolchain_manifest_stays_lean_for_local_bootstrap(self) -> None:
         toolchain = load_toml(REPO_ROOT / "codex-rs" / "rust-toolchain.toml")[

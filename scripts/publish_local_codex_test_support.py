@@ -13,6 +13,7 @@ import unittest
 
 SCRIPT = Path(__file__).resolve().parent / "publish-local-codex.ps1"
 HASHING_HELPER = Path(__file__).resolve().parent / "publish-local-codex.hashing.ps1"
+PROOF_HELPER = Path(__file__).resolve().parent / "publish-local-codex.proof.ps1"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 RUN_TIMEOUT_SECONDS = 120
 FIXTURE_TIME = 946684900
@@ -180,7 +181,13 @@ class PublishLocalCodexTestBase(unittest.TestCase):
             self.fail(f"git {' '.join(args)} failed:\n{result.stderr}")
         return result
 
-    def write_build_stamp(self, profile: str, timestamp: float) -> Path:
+    def write_build_stamp(
+        self,
+        profile: str,
+        timestamp: float,
+        source_exe: Path,
+        source_code_mode_host: Path | None = None,
+    ) -> Path:
         stamp = (
             self.repo_root
             / "codex-rs"
@@ -189,10 +196,46 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         )
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp_time = datetime.fromtimestamp(timestamp, timezone.utc)
-        stamp.write_text(
-            f"{stamp_time:%Y-%m-%dT%H:%M:%S}.{stamp_time.microsecond * 10:07d}Z",
-            encoding="utf-8",
+        source_newest = (
+            f"{stamp_time:%Y-%m-%dT%H:%M:%S}.{stamp_time.microsecond * 10:07d}Z"
         )
+        code_mode_host = source_code_mode_host or self.source_code_mode_host
+        command = (
+            "Set-StrictMode -Version Latest; "
+            "$ErrorActionPreference = 'Stop'; "
+            f". {ps_single_quote(HASHING_HELPER)}; "
+            f". {ps_single_quote(PROOF_HELPER)}; "
+            f"$fingerprint = Get-LocalPublishBuildInputFingerprint -RepoRoot {ps_single_quote(self.repo_root)}; "
+            f"Write-BuildStamp -StampPath {ps_single_quote(stamp)} "
+            f"-Profile {ps_single_quote(profile)} "
+            "-SourceFingerprint $fingerprint "
+            f"-SourceExe {ps_single_quote(source_exe)} "
+            f"-SourceCodeModeHostExe {ps_single_quote(code_mode_host)} "
+            f"-SourceNewestUtc ([DateTime]::Parse({ps_single_quote(source_newest)}, "
+            "[Globalization.CultureInfo]::InvariantCulture, "
+            "[Globalization.DateTimeStyles]::RoundtripKind))"
+        )
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=RUN_TIMEOUT_SECONDS,
+            creationflags=CREATE_NO_WINDOW,
+            env=clean_env(),
+        )
+        if result.returncode != 0:
+            self.fail(
+                "failed to write production build stamp:\n"
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+            )
         return stamp
 
     def touch_tracked_source(self, timestamp: float) -> Path:
@@ -245,16 +288,6 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         if timestamp is not None:
             os.utime(target, (timestamp, timestamp))
         return target
-
-    def hash_cache_path(self, path: Path) -> Path:
-        safe_name = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
-        return (
-            self.repo_root
-            / "codex-rs"
-            / "target"
-            / "codex-local-publish-hashes"
-            / f"{safe_name}.sha256.json"
-        )
 
     def write_fake_codex(
         self,

@@ -70,7 +70,7 @@ feature-depth = 1
 # A list of advisory IDs to ignore. Note that ignored advisories will still
 # output a note when they are encountered.
 ignore = [
-    # Reviewed 2026-07-02. Keep this list in sync with .cargo/audit.toml.
+    # Reviewed 2026-07-10. Keep this list in sync with .cargo/audit.toml.
     # Each exception must identify the dependency path and removal condition.
     { id = "RUSTSEC-2024-0388", reason = "derivative is unmaintained; pulled in via starlark/starlark_syntax v0.14.2 used by execpolicy/cli/core; no fixed starlark release yet" },
     { id = "RUSTSEC-2025-0057", reason = "fxhash is unmaintained; pulled in via starlark_map under starlark v0.14.2 used by execpolicy/cli/core and bm25 used by core; remove when upstream dependencies drop fxhash" },

@@ -58,6 +58,37 @@ function Test-FilesEqual {
     return $true
 }
 
+function Install-GeneratedFileAtomically {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Destination
+    )
+
+    $destinationDirectory = Split-Path -Parent $Destination
+    $destinationName = Split-Path -Leaf $Destination
+    $temporaryPath = Join-Path $destinationDirectory (
+        ".${destinationName}." + [guid]::NewGuid().ToString('N') + '.tmp'
+    )
+    $backupPath = $temporaryPath + '.bak'
+    try {
+        [System.IO.File]::Copy($Source, $temporaryPath, $false)
+        if ([System.IO.File]::Exists($Destination)) {
+            [System.IO.File]::Replace($temporaryPath, $Destination, $backupPath)
+        }
+        else {
+            [System.IO.File]::Move($temporaryPath, $Destination)
+        }
+    }
+    finally {
+        if ([System.IO.File]::Exists($temporaryPath)) {
+            [System.IO.File]::Delete($temporaryPath)
+        }
+        if ([System.IO.File]::Exists($backupPath)) {
+            [System.IO.File]::Delete($backupPath)
+        }
+    }
+}
+
 function Resolve-ProtocPath {
     param(
         [string]$ExplicitPath
@@ -76,8 +107,20 @@ function Resolve-ProtocPath {
         $candidates.Add($protocCommand.Source)
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
-        $vendoredPattern = Join-Path $env:CARGO_HOME (
+    $cargoHome = $env:CARGO_HOME
+    if ([string]::IsNullOrWhiteSpace($cargoHome)) {
+        $userHome = if (-not [string]::IsNullOrWhiteSpace($env:USERPROFILE)) {
+            $env:USERPROFILE
+        }
+        else {
+            $env:HOME
+        }
+        if (-not [string]::IsNullOrWhiteSpace($userHome)) {
+            $cargoHome = Join-Path $userHome '.cargo'
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($cargoHome)) {
+        $vendoredPattern = Join-Path $cargoHome (
             'registry/src/*/protoc-bin-vendored-win32-*/bin/protoc.exe'
         )
         Get-ChildItem -Path $vendoredPattern -File -ErrorAction SilentlyContinue |
@@ -157,7 +200,7 @@ try {
         $true
     )
 
-    & $cargoLane -Lane auto cargo run -p codex-config --example generate-proto -- $protoDir
+    & $cargoLane -Lane auto cargo run --locked -p codex-config --example generate-proto -- $protoDir
     if ($LASTEXITCODE -ne 0) {
         throw "generate-proto failed with exit code $LASTEXITCODE"
     }
@@ -179,10 +222,7 @@ try {
         Write-Output "Config proto is already current: $checkedGenerated"
     }
     else {
-        [System.IO.File]::WriteAllBytes(
-            $checkedGenerated,
-            [System.IO.File]::ReadAllBytes($generated)
-        )
+        Install-GeneratedFileAtomically -Source $generated -Destination $checkedGenerated
         Write-Output "Updated config proto: $checkedGenerated"
     }
 }

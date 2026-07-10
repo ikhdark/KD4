@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -106,7 +107,14 @@ fn validate_request_user_input_questions(
         return Err("request_user_input requires 1 to 3 questions");
     }
 
+    let mut question_ids = HashSet::with_capacity(questions.len());
     for question in questions {
+        if question.id.trim().is_empty() {
+            return Err("question id must not be empty");
+        }
+        if !question_ids.insert(question.id.as_str()) {
+            return Err("question ids must be unique");
+        }
         if question.header.chars().count() > 12 {
             return Err("question header must be 12 characters or fewer");
         }

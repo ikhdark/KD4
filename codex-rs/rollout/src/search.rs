@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
@@ -13,6 +14,10 @@ use codex_protocol::protocol::strip_user_message_prefix;
 use regex::Regex;
 use regex::RegexBuilder;
 use serde_json::Value;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
+use tokio::io::BufReader;
 use tokio::process::Command;
 
 use super::ARCHIVED_SESSIONS_SUBDIR;
@@ -76,27 +81,31 @@ async fn ripgrep_rollout_paths(
         return Ok(Some(HashMap::new()));
     }
 
-    let output = match Command::new(rg_command)
-        .arg("--json")
-        .arg("--fixed-strings")
-        .arg("--ignore-case")
-        .arg("--no-ignore")
-        .arg("--glob")
-        .arg("*.jsonl")
-        .arg("--")
-        .arg(json_search_term)
-        .arg(root)
-        .output()
-        .await
-    {
-        Ok(output) => output,
+    let search_term = case_insensitive_literal_regex(search_term)?;
+    let mut command = rollout_ripgrep_command(rg_command, root, json_search_term);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
         Err(err) if err.kind() == io::ErrorKind::NotFound => {
             return Ok(None);
         }
         Err(err) => return Err(err),
     };
-    if !output.status.success() {
-        if output.status.code() == Some(1) && output.stderr.is_empty() {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("ripgrep rollout search stdout was not captured"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("ripgrep rollout search stderr was not captured"))?;
+    let read_matches = read_ripgrep_rollout_matches(stdout, root, &search_term);
+    let drain_stderr = drain_and_check_empty(stderr);
+    let wait_for_exit = child.wait();
+    let (matches, stderr_is_empty, status) =
+        tokio::try_join!(read_matches, drain_stderr, wait_for_exit)?;
+
+    if !status.success() {
+        if status.code() == Some(1) && stderr_is_empty {
             return Ok(Some(HashMap::new()));
         }
 
@@ -106,16 +115,53 @@ async fn ripgrep_rollout_paths(
         )));
     }
 
-    let search_term = case_insensitive_literal_regex(search_term)?;
+    Ok(Some(matches))
+}
+
+fn rollout_ripgrep_command(rg_command: &Path, root: &Path, json_search_term: &str) -> Command {
+    let mut command = Command::new(rg_command);
+    command
+        .arg("--json")
+        .arg("--max-count=1")
+        .arg("--fixed-strings")
+        .arg("--ignore-case")
+        .arg("--no-ignore")
+        .arg("--glob")
+        .arg("*.jsonl")
+        .arg("--")
+        .arg(json_search_term)
+        .arg(root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command
+}
+
+async fn read_ripgrep_rollout_matches(
+    stdout: impl AsyncRead + Unpin,
+    root: &Path,
+    search_term: &Regex,
+) -> io::Result<RolloutSearchMatches> {
+    let mut lines = BufReader::new(stdout).lines();
     let mut matches = HashMap::new();
-    for line in String::from_utf8_lossy(output.stdout.as_slice()).lines() {
-        let Some((path, snippet)) = parse_ripgrep_rollout_match(line, root, &search_term) else {
+    while let Some(line) = lines.next_line().await? {
+        let Some((path, snippet)) = parse_ripgrep_rollout_match(&line, root, search_term) else {
             continue;
         };
         insert_rollout_match(&mut matches, path, snippet);
     }
+    Ok(matches)
+}
 
-    Ok(Some(matches))
+async fn drain_and_check_empty(mut reader: impl AsyncRead + Unpin) -> io::Result<bool> {
+    let mut first_byte = [0_u8; 1];
+    if reader.read(&mut first_byte).await? == 0 {
+        return Ok(true);
+    }
+
+    let mut sink = tokio::io::sink();
+    tokio::io::copy(&mut reader, &mut sink).await?;
+    Ok(false)
 }
 
 fn parse_ripgrep_rollout_match(
@@ -456,5 +502,98 @@ mod tests {
         insert_rollout_match(&mut matches, path.clone(), Some("later".to_string()));
 
         assert_eq!(matches.get(&path), Some(&Some("first".to_string())));
+    }
+
+    #[test]
+    fn rollout_ripgrep_command_limits_matches_per_file() {
+        let command = rollout_ripgrep_command(Path::new("rg"), Path::new("sessions"), "needle");
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                "--json",
+                "--max-count=1",
+                "--fixed-strings",
+                "--ignore-case",
+                "--no-ignore",
+                "--glob",
+                "*.jsonl",
+                "--",
+                "needle",
+                "sessions",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_ripgrep_rollout_matches_keeps_one_path_and_first_snippet() {
+        let root = Path::new("sessions");
+        let path = "2026/07/09/rollout-test.jsonl";
+        let first_line = user_rollout_line("2026-07-09T00:00:00Z", "first needle");
+        let later_line = user_rollout_line("2026-07-09T00:00:01Z", "later needle");
+        let output = (0..1_000)
+            .map(|index| {
+                ripgrep_match(
+                    path,
+                    if index == 0 {
+                        first_line.as_str()
+                    } else {
+                        later_line.as_str()
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let search_term = case_insensitive_literal_regex("needle").expect("search regex");
+
+        let matches = read_ripgrep_rollout_matches(
+            std::io::Cursor::new(output.into_bytes()),
+            root,
+            &search_term,
+        )
+        .await
+        .expect("read ripgrep matches");
+
+        assert_eq!(
+            matches,
+            HashMap::from([(root.join(path), Some("first needle".to_string()))])
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_first_ripgrep_match_can_fall_back_to_later_content() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let rollout_path = tempdir.path().join("rollout-test.jsonl");
+        let metadata_match = user_rollout_line("needle", "unrelated conversation");
+        let content_match = user_rollout_line("2026-07-09T00:00:01Z", "later needle");
+        tokio::fs::write(
+            &rollout_path,
+            format!("{metadata_match}\n{content_match}\n"),
+        )
+        .await
+        .expect("write rollout");
+        let output = ripgrep_match(rollout_path.to_string_lossy().as_ref(), &metadata_match);
+        let search_term = case_insensitive_literal_regex("needle").expect("search regex");
+
+        let matches = read_ripgrep_rollout_matches(
+            std::io::Cursor::new(output.into_bytes()),
+            tempdir.path(),
+            &search_term,
+        )
+        .await
+        .expect("read ripgrep matches");
+
+        assert_eq!(matches.get(&rollout_path), Some(&None));
+        assert_eq!(
+            first_rollout_content_match_snippet(&rollout_path, "needle")
+                .await
+                .expect("scan rollout fallback"),
+            Some("later needle".to_string())
+        );
     }
 }

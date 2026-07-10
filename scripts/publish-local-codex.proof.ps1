@@ -283,7 +283,7 @@ function Get-TrackedSourceNewestWriteUtc {
     $oldErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        $trackedFiles = & $git.Source -C $RepoRoot ls-files -- codex-rs scripts/publish-local-codex.ps1 scripts/publish-local-codex.hashing.ps1 scripts/common-rust-env.ps1 justfile 2>$null
+        $trackedFiles = & $git.Source -C $RepoRoot ls-files -- codex-rs "scripts/publish-local-codex*.ps1" scripts/common-rust-env.ps1 justfile 2>$null
         $trackedFilesExitCode = $LASTEXITCODE
     }
     finally {
@@ -356,7 +356,7 @@ function Get-TrackedSourceNewestWriteUtc {
     return $newest
 }
 
-function Get-SourceNewestWriteUtcForSkipBuild {
+function Get-SourceNewestWriteUtcForProof {
     param(
         [string]$RepoRoot,
         [string]$StampPath
@@ -368,6 +368,226 @@ function Get-SourceNewestWriteUtcForSkipBuild {
     }
 
     return Get-BuildStampNewestWriteUtc -StampPath $StampPath
+}
+
+function Get-LocalPublishBuildInputFingerprint {
+    param(
+        [string]$RepoRoot
+    )
+
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    if (-not $git) {
+        return $null
+    }
+
+    $oldErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $inputPaths = @(& $git.Source -c core.quotepath=false -C $RepoRoot ls-files --cached --others --exclude-standard -- codex-rs "scripts/publish-local-codex*.ps1" scripts/common-rust-env.ps1 justfile 2>$null)
+        $inputPathsExitCode = $LASTEXITCODE
+        $headCommit = @(& $git.Source -C $RepoRoot rev-parse --verify HEAD 2>$null)
+        $headCommitExitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $oldErrorActionPreference
+    }
+    if (
+        $inputPathsExitCode -ne 0 -or
+        $headCommitExitCode -ne 0 -or
+        $headCommit.Count -ne 1 -or
+        [string]::IsNullOrWhiteSpace([string]$headCommit[0])
+    ) {
+        return $null
+    }
+
+    $relevantPaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($inputPath in $inputPaths) {
+        $normalized = ([string]$inputPath).Trim().Trim('"') -replace "\\", "/"
+        if (Test-LocalPublishBuildRelevantPath -Path $normalized) {
+            $relevantPaths.Add($normalized)
+        }
+    }
+
+    [string[]]$sortedPaths = @($relevantPaths.ToArray())
+    [Array]::Sort($sortedPaths, [StringComparer]::Ordinal)
+
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    $utf8 = [Text.UTF8Encoding]::new($false)
+    $buffer = [byte[]]::new(1MB)
+    $empty = [byte[]]::new(0)
+    $newlineBytes = $utf8.GetBytes("`n")
+    try {
+        $prefixBytes = $utf8.GetBytes("codex-local-publish-inputs-v2`nhead=$(([string]$headCommit[0]).Trim())`n")
+        [void]$sha256.TransformBlock($prefixBytes, 0, $prefixBytes.Length, $prefixBytes, 0)
+        $previousPath = $null
+        foreach ($normalized in $sortedPaths) {
+            if ($normalized -ceq $previousPath) {
+                continue
+            }
+            $previousPath = $normalized
+            $pathBytes = $utf8.GetBytes($normalized)
+            $path = Join-Path $RepoRoot ($normalized -replace "/", [IO.Path]::DirectorySeparatorChar)
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                $missingBytes = $utf8.GetBytes("missing:$($pathBytes.Length):$normalized`n")
+                [void]$sha256.TransformBlock($missingBytes, 0, $missingBytes.Length, $missingBytes, 0)
+                continue
+            }
+
+            $stream = $null
+            try {
+                $stream = [IO.File]::Open(
+                    $path,
+                    [IO.FileMode]::Open,
+                    [IO.FileAccess]::Read,
+                    [IO.FileShare]::Read
+                )
+                $headerBytes = $utf8.GetBytes("file:$($pathBytes.Length):${normalized}:$($stream.Length):")
+                [void]$sha256.TransformBlock($headerBytes, 0, $headerBytes.Length, $headerBytes, 0)
+                $bytesReadTotal = 0L
+                while (($bytesRead = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                    [void]$sha256.TransformBlock($buffer, 0, $bytesRead, $buffer, 0)
+                    $bytesReadTotal += $bytesRead
+                }
+                if ($bytesReadTotal -ne $stream.Length) {
+                    return $null
+                }
+                [void]$sha256.TransformBlock($newlineBytes, 0, $newlineBytes.Length, $newlineBytes, 0)
+            }
+            finally {
+                if ($null -ne $stream) {
+                    $stream.Dispose()
+                }
+            }
+        }
+
+        [void]$sha256.TransformFinalBlock($empty, 0, 0)
+        return [BitConverter]::ToString($sha256.Hash).Replace("-", "").ToLowerInvariant()
+    }
+    catch {
+        return $null
+    }
+    finally {
+        $sha256.Dispose()
+    }
+}
+
+function Test-Sha256Text {
+    param(
+        [AllowNull()]
+        [object]$Value
+    )
+
+    return $null -ne $Value -and ([string]$Value) -cmatch "\A[0-9a-f]{64}\z"
+}
+
+function Read-BuildStamp {
+    param(
+        [string]$StampPath
+    )
+
+    if (-not (Test-Path -LiteralPath $StampPath -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        $stamp = [IO.File]::ReadAllText($StampPath) | ConvertFrom-Json
+        $schemaVersion = $stamp.PSObject.Properties["schemaVersion"]
+        $profile = $stamp.PSObject.Properties["profile"]
+        $sourceFingerprint = $stamp.PSObject.Properties["sourceFingerprint"]
+        $sourceNewestWriteUtc = $stamp.PSObject.Properties["sourceNewestWriteUtc"]
+        $codexSha256 = $stamp.PSObject.Properties["codexSha256"]
+        $codeModeHostSha256 = $stamp.PSObject.Properties["codeModeHostSha256"]
+        $writtenAtUtc = $stamp.PSObject.Properties["writtenAtUtc"]
+        if (
+            $null -eq $schemaVersion -or [string]$schemaVersion.Value -cne "2" -or
+            $null -eq $profile -or [string]::IsNullOrWhiteSpace([string]$profile.Value) -or
+            $null -eq $sourceFingerprint -or -not (Test-Sha256Text -Value $sourceFingerprint.Value) -or
+            $null -eq $codexSha256 -or -not (Test-Sha256Text -Value $codexSha256.Value) -or
+            $null -eq $codeModeHostSha256 -or -not (Test-Sha256Text -Value $codeModeHostSha256.Value) -or
+            $null -eq $writtenAtUtc -or [string]::IsNullOrWhiteSpace([string]$writtenAtUtc.Value)
+        ) {
+            return $null
+        }
+
+        [void][DateTime]::ParseExact(
+            [string]$writtenAtUtc.Value,
+            "o",
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind
+        )
+        if ($null -ne $sourceNewestWriteUtc -and $null -ne $sourceNewestWriteUtc.Value) {
+            [void][DateTime]::ParseExact(
+                [string]$sourceNewestWriteUtc.Value,
+                "o",
+                [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::RoundtripKind
+            )
+        }
+
+        return [pscustomobject]@{
+            Profile = [string]$profile.Value
+            SourceFingerprint = ([string]$sourceFingerprint.Value).ToLowerInvariant()
+            SourceNewestWriteUtc = if ($null -eq $sourceNewestWriteUtc) { $null } else { $sourceNewestWriteUtc.Value }
+            CodexSha256 = ([string]$codexSha256.Value).ToLowerInvariant()
+            CodeModeHostSha256 = ([string]$codeModeHostSha256.Value).ToLowerInvariant()
+        }
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-AutoSkipBuildDecision {
+    param(
+        [string]$RepoRoot,
+        [string]$StampPath,
+        [string]$Profile,
+        [string]$SourceExe,
+        [string]$SourceCodeModeHostExe
+    )
+
+    if (
+        -not (Test-Path -LiteralPath $SourceExe -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $SourceCodeModeHostExe -PathType Leaf)
+    ) {
+        return [pscustomobject]@{ CanSkip = $false; Reason = "source artifact missing" }
+    }
+
+    $stamp = Read-BuildStamp -StampPath $StampPath
+    if ($null -eq $stamp) {
+        $reason = if (Test-Path -LiteralPath $StampPath -PathType Leaf) {
+            "build stamp legacy or invalid"
+        }
+        else {
+            "build stamp missing"
+        }
+        return [pscustomobject]@{ CanSkip = $false; Reason = $reason }
+    }
+    if ($stamp.Profile -cne $Profile) {
+        return [pscustomobject]@{ CanSkip = $false; Reason = "build stamp profile mismatch" }
+    }
+
+    $sourceFingerprint = Get-LocalPublishBuildInputFingerprint -RepoRoot $RepoRoot
+    if (-not (Test-Sha256Text -Value $sourceFingerprint)) {
+        return [pscustomobject]@{ CanSkip = $false; Reason = "publish input fingerprint unavailable" }
+    }
+    if ($stamp.SourceFingerprint -cne $sourceFingerprint) {
+        return [pscustomobject]@{ CanSkip = $false; Reason = "tracked publish inputs changed" }
+    }
+
+    $codexSha256 = Get-FileSha256 -Path $SourceExe
+    $codeModeHostSha256 = Get-FileSha256 -Path $SourceCodeModeHostExe
+    if (
+        $stamp.CodexSha256 -cne $codexSha256 -or
+        $stamp.CodeModeHostSha256 -cne $codeModeHostSha256
+    ) {
+        return [pscustomobject]@{ CanSkip = $false; Reason = "source artifact differs from stamped build" }
+    }
+
+    return [pscustomobject]@{
+        CanSkip = $true
+        Reason = "source artifacts and tracked publish inputs match build stamp"
+    }
 }
 
 function Get-BuildStampPath {
@@ -384,17 +604,14 @@ function Get-BuildStampNewestWriteUtc {
         [string]$StampPath
     )
 
-    if (-not (Test-Path -LiteralPath $StampPath -PathType Leaf)) {
+    $stamp = Read-BuildStamp -StampPath $StampPath
+    if ($null -eq $stamp -or $null -eq $stamp.SourceNewestWriteUtc) {
         return $null
     }
 
     try {
-        $stamp = [IO.File]::ReadAllText($StampPath).Trim()
-        if ([string]::IsNullOrWhiteSpace($stamp)) {
-            return $null
-        }
         return [DateTime]::ParseExact(
-            $stamp,
+            [string]$stamp.SourceNewestWriteUtc,
             "o",
             [Globalization.CultureInfo]::InvariantCulture,
             [Globalization.DateTimeStyles]::RoundtripKind
@@ -408,17 +625,60 @@ function Get-BuildStampNewestWriteUtc {
 function Write-BuildStamp {
     param(
         [string]$StampPath,
+        [string]$Profile,
+        [string]$SourceFingerprint,
+        [string]$SourceExe,
+        [string]$SourceCodeModeHostExe,
         [AllowNull()]
         [object]$SourceNewestUtc
     )
 
-    if ($null -eq $SourceNewestUtc) {
-        return
+    if (-not (Test-Sha256Text -Value $SourceFingerprint)) {
+        throw "Cannot write local publish build stamp without a valid source fingerprint."
+    }
+    $codexSha256 = Get-FileSha256 -Path $SourceExe
+    $codeModeHostSha256 = Get-FileSha256 -Path $SourceCodeModeHostExe
+    if (-not (Test-Sha256Text -Value $codexSha256) -or -not (Test-Sha256Text -Value $codeModeHostSha256)) {
+        throw "Cannot write local publish build stamp because a built source artifact is missing."
     }
 
     $parent = Split-Path -Parent $StampPath
     New-Item -ItemType Directory -Path $parent -Force | Out-Null
-    [IO.File]::WriteAllText($StampPath, ([DateTime]$SourceNewestUtc).ToString("o"))
+    $stamp = [ordered]@{
+        schemaVersion = 2
+        profile = $Profile
+        sourceFingerprint = $SourceFingerprint
+        sourceNewestWriteUtc = if ($null -eq $SourceNewestUtc) { $null } else { ([DateTime]$SourceNewestUtc).ToString("o") }
+        codexSha256 = $codexSha256
+        codeModeHostSha256 = $codeModeHostSha256
+        writtenAtUtc = [DateTime]::UtcNow.ToString("o")
+    }
+    $temporaryPath = "$StampPath.$([Guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $utf8WithoutBom = [Text.UTF8Encoding]::new($false)
+        [IO.File]::WriteAllText($temporaryPath, ($stamp | ConvertTo-Json -Compress), $utf8WithoutBom)
+        if (Test-Path -LiteralPath $StampPath -PathType Leaf) {
+            [IO.File]::Replace($temporaryPath, $StampPath, $null)
+        }
+        else {
+            [IO.File]::Move($temporaryPath, $StampPath)
+        }
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryPath -Force
+        }
+    }
+}
+
+function Remove-BuildStamp {
+    param(
+        [string]$StampPath
+    )
+
+    if (Test-Path -LiteralPath $StampPath -PathType Leaf) {
+        Remove-Item -LiteralPath $StampPath -Force
+    }
 }
 
 function Test-FileStaleAgainstSource {

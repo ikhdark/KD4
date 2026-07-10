@@ -1,4 +1,5 @@
-use codex_utils_string::truncate_middle_with_token_budget;
+use codex_utils_string::approx_bytes_for_tokens;
+use codex_utils_string::approx_tokens_from_byte_count;
 
 use crate::ContextualUserFragment;
 
@@ -131,16 +132,96 @@ fn matches_legacy_external_context(trimmed: &str) -> bool {
 }
 
 fn additional_context_body(tag: &str, kind: &str, key: &str, value: &str) -> String {
-    let value = truncate_middle_with_token_budget(value, MAX_ADDITIONAL_CONTEXT_VALUE_TOKENS).0;
     format!(
         "<{tag} source=\"{}\" kind=\"{kind}\">\n{}\n</{tag}>",
         escape_attr_value(key),
-        escape_text(&value)
+        escape_text_with_token_budget(value)
     )
 }
 
-fn escape_text(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
+fn escape_text_with_token_budget(value: &str) -> String {
+    let max_bytes = approx_bytes_for_tokens(MAX_ADDITIONAL_CONTEXT_VALUE_TOKENS);
+    let escaped_bytes = value.chars().fold(0usize, |total, ch| {
+        total.saturating_add(escaped_text_char_len(ch))
+    });
+    if escaped_bytes <= max_bytes {
+        let mut escaped = String::with_capacity(escaped_bytes);
+        push_escaped_text(&mut escaped, value);
+        return escaped;
+    }
+
+    let mut omitted_tokens = approx_tokens_from_byte_count(escaped_bytes.saturating_sub(max_bytes));
+    for _ in 0..4 {
+        let marker = format!("…{omitted_tokens} tokens truncated…");
+        let bounds = escaped_text_bounds(value, max_bytes.saturating_sub(marker.len()));
+        let next_omitted_tokens =
+            approx_tokens_from_byte_count(escaped_bytes.saturating_sub(bounds.2));
+        if next_omitted_tokens == omitted_tokens {
+            break;
+        }
+        omitted_tokens = next_omitted_tokens;
+    }
+
+    let marker = format!("…{omitted_tokens} tokens truncated…");
+    let bounds = escaped_text_bounds(value, max_bytes.saturating_sub(marker.len()));
+    let (prefix_end, suffix_start, kept_escaped_bytes) = bounds;
+    let mut escaped = String::with_capacity(
+        kept_escaped_bytes
+            .saturating_add(marker.len())
+            .min(max_bytes),
+    );
+    push_escaped_text(&mut escaped, &value[..prefix_end]);
+    escaped.push_str(&marker);
+    push_escaped_text(&mut escaped, &value[suffix_start..]);
+    debug_assert!(escaped.len() <= max_bytes);
+    escaped
+}
+
+fn escaped_text_bounds(value: &str, content_budget: usize) -> (usize, usize, usize) {
+    let prefix_budget = content_budget / 2;
+    let suffix_budget = content_budget - prefix_budget;
+    let mut prefix_end = 0;
+    let mut prefix_bytes = 0usize;
+    for (idx, ch) in value.char_indices() {
+        let char_len = escaped_text_char_len(ch);
+        if prefix_bytes.saturating_add(char_len) > prefix_budget {
+            break;
+        }
+        prefix_bytes += char_len;
+        prefix_end = idx + ch.len_utf8();
+    }
+
+    let mut suffix_start = value.len();
+    let mut suffix_bytes = 0usize;
+    for (idx, ch) in value.char_indices().rev() {
+        if idx < prefix_end {
+            break;
+        }
+        let char_len = escaped_text_char_len(ch);
+        if suffix_bytes.saturating_add(char_len) > suffix_budget {
+            break;
+        }
+        suffix_bytes += char_len;
+        suffix_start = idx;
+    }
+
+    (
+        prefix_end,
+        suffix_start,
+        prefix_bytes.saturating_add(suffix_bytes),
+    )
+}
+
+fn escaped_text_char_len(ch: char) -> usize {
+    match ch {
+        '&' => "&amp;".len(),
+        '<' => "&lt;".len(),
+        '>' => "&gt;".len(),
+        _ => ch.len_utf8(),
+    }
+}
+
+fn push_escaped_text(escaped: &mut String, value: &str) {
     for ch in value.chars() {
         match ch {
             '&' => escaped.push_str("&amp;"),
@@ -149,7 +230,6 @@ fn escape_text(value: &str) -> String {
             _ => escaped.push(ch),
         }
     }
-    escaped
 }
 
 fn escape_attr_value(value: &str) -> String {

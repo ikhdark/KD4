@@ -283,9 +283,9 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
     stdin_open: bool,
     use_private_desktop: bool,
 ) -> Result<SpawnedProcess> {
-    if !crate::legacy_restricted_token_enforces_delete_child() {
-        anyhow::bail!(crate::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR);
-    }
+    crate::ensure_legacy_delete_child_safety(
+        crate::legacy_restricted_token_enforces_delete_child(),
+    )?;
     let common = prepare_legacy_spawn_context(
         permission_profile,
         workspace_roots,

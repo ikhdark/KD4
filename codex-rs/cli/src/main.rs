@@ -46,6 +46,7 @@ use supports_color::Stream;
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
+mod build_info;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
 mod doctor;
@@ -2694,6 +2695,17 @@ mod tests {
 
         assert!(cli.subcommand.is_none());
         assert_eq!(cli.interactive.prompt.as_deref(), Some("import"));
+    }
+
+    #[test]
+    fn version_output_remains_single_line() {
+        let err = MultitoolCli::try_parse_from(["codex", "--version"])
+            .expect_err("--version should render and stop parsing");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        let rendered = err.to_string();
+        assert_eq!(rendered.lines().filter(|line| !line.is_empty()).count(), 1);
+        assert!(!rendered.contains("commit:"));
     }
 
     #[test]

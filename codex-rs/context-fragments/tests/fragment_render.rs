@@ -101,6 +101,28 @@ run &lt;trusted&gt; &amp; inspect\n\
 }
 
 #[test]
+fn additional_context_caps_entity_heavy_values_after_escaping() {
+    let fragment = AdditionalContextUserFragment::new("browser".to_string(), "&".repeat(4_000));
+
+    let rendered = fragment.render();
+    let body = rendered
+        .strip_prefix("<external_context source=\"browser\" kind=\"untrusted\">\n")
+        .and_then(|body| body.strip_suffix("\n</external_context>"))
+        .expect("additional context wrapper should be intact");
+    let (prefix, truncated) = body
+        .split_once('…')
+        .expect("oversized escaped context should include a truncation marker");
+    let (marker, suffix) = truncated
+        .split_once('…')
+        .expect("truncation marker should have a closing delimiter");
+
+    assert!(body.len() <= 4_000);
+    assert!(marker.ends_with(" tokens truncated"));
+    assert_eq!(prefix.replace("&amp;", ""), "");
+    assert_eq!(suffix.replace("&amp;", ""), "");
+}
+
+#[test]
 fn additional_context_match_accepts_fixed_and_legacy_user_wrappers() {
     assert!(AdditionalContextUserFragment::matches_text(
         "<external_context source=\"path\" kind=\"untrusted\">\nvalue\n</external_context>"

@@ -75,7 +75,7 @@ owner crosses script/package boundaries or remains ambiguous.
 - Script wrappers such as `just-shell.py` and `run-powershell-script.ps1` treat
   quoting, argument forwarding, and exit-code propagation as compatibility
   surfaces.
-- Reasoning eval, mock websocket server, Bazel helper, and repository-check
+- Mock websocket server, Bazel helper, and repository-check
   output/schema changes are contract changes for their callers/tests.
 
 ## Editing Rules

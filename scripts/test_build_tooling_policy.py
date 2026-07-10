@@ -84,7 +84,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertNotIn("SystemTime::now", text)
         self.assertIn('workspace_root.join("build_info.rs").display()', text)
 
-    def test_build_info_scripts_match_upstream_reset_shape(self) -> None:
+    def test_build_info_scripts_emit_metadata_and_preserve_macos_linking(self) -> None:
         app_server_build = (
             REPO_ROOT / "codex-rs" / "app-server" / "build.rs"
         ).read_text(encoding="utf-8")
@@ -94,12 +94,17 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         self.assertIn('#[path = "../build_info.rs"]', app_server_build)
         self.assertIn("build_info::emit();", app_server_build)
+        self.assertIn('#[path = "../build_info.rs"]', cli_build)
+        self.assertIn("build_info::emit();", cli_build)
         self.assertIn("cargo:rustc-link-arg=-ObjC", cli_build)
-        self.assertNotIn("build_info::emit();", cli_build)
 
-    def test_bazel_build_scripts_match_upstream_reset_shape(
+    def test_bazel_build_scripts_include_shared_build_info_source(
         self,
     ) -> None:
+        macro = (REPO_ROOT / "defs.bzl").read_text(encoding="utf-8")
+        workspace_build = (
+            REPO_ROOT / "codex-rs" / "BUILD.bazel"
+        ).read_text(encoding="utf-8")
         cli_build = (REPO_ROOT / "codex-rs" / "cli" / "BUILD.bazel").read_text(
             encoding="utf-8"
         )
@@ -109,8 +114,14 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         self.assertIn("MACOS_WEBRTC_RUSTC_LINK_FLAGS", cli_build)
         self.assertIn("extra_binaries_non_windows", app_server_build)
-        self.assertNotIn("build_script_srcs", cli_build)
-        self.assertNotIn("build_script_srcs", app_server_build)
+        self.assertIn('"build_info.rs"', workspace_build)
+        self.assertIn("build_script_srcs = []", macro)
+        self.assertIn('srcs = ["build.rs"] + build_script_srcs', macro)
+        for crate_build in (cli_build, app_server_build):
+            self.assertIn(
+                'build_script_srcs = ["//codex-rs:build_info.rs"]',
+                crate_build,
+            )
 
     def test_bwrap_build_script_tracks_resolved_source_dir(self) -> None:
         text = (REPO_ROOT / "codex-rs" / "bwrap" / "build.rs").read_text(
@@ -248,6 +259,15 @@ class BuildToolingPolicyTest(unittest.TestCase):
             'Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "version"',
             powershell_installer,
         )
+
+    def test_windows_installer_parses_the_first_nonempty_version_line(self) -> None:
+        powershell_installer = (
+            REPO_ROOT / "scripts" / "install" / "install.ps1"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("$versionLine = @($versionOutput)", powershell_installer)
+        self.assertIn("[regex]::Match($versionLine", powershell_installer)
+        self.assertNotIn("$versionOutput -match", powershell_installer)
 
     def test_root_maintenance_covers_current_script_tooling_tests(self) -> None:
         root_maintenance = load_root_maintenance_module()

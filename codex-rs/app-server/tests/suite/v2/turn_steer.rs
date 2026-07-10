@@ -26,6 +26,7 @@ use codex_app_server_protocol::TurnSteerParams;
 use codex_app_server_protocol::TurnSteerResponse;
 use codex_app_server_protocol::UserInput as V2UserInput;
 use codex_protocol::user_input::MAX_USER_INPUT_TEXT_CHARS;
+use core_test_support::responses;
 use core_test_support::skip_if_remote;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -254,15 +255,19 @@ async fn turn_steer_returns_active_turn_id() -> Result<()> {
     let working_directory = tmp.path().join("workdir");
     std::fs::create_dir(&working_directory)?;
 
-    let server = create_mock_responses_server_sequence_unchecked(vec![
-        create_shell_command_sse_response(
-            shell_command.clone(),
-            Some(&working_directory),
-            Some(10_000),
-            "call_sleep",
-        )?,
-        app_test_support::create_final_assistant_message_sse_response("Done")?,
-    ])
+    let server = responses::start_mock_server().await;
+    let response_mock = responses::mount_sse_sequence(
+        &server,
+        vec![
+            create_shell_command_sse_response(
+                shell_command.clone(),
+                Some(&working_directory),
+                Some(10_000),
+                "call_sleep",
+            )?,
+            app_test_support::create_final_assistant_message_sse_response("Done")?,
+        ],
+    )
     .await;
     write_mock_responses_config_toml_with_chatgpt_base_url(
         &codex_home,
@@ -493,22 +498,14 @@ async fn turn_steer_rejects_context_only_input_without_merging_context() -> Resu
     )
     .await??;
 
-    let requests = server
-        .received_requests()
-        .await
-        .context("failed to fetch received requests")?;
-    let response_requests = requests
-        .iter()
-        .filter(|request| request.url.path().ends_with("/responses"))
-        .collect::<Vec<_>>();
+    let response_requests = response_mock.requests();
     assert_eq!(response_requests.len(), 2);
-    let body = response_requests[1]
-        .body_json::<Value>()
-        .context("request body should be JSON")?;
+    let user_texts = response_requests[1].message_input_texts("user");
     assert!(
-        !body
-            .to_string()
-            .contains("<external_browser_info>tab one</external_browser_info>")
+        user_texts.iter().all(|text| {
+            !text.contains("tab one") && !text.contains("<external_context source=\"browser_info\"")
+        }),
+        "rejected context-only steering input must not reach the model: {user_texts:?}"
     );
 
     Ok(())

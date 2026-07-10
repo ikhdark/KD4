@@ -79,8 +79,6 @@ is the current source map for the checked-in script tooling.
 - `asciicheck.py`, `check_blob_size.py`, `readme_toc.py`,
   and matching `test_*` files: focused repository checks. Prefer updating the
   check and its focused test together when behavior changes.
-- `reasoning_quality_eval.py` and `test_reasoning_quality_eval.py`: reasoning
-  evaluation helper. Treat output/schema changes as evaluator contract changes.
 - `mock_responses_websocket_server.py` and
   `test_mock_responses_websocket_server.py`: mock Responses WebSocket server for
   local protocol/testing flows.

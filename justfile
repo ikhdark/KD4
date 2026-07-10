@@ -5,7 +5,7 @@ set shell := ["python3", "-c", 'import os, runpy; runpy.run_path(os.environ["JUS
 set windows-shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST_SHELL"], run_name="__main__")']
 
 rust_min_stack := "8388608" # 8 MiB
-cargo_build_jobs := env_var_or_default("CARGO_BUILD_JOBS", "30") # Leave two logical CPUs free.
+cargo_build_jobs := env_var_or_default("CARGO_BUILD_JOBS", "-2") # Leave two logical CPUs free on any host.
 export CARGO_BUILD_JOBS := cargo_build_jobs
 python := if os_family() == "windows" { "python" } else { "python3" }
 
@@ -596,13 +596,24 @@ mcp-server-run *args:
 # Regenerate the thread-config protobuf bindings through the platform-native wrapper.
 [no-cd]
 [unix]
-generate-config-proto:
-    {{ justfile_directory() }}/codex-rs/config/scripts/generate-proto.sh
+generate-config-proto *args:
+    {{ justfile_directory() }}/codex-rs/config/scripts/generate-proto.sh "$@"
 
 [no-cd]
 [windows]
-generate-config-proto:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\codex-rs\config\scripts\generate-proto.ps1"
+generate-config-proto *args:
+    $forwarded_args = @($args | Select-Object -Skip 1); powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\codex-rs\config\scripts\generate-proto.ps1" @forwarded_args; exit $LASTEXITCODE
+
+# Verify the checked-in thread-config protobuf binding without replacing it.
+[no-cd]
+[unix]
+generate-config-proto-check:
+    {{ justfile_directory() }}/codex-rs/config/scripts/generate-proto.sh --check
+
+[no-cd]
+[windows]
+generate-config-proto-check:
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\codex-rs\config\scripts\generate-proto.ps1" -Check
 
 # Regenerate the json schema for config.toml from the current config types.
 write-config-schema:
@@ -643,9 +654,13 @@ tui-large-widget-check:
 deps-duplicates-check *args:
     just deps-duplicates {args}
 
+# Refresh the advisory database and audit the locked dependency graph.
+deps-audit:
+    cargo audit
+
 # Dependency policy gate for the dependency-cleanup surface: duplicate report
 # plus the offline cargo-deny checks. Advisories need network access, so they
-# stay with `cargo audit` (.github/workflows/cargo-audit.yml, .cargo/audit.toml).
+# stay in the separate `deps-audit` gate configured by .cargo/audit.toml.
 deps-policy-check *args:
     just _cargo-deny-installed
     just deps-duplicates {args}

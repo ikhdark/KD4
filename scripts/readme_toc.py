@@ -48,10 +48,10 @@ class TocParseResult:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Check and optionally fix the README.md Table of Contents."
+        description="Check and optionally fix a Markdown Table of Contents."
     )
     parser.add_argument(
-        "file", nargs="?", default="README.md", help="Markdown file to process"
+        "file", nargs="?", default="SOURCEMAP.md", help="Markdown file to process"
     )
     parser.add_argument(
         "--fix", action="store_true", help="Rewrite file with updated ToC"

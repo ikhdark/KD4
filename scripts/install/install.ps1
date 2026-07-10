@@ -257,8 +257,17 @@ function Get-VersionFromBinary {
         $ErrorActionPreference = $oldErrorActionPreference
     }
 
-    if ($versionOutput -match '([0-9][0-9A-Za-z.+-]*)$') {
-        return $matches[1]
+    $versionLine = @($versionOutput) |
+        ForEach-Object { [string]$_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace($versionLine)) {
+        return $null
+    }
+
+    $versionMatch = [regex]::Match($versionLine, '([0-9][0-9A-Za-z.+-]*)$')
+    if ($versionMatch.Success) {
+        return $versionMatch.Groups[1].Value
     }
 
     return $null

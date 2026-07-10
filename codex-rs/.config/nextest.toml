@@ -60,6 +60,13 @@ test-group = 'app_server_integration'
 filter = 'package(codex-app-server) & kind(test)'
 test-group = 'app_server_integration_local'
 
+[[profile.fast.overrides]]
+# Nextest resolves per-test overrides from the selected profile and `default`,
+# not from intermediate profiles. Mirror the bounded local concurrency here so
+# fast validation does not fall back to the serialized CI group.
+filter = 'package(codex-app-server) & kind(test)'
+test-group = 'app_server_integration_local'
+
 [[profile.default.overrides]]
 # These tests exercise full Codex turns and apply_patch execution, and they are
 # sensitive to Windows runner process-startup stalls when many cases launch at once.
@@ -68,12 +75,12 @@ test-group = 'core_apply_patch_cli_integration'
 
 [[profile.default.overrides]]
 # These tests create restricted-token Windows child processes and private desktops.
-# Serialize them to avoid exhausting Windows session/global desktop resources in CI.
-# Private-desktop startup can run close to the default 60s timeout on local Windows
-# machines under build or disk pressure, so give this serialized lane extra headroom.
-filter = 'package(codex-windows-sandbox) & test(legacy_)'
+# Serialize only the unified-exec process tests to avoid exhausting Windows
+# session/global desktop resources. The delete-child probe is cached and unsafe
+# kernels fail closed before process startup, so the default timeout is sufficient.
+platform = 'cfg(windows)'
+filter = 'package(codex-windows-sandbox) & test(unified_exec::tests::legacy_)'
 test-group = 'windows_sandbox_legacy_sessions'
-slow-timeout = { period = "30s", terminate-after = 4 }
 
 [[profile.default.overrides]]
 # This Codex-home startup path still exceeded the broader Windows-heavy ceiling

@@ -32,7 +32,10 @@ pub(crate) fn current() -> ServerRuntimeInfo {
         expected_local_binary_path.as_ref(),
         local_binary_match,
     );
-    warnings.extend(build_warnings(build_info));
+    warnings.extend(build_warnings(
+        build_info,
+        expected_local_binary_path.is_some(),
+    ));
 
     ServerRuntimeInfo {
         executable_path,
@@ -54,28 +57,44 @@ fn current_executable_path() -> Option<AbsolutePathBuf> {
 }
 
 fn expected_local_binary_path() -> Option<AbsolutePathBuf> {
-    if let Some(path) = std::env::var_os(LOCAL_CLI_PATH_ENV)
+    let local_cli_path = std::env::var_os(LOCAL_CLI_PATH_ENV)
         .filter(|value| !value.is_empty())
-        .and_then(|path| AbsolutePathBuf::from_absolute_path(PathBuf::from(path)).ok())
+        .map(PathBuf::from);
+    let local_publish_dir = std::env::var_os(LOCAL_PUBLISH_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let default_home = std::env::var_os("USERPROFILE")
+        .filter(|value| !value.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|value| !value.is_empty()))
+        .map(PathBuf::from);
+
+    expected_local_binary_path_from_inputs(
+        local_cli_path,
+        local_publish_dir,
+        default_home,
+        cfg!(windows),
+    )
+}
+
+fn expected_local_binary_path_from_inputs(
+    local_cli_path: Option<PathBuf>,
+    local_publish_dir: Option<PathBuf>,
+    default_home: Option<PathBuf>,
+    is_windows: bool,
+) -> Option<AbsolutePathBuf> {
+    if let Some(path) =
+        local_cli_path.and_then(|path| AbsolutePathBuf::from_absolute_path(path).ok())
     {
         return Some(path);
     }
 
-    let install_dir = if let Some(path) =
-        std::env::var_os(LOCAL_PUBLISH_DIR_ENV).filter(|value| !value.is_empty())
-    {
-        PathBuf::from(path)
-    } else if let Some(user_profile) =
-        std::env::var_os("USERPROFILE").filter(|value| !value.is_empty())
-    {
-        PathBuf::from(user_profile).join("Desktop").join("LOCAL-KD")
-    } else if let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) {
-        PathBuf::from(home).join("Desktop").join("LOCAL-KD")
-    } else {
-        return None;
+    let install_dir = match local_publish_dir {
+        Some(path) => path,
+        None if is_windows => default_home?.join("Desktop").join("LOCAL-KD"),
+        None => return None,
     };
-
-    AbsolutePathBuf::from_absolute_path(install_dir.join("codex.exe")).ok()
+    let binary_name = if is_windows { "codex.exe" } else { "codex" };
+    AbsolutePathBuf::from_absolute_path(install_dir.join(binary_name)).ok()
 }
 
 fn package_layout_info(layout: &CodexPackageLayout) -> ServerPackageLayout {
@@ -150,8 +169,11 @@ fn local_binary_warnings(
     warnings
 }
 
-fn build_warnings(build_info: BuildInfo) -> Vec<ServerRuntimeWarning> {
-    if build_info.dirty != "true" {
+fn build_warnings(
+    build_info: BuildInfo,
+    expected_local_binary_configured: bool,
+) -> Vec<ServerRuntimeWarning> {
+    if !expected_local_binary_configured || build_info.dirty != "true" {
         return Vec::new();
     }
 
@@ -163,6 +185,8 @@ fn build_warnings(build_info: BuildInfo) -> Vec<ServerRuntimeWarning> {
 }
 
 fn paths_match(left: &Path, right: &Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
     if cfg!(windows) {
         left.to_string_lossy()
             .eq_ignore_ascii_case(&right.to_string_lossy())
@@ -226,13 +250,16 @@ mod tests {
 
     #[test]
     fn build_warnings_are_structured_for_dirty_local_build() {
-        let warnings = build_warnings(BuildInfo {
-            version: "0.1.0",
-            commit: "abc123",
-            dirty: "true",
-            profile: "release",
-            built: "now",
-        });
+        let warnings = build_warnings(
+            BuildInfo {
+                version: "0.1.0",
+                commit: "abc123",
+                dirty: "true",
+                profile: "release",
+                built: "now",
+            },
+            true,
+        );
 
         assert_eq!(warnings.len(), 1);
         assert_eq!(warnings[0].code, "localBuildDirty");
@@ -247,14 +274,72 @@ mod tests {
     #[test]
     fn build_warnings_ignore_unknown_dirty_state() {
         assert!(
-            build_warnings(BuildInfo {
-                version: "0.1.0",
-                commit: "unknown",
-                dirty: "unknown",
-                profile: "release",
-                built: "unknown",
-            })
+            build_warnings(
+                BuildInfo {
+                    version: "0.1.0",
+                    commit: "unknown",
+                    dirty: "unknown",
+                    profile: "release",
+                    built: "unknown",
+                },
+                true,
+            )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn build_warnings_ignore_dirty_build_without_local_target() {
+        assert!(
+            build_warnings(
+                BuildInfo {
+                    version: "0.1.0",
+                    commit: "abc123",
+                    dirty: "true",
+                    profile: "debug",
+                    built: "now",
+                },
+                false,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn expected_local_binary_path_respects_explicit_precedence_and_platform() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let explicit_cli = temp_dir.path().join("explicit-codex");
+        let publish_dir = temp_dir.path().join("publish");
+        let home = temp_dir.path().join("home");
+
+        assert_eq!(
+            expected_local_binary_path_from_inputs(
+                Some(explicit_cli.clone()),
+                Some(publish_dir.clone()),
+                Some(home.clone()),
+                false,
+            )
+            .map(AbsolutePathBuf::into_path_buf),
+            Some(explicit_cli)
+        );
+        assert_eq!(
+            expected_local_binary_path_from_inputs(
+                None,
+                Some(publish_dir.clone()),
+                Some(home.clone()),
+                false,
+            )
+            .map(AbsolutePathBuf::into_path_buf),
+            Some(publish_dir.join("codex"))
+        );
+        assert_eq!(
+            expected_local_binary_path_from_inputs(None, None, Some(home.clone()), false),
+            None
+        );
+        assert_eq!(
+            expected_local_binary_path_from_inputs(None, None, Some(home.clone()), true)
+                .map(AbsolutePathBuf::into_path_buf),
+            Some(home.join("Desktop").join("LOCAL-KD").join("codex.exe"))
         );
     }
 

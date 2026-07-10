@@ -1,5 +1,5 @@
 [advisories]
-# Reviewed 2026-07-02. Keep this list in sync with ../deny.toml.
+# Reviewed 2026-07-10. Keep this list in sync with ../deny.toml.
 ignore = [
     "RUSTSEC-2024-0388", # derivative 2.2.0 via starlark/starlark_syntax; upstream crate is unmaintained
     "RUSTSEC-2025-0057", # fxhash 0.2.1 via starlark_map/bm25; upstream crate is unmaintained
@@ -13,3 +13,12 @@ ignore = [
     "RUSTSEC-2026-0194", # quick-xml via plist/syntect and wayland-scanner; trusted inputs only; remove when rust-plist#191 and wayland-rs#938 are released
     "RUSTSEC-2026-0195", # quick-xml via plist/syntect and wayland-scanner; trusted inputs only; remove when rust-plist#191 and wayland-rs#938 are released
 ]
+
+[output]
+# Vulnerabilities already fail cargo-audit. Also fail when a yanked crate enters
+# the lockfile, while keeping informational advisories visible as warnings.
+deny = ["yanked"]
+quiet = false
+# Keep routine audit output reviewable; use `cargo tree -i <crate>` when a
+# warning or vulnerability needs its full reverse dependency graph.
+show_tree = false

@@ -2,6 +2,16 @@
 
 use super::*;
 
+#[cfg(target_os = "windows")]
+fn legacy_windows_sandbox_is_compatible() -> bool {
+    codex_windows_sandbox::legacy_restricted_token_enforces_delete_child()
+}
+
+#[cfg(all(not(target_os = "windows"), test))]
+fn legacy_windows_sandbox_is_compatible() -> bool {
+    true
+}
+
 impl ChatWidget {
     #[cfg(any(target_os = "windows", test))]
     pub(crate) fn windows_sandbox_mode_allowed(&self, mode: WindowsSandboxModeToml) -> bool {
@@ -222,6 +232,20 @@ impl ChatWidget {
         preset: ApprovalPreset,
         profile_selection: Option<PermissionProfileSelection>,
     ) {
+        self.open_windows_sandbox_enable_prompt_with_legacy_compatibility(
+            preset,
+            profile_selection,
+            legacy_windows_sandbox_is_compatible(),
+        );
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    pub(crate) fn open_windows_sandbox_enable_prompt_with_legacy_compatibility(
+        &mut self,
+        preset: ApprovalPreset,
+        profile_selection: Option<PermissionProfileSelection>,
+        legacy_is_compatible: bool,
+    ) {
         use ratatui_macros::line;
 
         self.session_telemetry.counter(
@@ -230,20 +254,26 @@ impl ChatWidget {
             &[],
         );
 
-        let allow_unelevated =
+        let requirements_allow_unelevated =
             self.windows_sandbox_mode_allowed(WindowsSandboxModeToml::Unelevated);
+        let allow_unelevated = requirements_allow_unelevated && legacy_is_compatible;
         let setup_choice_is_required =
             !allow_unelevated || self.elevated_windows_sandbox_setup_required();
         let mut header = ColumnRenderable::new();
         header.push(*Box::new(
-            Paragraph::new(if allow_unelevated {
-                vec![
-                    line!["Set up the Codex agent sandbox to protect your files and control network access. Learn more <https://developers.openai.com/codex/windows>"],
-                ]
-            } else {
+            Paragraph::new(if !requirements_allow_unelevated {
                 vec![
                     line!["Your organization requires the default Codex agent sandbox to continue. Set it up to protect your files and control network access."],
                     line!["Learn more <https://developers.openai.com/codex/windows>"],
+                ]
+            } else if !legacy_is_compatible {
+                vec![
+                    line!["The non-admin sandbox is not safely available on this Windows build. Choose the default sandbox or quit."],
+                    line!["Learn more <https://developers.openai.com/codex/windows>"],
+                ]
+            } else {
+                vec![
+                    line!["Set up the Codex agent sandbox to protect your files and control network access. Learn more <https://developers.openai.com/codex/windows>"],
                 ]
             })
             .wrap(Wrap { trim: false }),
@@ -338,10 +368,25 @@ impl ChatWidget {
         preset: ApprovalPreset,
         profile_selection: Option<PermissionProfileSelection>,
     ) {
+        self.open_windows_sandbox_fallback_prompt_with_legacy_compatibility(
+            preset,
+            profile_selection,
+            legacy_windows_sandbox_is_compatible(),
+        );
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    pub(crate) fn open_windows_sandbox_fallback_prompt_with_legacy_compatibility(
+        &mut self,
+        preset: ApprovalPreset,
+        profile_selection: Option<PermissionProfileSelection>,
+        legacy_is_compatible: bool,
+    ) {
         use ratatui_macros::line;
 
-        let allow_unelevated =
+        let requirements_allow_unelevated =
             self.windows_sandbox_mode_allowed(WindowsSandboxModeToml::Unelevated);
+        let allow_unelevated = requirements_allow_unelevated && legacy_is_compatible;
         let setup_choice_is_required =
             !allow_unelevated || self.elevated_windows_sandbox_setup_required();
         let mut lines = Vec::new();
@@ -349,13 +394,17 @@ impl ChatWidget {
             "Couldn't set up your sandbox with Administrator permissions".bold()
         ]);
         lines.push(line![""]);
-        if allow_unelevated {
+        if !requirements_allow_unelevated {
             lines.push(line![
-                "You can still use Codex in a non-admin sandbox. It carries greater risk if prompt injected."
+                "Your organization requires the default sandbox before Codex can continue."
+            ]);
+        } else if !legacy_is_compatible {
+            lines.push(line![
+                "The non-admin sandbox is not safely available on this Windows build. No settings were changed."
             ]);
         } else {
             lines.push(line![
-                "Your organization requires the default sandbox before Codex can continue."
+                "You can still use Codex in a non-admin sandbox. It carries greater risk if prompt injected."
             ]);
         }
         lines.push(line![
@@ -446,6 +495,83 @@ impl ChatWidget {
             }),
             ..Default::default()
         });
+    }
+
+    #[cfg(any(target_os = "windows", test))]
+    pub(crate) fn open_windows_sandbox_legacy_unavailable_prompt(
+        &mut self,
+        preset: ApprovalPreset,
+        profile_selection: Option<PermissionProfileSelection>,
+    ) {
+        use ratatui_macros::line;
+
+        let elevated_otel = self.session_telemetry.clone();
+        let quit_otel = self.session_telemetry.clone();
+        let retry_preset = preset.clone();
+        let retry_profile_selection = profile_selection.clone();
+        let items = vec![
+            SelectionItem {
+                name: "Set up default sandbox (requires Administrator permissions)".to_string(),
+                description: None,
+                actions: vec![Box::new(move |tx| {
+                    elevated_otel.counter(
+                        "codex.windows_sandbox.legacy_unavailable_use_elevated",
+                        /*inc*/ 1,
+                        &[],
+                    );
+                    tx.send(AppEvent::BeginWindowsSandboxElevatedSetup {
+                        preset: preset.clone(),
+                        profile_selection: profile_selection.clone(),
+                    });
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            SelectionItem {
+                name: "Quit".to_string(),
+                description: None,
+                actions: vec![Box::new(move |tx| {
+                    quit_otel.counter(
+                        "codex.windows_sandbox.legacy_unavailable_quit",
+                        /*inc*/ 1,
+                        &[],
+                    );
+                    tx.send(AppEvent::Exit(ExitMode::ShutdownFirst));
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+        let mut header = ColumnRenderable::new();
+        header.push(*Box::new(
+            Paragraph::new(vec![
+                line!["Non-admin sandbox is not safely available on this Windows build. No settings were changed."],
+                line!["Choose Administrator setup or quit."],
+            ])
+            .wrap(Wrap { trim: false }),
+        ));
+
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            title: None,
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            header: Box::new(header),
+            on_cancel: Some(Box::new(move |tx: &AppEventSender| {
+                tx.send(AppEvent::OpenWindowsSandboxEnablePrompt {
+                    preset: retry_preset.clone(),
+                    profile_selection: retry_profile_selection.clone(),
+                });
+            })),
+            ..Default::default()
+        });
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(test)))]
+    pub(crate) fn open_windows_sandbox_legacy_unavailable_prompt(
+        &mut self,
+        _preset: ApprovalPreset,
+        _profile_selection: Option<PermissionProfileSelection>,
+    ) {
     }
 
     #[cfg(all(not(target_os = "windows"), not(test)))]

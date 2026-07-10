@@ -67,6 +67,8 @@ def proof_input_files() -> list[Path]:
         REPO_ROOT / ".cargo" / "config.toml",
         CODEX_RS / ".cargo" / "config.toml",
         REPO_ROOT / "justfile",
+        REPO_ROOT / "scripts" / "verify_local_context.py",
+        Path(__file__).resolve(),
         Path(_runtime().__file__).resolve(),
         RULES_PATH,
     ]

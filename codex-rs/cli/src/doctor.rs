@@ -344,6 +344,25 @@ async fn build_report(
         installation_check(!command.summary)
     }));
     checks.push(run_sync_check("runtime", progress.clone(), runtime_check));
+    if let Some(local_target) = runtime::local_publish_target_path() {
+        checks.push(
+            run_async_check(
+                "local publish",
+                progress.clone(),
+                runtime::local_publish_check(local_target.clone()),
+            )
+            .await,
+        );
+        #[cfg(windows)]
+        checks.push(
+            run_async_check(
+                "desktop",
+                progress.clone(),
+                runtime::desktop_runtime_chain_check(local_target, !command.summary),
+            )
+            .await,
+        );
+    }
     checks.push(run_sync_check("search", progress.clone(), search_check));
 
     progress.begin("config");

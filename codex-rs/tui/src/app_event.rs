@@ -803,6 +803,14 @@ pub(crate) enum AppEvent {
         profile_selection: Option<PermissionProfileSelection>,
     },
 
+    /// Report that the non-elevated Windows sandbox failed its safety preflight.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    WindowsSandboxLegacySetupFailed {
+        preset: ApprovalPreset,
+        profile_selection: Option<PermissionProfileSelection>,
+        error: String,
+    },
+
     /// Begin a non-elevated grant of read access for an additional directory.
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     BeginWindowsSandboxGrantReadRoot {

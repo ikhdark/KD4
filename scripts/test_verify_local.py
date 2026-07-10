@@ -371,6 +371,17 @@ class VerifyLocalPlannerTest(unittest.TestCase):
         selected = set(self.v.selected_hash_roots(["codex-core"], self.graph))
         self.assertEqual(selected, set(roots.values()))
 
+    def test_proof_inputs_include_all_verify_local_modules(self) -> None:
+        proof_inputs = set(self.v.proof_input_files())
+
+        self.assertTrue(
+            {
+                REPO_ROOT / "scripts" / "verify_local.py",
+                REPO_ROOT / "scripts" / "verify_local_context.py",
+                REPO_ROOT / "scripts" / "verify_local_execution.py",
+            }.issubset(proof_inputs)
+        )
+
     def test_non_owner_cache_key_uses_scoped_file_hash(self) -> None:
         scope = self.v.Scope(
             scope_id="script-scope",

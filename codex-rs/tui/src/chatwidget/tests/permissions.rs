@@ -409,7 +409,9 @@ async fn windows_auto_mode_prompt_requests_enabling_sandbox_feature() {
         .into_iter()
         .find(|preset| preset.id == "auto")
         .expect("auto preset");
-    chat.open_windows_sandbox_enable_prompt(preset, /*profile_selection*/ None);
+    chat.open_windows_sandbox_enable_prompt_with_legacy_compatibility(
+        preset, /*profile_selection*/ None, /*legacy_is_compatible*/ true,
+    );
 
     let popup = render_bottom_popup(&chat, /*width*/ 120);
     assert!(
@@ -422,9 +424,52 @@ async fn windows_auto_mode_prompt_requests_enabling_sandbox_feature() {
     );
 }
 
+#[tokio::test]
+async fn windows_sandbox_enable_prompt_hides_incompatible_legacy_mode() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let preset = builtin_approval_presets()
+        .into_iter()
+        .find(|preset| preset.id == "auto")
+        .expect("auto preset");
+
+    chat.open_windows_sandbox_enable_prompt_with_legacy_compatibility(
+        preset, /*profile_selection*/ None, /*legacy_is_compatible*/ false,
+    );
+
+    let popup = render_bottom_popup(&chat, /*width*/ 120);
+    assert!(popup.contains("not safely available"), "popup: {popup}");
+    assert!(!popup.contains("Use non-admin sandbox"), "popup: {popup}");
+    assert!(popup.contains("Set up default sandbox"), "popup: {popup}");
+    assert!(popup.contains("Quit"), "popup: {popup}");
+}
+
+#[tokio::test]
+async fn windows_sandbox_legacy_failure_prompt_only_offers_safe_exit_paths() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let preset = builtin_approval_presets()
+        .into_iter()
+        .find(|preset| preset.id == "auto")
+        .expect("auto preset");
+
+    chat.open_windows_sandbox_legacy_unavailable_prompt(preset, /*profile_selection*/ None);
+
+    let popup = render_bottom_popup(&chat, /*width*/ 120);
+    assert!(popup.contains("No settings were changed"), "popup: {popup}");
+    assert!(
+        popup.contains("Choose Administrator setup or quit"),
+        "popup: {popup}"
+    );
+    assert!(
+        !popup.contains("non-admin sandbox (higher risk"),
+        "popup: {popup}"
+    );
+    assert!(popup.contains("Set up default sandbox"), "popup: {popup}");
+    assert!(popup.contains("Quit"), "popup: {popup}");
+}
+
 #[cfg(target_os = "windows")]
 #[tokio::test]
-async fn startup_prompts_for_windows_sandbox_when_agent_requested() {
+async fn startup_windows_sandbox_prompt_only_offers_compatible_modes() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
 
     chat.set_feature_enabled(Feature::WindowsSandbox, /*enabled*/ false);
@@ -441,10 +486,19 @@ async fn startup_prompts_for_windows_sandbox_when_agent_requested() {
         popup.contains("Set up default sandbox"),
         "expected startup prompt to offer default sandbox setup: {popup}"
     );
-    assert!(
+    let legacy_is_compatible =
+        codex_windows_sandbox::legacy_restricted_token_enforces_delete_child();
+    assert_eq!(
         popup.contains("Use non-admin sandbox"),
-        "expected startup prompt to offer non-admin fallback: {popup}"
+        legacy_is_compatible,
+        "startup prompt must expose legacy mode exactly when its kernel safety probe passes: {popup}"
     );
+    if !legacy_is_compatible {
+        assert!(
+            popup.contains("not safely available"),
+            "expected incompatible legacy-mode explanation: {popup}"
+        );
+    }
     assert!(
         popup.contains("Quit"),
         "expected startup prompt to offer quit action: {popup}"

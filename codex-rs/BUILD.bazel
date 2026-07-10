@@ -1,4 +1,5 @@
 exports_files([
+    "build_info.rs",
     "clippy.toml",
 ])
 

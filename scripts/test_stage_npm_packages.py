@@ -120,15 +120,16 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertEqual(package_json["files"], ["vendor"])
         self.assertNotIn("packageManager", package_json)
 
-    def test_codex_staging_copies_root_sourcemap_as_package_readme(self) -> None:
+    def test_codex_staging_copies_user_facing_package_readme(self) -> None:
         build = stage.load_build_module()
 
         build.stage_sources(self.root, "1.2.3", "codex")
 
         self.assertEqual(
             (self.root / "README.md").read_text(encoding="utf-8"),
-            (build.REPO_ROOT / "SOURCEMAP.md").read_text(encoding="utf-8"),
+            (build.CODEX_CLI_ROOT / "README.npm.md").read_text(encoding="utf-8"),
         )
+        self.assertNotIn("Repository source map", (self.root / "README.md").read_text())
 
     def test_codex_sdk_staging_injects_matching_cli_dependency(self) -> None:
         build = stage.load_build_module()

@@ -23,6 +23,8 @@ const DISABLE_HOOKS_CONFIG: &str = if cfg!(windows) {
 };
 const EXECUTABLE_FILTER_CONFIG_PATTERN: &str = r"^filter\..*\.(clean|process)$";
 const MAX_UNTRACKED_FILE_DIFFS: usize = 50;
+const MAX_OMITTED_UNTRACKED_PATHS: usize = 50;
+const MAX_OMITTED_UNTRACKED_PATH_CHARS: usize = 200;
 
 // `/diff` may execute Git through a remote workspace, so git-utils owns the
 // probe policy while this adapter keeps command execution in the TUI layer.
@@ -81,7 +83,7 @@ pub(crate) async fn get_git_diff(
             runner,
             cwd,
             fsmonitor,
-            &["ls-files", "--others", "--exclude-standard"]
+            &["ls-files", "-z", "--others", "--exclude-standard"]
         ),
     );
     let tracked_diff = tracked_diff_res?;
@@ -95,11 +97,7 @@ pub(crate) async fn get_git_diff(
     };
 
     let null_path = null_device.to_str().unwrap_or("/dev/null");
-    let untracked_files = untracked_output
-        .split('\n')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
+    let untracked_files = parse_untracked_files(&untracked_output);
     let (files_to_diff, omitted_files) =
         untracked_files.split_at(untracked_files.len().min(MAX_UNTRACKED_FILE_DIFFS));
     for file in files_to_diff {
@@ -124,6 +122,13 @@ pub(crate) async fn get_git_diff(
     Ok((true, format!("{tracked_diff}{untracked_diff}")))
 }
 
+fn parse_untracked_files(output: &str) -> Vec<&str> {
+    output
+        .split_terminator('\0')
+        .filter(|path| !path.is_empty())
+        .collect()
+}
+
 fn append_omitted_untracked_diff_notice(diff: &mut String, omitted_files: &[&str]) {
     if omitted_files.is_empty() {
         return;
@@ -139,11 +144,32 @@ fn append_omitted_untracked_diff_notice(diff: &mut String, omitted_files: &[&str
         "# Untracked file diffs omitted after first {MAX_UNTRACKED_FILE_DIFFS} files ({} omitted):\n",
         omitted_files.len()
     ));
-    for file in omitted_files {
+    for file in omitted_files.iter().take(MAX_OMITTED_UNTRACKED_PATHS) {
         diff.push_str("# - ");
-        diff.push_str(file);
+        diff.push_str(&escaped_path_for_notice(file));
         diff.push('\n');
     }
+    let additional = omitted_files
+        .len()
+        .saturating_sub(MAX_OMITTED_UNTRACKED_PATHS);
+    if additional > 0 {
+        diff.push_str(&format!(
+            "# ... {additional} additional omitted paths not listed\n"
+        ));
+    }
+}
+
+fn escaped_path_for_notice(path: &str) -> String {
+    let mut chars = path.chars();
+    let mut escaped = chars
+        .by_ref()
+        .take(MAX_OMITTED_UNTRACKED_PATH_CHARS)
+        .flat_map(char::escape_default)
+        .collect::<String>();
+    if chars.next().is_some() {
+        escaped.push('…');
+    }
+    escaped
 }
 
 /// Helper that executes `git` with the given `args` and returns `stdout` as a
@@ -378,10 +404,10 @@ mod tests {
             response(
                 git_command(
                     FsmonitorOverride::Disabled,
-                    &["ls-files", "--others", "--exclude-standard"],
+                    &["ls-files", "-z", "--others", "--exclude-standard"],
                 ),
                 /*exit_code*/ 0,
-                "new.txt\n",
+                "new.txt\0",
             ),
             response(
                 git_command(
@@ -467,10 +493,10 @@ mod tests {
             response(
                 git_command(
                     FsmonitorOverride::BuiltIn,
-                    &["ls-files", "--others", "--exclude-standard"],
+                    &["ls-files", "-z", "--others", "--exclude-standard"],
                 ),
                 /*exit_code*/ 0,
-                "new.txt\n",
+                "new.txt\0",
             ),
             response(
                 git_command(
@@ -548,7 +574,7 @@ mod tests {
             response(
                 git_command(
                     FsmonitorOverride::Disabled,
-                    &["ls-files", "--others", "--exclude-standard"],
+                    &["ls-files", "-z", "--others", "--exclude-standard"],
                 ),
                 /*exit_code*/ 0,
                 "",
@@ -567,7 +593,7 @@ mod tests {
         let untracked_files = (0..MAX_UNTRACKED_FILE_DIFFS + 2)
             .map(|index| format!("new-{index:02}.txt"))
             .collect::<Vec<_>>();
-        let untracked_output = format!("{}\n", untracked_files.join("\n"));
+        let untracked_output = format!("{}\0", untracked_files.join("\0"));
         let mut responses = vec![
             response(
                 git_command(
@@ -614,7 +640,7 @@ mod tests {
             response(
                 git_command(
                     FsmonitorOverride::Disabled,
-                    &["ls-files", "--others", "--exclude-standard"],
+                    &["ls-files", "-z", "--others", "--exclude-standard"],
                 ),
                 /*exit_code*/ 0,
                 &untracked_output,
@@ -712,7 +738,7 @@ mod tests {
             response(
                 git_command(
                     FsmonitorOverride::Disabled,
-                    &["ls-files", "--others", "--exclude-standard"],
+                    &["ls-files", "-z", "--others", "--exclude-standard"],
                 ),
                 /*exit_code*/ 0,
                 "",
@@ -728,6 +754,32 @@ mod tests {
             "git [\"diff\", \"--no-textconv\", \"--no-ext-diff\", \"--submodule=short\", \"--ignore-submodules=dirty\", \"--color\"] failed with status 2"
         );
         assert_command_metadata(&runner.commands(), &cwd);
+    }
+
+    #[test]
+    fn nul_delimited_untracked_paths_preserve_whitespace_and_newlines() {
+        assert_eq!(
+            parse_untracked_files(" leading\nname.txt \0trailing-space.txt \0"),
+            vec![" leading\nname.txt ", "trailing-space.txt "]
+        );
+    }
+
+    #[test]
+    fn omitted_untracked_notice_is_bounded_and_escapes_control_characters() {
+        let paths = (0..MAX_OMITTED_UNTRACKED_PATHS + 2)
+            .map(|index| format!("path-{index:02}\n{}.txt", "x".repeat(250)))
+            .collect::<Vec<_>>();
+        let path_refs = paths.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut notice = String::new();
+
+        append_omitted_untracked_diff_notice(&mut notice, &path_refs);
+
+        assert_eq!(notice.matches("# - ").count(), MAX_OMITTED_UNTRACKED_PATHS);
+        assert_eq!(notice.lines().count(), MAX_OMITTED_UNTRACKED_PATHS + 2);
+        assert!(notice.contains("\\n"));
+        assert!(notice.contains('…'));
+        assert!(notice.contains("# ... 2 additional omitted paths not listed\n"));
+        assert!(notice.lines().all(|line| line.len() < 2_100));
     }
 
     #[cfg(unix)]

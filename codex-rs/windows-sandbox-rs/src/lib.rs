@@ -49,6 +49,12 @@ pub const LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR: &str = concat!(
     "on this Windows build; select the elevated Windows sandbox backend"
 );
 
+#[cfg(target_os = "windows")]
+mod legacy_delete_child_probe_cache {
+    pub(super) static LEGACY_DELETE_CHILD_RESTRICTION: std::sync::OnceLock<bool> =
+        std::sync::OnceLock::new();
+}
+
 /// Returns whether the running Windows kernel applies restricting SIDs when
 /// checking `FILE_DELETE_CHILD` for a write-restricted token.
 ///
@@ -56,7 +62,16 @@ pub const LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR: &str = concat!(
 /// deletions and must fail closed rather than launch the requested process.
 #[cfg(target_os = "windows")]
 pub fn legacy_restricted_token_enforces_delete_child() -> bool {
-    token::probe_legacy_delete_child_restriction().unwrap_or(false)
+    let cache = &legacy_delete_child_probe_cache::LEGACY_DELETE_CHILD_RESTRICTION;
+    *cache.get_or_init(|| token::probe_legacy_delete_child_restriction().unwrap_or(false))
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn ensure_legacy_delete_child_safety(enforces_delete_child: bool) -> anyhow::Result<()> {
+    if !enforces_delete_child {
+        anyhow::bail!(LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -389,21 +404,24 @@ mod windows_impl {
     use std::time::Duration;
     use std::time::Instant;
     use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
-    use windows_sys::Win32::Foundation::DuplicateHandle;
+    use windows_sys::Win32::Foundation::ERROR_BROKEN_PIPE;
+    use windows_sys::Win32::Foundation::ERROR_NO_DATA;
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::Foundation::SetHandleInformation;
-    use windows_sys::Win32::System::IO::CancelSynchronousIo;
     use windows_sys::Win32::System::Pipes::CreatePipe;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    use windows_sys::Win32::System::Threading::GetCurrentThread;
+    use windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
+    use windows_sys::Win32::System::Pipes::SetNamedPipeHandleState;
     use windows_sys::Win32::System::Threading::GetExitCodeProcess;
     use windows_sys::Win32::System::Threading::INFINITE;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     type PipeHandles = ((HANDLE, HANDLE), (HANDLE, HANDLE), (HANDLE, HANDLE));
+
+    const CAPTURE_PIPE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+    const CAPTURE_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 
     enum WaitOutcome {
         Exited,
@@ -449,6 +467,20 @@ mod windows_impl {
         }
     }
 
+    unsafe fn close_pipe_handles(handles: &[HANDLE]) {
+        for &handle in handles {
+            if handle != 0 && handle != INVALID_HANDLE_VALUE {
+                CloseHandle(handle);
+            }
+        }
+    }
+
+    unsafe fn pipe_setup_error(handles: &[HANDLE]) -> io::Error {
+        let error = GetLastError();
+        close_pipe_handles(handles);
+        io::Error::from_raw_os_error(error as i32)
+    }
+
     unsafe fn setup_stdio_pipes() -> io::Result<PipeHandles> {
         let mut in_r: HANDLE = 0;
         let mut in_w: HANDLE = 0;
@@ -460,19 +492,27 @@ mod windows_impl {
             return Err(io::Error::from_raw_os_error(GetLastError() as i32));
         }
         if CreatePipe(&mut out_r, &mut out_w, ptr::null_mut(), 0) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+            return Err(pipe_setup_error(&[in_r, in_w]));
         }
         if CreatePipe(&mut err_r, &mut err_w, ptr::null_mut(), 0) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+            return Err(pipe_setup_error(&[in_r, in_w, out_r, out_w]));
         }
+        let handles = [in_r, in_w, out_r, out_w, err_r, err_w];
         if SetHandleInformation(in_r, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+            return Err(pipe_setup_error(&handles));
         }
         if SetHandleInformation(out_w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+            return Err(pipe_setup_error(&handles));
         }
         if SetHandleInformation(err_w, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) == 0 {
-            return Err(io::Error::from_raw_os_error(GetLastError() as i32));
+            return Err(pipe_setup_error(&handles));
+        }
+        let pipe_mode = PIPE_NOWAIT;
+        if SetNamedPipeHandleState(out_r, &pipe_mode, ptr::null(), ptr::null()) == 0 {
+            return Err(pipe_setup_error(&handles));
+        }
+        if SetNamedPipeHandleState(err_r, &pipe_mode, ptr::null(), ptr::null()) == 0 {
+            return Err(pipe_setup_error(&handles));
         }
         Ok(((in_r, in_w), (out_r, out_w), (err_r, err_w)))
     }
@@ -484,89 +524,122 @@ mod windows_impl {
         pub timed_out: bool,
     }
 
+    struct OwnedCapturePipeHandle(HANDLE);
+
+    impl Drop for OwnedCapturePipeHandle {
+        fn drop(&mut self) {
+            if self.0 != 0 && self.0 != INVALID_HANDLE_VALUE {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+
+    fn read_capture_pipe(handle: HANDLE, stop_rx: mpsc::Receiver<()>) -> io::Result<Vec<u8>> {
+        let _handle = OwnedCapturePipeHandle(handle);
+        let mut output = Vec::new();
+        let mut tmp = [0u8; 8192];
+        let mut drain_deadline = None;
+
+        loop {
+            if drain_deadline.is_none() {
+                match stop_rx.try_recv() {
+                    Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                        drain_deadline = Some(Instant::now() + self::CAPTURE_PIPE_DRAIN_TIMEOUT);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            if drain_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                break;
+            }
+
+            let mut read_bytes = 0u32;
+            let ok = unsafe {
+                windows_sys::Win32::Storage::FileSystem::ReadFile(
+                    handle,
+                    tmp.as_mut_ptr(),
+                    tmp.len() as u32,
+                    &mut read_bytes,
+                    ptr::null_mut(),
+                )
+            };
+            let no_data = if ok != 0 {
+                if read_bytes == 0 {
+                    true
+                } else {
+                    output.extend_from_slice(&tmp[..read_bytes as usize]);
+                    false
+                }
+            } else {
+                let error = unsafe { GetLastError() };
+                match error {
+                    ERROR_BROKEN_PIPE => break,
+                    ERROR_NO_DATA => true,
+                    _ => return Err(io::Error::from_raw_os_error(error as i32)),
+                }
+            };
+
+            if let Some(deadline) = drain_deadline {
+                if no_data || Instant::now() >= deadline {
+                    break;
+                }
+                continue;
+            }
+            if no_data {
+                match stop_rx.recv_timeout(self::CAPTURE_PIPE_POLL_INTERVAL) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        drain_deadline = Some(Instant::now() + self::CAPTURE_PIPE_DRAIN_TIMEOUT);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
     struct CapturePipeReader {
-        join: Option<std::thread::JoinHandle<()>>,
-        rx: mpsc::Receiver<Vec<u8>>,
-        thread_handle: HANDLE,
+        stop_tx: mpsc::SyncSender<()>,
+        join: Option<std::thread::JoinHandle<io::Result<Vec<u8>>>>,
     }
 
     impl CapturePipeReader {
         fn spawn_capture_pipe_reader(handle: HANDLE) -> Self {
-            let (tx, rx) = mpsc::channel::<Vec<u8>>();
-            let (thread_handle_tx, thread_handle_rx) = mpsc::channel::<HANDLE>();
-            let join = std::thread::spawn(move || {
-                let mut thread_handle: HANDLE = 0;
-                let duplicate_ok = unsafe {
-                    DuplicateHandle(
-                        GetCurrentProcess(),
-                        GetCurrentThread(),
-                        GetCurrentProcess(),
-                        &mut thread_handle,
-                        0,
-                        0,
-                        DUPLICATE_SAME_ACCESS,
-                    )
-                };
-                let _ = thread_handle_tx.send(if duplicate_ok == 0 { 0 } else { thread_handle });
-
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 8192];
-                loop {
-                    let mut read_bytes: u32 = 0;
-                    let ok = unsafe {
-                        windows_sys::Win32::Storage::FileSystem::ReadFile(
-                            handle,
-                            tmp.as_mut_ptr(),
-                            tmp.len() as u32,
-                            &mut read_bytes,
-                            std::ptr::null_mut(),
-                        )
-                    };
-                    if ok == 0 || read_bytes == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&tmp[..read_bytes as usize]);
-                }
-                unsafe {
-                    CloseHandle(handle);
-                }
-                let _ = tx.send(buf);
-            });
-            let thread_handle = thread_handle_rx.recv().unwrap_or(0);
+            let (stop_tx, stop_rx) = mpsc::sync_channel(1);
+            let join = std::thread::spawn(move || read_capture_pipe(handle, stop_rx));
             Self {
+                stop_tx,
                 join: Some(join),
-                rx,
-                thread_handle,
             }
         }
 
-        fn finish_capture_pipe_reader(mut self) -> Vec<u8> {
+        fn request_stop(&self) {
+            let _ = self.stop_tx.try_send(());
+        }
+
+        fn join_reader(&mut self) -> io::Result<Vec<u8>> {
+            let Some(join) = self.join.take() else {
+                return Err(io::Error::other("capture pipe reader already joined"));
+            };
+            match join.join() {
+                Ok(result) => result,
+                Err(_) => Err(io::Error::other("capture pipe reader thread panicked")),
+            }
+        }
+
+        fn stop_and_collect(mut self) -> io::Result<Vec<u8>> {
+            self.request_stop();
+            self.join_reader()
+        }
+    }
+
+    impl Drop for CapturePipeReader {
+        fn drop(&mut self) {
+            self.request_stop();
             if let Some(join) = self.join.take() {
                 let _ = join.join();
-            }
-            self.close_thread_handle();
-            self.rx.recv().unwrap_or_default()
-        }
-
-        fn cancel_and_collect(mut self) -> Vec<u8> {
-            if self.thread_handle != 0 {
-                unsafe {
-                    let _ = CancelSynchronousIo(self.thread_handle);
-                }
-            }
-            self.close_thread_handle();
-            self.join.take();
-            self.rx
-                .recv_timeout(Duration::from_millis(100))
-                .unwrap_or_default()
-        }
-
-        fn close_thread_handle(&mut self) {
-            if self.thread_handle != 0 {
-                unsafe {
-                    CloseHandle(self.thread_handle);
-                }
-                self.thread_handle = 0;
             }
         }
     }
@@ -612,9 +685,7 @@ mod windows_impl {
         additional_deny_write_paths: &[AbsolutePathBuf],
         use_private_desktop: bool,
     ) -> Result<CaptureResult> {
-        if !legacy_restricted_token_enforces_delete_child() {
-            anyhow::bail!(super::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR);
-        }
+        super::ensure_legacy_delete_child_safety(legacy_restricted_token_enforces_delete_child())?;
         let additional_deny_read_paths = additional_deny_read_paths
             .iter()
             .map(AbsolutePathBuf::to_path_buf)
@@ -737,17 +808,10 @@ mod windows_impl {
             }
             CloseHandle(security.h_token);
         }
-        let (stdout, stderr) = if timed_out || cancelled {
-            (
-                stdout_reader.cancel_and_collect(),
-                stderr_reader.cancel_and_collect(),
-            )
-        } else {
-            (
-                stdout_reader.finish_capture_pipe_reader(),
-                stderr_reader.finish_capture_pipe_reader(),
-            )
-        };
+        let stdout_result = stdout_reader.stop_and_collect();
+        let stderr_result = stderr_reader.stop_and_collect();
+        let stdout = stdout_result?;
+        let stderr = stderr_result?;
         let exit_code = if timed_out {
             128 + 64
         } else {
@@ -781,9 +845,7 @@ mod windows_impl {
         ) else {
             return Ok(());
         };
-        if !legacy_restricted_token_enforces_delete_child() {
-            anyhow::bail!(super::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR);
-        }
+        super::ensure_legacy_delete_child_safety(legacy_restricted_token_enforces_delete_child())?;
         if !permissions.uses_write_capabilities_for_cwd(cwd, env_map) {
             return Ok(());
         }
@@ -816,10 +878,16 @@ mod windows_impl {
         use codex_protocol::models::PermissionProfile;
         use codex_protocol::permissions::NetworkSandboxPolicy;
         use std::collections::HashMap;
+        use std::io;
         use std::path::Path;
+        use std::ptr;
         use std::time::Duration;
         use std::time::Instant;
         use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::WriteFile;
 
         fn workspace_profile(network_policy: NetworkSandboxPolicy) -> PermissionProfile {
             PermissionProfile::workspace_write_with(
@@ -858,8 +926,7 @@ mod windows_impl {
             assert!(should_apply_network_block(&PermissionProfile::read_only()));
         }
 
-        #[test]
-        fn cancelled_capture_reader_does_not_wait_for_an_open_writer() {
+        fn capture_pipe_with_open_writer() -> (super::CapturePipeReader, HANDLE) {
             let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) =
                 unsafe { super::setup_stdio_pipes() }.expect("create capture pipes");
             unsafe {
@@ -868,19 +935,113 @@ mod windows_impl {
                 CloseHandle(err_r);
                 CloseHandle(err_w);
             }
+            (
+                super::CapturePipeReader::spawn_capture_pipe_reader(out_r),
+                out_w,
+            )
+        }
 
-            let reader = super::CapturePipeReader::spawn_capture_pipe_reader(out_r);
+        fn write_pipe(handle: HANDLE, mut bytes: &[u8]) -> io::Result<()> {
+            while !bytes.is_empty() {
+                let mut written = 0u32;
+                let ok = unsafe {
+                    WriteFile(
+                        handle,
+                        bytes.as_ptr(),
+                        bytes.len() as u32,
+                        &mut written,
+                        ptr::null_mut(),
+                    )
+                };
+                if ok == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if written == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "pipe write completed without writing bytes",
+                    ));
+                }
+                bytes = &bytes[written as usize..];
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn stopped_capture_reader_joins_before_return_with_writer_open() {
             let started_at = Instant::now();
-            let output = reader.cancel_and_collect();
+            for _ in 0..16 {
+                let (reader, out_w) = capture_pipe_with_open_writer();
+                let output = reader.stop_and_collect();
+                let write_after_join = write_pipe(out_w, b"x");
+                unsafe {
+                    CloseHandle(out_w);
+                }
+
+                assert!(output.expect("stop and join capture reader").is_empty());
+                assert!(
+                    write_after_join.is_err(),
+                    "reader handle must be closed before collection returns"
+                );
+            }
+
+            assert!(
+                started_at.elapsed() < Duration::from_secs(2),
+                "repeated stop-and-join cycles should be bounded"
+            );
+        }
+
+        #[test]
+        fn stopped_capture_reader_preserves_buffered_output() {
+            let (reader, out_w) = capture_pipe_with_open_writer();
+            let expected = b"buffered before stop";
+            write_pipe(out_w, expected).expect("buffer output");
+
+            let output = reader.stop_and_collect();
             unsafe {
                 CloseHandle(out_w);
             }
 
-            assert!(output.is_empty());
-            assert!(
-                started_at.elapsed() < Duration::from_secs(1),
-                "cancelled pipe collection should be bounded"
+            assert_eq!(
+                output.expect("stop and join capture reader").as_slice(),
+                expected
             );
+        }
+
+        #[test]
+        fn stopped_capture_reader_bounds_continuous_writer_drain() {
+            let (reader, out_w) = capture_pipe_with_open_writer();
+            let writer = std::thread::spawn(move || {
+                let chunk = [b'x'; 64];
+                while write_pipe(out_w, &chunk).is_ok() {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                unsafe {
+                    CloseHandle(out_w);
+                }
+            });
+            std::thread::sleep(Duration::from_millis(20));
+
+            let started_at = Instant::now();
+            let output = reader.stop_and_collect();
+            let elapsed = started_at.elapsed();
+            writer.join().expect("join capture writer");
+
+            assert!(!output.expect("stop and join capture reader").is_empty());
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "continuous output must not extend the bounded drain"
+            );
+        }
+
+        #[test]
+        fn capture_reader_propagates_read_errors() {
+            let reader = super::CapturePipeReader::spawn_capture_pipe_reader(INVALID_HANDLE_VALUE);
+            let err = reader
+                .stop_and_collect()
+                .expect_err("invalid pipe handle should fail");
+
+            assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE as i32));
         }
 
         #[test]
@@ -903,25 +1064,11 @@ mod windows_impl {
         }
 
         #[test]
-        fn legacy_preflight_rejects_unsafe_delete_child_semantics() {
-            if crate::legacy_restricted_token_enforces_delete_child() {
-                return;
-            }
-
-            let workspace = tempfile::tempdir().expect("workspace");
-            let codex_home = tempfile::tempdir().expect("codex home");
-            let workspace_root =
-                codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace.path())
-                    .expect("absolute workspace");
-            let err = super::run_windows_sandbox_legacy_preflight(
-                &PermissionProfile::workspace_write(),
-                &[workspace_root],
-                codex_home.path(),
-                workspace.path(),
-                &HashMap::new(),
-            )
-            .expect_err("unsafe legacy preflight should fail closed");
-
+        fn legacy_delete_child_safety_is_deterministic() {
+            crate::ensure_legacy_delete_child_safety(true)
+                .expect("safe delete-child semantics should be accepted");
+            let err = crate::ensure_legacy_delete_child_safety(false)
+                .expect_err("unsafe delete-child semantics should fail closed");
             assert_eq!(
                 err.to_string(),
                 crate::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR

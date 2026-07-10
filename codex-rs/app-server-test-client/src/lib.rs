@@ -95,9 +95,12 @@ mod process;
 mod request_user_input;
 
 use process::add_codex_parent_to_path;
+use process::build_serve_command;
 use process::listener_pids_on_port;
+use process::preflight_serve_restart;
 use process::runtime_dir;
 use process::shell_quote;
+use process::start_prepared_serve;
 use process::terminate_process;
 
 const NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
@@ -605,9 +608,7 @@ fn serve(codex_bin: &Path, config_overrides: &[String], listen: &str, kill: bool
     fs::create_dir_all(&runtime_path)
         .with_context(|| format!("failed to create runtime dir {}", runtime_path.display()))?;
     let log_path = runtime_path.join("app-server.log");
-    if kill {
-        kill_listeners_on_same_port(listen)?;
-    }
+    let mut command = build_serve_command(codex_bin, config_overrides, listen)?;
 
     let log_file = OpenOptions::new()
         .create(true)
@@ -618,30 +619,34 @@ fn serve(codex_bin: &Path, config_overrides: &[String], listen: &str, kill: bool
         .try_clone()
         .with_context(|| format!("failed to clone log file handle {}", log_path.display()))?;
 
-    let mut cmdline = format!(
-        "tail -f /dev/null | RUST_BACKTRACE=full RUST_LOG=warn,codex_=trace {}",
-        shell_quote(&codex_bin.display().to_string())
-    );
-    for override_kv in config_overrides {
-        cmdline.push_str(&format!(" --config {}", shell_quote(override_kv)));
-    }
-    cmdline.push_str(&format!(" app-server --listen {}", shell_quote(listen)));
-
-    let child = Command::new("nohup")
-        .arg("sh")
-        .arg("-c")
-        .arg(cmdline)
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file_stderr))
-        .spawn()
-        .with_context(|| format!("failed to start `{}` app-server", codex_bin.display()))?;
+        .stderr(Stdio::from(log_file_stderr));
+
+    let child = start_prepared_serve(
+        kill,
+        || preflight_serve_restart(codex_bin, config_overrides),
+        || kill_listeners_on_same_port(listen),
+        || {
+            command
+                .spawn()
+                .with_context(|| format!("failed to start `{}` app-server", codex_bin.display()))
+        },
+    )?;
 
     let pid = child.id();
 
     println!("started codex app-server");
     println!("listen: {listen}");
-    println!("pid: {pid} (launcher process)");
+    println!(
+        "pid: {pid} ({})",
+        if cfg!(windows) {
+            "app-server process"
+        } else {
+            "launcher process"
+        }
+    );
     println!("log: {}", log_path.display());
 
     Ok(())
