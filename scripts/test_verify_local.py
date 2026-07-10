@@ -183,6 +183,22 @@ class VerifyLocalPlannerTest(unittest.TestCase):
             ],
         )
 
+    def test_git_name_list_preserves_newlines_and_spaces_in_paths(self) -> None:
+        with mock.patch.object(
+            self.v,
+            "git",
+            return_value="scripts/line\nbreak.py\0scripts/ trailing .py\0",
+        ) as git:
+            paths = self.v.git_name_list(
+                ["diff", "--name-only", "--diff-filter=ACMRTD"]
+            )
+
+        self.assertEqual(
+            [path.as_posix() for path in paths],
+            ["scripts/line\nbreak.py", "scripts/ trailing .py"],
+        )
+        self.assertEqual(git.call_args.args[0][-1], "-z")
+
     def test_git_does_not_retry_dubious_ownership_for_non_inspection(self) -> None:
         dubious = subprocess.CompletedProcess(
             ["git", "branch", "new-branch"],
@@ -527,6 +543,19 @@ class VerifyLocalPlannerTest(unittest.TestCase):
                 self.v.bash_parse_script(Path("scripts/start-codex-exec.sh")),
             ),
         )
+        self.assertEqual(
+            commands["script-test:publish-local-codex+start-codex-exec"],
+            (
+                self.v.python_executable(),
+                "-m",
+                "scripts.root_maintenance",
+                "test-python",
+                "--changed",
+                "scripts/publish-local-codex.ps1",
+                "--changed",
+                "scripts/start-codex-exec.sh",
+            ),
+        )
 
     def test_verify_local_rules_change_runs_router_tests(self) -> None:
         changed = [Path("scripts/verify_local_rules.toml")]
@@ -590,6 +619,23 @@ class VerifyLocalPlannerTest(unittest.TestCase):
                 "scripts/verify_local.py",
             ),
         )
+
+    def test_top_level_typescript_files_require_prettier(self) -> None:
+        self.assertTrue(
+            self.v.needs_prettier_formatter(Path("sdk/typescript/index.ts"))
+        )
+        self.assertTrue(self.v.needs_prettier_formatter(Path("codex-cli/index.js")))
+
+    def test_main_preserves_explicit_empty_argv(self) -> None:
+        with (
+            mock.patch.object(
+                self.v, "parse_args", side_effect=RuntimeError("stop after parse")
+            ) as parse_args,
+            self.assertRaisesRegex(RuntimeError, "stop after parse"),
+        ):
+            self.v.main([])
+
+        parse_args.assert_called_once_with([])
 
     def test_root_maintenance_commands_resolve_bare_python_executable(self) -> None:
         with (
@@ -868,7 +914,7 @@ class VerifyLocalPlannerTest(unittest.TestCase):
             "config-schema",
             "vscode-runtime-proof",
             "tui-large-widget-risk",
-            "source-discovery",
+            "source-map",
             "dependency-cleanup",
             "sdk-typescript",
             "sdk-python",
@@ -876,6 +922,7 @@ class VerifyLocalPlannerTest(unittest.TestCase):
         ]:
             self.assertIn(surface_id, loaded)
             self.assertIsNotNone(loaded[surface_id].validation_command)
+        self.assertIn("SOURCEMAP.md", loaded["source-map"].paths)
 
     def test_rules_file_schema_surfaces_mirror_checker_inputs(self) -> None:
         loaded = {rule.id: rule for rule in self.v.load_rules()}

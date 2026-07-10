@@ -175,8 +175,9 @@ stage_codex_binary() {
     return 0
   fi
 
-  docker exec -i "${container_name}" sh -lc \
-    "mkdir -p /tmp/codex-remote-env/bin && cat > ${remote_codex_path} && chmod +x ${remote_codex_path}" <"${binary_path}" || return 1
+  docker exec -i "${container_name}" sh -c \
+    'mkdir -p "$1" && cat >"$2" && chmod +x "$2"' sh \
+    "$(dirname "${remote_codex_path}")" "${remote_codex_path}" <"${binary_path}" || return 1
   echo "${remote_codex_path}"
 }
 
@@ -184,8 +185,9 @@ stop_remote_exec_server() {
   local container_name="$1"
   local pid_path="/tmp/codex-remote-env/exec-server.pid"
 
-  docker exec "${container_name}" sh -lc \
-    "if [ -r ${pid_path} ]; then read pid < ${pid_path}; kill \"\$pid\" >/dev/null 2>&1 || true; rm -f ${pid_path}; fi" >/dev/null 2>&1 || true
+  docker exec "${container_name}" sh -c \
+    'pid_path=$1; if [ -r "$pid_path" ]; then IFS= read -r pid <"$pid_path"; kill "$pid" >/dev/null 2>&1 || true; rm -f "$pid_path"; fi' \
+    sh "${pid_path}" >/dev/null 2>&1 || true
 }
 
 start_remote_exec_server() {
@@ -195,16 +197,32 @@ start_remote_exec_server() {
   local stdout_path="$4"
   local pid_path="/tmp/codex-remote-env/exec-server.pid"
 
-  docker exec "${container_name}" sh -lc \
-    "mkdir -p /tmp/codex-remote-env; rm -f ${stdout_path} ${pid_path}; nohup ${remote_codex_path} exec-server --listen ws://0.0.0.0:${port} > ${stdout_path} 2>&1 & pid=\$!; echo \$pid > ${pid_path}; echo \$pid"
+  docker exec "${container_name}" sh -c \
+    'stdout_path=$1; pid_path=$2; remote_codex=$3; listen_url=$4; mkdir -p "$(dirname "$stdout_path")"; rm -f "$stdout_path" "$pid_path"; nohup "$remote_codex" exec-server --listen "$listen_url" >"$stdout_path" 2>&1 & pid=$!; echo "$pid" >"$pid_path"; echo "$pid"' \
+    sh "${stdout_path}" "${pid_path}" "${remote_codex_path}" "ws://0.0.0.0:${port}"
 }
 
 remote_exec_server_pid() {
   local container_name="$1"
   local pid_path="/tmp/codex-remote-env/exec-server.pid"
 
-  docker exec "${container_name}" sh -lc \
-    "if [ -r ${pid_path} ]; then read pid < ${pid_path}; echo \$pid; fi" 2>/dev/null || true
+  docker exec "${container_name}" sh -c \
+    'pid_path=$1; if [ -r "$pid_path" ]; then IFS= read -r pid <"$pid_path"; echo "$pid"; fi' \
+    sh "${pid_path}" 2>/dev/null || true
+}
+
+cleanup_remote_env_setup_failure() {
+  local container_name="$1"
+  local managed_server="${2:-0}"
+
+  if is_truthy "${managed_server}"; then
+    stop_remote_exec_server "${container_name}"
+    unset CODEX_TEST_REMOTE_EXEC_SERVER_PID
+    unset CODEX_TEST_REMOTE_EXEC_SERVER_URL
+  fi
+  if ! is_truthy "${CODEX_TEST_REMOTE_ENV_REUSE:-0}"; then
+    docker rm -f "${container_name}" >/dev/null 2>&1 || true
+  fi
 }
 
 remote_exec_server_url() {
@@ -238,6 +256,7 @@ setup_remote_env() {
   local remote_exec_server_pid
   local remote_exec_server_port
   local remote_exec_server_stdout_path
+  local managed_server=0
 
   if is_truthy "${CODEX_TEST_REMOTE_ENV_REUSE:-0}"; then
     container_name="${CODEX_TEST_REMOTE_ENV_CONTAINER_NAME:-codex-remote-test-env-local}"
@@ -268,20 +287,38 @@ setup_remote_env() {
   fi
 
   if [[ -z "${CODEX_TEST_REMOTE_EXEC_SERVER_URL:-}" ]]; then
+    managed_server=1
     remote_exec_server_stdout_path="/tmp/codex-remote-env/exec-server.stdout"
     if ! is_truthy "${CODEX_TEST_REMOTE_ENV_REUSE_SERVER:-0}" || ! wait_for_remote_exec_server_port "${container_name}" "${remote_exec_server_port}" "${remote_exec_server_stdout_path}" 1; then
       stop_remote_exec_server "${container_name}"
-      remote_codex_path="$(stage_codex_binary "${container_name}" "${codex_binary_path}")" || return 1
-      remote_exec_server_pid="$(start_remote_exec_server "${container_name}" "${remote_codex_path}" "${remote_exec_server_port}" "${remote_exec_server_stdout_path}")" || return 1
-      wait_for_remote_exec_server_port "${container_name}" "${remote_exec_server_port}" "${remote_exec_server_stdout_path}" || return 1
+      remote_codex_path="$(stage_codex_binary "${container_name}" "${codex_binary_path}")" || {
+        cleanup_remote_env_setup_failure "${container_name}" "${managed_server}"
+        return 1
+      }
+      remote_exec_server_pid="$(start_remote_exec_server "${container_name}" "${remote_codex_path}" "${remote_exec_server_port}" "${remote_exec_server_stdout_path}")" || {
+        cleanup_remote_env_setup_failure "${container_name}" "${managed_server}"
+        return 1
+      }
+      wait_for_remote_exec_server_port "${container_name}" "${remote_exec_server_port}" "${remote_exec_server_stdout_path}" || {
+        cleanup_remote_env_setup_failure "${container_name}" "${managed_server}"
+        return 1
+      }
     else
       remote_exec_server_pid="$(remote_exec_server_pid "${container_name}")"
     fi
     export CODEX_TEST_REMOTE_EXEC_SERVER_PID="${remote_exec_server_pid}"
-    CODEX_TEST_REMOTE_EXEC_SERVER_URL="$(remote_exec_server_url "${container_name}" "${remote_exec_server_port}")" || return 1
+    CODEX_TEST_REMOTE_EXEC_SERVER_URL="$(remote_exec_server_url "${container_name}" "${remote_exec_server_port}")" || {
+      cleanup_remote_env_setup_failure "${container_name}" "${managed_server}"
+      return 1
+    }
     export CODEX_TEST_REMOTE_EXEC_SERVER_URL
   fi
 
+  if is_truthy "${managed_server}"; then
+    export CODEX_TEST_REMOTE_EXEC_SERVER_MANAGED=1
+  else
+    unset CODEX_TEST_REMOTE_EXEC_SERVER_MANAGED
+  fi
   export CODEX_TEST_REMOTE_ENV="${container_name}"
 }
 
@@ -314,14 +351,14 @@ PY
 
   if ! is_truthy "${quiet}"; then
     echo "timed out waiting for remote exec-server on ${container_name}:${port}" >&2
-    docker exec "${container_name}" sh -lc "cat ${stdout_path} 2>/dev/null || true" >&2 || true
+    docker exec "${container_name}" sh -c 'cat "$1" 2>/dev/null || true' sh "${stdout_path}" >&2 || true
   fi
   return 1
 }
 
 codex_remote_env_cleanup() {
   if [[ -n "${CODEX_TEST_REMOTE_ENV:-}" ]]; then
-    if ! is_truthy "${CODEX_TEST_REMOTE_ENV_REUSE_SERVER:-0}"; then
+    if is_truthy "${CODEX_TEST_REMOTE_EXEC_SERVER_MANAGED:-0}" && ! is_truthy "${CODEX_TEST_REMOTE_ENV_REUSE_SERVER:-0}"; then
       stop_remote_exec_server "${CODEX_TEST_REMOTE_ENV}"
     fi
     if ! is_truthy "${CODEX_TEST_REMOTE_ENV_REUSE:-0}"; then
@@ -329,8 +366,11 @@ codex_remote_env_cleanup() {
     fi
     unset CODEX_TEST_REMOTE_ENV
   fi
-  unset CODEX_TEST_REMOTE_EXEC_SERVER_PID
-  unset CODEX_TEST_REMOTE_EXEC_SERVER_URL
+  if is_truthy "${CODEX_TEST_REMOTE_EXEC_SERVER_MANAGED:-0}"; then
+    unset CODEX_TEST_REMOTE_EXEC_SERVER_PID
+    unset CODEX_TEST_REMOTE_EXEC_SERVER_URL
+  fi
+  unset CODEX_TEST_REMOTE_EXEC_SERVER_MANAGED
 }
 
 if ! is_sourced; then

@@ -15,6 +15,7 @@ use serde_json::Value;
 use serde_json::json;
 use tracing::error;
 
+use crate::approval_response::review_decision_from_elicitation_response;
 use crate::outgoing_message::OutgoingMessageSender;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -123,17 +124,15 @@ pub(crate) async fn on_patch_approval_response(
         }
     };
 
-    let response = serde_json::from_value::<PatchApprovalResponse>(value).unwrap_or_else(|err| {
+    let decision = review_decision_from_elicitation_response(value).unwrap_or_else(|err| {
         error!("failed to deserialize PatchApprovalResponse: {err}");
-        PatchApprovalResponse {
-            decision: ReviewDecision::Denied,
-        }
+        ReviewDecision::Denied
     });
 
     if let Err(err) = codex
         .submit(Op::PatchApproval {
             id: approval_id,
-            decision: response.decision,
+            decision,
         })
         .await
     {

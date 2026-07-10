@@ -17,10 +17,27 @@ function ConvertTo-SafeCargoLaneName {
     )
 
     $safe = ([string]$Value -replace "[^A-Za-z0-9_.-]", "-").Trim("-")
-    if ([string]::IsNullOrWhiteSpace($safe)) {
+    if ([string]::IsNullOrWhiteSpace($safe) -or $safe -in @(".", "..")) {
         throw "Cargo target lane cannot be empty."
     }
     return $safe
+}
+
+function Test-StringArrayEqual {
+    param(
+        [string[]]$Left,
+        [string[]]$Right
+    )
+
+    if ($Left.Count -ne $Right.Count) {
+        return $false
+    }
+    for ($i = 0; $i -lt $Left.Count; $i++) {
+        if (-not [string]::Equals($Left[$i], $Right[$i], [StringComparison]::Ordinal)) {
+            return $false
+        }
+    }
+    return $true
 }
 
 function Format-EnvProofValue {
@@ -125,7 +142,7 @@ try {
             Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
             $cargoTargetDirProof = "<explicit command argument>"
         }
-        elseif ($programArgsWithTargetDir.Count -eq $ProgramArgs.Count) {
+        elseif (Test-StringArrayEqual -Left $programArgsWithTargetDir -Right $ProgramArgs) {
             $env:CARGO_TARGET_DIR = $laneTargetDir
             $cargoTargetDirProof = $laneTargetDir
         }

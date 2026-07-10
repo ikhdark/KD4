@@ -25,8 +25,8 @@ working tree.
 
 ## Fast Routing
 
-Use this section first, then read `SOURCE_MAP.md` only when ownership remains
-ambiguous or the task touches a cross-cutting surface.
+Use this section first, then read [`../SOURCEMAP.md`](../SOURCEMAP.md) only when
+ownership remains ambiguous or the task touches a cross-cutting surface.
 
 - CLI, login, auth, plugins from the CLI, marketplace, daemon, and completions:
   `cli`, `login`, `aws-auth`, `keyring-store`, `secrets`.
@@ -97,8 +97,9 @@ stay non-mutating unless the user explicitly asks for edits.
   paths, stop and compare the versions. Keep or add the better version for the
   requested behavior, integrate compatible improvements where practical, and
   continue without reverting unrelated work.
-- Prefer `SOURCE_MAP.md` when present, crate-local README files, Cargo workspace
-  metadata, and manifest entrypoints before hard-coded path heuristics.
+- Prefer [`../SOURCEMAP.md`](../SOURCEMAP.md), crate-local README files, Cargo
+  workspace metadata, and manifest entrypoints before hard-coded path
+  heuristics.
 - If the user says no tests, do not run Rust/Cargo/nextest test commands. Use
   relevant non-test checks and report skipped test commands.
 - Do not launch multiple normal Cargo/`just test`/`just fix` commands concurrently

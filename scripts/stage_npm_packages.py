@@ -220,7 +220,11 @@ def codex_platform_packages() -> dict[str, dict[str, str]]:
 
 
 def package_target_filters() -> dict[str, set[str]]:
-    return getattr(load_build_module(), "PACKAGE_TARGET_FILTERS", {})
+    raw_filters = getattr(load_build_module(), "PACKAGE_TARGET_FILTERS", {})
+    return {
+        package: {targets} if isinstance(targets, str) else set(targets)
+        for package, targets in raw_filters.items()
+    }
 
 
 def codex_package_component() -> str:
@@ -543,6 +547,7 @@ def write_complete_marker(artifact_dir: Path, artifact: WorkflowArtifact) -> Non
 def exclusive_file_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd: int | None = None
+    lock_identity: tuple[int, int] | None = None
     while fd is None:
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -550,9 +555,17 @@ def exclusive_file_lock(lock_path: Path):
                 fd,
                 f"pid={os.getpid()} thread={threading.get_ident()}\n".encode("utf-8"),
             )
+            stat_result = os.fstat(fd)
+            lock_identity = (stat_result.st_dev, stat_result.st_ino)
         except FileExistsError:
             try:
-                if time.time() - lock_path.stat().st_mtime > LOCK_STALE_SECONDS:
+                lock_stat = lock_path.stat()
+                owner_pid = lock_owner_pid(lock_path)
+                owner_is_live = owner_pid is not None and process_is_running(owner_pid)
+                if (
+                    time.time() - lock_stat.st_mtime > LOCK_STALE_SECONDS
+                    and not owner_is_live
+                ):
                     lock_path.unlink()
             except (FileNotFoundError, PermissionError):
                 # On Windows, unlinking a lock whose holder still has the fd
@@ -565,7 +578,45 @@ def exclusive_file_lock(lock_path: Path):
     finally:
         if fd is not None:
             os.close(fd)
-        lock_path.unlink(missing_ok=True)
+        try:
+            lock_stat = lock_path.stat()
+            if lock_identity == (lock_stat.st_dev, lock_stat.st_ino):
+                lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def lock_owner_pid(lock_path: Path) -> int | None:
+    try:
+        fields = lock_path.read_text(encoding="utf-8").split()
+    except (OSError, UnicodeError):
+        return None
+    for field in fields:
+        if field.startswith("pid="):
+            try:
+                return int(field.removeprefix("pid="))
+            except ValueError:
+                return None
+    return None
+
+
+def process_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # Python's Windows os.kill implementation does not offer a harmless
+        # signal-0 probe. The open lock handle denies deletion on Windows, so
+        # let the unlink attempt itself distinguish a live owner.
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return True
+    return True
 
 
 def worker_count_for(item_count: int, requested: int | None = None) -> int:
@@ -768,6 +819,11 @@ def validate_tar_members_for_legacy_python(
             raise RuntimeError(
                 f"archive links require Python tarfile data_filter support: {member.name}"
             )
+        if not (member.isfile() or member.isdir()):
+            raise RuntimeError(
+                "archive special files require Python tarfile data_filter "
+                f"support: {member.name}"
+            )
 
 
 def is_relative_to(path: Path, parent: Path) -> bool:
@@ -829,7 +885,6 @@ def install_single_binary(
         else component.binary_basename
     )
     dest = dest_dir / binary_name
-    dest.unlink(missing_ok=True)
     extract_zstd_archive(archive_path, dest)
     if "windows" not in target:
         dest.chmod(0o755)

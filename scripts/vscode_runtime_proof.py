@@ -62,17 +62,20 @@ def extension_candidates(limit: int = 8) -> list[str]:
     names = ("codex", "codex.exe")
     matches: list[str] = []
     for root in roots:
-        if not root.exists():
+        if not root.is_dir():
             continue
-        for child in root.rglob("*"):
-            if len(matches) >= limit:
-                return matches
-            if (
-                child.is_file()
-                and child.name in names
-                and "codex" in child.as_posix().lower()
-            ):
-                matches.append(str(child))
+        for directory, dirnames, filenames in os.walk(
+            root, onerror=lambda _error: None
+        ):
+            dirnames.sort()
+            for name in sorted(filenames):
+                if len(matches) >= limit:
+                    return matches
+                if name not in names:
+                    continue
+                child = Path(directory) / name
+                if "codex" in child.as_posix().lower():
+                    matches.append(str(child))
     return matches
 
 

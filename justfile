@@ -5,6 +5,8 @@ set shell := ["python3", "-c", 'import os, runpy; runpy.run_path(os.environ["JUS
 set windows-shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST_SHELL"], run_name="__main__")']
 
 rust_min_stack := "8388608" # 8 MiB
+cargo_build_jobs := env_var_or_default("CARGO_BUILD_JOBS", "30") # Leave two logical CPUs free.
+export CARGO_BUILD_JOBS := cargo_build_jobs
 python := if os_family() == "windows" { "python" } else { "python3" }
 
 # Display help
@@ -615,9 +617,9 @@ app-server-runtime-check:
     just app-server-process-exec-check
     just app-server-thread-status-check
 
-source-discovery-check:
-    cargo nextest run -p codex-core -E 'test(source_search_plan) | test(search_source) | test(read_file_span) | test(list_source_surface)'
-    cargo check -p codex-file-search
+source-map-check:
+    {{ python }} "{{ justfile_directory() }}/scripts/asciicheck.py" "{{ justfile_directory() }}/SOURCEMAP.md"
+    {{ python }} "{{ justfile_directory() }}/scripts/readme_toc.py" "{{ justfile_directory() }}/SOURCEMAP.md"
 
 tui-large-widget-check:
     cargo nextest run -p codex-tui -E 'test(footer_collapse_snapshots) | test(handle_paste_large_uses_placeholder_and_replaces_on_submit) | test(resume_picker)'

@@ -48,6 +48,40 @@ PYTHON_UNITTEST_TARGETS = python_unittest_targets()
 
 UV_RUN_SCRIPTS = ["uv", "run", "--frozen", "--project", "scripts"]
 
+# Several script owners intentionally use aggregate test modules instead of a
+# same-stem test file. Keep that routing explicit so changed PowerShell/shell
+# helpers and shared Python utilities do not receive syntax-only validation.
+SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
+    "scripts/app_server_schema_runtime_check.py": ("scripts.test_dev_environment",),
+    "scripts/build_codex_package.py": ("scripts.test_stage_npm_packages",),
+    "scripts/cargo-lane-trash-cleanup.ps1": ("scripts.test_cargo_lane",),
+    "scripts/cargo-lane.ps1": ("scripts.test_cargo_lane",),
+    "scripts/common-rust-env.ps1": ("scripts.test_build_tooling",),
+    "scripts/config_schema_check.py": ("scripts.test_dev_environment",),
+    "scripts/dev_env_doctor.py": ("scripts.test_dev_environment",),
+    "scripts/format.py": ("scripts.test_build_tooling",),
+    "scripts/git_doctor.py": ("scripts.test_dev_environment",),
+    "scripts/invoke-rust-perf-env.ps1": ("scripts.test_build_tooling",),
+    "scripts/just-shell.py": ("scripts.test_build_tooling",),
+    "scripts/publish-local-codex-wsl.sh": (
+        "scripts.test_dev_environment",
+        "scripts.test_publish_local_codex",
+    ),
+    "scripts/publish-local-codex.hashing.ps1": ("scripts.test_publish_local_codex",),
+    "scripts/publish-local-codex.ps1": ("scripts.test_publish_local_codex",),
+    "scripts/root_maintenance.py": ("scripts.test_build_tooling",),
+    "scripts/run-powershell-script.ps1": ("scripts.test_run_powershell_script",),
+    "scripts/run_tui_with_exec_server.sh": ("scripts.test_run_tui_with_exec_server",),
+    "scripts/rust_build_status.py": ("scripts.test_build_tooling",),
+    "scripts/rust_packages.py": ("scripts.test_build_tooling",),
+    "scripts/sccache-perf.ps1": ("scripts.test_build_tooling",),
+    "scripts/stage_npm_packages.py": ("scripts.test_stage_npm_packages",),
+    "scripts/start-codex-exec.sh": ("scripts.test_run_tui_with_exec_server",),
+    "scripts/test-remote-env.sh": ("scripts.test_build_tooling",),
+    "scripts/tool_versions.py": ("scripts.test_build_tooling",),
+    "scripts/vscode_runtime_proof.py": ("scripts.test_dev_environment",),
+}
+
 
 def script_python_path(path_text: str) -> Path | None:
     path = Path(path_text)
@@ -87,6 +121,7 @@ def git_changed_paths() -> list[str]:
             "core.quotepath=off",
             "diff",
             "--name-only",
+            "-z",
             "--diff-filter=ACMRTUXB",
             "HEAD",
             "--",
@@ -100,7 +135,8 @@ def git_changed_paths() -> list[str]:
     )
     if result.returncode != 0:
         return []
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    delimiter = "\0" if "\0" in result.stdout else "\n"
+    return [path for path in result.stdout.split(delimiter) if path]
 
 
 def expand_changed_paths(changed: Sequence[str | None]) -> list[str]:
@@ -116,24 +152,40 @@ def expand_changed_paths(changed: Sequence[str | None]) -> list[str]:
     return expanded
 
 
-def test_module_for_changed_path(path_text: str) -> str | None:
+def test_modules_for_changed_path(path_text: str) -> tuple[str, ...]:
+    raw_path = Path(path_text)
+    if raw_path.is_absolute():
+        try:
+            raw_path = raw_path.relative_to(REPO_ROOT)
+        except ValueError:
+            return ()
+    path_key = raw_path.as_posix()
+    if os.name == "nt":
+        path_key = path_key.lower()
+
+    selected = list(SCRIPT_TEST_MODULES.get(path_key, ()))
     path = script_python_path(path_text)
     if path is None:
-        return None
-    parts = path.parts
+        return tuple(selected)
     module = path.with_suffix("").as_posix().replace("/", ".")
     if path.name.startswith("test_"):
-        return module
-    test_module = ".".join((*parts[:-1], f"test_{path.stem}"))
-    return test_module if test_module in PYTHON_UNITTEST_TARGETS else None
+        selected.append(module)
+    else:
+        test_module = ".".join((*path.parts[:-1], f"test_{path.stem}"))
+        if test_module in PYTHON_UNITTEST_TARGETS:
+            selected.append(test_module)
+    return tuple(dict.fromkeys(selected))
+
+
+def test_module_for_changed_path(path_text: str) -> str | None:
+    modules = test_modules_for_changed_path(path_text)
+    return modules[0] if modules else None
 
 
 def python_test_targets(modules: Sequence[str], changed: Sequence[str]) -> list[str]:
     selected = list(modules)
     selected.extend(
-        module
-        for module in (test_module_for_changed_path(path) for path in changed)
-        if module is not None
+        module for path in changed for module in test_modules_for_changed_path(path)
     )
     if not selected:
         return PYTHON_UNITTEST_TARGETS

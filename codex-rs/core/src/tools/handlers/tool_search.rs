@@ -18,46 +18,92 @@ use codex_tools::ToolSearchEntry;
 use codex_tools::ToolSearchInfo;
 use codex_tools::ToolSpec;
 use codex_tools::coalesce_loadable_tool_specs;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::instrument;
+
+const MAX_TOOL_SEARCH_HANDLER_CACHE: usize = 4;
+const MAX_TOOL_SEARCH_RESULT_CACHE: usize = 32;
+const TOOL_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
 
 pub struct ToolSearchHandler {
     search_infos: Vec<ToolSearchInfo>,
     spec: ToolSpec,
     search_engine: SearchEngine<usize>,
+    result_cache: Mutex<VecDeque<ToolSearchCacheEntry>>,
 }
 
 #[derive(Default)]
 pub(crate) struct ToolSearchHandlerCache {
-    cached: Mutex<Option<Arc<ToolSearchHandler>>>,
+    cached: Mutex<VecDeque<Arc<ToolSearchHandler>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ToolSearchQueryKey {
+    query: String,
+    limit: usize,
+}
+
+#[derive(Clone)]
+struct ToolSearchCacheEntry {
+    key: ToolSearchQueryKey,
+    tools: Vec<LoadableToolSpec>,
 }
 
 impl ToolSearchHandlerCache {
     #[instrument(level = "trace", skip_all, fields(search_info_count = search_infos.len()))]
     pub(crate) fn get_or_build(&self, search_infos: Vec<ToolSearchInfo>) -> Arc<ToolSearchHandler> {
         {
-            let cached = self.cached();
-            if let Some(cached) = cached.as_ref()
-                && cached.search_infos == search_infos
+            let mut cached = self.cached();
+            if let Some(index) = cached
+                .iter()
+                .position(|handler| handler.search_infos == search_infos)
+                && let Some(handler) = cached.remove(index)
             {
-                return Arc::clone(cached);
+                cached.push_back(Arc::clone(&handler));
+                tracing::trace!(
+                    cache_hit = true,
+                    cached_inventory_count = cached.len(),
+                    "tool search handler cache resolved"
+                );
+                return handler;
             }
         }
 
         let handler = Arc::new(ToolSearchHandler::new(search_infos));
         let mut cached = self.cached();
-        if let Some(cached) = cached.as_ref()
-            && cached.search_infos == handler.search_infos
+        if let Some(index) = cached
+            .iter()
+            .position(|cached_handler| cached_handler.search_infos == handler.search_infos)
+            && let Some(cached_handler) = cached.remove(index)
         {
-            return Arc::clone(cached);
+            cached.push_back(Arc::clone(&cached_handler));
+            tracing::trace!(
+                cache_hit = true,
+                cached_inventory_count = cached.len(),
+                "tool search handler cache resolved after concurrent build"
+            );
+            return cached_handler;
         }
 
-        *cached = Some(Arc::clone(&handler));
+        cached.push_back(Arc::clone(&handler));
+        let mut evicted_inventory_count = 0usize;
+        while cached.len() > MAX_TOOL_SEARCH_HANDLER_CACHE {
+            cached.pop_front();
+            evicted_inventory_count += 1;
+        }
+        tracing::trace!(
+            cache_hit = false,
+            cached_inventory_count = cached.len(),
+            evicted_inventory_count,
+            "tool search handler cache resolved"
+        );
         handler
     }
 
-    fn cached(&self) -> std::sync::MutexGuard<'_, Option<Arc<ToolSearchHandler>>> {
+    fn cached(&self) -> std::sync::MutexGuard<'_, VecDeque<Arc<ToolSearchHandler>>> {
         match self.cached.lock() {
             Ok(cached) => cached,
             Err(poisoned) => poisoned.into_inner(),
@@ -90,6 +136,7 @@ impl ToolSearchHandler {
             search_infos,
             spec,
             search_engine,
+            result_cache: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -128,7 +175,7 @@ impl ToolSearchHandler {
             }
         };
 
-        let query = args.query.trim();
+        let query = normalize_tool_search_query(&args.query);
         if query.is_empty() {
             return Err(FunctionCallError::RespondToModel(
                 "query must not be empty".to_string(),
@@ -146,7 +193,7 @@ impl ToolSearchHandler {
             return Ok(boxed_tool_output(ToolSearchOutput { tools: Vec::new() }));
         }
 
-        let tools = self.search(query, limit)?;
+        let tools = self.search(&query, limit)?;
 
         Ok(boxed_tool_output(ToolSearchOutput { tools }))
     }
@@ -160,14 +207,60 @@ impl ToolSearchHandler {
         query: &str,
         limit: usize,
     ) -> Result<Vec<LoadableToolSpec>, FunctionCallError> {
-        let results = self
+        let key = ToolSearchQueryKey {
+            query: normalize_tool_search_query(query),
+            limit,
+        };
+        if let Some(tools) = self.cached_search_result(&key) {
+            tracing::trace!(
+                normalized_query_bytes = key.query.len(),
+                effective_limit = limit,
+                cache_hit = true,
+                output_tool_count = tools.len(),
+                output_source_count = loadable_tool_spec_diversity_count(&tools),
+                "tool search completed"
+            );
+            return Ok(tools);
+        }
+
+        let candidate_limit = tool_search_candidate_limit(limit, self.search_infos.len());
+        let mut ranked_results = self
             .search_engine
-            .search(query, limit)
+            .search(&key.query, self.search_infos.len());
+        ranked_results.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.document.id.cmp(&right.document.id))
+        });
+        let candidates = ranked_results
             .into_iter()
+            .take(candidate_limit)
             .map(|result| result.document.id)
             .filter_map(|id| self.search_infos.get(id))
-            .map(|search_info| &search_info.entry);
-        self.search_output_tools(results)
+            .collect::<Vec<_>>();
+        let candidate_count = candidates.len();
+        let candidate_source_count = tool_search_info_diversity_count(candidates.iter().copied());
+        let results = diversify_search_results(candidates, limit);
+        let result_count = results.len();
+        let result_source_count = tool_search_info_diversity_count(results.iter().copied());
+        let tools =
+            self.search_output_tools(results.iter().map(|search_info| &search_info.entry))?;
+        tracing::trace!(
+            normalized_query_bytes = key.query.len(),
+            effective_limit = limit,
+            cache_hit = false,
+            candidate_limit,
+            candidate_count,
+            candidate_source_count,
+            result_count,
+            result_source_count,
+            output_tool_count = tools.len(),
+            output_source_count = loadable_tool_spec_diversity_count(&tools),
+            "tool search completed"
+        );
+        self.cache_search_result(key, tools.clone());
+        Ok(tools)
     }
 
     fn search_output_tools<'a>(
@@ -177,6 +270,131 @@ impl ToolSearchHandler {
         Ok(coalesce_loadable_tool_specs(
             results.into_iter().map(|entry| entry.output.clone()),
         ))
+    }
+
+    fn cached_search_result(&self, key: &ToolSearchQueryKey) -> Option<Vec<LoadableToolSpec>> {
+        let mut cache = self.result_cache();
+        let index = cache.iter().position(|entry| &entry.key == key)?;
+        let entry = cache.remove(index)?;
+        let tools = entry.tools.clone();
+        cache.push_back(entry);
+        Some(tools)
+    }
+
+    fn cache_search_result(&self, key: ToolSearchQueryKey, tools: Vec<LoadableToolSpec>) {
+        let mut cache = self.result_cache();
+        if let Some(index) = cache.iter().position(|entry| entry.key == key) {
+            cache.remove(index);
+        }
+        cache.push_back(ToolSearchCacheEntry { key, tools });
+        while cache.len() > MAX_TOOL_SEARCH_RESULT_CACHE {
+            cache.pop_front();
+        }
+    }
+
+    fn result_cache(&self) -> std::sync::MutexGuard<'_, VecDeque<ToolSearchCacheEntry>> {
+        match self.result_cache.lock() {
+            Ok(cache) => cache,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    #[cfg(test)]
+    fn result_cache_len(&self) -> usize {
+        self.result_cache().len()
+    }
+}
+
+fn normalize_tool_search_query(query: &str) -> String {
+    query
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn tool_search_candidate_limit(effective_limit: usize, inventory_size: usize) -> usize {
+    effective_limit
+        .saturating_mul(TOOL_SEARCH_CANDIDATE_MULTIPLIER)
+        .min(inventory_size)
+}
+
+fn diversify_search_results(results: Vec<&ToolSearchInfo>, limit: usize) -> Vec<&ToolSearchInfo> {
+    if results.len() <= limit {
+        return results;
+    }
+
+    let mut remaining = results;
+    let mut diversified = Vec::with_capacity(limit);
+    let mut seen_this_pass = HashSet::new();
+
+    while !remaining.is_empty() && diversified.len() < limit {
+        let mut deferred = Vec::new();
+        let mut added_this_pass = false;
+
+        for result in remaining {
+            if diversified.len() >= limit {
+                break;
+            }
+            if seen_this_pass.insert(tool_search_info_diversity_key(result)) {
+                diversified.push(result);
+                added_this_pass = true;
+            } else {
+                deferred.push(result);
+            }
+        }
+
+        if !added_this_pass {
+            diversified.extend(deferred.into_iter().take(limit - diversified.len()));
+            break;
+        }
+
+        remaining = deferred;
+        seen_this_pass.clear();
+    }
+
+    diversified
+}
+
+fn tool_search_info_diversity_count<'a>(
+    results: impl IntoIterator<Item = &'a ToolSearchInfo>,
+) -> usize {
+    results
+        .into_iter()
+        .map(tool_search_info_diversity_key)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ToolSearchDiversityKey<'a> {
+    Source(&'a str),
+    Function(&'a str),
+    Namespace(&'a str),
+}
+
+fn tool_search_info_diversity_key(search_info: &ToolSearchInfo) -> ToolSearchDiversityKey<'_> {
+    search_info
+        .source_info
+        .as_ref()
+        .map(|source| ToolSearchDiversityKey::Source(source.name.as_str()))
+        .unwrap_or_else(|| loadable_tool_spec_diversity_key(&search_info.entry.output))
+}
+
+fn loadable_tool_spec_diversity_count(specs: &[LoadableToolSpec]) -> usize {
+    specs
+        .iter()
+        .map(loadable_tool_spec_diversity_key)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+fn loadable_tool_spec_diversity_key(spec: &LoadableToolSpec) -> ToolSearchDiversityKey<'_> {
+    match spec {
+        LoadableToolSpec::Function(tool) => ToolSearchDiversityKey::Function(tool.name.as_str()),
+        LoadableToolSpec::Namespace(namespace) => {
+            ToolSearchDiversityKey::Namespace(namespace.name.as_str())
+        }
     }
 }
 
@@ -191,6 +409,8 @@ mod tests {
     use codex_tools::ResponsesApiNamespace;
     use codex_tools::ResponsesApiNamespaceTool;
     use codex_tools::ResponsesApiTool;
+    use codex_tools::ToolSearchEntry;
+    use codex_tools::ToolSearchSourceInfo;
     use pretty_assertions::assert_eq;
     use rmcp::model::Tool;
     use std::sync::Arc;
@@ -209,13 +429,137 @@ mod tests {
         let second = cache.get_or_build(search_infos.clone());
         assert!(Arc::ptr_eq(&first, &second));
 
-        let mut changed_search_infos = search_infos;
+        let mut changed_search_infos = search_infos.clone();
         changed_search_infos[0]
             .entry
             .search_text
             .push_str(" changed");
         let changed = cache.get_or_build(changed_search_infos);
         assert!(!Arc::ptr_eq(&first, &changed));
+
+        let mut changed_source_infos = search_infos.clone();
+        changed_source_infos[0]
+            .source_info
+            .as_mut()
+            .expect("MCP search info should include source metadata")
+            .name
+            .push_str(" changed");
+        let changed_source = cache.get_or_build(changed_source_infos);
+        assert!(!Arc::ptr_eq(&first, &changed_source));
+
+        let mut changed_output_infos = search_infos;
+        match &mut changed_output_infos[0].entry.output {
+            LoadableToolSpec::Function(tool) => tool.description.push_str(" changed"),
+            LoadableToolSpec::Namespace(namespace) => namespace.description.push_str(" changed"),
+        }
+        let changed_output = cache.get_or_build(changed_output_infos);
+        assert!(!Arc::ptr_eq(&first, &changed_output));
+    }
+
+    #[test]
+    fn cache_retains_four_inventory_entries_in_lru_order() {
+        let cache = ToolSearchHandlerCache::default();
+        let inventories = (0..5)
+            .map(|idx| {
+                vec![
+                    McpHandler::new(tool_info(
+                        "calendar",
+                        &format!("tool_{idx}"),
+                        "Calendar tool",
+                    ))
+                    .expect("MCP tool should convert")
+                    .search_info()
+                    .expect("MCP handler should return search info"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let handlers = inventories[..4]
+            .iter()
+            .cloned()
+            .map(|search_infos| cache.get_or_build(search_infos))
+            .collect::<Vec<_>>();
+
+        let refreshed_first = cache.get_or_build(inventories[0].clone());
+        assert!(Arc::ptr_eq(&handlers[0], &refreshed_first));
+
+        cache.get_or_build(inventories[4].clone());
+        let rebuilt_second = cache.get_or_build(inventories[1].clone());
+        assert!(!Arc::ptr_eq(&handlers[1], &rebuilt_second));
+
+        let retained_first = cache.get_or_build(inventories[0].clone());
+        assert!(Arc::ptr_eq(&handlers[0], &retained_first));
+        assert_eq!(cache.cached().len(), MAX_TOOL_SEARCH_HANDLER_CACHE);
+    }
+
+    #[test]
+    fn search_reuses_normalized_query_results_and_keys_by_limit() {
+        let search_infos = vec![
+            McpHandler::new(tool_info("calendar", "create_event", "Create events"))
+                .expect("MCP tool should convert")
+                .search_info()
+                .expect("MCP handler should return search info"),
+        ];
+        let handler = ToolSearchHandler::new(search_infos);
+
+        let first = handler
+            .search("  Calendar   Events  ", TOOL_SEARCH_DEFAULT_LIMIT)
+            .expect("search should succeed");
+        let second = handler
+            .search("calendar events", TOOL_SEARCH_DEFAULT_LIMIT)
+            .expect("normalized query cache should succeed");
+        let limited = handler
+            .search("calendar events", 1)
+            .expect("different limit should create a distinct cache entry");
+
+        assert_eq!(first, second);
+        assert_eq!(limited, first);
+        assert_eq!(handler.result_cache_len(), 2);
+    }
+
+    #[test]
+    fn search_result_cache_is_bounded_and_lru() {
+        let search_infos = vec![
+            McpHandler::new(tool_info("calendar", "create_event", "Create events"))
+                .expect("MCP tool should convert")
+                .search_info()
+                .expect("MCP handler should return search info"),
+        ];
+        let handler = ToolSearchHandler::new(search_infos);
+
+        for idx in 0..MAX_TOOL_SEARCH_RESULT_CACHE {
+            handler
+                .search(&format!("unmatched-query-{idx}"), TOOL_SEARCH_DEFAULT_LIMIT)
+                .expect("search should succeed");
+        }
+        handler
+            .search("unmatched-query-0", TOOL_SEARCH_DEFAULT_LIMIT)
+            .expect("cache hit should refresh the oldest entry");
+        handler
+            .search(
+                &format!("unmatched-query-{MAX_TOOL_SEARCH_RESULT_CACHE}"),
+                TOOL_SEARCH_DEFAULT_LIMIT,
+            )
+            .expect("search should evict the least recently used entry");
+
+        let cached = handler.result_cache();
+        assert_eq!(cached.len(), MAX_TOOL_SEARCH_RESULT_CACHE);
+        assert!(
+            cached
+                .iter()
+                .any(|entry| entry.key.query == "unmatched-query-0")
+        );
+        assert!(
+            !cached
+                .iter()
+                .any(|entry| entry.key.query == "unmatched-query-1")
+        );
+    }
+
+    #[test]
+    fn candidate_limit_overfetches_and_saturates_at_inventory_size() {
+        assert_eq!(tool_search_candidate_limit(3, 100), 9);
+        assert_eq!(tool_search_candidate_limit(10, 5), 5);
+        assert_eq!(tool_search_candidate_limit(usize::MAX, 7), 7);
     }
 
     #[test]
@@ -323,6 +667,114 @@ mod tests {
                 }),
             ],
         );
+    }
+
+    #[test]
+    fn diversify_search_results_round_robins_by_source() {
+        let calendar_create = search_info_with_source("calendar-create", "calendar", "create");
+        let calendar_list = search_info_with_source("calendar-list", "calendar", "list");
+        let calendar_delete = search_info_with_source("calendar-delete", "calendar", "delete");
+        let docs_search = search_info_with_source("docs-search", "docs", "search");
+        let calendar_update = search_info_with_source("calendar-update", "calendar", "update");
+
+        let results = vec![
+            &calendar_create,
+            &calendar_list,
+            &calendar_delete,
+            &docs_search,
+            &calendar_update,
+        ];
+        let diversified = diversify_search_results(results, 3);
+        let diversified_names = diversified
+            .iter()
+            .map(|search_info| search_info.entry.search_text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            diversified_names,
+            vec!["calendar-create", "docs-search", "calendar-list"],
+        );
+    }
+
+    #[test]
+    fn diversify_search_results_falls_back_to_namespace_identity() {
+        let alpha_first = search_info("alpha-first", None, "alpha", "first");
+        let alpha_second = search_info("alpha-second", None, "alpha", "second");
+        let beta_first = search_info("beta-first", None, "beta", "first");
+
+        let diversified =
+            diversify_search_results(vec![&alpha_first, &alpha_second, &beta_first], 2);
+        let diversified_names = diversified
+            .iter()
+            .map(|search_info| search_info.entry.search_text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(diversified_names, vec!["alpha-first", "beta-first"]);
+    }
+
+    #[test]
+    fn search_overfetches_then_returns_diverse_sources() {
+        let handler = ToolSearchHandler::new(vec![
+            search_info_with_source("shared capability", "alpha", "first"),
+            search_info_with_source("shared capability", "alpha", "second"),
+            search_info_with_source("shared capability", "alpha", "third"),
+            search_info_with_source("shared capability", "beta", "first"),
+            search_info_with_source("shared capability", "gamma", "first"),
+        ]);
+
+        let tools = handler
+            .search("shared capability", 3)
+            .expect("search should return diverse results");
+        let namespaces = tools
+            .iter()
+            .map(|tool| match tool {
+                LoadableToolSpec::Namespace(namespace) => namespace.name.as_str(),
+                LoadableToolSpec::Function(tool) => tool.name.as_str(),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(namespaces, vec!["mcp__alpha", "mcp__beta", "mcp__gamma"]);
+    }
+
+    fn search_info_with_source(
+        search_text: &str,
+        source_name: &str,
+        tool_name: &str,
+    ) -> ToolSearchInfo {
+        search_info(search_text, Some(source_name), source_name, tool_name)
+    }
+
+    fn search_info(
+        search_text: &str,
+        source_name: Option<&str>,
+        namespace_name: &str,
+        tool_name: &str,
+    ) -> ToolSearchInfo {
+        ToolSearchInfo {
+            entry: ToolSearchEntry {
+                search_text: search_text.to_string(),
+                output: LoadableToolSpec::Namespace(ResponsesApiNamespace {
+                    name: format!("mcp__{namespace_name}"),
+                    description: format!("Tools in the {namespace_name} namespace."),
+                    tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                        name: tool_name.to_string(),
+                        description: format!("{tool_name} tool"),
+                        strict: false,
+                        defer_loading: Some(true),
+                        parameters: codex_tools::JsonSchema::object(
+                            Default::default(),
+                            /*required*/ None,
+                            Some(false.into()),
+                        ),
+                        output_schema: None,
+                    })],
+                }),
+            },
+            source_info: source_name.map(|source_name| ToolSearchSourceInfo {
+                name: source_name.to_string(),
+                description: None,
+            }),
+        }
     }
 
     fn tool_info(server_name: &str, tool_name: &str, description_prefix: &str) -> ToolInfo {

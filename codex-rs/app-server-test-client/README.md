@@ -119,7 +119,8 @@ cargo run -p codex-app-server-test-client -- watch
 
 ## Testing Thread Rejoin Behavior
 
-Build and start an app server using commands above. The app-server log is written to `/tmp/codex-app-server-test-client/app-server.log`
+Build and start an app server using commands above. The app-server log is written under the
+platform's temporary directory at `codex-app-server-test-client/app-server.log`.
 
 ### 1) Get a thread id
 

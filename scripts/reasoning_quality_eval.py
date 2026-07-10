@@ -156,9 +156,7 @@ def is_tool_call(node: dict[str, Any]) -> bool:
     node_type = str(node.get("type", "")).lower()
     if node_type in {"function_call", "custom_tool_call", "local_shell_call"}:
         return True
-    return {"name", "arguments"}.issubset(node) or {"command", "call_id"}.issubset(
-        node
-    )
+    return {"name", "arguments"}.issubset(node) or {"command", "call_id"}.issubset(node)
 
 
 def is_tool_output(node: dict[str, Any]) -> bool:
@@ -336,6 +334,12 @@ def looks_like_validation(command: str) -> bool:
             "python -m unittest",
             "unittest",
             "ruff check",
+            "git diff --check",
+            "bash -n",
+            "node --check",
+            "py_compile",
+            "compileall",
+            "just --summary",
             "tsc ",
         ]
     )

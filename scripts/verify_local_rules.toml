@@ -165,17 +165,17 @@ validation_command = ["just", "tui-large-widget-check"]
 skip_owner_tests = true
 
 [[surface]]
-id = "source-discovery"
-owned_packages = ["codex-core", "codex-file-search"]
+id = "source-map"
+owned_packages = []
 paths = [
-  "codex-rs/core/src/tools/handlers/source.rs",
-  "codex-rs/core/src/tools/handlers/source_spec.rs",
-  "codex-rs/core/src/source_evidence.rs",
-  "codex-rs/file-search/src/source_search.rs",
-  "codex-rs/file-search/src/source_routes.rs",
-  "codex-rs/SOURCE_MAP.md",
+  "SOURCEMAP.md",
+  "AGENTS.md",
+  "codex-rs/AGENTS.md",
+  "scripts/AGENTS.md",
+  ".github/workflows/repo-checks.yml",
+  "codex-cli/scripts/build_npm_package.py",
 ]
-validation_command = ["just", "source-discovery-check"]
+validation_command = ["just", "source-map-check"]
 skip_owner_tests = true
 
 [[surface]]

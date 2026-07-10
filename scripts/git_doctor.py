@@ -143,9 +143,7 @@ def build_report(timeout: float) -> GitDoctorReport:
     untracked_cache = git_config("core.untrackedCache")
     unreadable_pytest_caches = unreadable_pytest_cache_dirs(Path(root))
     seconds, timed_out = timed_status(timeout)
-    recs = recommendations(
-        kind, fsmonitor, untracked_cache, unreadable_pytest_caches
-    )
+    recs = recommendations(kind, fsmonitor, untracked_cache, unreadable_pytest_caches)
     if timed_out:
         recs = (
             *recs,
@@ -172,8 +170,7 @@ def print_report(report: GitDoctorReport) -> None:
     print(f"- core.untrackedCache: {report.untracked_cache or '<unset>'}")
     if report.unreadable_pytest_caches:
         print(
-            "- unreadable pytest caches: "
-            + ", ".join(report.unreadable_pytest_caches)
+            "- unreadable pytest caches: " + ", ".join(report.unreadable_pytest_caches)
         )
     if report.status_timed_out:
         print("- status check: timed out")

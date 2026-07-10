@@ -28,6 +28,9 @@
 
 ## Implementation Completion Gate
 
+Use the authoritative status definitions in
+[`../workflow.md`](../workflow.md#incomplete-implementation-finish-gate).
+
 - [ ] Intended runtime path identified:
 - [ ] Changed code is reached from that path:
 - [ ] No new or task-relevant placeholder/stub markers in changed code or the
@@ -37,15 +40,7 @@
 - [ ] New public functions, types, config fields, commands, or workflow entries
       are wired into expected callers
 - [ ] Nearest sufficient validation ran, or skip/not-applicable reason recorded
-- [ ] Completion gate status recorded:
-      - `passed`: runtime path checked, wiring checked, placeholder/stub sweep
-        checked, nearest validation run or legitimately not applicable, and no
-        known unverified completion risk
-      - `partial`: some evidence is missing or validation was skipped for a
-        practical reason; summarize work but do not claim complete
-      - `blocked`: cannot reasonably finish or verify without user input,
-        missing environment, failing prerequisite, or unresolved
-        design/ownership issue
+- [ ] Completion gate status recorded: passed | partial | blocked
 - [ ] Final implementation answer includes completion gate status, wiring proof,
       validation run, and remaining unverified risk
 

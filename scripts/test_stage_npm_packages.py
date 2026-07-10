@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import tarfile
 import tempfile
@@ -91,7 +92,7 @@ class StageNpmPackagesTests(unittest.TestCase):
         )
         self.assertEqual(
             build.PACKAGE_TARGET_FILTERS["codex-linux-x64"],
-            {"x86_64-unknown-linux-musl"},
+            "x86_64-unknown-linux-musl",
         )
         self.assertEqual(
             build.PACKAGE_NATIVE_COMPONENTS["codex-linux-x64"],
@@ -118,6 +119,16 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertEqual(package_json["cpu"], ["x64"])
         self.assertEqual(package_json["files"], ["vendor"])
         self.assertNotIn("packageManager", package_json)
+
+    def test_codex_staging_copies_root_sourcemap_as_package_readme(self) -> None:
+        build = stage.load_build_module()
+
+        build.stage_sources(self.root, "1.2.3", "codex")
+
+        self.assertEqual(
+            (self.root / "README.md").read_text(encoding="utf-8"),
+            (build.REPO_ROOT / "SOURCEMAP.md").read_text(encoding="utf-8"),
+        )
 
     def test_codex_sdk_staging_injects_matching_cli_dependency(self) -> None:
         build = stage.load_build_module()
@@ -445,6 +456,20 @@ class StageNpmPackagesTests(unittest.TestCase):
                     self.root / "dest",
                 )
 
+    def test_extract_tar_data_rejects_legacy_archive_special_files(self) -> None:
+        archive_path = self.root / "fifo.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as archive:
+            member = tarfile.TarInfo("payload-fifo")
+            member.type = tarfile.FIFOTYPE
+            archive.addfile(member)
+
+        with self.assertRaisesRegex(RuntimeError, "archive special files require"):
+            with tarfile.open(archive_path, "r:gz") as archive:
+                stage.validate_tar_members_for_legacy_python(
+                    archive,
+                    self.root / "dest",
+                )
+
     def test_extract_tar_data_uses_legacy_fallback_when_filter_is_unavailable(
         self,
     ) -> None:
@@ -522,6 +547,54 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertEqual(dest.read_text(encoding="utf-8"), "payload")
         self.assertEqual(observed_output[0].parent, dest.parent)
         self.assertFalse(observed_output[0].exists())
+
+    def test_failed_binary_extract_preserves_existing_vendor_binary(self) -> None:
+        target = "x86_64-unknown-linux-musl"
+        component = stage.BinaryComponent("codex", "codex", "codex")
+        dest = self.root / "vendor" / target / "codex" / "codex"
+        dest.parent.mkdir(parents=True)
+        dest.write_bytes(b"existing")
+
+        with (
+            mock.patch.object(
+                stage,
+                "binary_archive_path",
+                return_value=self.root / "artifact.zst",
+            ),
+            mock.patch.object(
+                stage, "extract_zstd_archive", side_effect=RuntimeError("bad archive")
+            ),
+            self.assertRaisesRegex(RuntimeError, "bad archive"),
+        ):
+            stage.install_single_binary(
+                self.root / "artifacts",
+                self.root / "vendor",
+                target,
+                component,
+            )
+
+        self.assertEqual(dest.read_bytes(), b"existing")
+
+    def test_stale_lock_with_live_owner_is_not_removed(self) -> None:
+        lock_path = self.root / "cache" / ".artifact.lock"
+        lock_path.parent.mkdir()
+        lock_path.write_text("pid=123 thread=1\n", encoding="utf-8")
+        os.utime(lock_path, (0, 0))
+
+        with (
+            mock.patch.object(
+                stage.time, "time", return_value=stage.LOCK_STALE_SECONDS + 100
+            ),
+            mock.patch.object(stage, "process_is_running", return_value=True),
+            mock.patch.object(
+                stage.time, "sleep", side_effect=RuntimeError("stop waiting")
+            ),
+            self.assertRaisesRegex(RuntimeError, "stop waiting"),
+        ):
+            with stage.exclusive_file_lock(lock_path):
+                self.fail("lock should not have been acquired")
+
+        self.assertTrue(lock_path.exists())
 
     def test_stage_packages_returns_results_in_package_order(self) -> None:
         calls: list[tuple[str, bool]] = []

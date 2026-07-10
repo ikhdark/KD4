@@ -2929,6 +2929,39 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
 }
 
 #[test]
+fn core_windows_command_execution_uses_windows_display_quoting() {
+    let command_item = TurnItem::CommandExecution(CommandExecutionItem {
+        id: "exec-windows".to_string(),
+        process_id: None,
+        command: vec![
+            r"C:\Program Files\PowerShell\7\pwsh.exe".to_string(),
+            "-Command".to_string(),
+            "Write-Output \"hello world\"".to_string(),
+        ],
+        cwd: PathUri::from_abs_path(&test_path_buf("/tmp").abs()),
+        parsed_cmd: Vec::new(),
+        source: CoreExecCommandSource::Agent,
+        interaction_input: None,
+        status: CoreCommandExecutionStatus::InProgress,
+        stdout: None,
+        stderr: None,
+        aggregated_output: None,
+        exit_code: None,
+        duration: None,
+        formatted_output: None,
+    });
+
+    let ThreadItem::CommandExecution { command, .. } = ThreadItem::from(command_item) else {
+        panic!("expected command execution item");
+    };
+
+    assert_eq!(
+        command,
+        "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command \"Write-Output \\\"hello world\\\"\""
+    );
+}
+
+#[test]
 fn mcp_tool_call_app_context_serializes_connector_id() {
     let item = ThreadItem::McpToolCall {
         id: "mcp-1".to_string(),

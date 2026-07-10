@@ -39,6 +39,40 @@ class DevEnvironmentDoctorTest(unittest.TestCase):
                 )
                 self.assertEqual(dev_env_doctor.package_manager_pin(), "pnpm@4.5.6")
 
+    def test_version_checks_enforce_python_floor_and_exact_pnpm_pin(self) -> None:
+        self.assertEqual(dev_env_doctor.numeric_version("Python 3.11.9"), (3, 11, 9))
+        self.assertEqual(
+            dev_env_doctor.package_manager_version("pnpm@10.12.4"), "10.12.4"
+        )
+
+        with (
+            mock.patch.object(dev_env_doctor.shutil, "which", return_value="/tool"),
+            mock.patch.object(
+                dev_env_doctor, "run_version", return_value="Python 3.10.9"
+            ),
+        ):
+            check = dev_env_doctor.check_tool(
+                "python",
+                ["python", "--version"],
+                required=True,
+                guidance="upgrade",
+                min_version=(3, 11),
+            )
+        self.assertFalse(check.ok)
+
+        with (
+            mock.patch.object(dev_env_doctor.shutil, "which", return_value="/tool"),
+            mock.patch.object(dev_env_doctor, "run_version", return_value="10.12.3"),
+        ):
+            check = dev_env_doctor.check_tool(
+                "pnpm",
+                ["pnpm", "--version"],
+                required=True,
+                guidance="pin",
+                required_version="10.12.4",
+            )
+        self.assertFalse(check.ok)
+
 
 class GitDoctorTest(unittest.TestCase):
     def test_path_kind_detects_wsl_windows_mount(self) -> None:
@@ -102,6 +136,24 @@ class VscodeRuntimeProofTest(unittest.TestCase):
                 vscode_runtime_proof.desktop_target().replace("\\", "/"),
                 f"C:/tmp/local/{binary}",
             )
+
+    def test_extension_candidates_are_sorted_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir)
+            extension_root = home / ".vscode" / "extensions" / "openai.codex"
+            extension_root.mkdir(parents=True)
+            (extension_root / "codex.exe").write_bytes(b"")
+            nested = extension_root / "bin"
+            nested.mkdir()
+            (nested / "codex").write_bytes(b"")
+
+            with mock.patch.object(
+                vscode_runtime_proof.Path, "home", return_value=home
+            ):
+                matches = vscode_runtime_proof.extension_candidates(limit=1)
+
+        self.assertEqual(len(matches), 1)
+        self.assertTrue(matches[0].endswith("codex.exe"))
 
 
 class ConfigSchemaCheckTest(unittest.TestCase):
@@ -218,6 +270,8 @@ class WslPublishBridgeTest(unittest.TestCase):
             text,
             r'(?m)^\s*powershell\.exe\b.*-File "\$windows_script".*-RepoRoot "\$windows_repo_root"',
         )
+        self.assertIn("-SourceCodeModeHostExe", text)
+        self.assertIn('arg_lower="${arg,,}"', text)
 
 
 if __name__ == "__main__":

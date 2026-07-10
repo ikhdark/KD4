@@ -61,6 +61,20 @@ def node_major(version: str | None) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def numeric_version(version: str | None) -> tuple[int, ...] | None:
+    if version is None:
+        return None
+    match = re.search(r"(?<!\d)(\d+(?:\.\d+)+)", version)
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def package_manager_version(pin: str) -> str | None:
+    _name, separator, version = pin.rpartition("@")
+    return version if separator and version else None
+
+
 def check_tool(
     name: str,
     command: Sequence[str],
@@ -68,6 +82,8 @@ def check_tool(
     required: bool,
     guidance: str,
     min_node_major: int | None = None,
+    min_version: tuple[int, ...] | None = None,
+    required_version: str | None = None,
 ) -> ToolCheck:
     executable = shutil.which(command[0])
     version = run_version(command) if executable else None
@@ -75,6 +91,13 @@ def check_tool(
     if min_node_major is not None:
         major = node_major(version)
         ok = ok and major is not None and major >= min_node_major
+    if min_version is not None:
+        actual = numeric_version(version)
+        ok = ok and actual is not None and actual >= min_version
+    if required_version is not None:
+        actual = numeric_version(version)
+        expected = numeric_version(required_version)
+        ok = ok and actual is not None and expected is not None and actual == expected
     return ToolCheck(
         name=name,
         command=tuple(command),
@@ -94,6 +117,7 @@ def collect_checks() -> list[ToolCheck]:
             [sys.executable, "--version"],
             required=True,
             guidance="Install Python 3.11+ and rerun this script.",
+            min_version=(3, 11),
         ),
         check_tool(
             "git",
@@ -131,6 +155,7 @@ def collect_checks() -> list[ToolCheck]:
             ["pnpm", "--version"],
             required=True,
             guidance=f"Enable the pinned pnpm with `corepack enable` and `corepack prepare {pnpm_pin} --activate`.",
+            required_version=package_manager_version(pnpm_pin),
         ),
     ]
 

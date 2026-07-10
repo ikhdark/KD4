@@ -1,64 +1,34 @@
 # KD4 Harness
 
-This directory holds the KD4-local harness system for durable agent work. It is
-for planning, coordinating, implementing, checking, and finishing Codex tasks in
-this fork without changing product behavior by default.
+This is KD4's lightweight workflow layer for planning, implementing, checking,
+and resuming substantial work without changing product behavior by default.
+[`workflow.md`](workflow.md) owns the lifecycle and completion gate;
+[`context-modes.md`](context-modes.md) owns phase and compaction guidance.
 
-The harness combines useful patterns from the inspected local repositories:
+## Choose The Smallest Artifact Set
 
-- lightweight planning and checklist templates from the awesome harness
-  materials;
-- agent/team design patterns from the harness plugin materials;
-- durable task-state and workflow ideas inspired by Trellis.
+| Situation | Artifact |
+| --- | --- |
+| Focused task that fits in one turn | No durable artifact; follow the workflow in conversation |
+| Multi-step, risky, or resumable task | [`templates/PLAN.md`](templates/PLAN.md) |
+| Decisions or evidence must survive later turns | [`templates/IMPLEMENT.md`](templates/IMPLEMENT.md) |
+| Behavior needs explicit capability or regression criteria | [`templates/EVAL.md`](templates/EVAL.md) |
+| Broad or risky verification | [`templates/QA_CHECKLIST.md`](templates/QA_CHECKLIST.md) |
+| Harness reliability review | [`templates/HARNESS_AUDIT.md`](templates/HARNESS_AUDIT.md) |
+| Compaction, interruption, or task switch | [`templates/HANDOFF.md`](templates/HANDOFF.md) |
+| Explicitly requested multi-agent work | [`templates/ORCHESTRATOR.md`](templates/ORCHESTRATOR.md) |
 
-No Trellis implementation code is copied here. Keep this layer as KD4-local
-guidance unless the user explicitly asks for executable automation.
+[`templates/HARNESS_CHECKLIST.md`](templates/HARNESS_CHECKLIST.md) is the compact
+end-to-end checklist when a single task spans several of these concerns. Delete
+unused placeholder sections instead of filling artifacts for completeness.
 
-## Contents
+## Execution Rules
 
-- `workflow.md`: the standard KD4 harness lifecycle.
-- `context-modes.md`: lightweight phase modes and compaction guidance.
-- `templates/PLAN.md`: planning artifact for non-trivial work.
-- `templates/IMPLEMENT.md`: implementation log and decision record.
-- `templates/EVAL.md`: capability and regression eval artifact.
-- `templates/HARNESS_CHECKLIST.md`: completion and validation checklist.
-- `templates/HARNESS_AUDIT.md`: scorecard for harness reliability reviews.
-- `templates/HANDOFF.md`: resumable context before compaction or task switch.
-- `templates/ORCHESTRATOR.md`: optional multi-agent coordination template.
-- `templates/QA_CHECKLIST.md`: focused review and verification template.
-
-## How To Use
-
-Use the `.codex/skills/kd4-harness` skill when the user asks to create, update,
-or run a harnessed KD4 task, or when KD4 implementation work explicitly invokes
-Wiring Guard/KDWG, `wire-implementations`, or static wiring proof.
-
-For implementation, debugging, refactoring, integration, migration, or
-repo-behavior work, the harness must use
-`.codex/skills/kd4-crosscheck-and-finish/SKILL.md` as the execution discipline.
-The harness must also use Wiring Guard/KDWG as the static reachability proof
-layer when the plugin is active. The harness stores durable planning and
-evidence; it does not replace crosscheck-and-finish or Wiring Guard.
-
-For routine implementation work, the harness can stay lightweight:
-
-1. Classify the task lane using the root `AGENTS.md`.
-2. Apply `kd4-crosscheck-and-finish` for inspection, implementation, and finish
-   claims.
-3. Declare Wiring Guard/KDWG intent before implementation edits when the plugin
-   is active.
-4. Treat Wiring Guard/KDWG-triggered tasks as harnessed even when no run
-   directory is created.
-5. Inspect the owner files, nearest call path, relevant config, and nearest
-   tests before editing.
-6. Use the templates only when they reduce ambiguity or preserve useful state.
-7. Validate with the closest proof that exercises the touched behavior and the
-   Wiring Guard/KDWG check when applicable.
-8. Finish with evidence, remaining risk, and any desktop publish requirement.
-
-Use `context-modes.md` when a task shifts between research, planning,
-implementation, review, and finish phases. Use `HANDOFF.md` before compaction or
-when a task is likely to resume later.
+Choose the task lane from the root `AGENTS.md`. Apply
+[`kd4-crosscheck-and-finish`](../skills/kd4-crosscheck-and-finish/SKILL.md) for
+implementation and repository-behavior work. When Wiring Guard/KDWG is active,
+use it for static reachability proof and treat the task as harnessed in
+lightweight mode even when no run directory is created.
 
 ## Generated Task State
 

@@ -87,6 +87,16 @@ function Ensure-CodexRustSccacheServer {
 
         sccache --stop-server 2>$null | Out-Null
         sccache --start-server 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            return
+        }
+        $restartedStats = @(sccache --show-stats 2>$null)
+        if (
+            $LASTEXITCODE -ne 0 -or
+            -not (Test-CodexRustSccacheStatsCacheSize -Stats $restartedStats)
+        ) {
+            return
+        }
     }
     finally {
         $ErrorActionPreference = $oldErrorActionPreference
@@ -223,7 +233,12 @@ function Add-CargoWatchExecTargetDir {
         return $ExecCommand
     }
 
-    return "$ExecCommand --target-dir $(Format-CargoWatchExecTargetDir -TargetDir $TargetDir)"
+    $targetArgument = "--target-dir $(Format-CargoWatchExecTargetDir -TargetDir $TargetDir)"
+    $separatorIndex = $ExecCommand.IndexOf(" -- ", [StringComparison]::Ordinal)
+    if ($separatorIndex -ge 0) {
+        return $ExecCommand.Insert($separatorIndex, " $targetArgument")
+    }
+    return "$ExecCommand $targetArgument"
 }
 
 function Add-CargoWatchTargetDirArgument {

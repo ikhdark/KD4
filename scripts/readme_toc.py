@@ -72,13 +72,17 @@ def generate_toc_lines(lines: Iterable[str]) -> list[str]:
     Generate markdown list lines for headings (## to ######) in content.
     """
     toc: list[str] = []
-    in_code = False
+    code_fence: str | None = None
     used_slugs: dict[str, int] = {}
     for line in lines:
-        if CODE_FENCE_RE.match(line):
-            in_code = not in_code
+        if match := CODE_FENCE_RE.match(line):
+            marker = match.group(1)
+            if code_fence is None:
+                code_fence = marker
+            elif code_fence == marker:
+                code_fence = None
             continue
-        if in_code:
+        if code_fence is not None:
             continue
         m = HEADING_RE.match(line)
         if not m:
@@ -114,16 +118,20 @@ def parse_markdown_toc(lines: Sequence[str]) -> TocParseResult | None:
 
     for idx, line in enumerate(lines):
         stripped = line.strip()
-        if stripped == BEGIN_TOC and begin_idx == -1:
+        if stripped == BEGIN_TOC:
+            if begin_idx != -1:
+                raise ValueError("duplicate ToC begin marker")
             begin_idx = idx
             in_toc = True
             continue
-        if stripped == END_TOC and in_toc:
+        if stripped == END_TOC:
+            if not in_toc or end_idx != -1:
+                raise ValueError("unexpected ToC end marker")
             end_idx = idx
             in_toc = False
             continue
         if in_toc:
-            if line.lstrip().startswith("- ["):
+            if stripped:
                 current.append(line)
             continue
         heading_lines.append(line)

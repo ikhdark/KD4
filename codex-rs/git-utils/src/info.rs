@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -443,13 +444,77 @@ async fn run_git_command_with_timeout_from(
     cwd: &Path,
     fsmonitor: crate::FsmonitorOverride,
 ) -> Option<std::process::Output> {
+    let command_args = git_inspection_args(args, fsmonitor, None);
+    let output = run_git_command_attempt(git, &command_args, cwd).await?;
+    let Some(retry_args) = safe_directory_retry_args(
+        args,
+        cwd,
+        fsmonitor,
+        output.status.success(),
+        &output.stderr,
+    ) else {
+        return Some(output);
+    };
+
+    run_git_command_attempt(git, &retry_args, cwd).await
+}
+
+fn safe_directory_retry_args(
+    args: &[&str],
+    cwd: &Path,
+    fsmonitor: crate::FsmonitorOverride,
+    status_success: bool,
+    stderr: &[u8],
+) -> Option<Vec<OsString>> {
+    if !is_dubious_ownership_stderr(status_success, stderr) {
+        return None;
+    }
+    let repo_root = get_git_repo_root(cwd)?;
+    Some(git_inspection_args(
+        args,
+        fsmonitor,
+        Some(repo_root.as_path()),
+    ))
+}
+
+fn git_inspection_args(
+    args: &[&str],
+    fsmonitor: crate::FsmonitorOverride,
+    safe_directory: Option<&Path>,
+) -> Vec<OsString> {
+    let mut command_args = vec![
+        OsString::from("-c"),
+        OsString::from(format!("core.hooksPath={DISABLED_HOOKS_PATH}")),
+        OsString::from("-c"),
+        OsString::from(fsmonitor.git_config_arg()),
+    ];
+    if let Some(safe_directory) = safe_directory {
+        command_args.push(OsString::from("-c"));
+        command_args.push(OsString::from(format!(
+            "safe.directory={}",
+            safe_directory.to_string_lossy()
+        )));
+    }
+    command_args.extend(args.iter().map(OsString::from));
+    command_args
+}
+
+fn is_dubious_ownership_stderr(status_success: bool, stderr: &[u8]) -> bool {
+    if status_success {
+        return false;
+    }
+    let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    stderr.contains("detected dubious ownership") && stderr.contains("safe.directory")
+}
+
+async fn run_git_command_attempt(
+    git: &Path,
+    args: &[OsString],
+    cwd: &Path,
+) -> Option<std::process::Output> {
     let mut command = Command::new(git);
     command
         .env("GIT_OPTIONAL_LOCKS", "0")
-        // Keep internal Git commands independent of repository-selected hooks
-        // and fsmonitor helpers while preserving built-in fsmonitor acceleration.
-        .args(["-c", &format!("core.hooksPath={DISABLED_HOOKS_PATH}")])
-        .args(["-c", fsmonitor.git_config_arg()])
         .args(args)
         .current_dir(cwd)
         .kill_on_drop(true);
@@ -946,6 +1011,119 @@ mod tests {
         for remote in ["", "file:///tmp/repo", "github.com/openai", "/tmp/repo"] {
             assert_eq!(canonicalize_git_remote_url(remote), None);
         }
+    }
+
+    #[test]
+    fn dubious_ownership_detection_matches_git_safe_directory_error() {
+        let stderr = b"fatal: detected dubious ownership in repository at 'C:/repo'\n\
+            To add an exception for this directory, call:\n\n\
+            \tgit config --global --add safe.directory C:/repo\n";
+
+        assert!(is_dubious_ownership_stderr(false, stderr));
+        assert!(!is_dubious_ownership_stderr(true, stderr));
+        assert!(!is_dubious_ownership_stderr(
+            false,
+            b"fatal: not a git repository"
+        ));
+    }
+
+    #[test]
+    fn safe_directory_retry_args_are_per_command_and_preserve_hardening() {
+        let repo = tempfile::tempdir().expect("create temp repo root");
+        let disabled_hooks = format!("core.hooksPath={DISABLED_HOOKS_PATH}");
+        let safe_directory = format!("safe.directory={}", repo.path().to_string_lossy());
+
+        let initial = git_inspection_args(
+            &["status", "--porcelain"],
+            crate::FsmonitorOverride::Disabled,
+            None,
+        )
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            initial,
+            vec![
+                "-c",
+                disabled_hooks.as_str(),
+                "-c",
+                "core.fsmonitor=false",
+                "status",
+                "--porcelain",
+            ]
+        );
+
+        let retry = git_inspection_args(
+            &["status", "--porcelain"],
+            crate::FsmonitorOverride::Disabled,
+            Some(repo.path()),
+        )
+        .into_iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        assert_eq!(
+            retry,
+            vec![
+                "-c",
+                disabled_hooks.as_str(),
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                safe_directory.as_str(),
+                "status",
+                "--porcelain",
+            ]
+        );
+    }
+
+    #[test]
+    fn safe_directory_retry_is_limited_to_dubious_ownership_inside_repo() {
+        let repo = tempfile::tempdir().expect("create temp repo root");
+        std::fs::create_dir(repo.path().join(".git")).expect("create git marker");
+        let subdir = repo.path().join("nested");
+        std::fs::create_dir(&subdir).expect("create nested directory");
+        let stderr = b"fatal: detected dubious ownership in repository at 'C:/repo'\n\
+            To add an exception for this directory, call:\n\n\
+            \tgit config --global --add safe.directory C:/repo\n";
+
+        let retry = safe_directory_retry_args(
+            &["rev-parse", "HEAD"],
+            &subdir,
+            crate::FsmonitorOverride::Disabled,
+            false,
+            stderr,
+        )
+        .expect("dubious ownership inside a repo should retry");
+        let expected_safe_directory = format!("safe.directory={}", repo.path().to_string_lossy());
+        assert!(
+            retry
+                .into_iter()
+                .any(|arg| arg.to_string_lossy() == expected_safe_directory)
+        );
+
+        let outside = tempfile::tempdir().expect("create non-repo temp dir");
+        assert!(
+            safe_directory_retry_args(
+                &["rev-parse", "HEAD"],
+                outside.path(),
+                crate::FsmonitorOverride::Disabled,
+                false,
+                stderr,
+            )
+            .is_none(),
+            "do not add safe.directory when no repo root is discovered"
+        );
+        assert!(
+            safe_directory_retry_args(
+                &["rev-parse", "HEAD"],
+                &subdir,
+                crate::FsmonitorOverride::Disabled,
+                false,
+                b"fatal: not a git repository",
+            )
+            .is_none(),
+            "do not retry unrelated git failures"
+        );
     }
 
     #[tokio::test]

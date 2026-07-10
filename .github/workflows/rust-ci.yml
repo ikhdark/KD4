@@ -73,10 +73,10 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
-        with:
-          components: rustfmt
+      - name: Install pinned nightly rustfmt
+        run: rustup toolchain install nightly-2025-09-18 --profile minimal --component rustfmt --no-self-update
       - name: cargo fmt
-        run: cargo fmt -- --config imports_granularity=Item --check
+        run: cargo +nightly-2025-09-18 fmt -- --config imports_granularity=Item --check
       - name: Rust benchmark smoke test
         run: just bench-smoke
 

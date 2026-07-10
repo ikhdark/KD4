@@ -33,6 +33,8 @@ TOOL_RUN_TIMEOUT_SECONDS = 2.0
 # and every recipe line paid the full stall.
 SCCACHE_PROBE_TIMEOUT_SECONDS = 15.0
 CARGO_GIT_CLI_ENV_VAR = "CARGO_NET_GIT_FETCH_WITH_CLI"
+PYTHON_CPU_COUNT_ENV_VAR = "PYTHON_CPU_COUNT"
+DEFAULT_PYTHON_CPU_COUNT = "16"
 # One shared local default with codex_package/cargo.py and common-rust-env.ps1;
 # override everywhere with CODEX_SCCACHE_CACHE_SIZE.
 SCCACHE_CACHE_SIZE_ENV_VAR = "CODEX_SCCACHE_CACHE_SIZE"
@@ -55,6 +57,7 @@ def main() -> int:
     recipe_args = sys.argv[3:]
     repo_root = Path(__file__).resolve().parents[1]
     cache_dir = probe_cache_dir(repo_root)
+    os.environ.update(python_cpu_env(os.environ))
     python_updates = python_tool_env(
         os.environ,
         os_name=os.name,
@@ -261,18 +264,42 @@ def ensure_sccache_server_env(
         write_cached_tool_run(cache_key, cache_dir, True)
         return False
 
-    for args in (["--stop-server"], ["--start-server"]):
-        try:
-            run(
-                [sccache, *args],
-                env=dict(env),
-                text=True,
-                capture_output=True,
-                timeout=SCCACHE_PROBE_TIMEOUT_SECONDS,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+    try:
+        # Stopping a server that disappeared between the stats probe and this
+        # call is harmless. Starting and then observing the requested size are
+        # the operations that prove the restart actually succeeded.
+        run(
+            [sccache, "--stop-server"],
+            env=dict(env),
+            text=True,
+            capture_output=True,
+            timeout=SCCACHE_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+        started = run(
+            [sccache, "--start-server"],
+            env=dict(env),
+            text=True,
+            capture_output=True,
+            timeout=SCCACHE_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+        if started.returncode != 0:
             return False
+        verified = run(
+            [sccache, "--show-stats"],
+            env=dict(env),
+            text=True,
+            capture_output=True,
+            timeout=SCCACHE_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if verified.returncode != 0 or sccache_stats_max_cache_size(
+        verified.stdout
+    ) != expected_sccache_stats_cache_size(cache_size):
+        return False
     write_cached_tool_run(cache_key, cache_dir, True)
     return True
 
@@ -331,7 +358,7 @@ def python_tool_env(
     venv = repo_root / "scripts" / ".venv"
     bin_dir = venv / ("Scripts" if os_name == "nt" else "bin")
     python_exe = bin_dir / ("python.exe" if os_name == "nt" else "python")
-    if not python_exe.exists():
+    if not python_exe.is_file():
         if (repo_root / "scripts" / "uv.lock").exists():
             warn_once(
                 "scripts-venv-missing",
@@ -347,6 +374,12 @@ def python_tool_env(
         "VIRTUAL_ENV": str(venv),
         "VIRTUAL_ENV_DISABLE_PROMPT": "1",
     }
+
+
+def python_cpu_env(env: Mapping[str, str]) -> dict[str, str]:
+    if is_ci(env) or env.get(PYTHON_CPU_COUNT_ENV_VAR):
+        return {}
+    return {PYTHON_CPU_COUNT_ENV_VAR: DEFAULT_PYTHON_CPU_COUNT}
 
 
 def prepend_path(path: str, entry: str) -> str:
@@ -557,18 +590,22 @@ def run_powershell(
     command = render_command(
         command, args=POWERSHELL_ARGS, stderr_null=POWERSHELL_STDERR_NULL
     )
-    return subprocess.run(
-        [
-            pwsh,
-            "-NoLogo",
-            "-NoProfile",
-            "-CommandWithArgs",
-            command,
-            recipe_name,
-            *recipe_args,
-        ],
-        check=False,
-    ).returncode
+    try:
+        return subprocess.run(
+            [
+                pwsh,
+                "-NoLogo",
+                "-NoProfile",
+                "-CommandWithArgs",
+                command,
+                recipe_name,
+                *recipe_args,
+            ],
+            check=False,
+        ).returncode
+    except OSError as exc:
+        print(f"Failed to launch PowerShell ('pwsh'): {exc}", file=stderr)
+        return 1
 
 
 def powershell_supports_command_with_args(

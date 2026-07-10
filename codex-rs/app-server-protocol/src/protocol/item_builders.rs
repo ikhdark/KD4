@@ -81,7 +81,7 @@ pub fn build_command_execution_approval_request_item(
 ) -> ThreadItem {
     ThreadItem::CommandExecution {
         id: payload.call_id.clone(),
-        command: shlex_join(&payload.command),
+        command: command_display_string(&payload.command),
         cwd: payload.cwd.clone().into(),
         process_id: None,
         source: CommandExecutionSource::Agent,
@@ -102,7 +102,7 @@ pub fn build_command_execution_begin_item(payload: &ExecCommandBeginEvent) -> Th
     let command_actions = command_actions_for_path_uri(&payload.parsed_cmd, &payload.cwd);
     ThreadItem::CommandExecution {
         id: payload.call_id.clone(),
-        command: shlex_join(&payload.command),
+        command: command_display_string(&payload.command),
         cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
         source: payload.source.into(),
@@ -125,7 +125,7 @@ pub fn build_command_execution_end_item(payload: &ExecCommandEndEvent) -> Thread
 
     ThreadItem::CommandExecution {
         id: payload.call_id.clone(),
-        command: shlex_join(&payload.command),
+        command: command_display_string(&payload.command),
         cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
         source: payload.source.into(),
@@ -135,6 +135,75 @@ pub fn build_command_execution_end_item(payload: &ExecCommandEndEvent) -> Thread
         exit_code: Some(payload.exit_code),
         duration_ms: Some(duration_ms),
     }
+}
+
+/// Format argv for app-server command presentation without changing execution semantics.
+///
+/// Commands whose executable is an absolute Windows path use Windows argv quoting so
+/// backslashes remain readable and arguments still round-trip through the CRT parsing rules.
+/// Other commands keep the existing POSIX-style display, including its NUL-byte placeholder.
+pub fn command_display_string(command: &[String]) -> String {
+    if command.iter().any(|arg| arg.contains('\0')) {
+        return shlex_join(command);
+    }
+
+    if command
+        .first()
+        .is_some_and(|program| looks_like_windows_absolute_path(program))
+    {
+        command
+            .iter()
+            .map(|arg| quote_windows_display_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        shlex_join(command)
+    }
+}
+
+fn looks_like_windows_absolute_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    matches!(
+        bytes,
+        [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()
+    ) || value.starts_with(r"\\")
+}
+
+/// Quote one display argument using the rules followed by CommandLineToArgvW/the CRT.
+fn quote_windows_display_arg(arg: &str) -> String {
+    let needs_quotes = arg.is_empty()
+        || arg
+            .chars()
+            .any(|ch| matches!(ch, ' ' | '\t' | '\n' | '\r' | '"'));
+    if !needs_quotes {
+        return arg.to_string();
+    }
+
+    let mut quoted = String::with_capacity(arg.len() + 2);
+    quoted.push('"');
+    let mut backslashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                if backslashes > 0 {
+                    quoted.push_str(&"\\".repeat(backslashes));
+                    backslashes = 0;
+                }
+                quoted.push(ch);
+            }
+        }
+    }
+    if backslashes > 0 {
+        quoted.push_str(&"\\".repeat(backslashes * 2));
+    }
+    quoted.push('"');
+    quoted
 }
 
 pub(crate) fn command_actions_for_path_uri(
@@ -220,7 +289,7 @@ pub fn build_item_from_guardian_event(
                     .chain(argv.iter().skip(1).cloned())
                     .collect::<Vec<_>>()
             };
-            let command = shlex_join(&argv);
+            let command = command_display_string(&argv);
             let parsed_cmd = parse_command(&argv);
             let command_actions = if parsed_cmd.is_empty() {
                 vec![CommandAction::Unknown {

@@ -10,6 +10,7 @@ from typing import Any
 try:
     import websockets
 except ModuleNotFoundError:
+
     class _MissingWebsockets:
         @staticmethod
         async def serve(*_args: Any, **_kwargs: Any) -> None:
@@ -175,10 +176,15 @@ async def _recv_json(
         )
         await websocket.close(code=1009, reason="message too large")
         raise _ConnectionAbort
-    if isinstance(msg, bytes):
-        payload = json.loads(msg.decode("utf-8"))
-    else:
-        payload = json.loads(msg)
+    try:
+        if isinstance(msg, bytes):
+            payload = json.loads(msg.decode("utf-8"))
+        else:
+            payload = json.loads(msg)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        _log_conn("rejecting invalid JSON message", quiet=quiet)
+        await websocket.close(code=1007, reason="invalid JSON")
+        raise _ConnectionAbort from None
     _print_request(f"[{label}] recv", payload, quiet=quiet, log_json=log_json)
     return payload
 
@@ -264,6 +270,8 @@ async def _serve(
     max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
     max_sessions: int | None = None,
 ) -> int:
+    if not 0 <= port <= 65535:
+        raise ValueError("port must be between 0 and 65535")
     if max_sessions is not None and max_sessions < 1:
         raise ValueError("max_sessions must be >= 1")
 
@@ -324,6 +332,13 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _port(value: str) -> int:
+    parsed = int(value)
+    if not 0 <= parsed <= 65535:
+        raise argparse.ArgumentTypeError("must be between 0 and 65535")
+    return parsed
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -334,7 +349,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--port",
-        type=int,
+        type=_port,
         default=DEFAULT_PORT,
         help=f"Bind port (default: {DEFAULT_PORT}; use 0 for random free port).",
     )

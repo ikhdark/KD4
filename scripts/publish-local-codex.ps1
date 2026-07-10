@@ -12,6 +12,7 @@ param(
     [switch]$PrintBuiltCodexPath,
     [string]$RepoRoot,
     [string]$SourceExe,
+    [string]$SourceCodeModeHostExe,
     [string]$InstallDir = $env:CODEX_LOCAL_PUBLISH_DIR,
     [string]$BackupDir,
     [switch]$RunDoctor,
@@ -121,6 +122,16 @@ function Get-BuiltCodexPath {
 
     $profileDir = if ($Profile -eq "debug") { "debug" } else { $Profile }
     return Join-Path $RepoRoot "codex-rs\target\publish-$Profile\$profileDir\codex.exe"
+}
+
+function Get-BuiltCodeModeHostPath {
+    param(
+        [string]$RepoRoot,
+        [string]$Profile
+    )
+
+    $profileDir = if ($Profile -eq "debug") { "debug" } else { $Profile }
+    return Join-Path $RepoRoot "codex-rs\target\publish-$Profile\$profileDir\codex-code-mode-host.exe"
 }
 
 function Get-FileLastWriteUtc {
@@ -608,9 +619,10 @@ function Get-RunningCodexTargetProcesses {
     )
 
     $targetFullPath = [System.IO.Path]::GetFullPath($TargetPath)
+    $processName = [System.IO.Path]::GetFileNameWithoutExtension($targetFullPath)
     try {
         return @(
-            Get-Process -Name codex -ErrorAction SilentlyContinue |
+            Get-Process -Name $processName -ErrorAction SilentlyContinue |
                 Where-Object {
                     -not [string]::IsNullOrWhiteSpace($_.Path) -and
                     [string]::Equals(
@@ -1537,7 +1549,7 @@ function Assert-RustyV8ArchiveChecksum {
         return
     }
 
-    $actualChecksum = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $actualChecksum = Get-FileSha256 -Path $Path
     Write-ProofLine "v8ArchiveChecksum" $actualChecksum
     if ($actualChecksum -ne $ExpectedChecksum) {
         Write-ProofLine "v8ArchiveChecksumStatus" "mismatch"
@@ -1712,8 +1724,9 @@ function Invoke-CodexBuild {
             $cargoConfigArgs = @("--config", $noSccacheCargoConfigPath)
         }
     }
-    $buildArgs = $cargoConfigArgs + @("build", "-p", "codex-cli", "--profile", $cargoProfile)
-    $checkArgs = $cargoConfigArgs + @("check", "-p", "codex-cli", "--profile", $cargoProfile)
+    $publishPackages = @("-p", "codex-cli", "-p", "codex-code-mode-host")
+    $buildArgs = $cargoConfigArgs + @("build") + $publishPackages + @("--profile", $cargoProfile)
+    $checkArgs = $cargoConfigArgs + @("check") + $publishPackages + @("--profile", $cargoProfile)
     $runPreflightCheck = $DryRun -and -not $SkipPreflightCheck -and $Profile -ne "debug"
 
     $codexRs = Join-Path $RepoRoot "codex-rs"
@@ -1814,8 +1827,22 @@ function Restore-CodexBinaryPublish {
     param(
         [string]$TargetPath,
         [string]$BackupPath,
-        [bool]$HadPreviousTarget
+        [bool]$HadPreviousTarget,
+        [string]$ProofPrefix = ""
     )
+
+    $rollbackResultKey = if ([string]::IsNullOrWhiteSpace($ProofPrefix)) {
+        "rollbackResult"
+    }
+    else {
+        "${ProofPrefix}RollbackResult"
+    }
+    $targetSha256AfterRollbackKey = if ([string]::IsNullOrWhiteSpace($ProofPrefix)) {
+        "targetSha256AfterRollback"
+    }
+    else {
+        "${ProofPrefix}TargetSha256AfterRollback"
+    }
 
     if ($HadPreviousTarget) {
         if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
@@ -1823,20 +1850,21 @@ function Restore-CodexBinaryPublish {
         }
 
         [IO.File]::Copy($BackupPath, $TargetPath, $true)
-        Write-ProofLine "rollbackResult" "restored backup"
-        Write-ProofLine "targetSha256AfterRollback" (Get-FileSha256 $TargetPath)
+        Write-ProofLine $rollbackResultKey "restored backup"
+        Write-ProofLine $targetSha256AfterRollbackKey (Get-FileSha256 $TargetPath)
         return
     }
 
     if (Test-Path -LiteralPath $TargetPath -PathType Leaf) {
         Remove-Item -LiteralPath $TargetPath -Force
     }
-    Write-ProofLine "rollbackResult" "removed newly published target"
+    Write-ProofLine $rollbackResultKey "removed newly published target"
 }
 
 function Remove-OldCodexBackups {
     param(
         [string]$BackupDir,
+        [string]$ArtifactName = "codex",
         [int]$Keep = 10,
         [AllowNull()]
         [string]$ProtectedPath
@@ -1846,7 +1874,10 @@ function Remove-OldCodexBackups {
         return
     }
 
-    $protectedFullPath = if ([string]::IsNullOrWhiteSpace($ProtectedPath)) {
+    $protectedFullPath = if (
+        [string]::IsNullOrWhiteSpace($ProtectedPath) -or
+        -not (Test-Path -LiteralPath $ProtectedPath -PathType Leaf)
+    ) {
         $null
     }
     else {
@@ -1859,13 +1890,17 @@ function Remove-OldCodexBackups {
         [Math]::Max(0, $Keep - 1)
     }
 
-    $backups = @(Get-ChildItem -LiteralPath $BackupDir -Filter "codex-*.exe" -File |
+    $backupNamePattern = "^$([Regex]::Escape($ArtifactName))-[0-9]{8}T[0-9]{9}Z\.exe$"
+    $backups = @(Get-ChildItem -LiteralPath $BackupDir -Filter "$ArtifactName-*.exe" -File |
         Where-Object {
-            $null -eq $protectedFullPath -or
-            -not [string]::Equals(
-                [System.IO.Path]::GetFullPath($_.FullName),
-                $protectedFullPath,
-                [System.StringComparison]::OrdinalIgnoreCase
+            $_.Name -match $backupNamePattern -and
+            (
+                $null -eq $protectedFullPath -or
+                -not [string]::Equals(
+                    [System.IO.Path]::GetFullPath($_.FullName),
+                    $protectedFullPath,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
             )
         } |
         Sort-Object -Property Name -Descending)
@@ -1951,11 +1986,24 @@ else {
     $LocalCodexSqliteHome = Resolve-AbsolutePath $LocalCodexSqliteHome
 }
 
-if ([string]::IsNullOrWhiteSpace($SourceExe)) {
+$sourceExeWasExplicit = -not [string]::IsNullOrWhiteSpace($SourceExe)
+if (-not $sourceExeWasExplicit) {
     $SourceExe = Get-BuiltCodexPath -RepoRoot $repoRoot -Profile $Profile
 }
 else {
     $SourceExe = Resolve-AbsolutePath $SourceExe
+}
+
+if ([string]::IsNullOrWhiteSpace($SourceCodeModeHostExe)) {
+    if ($sourceExeWasExplicit) {
+        $SourceCodeModeHostExe = Join-Path (Split-Path -Parent $SourceExe) "codex-code-mode-host.exe"
+    }
+    else {
+        $SourceCodeModeHostExe = Get-BuiltCodeModeHostPath -RepoRoot $repoRoot -Profile $Profile
+    }
+}
+else {
+    $SourceCodeModeHostExe = Resolve-AbsolutePath $SourceCodeModeHostExe
 }
 
 if ([string]::IsNullOrWhiteSpace($BackupDir)) {
@@ -1966,8 +2014,10 @@ else {
 }
 
 $targetPath = Join-Path $InstallDir "codex.exe"
+$codeModeHostTargetPath = Join-Path $InstallDir "codex-code-mode-host.exe"
 $backupStamp = (Get-Date).ToUniversalTime().ToString("yyyyMMddTHHmmssfffZ")
 $backupPath = Join-Path $BackupDir "codex-$backupStamp.exe"
+$codeModeHostBackupPath = Join-Path $BackupDir "codex-code-mode-host-$backupStamp.exe"
 $buildStampPath = Get-BuildStampPath -RepoRoot $repoRoot -Profile $Profile
 
 Write-ProofLine "action" $(if ($DryRun) { "DRY-RUN" } elseif ($BuildOnly) { "build-only" } elseif ($TestRun) { "test-run" } else { "publish" })
@@ -1993,11 +2043,15 @@ if ($AutoSkipBuild -and -not $SkipBuild -and -not $BuildOnly) {
         -RepoRoot $repoRoot `
         -StampPath $buildStampPath
     $sourceLastWriteForAutoSkip = Get-FileLastWriteUtc $SourceExe
+    $sourceCodeModeHostLastWriteForAutoSkip = Get-FileLastWriteUtc $SourceCodeModeHostExe
     if (
         (Test-Path -LiteralPath $SourceExe -PathType Leaf) -and
+        (Test-Path -LiteralPath $SourceCodeModeHostExe -PathType Leaf) -and
         $null -ne $sourceTreeNewestForAutoSkip -and
         $null -ne $sourceLastWriteForAutoSkip -and
-        -not (Test-FileStaleAgainstSource -SourceNewestUtc $sourceTreeNewestForAutoSkip -FileLastWriteUtc $sourceLastWriteForAutoSkip)
+        $null -ne $sourceCodeModeHostLastWriteForAutoSkip -and
+        -not (Test-FileStaleAgainstSource -SourceNewestUtc $sourceTreeNewestForAutoSkip -FileLastWriteUtc $sourceLastWriteForAutoSkip) -and
+        -not (Test-FileStaleAgainstSource -SourceNewestUtc $sourceTreeNewestForAutoSkip -FileLastWriteUtc $sourceCodeModeHostLastWriteForAutoSkip)
     ) {
         $SkipBuild = $true
         Write-ProofLine "autoSkipBuild" "true"
@@ -2005,8 +2059,11 @@ if ($AutoSkipBuild -and -not $SkipBuild -and -not $BuildOnly) {
     }
     else {
         Write-ProofLine "autoSkipBuild" "false"
-        if (-not (Test-Path -LiteralPath $SourceExe -PathType Leaf)) {
-            Write-ProofLine "autoSkipBuildReason" "source binary missing"
+        if (
+            -not (Test-Path -LiteralPath $SourceExe -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $SourceCodeModeHostExe -PathType Leaf)
+        ) {
+            Write-ProofLine "autoSkipBuildReason" "source artifact missing"
         }
         elseif ($null -eq $sourceTreeNewestForAutoSkip) {
             Write-ProofLine "autoSkipBuildReason" "tracked source freshness unknown"
@@ -2036,6 +2093,7 @@ else {
 if ($BuildOnly) {
     Write-ProofLine "buildOnly" "true"
     Write-ProofLine "builtCodexPath" (Get-BuiltCodexPath -RepoRoot $repoRoot -Profile $Profile)
+    Write-ProofLine "builtCodeModeHostPath" (Get-BuiltCodeModeHostPath -RepoRoot $repoRoot -Profile $Profile)
     Write-ProofLine "buildStampPath" $buildStampPath
     exit 0
 }
@@ -2043,10 +2101,16 @@ if ($BuildOnly) {
 if ($TestRun) {
     Write-ProofLine "testRun" "true"
     Write-ProofLine "sourcePath" $SourceExe
+    Write-ProofLine "sourceCodeModeHostPath" $SourceCodeModeHostExe
     if (-not (Test-Path -LiteralPath $SourceExe -PathType Leaf)) {
         throw "Test run built source Codex binary does not exist: $SourceExe"
     }
+    if (-not (Test-Path -LiteralPath $SourceCodeModeHostExe -PathType Leaf)) {
+        throw "Test run built source code-mode host does not exist: $SourceCodeModeHostExe"
+    }
     Write-ProofLine "sourceMissing" "false"
+    Write-ProofLine "sourceCodeModeHostMissing" "false"
+    Write-ProofLine "sourceCodeModeHostSha256" (Get-FileSha256 $SourceCodeModeHostExe)
     Write-VersionProofBlock -Prefix "source" -Path $SourceExe
     if ($RunDoctor) {
         Invoke-DoctorForPublish -TargetPath $SourceExe
@@ -2069,8 +2133,19 @@ if (-not (Test-Path -LiteralPath $SourceExe -PathType Leaf)) {
 else {
     Write-ProofLine "sourceMissing" "false"
 }
+Write-ProofLine "sourceCodeModeHostPath" $SourceCodeModeHostExe
+if (-not (Test-Path -LiteralPath $SourceCodeModeHostExe -PathType Leaf)) {
+    if (-not $DryRun) {
+        throw "Source code-mode host does not exist: $SourceCodeModeHostExe"
+    }
+    Write-ProofLine "sourceCodeModeHostMissing" "true"
+}
+else {
+    Write-ProofLine "sourceCodeModeHostMissing" "false"
+}
 Write-VersionProofBlock -Prefix "source" -Path $SourceExe
 Write-ProofLine "targetPath" $targetPath
+Write-ProofLine "codeModeHostTargetPath" $codeModeHostTargetPath
 Write-ProofLine "targetKind" "local CLI/TUI payload used by Codex Desktop; launching it directly opens a terminal."
 $publishLock = $null
 if (-not $DryRun) {
@@ -2080,11 +2155,15 @@ if (-not $DryRun) {
 
 try {
 $targetBeforeSha256 = Get-FileSha256 $targetPath
+$codeModeHostTargetBeforeSha256 = Get-FileSha256 $codeModeHostTargetPath
 Write-ProofLine "targetBeforeSha256" $targetBeforeSha256
+Write-ProofLine "codeModeHostTargetBeforeSha256" $codeModeHostTargetBeforeSha256
 $sourceSha256Mode = "hashed"
 $sourceSha256 = Get-FileSha256 $SourceExe
+$sourceCodeModeHostSha256 = Get-FileSha256 $SourceCodeModeHostExe
 Write-ProofLine "sourceSha256Mode" $sourceSha256Mode
 Write-ProofLine "sourceSha256" $sourceSha256
+Write-ProofLine "sourceCodeModeHostSha256" $sourceCodeModeHostSha256
 $sourceTreeNewestUtc = if ($SkipBuild) {
     Get-SourceNewestWriteUtcForSkipBuild `
         -RepoRoot $repoRoot `
@@ -2094,26 +2173,45 @@ else {
     Get-BuildStampNewestWriteUtc -StampPath $buildStampPath
 }
 $sourceLastWriteUtc = Get-FileLastWriteUtc $SourceExe
+$sourceCodeModeHostLastWriteUtc = Get-FileLastWriteUtc $SourceCodeModeHostExe
 $targetBeforeLastWriteUtc = Get-FileLastWriteUtc $targetPath
+$codeModeHostTargetBeforeLastWriteUtc = Get-FileLastWriteUtc $codeModeHostTargetPath
 Write-ProofLine "sourceTreeNewestWriteUtc" (Format-UtcTimestamp $sourceTreeNewestUtc)
 Write-ProofLine "sourceLastWriteUtc" (Format-UtcTimestamp $sourceLastWriteUtc)
+Write-ProofLine "sourceCodeModeHostLastWriteUtc" (Format-UtcTimestamp $sourceCodeModeHostLastWriteUtc)
 Write-ProofLine "targetBeforeLastWriteUtc" (Format-UtcTimestamp $targetBeforeLastWriteUtc)
-$sourceBuildStale = Test-FileStaleAgainstSource `
+Write-ProofLine "codeModeHostTargetBeforeLastWriteUtc" (Format-UtcTimestamp $codeModeHostTargetBeforeLastWriteUtc)
+$codexSourceBuildStale = Test-FileStaleAgainstSource `
     -SourceNewestUtc $sourceTreeNewestUtc `
     -FileLastWriteUtc $sourceLastWriteUtc
+$codeModeHostSourceBuildStale = Test-FileStaleAgainstSource `
+    -SourceNewestUtc $sourceTreeNewestUtc `
+    -FileLastWriteUtc $sourceCodeModeHostLastWriteUtc
+$sourceBuildStale = $codexSourceBuildStale -or $codeModeHostSourceBuildStale
+Write-ProofLine "codexSourceBuildStale" $codexSourceBuildStale
+Write-ProofLine "codeModeHostSourceBuildStale" $codeModeHostSourceBuildStale
 Write-ProofLine "sourceBuildStale" $sourceBuildStale
 if ($sourceBuildStale) {
     Write-ProofLine "sourceBuildStaleRemedy" "Run just publish-local-codex -Profile $Profile -RunDoctor without -SkipBuild, then restart Codex Desktop."
 }
-$targetBeforeStale = Test-FileStaleAgainstSource `
+$codexTargetBeforeStale = Test-FileStaleAgainstSource `
     -SourceNewestUtc $sourceLastWriteUtc `
     -FileLastWriteUtc $targetBeforeLastWriteUtc
+$codeModeHostTargetBeforeStale = Test-FileStaleAgainstSource `
+    -SourceNewestUtc $sourceCodeModeHostLastWriteUtc `
+    -FileLastWriteUtc $codeModeHostTargetBeforeLastWriteUtc
+$targetBeforeStale = $codexTargetBeforeStale -or $codeModeHostTargetBeforeStale
+Write-ProofLine "codexTargetBeforeStale" $codexTargetBeforeStale
+Write-ProofLine "codeModeHostTargetBeforeStale" $codeModeHostTargetBeforeStale
 Write-ProofLine "targetBeforeStale" $targetBeforeStale
 if ($targetBeforeStale) {
     Write-ProofLine "targetBeforeStaleRemedy" "Run just publish-local-codex and restart Codex Desktop."
 }
 $script:RunningTargetProcessProbeError = $null
-$runningTargetProcesses = @(Get-RunningCodexTargetProcesses -TargetPath $targetPath)
+$runningCodexProcesses = @(Get-RunningCodexTargetProcesses -TargetPath $targetPath)
+$runningCodeModeHostProcesses = @(Get-RunningCodexTargetProcesses -TargetPath $codeModeHostTargetPath)
+$allRunningTargetProcesses = @($runningCodexProcesses) + @($runningCodeModeHostProcesses)
+$runningTargetProcesses = @($allRunningTargetProcesses | Sort-Object -Property Id -Unique)
 if (-not [string]::IsNullOrWhiteSpace($script:RunningTargetProcessProbeError)) {
     Write-ProofLine "runningTargetProcesses" "<unavailable: $script:RunningTargetProcessProbeError>"
 }
@@ -2125,12 +2223,33 @@ else {
 }
 
 $targetExists = Test-Path -LiteralPath $targetPath -PathType Leaf
-$binaryChanged = -not (
+$codeModeHostTargetExists = Test-Path -LiteralPath $codeModeHostTargetPath -PathType Leaf
+$codexBinaryChanged = -not (
     $targetExists -and
     $sourceSha256 -ne "<missing>" -and
     [string]::Equals($sourceSha256, $targetBeforeSha256, [System.StringComparison]::OrdinalIgnoreCase)
 )
+$codeModeHostBinaryChanged = -not (
+    $codeModeHostTargetExists -and
+    $sourceCodeModeHostSha256 -ne "<missing>" -and
+    [string]::Equals(
+        $sourceCodeModeHostSha256,
+        $codeModeHostTargetBeforeSha256,
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+)
+$binaryChanged = $codexBinaryChanged -or $codeModeHostBinaryChanged
+Write-ProofLine "codexBinaryChanged" $(if ($codexBinaryChanged) { "true" } else { "false" })
+Write-ProofLine "codeModeHostBinaryChanged" $(if ($codeModeHostBinaryChanged) { "true" } else { "false" })
 Write-ProofLine "binaryChanged" $(if ($binaryChanged) { "true" } else { "false" })
+if (
+    $binaryChanged -and
+    -not $DryRun -and
+    -not $AllowRunningTarget -and
+    -not [string]::IsNullOrWhiteSpace($script:RunningTargetProcessProbeError)
+) {
+    throw "Cannot safely publish because running-target process detection failed: $script:RunningTargetProcessProbeError. Rerun after fixing process access, or explicitly use -AllowRunningTarget."
+}
 Write-DesktopProof -BinaryChanged $binaryChanged -FastProof:$FastProof
 if ($sourceBuildStale) {
     Write-ProofLine "publishReadiness" "blocked: source build stale"
@@ -2153,6 +2272,12 @@ if ($targetExists) {
 }
 else {
     Write-ProofLine "backupPath" "<none: target missing>"
+}
+if ($codeModeHostTargetExists) {
+    Write-ProofLine "codeModeHostBackupPath" $codeModeHostBackupPath
+}
+else {
+    Write-ProofLine "codeModeHostBackupPath" "<none: target missing>"
 }
 
 $desktopRoutingResult = [pscustomobject]@{
@@ -2218,16 +2343,19 @@ if ($DryRun) {
 if ($skipBuildBlockedByStaleSource) {
     Write-ProofLine "replace" "blocked: source build stale"
     Write-ProofLine "restartRequired" "unknown until rebuild"
-    throw "SkipBuild cannot publish the newest Codex app payload because tracked source files are newer than $SourceExe. Run just publish-local-codex -Profile $Profile -RunDoctor without -SkipBuild."
+    throw "SkipBuild cannot publish the newest Codex bundle because tracked source files are newer than one or more source artifacts. Run just publish-local-codex -Profile $Profile -RunDoctor without -SkipBuild."
 }
 
 if ($runningTargetProcesses.Count -gt 0 -and $binaryChanged -and -not $AllowRunningTarget) {
     Stop-RunningCodexTargetProcesses `
         -Processes $runningTargetProcesses `
         -TimeoutSeconds $CloseRunningTargetTimeoutSeconds
-    $runningTargetProcesses = @(Get-RunningCodexTargetProcesses -TargetPath $targetPath)
+    $runningCodexProcesses = @(Get-RunningCodexTargetProcesses -TargetPath $targetPath)
+    $runningCodeModeHostProcesses = @(Get-RunningCodexTargetProcesses -TargetPath $codeModeHostTargetPath)
+    $allRunningTargetProcesses = @($runningCodexProcesses) + @($runningCodeModeHostProcesses)
+    $runningTargetProcesses = @($allRunningTargetProcesses | Sort-Object -Property Id -Unique)
     if ($runningTargetProcesses.Count -gt 0) {
-        throw "Target Codex binary is still running ($((Format-ProcessProof $runningTargetProcesses))). Close Codex Desktop or rerun with -AllowRunningTarget."
+        throw "Target Codex publish bundle is still running ($((Format-ProcessProof $runningTargetProcesses))). Close Codex Desktop or rerun with -AllowRunningTarget."
     }
     Write-ProofLine "runningTargetProcessesAfterClose" "<none>"
 }
@@ -2241,7 +2369,9 @@ elseif ($runningTargetProcesses.Count -gt 0 -and $AllowRunningTarget) {
 if (-not $binaryChanged) {
     Write-ProofLine "replace" "skipped: target already current"
     Write-ProofLine "targetSha256" $targetBeforeSha256
+    Write-ProofLine "codeModeHostTargetSha256" $codeModeHostTargetBeforeSha256
     Write-ProofLine "backupSha256" "<none: target already current>"
+    Write-ProofLine "codeModeHostBackupSha256" "<none: target already current>"
     Write-ProofLine "restartRequired" $(if ($desktopRoutingResult.RestartRequired) { "true" } else { "false" })
     if ($RunDoctor) {
         if ($DoctorOnNoop) {
@@ -2262,22 +2392,66 @@ if (-not $binaryChanged) {
     exit 0
 }
 
-Publish-CodexBinary -SourcePath $SourceExe -TargetPath $targetPath -BackupPath $backupPath
-
+$publishedCodeModeHost = $false
+$publishedCodex = $false
 try {
+    if ($codeModeHostBinaryChanged) {
+        Publish-CodexBinary `
+            -SourcePath $SourceCodeModeHostExe `
+            -TargetPath $codeModeHostTargetPath `
+            -BackupPath $codeModeHostBackupPath
+        $publishedCodeModeHost = $true
+    }
+    if ($codexBinaryChanged) {
+        Publish-CodexBinary -SourcePath $SourceExe -TargetPath $targetPath -BackupPath $backupPath
+        $publishedCodex = $true
+    }
+
     $targetVersionLines = @(Get-VersionProofLines -Path $targetPath -TimeoutMilliseconds 10000 -Attempts 2)
     Write-VersionProofLinesBlock -Prefix "target" -VersionLines $targetVersionLines
     if (-not (Test-VersionProofAvailable -VersionLines $targetVersionLines)) {
         throw "Published Codex binary failed --version verification: $($targetVersionLines[0])"
     }
     Write-ProofLine "postPublishVerify" "version ok"
-    Write-ProofLine "targetSha256" (Get-FileSha256 $targetPath)
-    if (-not $targetExists) {
+    $targetSha256 = Get-FileSha256 $targetPath
+    $codeModeHostTargetSha256 = Get-FileSha256 $codeModeHostTargetPath
+    if (-not [string]::Equals(
+            $sourceSha256,
+            $targetSha256,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "Published Codex binary failed SHA-256 verification."
+    }
+    Write-ProofLine "codexPostPublishVerify" "sha256 ok"
+    if (-not [string]::Equals(
+            $sourceCodeModeHostSha256,
+            $codeModeHostTargetSha256,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )) {
+        throw "Published code-mode host failed SHA-256 verification."
+    }
+    Write-ProofLine "codeModeHostPostPublishVerify" "sha256 ok"
+    Write-ProofLine "targetSha256" $targetSha256
+    Write-ProofLine "codeModeHostTargetSha256" $codeModeHostTargetSha256
+    if (-not $codexBinaryChanged) {
+        Write-ProofLine "backupSha256" "<none: target already current>"
+    }
+    elseif (-not $targetExists) {
         Write-ProofLine "backupSha256" "<none: target missing>"
     }
     else {
         Write-ProofLine "backupSha256" $targetBeforeSha256
         Write-ProofLine "rollbackCommand" "Copy-Item -LiteralPath `"$backupPath`" -Destination `"$targetPath`" -Force"
+    }
+    if (-not $codeModeHostBinaryChanged) {
+        Write-ProofLine "codeModeHostBackupSha256" "<none: target already current>"
+    }
+    elseif (-not $codeModeHostTargetExists) {
+        Write-ProofLine "codeModeHostBackupSha256" "<none: target missing>"
+    }
+    else {
+        Write-ProofLine "codeModeHostBackupSha256" $codeModeHostTargetBeforeSha256
+        Write-ProofLine "codeModeHostRollbackCommand" "Copy-Item -LiteralPath `"$codeModeHostBackupPath`" -Destination `"$codeModeHostTargetPath`" -Force"
     }
     Write-ProofLine "restartRequired" "true"
     Write-ProofLine "restart" "Restart Codex Desktop from the Start menu or desktopAppLaunchCommand; do not launch targetPath directly."
@@ -2295,18 +2469,51 @@ try {
     }
 }
 catch {
-    Write-ProofLine "rollback" "requested: $($_.Exception.Message)"
-    Restore-CodexBinaryPublish `
-        -TargetPath $targetPath `
-        -BackupPath $backupPath `
-        -HadPreviousTarget $targetExists
-    throw
+    $publishError = $_.Exception
+    Write-ProofLine "rollback" "requested: $($publishError.Message)"
+    $rollbackFailures = [System.Collections.Generic.List[string]]::new()
+    if ($publishedCodex) {
+        try {
+            Restore-CodexBinaryPublish `
+                -TargetPath $targetPath `
+                -BackupPath $backupPath `
+                -HadPreviousTarget $targetExists
+        }
+        catch {
+            $rollbackFailures.Add("codex.exe: $($_.Exception.Message)")
+        }
+    }
+    if ($publishedCodeModeHost) {
+        try {
+            Restore-CodexBinaryPublish `
+                -TargetPath $codeModeHostTargetPath `
+                -BackupPath $codeModeHostBackupPath `
+                -HadPreviousTarget $codeModeHostTargetExists `
+                -ProofPrefix "codeModeHost"
+        }
+        catch {
+            $rollbackFailures.Add("codex-code-mode-host.exe: $($_.Exception.Message)")
+        }
+    }
+    if ($rollbackFailures.Count -gt 0) {
+        throw "Publish failed: $($publishError.Message) Rollback also failed: $($rollbackFailures -join '; ')"
+    }
+    throw $publishError
 }
 
 $protectedBackupPath = if ($targetExists) { $backupPath } else { $null }
-Remove-OldCodexBackups -BackupDir $BackupDir -ProtectedPath $protectedBackupPath
+$protectedCodeModeHostBackupPath = if ($codeModeHostTargetExists) { $codeModeHostBackupPath } else { $null }
+Remove-OldCodexBackups `
+    -BackupDir $BackupDir `
+    -ArtifactName "codex" `
+    -ProtectedPath $protectedBackupPath
+Remove-OldCodexBackups `
+    -BackupDir $BackupDir `
+    -ArtifactName "codex-code-mode-host" `
+    -ProtectedPath $protectedCodeModeHostBackupPath
 
 Write-Output "Restart Codex Desktop from the Start menu or run: $(Get-CodexDesktopLaunchCommand)"
+Write-Output "Published codex.exe and codex-code-mode-host.exe as one local runtime bundle."
 Write-Output "Do not launch targetPath directly; it is the CLI/TUI payload and opens a terminal."
 }
 finally {

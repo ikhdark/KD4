@@ -13,7 +13,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "run_tui_with_exec_server.sh"
-BASH = shutil.which("bash") or shutil.which("sh")
+BASH = (
+    shutil.which("sh") or shutil.which("bash")
+    if os.name == "nt"
+    else shutil.which("bash") or shutil.which("sh")
+)
 
 
 def write_executable(path: Path, body: str) -> None:
@@ -30,7 +34,13 @@ def bash_available() -> bool:
         return False
     return (
         subprocess.run(
-            [BASH, "--version"],
+            [
+                BASH,
+                "-c",
+                'test -n "$BASH_VERSION" && test -f "$1"',
+                "bash",
+                bash_path(SCRIPT),
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -45,7 +55,7 @@ class RunTuiWithExecServerTest(unittest.TestCase):
         merged_env = os.environ.copy()
         merged_env.update(env)
         return subprocess.run(
-            [BASH, str(SCRIPT), "--probe"],
+            [BASH, bash_path(SCRIPT), "--probe"],
             cwd=REPO_ROOT,
             env=merged_env,
             text=True,

@@ -35,6 +35,9 @@ working tree.
 
 ## Fast Routing
 
+Use this section first. Read [`../SOURCEMAP.md`](../SOURCEMAP.md) only when the
+owner crosses script/package boundaries or remains ambiguous.
+
 - Local Codex binary publish/replacement proof: `publish-local-codex.ps1`,
   `publish-local-codex.hashing.ps1`, `test_publish_local_codex.py`.
 - Rust lanes, target cleanup, and build diagnostics: `cargo-lane.ps1`,

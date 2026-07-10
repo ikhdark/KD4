@@ -5,6 +5,13 @@
   "scripts": {
     "format": "prettier --check *.json *.md docs/*.md .github/workflows/*.yml **/*.js",
     "format:fix": "prettier --write *.json *.md docs/*.md .github/workflows/*.yml **/*.js",
+    "format:python": "python scripts/root_maintenance.py format-python",
+    "format:python:fix": "python scripts/root_maintenance.py format-python --write",
+    "lint:python": "python scripts/root_maintenance.py lint-python",
+    "lint:python:fix": "python scripts/root_maintenance.py lint-python --fix",
+    "test:scripts": "python scripts/root_maintenance.py test-python",
+    "test:scripts:target": "python scripts/root_maintenance.py test-python --changed",
+    "test:scripts:changed": "python scripts/root_maintenance.py test-python --changed",
     "write-hooks-schema": "cargo run --manifest-path ./codex-rs/Cargo.toml -p codex-hooks --bin write_hooks_schema_fixtures"
   },
   "devDependencies": {

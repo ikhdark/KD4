@@ -82,6 +82,7 @@ use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
 use codex_app_server_protocol::WarningNotification;
 use codex_app_server_protocol::build_item_from_guardian_event;
+use codex_app_server_protocol::command_display_string;
 use codex_app_server_protocol::guardian_auto_approval_review_notification;
 use codex_app_server_protocol::item_event_to_server_notification;
 use codex_core::CodexThread;
@@ -109,7 +110,6 @@ use codex_protocol::request_permissions::RequestPermissionsResponse as CoreReque
 use codex_protocol::request_user_input::RequestUserInputAnswer as CoreRequestUserInputAnswer;
 use codex_protocol::request_user_input::RequestUserInputResponse as CoreRequestUserInputResponse;
 use codex_sandboxing::policy_transforms::intersect_permission_profiles;
-use codex_shell_command::parse_command::shlex_join;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
 use std::collections::HashMap;
@@ -590,7 +590,7 @@ pub(crate) async fn apply_bespoke_event_handling(
             {
                 CommandExecutionApprovalPresentation::Network(network_approval_context)
             } else {
-                let command_string = shlex_join(&command);
+                let command_string = command_display_string(&command);
                 let completion_item = CommandExecutionCompletionItem {
                     command: command_string,
                     cwd: cwd.clone().into(),

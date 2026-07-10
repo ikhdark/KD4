@@ -16,6 +16,18 @@ fn detects_environment_context_fragment() {
 }
 
 #[test]
+fn detects_current_and_legacy_additional_context_fragments() {
+    for text in [
+        "<external_context source=\"browser_info\" kind=\"untrusted\">\ntab one\n</external_context>",
+        "<external_browser_info>tab one</external_browser_info>",
+    ] {
+        assert!(is_contextual_user_fragment(&ContentItem::InputText {
+            text: text.to_string(),
+        }));
+    }
+}
+
+#[test]
 fn detects_agents_instructions_fragment() {
     for text in [
         "# AGENTS.md instructions for /tmp\n\n<INSTRUCTIONS>\nbody\n</INSTRUCTIONS>",

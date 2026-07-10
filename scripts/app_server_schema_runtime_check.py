@@ -161,7 +161,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         skipped_regen = True
 
     if skipped_regen:
-        protocol_code, retry_changed = run_app_server_protocol_check_with_auto_regen(root)
+        protocol_code, retry_changed = run_app_server_protocol_check_with_auto_regen(
+            root
+        )
         generated_changed = generated_changed or retry_changed
     else:
         protocol_code = run_protocol_check(root)

@@ -541,6 +541,10 @@ strip = false
 # Balance parallel release code generation against binary size.
 codegen-units = 4
 
+[profile.local-release]
+inherits = "release"
+lto = false
+
 [profile.profiling]
 inherits = "release"
 debug = "full"

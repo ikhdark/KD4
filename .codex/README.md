@@ -1,24 +1,30 @@
 # Repo-Local Codex Workspace
 
-This directory contains local Codex workflow guidance and generated state for
-the `C:\Users\kuh\Desktop\kd4` fork.
+This directory is KD4's project-owned Codex workflow layer. It contains durable
+guidance and local generated state; it is not upstream product source by
+default.
 
-Durable guidance belongs in tracked files such as `.codex/AGENTS.md`, this
-README, `.codex/environments/README.md`, `.codex/harness/**`, and fork-local
-skills under `.codex/skills`.
+## Start Here
 
-Generated runtime state belongs under directories such as `.codex/verify-local`.
-Treat those files as local evidence or cache output, not as source for normal
-patches.
+| Need | Authoritative file |
+| --- | --- |
+| Edit anything under `.codex` | [`AGENTS.md`](AGENTS.md) |
+| Prepare ignored files for a Codex worktree | [`environments/README.md`](environments/README.md) |
+| Plan or preserve evidence for a durable task | [`harness/README.md`](harness/README.md) |
+| Follow the harness lifecycle and finish gate | [`harness/workflow.md`](harness/workflow.md) |
+| Implement or change KD4 repository behavior | [`skills/kd4-crosscheck-and-finish/SKILL.md`](skills/kd4-crosscheck-and-finish/SKILL.md) |
+| Create, audit, or run harness artifacts | [`skills/kd4-harness/SKILL.md`](skills/kd4-harness/SKILL.md) |
 
-The KD4 harness lives under `.codex/harness`. Its `README.md`,
-`context-modes.md`, `workflow.md`, and `templates/**` files are durable workflow
-guidance. Per-task run directories under `.codex/harness/runs/**` are local
-working state unless the user asks to keep them in reviewable changes.
-Use the harness for explicit harness work and for KD4 implementation tasks that
-invoke Wiring Guard/KDWG, `wire-implementations`, or static wiring proof; those
-tasks can use lightweight harness mode without creating a run directory.
+Use the smallest relevant surface. Routine work does not need a harness run
+directory, and specialized skills should be loaded only when their task applies.
 
-Project-local Codex configuration may be added as `.codex/config.toml` when this
-checkout needs repo-specific runtime settings. If it is absent, do not infer a
-missing setup step from the filename alone.
+## Source And State Boundary
+
+Durable policy, templates, environment source, and fork-local skills are
+reviewable source. Generated runs, verification output, app backups, patched-app
+trees, and Wiring Guard sessions are local state; the exact boundary is owned by
+[`AGENTS.md`](AGENTS.md).
+
+Project-local runtime configuration may be added as `.codex/config.toml` only
+when this checkout needs an explicit setting. Its absence is intentional and is
+not a missing setup step.

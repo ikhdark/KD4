@@ -17,7 +17,10 @@ def _normalized_path(path: Path) -> str:
 def _is_within_or_same(path: Path, root: Path) -> bool:
     normalized_root = _normalized_path(root)
     try:
-        return os.path.commonpath([_normalized_path(path), normalized_root]) == normalized_root
+        return (
+            os.path.commonpath([_normalized_path(path), normalized_root])
+            == normalized_root
+        )
     except ValueError:
         return False
 

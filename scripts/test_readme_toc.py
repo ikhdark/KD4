@@ -50,6 +50,20 @@ class ReadmeTocTest(unittest.TestCase):
             ],
         )
 
+    def test_generate_toc_lines_does_not_close_fence_with_other_marker(self) -> None:
+        self.assertEqual(
+            readme_toc.generate_toc_lines(
+                [
+                    "```text",
+                    "~~~",
+                    "## Still Code",
+                    "```",
+                    "## Real",
+                ]
+            ),
+            ["- [Real](#real)"],
+        )
+
     def test_parse_markdown_toc_finds_markers_and_expected_without_joining(
         self,
     ) -> None:
@@ -85,6 +99,33 @@ class ReadmeTocTest(unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertIn("no markers found", output.getvalue())
+
+    def test_parse_toc_keeps_unexpected_content_so_check_fails(self) -> None:
+        lines = [
+            readme_toc.BEGIN_TOC,
+            "unexpected prose",
+            readme_toc.END_TOC,
+            "## Current",
+        ]
+
+        parsed = readme_toc.parse_markdown_toc(lines)
+
+        self.assertEqual(parsed.current, ["unexpected prose"])
+        self.assertNotEqual(parsed.current, parsed.expected)
+
+    def test_parse_toc_rejects_duplicate_or_unexpected_markers(self) -> None:
+        malformed = (
+            [readme_toc.BEGIN_TOC, readme_toc.BEGIN_TOC, readme_toc.END_TOC],
+            [readme_toc.END_TOC],
+            [
+                readme_toc.BEGIN_TOC,
+                readme_toc.END_TOC,
+                readme_toc.END_TOC,
+            ],
+        )
+        for lines in malformed:
+            with self.subTest(lines=lines), self.assertRaises(ValueError):
+                readme_toc.parse_markdown_toc(lines)
 
     def test_fix_updates_only_toc_block(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -91,7 +91,14 @@ mod loopback_responses_server;
 mod plugin_analytics_capture;
 mod plugin_analytics_mutation_smoke;
 mod plugin_analytics_smoke;
+mod process;
 mod request_user_input;
+
+use process::add_codex_parent_to_path;
+use process::listener_pids_on_port;
+use process::runtime_dir;
+use process::shell_quote;
+use process::terminate_process;
 
 const NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
     // v2 item deltas.
@@ -155,8 +162,8 @@ struct Cli {
 enum CliCommand {
     /// Start `codex app-server` on a websocket endpoint in the background.
     ///
-    /// Logs are written to:
-    ///   `/tmp/codex-app-server-test-client/`
+    /// Logs are written under the platform's temporary directory in
+    /// `codex-app-server-test-client/`.
     Serve {
         /// WebSocket listen URL passed to `codex app-server --listen`.
         #[arg(long, default_value = "ws://127.0.0.1:4222")]
@@ -563,14 +570,7 @@ impl BackgroundAppServer {
 
         let url = format!("ws://{addr}");
         let mut cmd = Command::new(codex_bin);
-        if let Some(codex_bin_parent) = codex_bin.parent() {
-            let mut path = OsString::from(codex_bin_parent.as_os_str());
-            if let Some(existing_path) = std::env::var_os("PATH") {
-                path.push(":");
-                path.push(existing_path);
-            }
-            cmd.env("PATH", path);
-        }
+        add_codex_parent_to_path(&mut cmd, codex_bin)?;
         for override_kv in config_overrides {
             cmd.arg("--config").arg(override_kv);
         }
@@ -601,10 +601,10 @@ impl Drop for BackgroundAppServer {
 }
 
 fn serve(codex_bin: &Path, config_overrides: &[String], listen: &str, kill: bool) -> Result<()> {
-    let runtime_dir = PathBuf::from("/tmp/codex-app-server-test-client");
-    fs::create_dir_all(&runtime_dir)
-        .with_context(|| format!("failed to create runtime dir {}", runtime_dir.display()))?;
-    let log_path = runtime_dir.join("app-server.log");
+    let runtime_path = runtime_dir();
+    fs::create_dir_all(&runtime_path)
+        .with_context(|| format!("failed to create runtime dir {}", runtime_path.display()))?;
+    let log_path = runtime_path.join("app-server.log");
     if kill {
         kill_listeners_on_same_port(listen)?;
     }
@@ -653,33 +653,14 @@ fn kill_listeners_on_same_port(listen: &str) -> Result<()> {
         .port_or_known_default()
         .with_context(|| format!("unable to infer port from --listen URL `{listen}`"))?;
 
-    let output = Command::new("lsof")
-        .arg("-nP")
-        .arg(format!("-tiTCP:{port}"))
-        .arg("-sTCP:LISTEN")
-        .output()
-        .with_context(|| format!("failed to run lsof for port {port}"))?;
-
-    if !output.status.success() {
-        return Ok(());
-    }
-
-    let pids: Vec<u32> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-        .collect();
-
+    let pids = listener_pids_on_port(port)?;
     if pids.is_empty() {
         return Ok(());
     }
 
     for pid in pids {
         println!("killing listener pid {pid} on port {port}");
-        let pid_str = pid.to_string();
-        let term_status = Command::new("kill")
-            .arg(&pid_str)
-            .status()
-            .with_context(|| format!("failed to send SIGTERM to pid {pid}"))?;
+        let term_status = terminate_process(pid, false)?;
         if !term_status.success() {
             continue;
         }
@@ -687,29 +668,12 @@ fn kill_listeners_on_same_port(listen: &str) -> Result<()> {
 
     thread::sleep(Duration::from_millis(300));
 
-    let output = Command::new("lsof")
-        .arg("-nP")
-        .arg(format!("-tiTCP:{port}"))
-        .arg("-sTCP:LISTEN")
-        .output()
-        .with_context(|| format!("failed to re-check listeners on port {port}"))?;
-    if !output.status.success() {
-        return Ok(());
-    }
-    let remaining: Vec<u32> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| line.trim().parse::<u32>().ok())
-        .collect();
-    for pid in remaining {
+    for pid in listener_pids_on_port(port)? {
         println!("force killing remaining listener pid {pid} on port {port}");
-        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
+        let _ = terminate_process(pid, true);
     }
 
     Ok(())
-}
-
-fn shell_quote(input: &str) -> String {
-    format!("'{}'", input.replace('\'', "'\\''"))
 }
 
 struct SendMessagePolicies<'a> {
@@ -1542,14 +1506,7 @@ impl CodexClient {
     ) -> Result<Self> {
         let codex_bin_display = codex_bin.display();
         let mut cmd = Command::new(codex_bin);
-        if let Some(codex_bin_parent) = codex_bin.parent() {
-            let mut path = OsString::from(codex_bin_parent.as_os_str());
-            if let Some(existing_path) = std::env::var_os("PATH") {
-                path.push(":");
-                path.push(existing_path);
-            }
-            cmd.env("PATH", path);
-        }
+        add_codex_parent_to_path(&mut cmd, codex_bin)?;
         for override_kv in config_overrides {
             cmd.arg("--config").arg(override_kv);
         }

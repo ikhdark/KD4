@@ -36,8 +36,12 @@
 - [ ] Focused validation ran
 - [ ] Wiring Guard/KDWG check ran when active and applicable, or
       `--no-wiring-targets` was explicitly justified
+- [ ] Changed code and its intended path were swept for placeholders or stubs
+- [ ] New public symbols, config fields, commands, or workflow entries were
+      checked against their expected callers
 - [ ] Validation output reviewed
 - [ ] Skipped checks are named with reasons
+- [ ] Completion gate status is recorded using `workflow.md`
 - [ ] Claims in the final answer match the evidence
 
 ## Finish

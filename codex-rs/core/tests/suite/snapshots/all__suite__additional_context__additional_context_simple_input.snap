@@ -1,11 +1,11 @@
 ---
 source: core/tests/suite/additional_context.rs
-expression: "context_snapshot::format_labeled_requests_snapshot(\"additional context is inserted before the user turn input.\",\n&[(\"Request\", &request)], &additional_context_snapshot_options(),)"
+expression: "context_snapshot::format_labeled_requests_snapshot(\"additional context is inserted before the user turn input.\",\n&[(\"Request\", &request)],\n&ContextSnapshotOptions::default().strip_capability_instructions().render_mode(ContextSnapshotRenderMode::KindWithTextPrefix\n{ max_chars: 160 }),)"
 ---
 Scenario: additional context is inserted before the user turn input.
 
 ## Request
 00:message/developer:<PERMISSIONS_INSTRUCTIONS>
-01:message/developer:<automation_info>run one</automation_info>
-02:message/user:<external_browser_info>tab one</external_browser_info>
+01:message/developer:<application_context source="automation_info" kind="application">\nrun one\n</application_context>
+02:message/user:<external_context source="browser_info" kind="untrusted">\ntab one\n</external_context>
 03:message/user:inspect the active tab

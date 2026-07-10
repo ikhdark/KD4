@@ -474,14 +474,22 @@ function Invoke-CargoLanePrune {
     $previousLanesRoot = $env:CODEX_CARGO_LANES_ROOT
     $env:CODEX_CARGO_LANE_ACTIVE_NAMES = ($active | Select-Object -Unique) -join ";"
     $env:CODEX_CARGO_LANES_ROOT = $LanesRoot
+    $pruneSucceeded = $false
     try {
         $scriptPath = Join-Path $RepoRoot "scripts\rust_build_status.py"
+        $global:LASTEXITCODE = $null
         & python $scriptPath prune --skip-disk-report --keep-warm-per-base 1 --max-age-days $maxAgeDays @maxLaneArgs | Out-Null
+        $pruneSucceeded = $LASTEXITCODE -eq 0
     }
     finally {
         $env:CODEX_CARGO_LANE_ACTIVE_NAMES = $previousActiveNames
         $env:CODEX_CARGO_LANES_ROOT = $previousLanesRoot
+    }
+    if ($pruneSucceeded) {
         [IO.File]::WriteAllText($stampPath, (Get-Date).ToUniversalTime().ToString("o"))
+    }
+    else {
+        Write-Warning "Cargo lane pruning failed; leaving the GC stamp unchanged so the next run can retry."
     }
 }
 
@@ -764,6 +772,7 @@ try {
     $commandArgs = @(Add-CargoTargetDirArgument -CommandArgs $commandArgs -TargetDir $targetDir)
     $program = $commandArgs[0]
     $arguments = @($commandArgs | Select-Object -Skip 1)
+    $global:LASTEXITCODE = $null
     & $program @arguments
     if ($null -eq $LASTEXITCODE) {
         if ($?) {

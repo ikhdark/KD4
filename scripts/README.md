@@ -22,7 +22,7 @@ is the current source map for the checked-in script tooling.
 
 ## Routing
 
-- Local Codex binary replacement and desktop/CLI publish proof:
+- Local Codex runtime-bundle replacement and desktop/CLI publish proof:
   `publish-local-codex.ps1`, `publish-local-codex.hashing.ps1`, and
   `test_publish_local_codex.py`.
 - Rust build lanes, target cleanup, and build-status diagnostics:
@@ -32,7 +32,7 @@ is the current source map for the checked-in script tooling.
   `stage_npm_packages.py`, and `codex_package/`.
 - Platform install flows: `install/install.sh` and `install/install.ps1`.
 - Root package maintenance commands: `root_maintenance.py`. The root
-  `package.json` `format:*`, `lint:*`, `dead-code`, and `test:scripts` commands
+  `package.json` `format:python*`, `lint:python*`, and `test:scripts*` aliases
   route Python script maintenance through this helper.
 - Repository checks: `format.py`, `asciicheck.py`, `readme_toc.py`,
   `check_blob_size.py`, and their matching tests.
@@ -43,12 +43,14 @@ is the current source map for the checked-in script tooling.
 
 ## Script Context
 
-- `publish-local-codex.ps1`: Windows local binary publish flow. Preserve dry-run,
-  backup, rollback, doctor, hash/version proof, process detection, and
-  process-closing protections. Final local publish proof should stay on the
-  optimized `release` profile via `just publish-local-codex-final`; use
-  `local-release` and `-BuildOnly` only to warm or iterate on the exact publish
-  target without replacing the installed binary.
+- `publish-local-codex.ps1`: Windows local runtime-bundle publish flow. It builds
+  and publishes `codex.exe` plus `codex-code-mode-host.exe` beside each other.
+  Preserve dry-run, per-artifact backup, bundle rollback, doctor, hash/version
+  proof, process detection, and process-closing protections. Final local publish
+  proof should stay on the optimized `release` profile via
+  `just publish-local-codex-final`; use `local-release` and `-BuildOnly` only to
+  warm or iterate on the exact publish target without replacing the installed
+  binaries.
 - `publish-local-codex.hashing.ps1`: hashing/version helper code for publish
   proof. Keep output contracts stable for publish tests and doctor reporting.
 - `test_publish_local_codex.py`: focused coverage for local publish behavior.

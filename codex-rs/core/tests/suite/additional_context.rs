@@ -97,17 +97,17 @@ async fn additional_context_is_model_visible_but_not_a_user_message_item() -> Re
     let developer_context_texts = request
         .message_input_texts("developer")
         .into_iter()
-        .filter(|text| text.starts_with("<automation_info>"))
+        .filter(|text| text.starts_with(application_context_prefix("automation_info").as_str()))
         .collect::<Vec<_>>();
     assert_eq!(
         developer_context_texts,
-        vec!["<automation_info>run one</automation_info>"]
+        vec![application_context("automation_info", "run one")]
     );
     assert_eq!(
         request.message_input_texts("user"),
         vec![
-            "<external_browser_info>tab one</external_browser_info>",
-            "inspect the active tab",
+            external_context("browser_info", "tab one"),
+            "inspect the active tab".to_string(),
         ]
     );
 
@@ -214,17 +214,17 @@ async fn additional_context_trust_controls_message_role() -> Result<()> {
     let developer_context_texts = request
         .message_input_texts("developer")
         .into_iter()
-        .filter(|text| text.starts_with("<automation_info>"))
+        .filter(|text| text.starts_with(application_context_prefix("automation_info").as_str()))
         .collect::<Vec<_>>();
     assert_eq!(
         developer_context_texts,
-        vec!["<automation_info>run one</automation_info>"]
+        vec![application_context("automation_info", "run one")]
     );
     assert_eq!(
         request.message_input_texts("user"),
         vec![
-            "<external_browser_info>tab one</external_browser_info>",
-            "inspect context",
+            external_context("browser_info", "tab one"),
+            "inspect context".to_string(),
         ]
     );
 
@@ -295,16 +295,16 @@ async fn additional_context_is_deduplicated_between_turns_while_retained() -> Re
     assert_eq!(
         first_request.single_request().message_input_texts("user"),
         vec![
-            "<external_browser_info>same tab</external_browser_info>",
-            "first turn",
+            external_context("browser_info", "same tab"),
+            "first turn".to_string(),
         ]
     );
     assert_eq!(
         second_request.single_request().message_input_texts("user"),
         vec![
-            "<external_browser_info>same tab</external_browser_info>",
-            "first turn",
-            "second turn",
+            external_context("browser_info", "same tab"),
+            "first turn".to_string(),
+            "second turn".to_string(),
         ]
     );
 
@@ -442,31 +442,31 @@ async fn additional_context_removes_one_value_while_adding_another() -> Result<(
     assert_eq!(
         first_request.single_request().message_input_texts("user"),
         vec![
-            "<external_automation_info>run one</external_automation_info>",
-            "<external_browser_info>tab one</external_browser_info>",
-            "first turn",
+            external_context("automation_info", "run one"),
+            external_context("browser_info", "tab one"),
+            "first turn".to_string(),
         ]
     );
     assert_eq!(
         second_request.single_request().message_input_texts("user"),
         vec![
-            "<external_automation_info>run one</external_automation_info>",
-            "<external_browser_info>tab one</external_browser_info>",
-            "first turn",
-            "<external_terminal_info>pty one</external_terminal_info>",
-            "second turn",
+            external_context("automation_info", "run one"),
+            external_context("browser_info", "tab one"),
+            "first turn".to_string(),
+            external_context("terminal_info", "pty one"),
+            "second turn".to_string(),
         ]
     );
     assert_eq!(
         third_request.single_request().message_input_texts("user"),
         vec![
-            "<external_automation_info>run one</external_automation_info>",
-            "<external_browser_info>tab one</external_browser_info>",
-            "first turn",
-            "<external_terminal_info>pty one</external_terminal_info>",
-            "second turn",
-            "<external_browser_info>tab one</external_browser_info>",
-            "third turn",
+            external_context("automation_info", "run one"),
+            external_context("browser_info", "tab one"),
+            "first turn".to_string(),
+            external_context("terminal_info", "pty one"),
+            "second turn".to_string(),
+            external_context("browser_info", "tab one"),
+            "third turn".to_string(),
         ]
     );
 
@@ -491,10 +491,9 @@ async fn additional_context_values_are_truncated_before_model_input() -> Result<
         .await?;
     let long_browser_value = format!("browser-head-{}browser-tail", "b".repeat(40_000));
     let long_automation_value = format!("automation-head-{}automation-tail", "a".repeat(40_000));
-    let untruncated_browser_fragment =
-        format!("<external_browser_info>{long_browser_value}</external_browser_info>");
+    let untruncated_browser_fragment = external_context("browser_info", &long_browser_value);
     let untruncated_automation_fragment =
-        format!("<automation_info>{long_automation_value}</automation_info>");
+        application_context("automation_info", &long_automation_value);
 
     test.codex
         .submit(Op::UserInput {
@@ -532,17 +531,18 @@ async fn additional_context_values_are_truncated_before_model_input() -> Result<
     let developer_texts = request
         .message_input_texts("developer")
         .into_iter()
-        .filter(|text| text.starts_with("<automation_info>"))
+        .filter(|text| text.starts_with(application_context_prefix("automation_info").as_str()))
         .collect::<Vec<_>>();
     let [automation_text] = developer_texts.as_slice() else {
         panic!("expected application additional context, got {developer_texts:?}");
     };
     assert!(automation_text.starts_with(&format!(
-        "<automation_info>automation-head-{}",
+        "{}\nautomation-head-{}",
+        application_context_prefix("automation_info"),
         "a".repeat(1024)
     )));
     assert!(automation_text.contains("tokens truncated"));
-    assert!(automation_text.ends_with("automation-tail</automation_info>"));
+    assert!(automation_text.ends_with("automation-tail\n</application_context>"));
     assert!(automation_text.len() < untruncated_automation_fragment.len());
     assert!(
         automation_text.len() <= MAX_EXPECTED_EXTERNAL_CONTEXT_TEXT_BYTES,
@@ -556,11 +556,12 @@ async fn additional_context_values_are_truncated_before_model_input() -> Result<
     };
     assert_eq!(user_text, "summarize context");
     assert!(external_text.starts_with(&format!(
-        "<external_browser_info>browser-head-{}",
+        "{}\nbrowser-head-{}",
+        external_context_prefix("browser_info"),
         "b".repeat(1024)
     )));
     assert!(external_text.contains("tokens truncated"));
-    assert!(external_text.ends_with("browser-tail</external_browser_info>"));
+    assert!(external_text.ends_with("browser-tail\n</external_context>"));
     assert!(external_text.len() < untruncated_browser_fragment.len());
     assert!(
         external_text.len() <= MAX_EXPECTED_EXTERNAL_CONTEXT_TEXT_BYTES,
@@ -569,4 +570,28 @@ async fn additional_context_values_are_truncated_before_model_input() -> Result<
     );
 
     Ok(())
+}
+
+fn external_context(source: &str, value: &str) -> String {
+    format!(
+        "{}\n{}\n</external_context>",
+        external_context_prefix(source),
+        value
+    )
+}
+
+fn external_context_prefix(source: &str) -> String {
+    format!("<external_context source=\"{source}\" kind=\"untrusted\">")
+}
+
+fn application_context(source: &str, value: &str) -> String {
+    format!(
+        "{}\n{}\n</application_context>",
+        application_context_prefix(source),
+        value
+    )
+}
+
+fn application_context_prefix(source: &str) -> String {
+    format!("<application_context source=\"{source}\" kind=\"application\">")
 }

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import contextlib
 import io
 import json
 import importlib.util
@@ -147,14 +148,16 @@ class BuildToolingTest(unittest.TestCase):
     def test_local_just_shell_restarts_stale_sccache_server_cache_size(self) -> None:
         just_shell = load_just_shell_module()
         calls = []
+        stats_calls = 0
 
         def fake_run(command, **_kwargs):
+            nonlocal stats_calls
             calls.append(command)
-            stdout = (
-                "Max cache size                       10 GiB\n"
-                if command[1:] == ["--show-stats"]
-                else ""
-            )
+            stdout = ""
+            if command[1:] == ["--show-stats"]:
+                stats_calls += 1
+                size = "10 GiB" if stats_calls == 1 else "80 GiB"
+                stdout = f"Max cache size                       {size}\n"
             return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
         restarted = just_shell.ensure_sccache_server_env(
@@ -173,8 +176,45 @@ class BuildToolingTest(unittest.TestCase):
                 ["/tools/sccache", "--show-stats"],
                 ["/tools/sccache", "--stop-server"],
                 ["/tools/sccache", "--start-server"],
+                ["/tools/sccache", "--show-stats"],
             ],
         )
+
+    def test_local_just_shell_does_not_cache_failed_sccache_restart(self) -> None:
+        just_shell = load_just_shell_module()
+        calls = []
+
+        def fake_run(command, **_kwargs):
+            calls.append(command)
+            if command[1:] == ["--show-stats"]:
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout="Max cache size                       10 GiB\n",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(
+                command,
+                9 if command[1:] == ["--start-server"] else 0,
+                stdout="",
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            restarted = just_shell.ensure_sccache_server_env(
+                {
+                    "RUSTC_WRAPPER": "/tools/sccache",
+                    "SCCACHE_CACHE_SIZE": "80G",
+                },
+                which=lambda program: (
+                    f"/tools/{program}" if program == "sccache" else None
+                ),
+                run=fake_run,
+                cache_dir=Path(tmp),
+            )
+
+        self.assertFalse(restarted)
+        self.assertEqual(calls[-1], ["/tools/sccache", "--start-server"])
 
     def test_local_just_shell_caches_matching_sccache_server_cache_size(self) -> None:
         just_shell = load_just_shell_module()
@@ -345,6 +385,19 @@ class BuildToolingTest(unittest.TestCase):
             f"{scripts_bin}{just_shell.os.pathsep}C:/Windows/System32",
         )
 
+    def test_local_just_shell_uses_physical_core_count_for_python(self) -> None:
+        just_shell = load_just_shell_module()
+
+        self.assertEqual(
+            just_shell.python_cpu_env({}),
+            {"PYTHON_CPU_COUNT": "16"},
+        )
+        self.assertEqual(
+            just_shell.python_cpu_env({"PYTHON_CPU_COUNT": "8"}),
+            {},
+        )
+        self.assertEqual(just_shell.python_cpu_env({"CI": "true"}), {})
+
     def test_local_just_shell_keeps_existing_virtualenv(self) -> None:
         just_shell = load_just_shell_module()
 
@@ -412,6 +465,19 @@ class BuildToolingTest(unittest.TestCase):
         self.assertEqual(updates, {})
         self.assertIn("scripts/.venv is missing", stderr.getvalue())
         self.assertEqual(second_stderr.getvalue(), "")
+
+    def test_local_just_shell_rejects_directory_named_like_python(self) -> None:
+        just_shell = load_just_shell_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            python_dir = root / "scripts" / ".venv" / "Scripts" / "python.exe"
+            python_dir.mkdir(parents=True)
+
+            self.assertEqual(
+                just_shell.python_tool_env({}, os_name="nt", repo_root=root),
+                {},
+            )
 
     def test_local_just_shell_tool_probe_has_timeout(self) -> None:
         just_shell = load_just_shell_module()
@@ -505,6 +571,25 @@ class BuildToolingTest(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn("PowerShell 7.4", stderr.getvalue())
 
+    def test_local_just_shell_reports_powershell_launch_failure(self) -> None:
+        just_shell = load_just_shell_module()
+        stderr = io.StringIO()
+
+        with mock.patch.object(
+            just_shell.subprocess, "run", side_effect=OSError("launch failed")
+        ):
+            result = just_shell.run_powershell(
+                "Write-Output hi",
+                "recipe",
+                [],
+                which=lambda _program: "C:/pwsh.exe",
+                can_run=lambda _command: True,
+                stderr=stderr,
+            )
+
+        self.assertEqual(result, 1)
+        self.assertIn("Failed to launch PowerShell", stderr.getvalue())
+
     def test_rust_workspace_uses_upstream_default_members(self) -> None:
         manifest = load_toml(REPO_ROOT / "codex-rs" / "Cargo.toml")
 
@@ -572,10 +657,9 @@ class BuildToolingTest(unittest.TestCase):
         self.assertEqual(
             codex_api["dependencies"]["tokio-tungstenite"], {"workspace": True}
         )
-        # codex-api uses tungstenite only through tokio_tungstenite's re-export,
-        # so it must not carry a direct tungstenite dependency (cargo-shear
-        # would flag it as unused).
-        self.assertNotIn("tungstenite", codex_api["dependencies"])
+        # Extension configuration is imported from tungstenite directly while
+        # stream/message types continue to use tokio-tungstenite's re-export.
+        self.assertEqual(codex_api["dependencies"]["tungstenite"], {"workspace": True})
         self.assertNotIn("features", codex_api)
 
     def test_sqlx_workspace_features_are_shared_by_sqlite_crates(self) -> None:
@@ -816,15 +900,16 @@ class BuildToolingTest(unittest.TestCase):
         self.assertIn("if !samples_dir.exists()", text)
 
     def test_repo_local_skill_tree_is_local_build_focused(self) -> None:
-        allowed = {
+        required = {
             "kd4-crosscheck-and-finish",
+            "kd4-harness",
         }
         skills_dir = REPO_ROOT / ".codex" / "skills"
         if not skills_dir.exists():
             self.skipTest("repo-local skills directory is not materialized")
         actual = {path.name for path in skills_dir.iterdir() if path.is_dir()}
 
-        self.assertEqual(actual, allowed)
+        self.assertTrue(required.issubset(actual))
 
     def test_repo_local_skill_frontmatter_names_match_folders(self) -> None:
         skills_dir = REPO_ROOT / ".codex" / "skills"
@@ -832,6 +917,7 @@ class BuildToolingTest(unittest.TestCase):
             self.skipTest("repo-local skills directory is not materialized")
         skill_dirs = [path for path in skills_dir.iterdir() if path.is_dir()]
         self.assertTrue(skill_dirs, "skills directory exists but contains no skills")
+        frontmatter_names: list[str] = []
         for skill_dir in skill_dirs:
             skill_path = skill_dir / "SKILL.md"
             # A skill directory without SKILL.md is a broken skill, not an
@@ -842,7 +928,12 @@ class BuildToolingTest(unittest.TestCase):
             )
             skill = skill_path.read_text(encoding="utf-8")
 
-            self.assertIn(f"name: {skill_dir.name}\n", skill)
+            name_lines = [
+                line for line in skill.splitlines() if line.startswith("name: ")
+            ]
+            self.assertEqual(len(name_lines), 1, f"invalid skill name in {skill_path}")
+            frontmatter_names.append(name_lines[0].removeprefix("name: ").strip())
+        self.assertEqual(len(frontmatter_names), len(set(frontmatter_names)))
 
     def test_agents_skill_inventory_matches_local_build_tree(self) -> None:
         agents = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
@@ -855,31 +946,11 @@ class BuildToolingTest(unittest.TestCase):
         skill_names = sorted(
             path.name for path in skills_dir.iterdir() if path.is_dir()
         )
-        self.assertEqual(
-            skill_names,
-            [
-                "kd4-crosscheck-and-finish",
-            ],
-        )
+        self.assertIn("kd4-crosscheck-and-finish", skill_names)
+        self.assertIn("kd4-harness", skill_names)
         self.assertIn("`.codex/skills`", agents)
-        for phrase in (
-            "fork-local skills",
-            "crosscheck-and-finish",
-        ):
+        for phrase in ("fork-local skills", "validation workflows"):
             self.assertIn(phrase, normalized)
-        self.assertNotIn(
-            "skills for brainstorm, current data refresh, and local Codex "
-            "update/rebuild workflows",
-            normalized,
-        )
-        for removed in (
-            "PR babysitting",
-            "Codex bug/issue triage",
-            "PR body editing",
-            "remote tests",
-            "V8 updates",
-        ):
-            self.assertNotIn(removed, agents)
 
     def test_agents_mentions_current_checkout_not_stale_codexkd_path(self) -> None:
         text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
@@ -904,17 +975,17 @@ class BuildToolingTest(unittest.TestCase):
         text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         normalized = " ".join(text.split())
 
-        self.assertIn("## Validation map", text)
-        self.assertIn("Rust crate changes", text)
-        self.assertIn("Script changes", text)
-        self.assertIn("Local publish changes", text)
+        self.assertIn("## Validation and local-build proof", text)
+        self.assertIn("Rust crates", text)
+        self.assertIn("Scripts", text)
+        self.assertIn("Local publish", text)
         self.assertIn("do not hand-edit generated locks", normalized)
 
     def test_agents_scripts_policy_is_nested_and_discoverable(self) -> None:
         root_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         scripts_text = (REPO_ROOT / "scripts" / "AGENTS.md").read_text(encoding="utf-8")
 
-        self.assertIn("and `scripts/AGENTS.md`", root_text)
+        self.assertIn("`scripts/AGENTS.md`", root_text)
         self.assertIn("# Scripts Policy", scripts_text)
         self.assertIn("Root maintenance commands", scripts_text)
         self.assertIn("root_maintenance.py", scripts_text)
@@ -997,6 +1068,41 @@ class BuildToolingTest(unittest.TestCase):
             root_maintenance.test_module_for_changed_path("docs/example.md"),
             None,
         )
+        self.assertEqual(
+            root_maintenance.test_modules_for_changed_path(
+                "scripts/publish-local-codex.ps1"
+            ),
+            ("scripts.test_publish_local_codex",),
+        )
+        self.assertEqual(
+            root_maintenance.test_modules_for_changed_path(
+                "scripts/publish-local-codex-wsl.sh"
+            ),
+            (
+                "scripts.test_dev_environment",
+                "scripts.test_publish_local_codex",
+            ),
+        )
+
+    def test_root_maintenance_git_paths_use_nul_delimiters(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+        completed = subprocess.CompletedProcess(
+            ["git"],
+            0,
+            stdout="scripts/line\nbreak.py\0scripts/ trailing .py\0",
+            stderr="",
+        )
+
+        with mock.patch.object(
+            root_maintenance.subprocess, "run", return_value=completed
+        ) as run:
+            paths = root_maintenance.git_changed_paths()
+
+        self.assertEqual(
+            paths,
+            ["scripts/line\nbreak.py", "scripts/ trailing .py"],
+        )
+        self.assertIn("-z", run.call_args.args[0])
 
     def test_root_maintenance_uv_commands_use_frozen_lock(self) -> None:
         root_maintenance = load_root_maintenance_module()
@@ -1118,10 +1224,10 @@ class BuildToolingTest(unittest.TestCase):
         normalized = " ".join(text.split())
 
         self.assertIn(
-            "Validation tooling passing does not prove a",
+            "Tooling success alone does not prove a",
             text,
         )
-        self.assertIn("focused failing test or approved final gate passes", normalized)
+        self.assertIn("focused failing test or approved final gate", normalized)
 
     def test_local_rust_loop_recipes_are_discoverable(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1230,6 +1336,16 @@ class BuildToolingTest(unittest.TestCase):
         self.assertNotIn('-CommandLine (("cargo', justfile)
         self.assertNotIn("[string]$CommandLine", perf_env)
         self.assertNotIn("cmd.exe /d /s /c", perf_env)
+
+    def test_remote_env_setup_quotes_container_paths_and_tracks_ownership(self) -> None:
+        remote_env = (REPO_ROOT / "scripts" / "test-remote-env.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("cleanup_remote_env_setup_failure", remote_env)
+        self.assertIn("CODEX_TEST_REMOTE_EXEC_SERVER_MANAGED", remote_env)
+        self.assertIn('nohup "$remote_codex" exec-server', remote_env)
+        self.assertNotIn("nohup ${remote_codex_path} exec-server", remote_env)
 
     @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
     def test_perf_env_no_sccache_leaves_incremental_and_uses_lane(self) -> None:
@@ -1341,6 +1457,97 @@ class BuildToolingTest(unittest.TestCase):
         self.assertIn(f"--target-dir {explicit_target}", result.stdout)
         self.assertNotIn("stale-target-env", result.stdout)
         self.assertNotIn("perf-explicit-target", result.stdout)
+
+    @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
+    def test_perf_env_rejects_dot_path_lane_names(self) -> None:
+        shell = pwsh_only()
+        if shell is None:
+            self.skipTest("pwsh is not available")
+        script = REPO_ROOT / "scripts" / "invoke-rust-perf-env.ps1"
+
+        result = subprocess.run(
+            [
+                shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                (
+                    f"$programArgs = @({ps_single_quote(shell)}, '-NoProfile', "
+                    "'-Command', 'exit 0'); "
+                    f"& {ps_single_quote(script)} -CargoTargetLane '..' "
+                    f"-WorkingDirectory {ps_single_quote(REPO_ROOT)} "
+                    "-ProgramArgs $programArgs"
+                ),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Cargo target lane", result.stderr)
+
+    @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
+    def test_perf_env_keeps_same_length_cargo_watch_rewrite(self) -> None:
+        shell = pwsh_only()
+        if shell is None:
+            self.skipTest("pwsh is not available")
+        script = REPO_ROOT / "scripts" / "invoke-rust-perf-env.ps1"
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            temp_root = Path(tempdir)
+            fake_bin = temp_root / "bin"
+            fake_bin.mkdir()
+            (fake_bin / "cargo.cmd").write_text(
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        "if defined CARGO_TARGET_DIR (echo targetenv=%CARGO_TARGET_DIR%) else echo targetenv=",
+                        "echo cargo-args:%*",
+                        "exit /b 0",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+            env["CARGO_TARGET_DIR"] = "stale-target-env"
+
+            result = subprocess.run(
+                [
+                    shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    (
+                        "$programArgs = @('cargo', 'watch', '-x', "
+                        "'test -- --nocapture'); "
+                        f"& {ps_single_quote(script)} "
+                        "-CargoTargetLane 'perf watch' "
+                        f"-WorkingDirectory {ps_single_quote(REPO_ROOT)} "
+                        "-ProgramArgs $programArgs; exit $LASTEXITCODE"
+                    ),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+                creationflags=CREATE_NO_WINDOW,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("targetenv=", result.stdout)
+        self.assertNotIn("targetenv=stale-target-env", result.stdout)
+        self.assertIn("--target-dir", result.stdout)
+        self.assertIn(" -- --nocapture", result.stdout)
 
     @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
     def test_perf_env_non_native_success_does_not_use_stale_last_exit_code(
@@ -1647,26 +1854,28 @@ class BuildToolingTest(unittest.TestCase):
             ".codex/AGENTS.md",
             "AGENTS.md",
             "codex-rs/AGENTS.md",
-            "codex-rs/app-server-protocol/AGENTS.md",
-            "codex-rs/app-server/AGENTS.md",
-            "codex-rs/apply-patch/AGENTS.md",
-            "codex-rs/config/AGENTS.md",
             "codex-rs/core/AGENTS.md",
+            "codex-rs/prompts/AGENTS.md",
+            "codex-rs/protocol/AGENTS.md",
             "codex-rs/shell-command/AGENTS.md",
-            "codex-rs/shell-escalation/AGENTS.md",
-            "codex-rs/tools/AGENTS.md",
-            "codex-rs/tui/AGENTS.md",
+            "codex-rs/tui/src/bottom_pane/AGENTS.md",
             "scripts/AGENTS.md",
+            "scripts/codex_package/AGENTS.md",
+            "scripts/install/AGENTS.md",
         ]
-        missing_agent_files = [
-            path for path in expected_agent_files if not (REPO_ROOT / path).is_file()
-        ]
+        actual_agent_files = sorted(
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in REPO_ROOT.rglob("AGENTS.md")
+            if ".git" not in path.parts
+        )
         root_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        normalized_root = " ".join(root_text.split())
 
-        self.assertEqual(missing_agent_files, [])
-        self.assertIn("This repo currently has this root `AGENTS.md`", root_text)
-        self.assertIn("Do not refer to nested `AGENTS.md` files", root_text)
-        self.assertIn("unless they are present in the working", root_text)
+        self.assertEqual(actual_agent_files, sorted(expected_agent_files))
+        self.assertIn("further nested files apply only where present", normalized_root)
+        self.assertIn(
+            "Never rely on an instruction file that is absent", normalized_root
+        )
 
     def test_rust_build_doctor_reports_cache_linker_and_contention(self) -> None:
         report = rust_build_status.build_doctor_report(
@@ -1857,6 +2066,13 @@ class BuildToolingTest(unittest.TestCase):
             self.assertTrue(locked.exists())
             self.assertFalse(stale.exists())
 
+    def test_unreadable_lock_files_are_treated_as_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lane = Path(temp_dir)
+            with mock.patch.object(Path, "stat", side_effect=PermissionError("denied")):
+                self.assertTrue(rust_build_status.cargo_lock_is_busy(lane))
+                self.assertTrue(rust_build_status.lane_active_lock_is_held(lane))
+
     def test_prune_rechecks_lane_lock_before_delete(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = Path(temp_dir)
@@ -1882,6 +2098,83 @@ class BuildToolingTest(unittest.TestCase):
 
             self.assertEqual(removed, [])
             self.assertTrue(lane.exists())
+
+    def test_prune_rechecks_active_reservation_before_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            lane = repo_root / "codex-rs" / "target" / "lanes" / "late-reserved"
+            lane.mkdir(parents=True)
+            snapshot = rust_build_status.BuildStatusSnapshot.collect(
+                repo_root=repo_root,
+                processes=[],
+            )
+
+            with mock.patch.object(
+                rust_build_status, "lane_active_lock_is_held", return_value=True
+            ):
+                removed = rust_build_status.prune_stale_lanes(
+                    repo_root=repo_root,
+                    snapshot=snapshot,
+                    keep_warm_per_base=0,
+                    max_age_days=None,
+                )
+
+            self.assertEqual(removed, [])
+            self.assertTrue(lane.exists())
+
+    def test_prune_skips_path_that_becomes_indirect(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            lane = repo_root / "codex-rs" / "target" / "lanes" / "racy"
+            lane.mkdir(parents=True)
+
+            with (
+                mock.patch.object(
+                    rust_build_status, "prunable_lane_dirs", return_value=[lane]
+                ),
+                mock.patch.object(
+                    rust_build_status,
+                    "is_indirect_directory",
+                    side_effect=[False, True],
+                ),
+                mock.patch.object(
+                    rust_build_status, "cargo_lock_is_busy", return_value=False
+                ),
+                mock.patch.object(
+                    rust_build_status,
+                    "lane_active_lock_is_held",
+                    return_value=False,
+                ),
+            ):
+                removed = rust_build_status.prune_stale_lanes(
+                    repo_root=repo_root,
+                    keep_warm_per_base=0,
+                    max_age_days=None,
+                )
+
+            self.assertEqual(removed, [])
+            self.assertTrue(lane.exists())
+
+    def test_prune_strays_skips_indirect_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            stray = repo_root / "codex-rs" / "target" / "stray"
+            stray.mkdir(parents=True)
+
+            with (
+                mock.patch.object(
+                    rust_build_status, "stray_cargo_target_dirs", return_value=[stray]
+                ),
+                mock.patch.object(
+                    rust_build_status, "is_indirect_directory", return_value=True
+                ),
+            ):
+                removed = rust_build_status.prune_stray_cargo_target_dirs(
+                    repo_root=repo_root
+                )
+
+            self.assertEqual(removed, [])
+            self.assertTrue(stray.exists())
 
     def test_prune_stale_lanes_keeps_two_newest_warm_lanes_per_base(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2000,6 +2293,21 @@ class BuildToolingTest(unittest.TestCase):
     def test_lane_size_workers_are_capped(self) -> None:
         self.assertEqual(rust_build_status.bounded_size_workers(99, 10), 4)
         self.assertEqual(rust_build_status.bounded_size_workers(2, 1), 1)
+
+    def test_prune_cli_rejects_destructive_negative_budgets(self) -> None:
+        for option, value in (
+            ("--keep-warm-per-base", "-1"),
+            ("--max-age-days", "-1"),
+            ("--max-lane-gib", "-1"),
+            ("--max-lane-bytes", "-1"),
+            ("--size-workers", "0"),
+        ):
+            with (
+                self.subTest(option=option),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                rust_build_status.main(["prune", option, value])
 
     def test_lane_regexes_use_shared_tooling_patterns(self) -> None:
         self.assertEqual(

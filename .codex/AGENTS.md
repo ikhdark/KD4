@@ -14,6 +14,7 @@ Keep durable, reviewable guidance and source files separate from runtime state.
 
 Durable files include, when present:
 
+- `.codex/.gitignore`
 - `.codex/AGENTS.md`
 - `.codex/environments/README.md`
 - `.codex/environments/setup.py`
@@ -33,10 +34,15 @@ Generated or local runtime state includes:
 - `.codex/app-asar-backups/**`
 - `.codex/app-asar-work/**`, except durable instructions explicitly kept there
 - `.codex/codex-desktop-patched/**`
+- `.codex/wiring-guard/**`
 
 Do not hand-edit generated or runtime-state files unless the task is explicitly
 to inspect, repair, or reset that local state. Do not treat state or cache files
 as durable evidence that belongs in a patch.
+
+Keep `.codex/.gitignore` limited to paths that are wholly generated or local.
+Do not blanket-ignore mixed paths such as `.codex/app-asar-work`, where durable
+instructions may be kept intentionally.
 
 ## Environment setup
 

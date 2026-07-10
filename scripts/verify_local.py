@@ -382,8 +382,8 @@ def is_ancestor(base: str, head: str = "HEAD") -> bool:
     )
 
 
-def normalize_path(value: str) -> Path:
-    raw = value.strip().strip('"')
+def normalize_path(value: str, *, strip_outer: bool = True) -> Path:
+    raw = value.strip().strip('"') if strip_outer else value
     if raw.startswith("file:"):
         parsed = urlparse(raw)
         raw = unquote(parsed.path)
@@ -399,11 +399,11 @@ def normalize_path(value: str) -> Path:
         raise ValueError(f"path is outside repository: {value}") from exc
 
 
-def normalize_paths(values: Iterable[str]) -> list[Path]:
+def normalize_paths(values: Iterable[str], *, strip_outer: bool = True) -> list[Path]:
     seen: set[str] = set()
     result: list[Path] = []
     for value in values:
-        path = normalize_path(value)
+        path = normalize_path(value, strip_outer=strip_outer)
         key = path.as_posix().lower() if os.name == "nt" else path.as_posix()
         if key not in seen:
             seen.add(key)
@@ -434,8 +434,11 @@ def git_name_list(args: Sequence[str]) -> list[Path]:
     # core.quotepath=off keeps non-ASCII filenames as raw UTF-8 instead of
     # C-quoted octal escapes, which normalize_path would mangle into garbage
     # multi-component paths.
-    output = git(["-c", "core.quotepath=off", *args], check=False)
-    return normalize_paths(line for line in output.splitlines() if line.strip())
+    output = git(["-c", "core.quotepath=off", *args, "-z"], check=False)
+    delimiter = "\0" if "\0" in output else "\n"
+    return normalize_paths(
+        (path for path in output.split(delimiter) if path), strip_outer=False
+    )
 
 
 def staged_files() -> list[Path]:
@@ -1051,7 +1054,7 @@ def justfile_check_command(scope: Scope) -> CommandSpec | None:
 
 
 def script_validation_commands(scope: Scope) -> list[CommandSpec]:
-    from scripts.root_maintenance import test_module_for_changed_path
+    from scripts.root_maintenance import test_modules_for_changed_path
 
     paths = script_paths(scope)
     ps_paths = powershell_script_paths(scope)
@@ -1104,8 +1107,8 @@ def script_validation_commands(scope: Scope) -> list[CommandSpec]:
         )
     test_paths = [
         path
-        for path in paths
-        if test_module_for_changed_path(path.as_posix()) is not None
+        for path in (*paths, *ps_paths, *sh_paths)
+        if test_modules_for_changed_path(path.as_posix())
     ]
     if not test_paths and control_paths:
         commands.append(
@@ -1153,9 +1156,11 @@ def needs_prettier_formatter(path: Path) -> bool:
         in {"package.json", "knip.json", "pnpm-workspace.yaml", "eslint.config.mjs"}
         or fnmatch.fnmatch(text, "docs/*.md")
         or fnmatch.fnmatch(text, ".github/workflows/*.yml")
-        or fnmatch.fnmatch(text, "codex-cli/**/*.js")
-        or fnmatch.fnmatch(text, "sdk/typescript/**/*.js")
-        or fnmatch.fnmatch(text, "sdk/typescript/**/*.ts")
+        or (text.startswith("codex-cli/") and text.endswith(".js"))
+        or (
+            text.startswith("sdk/typescript/")
+            and (text.endswith(".js") or text.endswith(".ts"))
+        )
     )
 
 
@@ -1884,7 +1889,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv or sys.argv[1:])
+    args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
         graph = load_cargo_metadata()
         rules = load_rules()

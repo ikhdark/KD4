@@ -9,6 +9,7 @@ use super::RequestPermissionProfile;
 use super::UserInput;
 use super::shared::v2_enum_from_core;
 use crate::protocol::item_builders::command_actions_for_path_uri;
+use crate::protocol::item_builders::command_display_string;
 use crate::protocol::item_builders::convert_patch_changes;
 use crate::protocol::item_builders::review_output_text;
 use codex_experimental_api_macros::ExperimentalApi;
@@ -40,7 +41,6 @@ use codex_protocol::protocol::GuardianUserAuthorization as CoreGuardianUserAutho
 use codex_protocol::protocol::PatchApplyStatus as CorePatchApplyStatus;
 use codex_protocol::protocol::ReviewDecision as CoreReviewDecision;
 use codex_protocol::protocol::SubAgentActivityKind as CoreSubAgentActivityKind;
-use codex_shell_command::parse_command::shlex_join;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::LegacyAppPathString;
 use schemars::JsonSchema;
@@ -842,7 +842,7 @@ impl From<CoreTurnItem> for ThreadItem {
             },
             CoreTurnItem::CommandExecution(command) => ThreadItem::CommandExecution {
                 id: command.id,
-                command: shlex_join(&command.command),
+                command: command_display_string(&command.command),
                 cwd: command.cwd.clone().into(),
                 process_id: command.process_id,
                 source: command.source.into(),

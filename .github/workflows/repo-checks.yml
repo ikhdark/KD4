@@ -73,10 +73,10 @@ jobs:
           name: codex-npm-staging
           path: ${{ steps.stage_npm_package.outputs.pack_output }}
 
-      - name: Ensure root README.md contains only ASCII and certain Unicode code points
-        run: ./scripts/asciicheck.py README.md
-      - name: Check root README ToC
-        run: python3 scripts/readme_toc.py README.md
+      - name: Ensure root SOURCEMAP.md contains only ASCII and allowed Unicode
+        run: ./scripts/asciicheck.py SOURCEMAP.md
+      - name: Check root source map ToC
+        run: python3 scripts/readme_toc.py SOURCEMAP.md
 
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0

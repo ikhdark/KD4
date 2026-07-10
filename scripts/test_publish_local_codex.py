@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import base64
 from datetime import datetime, timezone
 import json
 from pathlib import Path
@@ -72,10 +71,35 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
         self.assertIn('$sourceSha256Mode = "hashed"', publish_script)
         self.assertIn("$sourceSha256 = Get-FileSha256 $SourceExe", publish_script)
         self.assertIn(
+            "$sourceCodeModeHostSha256 = Get-FileSha256 $SourceCodeModeHostExe",
+            publish_script,
+        )
+        self.assertIn(
             "$targetBeforeSha256 = Get-FileSha256 $targetPath", publish_script
+        )
+        self.assertIn(
+            "$codeModeHostTargetBeforeSha256 = Get-FileSha256 $codeModeHostTargetPath",
+            publish_script,
         )
         self.assertNotIn("Get-FileSha256Cached $SourceExe", publish_script)
         self.assertNotIn("Get-FileSha256Cached $targetPath", publish_script)
+        self.assertIn("$sourceSha256,\n            $targetSha256", publish_script)
+        self.assertIn(
+            'Write-ProofLine "codexPostPublishVerify" "sha256 ok"', publish_script
+        )
+        self.assertIn("running-target process detection failed", publish_script)
+
+    def test_publish_build_includes_cli_and_code_mode_host_packages(self) -> None:
+        publish_script = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            '$publishPackages = @("-p", "codex-cli", "-p", "codex-code-mode-host")',
+            publish_script,
+        )
+        self.assertIn("Get-BuiltCodeModeHostPath", publish_script)
+        self.assertIn(
+            'Join-Path $InstallDir "codex-code-mode-host.exe"', publish_script
+        )
 
     @unittest.skipUnless(os.name == "nt", "PowerShell helper is Windows-only")
     def test_hashing_helper_initializes_cache_state_when_dot_sourced_directly(
@@ -91,6 +115,11 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
             cache_dir = temp_path / "cache"
             source.write_bytes(b"codex")
             expected = hashlib.sha256(source.read_bytes()).hexdigest()
+            cache_dir.mkdir()
+            legacy_cache = cache_dir / "legacy-path-key.sha256.json"
+            legacy_cache.write_text(
+                json.dumps({"path": str(source.resolve())}), encoding="utf-8"
+            )
 
             result = subprocess.run(
                 [
@@ -114,6 +143,11 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
                 check=False,
                 creationflags=CREATE_NO_WINDOW,
             )
+            cache_names = sorted(path.name for path in cache_dir.iterdir())
+            expected_cache_name = (
+                hashlib.sha256(str(source.resolve()).encode("utf-8")).hexdigest()
+                + ".sha256.json"
+            )
 
         self.assertEqual(
             result.returncode,
@@ -121,6 +155,8 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertEqual(result.stdout.strip(), expected)
+        self.assertEqual(cache_names, [expected_cache_name])
+        self.assertEqual(len(expected_cache_name), 76)
 
     def test_publish_script_uses_global_publish_mutex(self) -> None:
         publish_script = SCRIPT.read_text(encoding="utf-8")
@@ -283,6 +319,11 @@ class PublishLocalCodexTest(unittest.TestCase):
         self.repo_root = Path(self.repo_temp.name) / "repo"
         self.repo_root.mkdir()
         (self.repo_root / "codex-rs").mkdir()
+        self.source_code_mode_host = (
+            Path(self.repo_temp.name) / "fixture-code-mode-host.exe"
+        )
+        self.source_code_mode_host_bytes = b"codex-code-mode-host-test-fixture"
+        self.source_code_mode_host.write_bytes(self.source_code_mode_host_bytes)
         self.repo_fixture_initialized = False
 
     def init_repo_fixture(self) -> None:
@@ -446,9 +487,20 @@ class PublishLocalCodexTest(unittest.TestCase):
     def assert_no_publish_temps(self, install_dir: Path) -> None:
         self.assertEqual(list(install_dir.glob(".codex-local-publish.*.tmp")), [])
 
+    def install_matching_code_mode_host(
+        self,
+        install_dir: Path,
+        *,
+        timestamp: float | None = None,
+    ) -> Path:
+        target = install_dir / "codex-code-mode-host.exe"
+        target.write_bytes(self.source_code_mode_host_bytes)
+        if timestamp is not None:
+            os.utime(target, (timestamp, timestamp))
+        return target
+
     def hash_cache_path(self, path: Path) -> Path:
-        encoded = base64.b64encode(str(path.resolve()).encode("utf-8")).decode("ascii")
-        safe_name = "".join("_" if char in "+/=" else char for char in encoded)
+        safe_name = hashlib.sha256(str(path.resolve()).encode("utf-8")).hexdigest()
         return (
             self.repo_root
             / "codex-rs"
@@ -500,6 +552,11 @@ class PublishLocalCodexTest(unittest.TestCase):
         *args: str,
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        publish_args = list(self.publish_args(args))
+        if "-SourceCodeModeHostExe" not in publish_args:
+            publish_args.extend(
+                ["-SourceCodeModeHostExe", str(self.source_code_mode_host)]
+            )
         return subprocess.run(
             [
                 self.shell,
@@ -508,7 +565,7 @@ class PublishLocalCodexTest(unittest.TestCase):
                 "Bypass",
                 "-File",
                 str(SCRIPT),
-                *self.publish_args(args),
+                *publish_args,
             ],
             text=True,
             capture_output=True,
@@ -538,7 +595,17 @@ class PublishLocalCodexTest(unittest.TestCase):
             self.assertIn("DRY-RUN", result.stdout)
             self.assertIn("sourceSha256:", result.stdout)
             self.assertIn("targetPath:", result.stdout)
+            self.assertIn(
+                f"sourceCodeModeHostPath: {self.source_code_mode_host}", result.stdout
+            )
+            self.assertIn(
+                f"codeModeHostTargetPath: {install_dir / 'codex-code-mode-host.exe'}",
+                result.stdout,
+            )
+            self.assertIn("sourceCodeModeHostSha256:", result.stdout)
+            self.assertIn("codeModeHostTargetBeforeSha256: <missing>", result.stdout)
             self.assertFalse((install_dir / "codex.exe").exists())
+            self.assertFalse((install_dir / "codex-code-mode-host.exe").exists())
 
     def test_dry_run_allows_missing_default_source_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -961,6 +1028,7 @@ class PublishLocalCodexTest(unittest.TestCase):
             target = install_dir / "codex.exe"
             target.write_bytes(fake_codex.read_bytes())
             os.utime(target, (stale_timestamp, stale_timestamp))
+            self.install_matching_code_mode_host(install_dir)
 
             result = self.run_script(
                 "-DryRun",
@@ -1052,7 +1120,7 @@ class PublishLocalCodexTest(unittest.TestCase):
             self.assertIn("replace: blocked: source build stale", result.stdout)
             self.assertIn("restartRequired: unknown until rebuild", result.stdout)
             self.assertIn(
-                "SkipBuild cannot publish the newest Codex app payload",
+                "SkipBuild cannot publish the newest Codex bundle",
                 result.stderr,
             )
 
@@ -1069,6 +1137,7 @@ class PublishLocalCodexTest(unittest.TestCase):
             target = install_dir / "codex.exe"
             target.write_bytes(fake_codex.read_bytes())
             os.utime(target, (source_timestamp, source_timestamp))
+            self.install_matching_code_mode_host(install_dir)
 
             result = self.run_script(
                 "-SkipBuild",
@@ -1094,6 +1163,55 @@ class PublishLocalCodexTest(unittest.TestCase):
                 "skipped: target already current",
             )
             self.assert_proof_value(result.stdout, "restartRequired", "false")
+            self.assert_no_publish_temps(install_dir)
+
+    def test_apply_repairs_missing_code_mode_host_without_replacing_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            install_dir = temp_path / "install"
+            install_dir.mkdir()
+            fake_codex = self.copy_valid_codex(
+                temp_path / "fake-codex.exe",
+                timestamp=FRESH_SOURCE_TIME,
+            )
+            target = install_dir / "codex.exe"
+            target.write_bytes(fake_codex.read_bytes())
+            os.utime(target, (FRESH_SOURCE_TIME, FRESH_SOURCE_TIME))
+            code_mode_host_target = install_dir / "codex-code-mode-host.exe"
+
+            result = self.run_script(
+                "-SkipBuild",
+                "-SourceExe",
+                str(fake_codex),
+                "-InstallDir",
+                str(install_dir),
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(target.read_bytes(), fake_codex.read_bytes())
+            self.assertEqual(
+                code_mode_host_target.read_bytes(), self.source_code_mode_host_bytes
+            )
+            self.assert_proof_value(result.stdout, "codexBinaryChanged", "false")
+            self.assert_proof_value(result.stdout, "codeModeHostBinaryChanged", "true")
+            self.assert_proof_value(result.stdout, "binaryChanged", "true")
+            self.assert_proof_value(
+                result.stdout, "backupSha256", "<none: target already current>"
+            )
+            self.assert_proof_value(
+                result.stdout,
+                "codeModeHostBackupSha256",
+                "<none: target missing>",
+            )
+            self.assert_proof_value(
+                result.stdout, "codeModeHostPostPublishVerify", "sha256 ok"
+            )
+            self.assert_proof_value(result.stdout, "restartRequired", "true")
+            self.assertFalse((install_dir / "backups").exists())
             self.assert_no_publish_temps(install_dir)
 
     def test_same_size_mtime_different_content_requires_replacement(self) -> None:
@@ -1204,6 +1322,38 @@ class PublishLocalCodexTest(unittest.TestCase):
             )
             self.assertIn("buildCommand: <skipped>", result.stdout)
             self.assertIn("sourceBuildStale: False", result.stdout)
+
+    def test_auto_skip_build_requires_code_mode_host_artifact(self) -> None:
+        self.init_repo_fixture()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            install_dir = temp_path / "install"
+            fake_codex = self.write_fake_codex(
+                temp_path / "fake-codex.cmd",
+                timestamp=FRESH_SOURCE_TIME,
+            )
+            missing_host = temp_path / "missing-code-mode-host.exe"
+
+            result = self.run_script(
+                "-DryRun",
+                "-AutoSkipBuild",
+                "-SourceExe",
+                str(fake_codex),
+                "-SourceCodeModeHostExe",
+                str(missing_host),
+                "-InstallDir",
+                str(install_dir),
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertIn("autoSkipBuild: false", result.stdout)
+            self.assertIn("autoSkipBuildReason: source artifact missing", result.stdout)
+            self.assertIn("buildCommand: cargo --config", result.stdout)
+            self.assertIn("-p codex-cli -p codex-code-mode-host", result.stdout)
 
     def test_auto_skip_build_does_not_skip_when_freshness_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1553,6 +1703,7 @@ class PublishLocalCodexTest(unittest.TestCase):
             target = install_dir / "codex.exe"
             target.write_bytes(fake_codex.read_bytes())
             os.utime(target, (source_timestamp, source_timestamp))
+            self.install_matching_code_mode_host(install_dir)
 
             result = self.run_script(
                 "-DryRun",
@@ -1590,6 +1741,7 @@ class PublishLocalCodexTest(unittest.TestCase):
             target = install_dir / "codex.exe"
             target.write_bytes(fake_codex.read_bytes())
             os.utime(target, (source_timestamp, source_timestamp))
+            self.install_matching_code_mode_host(install_dir)
 
             result = self.run_script(
                 "-SkipBuild",
@@ -1932,6 +2084,9 @@ class PublishLocalCodexTest(unittest.TestCase):
             )
             target = install_dir / "codex.exe"
             target.write_bytes(b"previous-codex")
+            code_mode_host_target = install_dir / "codex-code-mode-host.exe"
+            previous_code_mode_host = b"previous-code-mode-host"
+            code_mode_host_target.write_bytes(previous_code_mode_host)
 
             result = self.run_script(
                 "-SkipBuild",
@@ -1947,14 +2102,35 @@ class PublishLocalCodexTest(unittest.TestCase):
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
             self.assertEqual(target.read_bytes(), fake_codex.read_bytes())
-            backups = sorted((install_dir / "backups").glob("codex-*.exe"))
+            self.assertEqual(
+                code_mode_host_target.read_bytes(), self.source_code_mode_host_bytes
+            )
+            backups = sorted((install_dir / "backups").glob("codex-2*.exe"))
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_bytes(), b"previous-codex")
+            code_mode_host_backups = sorted(
+                (install_dir / "backups").glob("codex-code-mode-host-*.exe")
+            )
+            self.assertEqual(len(code_mode_host_backups), 1)
+            self.assertEqual(
+                code_mode_host_backups[0].read_bytes(), previous_code_mode_host
+            )
             previous_sha256 = hashlib.sha256(b"previous-codex").hexdigest()
+            previous_code_mode_host_sha256 = hashlib.sha256(
+                previous_code_mode_host
+            ).hexdigest()
             self.assertIn("targetSha256:", result.stdout)
             self.assertIn(f"backupSha256: {previous_sha256}", result.stdout)
+            self.assertIn("codeModeHostTargetSha256:", result.stdout)
+            self.assertIn(
+                f"codeModeHostBackupSha256: {previous_code_mode_host_sha256}",
+                result.stdout,
+            )
             self.assertIn("backupPath:", result.stdout)
+            self.assertIn("codeModeHostBackupPath:", result.stdout)
             self.assertIn("postPublishVerify: version ok", result.stdout)
+            self.assertIn("codexPostPublishVerify: sha256 ok", result.stdout)
+            self.assertIn("codeModeHostPostPublishVerify: sha256 ok", result.stdout)
             self.assertRegex(
                 result.stdout,
                 r"targetBeforeVersion: <unavailable: [^\r\n]+>[\r\n]",
@@ -1998,6 +2174,43 @@ class PublishLocalCodexTest(unittest.TestCase):
             self.assertIn("backupPruned:", result.stdout)
             self.assert_no_publish_temps(install_dir)
 
+    def test_host_only_publish_does_not_reserve_nonexistent_codex_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            install_dir = temp_path / "install"
+            backup_dir = install_dir / "backups"
+            backup_dir.mkdir(parents=True)
+            for index in range(10):
+                (backup_dir / f"codex-20000101T0000{index:02d}000Z.exe").write_bytes(
+                    f"backup-{index}".encode("utf-8")
+                )
+
+            fake_codex = self.copy_valid_codex(
+                temp_path / "fake-codex.exe",
+                timestamp=FRESH_SOURCE_TIME,
+            )
+            target = install_dir / "codex.exe"
+            target.write_bytes(fake_codex.read_bytes())
+            os.utime(target, (FRESH_SOURCE_TIME, FRESH_SOURCE_TIME))
+            (install_dir / "codex-code-mode-host.exe").write_bytes(b"old-host")
+
+            result = self.run_script(
+                "-SkipBuild",
+                "-SourceExe",
+                str(fake_codex),
+                "-InstallDir",
+                str(install_dir),
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(len(list(backup_dir.glob("codex-2*.exe"))), 10)
+            self.assert_proof_value(result.stdout, "codexBinaryChanged", "false")
+            self.assert_proof_value(result.stdout, "codeModeHostBinaryChanged", "true")
+
     def test_apply_rolls_back_when_published_binary_fails_version_check(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -2010,6 +2223,9 @@ class PublishLocalCodexTest(unittest.TestCase):
             previous = b"previous-codex"
             target = install_dir / "codex.exe"
             target.write_bytes(previous)
+            previous_code_mode_host = b"previous-code-mode-host"
+            code_mode_host_target = install_dir / "codex-code-mode-host.exe"
+            code_mode_host_target.write_bytes(previous_code_mode_host)
 
             result = self.run_script(
                 "-SkipBuild",
@@ -2021,11 +2237,22 @@ class PublishLocalCodexTest(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(target.read_bytes(), previous)
-            backups = sorted((install_dir / "backups").glob("codex-*.exe"))
+            self.assertEqual(
+                code_mode_host_target.read_bytes(), previous_code_mode_host
+            )
+            backups = sorted((install_dir / "backups").glob("codex-2*.exe"))
             self.assertEqual(len(backups), 1)
             self.assertEqual(backups[0].read_bytes(), previous)
+            code_mode_host_backups = sorted(
+                (install_dir / "backups").glob("codex-code-mode-host-*.exe")
+            )
+            self.assertEqual(len(code_mode_host_backups), 1)
+            self.assertEqual(
+                code_mode_host_backups[0].read_bytes(), previous_code_mode_host
+            )
             self.assertIn("rollback: requested:", result.stdout)
             self.assertIn("rollbackResult: restored backup", result.stdout)
+            self.assertIn("codeModeHostRollbackResult: restored backup", result.stdout)
             self.assertIn(
                 "Published Codex binary failed --version verification",
                 result.stderr,
@@ -2071,6 +2298,7 @@ class PublishLocalCodexTest(unittest.TestCase):
             self.assertIn("rollback: requested:", result.stdout)
             self.assertIn("rollbackResult: restored backup", result.stdout)
             self.assertNotIn("backupPruned:", result.stdout)
+            self.assertFalse((install_dir / "codex-code-mode-host.exe").exists())
             self.assert_no_publish_temps(install_dir)
 
     def test_apply_rolls_back_new_target_when_verification_fails(self) -> None:
@@ -2094,10 +2322,15 @@ class PublishLocalCodexTest(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse(target.exists())
+            self.assertFalse((install_dir / "codex-code-mode-host.exe").exists())
             self.assertIn("backupPath: <none: target missing>", result.stdout)
             self.assertIn("rollback: requested:", result.stdout)
             self.assertIn(
                 "rollbackResult: removed newly published target", result.stdout
+            )
+            self.assertIn(
+                "codeModeHostRollbackResult: removed newly published target",
+                result.stdout,
             )
             self.assert_no_publish_temps(install_dir)
 
@@ -2142,6 +2375,57 @@ class PublishLocalCodexTest(unittest.TestCase):
                 self.assertEqual(
                     target.read_bytes(),
                     fake_codex.read_bytes(),
+                )
+                self.assert_no_publish_temps(install_dir)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait(timeout=5)
+
+    def test_apply_closes_running_code_mode_host_before_replacing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            install_dir = temp_path / "install"
+            install_dir.mkdir()
+            fake_codex = self.copy_valid_codex(
+                temp_path / "fake-codex.exe",
+                timestamp=FRESH_SOURCE_TIME,
+            )
+            target = install_dir / "codex.exe"
+            target.write_bytes(fake_codex.read_bytes())
+            os.utime(target, (FRESH_SOURCE_TIME, FRESH_SOURCE_TIME))
+            code_mode_host_target = install_dir / "codex-code-mode-host.exe"
+            code_mode_host_target.write_bytes(self.source_exe_bytes)
+
+            process = subprocess.Popen(
+                [str(code_mode_host_target), "/c", "ping -n 30 127.0.0.1 > nul"],
+                creationflags=CREATE_NO_WINDOW,
+            )
+            try:
+                result = self.run_script(
+                    "-SkipBuild",
+                    "-SourceExe",
+                    str(fake_codex),
+                    "-InstallDir",
+                    str(install_dir),
+                    "-CloseRunningTargetTimeoutSeconds",
+                    "1",
+                )
+
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+                self.assertIn("runningTargetProcesses: pid=", result.stdout)
+                self.assertIn("closeRunningTarget: requested:", result.stdout)
+                self.assertIn("closeRunningTargetResult: closed", result.stdout)
+                self.assertIn("runningTargetProcessesAfterClose: <none>", result.stdout)
+                self.assertIsNotNone(process.poll())
+                self.assertEqual(target.read_bytes(), fake_codex.read_bytes())
+                self.assertEqual(
+                    code_mode_host_target.read_bytes(),
+                    self.source_code_mode_host_bytes,
                 )
                 self.assert_no_publish_temps(install_dir)
             finally:

@@ -122,6 +122,20 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
         self.assertEqual(websocket.sent, [])
         self.assertEqual(websocket.close_calls, [(1009, "message too large")])
 
+    def test_invalid_json_closes_with_invalid_payload_code(self) -> None:
+        websocket = FakeWebSocket([b"\xff"])
+
+        asyncio.run(
+            server._handle_connection(
+                websocket,
+                quiet=True,
+                log_json="off",
+            )
+        )
+
+        self.assertEqual(websocket.sent, [])
+        self.assertEqual(websocket.close_calls, [(1007, "invalid JSON")])
+
     def test_serve_disables_compression_caps_messages_and_can_exit(self) -> None:
         captured: dict[str, object] = {}
         fake_server = FakeServer()
@@ -170,6 +184,13 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
     def test_parser_rejects_non_positive_max_sessions(self) -> None:
         with self.assertRaises(SystemExit):
             server._build_arg_parser().parse_args(["--max-sessions", "0"])
+
+    def test_parser_and_serve_reject_invalid_ports(self) -> None:
+        for value in ("-1", "65536"):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                server._build_arg_parser().parse_args(["--port", value])
+        with self.assertRaisesRegex(ValueError, "port must be between"):
+            asyncio.run(server._serve(65536, quiet=True, max_sessions=1))
 
     def test_parser_accepts_performance_flags(self) -> None:
         args = server._build_arg_parser().parse_args(

@@ -7,7 +7,42 @@ function Get-FileSha256 {
         return "<missing>"
     }
 
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    $stream = $null
+    $sha256 = $null
+    try {
+        $stream = [IO.File]::Open(
+            $Path,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+        )
+        $sha256 = [Security.Cryptography.SHA256]::Create()
+        $hash = $sha256.ComputeHash($stream)
+        return [BitConverter]::ToString($hash).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        if ($null -ne $sha256) {
+            $sha256.Dispose()
+        }
+    }
+}
+
+function Get-TextSha256 {
+    param(
+        [string]$Value
+    )
+
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($Value))
+        return [BitConverter]::ToString($hash).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $sha256.Dispose()
+    }
 }
 
 if (-not (Get-Variable -Name FileSha256CachePrunedDirs -Scope Script -ErrorAction SilentlyContinue)) {
@@ -55,6 +90,13 @@ function Remove-StaleFileSha256CacheEntries {
             $cachedPath = [string]$pathProperty.Value
             if (-not [string]::IsNullOrWhiteSpace($cachedPath) -and -not [IO.File]::Exists($cachedPath)) {
                 [IO.File]::Delete($cachePath)
+                continue
+            }
+            if (-not [string]::IsNullOrWhiteSpace($cachedPath)) {
+                $expectedName = "$(Get-TextSha256 -Value ([IO.Path]::GetFullPath($cachedPath))).sha256.json"
+                if ([IO.Path]::GetFileName($cachePath) -cne $expectedName) {
+                    [IO.File]::Delete($cachePath)
+                }
             }
         }
         catch {
@@ -75,7 +117,7 @@ function Get-FileSha256Cached {
     }
 
     $identity = Get-FileIdentity -Path $Path
-    $safeName = ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([IO.Path]::GetFullPath($Path))) -replace "[+/=]", "_")
+    $safeName = Get-TextSha256 -Value ([IO.Path]::GetFullPath($Path))
     $cachePath = Join-Path $CacheDir "$safeName.sha256.json"
 
     if (Test-Path -LiteralPath $cachePath -PathType Leaf) {

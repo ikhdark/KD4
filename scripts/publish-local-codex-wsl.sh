@@ -33,9 +33,10 @@ main() {
 }
 
 has_repo_root_arg() {
-  local arg
+  local arg arg_lower
   for arg in "$@"; do
-    if [[ "$arg" == "-RepoRoot" || "$arg" == "-RepoRoot="* ]]; then
+    arg_lower="${arg,,}"
+    if [[ "$arg_lower" == "-reporoot" || "$arg_lower" == "-reporoot="* ]]; then
       return 0
     fi
   done
@@ -49,6 +50,7 @@ translate_args() {
   local path_flags=(
     -RepoRoot
     -SourceExe
+    -SourceCodeModeHostExe
     -InstallDir
     -BackupDir
     -RustyV8Archive
@@ -56,20 +58,22 @@ translate_args() {
     -LocalCodexSqliteHome
   )
   local expect_path=0
-  local arg flag value
+  local arg arg_lower flag flag_lower value
   for arg in "$@"; do
     if [[ "$expect_path" -eq 1 ]]; then
       out_ref+=("$(translate_path_arg "$arg")")
       expect_path=0
       continue
     fi
+    arg_lower="${arg,,}"
     for flag in "${path_flags[@]}"; do
-      if [[ "$arg" == "$flag" ]]; then
+      flag_lower="${flag,,}"
+      if [[ "$arg_lower" == "$flag_lower" ]]; then
         out_ref+=("$arg")
         expect_path=1
         continue 2
       fi
-      if [[ "$arg" == "$flag="* ]]; then
+      if [[ "$arg_lower" == "$flag_lower="* ]]; then
         value="${arg#*=}"
         out_ref+=("$flag=$(translate_path_arg "$value")")
         continue 2

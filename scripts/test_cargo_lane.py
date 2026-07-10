@@ -104,7 +104,9 @@ class CargoLaneTest(unittest.TestCase):
         lane_path = self.make_lane(lane)
         lock_path = lane_path / lock_name
         ready_path = lane_path / f"{lock_name}.ready"
-        helper = self.temp_root / f"hold-{lock_name.removeprefix('.').replace('.', '-')}.ps1"
+        helper = (
+            self.temp_root / f"hold-{lock_name.removeprefix('.').replace('.', '-')}.ps1"
+        )
         helper.write_text(
             "\n".join(
                 [
@@ -467,6 +469,24 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn(f"--exec=check -p {package} --target-dir", result.stdout)
         self.assertIn(self.lane_path(package), result.stdout)
 
+    def test_cargo_watch_exec_inserts_target_before_test_arguments(self) -> None:
+        result = self.run_fake_cargo(
+            "-Lane",
+            "auto",
+            "cargo",
+            "watch",
+            "-x",
+            "test -- --nocapture",
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("test --target-dir", result.stdout)
+        self.assertIn(" -- --nocapture", result.stdout)
+
     def test_cargo_watch_shell_command_is_not_rewritten(self) -> None:
         result = self.run_fake_cargo(
             "-Lane",
@@ -565,7 +585,9 @@ class CargoLaneTest(unittest.TestCase):
                     0,
                     f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
                 )
-                self.assertIn(f"--target-dir {self.lane_path(release_lane)}", result.stdout)
+                self.assertIn(
+                    f"--target-dir {self.lane_path(release_lane)}", result.stdout
+                )
 
     def test_gc_prunes_old_idle_lanes_but_excludes_requested_lane(self) -> None:
         requested = f"unit-keep-old-{os.getpid()}"
@@ -621,14 +643,42 @@ class CargoLaneTest(unittest.TestCase):
 
         deadline = time.time() + 20
         while time.time() < deadline:
-            if not list(self.lanes_root.glob("*.trash-*")) and not (
-                self.lanes_root / ".cargo-lane-trash-cleanup.lock"
-            ).exists():
+            if (
+                not list(self.lanes_root.glob("*.trash-*"))
+                and not (self.lanes_root / ".cargo-lane-trash-cleanup.lock").exists()
+            ):
                 break
             time.sleep(0.2)
 
         self.assertFalse(list(self.lanes_root.glob("*.trash-*")))
         self.assertFalse((self.lanes_root / ".cargo-lane-trash-cleanup.lock").exists())
+
+    def test_failed_gc_does_not_advance_stamp(self) -> None:
+        fake_bin = self.fake_cargo_bin()
+        (fake_bin / "python.cmd").write_text(
+            "@echo off\r\nexit /b 7\r\n", encoding="utf-8"
+        )
+
+        result = self.run_script(
+            "-Lane",
+            f"unit-gc-failure-{os.getpid()}",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo ok",
+            extra_env={
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "0",
+            },
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertFalse((self.lanes_root / ".gc-stamp").exists())
+        self.assertIn("leaving the GC stamp unchanged", result.stdout + result.stderr)
 
     def test_gc_size_cap_evicts_oversized_idle_lane(self) -> None:
         oversized = f"unit-size-large-{os.getpid()}"

@@ -862,6 +862,18 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
         &cache,
     );
     let second_plan = ToolPlanProbe::from_router(second_router);
+    let third_router = ToolRouter::from_context(
+        first_step_context.as_ref(),
+        ToolRouterParams {
+            mcp_tools: None,
+            deferred_mcp_tools: Some(vec![mcp_tool("first", "mcp__first", "lookup")]),
+            tool_suggest_candidates: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: &[],
+        },
+        &cache,
+    );
+    let third_plan = ToolPlanProbe::from_router(third_router);
 
     let ToolSpec::ToolSearch {
         description: first_description,
@@ -882,6 +894,16 @@ async fn tool_search_cache_rebuilds_when_deferred_sources_change() {
     };
     assert!(second_description.contains("- second: Tools from second."));
     assert!(!second_description.contains("- first: Tools from first."));
+
+    let ToolSpec::ToolSearch {
+        description: third_description,
+        ..
+    } = third_plan.visible_spec("tool_search")
+    else {
+        panic!("expected third tool_search spec");
+    };
+    assert!(third_description.contains("- first: Tools from first."));
+    assert!(!third_description.contains("- second: Tools from second."));
 }
 
 #[tokio::test]

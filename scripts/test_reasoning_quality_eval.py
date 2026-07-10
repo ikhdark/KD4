@@ -16,6 +16,17 @@ def write_jsonl(path, items):
 
 
 class ReasoningQualityEvalTests(unittest.TestCase):
+    def test_parser_and_hygiene_commands_count_as_validation(self):
+        for command in (
+            "git diff --check",
+            "bash -n scripts/example.sh",
+            "node --check codex-cli/bin/codex.js",
+            "python -m py_compile scripts/example.py",
+            "just --summary",
+        ):
+            with self.subTest(command=command):
+                self.assertTrue(reasoning_quality_eval.looks_like_validation(command))
+
     def test_repeated_tool_calls_and_missing_validation_after_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             rollout = Path(tmp) / "rollout.jsonl"
@@ -93,7 +104,9 @@ class ReasoningQualityEvalTests(unittest.TestCase):
                         "type": "function_call",
                         "call_id": "validation-1",
                         "name": "shell_command",
-                        "arguments": json.dumps({"command": "cargo test -p codex-core"}),
+                        "arguments": json.dumps(
+                            {"command": "cargo test -p codex-core"}
+                        ),
                     },
                     {
                         "type": "function_call_output",
@@ -200,7 +213,9 @@ class ReasoningQualityEvalTests(unittest.TestCase):
                         "type": "function_call",
                         "call_id": "validation-1",
                         "name": "shell_command",
-                        "arguments": json.dumps({"command": "cargo test -p codex-core"}),
+                        "arguments": json.dumps(
+                            {"command": "cargo test -p codex-core"}
+                        ),
                     },
                     {
                         "type": "message",
@@ -369,7 +384,9 @@ class ReasoningQualityEvalTests(unittest.TestCase):
                         "type": "function_call",
                         "call_id": "validation-1",
                         "name": "shell_command",
-                        "arguments": json.dumps({"command": "cargo test -p codex-core"}),
+                        "arguments": json.dumps(
+                            {"command": "cargo test -p codex-core"}
+                        ),
                     },
                     {
                         "type": "function_call_output",

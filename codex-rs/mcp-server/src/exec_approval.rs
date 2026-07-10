@@ -14,6 +14,8 @@ use serde_json::Value;
 use serde_json::json;
 use tracing::error;
 
+use crate::approval_response::review_decision_from_elicitation_response;
+
 /// Conforms to the MCP elicitation request params shape, so it can be used as
 /// the `params` field of an `elicitation/create` request.
 #[derive(Debug, Deserialize, Serialize)]
@@ -38,10 +40,7 @@ pub struct ExecApprovalElicitRequestParams {
     pub codex_parsed_cmd: Vec<ParsedCommand>,
 }
 
-// TODO(mbolin): ExecApprovalResponse does not conform to ElicitResult. See:
-// - https://github.com/modelcontextprotocol/modelcontextprotocol/blob/f962dc1780fa5eed7fb7c8a0232f1fc83ef220cd/schema/2025-06-18/schema.json#L617-L636
-// - https://modelcontextprotocol.io/specification/draft/client/elicitation#protocol-messages
-// It should have "action" and "content" fields.
+/// Legacy Codex-specific approval response retained for existing clients.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecApprovalResponse {
     pub decision: ReviewDecision,
@@ -124,21 +123,18 @@ async fn on_exec_approval_response(
         }
     };
 
-    // Try to deserialize `value` and then make the appropriate call to `codex`.
-    let response = serde_json::from_value::<ExecApprovalResponse>(value).unwrap_or_else(|err| {
+    let decision = review_decision_from_elicitation_response(value).unwrap_or_else(|err| {
         error!("failed to deserialize ExecApprovalResponse: {err}");
         // If we cannot deserialize the response, we deny the request to be
         // conservative.
-        ExecApprovalResponse {
-            decision: ReviewDecision::Denied,
-        }
+        ReviewDecision::Denied
     });
 
     if let Err(err) = codex
         .submit(Op::ExecApproval {
             id: approval_id,
             turn_id: Some(event_id),
-            decision: response.decision,
+            decision,
         })
         .await
     {

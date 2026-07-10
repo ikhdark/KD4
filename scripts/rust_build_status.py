@@ -148,7 +148,9 @@ class BuildStatusSnapshot:
         # (cargo-lane.ps1 matches with OrdinalIgnoreCase).
         active_lanes_folded = {name.casefold() for name in active_lanes}
         stale_lanes = [
-            path for path in lane_dirs if path.name.casefold() not in active_lanes_folded
+            path
+            for path in lane_dirs
+            if path.name.casefold() not in active_lanes_folded
         ]
         return cls(
             repo_root=repo_root,
@@ -314,8 +316,15 @@ def has_shared_target_rust_jobs(processes: Sequence[RustProcess] | None = None) 
 
 def cargo_lock_is_busy(target_dir: Path) -> bool:
     lock_path = target_dir / ".cargo-lock"
-    if not lock_path.is_file():
+    try:
+        if not stat.S_ISREG(lock_path.stat().st_mode):
+            return False
+    except FileNotFoundError:
         return False
+    except OSError:
+        # Cleanup is destructive. If an existing lock cannot be inspected,
+        # conservatively treat its target as busy instead of pruning it.
+        return True
     handle: TextIO | None = None
     try:
         handle = lock_path.open("r+")
@@ -338,7 +347,7 @@ def cargo_lock_is_busy(target_dir: Path) -> bool:
             except OSError:
                 return True
     except OSError:
-        return False
+        return True
     finally:
         if handle is not None:
             handle.close()
@@ -358,8 +367,13 @@ def locked_lane_names(lane_dirs: Sequence[Path]) -> set[str]:
 
 def lane_active_lock_is_held(lane_dir: Path) -> bool:
     lock_path = lane_dir / ".lane-active.lock"
-    if not lock_path.is_file():
+    try:
+        if not stat.S_ISREG(lock_path.stat().st_mode):
+            return False
+    except FileNotFoundError:
         return False
+    except OSError:
+        return True
     handle: TextIO | None = None
     try:
         try:
@@ -389,7 +403,7 @@ def lane_active_lock_is_held(lane_dir: Path) -> bool:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         return False
     except OSError:
-        return False
+        return True
     finally:
         if handle is not None:
             handle.close()
@@ -427,7 +441,10 @@ def stray_cargo_target_dirs(*, repo_root: Path = REPO_ROOT) -> list[Path]:
     return sorted(
         path
         for path in target_root.iterdir()
-        if path.is_dir() and is_stray_cargo_target_dir(path)
+        if path.is_dir()
+        and not path.is_symlink()
+        and not is_windows_junction(path)
+        and is_stray_cargo_target_dir(path)
     )
 
 
@@ -709,7 +726,7 @@ def existing_lane_dirs(lane_root: Path) -> list[Path]:
     return sorted(
         path
         for path in lane_root.iterdir()
-        if path.is_dir() and not path.is_symlink() and not is_windows_junction(path)
+        if path.is_dir() and not is_indirect_directory(path)
     )
 
 
@@ -726,6 +743,10 @@ def is_windows_junction(path: Path) -> bool:
         )
     except (OSError, AttributeError):
         return False
+
+
+def is_indirect_directory(path: Path) -> bool:
+    return path.is_symlink() or is_windows_junction(path)
 
 
 def active_lane_names(processes: Sequence[RustProcess]) -> set[str]:
@@ -908,6 +929,9 @@ def prune_stale_lanes(
         lane_size=lane_size,
         size_workers=size_workers,
     ):
+        if is_indirect_directory(path):
+            print(f"warning: skipping indirect lane path: {path}", file=sys.stderr)
+            continue
         resolved_path = path.resolve()
         if not resolved_path.is_relative_to(resolved_lane_root):
             # A reparse point that escapes the lanes root should not brick
@@ -917,17 +941,25 @@ def prune_stale_lanes(
                 file=sys.stderr,
             )
             continue
-        if cargo_lock_is_busy(resolved_path):
+        if cargo_lock_is_busy(path) or lane_active_lock_is_held(path):
             continue
         if not dry_run:
             try:
+                if is_indirect_directory(path):
+                    print(
+                        f"warning: lane became an indirect path before prune: {path}",
+                        file=sys.stderr,
+                    )
+                    continue
+                if cargo_lock_is_busy(path) or lane_active_lock_is_held(path):
+                    continue
                 # Lanes routinely contain read-only files (registry-cache
                 # copies in build OUT_DIRs); bare rmtree would abort partway.
-                remove_tree_allow_readonly(resolved_path)
+                remove_tree_allow_readonly(path)
             except OSError as exc:
-                if not cargo_lock_is_busy(resolved_path):
+                if not cargo_lock_is_busy(path) and not lane_active_lock_is_held(path):
                     print(
-                        f"warning: failed to prune lane {resolved_path}: {exc}",
+                        f"warning: failed to prune lane {path}: {exc}",
                         file=sys.stderr,
                     )
                 continue
@@ -1000,6 +1032,9 @@ def prune_stray_cargo_target_dirs(
     resolved_target_root = target_root.resolve()
     removed: list[Path] = []
     for path in stray_cargo_target_dirs(repo_root=repo_root):
+        if is_indirect_directory(path):
+            print(f"warning: skipping indirect target path: {path}", file=sys.stderr)
+            continue
         resolved_path = path.resolve()
         if resolved_path.parent != resolved_target_root:
             raise ValueError(
@@ -1009,9 +1044,11 @@ def prune_stray_cargo_target_dirs(
             continue
         if not dry_run:
             try:
-                remove_tree_allow_readonly(resolved_path)
+                if is_indirect_directory(path) or cargo_lock_is_busy(path):
+                    continue
+                remove_tree_allow_readonly(path)
             except OSError:
-                if cargo_lock_is_busy(resolved_path):
+                if cargo_lock_is_busy(path):
                     continue
                 continue
         removed.append(path)
@@ -1125,20 +1162,43 @@ def max_lane_bytes_from_args(args: argparse.Namespace) -> int | None:
     return bytes_from_gib(args.max_lane_gib)
 
 
+def positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return parsed
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return parsed
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
 def add_prune_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--warn-gib", type=float, default=50.0)
+    parser.add_argument("--warn-gib", type=positive_float, default=50.0)
     parser.add_argument(
         "--keep-warm-per-base",
-        type=int,
+        type=non_negative_int,
         default=DEFAULT_PRUNE_KEEP_WARM_PER_BASE,
     )
     parser.add_argument(
-        "--max-age-days", type=float, default=DEFAULT_PRUNE_MAX_AGE_DAYS
+        "--max-age-days", type=positive_float, default=DEFAULT_PRUNE_MAX_AGE_DAYS
     )
-    parser.add_argument("--max-lane-gib", type=float)
-    parser.add_argument("--max-lane-bytes", type=int)
-    parser.add_argument("--size-workers", type=int, default=DEFAULT_LANE_SIZE_WORKERS)
+    parser.add_argument("--max-lane-gib", type=positive_float)
+    parser.add_argument("--max-lane-bytes", type=positive_int)
+    parser.add_argument(
+        "--size-workers", type=positive_int, default=DEFAULT_LANE_SIZE_WORKERS
+    )
     parser.add_argument(
         "--all",
         action="store_true",
@@ -1156,7 +1216,7 @@ def main(argv: list[str] | None = None) -> int:
     disk_parser = subparsers.add_parser(
         "disk", help="Show codex-rs/target disk usage and warnings."
     )
-    disk_parser.add_argument("--warn-gib", type=float, default=50.0)
+    disk_parser.add_argument("--warn-gib", type=positive_float, default=50.0)
     prune_parser = subparsers.add_parser(
         "prune", help="Remove inactive target/lanes directories."
     )
