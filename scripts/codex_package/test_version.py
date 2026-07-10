@@ -83,6 +83,29 @@ class VersionDiscoveryTest(unittest.TestCase):
 
             self.assertEqual((first, second), ("1.0.0", "1.0.0"))
 
+    def test_cache_keeps_multiple_manifest_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first_manifest = root / "first.toml"
+            second_manifest = root / "second.toml"
+            first_manifest.write_text(
+                '[workspace.package]\nversion = "1.0.0"\n',
+                encoding="utf-8",
+            )
+            second_manifest.write_text(
+                '[workspace.package]\nversion = "2.0.0"\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(version.read_workspace_version(first_manifest), "1.0.0")
+            self.assertEqual(version.read_workspace_version(second_manifest), "2.0.0")
+            first_manifest.write_text(
+                '[workspace.package]\nversion = "3.0.0"\n',
+                encoding="utf-8",
+            )
+
+            self.assertEqual(version.read_workspace_version(first_manifest), "1.0.0")
+
     def test_default_manifest_uses_repo_root(self) -> None:
         expected = Path("repo") / "codex-rs" / "Cargo.toml"
 

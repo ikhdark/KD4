@@ -44,6 +44,21 @@ pub enum WindowsSandboxProxySettingsMode {
     Preserve,
 }
 
+pub const LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR: &str = concat!(
+    "legacy Windows restricted-token sandbox cannot safely enforce delete boundaries ",
+    "on this Windows build; select the elevated Windows sandbox backend"
+);
+
+/// Returns whether the running Windows kernel applies restricting SIDs when
+/// checking `FILE_DELETE_CHILD` for a write-restricted token.
+///
+/// A false result means the same-user legacy backend cannot safely contain
+/// deletions and must fail closed rather than launch the requested process.
+#[cfg(target_os = "windows")]
+pub fn legacy_restricted_token_enforces_delete_child() -> bool {
+    token::probe_legacy_delete_child_restriction().unwrap_or(false)
+}
+
 #[cfg(target_os = "windows")]
 mod acl;
 #[cfg(target_os = "windows")]
@@ -350,6 +365,7 @@ pub use stub::run_windows_sandbox_legacy_preflight;
 #[cfg(target_os = "windows")]
 mod windows_impl {
     use super::WindowsSandboxCancellationToken;
+    use super::legacy_restricted_token_enforces_delete_child;
     use super::logging::log_failure;
     use super::logging::log_success;
     use super::process::create_process_as_user;
@@ -369,14 +385,20 @@ mod windows_impl {
     use std::io;
     use std::path::Path;
     use std::ptr;
+    use std::sync::mpsc;
     use std::time::Duration;
     use std::time::Instant;
     use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
+    use windows_sys::Win32::Foundation::DuplicateHandle;
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Foundation::HANDLE_FLAG_INHERIT;
     use windows_sys::Win32::Foundation::SetHandleInformation;
+    use windows_sys::Win32::System::IO::CancelSynchronousIo;
     use windows_sys::Win32::System::Pipes::CreatePipe;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
     use windows_sys::Win32::System::Threading::GetExitCodeProcess;
     use windows_sys::Win32::System::Threading::INFINITE;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
@@ -462,6 +484,93 @@ mod windows_impl {
         pub timed_out: bool,
     }
 
+    struct CapturePipeReader {
+        join: Option<std::thread::JoinHandle<()>>,
+        rx: mpsc::Receiver<Vec<u8>>,
+        thread_handle: HANDLE,
+    }
+
+    impl CapturePipeReader {
+        fn spawn_capture_pipe_reader(handle: HANDLE) -> Self {
+            let (tx, rx) = mpsc::channel::<Vec<u8>>();
+            let (thread_handle_tx, thread_handle_rx) = mpsc::channel::<HANDLE>();
+            let join = std::thread::spawn(move || {
+                let mut thread_handle: HANDLE = 0;
+                let duplicate_ok = unsafe {
+                    DuplicateHandle(
+                        GetCurrentProcess(),
+                        GetCurrentThread(),
+                        GetCurrentProcess(),
+                        &mut thread_handle,
+                        0,
+                        0,
+                        DUPLICATE_SAME_ACCESS,
+                    )
+                };
+                let _ = thread_handle_tx.send(if duplicate_ok == 0 { 0 } else { thread_handle });
+
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 8192];
+                loop {
+                    let mut read_bytes: u32 = 0;
+                    let ok = unsafe {
+                        windows_sys::Win32::Storage::FileSystem::ReadFile(
+                            handle,
+                            tmp.as_mut_ptr(),
+                            tmp.len() as u32,
+                            &mut read_bytes,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    if ok == 0 || read_bytes == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..read_bytes as usize]);
+                }
+                unsafe {
+                    CloseHandle(handle);
+                }
+                let _ = tx.send(buf);
+            });
+            let thread_handle = thread_handle_rx.recv().unwrap_or(0);
+            Self {
+                join: Some(join),
+                rx,
+                thread_handle,
+            }
+        }
+
+        fn finish_capture_pipe_reader(mut self) -> Vec<u8> {
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+            self.close_thread_handle();
+            self.rx.recv().unwrap_or_default()
+        }
+
+        fn cancel_and_collect(mut self) -> Vec<u8> {
+            if self.thread_handle != 0 {
+                unsafe {
+                    let _ = CancelSynchronousIo(self.thread_handle);
+                }
+            }
+            self.close_thread_handle();
+            self.join.take();
+            self.rx
+                .recv_timeout(Duration::from_millis(100))
+                .unwrap_or_default()
+        }
+
+        fn close_thread_handle(&mut self) {
+            if self.thread_handle != 0 {
+                unsafe {
+                    CloseHandle(self.thread_handle);
+                }
+                self.thread_handle = 0;
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn run_windows_sandbox_capture(
         permission_profile: &PermissionProfile,
@@ -503,6 +612,9 @@ mod windows_impl {
         additional_deny_write_paths: &[AbsolutePathBuf],
         use_private_desktop: bool,
     ) -> Result<CaptureResult> {
+        if !legacy_restricted_token_enforces_delete_child() {
+            anyhow::bail!(super::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR);
+        }
         let additional_deny_read_paths = additional_deny_read_paths
             .iter()
             .map(AbsolutePathBuf::to_path_buf)
@@ -598,50 +710,8 @@ mod windows_impl {
             CloseHandle(err_w);
         }
 
-        let (tx_out, rx_out) = std::sync::mpsc::channel::<Vec<u8>>();
-        let (tx_err, rx_err) = std::sync::mpsc::channel::<Vec<u8>>();
-        let t_out = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 8192];
-            loop {
-                let mut read_bytes: u32 = 0;
-                let ok = unsafe {
-                    windows_sys::Win32::Storage::FileSystem::ReadFile(
-                        out_r,
-                        tmp.as_mut_ptr(),
-                        tmp.len() as u32,
-                        &mut read_bytes,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 || read_bytes == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..read_bytes as usize]);
-            }
-            let _ = tx_out.send(buf);
-        });
-        let t_err = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 8192];
-            loop {
-                let mut read_bytes: u32 = 0;
-                let ok = unsafe {
-                    windows_sys::Win32::Storage::FileSystem::ReadFile(
-                        err_r,
-                        tmp.as_mut_ptr(),
-                        tmp.len() as u32,
-                        &mut read_bytes,
-                        std::ptr::null_mut(),
-                    )
-                };
-                if ok == 0 || read_bytes == 0 {
-                    break;
-                }
-                buf.extend_from_slice(&tmp[..read_bytes as usize]);
-            }
-            let _ = tx_err.send(buf);
-        });
+        let stdout_reader = CapturePipeReader::spawn_capture_pipe_reader(out_r);
+        let stderr_reader = CapturePipeReader::spawn_capture_pipe_reader(err_r);
 
         let wait_outcome = wait_for_process(pi.hProcess, timeout_ms, cancellation.as_ref());
         let timed_out = matches!(wait_outcome, WaitOutcome::TimedOut);
@@ -654,6 +724,7 @@ mod windows_impl {
         } else {
             unsafe {
                 windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
+                let _ = WaitForSingleObject(pi.hProcess, 5_000);
             }
         }
 
@@ -666,10 +737,17 @@ mod windows_impl {
             }
             CloseHandle(security.h_token);
         }
-        let _ = t_out.join();
-        let _ = t_err.join();
-        let stdout = rx_out.recv().unwrap_or_default();
-        let stderr = rx_err.recv().unwrap_or_default();
+        let (stdout, stderr) = if timed_out || cancelled {
+            (
+                stdout_reader.cancel_and_collect(),
+                stderr_reader.cancel_and_collect(),
+            )
+        } else {
+            (
+                stdout_reader.finish_capture_pipe_reader(),
+                stderr_reader.finish_capture_pipe_reader(),
+            )
+        };
         let exit_code = if timed_out {
             128 + 64
         } else {
@@ -703,6 +781,9 @@ mod windows_impl {
         ) else {
             return Ok(());
         };
+        if !legacy_restricted_token_enforces_delete_child() {
+            anyhow::bail!(super::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR);
+        }
         if !permissions.uses_write_capabilities_for_cwd(cwd, env_map) {
             return Ok(());
         }
@@ -736,6 +817,9 @@ mod windows_impl {
         use codex_protocol::permissions::NetworkSandboxPolicy;
         use std::collections::HashMap;
         use std::path::Path;
+        use std::time::Duration;
+        use std::time::Instant;
+        use windows_sys::Win32::Foundation::CloseHandle;
 
         fn workspace_profile(network_policy: NetworkSandboxPolicy) -> PermissionProfile {
             PermissionProfile::workspace_write_with(
@@ -775,6 +859,31 @@ mod windows_impl {
         }
 
         #[test]
+        fn cancelled_capture_reader_does_not_wait_for_an_open_writer() {
+            let ((in_r, in_w), (out_r, out_w), (err_r, err_w)) =
+                unsafe { super::setup_stdio_pipes() }.expect("create capture pipes");
+            unsafe {
+                CloseHandle(in_r);
+                CloseHandle(in_w);
+                CloseHandle(err_r);
+                CloseHandle(err_w);
+            }
+
+            let reader = super::CapturePipeReader::spawn_capture_pipe_reader(out_r);
+            let started_at = Instant::now();
+            let output = reader.cancel_and_collect();
+            unsafe {
+                CloseHandle(out_w);
+            }
+
+            assert!(output.is_empty());
+            assert!(
+                started_at.elapsed() < Duration::from_secs(1),
+                "cancelled pipe collection should be bounded"
+            );
+        }
+
+        #[test]
         fn legacy_preflight_skips_profiles_without_managed_filesystem_permissions() {
             for permission_profile in [
                 PermissionProfile::Disabled,
@@ -791,6 +900,32 @@ mod windows_impl {
                 )
                 .expect("unsupported profiles do not need ACL preflight");
             }
+        }
+
+        #[test]
+        fn legacy_preflight_rejects_unsafe_delete_child_semantics() {
+            if crate::legacy_restricted_token_enforces_delete_child() {
+                return;
+            }
+
+            let workspace = tempfile::tempdir().expect("workspace");
+            let codex_home = tempfile::tempdir().expect("codex home");
+            let workspace_root =
+                codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(workspace.path())
+                    .expect("absolute workspace");
+            let err = super::run_windows_sandbox_legacy_preflight(
+                &PermissionProfile::workspace_write(),
+                &[workspace_root],
+                codex_home.path(),
+                workspace.path(),
+                &HashMap::new(),
+            )
+            .expect_err("unsafe legacy preflight should fail closed");
+
+            assert_eq!(
+                err.to_string(),
+                crate::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR
+            );
         }
     }
 }

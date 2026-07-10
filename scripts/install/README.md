@@ -10,6 +10,10 @@ This directory owns the standalone Codex install entrypoints:
 - `install.sh`: macOS/Linux shell installer.
 - `install.ps1`: Windows PowerShell installer.
 
+The shell installer keeps release-metadata helpers in `install_release.sh` for
+source maintainability. `build_install_sh.py` inlines that helper when staging
+the single-file `dist/install.sh` release artifact.
+
 The installers fetch OpenAI Codex release artifacts, verify release digests,
 stage standalone package layouts under the Codex home directory, expose the
 selected binary on PATH, and handle conflicts with existing npm, bun, Homebrew,

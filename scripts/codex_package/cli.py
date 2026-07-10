@@ -9,6 +9,7 @@ from pathlib import Path
 from time import perf_counter
 
 from .archive import package_entries
+from .archive import validate_archive_output
 from .archive import write_archive
 from .cargo import SourceBuildOutputs
 from .cargo import build_source_binaries
@@ -17,6 +18,7 @@ from .cargo import cargo_profile_output_dir
 from .cargo import validate_source_outputs
 from .layout import build_package_dir
 from .layout import prepare_package_dir
+from .layout import validate_package_dir_destination
 from .layout import validate_package_dir
 from .ripgrep import resolve_rg_bin
 from .targets import PACKAGE_VARIANTS
@@ -24,6 +26,8 @@ from .targets import SUPPORTED_TARGETS
 from .targets import SUPPORTED_VARIANTS
 from .targets import TARGET_SPECS
 from .targets import PackageInputs
+from .targets import PackageVariant
+from .targets import TargetSpec
 from .targets import default_target
 from .targets import resolve_input_path
 from .zsh import resolve_zsh_bin
@@ -95,6 +99,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--code-mode-host-bin",
+        type=Path,
+        help=(
+            "Optional prebuilt codex-code-mode-host executable. If omitted, "
+            "the host is built with Cargo."
+        ),
+    )
+    parser.add_argument(
         "--bwrap-bin",
         type=Path,
         help=(
@@ -133,6 +145,14 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "Optional local patched zsh executable override instead of fetching from "
+            "scripts/codex_package/codex-zsh."
+        ),
+    )
+    parser.add_argument(
+        "--zsh-manifest",
+        type=Path,
+        help=(
+            "Optional DotSlash manifest for the patched zsh fork instead of "
             "scripts/codex_package/codex-zsh."
         ),
     )
@@ -196,6 +216,7 @@ def main() -> int:
         if package_dir_arg is not None
         else Path(tempfile.mkdtemp(prefix="codex-package-")).resolve()
     )
+    validate_cli_request(args, spec, package_dir)
 
     timings = getattr(args, "timings", False)
     with timed_step("inputs", timings):
@@ -240,11 +261,12 @@ def main() -> int:
 
 def resolve_package_inputs(
     args: argparse.Namespace,
-    spec,
-    variant,
+    spec: TargetSpec,
+    variant: PackageVariant,
 ) -> tuple[str, PackageInputs]:
     zsh_bin = None
     zsh_bin_arg = getattr(args, "zsh_bin", None)
+    zsh_manifest_arg = getattr(args, "zsh_manifest", None)
     resolve_zsh = supports_zsh(spec)
     with ThreadPoolExecutor(max_workers=4) as executor:
         source_outputs_future = executor.submit(
@@ -253,12 +275,15 @@ def resolve_package_inputs(
         version_future = executor.submit(read_workspace_version)
         rg_future = executor.submit(resolve_rg_bin, spec, args.rg_bin)
         zsh_future = (
-            executor.submit(resolve_zsh_bin, spec)
-            if resolve_zsh and zsh_bin_arg is None
+            executor.submit(
+                resolve_zsh_bin,
+                spec,
+                zsh_bin_arg,
+                manifest_path=zsh_manifest_arg,
+            )
+            if resolve_zsh
             else None
         )
-        if resolve_zsh and zsh_bin_arg is not None:
-            zsh_bin = resolve_zsh_bin(spec, zsh_bin_arg)
         source_outputs = source_outputs_future.result()
         version = version_future.result()
         rg_bin = rg_future.result()
@@ -268,6 +293,7 @@ def resolve_package_inputs(
         version,
         PackageInputs(
             entrypoint_bin=source_outputs.entrypoint_bin,
+            code_mode_host_bin=source_outputs.code_mode_host_bin,
             rg_bin=rg_bin,
             zsh_bin=zsh_bin,
             bwrap_bin=source_outputs.bwrap_bin,
@@ -277,10 +303,89 @@ def resolve_package_inputs(
     )
 
 
+def validate_cli_request(
+    args: argparse.Namespace,
+    spec: TargetSpec,
+    package_dir: Path,
+) -> None:
+    zsh_bin = getattr(args, "zsh_bin", None)
+    zsh_manifest = getattr(args, "zsh_manifest", None)
+    if zsh_bin is not None and zsh_manifest is not None:
+        raise RuntimeError("--zsh-bin and --zsh-manifest cannot be used together.")
+    if not supports_zsh(spec) and (zsh_bin is not None or zsh_manifest is not None):
+        raise RuntimeError("zsh overrides are only supported for Unix package targets.")
+
+    bwrap_bin = getattr(args, "bwrap_bin", None)
+    command_runner_bin = getattr(args, "codex_command_runner_bin", None)
+    sandbox_setup_bin = getattr(args, "codex_windows_sandbox_setup_bin", None)
+    if bwrap_bin is not None and not spec.is_linux:
+        raise RuntimeError("--bwrap-bin is only supported for Linux targets.")
+    if command_runner_bin is not None and not spec.is_windows:
+        raise RuntimeError(
+            "--codex-command-runner-bin is only supported for Windows targets."
+        )
+    if sandbox_setup_bin is not None and not spec.is_windows:
+        raise RuntimeError(
+            "--codex-windows-sandbox-setup-bin is only supported for Windows targets."
+        )
+
+    if getattr(args, "skip_build_if_present", False):
+        ignored_source_flags = [
+            flag
+            for flag, value in [
+                ("--entrypoint-bin", getattr(args, "entrypoint_bin", None)),
+                (
+                    "--code-mode-host-bin",
+                    getattr(args, "code_mode_host_bin", None),
+                ),
+                ("--bwrap-bin", bwrap_bin),
+                ("--codex-command-runner-bin", command_runner_bin),
+                ("--codex-windows-sandbox-setup-bin", sandbox_setup_bin),
+            ]
+            if value is not None
+        ]
+        if ignored_source_flags:
+            raise RuntimeError(
+                "--skip-build-if-present cannot be combined with source binary "
+                f"overrides: {', '.join(ignored_source_flags)}"
+            )
+        if getattr(args, "reuse_source_builds", False):
+            raise RuntimeError(
+                "--skip-build-if-present cannot be combined with --reuse-source-builds."
+            )
+        if getattr(args, "force_source_rebuild", False):
+            raise RuntimeError(
+                "--skip-build-if-present cannot be combined with --force-source-rebuild."
+            )
+
+    force = bool(getattr(args, "force", False))
+    reuse_package_dir = bool(getattr(args, "reuse_package_dir", False))
+    validate_package_dir_destination(
+        package_dir,
+        force=force,
+        reuse=reuse_package_dir,
+    )
+
+    compression = getattr(args, "archive_compression", "default")
+    seen_outputs: set[Path] = set()
+    for archive_output in getattr(args, "archive_output", []):
+        _, resolved_output, _ = validate_archive_output(
+            package_dir,
+            archive_output,
+            force=force,
+            compression=compression,
+        )
+        if resolved_output in seen_outputs:
+            raise RuntimeError(
+                f"Archive output was specified more than once: {resolved_output}"
+            )
+        seen_outputs.add(resolved_output)
+
+
 def resolve_source_outputs(
     args: argparse.Namespace,
-    spec,
-    variant,
+    spec: TargetSpec,
+    variant: PackageVariant,
 ) -> SourceBuildOutputs:
     if getattr(args, "skip_build_if_present", False):
         outputs = source_outputs_from_existing(spec, variant, args.cargo_profile)
@@ -297,18 +402,23 @@ def resolve_source_outputs(
             "prebuilt entrypoint executable",
             "--entrypoint-bin",
         ),
+        code_mode_host_bin=resolve_optional_input_path(
+            getattr(args, "code_mode_host_bin", None),
+            "prebuilt code-mode host executable",
+            "--code-mode-host-bin",
+        ),
         bwrap_bin=resolve_optional_input_path(
-            args.bwrap_bin if spec.is_linux else None,
+            args.bwrap_bin,
             "prebuilt Linux bwrap executable",
             "--bwrap-bin",
         ),
         codex_command_runner_bin=resolve_optional_input_path(
-            args.codex_command_runner_bin if spec.is_windows else None,
+            args.codex_command_runner_bin,
             "prebuilt Windows codex-command-runner.exe executable",
             "--codex-command-runner-bin",
         ),
         codex_windows_sandbox_setup_bin=resolve_optional_input_path(
-            args.codex_windows_sandbox_setup_bin if spec.is_windows else None,
+            args.codex_windows_sandbox_setup_bin,
             "prebuilt Windows codex-windows-sandbox-setup.exe executable",
             "--codex-windows-sandbox-setup-bin",
         ),
@@ -317,7 +427,11 @@ def resolve_source_outputs(
     )
 
 
-def source_outputs_from_existing(spec, variant, profile: str) -> SourceBuildOutputs:
+def source_outputs_from_existing(
+    spec: TargetSpec,
+    variant: PackageVariant,
+    profile: str,
+) -> SourceBuildOutputs:
     # Look where this tool's own builds write (the package lane), not the
     # shared cargo target dir — otherwise --skip-build-if-present misses the
     # previous package build or, worse, picks up stale dev-lane binaries.
@@ -326,6 +440,7 @@ def source_outputs_from_existing(spec, variant, profile: str) -> SourceBuildOutp
     )
     return SourceBuildOutputs(
         entrypoint_bin=output_dir / variant.entrypoint_name(spec),
+        code_mode_host_bin=output_dir / spec.code_mode_host_name,
         bwrap_bin=output_dir / "bwrap" if spec.is_linux else None,
         codex_command_runner_bin=(
             output_dir / "codex-command-runner.exe" if spec.is_windows else None

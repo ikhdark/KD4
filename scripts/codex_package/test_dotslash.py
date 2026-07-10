@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 
 import hashlib
+import io
 import json
 from pathlib import Path
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -263,6 +265,93 @@ class DotSlashCacheStampTest(unittest.TestCase):
                 self.assertEqual(dotslash.read_json_stamp(stamp), {"ok": True})
 
             self.assertEqual(loads.call_count, 1)
+
+    def test_manifest_rejects_unsafe_archive_member(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manifest = Path(temp_dir) / "artifact"
+            spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "platforms": {
+                            spec.dotslash_platform: {
+                                "providers": [{"url": "https://example.test/rg.zip"}],
+                                "hash": "sha256",
+                                "size": 1,
+                                "digest": "0" * 64,
+                                "format": "zip",
+                                "path": "../rg.exe",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "Unsafe.*archive member"):
+                dotslash.artifact_for_target(
+                    spec,
+                    manifest,
+                    artifact_label="ripgrep",
+                )
+
+    def test_manifest_rejects_invalid_digest_and_format(self) -> None:
+        spec = TARGET_SPECS["x86_64-pc-windows-msvc"]
+        for field, value, expected in [
+            ("digest", "not-a-digest", "sha256 digest"),
+            ("format", "tar.xz", "archive format"),
+        ]:
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as temp_dir:
+                platform_info = {
+                    "providers": [{"url": "https://example.test/rg.zip"}],
+                    "hash": "sha256",
+                    "size": 1,
+                    "digest": "0" * 64,
+                    "format": "zip",
+                    "path": "rg.exe",
+                }
+                platform_info[field] = value
+                manifest = Path(temp_dir) / "artifact"
+                manifest.write_text(
+                    json.dumps({"platforms": {spec.dotslash_platform: platform_info}}),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    dotslash.artifact_for_target(
+                        spec,
+                        manifest,
+                        artifact_label="ripgrep",
+                    )
+
+    def test_failed_extraction_preserves_existing_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            archive_path = root / "artifact.tar.gz"
+            with tarfile.open(archive_path, "w:gz") as archive:
+                member = tarfile.TarInfo("bin/rg")
+                member.type = tarfile.DIRTYPE
+                archive.addfile(member, io.BytesIO())
+            dest = root / "rg"
+            dest.write_bytes(b"previous")
+            artifact = DotSlashArtifact(
+                size=archive_path.stat().st_size,
+                digest=hashlib.sha256(archive_path.read_bytes()).hexdigest(),
+                archive_format="tar.gz",
+                archive_member="bin/rg",
+                url=archive_path.as_uri(),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "not a regular file"):
+                dotslash.extract_archive_member(
+                    archive_path,
+                    artifact,
+                    dest,
+                    "ripgrep",
+                )
+
+            self.assertEqual(dest.read_bytes(), b"previous")
+            self.assertEqual(list(root.glob("rg.*.tmp")), [])
 
 
 if __name__ == "__main__":

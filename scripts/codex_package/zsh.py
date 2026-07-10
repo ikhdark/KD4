@@ -23,20 +23,25 @@ ZSH_DOTSLASH_PLATFORMS = frozenset(
         "macos-x86_64",
     }
 )
-ZSH_FETCH_KWARGS = {
-    "manifest_path": ZSH_MANIFEST,
-    "artifact_label": ZSH_ARTIFACT_LABEL,
-    "dest_name": ZSH_DEST_NAME,
-    "missing_ok": True,
-}
 
 
-def resolve_zsh_bin(spec: TargetSpec, explicit_path: Path | None = None) -> Path | None:
+def resolve_zsh_bin(
+    spec: TargetSpec,
+    explicit_path: Path | None = None,
+    *,
+    manifest_path: Path | None = None,
+) -> Path | None:
     if not supports_zsh(spec):
         return None
+    if explicit_path is not None and manifest_path is not None:
+        raise RuntimeError("--zsh-bin and --zsh-manifest cannot be used together.")
     if explicit_path is not None:
         return resolve_explicit_zsh_bin(explicit_path)
-    return resolve_zsh_bin_for_target(spec.target)
+    return resolve_zsh_bin_for_target(
+        spec.target,
+        manifest_path or ZSH_MANIFEST,
+        missing_ok=manifest_path is None,
+    )
 
 
 def supports_zsh(spec: TargetSpec) -> bool:
@@ -44,14 +49,22 @@ def supports_zsh(spec: TargetSpec) -> bool:
 
 
 @cache
-def resolve_zsh_bin_for_target(target: str) -> Path | None:
+def resolve_zsh_bin_for_target(
+    target: str,
+    manifest_path: Path = ZSH_MANIFEST,
+    *,
+    missing_ok: bool = True,
+) -> Path | None:
     spec = TARGET_SPECS[target]
     if not supports_zsh(spec):
         return None
     return fetch_dotslash_executable(
         spec,
+        manifest_path=manifest_path,
+        artifact_label=ZSH_ARTIFACT_LABEL,
         cache_key=zsh_cache_key(target),
-        **ZSH_FETCH_KWARGS,
+        dest_name=ZSH_DEST_NAME,
+        missing_ok=missing_ok,
     )
 
 

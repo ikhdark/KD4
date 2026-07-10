@@ -84,6 +84,10 @@ verify-local *args:
     @{{ python }} {{ justfile_directory() }}/scripts/verify_local.py {args}
 
 [no-cd]
+audit-scripts *args:
+    @{{ python }} {{ justfile_directory() }}/scripts/root_maintenance.py audit-scripts {args}
+
+[no-cd]
 dev-env-doctor *args:
     @{{ python }} {{ justfile_directory() }}/scripts/dev_env_doctor.py {args}
 

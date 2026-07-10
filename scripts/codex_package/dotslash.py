@@ -12,6 +12,7 @@ import zipfile
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from pathlib import PurePosixPath
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
@@ -111,7 +112,14 @@ def artifact_for_target(
     missing_ok: bool = False,
 ) -> DotSlashArtifact | None:
     manifest = load_manifest(manifest_path)
-    platform_info = manifest.get("platforms", {}).get(spec.dotslash_platform)
+    if not isinstance(manifest, dict):
+        raise RuntimeError(f"Invalid {artifact_label} manifest: {manifest_path}")
+    platforms = manifest.get("platforms")
+    if not isinstance(platforms, dict):
+        raise RuntimeError(
+            f"{artifact_label} manifest {manifest_path} has no platform map"
+        )
+    platform_info = platforms.get(spec.dotslash_platform)
     if platform_info is None:
         if missing_ok:
             return None
@@ -119,9 +127,14 @@ def artifact_for_target(
             f"{artifact_label} manifest {manifest_path} is missing platform "
             f"{spec.dotslash_platform!r}"
         )
+    if not isinstance(platform_info, dict):
+        raise RuntimeError(
+            f"Invalid {artifact_label} platform metadata for "
+            f"{spec.dotslash_platform!r} in {manifest_path}"
+        )
 
     providers = platform_info.get("providers")
-    if not providers:
+    if not isinstance(providers, list) or not providers:
         raise RuntimeError(
             f"{artifact_label} manifest {manifest_path} has no providers for "
             f"{spec.dotslash_platform!r}"
@@ -134,12 +147,68 @@ def artifact_for_target(
             f"{spec.dotslash_platform!r}; expected sha256"
         )
 
+    try:
+        size = int(platform_info["size"])
+        digest = str(platform_info["digest"]).lower()
+        archive_format = str(platform_info["format"])
+        archive_member = str(platform_info["path"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"Invalid {artifact_label} metadata for {spec.dotslash_platform!r} "
+            f"in {manifest_path}"
+        ) from exc
+
+    if size < 0:
+        raise RuntimeError(
+            f"Invalid {artifact_label} archive size {size} for "
+            f"{spec.dotslash_platform!r}"
+        )
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise RuntimeError(
+            f"Invalid {artifact_label} sha256 digest for "
+            f"{spec.dotslash_platform!r}: {digest!r}"
+        )
+    if archive_format not in {"tar.gz", "zip"}:
+        raise RuntimeError(
+            f"Unsupported {artifact_label} archive format {archive_format!r}; "
+            "expected tar.gz or zip"
+        )
+    if not is_safe_archive_member(archive_member):
+        raise RuntimeError(
+            f"Unsafe {artifact_label} archive member path: {archive_member!r}"
+        )
+
+    url = next(
+        (
+            provider.get("url")
+            for provider in providers
+            if isinstance(provider, dict)
+            and isinstance(provider.get("url"), str)
+            and provider.get("url")
+        ),
+        None,
+    )
+    if url is None:
+        raise RuntimeError(
+            f"{artifact_label} manifest {manifest_path} has no URL provider for "
+            f"{spec.dotslash_platform!r}"
+        )
+
     return DotSlashArtifact(
-        size=int(platform_info["size"]),
-        digest=str(platform_info["digest"]),
-        archive_format=str(platform_info["format"]),
-        archive_member=str(platform_info["path"]),
-        url=str(providers[0]["url"]),
+        size=size,
+        digest=digest,
+        archive_format=archive_format,
+        archive_member=archive_member,
+        url=url,
+    )
+
+
+def is_safe_archive_member(member: str) -> bool:
+    if not member or "\\" in member:
+        return False
+    path = PurePosixPath(member)
+    return not path.is_absolute() and all(
+        part not in {"", ".", ".."} for part in member.split("/")
     )
 
 
@@ -333,41 +402,60 @@ def extract_archive_member(
     artifact_label: str,
 ) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.unlink(missing_ok=True)
-
-    if artifact.archive_format == "tar.gz":
-        with tarfile.open(archive_path, "r:gz") as archive:
-            try:
-                member = archive.getmember(artifact.archive_member)
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"{artifact_label} archive {archive_path} is missing "
-                    f"{artifact.archive_member!r}"
-                ) from exc
-
-            extracted = archive.extractfile(member)
-            if extracted is None:
-                raise RuntimeError(
-                    f"{artifact_label} archive member {artifact.archive_member!r} is not a file"
-                )
-            with extracted, open(dest, "wb") as out:
-                shutil.copyfileobj(extracted, out)
-        return
-
-    if artifact.archive_format == "zip":
-        with zipfile.ZipFile(archive_path) as archive:
-            try:
-                with archive.open(artifact.archive_member) as extracted:
-                    with open(dest, "wb") as out:
-                        shutil.copyfileobj(extracted, out)
-            except KeyError as exc:
-                raise RuntimeError(
-                    f"{artifact_label} archive {archive_path} is missing "
-                    f"{artifact.archive_member!r}"
-                ) from exc
-        return
-
-    raise RuntimeError(
-        f"Unsupported {artifact_label} archive format {artifact.archive_format!r}; "
-        "expected tar.gz or zip"
+    temp_file = tempfile.NamedTemporaryFile(
+        prefix=f"{dest.name}.",
+        suffix=".tmp",
+        dir=dest.parent,
+        delete=False,
     )
+    temp_path = Path(temp_file.name)
+    temp_file.close()
+    try:
+        if artifact.archive_format == "tar.gz":
+            with tarfile.open(archive_path, "r:gz") as archive:
+                try:
+                    member = archive.getmember(artifact.archive_member)
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"{artifact_label} archive {archive_path} is missing "
+                        f"{artifact.archive_member!r}"
+                    ) from exc
+                if not member.isfile():
+                    raise RuntimeError(
+                        f"{artifact_label} archive member "
+                        f"{artifact.archive_member!r} is not a regular file"
+                    )
+
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise RuntimeError(
+                        f"{artifact_label} archive member "
+                        f"{artifact.archive_member!r} could not be read"
+                    )
+                with extracted, temp_path.open("wb") as out:
+                    shutil.copyfileobj(extracted, out)
+        elif artifact.archive_format == "zip":
+            with zipfile.ZipFile(archive_path) as archive:
+                try:
+                    member = archive.getinfo(artifact.archive_member)
+                except KeyError as exc:
+                    raise RuntimeError(
+                        f"{artifact_label} archive {archive_path} is missing "
+                        f"{artifact.archive_member!r}"
+                    ) from exc
+                member_mode = member.external_attr >> 16
+                if member.is_dir() or stat.S_ISLNK(member_mode):
+                    raise RuntimeError(
+                        f"{artifact_label} archive member "
+                        f"{artifact.archive_member!r} is not a regular file"
+                    )
+                with archive.open(member) as extracted, temp_path.open("wb") as out:
+                    shutil.copyfileobj(extracted, out)
+        else:
+            raise RuntimeError(
+                f"Unsupported {artifact_label} archive format "
+                f"{artifact.archive_format!r}; expected tar.gz or zip"
+            )
+        temp_path.replace(dest)
+    finally:
+        temp_path.unlink(missing_ok=True)

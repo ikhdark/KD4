@@ -18,6 +18,7 @@ from .targets import TargetSpec
 
 
 DOWNLOAD_TIMEOUT_SECS = 120
+HASH_CHUNK_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -104,7 +105,12 @@ def fetch_codex_v8_artifacts(
 
 
 def is_truthy_env(value: str | None) -> bool:
-    return value in {"1", "true", "TRUE", "yes", "YES", "on", "ON"}
+    return value is not None and value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def resolved_v8_crate_version() -> str:
@@ -147,6 +153,8 @@ def load_checksums(checksums_path: Path, artifact_names: set[str]) -> dict[str, 
             )
 
         digest, artifact_name = parts[0], parts[1].strip()
+        if artifact_name.startswith("*"):
+            artifact_name = artifact_name[1:]
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise RuntimeError(
                 f"Invalid V8 checksum digest in {checksums_path}: {digest}"
@@ -198,7 +206,7 @@ def has_checksum(path: Path, expected: str) -> bool:
 
     digest = hashlib.sha256()
     with path.open("rb") as artifact:
-        for chunk in iter(lambda: artifact.read(1024 * 1024), b""):
+        for chunk in iter(lambda: artifact.read(HASH_CHUNK_BYTES), b""):
             digest.update(chunk)
     if digest.hexdigest() != expected:
         return False
@@ -218,7 +226,7 @@ def download_file(url: str, dest: Path) -> None:
     try:
         with temp_file as output:
             with urlopen(url, timeout=DOWNLOAD_TIMEOUT_SECS) as response:
-                shutil.copyfileobj(response, output)
+                shutil.copyfileobj(response, output, length=HASH_CHUNK_BYTES)
         temp_path.replace(dest)
     finally:
         temp_path.unlink(missing_ok=True)

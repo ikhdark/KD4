@@ -64,7 +64,7 @@ class RipgrepResolverTest(unittest.TestCase):
                 "fetch_dotslash_executable",
                 return_value=None,
             ),
-            self.assertRaises(AssertionError) as cm,
+            self.assertRaises(RuntimeError) as cm,
         ):
             ripgrep.fetch_rg(spec)
 

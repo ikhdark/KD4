@@ -69,6 +69,22 @@ class CopyFileForStagingTest(unittest.TestCase):
             self.assertFalse((package_dir / "codex-package.json").exists())
             self.assertTrue(keep.is_file())
 
+    def test_destination_preflight_does_not_remove_existing_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_dir = Path(temp_dir) / "package"
+            package_dir.mkdir()
+            existing = package_dir / "keep"
+            existing.write_text("keep", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "not empty"):
+                layout.validate_package_dir_destination(
+                    package_dir,
+                    force=False,
+                    reuse=False,
+                )
+
+            self.assertEqual(existing.read_text(encoding="utf-8"), "keep")
+
     def test_remove_tree_uses_onerror_on_python_without_onexc(self) -> None:
         path = Path("package")
 
@@ -97,6 +113,7 @@ class CopyFileForStagingTest(unittest.TestCase):
             package_dir.mkdir()
             inputs = PackageInputs(
                 entrypoint_bin=root / "codex",
+                code_mode_host_bin=root / "codex-code-mode-host",
                 rg_bin=root / "rg",
                 zsh_bin=None,
                 bwrap_bin=None,
@@ -126,12 +143,13 @@ class CopyFileForStagingTest(unittest.TestCase):
             root = Path(temp_dir)
             package_dir = root / "package"
             package_dir.mkdir()
-            for filename in ["codex", "rg"]:
+            for filename in ["codex", "codex-code-mode-host", "rg"]:
                 path = root / filename
                 path.write_text(filename, encoding="utf-8")
                 path.chmod(0o755)
             inputs = PackageInputs(
                 entrypoint_bin=root / "codex",
+                code_mode_host_bin=root / "codex-code-mode-host",
                 rg_bin=root / "rg",
                 zsh_bin=None,
                 bwrap_bin=None,
@@ -161,17 +179,28 @@ class CopyFileForStagingTest(unittest.TestCase):
                     include_zsh=False,
                 )
 
+            metadata.pop("version")
+            metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "non-empty string"):
+                layout.validate_package_dir(
+                    package_dir,
+                    PACKAGE_VARIANTS["codex"],
+                    spec,
+                    include_zsh=False,
+                )
+
     def test_app_server_package_variant_uses_app_server_entrypoint(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             package_dir = root / "package"
             package_dir.mkdir()
-            for filename in ["codex-app-server", "rg"]:
+            for filename in ["codex-app-server", "codex-code-mode-host", "rg"]:
                 path = root / filename
                 path.write_text(filename, encoding="utf-8")
                 path.chmod(0o755)
             inputs = PackageInputs(
                 entrypoint_bin=root / "codex-app-server",
+                code_mode_host_bin=root / "codex-code-mode-host",
                 rg_bin=root / "rg",
                 zsh_bin=None,
                 bwrap_bin=None,
@@ -193,6 +222,7 @@ class CopyFileForStagingTest(unittest.TestCase):
             )
             self.assertEqual(metadata["variant"], "codex-app-server")
             self.assertEqual(metadata["entrypoint"], "bin/codex-app-server")
+            self.assertTrue((package_dir / "bin" / "codex-code-mode-host").is_file())
             layout.validate_package_dir(
                 package_dir,
                 PACKAGE_VARIANTS["codex-app-server"],
@@ -208,6 +238,7 @@ class CopyFileForStagingTest(unittest.TestCase):
             package_dir.mkdir()
             for filename in [
                 "codex.exe",
+                "codex-code-mode-host.exe",
                 "rg.exe",
                 "codex-command-runner.exe",
                 "codex-windows-sandbox-setup.exe",
@@ -215,6 +246,7 @@ class CopyFileForStagingTest(unittest.TestCase):
                 (root / filename).write_text(filename, encoding="utf-8")
             inputs = PackageInputs(
                 entrypoint_bin=root / "codex.exe",
+                code_mode_host_bin=root / "codex-code-mode-host.exe",
                 rg_bin=root / "rg.exe",
                 zsh_bin=None,
                 bwrap_bin=None,

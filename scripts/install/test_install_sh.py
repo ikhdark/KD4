@@ -4,16 +4,48 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 
 
 INSTALL_SCRIPT = Path(__file__).with_name("install.sh")
+BUNDLE_SCRIPT = Path(__file__).with_name("build_install_sh.py")
 VERSION = "0.142.5"
 
 
 class InstallShTest(unittest.TestCase):
+    def test_release_bundle_is_a_standalone_installer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            bundled_installer = Path(temp_dir) / "install.sh"
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(BUNDLE_SCRIPT),
+                    "--output",
+                    str(bundled_installer),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            bundled_text = bundled_installer.read_text(encoding="utf-8")
+            self.assertNotIn("install_release.sh", bundled_text)
+            self.assertIn("release_asset_digest_or_empty()", bundled_text)
+            subprocess.run(["/bin/sh", "-n", str(bundled_installer)], check=True)
+
+            result, requests = run_installer(
+                VERSION,
+                install_script=bundled_installer,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            requests[0],
+            f"https://api.github.com/repos/openai/codex/releases/tags/rust-v{VERSION}",
+        )
+
     def test_metadata_fetch_failure_is_not_reported_as_missing_assets(self) -> None:
         result, requests = run_installer(VERSION, metadata_failure=True)
 
@@ -35,34 +67,36 @@ class InstallShTest(unittest.TestCase):
         result, requests = run_installer(VERSION)
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(
-            requests,
-            [
-                "https://api.github.com/repos/openai/codex/releases/tags/"
-                f"rust-v{VERSION}",
-                "https://github.com/openai/codex/releases/download/"
-                f"rust-v{VERSION}/codex-package_SHA256SUMS",
-            ],
+        metadata_url = (
+            f"https://api.github.com/repos/openai/codex/releases/tags/rust-v{VERSION}"
         )
+        checksum_url = (
+            "https://github.com/openai/codex/releases/download/"
+            f"rust-v{VERSION}/codex-package_SHA256SUMS"
+        )
+        self.assertEqual(requests.count(metadata_url), 1)
+        self.assertEqual(requests.count(checksum_url), 1)
         self.assertIn(f"Resolved version: {VERSION}", result.stdout)
 
     def test_latest_release_reuses_version_metadata(self) -> None:
         result, requests = run_installer("latest")
 
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(
-            requests,
-            [
-                "https://api.github.com/repos/openai/codex/releases/latest",
-                "https://github.com/openai/codex/releases/download/"
-                f"rust-v{VERSION}/codex-package_SHA256SUMS",
-            ],
+        metadata_url = "https://api.github.com/repos/openai/codex/releases/latest"
+        checksum_url = (
+            "https://github.com/openai/codex/releases/download/"
+            f"rust-v{VERSION}/codex-package_SHA256SUMS"
         )
+        self.assertEqual(requests.count(metadata_url), 1)
+        self.assertEqual(requests.count(checksum_url), 1)
         self.assertIn(f"Resolved version: {VERSION}", result.stdout)
 
 
 def run_installer(
-    release: str, *, metadata_failure: bool = False
+    release: str,
+    *,
+    metadata_failure: bool = False,
+    install_script: Path = INSTALL_SCRIPT,
 ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
@@ -116,7 +150,7 @@ def run_installer(
             }
         )
         result = subprocess.run(
-            ["/bin/sh", str(INSTALL_SCRIPT)],
+            ["/bin/sh", str(install_script)],
             capture_output=True,
             check=False,
             env=env,

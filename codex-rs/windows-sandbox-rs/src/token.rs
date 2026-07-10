@@ -7,6 +7,7 @@ use windows_sys::Win32::Foundation::ERROR_SUCCESS;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::LUID;
 use windows_sys::Win32::Foundation::LocalFree;
 use windows_sys::Win32::Security::AdjustTokenPrivileges;
@@ -21,8 +22,18 @@ use windows_sys::Win32::Security::CreateRestrictedToken;
 use windows_sys::Win32::Security::CreateWellKnownSid;
 use windows_sys::Win32::Security::GetLengthSid;
 use windows_sys::Win32::Security::GetTokenInformation;
+use windows_sys::Win32::Security::ImpersonateLoggedOnUser;
 use windows_sys::Win32::Security::LookupPrivilegeValueW;
+use windows_sys::Win32::Security::RevertToSelf;
 use windows_sys::Win32::Security::SetTokenInformation;
+use windows_sys::Win32::Storage::FileSystem::CreateFileW;
+use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
+use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_WRITE;
+use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
 
 use windows_sys::Win32::Security::ACL;
 use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
@@ -480,4 +491,78 @@ unsafe fn create_token_with_caps_from(
 
     enable_single_privilege(new_token, "SeChangeNotifyPrivilege")?;
     Ok(new_token)
+}
+
+/// Probes whether this Windows kernel applies a write-restricted token's
+/// restricting SIDs when a directory is opened for `FILE_DELETE_CHILD`.
+pub(crate) fn probe_legacy_delete_child_restriction() -> Result<bool> {
+    let probe_root = tempfile::Builder::new()
+        .prefix("codex-legacy-delete-child-probe-")
+        .tempdir()?;
+    let probe_home = tempfile::Builder::new()
+        .prefix("codex-legacy-delete-child-cap-")
+        .tempdir()?;
+    let caps = crate::cap::load_or_create_cap_sids(probe_home.path())?;
+    let cap_sid = LocalSid::from_string(&caps.workspace)?;
+
+    unsafe {
+        let base_token = get_current_token_for_restriction()?;
+        let mut user_sid_bytes = match get_user_sid_bytes(base_token) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                CloseHandle(base_token);
+                return Err(err);
+            }
+        };
+        let user_sid = user_sid_bytes.as_mut_ptr() as *mut c_void;
+        if let Err(err) =
+            crate::acl::ensure_allow_mask_aces(probe_root.path(), &[user_sid], FILE_ALL_ACCESS)
+        {
+            CloseHandle(base_token);
+            return Err(err);
+        }
+        let restricted_token =
+            create_workspace_write_token_with_caps_from(base_token, &[cap_sid.as_ptr()]);
+        CloseHandle(base_token);
+        let restricted_token = restricted_token?;
+
+        if ImpersonateLoggedOnUser(restricted_token) == 0 {
+            let err = GetLastError();
+            CloseHandle(restricted_token);
+            return Err(anyhow!("ImpersonateLoggedOnUser failed: {err}"));
+        }
+
+        let path = to_wide(probe_root.path());
+        let handle = CreateFileW(
+            path.as_ptr(),
+            FILE_DELETE_CHILD,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            0,
+        );
+        let open_error = if handle == INVALID_HANDLE_VALUE {
+            Some(GetLastError())
+        } else {
+            None
+        };
+
+        let reverted = RevertToSelf();
+        if handle != INVALID_HANDLE_VALUE {
+            CloseHandle(handle);
+        }
+        CloseHandle(restricted_token);
+        if reverted == 0 {
+            return Err(anyhow!("RevertToSelf failed: {}", GetLastError()));
+        }
+
+        match open_error {
+            None => Ok(false),
+            Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED) => Ok(true),
+            Some(err) => Err(anyhow!(
+                "FILE_DELETE_CHILD compatibility probe failed: {err}"
+            )),
+        }
+    }
 }

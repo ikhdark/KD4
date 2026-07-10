@@ -1,6 +1,6 @@
 """Version discovery for Codex packages."""
 
-from functools import lru_cache
+from functools import cache
 from pathlib import Path
 
 from .targets import REPO_ROOT
@@ -10,7 +10,7 @@ def _default_cargo_toml() -> Path:
     return REPO_ROOT / "codex-rs" / "Cargo.toml"
 
 
-@lru_cache(maxsize=1)
+@cache
 def read_workspace_version(cargo_toml: Path | None = None) -> str:
     return _read_workspace_version_uncached(cargo_toml or _default_cargo_toml())
 

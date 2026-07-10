@@ -30,6 +30,7 @@ SCOOP_LLVM_LLD_LINK = Path("apps/llvm/current/bin/lld-link.exe")
 @dataclass(frozen=True)
 class SourceBuildOutputs:
     entrypoint_bin: Path
+    code_mode_host_bin: Path
     bwrap_bin: Path | None
     codex_command_runner_bin: Path | None
     codex_windows_sandbox_setup_bin: Path | None
@@ -42,6 +43,7 @@ def build_source_binaries(
     cargo: str,
     profile: str,
     entrypoint_bin: Path | None,
+    code_mode_host_bin: Path | None,
     bwrap_bin: Path | None,
     codex_command_runner_bin: Path | None,
     codex_windows_sandbox_setup_bin: Path | None,
@@ -56,6 +58,7 @@ def build_source_binaries(
     )
     validate_explicit_output_paths(
         entrypoint_bin=entrypoint_bin,
+        code_mode_host_bin=code_mode_host_bin,
         bwrap_bin=bwrap_bin,
         codex_command_runner_bin=codex_command_runner_bin,
         codex_windows_sandbox_setup_bin=codex_windows_sandbox_setup_bin,
@@ -67,6 +70,10 @@ def build_source_binaries(
         entrypoint_bin=resolve_output_path(
             entrypoint_bin,
             output_dir / variant.entrypoint_name(spec),
+        ),
+        code_mode_host_bin=resolve_output_path(
+            code_mode_host_bin,
+            output_dir / spec.code_mode_host_name,
         ),
         bwrap_bin=resolve_output_path(
             bwrap_bin,
@@ -86,6 +93,7 @@ def build_source_binaries(
         spec,
         variant,
         build_entrypoint=entrypoint_bin is None,
+        build_code_mode_host=code_mode_host_bin is None,
         build_bwrap=spec.is_linux and bwrap_bin is None,
         build_codex_command_runner=spec.is_windows and codex_command_runner_bin is None,
         build_codex_windows_sandbox_setup=spec.is_windows
@@ -114,7 +122,9 @@ def build_source_binaries(
             profile,
             binaries,
             target_dir=target_dir,
-            include_v8_env=variant.cargo_bin in binaries,
+            include_v8_env=(
+                variant.cargo_bin in binaries or "codex-code-mode-host" in binaries
+            ),
         )
 
     validate_source_outputs(outputs)
@@ -191,6 +201,7 @@ def source_binaries_for_target(
     variant: PackageVariant,
     *,
     build_entrypoint: bool,
+    build_code_mode_host: bool,
     build_bwrap: bool,
     build_codex_command_runner: bool,
     build_codex_windows_sandbox_setup: bool,
@@ -198,6 +209,8 @@ def source_binaries_for_target(
     binaries = []
     if build_entrypoint:
         binaries.append(variant.cargo_bin)
+    if build_code_mode_host:
+        binaries.append("codex-code-mode-host")
     if build_bwrap:
         binaries.append("bwrap")
     if build_codex_command_runner:
@@ -229,12 +242,14 @@ def validate_prebuilt_resource_inputs(
 def validate_explicit_output_paths(
     *,
     entrypoint_bin: Path | None,
+    code_mode_host_bin: Path | None,
     bwrap_bin: Path | None,
     codex_command_runner_bin: Path | None,
     codex_windows_sandbox_setup_bin: Path | None,
 ) -> None:
     explicit_paths = [
         ("prebuilt entrypoint executable", entrypoint_bin),
+        ("prebuilt code-mode host executable", code_mode_host_bin),
         ("prebuilt Linux bwrap executable", bwrap_bin),
         (
             "prebuilt Windows codex-command-runner.exe executable",
@@ -434,11 +449,7 @@ def binaries_missing_for_reuse(
         if not source_output_matches_fingerprint(output, stamp_outputs.get(output_key)):
             missing.append(binary)
 
-    if missing == binaries and requested_binaries_cover_source_outputs(
-        binaries,
-        outputs=outputs,
-        variant=variant,
-    ):
+    if missing == binaries:
         return binaries
     if not source_build_stamp_source_matches(stamp):
         return binaries
@@ -453,6 +464,8 @@ def expected_output_for_binary(
 ) -> Path:
     if binary == variant.cargo_bin:
         return outputs.entrypoint_bin
+    if binary == "codex-code-mode-host":
+        return outputs.code_mode_host_bin
     if binary == "bwrap" and outputs.bwrap_bin is not None:
         return outputs.bwrap_bin
     if (
@@ -475,6 +488,8 @@ def source_output_key_for_binary(
 ) -> str:
     if binary == variant.cargo_bin:
         return "entrypoint_bin"
+    if binary == "codex-code-mode-host":
+        return "code_mode_host_bin"
     if binary == "bwrap":
         return "bwrap_bin"
     if binary == "codex-command-runner":
@@ -484,28 +499,10 @@ def source_output_key_for_binary(
     raise RuntimeError(f"unknown source binary output: {binary}")
 
 
-def requested_binaries_cover_source_outputs(
-    binaries: list[str],
-    *,
-    outputs: SourceBuildOutputs,
-    variant: PackageVariant,
-) -> bool:
-    requested_keys = {
-        source_output_key_for_binary(binary, variant=variant) for binary in binaries
-    }
-    output_keys = {"entrypoint_bin"}
-    if outputs.bwrap_bin is not None:
-        output_keys.add("bwrap_bin")
-    if outputs.codex_command_runner_bin is not None:
-        output_keys.add("codex_command_runner_bin")
-    if outputs.codex_windows_sandbox_setup_bin is not None:
-        output_keys.add("codex_windows_sandbox_setup_bin")
-    return output_keys <= requested_keys
-
-
 def validate_source_outputs(outputs: SourceBuildOutputs) -> None:
     for path in [
         outputs.entrypoint_bin,
+        outputs.code_mode_host_bin,
         outputs.bwrap_bin,
         outputs.codex_command_runner_bin,
         outputs.codex_windows_sandbox_setup_bin,
@@ -656,6 +653,7 @@ def run_git_bytes(git: str, *args: str) -> bytes:
 def source_output_fingerprints(outputs: SourceBuildOutputs) -> dict[str, dict | None]:
     return {
         "entrypoint_bin": source_output_fingerprint(outputs.entrypoint_bin),
+        "code_mode_host_bin": source_output_fingerprint(outputs.code_mode_host_bin),
         "bwrap_bin": source_output_fingerprint(outputs.bwrap_bin),
         "codex_command_runner_bin": source_output_fingerprint(
             outputs.codex_command_runner_bin
@@ -691,6 +689,7 @@ def source_outputs_match_fingerprints(
         source_output_matches_fingerprint(path, fingerprints.get(key))
         for key, path in {
             "entrypoint_bin": outputs.entrypoint_bin,
+            "code_mode_host_bin": outputs.code_mode_host_bin,
             "bwrap_bin": outputs.bwrap_bin,
             "codex_command_runner_bin": outputs.codex_command_runner_bin,
             "codex_windows_sandbox_setup_bin": outputs.codex_windows_sandbox_setup_bin,

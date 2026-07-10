@@ -41,6 +41,16 @@ fn legacy_process_test_guard() -> MutexGuard<'static, ()> {
         .expect("legacy Windows sandbox process test lock poisoned")
 }
 
+fn legacy_process_sandbox_available() -> bool {
+    let available = crate::legacy_restricted_token_enforces_delete_child();
+    if !available {
+        eprintln!(
+            "skipping legacy process test: this Windows kernel does not safely restrict FILE_DELETE_CHILD"
+        );
+    }
+    available
+}
+
 fn current_thread_runtime() -> tokio::runtime::Runtime {
     Builder::new_current_thread()
         .enable_all()
@@ -151,10 +161,14 @@ async fn collect_stdout_and_exit(
 
 #[test]
 fn legacy_non_tty_cmd_emits_output() {
+    if !legacy_process_sandbox_available() {
+        return;
+    }
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
-        let cwd = sandbox_cwd();
+        let test_root = TempDir::new_in(sandbox_cwd()).expect("create non-tty cmd workspace");
+        let cwd = test_root.path().to_path_buf();
         let codex_home = sandbox_home("legacy-non-tty-cmd");
         println!("cmd codex_home={}", codex_home.path().display());
         let permission_profile = PermissionProfile::workspace_write();
@@ -190,10 +204,15 @@ fn legacy_non_tty_cmd_emits_output() {
 
 #[test]
 fn legacy_non_tty_cmd_rejects_deny_read_overrides() {
+    if !legacy_process_sandbox_available() {
+        return;
+    }
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
-        let cwd = sandbox_cwd();
+        let test_root =
+            TempDir::new_in(sandbox_cwd()).expect("create deny-read override workspace");
+        let cwd = test_root.path().to_path_buf();
         let codex_home = sandbox_home("legacy-non-tty-deny-read");
         let secret_path =
             AbsolutePathBuf::from_absolute_path(cwd.join("legacy-non-tty-deny-read-secret.env"))
@@ -232,10 +251,15 @@ fn legacy_non_tty_powershell_emits_output() {
     let Some(pwsh) = pwsh_path() else {
         return;
     };
+    if !legacy_process_sandbox_available() {
+        return;
+    }
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
-        let cwd = sandbox_cwd();
+        let test_root =
+            TempDir::new_in(sandbox_cwd()).expect("create non-tty PowerShell workspace");
+        let cwd = test_root.path().to_path_buf();
         let codex_home = sandbox_home("legacy-non-tty-pwsh");
         println!("pwsh codex_home={}", codex_home.path().display());
         let permission_profile = PermissionProfile::workspace_write();
@@ -420,14 +444,18 @@ fn legacy_capture_powershell_emits_output() {
     let Some(pwsh) = pwsh_path() else {
         return;
     };
+    if !legacy_process_sandbox_available() {
+        return;
+    }
     let _guard = legacy_process_test_guard();
-    let cwd = sandbox_cwd();
+    let test_root = TempDir::new_in(sandbox_cwd()).expect("create capture workspace");
+    let cwd = test_root.path();
     let codex_home = sandbox_home("legacy-capture-pwsh");
     println!("capture pwsh codex_home={}", codex_home.path().display());
     let permission_profile = PermissionProfile::workspace_write();
     let result = run_windows_sandbox_capture(
         &permission_profile,
-        workspace_roots_for(cwd.as_path()).as_slice(),
+        workspace_roots_for(cwd).as_slice(),
         codex_home.path(),
         vec![
             pwsh.display().to_string(),
@@ -435,7 +463,7 @@ fn legacy_capture_powershell_emits_output() {
             "-Command".to_string(),
             "Write-Output LEGACY-CAPTURE-DIRECT".to_string(),
         ],
-        cwd.as_path(),
+        cwd,
         HashMap::new(),
         Some(10_000),
         /*cancellation*/ None,
@@ -459,6 +487,40 @@ fn legacy_workspace_write_delete_is_limited_to_writable_roots() {
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
+        if !crate::legacy_restricted_token_enforces_delete_child() {
+            let cwd = sandbox_cwd();
+            let codex_home = sandbox_home("legacy-delete-unsupported-platform");
+            let result = spawn_windows_sandbox_session_legacy(
+                &PermissionProfile::workspace_write(),
+                workspace_roots_for(cwd.as_path()).as_slice(),
+                codex_home.path(),
+                vec![
+                    "C:\\Windows\\System32\\cmd.exe".to_string(),
+                    "/d".to_string(),
+                    "/c".to_string(),
+                    "exit 0".to_string(),
+                ],
+                cwd.as_path(),
+                HashMap::new(),
+                /*timeout_ms*/ Some(5_000),
+                &[],
+                &[],
+                /*tty*/ false,
+                /*stdin_open*/ false,
+                /*use_private_desktop*/ true,
+            )
+            .await;
+            let err = match result {
+                Ok(_) => panic!("unsafe legacy delete semantics should fail closed"),
+                Err(err) => err,
+            };
+            assert_eq!(
+                err.to_string(),
+                crate::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR
+            );
+            return;
+        }
+
         // Keep writable roots out of USERPROFILE exclusions such as AppData.
         let test_root = TempDir::new_in(sandbox_cwd()).expect("create legacy delete test root");
         let codex_home = sandbox_home("legacy-delete-writable-roots");
@@ -570,8 +632,12 @@ fn legacy_capture_cancellation_is_not_reported_as_timeout() {
         eprintln!("skipping cancellation regression test: PowerShell 7 is not installed");
         return;
     };
+    if !legacy_process_sandbox_available() {
+        return;
+    }
     let _guard = legacy_process_test_guard();
-    let cwd = sandbox_cwd();
+    let test_root = TempDir::new_in(sandbox_cwd()).expect("create cancellation workspace");
+    let cwd = test_root.path();
     let codex_home = sandbox_home("legacy-capture-cancel");
     let permission_profile = PermissionProfile::workspace_write();
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -587,7 +653,7 @@ fn legacy_capture_cancellation_is_not_reported_as_timeout() {
     let started_at = Instant::now();
     let result = run_windows_sandbox_capture(
         &permission_profile,
-        workspace_roots_for(cwd.as_path()).as_slice(),
+        workspace_roots_for(cwd).as_slice(),
         codex_home.path(),
         vec![
             pwsh.display().to_string(),
@@ -595,7 +661,7 @@ fn legacy_capture_cancellation_is_not_reported_as_timeout() {
             "-Command".to_string(),
             "Start-Sleep -Seconds 30".to_string(),
         ],
-        cwd.as_path(),
+        cwd,
         HashMap::new(),
         Some(30_000),
         /*cancellation*/ Some(cancellation),
@@ -620,10 +686,14 @@ fn legacy_tty_powershell_emits_output_and_accepts_input() {
     let Some(pwsh) = pwsh_path() else {
         return;
     };
+    if !legacy_process_sandbox_available() {
+        return;
+    }
     let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
-        let cwd = sandbox_cwd();
+        let test_root = TempDir::new_in(sandbox_cwd()).expect("create tty PowerShell workspace");
+        let cwd = test_root.path().to_path_buf();
         let codex_home = sandbox_home("legacy-tty-pwsh");
         println!("tty pwsh codex_home={}", codex_home.path().display());
         let permission_profile = PermissionProfile::workspace_write();
@@ -675,9 +745,14 @@ fn legacy_tty_powershell_emits_output_and_accepts_input() {
 #[test]
 #[ignore = "TODO: legacy ConPTY cmd.exe exits with STATUS_DLL_INIT_FAILED in CI"]
 fn legacy_tty_cmd_emits_output_and_accepts_input() {
+    if !legacy_process_sandbox_available() {
+        return;
+    }
+    let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
-        let cwd = sandbox_cwd();
+        let test_root = TempDir::new_in(sandbox_cwd()).expect("create tty cmd workspace");
+        let cwd = test_root.path().to_path_buf();
         let codex_home = sandbox_home("legacy-tty-cmd");
         println!("tty cmd codex_home={}", codex_home.path().display());
         let permission_profile = PermissionProfile::workspace_write();
@@ -726,9 +801,15 @@ fn legacy_tty_cmd_emits_output_and_accepts_input() {
 #[test]
 #[ignore = "TODO: legacy ConPTY cmd.exe exits with STATUS_DLL_INIT_FAILED in CI"]
 fn legacy_tty_cmd_default_desktop_emits_output_and_accepts_input() {
+    if !legacy_process_sandbox_available() {
+        return;
+    }
+    let _guard = legacy_process_test_guard();
     let runtime = current_thread_runtime();
     runtime.block_on(async move {
-        let cwd = sandbox_cwd();
+        let test_root =
+            TempDir::new_in(sandbox_cwd()).expect("create default-desktop tty cmd workspace");
+        let cwd = test_root.path().to_path_buf();
         let codex_home = sandbox_home("legacy-tty-cmd-default-desktop");
         println!(
             "tty cmd default desktop codex_home={}",

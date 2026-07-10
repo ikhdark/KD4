@@ -36,5 +36,5 @@ def fetch_rg(
         dest_name=spec.rg_name,
     )
     if rg_bin is None:
-        raise AssertionError("ripgrep is required for all package targets")
+        raise RuntimeError("ripgrep is required for all package targets")
     return rg_bin

@@ -529,6 +529,9 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertIn("[truncated 14 chars]", result)
         self.assertTrue(result.endswith("bbbbb"))
 
+    def test_format_bytes_returns_rendered_size(self) -> None:
+        self.assertEqual(stage.format_bytes(1024), "1.0 KiB")
+
     def test_extract_zstd_archive_decompresses_in_destination_directory(self) -> None:
         archive_path = self.root / "cache" / "artifact.zst"
         archive_path.parent.mkdir()

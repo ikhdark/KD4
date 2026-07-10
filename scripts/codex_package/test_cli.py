@@ -19,6 +19,59 @@ class CliPerformanceFlagsTest(unittest.TestCase):
 
         self.assertEqual(args.archive_compression, "fast")
 
+    def test_release_resource_flags_are_parsed(self) -> None:
+        with mock.patch(
+            "sys.argv",
+            [
+                "codex_package",
+                "--code-mode-host-bin",
+                "codex-code-mode-host",
+                "--zsh-manifest",
+                "standalone-zsh",
+            ],
+        ):
+            args = cli.parse_args()
+
+        self.assertEqual(args.code_mode_host_bin, Path("codex-code-mode-host"))
+        self.assertEqual(args.zsh_manifest, Path("standalone-zsh"))
+
+    def test_zsh_manifest_is_forwarded_to_resolver(self) -> None:
+        spec = cli.TARGET_SPECS["x86_64-unknown-linux-musl"]
+        variant = cli.PACKAGE_VARIANTS["codex"]
+        manifest = Path("standalone-zsh")
+        outputs = SourceBuildOutputs(
+            entrypoint_bin=Path("codex"),
+            code_mode_host_bin=Path("codex-code-mode-host"),
+            bwrap_bin=Path("bwrap"),
+            codex_command_runner_bin=None,
+            codex_windows_sandbox_setup_bin=None,
+        )
+        args = cli.argparse.Namespace(
+            rg_bin=None,
+            zsh_bin=None,
+            zsh_manifest=manifest,
+        )
+
+        with (
+            mock.patch.object(cli, "resolve_source_outputs", return_value=outputs),
+            mock.patch.object(cli, "read_workspace_version", return_value="1.2.3"),
+            mock.patch.object(cli, "resolve_rg_bin", return_value=Path("rg")),
+            mock.patch.object(
+                cli,
+                "resolve_zsh_bin",
+                return_value=Path("zsh"),
+            ) as resolve_zsh,
+        ):
+            version, inputs = cli.resolve_package_inputs(args, spec, variant)
+
+        self.assertEqual(version, "1.2.3")
+        self.assertEqual(inputs.zsh_bin, Path("zsh"))
+        resolve_zsh.assert_called_once_with(
+            spec,
+            None,
+            manifest_path=manifest,
+        )
+
     def test_skip_build_if_present_uses_existing_outputs_and_reuses_archive_entries(
         self,
     ) -> None:
@@ -30,6 +83,7 @@ class CliPerformanceFlagsTest(unittest.TestCase):
             target_dir.mkdir(parents=True)
             for name in [
                 "codex.exe",
+                "codex-code-mode-host.exe",
                 "codex-command-runner.exe",
                 "codex-windows-sandbox-setup.exe",
                 "rg.exe",
@@ -54,10 +108,13 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                         cargo="cargo",
                         cargo_profile="debug",
                         entrypoint_bin=None,
+                        code_mode_host_bin=None,
                         bwrap_bin=None,
                         codex_command_runner_bin=None,
                         codex_windows_sandbox_setup_bin=None,
                         rg_bin=target_dir / "rg.exe",
+                        zsh_bin=None,
+                        zsh_manifest=None,
                         skip_build_if_present=True,
                         skip_validate=False,
                         fast_validate=True,
@@ -119,12 +176,15 @@ class CliPerformanceFlagsTest(unittest.TestCase):
             out.mkdir()
             outputs = SourceBuildOutputs(
                 entrypoint_bin=out / "codex",
+                code_mode_host_bin=out / "codex-code-mode-host",
                 bwrap_bin=None,
                 codex_command_runner_bin=None,
                 codex_windows_sandbox_setup_bin=None,
             )
             outputs.entrypoint_bin.write_text("bin", encoding="utf-8")
             outputs.entrypoint_bin.chmod(0o755)
+            outputs.code_mode_host_bin.write_text("host", encoding="utf-8")
+            outputs.code_mode_host_bin.chmod(0o755)
 
             with (
                 mock.patch.object(
@@ -139,10 +199,13 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                         cargo="cargo",
                         cargo_profile="debug",
                         entrypoint_bin=None,
-                        bwrap_bin=Path("ignored-bwrap"),
-                        codex_command_runner_bin=Path("ignored-runner"),
-                        codex_windows_sandbox_setup_bin=Path("ignored-setup"),
+                        code_mode_host_bin=None,
+                        bwrap_bin=None,
+                        codex_command_runner_bin=None,
+                        codex_windows_sandbox_setup_bin=None,
                         rg_bin=out / "rg",
+                        zsh_bin=None,
+                        zsh_manifest=None,
                         skip_build_if_present=False,
                         skip_validate=True,
                         fast_validate=False,
@@ -178,12 +241,15 @@ class CliPerformanceFlagsTest(unittest.TestCase):
             out.mkdir()
             outputs = SourceBuildOutputs(
                 entrypoint_bin=out / "codex-app-server",
+                code_mode_host_bin=out / "codex-code-mode-host",
                 bwrap_bin=None,
                 codex_command_runner_bin=None,
                 codex_windows_sandbox_setup_bin=None,
             )
             outputs.entrypoint_bin.write_text("bin", encoding="utf-8")
             outputs.entrypoint_bin.chmod(0o755)
+            outputs.code_mode_host_bin.write_text("host", encoding="utf-8")
+            outputs.code_mode_host_bin.chmod(0o755)
 
             with (
                 mock.patch.object(
@@ -198,10 +264,13 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                         cargo="cargo",
                         cargo_profile="debug",
                         entrypoint_bin=None,
+                        code_mode_host_bin=None,
                         bwrap_bin=None,
                         codex_command_runner_bin=None,
                         codex_windows_sandbox_setup_bin=None,
                         rg_bin=out / "rg",
+                        zsh_bin=None,
+                        zsh_manifest=None,
                         skip_build_if_present=False,
                         skip_validate=True,
                         fast_validate=False,
@@ -236,12 +305,14 @@ class CliPerformanceFlagsTest(unittest.TestCase):
             out.mkdir()
             outputs = SourceBuildOutputs(
                 entrypoint_bin=out / "codex.exe",
+                code_mode_host_bin=out / "codex-code-mode-host.exe",
                 bwrap_bin=None,
                 codex_command_runner_bin=out / "codex-command-runner.exe",
                 codex_windows_sandbox_setup_bin=out / "codex-windows-sandbox-setup.exe",
             )
             for path in [
                 outputs.entrypoint_bin,
+                outputs.code_mode_host_bin,
                 outputs.codex_command_runner_bin,
                 outputs.codex_windows_sandbox_setup_bin,
                 out / "rg.exe",
@@ -261,11 +332,13 @@ class CliPerformanceFlagsTest(unittest.TestCase):
                         cargo="cargo",
                         cargo_profile="release",
                         entrypoint_bin=None,
+                        code_mode_host_bin=None,
                         bwrap_bin=None,
                         codex_command_runner_bin=None,
                         codex_windows_sandbox_setup_bin=None,
                         rg_bin=out / "rg.exe",
                         zsh_bin=None,
+                        zsh_manifest=None,
                         reuse_source_builds=True,
                         skip_build_if_present=False,
                         force_source_rebuild=True,
@@ -291,6 +364,87 @@ class CliPerformanceFlagsTest(unittest.TestCase):
             build.assert_called_once()
             self.assertTrue(build.call_args.kwargs["reuse_existing"])
             self.assertTrue(build.call_args.kwargs["force_rebuild"])
+
+
+class CliPreflightTest(unittest.TestCase):
+    def test_rejects_platform_incompatible_helper_override(self) -> None:
+        args = request_args(bwrap_bin=Path("bwrap"))
+
+        with self.assertRaisesRegex(RuntimeError, "only supported for Linux"):
+            cli.validate_cli_request(
+                args,
+                cli.TARGET_SPECS["x86_64-apple-darwin"],
+                Path("package"),
+            )
+
+    def test_skip_build_rejects_ignored_source_override(self) -> None:
+        args = request_args(
+            skip_build_if_present=True,
+            code_mode_host_bin=Path("codex-code-mode-host.exe"),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "--code-mode-host-bin"):
+            cli.validate_cli_request(
+                args,
+                cli.TARGET_SPECS["x86_64-pc-windows-msvc"],
+                Path("package"),
+            )
+
+    def test_duplicate_archive_output_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output = root / "package.zip"
+            args = request_args(archive_output=[output, root / "." / "package.zip"])
+
+            with self.assertRaisesRegex(RuntimeError, "more than once"):
+                cli.validate_cli_request(
+                    args,
+                    cli.TARGET_SPECS["x86_64-pc-windows-msvc"],
+                    root / "package",
+                )
+
+    def test_main_rejects_invalid_archive_before_resolving_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            args = request_args(
+                target="x86_64-pc-windows-msvc",
+                variant="codex",
+                package_dir=root / "package",
+                archive_output=[root / "package.tar.gz"],
+                archive_compression="none",
+            )
+
+            with (
+                mock.patch.object(cli, "parse_args", return_value=args),
+                mock.patch.object(
+                    cli,
+                    "resolve_package_inputs",
+                    side_effect=AssertionError("inputs should not be resolved"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "compression 'none'"),
+            ):
+                cli.main()
+
+
+def request_args(**overrides) -> cli.argparse.Namespace:
+    values = {
+        "force": False,
+        "reuse_package_dir": False,
+        "archive_output": [],
+        "archive_compression": "fast",
+        "zsh_bin": None,
+        "zsh_manifest": None,
+        "bwrap_bin": None,
+        "codex_command_runner_bin": None,
+        "codex_windows_sandbox_setup_bin": None,
+        "skip_build_if_present": False,
+        "reuse_source_builds": False,
+        "force_source_rebuild": False,
+        "entrypoint_bin": None,
+        "code_mode_host_bin": None,
+    }
+    values.update(overrides)
+    return cli.argparse.Namespace(**values)
 
 
 if __name__ == "__main__":

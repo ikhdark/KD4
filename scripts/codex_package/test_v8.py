@@ -35,7 +35,16 @@ class V8ArtifactCacheTest(unittest.TestCase):
     def test_resolve_env_skips_fetch_when_v8_from_source_is_truthy(self) -> None:
         spec = TARGET_SPECS["x86_64-apple-darwin"]
 
-        for value in ["1", "true", "TRUE", "yes", "YES", "on", "ON"]:
+        for value in [
+            "1",
+            "true",
+            "TRUE",
+            "yes",
+            "YES",
+            "on",
+            "ON",
+            " TrUe ",
+        ]:
             with (
                 self.subTest(value=value),
                 mock.patch.object(
@@ -171,6 +180,16 @@ class V8ArtifactCacheTest(unittest.TestCase):
             )
             self.assertEqual(pair.binding.name, f"src_binding_release_{spec.target}.rs")
             self.assertEqual(ensure_valid.call_count, 2)
+
+    def test_checksum_manifest_accepts_binary_mode_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checksums = Path(temp_dir) / "checksums"
+            checksums.write_text(f"{'1' * 64} *artifact.a.gz\n", encoding="utf-8")
+
+            self.assertEqual(
+                v8.load_checksums(checksums, {"artifact.a.gz"}),
+                {"artifact.a.gz": "1" * 64},
+            )
 
     def test_download_file_leaves_stale_deterministic_temp_file_alone(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

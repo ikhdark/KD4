@@ -32,8 +32,8 @@ is the current source map for the checked-in script tooling.
   `stage_npm_packages.py`, and `codex_package/`.
 - Platform install flows: `install/install.sh` and `install/install.ps1`.
 - Root package maintenance commands: `root_maintenance.py`. The root
-  `package.json` `format:python*`, `lint:python*`, and `test:scripts*` aliases
-  route Python script maintenance through this helper.
+  `package.json` `audit:scripts`, `format:python*`, `lint:python*`, and
+  `test:scripts*` aliases route script maintenance through this helper.
 - Repository checks: `format.py`, `asciicheck.py`, `readme_toc.py`,
   `check_blob_size.py`, and their matching tests.
 - Script invocation compatibility: `just-shell.py`, `run-powershell-script.ps1`,
@@ -70,9 +70,10 @@ is the current source map for the checked-in script tooling.
 - `build_codex_package.py`, `stage_npm_packages.py`, and
   `test_stage_npm_packages.py`: package assembly/staging. Keep generated package
   layout aligned with `scripts/codex_package/`.
-- `root_maintenance.py`: repository root maintenance helper for Python script
-  formatting, linting, dead-code checks, and script tests. Keep target lists
-  explicit and synchronized with root `package.json` script names.
+- `root_maintenance.py`: repository root maintenance helper for the complete
+  script inventory, project-context checks, syntax, formatting, linting,
+  optimization advisories, and script tests. Keep target discovery and root
+  aliases synchronized with the checked-in script types.
 - `format.py`: repository formatting entry point. Keep rustfmt/toolchain behavior
   aligned with `codex-rs/rustfmt.toml` and `codex-rs/rust-toolchain.toml`.
 - `asciicheck.py`, `check_blob_size.py`, `readme_toc.py`,
@@ -130,6 +131,14 @@ is the current source map for the checked-in script tooling.
   surface.
 
 ## Validation
+
+- Run `just audit-scripts` from the repository root, or
+  `python root_maintenance.py audit-scripts` from `scripts/`, for the complete
+  script audit. Add `--quick` to skip the full unit-test suite; add `--strict`
+  to promote large-file, duplicate-content, and syntax-only test-routing
+  advisories to failures. Optimization is intentionally limited to measurable
+  hygiene and maintainability signals rather than an unsupported claim that
+  every script is performance-optimal.
 
 - If the request says no tests, do not run test commands. Use focused non-test
   checks only when relevant, such as syntax checks, read-back proof, dry-run

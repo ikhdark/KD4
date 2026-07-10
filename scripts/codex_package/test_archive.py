@@ -147,8 +147,69 @@ class WriteArchiveSafetyTest(unittest.TestCase):
             with zipfile.ZipFile(resolved_output) as zip_archive:
                 self.assertEqual(zip_archive.namelist(), ["codex-package.json"])
 
+    def test_failed_force_write_preserves_existing_archive(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package_dir = root / "package"
+            package_dir.mkdir()
+            output = root / "package.zip"
+            output.write_bytes(b"previous archive")
+
+            with (
+                mock.patch.object(
+                    archive,
+                    "write_zip_archive",
+                    side_effect=RuntimeError("write failed"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "write failed"),
+            ):
+                archive.write_archive(package_dir, output, force=True)
+
+            self.assertEqual(output.read_bytes(), b"previous archive")
+            self.assertEqual(list(root.glob("package.zip.*.tmp")), [])
+
+    def test_incompatible_compression_is_rejected_before_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            package_dir = root / "package"
+            package_dir.mkdir()
+            output = root / "package.tar.gz"
+            output.write_bytes(b"previous archive")
+
+            with self.assertRaisesRegex(RuntimeError, "compression 'none'"):
+                archive.write_archive(
+                    package_dir,
+                    output,
+                    force=True,
+                    compression="none",
+                )
+
+            self.assertEqual(output.read_bytes(), b"previous archive")
+
 
 class ArchiveMemberNameTest(unittest.TestCase):
+    def test_package_entries_exclude_unmanaged_reuse_contents(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            package_dir = Path(temp_dir) / "package"
+            (package_dir / "bin").mkdir(parents=True)
+            (package_dir / "bin" / "codex.exe").write_bytes(b"codex")
+            (package_dir / "codex-resources").mkdir()
+            (package_dir / "codex-path").mkdir()
+            (package_dir / "codex-package.json").write_text("{}", encoding="utf-8")
+            unmanaged = package_dir / "custom-cache" / "secret"
+            unmanaged.parent.mkdir()
+            unmanaged.write_bytes(b"do not archive")
+
+            members = {
+                path.relative_to(package_dir).as_posix()
+                for path in archive.package_entries(package_dir)
+            }
+
+            self.assertIn("bin/codex.exe", members)
+            self.assertIn("codex-package.json", members)
+            self.assertNotIn("custom-cache", members)
+            self.assertNotIn("custom-cache/secret", members)
+
     def test_zip_archive_uses_posix_member_names(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

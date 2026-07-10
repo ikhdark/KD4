@@ -3,11 +3,13 @@
 import shutil
 import subprocess
 import tarfile
+import tempfile
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import BinaryIO
 
+from .layout import MANAGED_PACKAGE_PATHS
 from .targets import REPO_ROOT
 
 
@@ -22,44 +24,76 @@ def write_archive(
     entries: list[Path] | None = None,
     compression: str = "default",
 ) -> None:
+    package_dir, archive_path, archive_format = validate_archive_output(
+        package_dir,
+        archive_path,
+        force=force,
+        compression=compression,
+    )
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = tempfile.NamedTemporaryFile(
+        prefix=f"{archive_path.name}.",
+        suffix=".tmp",
+        dir=archive_path.parent,
+        delete=False,
+    )
+    temp_path = Path(temp_file.name)
+    temp_file.close()
+    try:
+        if archive_format == "tar.gz":
+            write_tar_archive(
+                package_dir,
+                temp_path,
+                mode="w:gz",
+                entries=entries,
+                compression=compression,
+            )
+        elif archive_format == "tar.zst":
+            write_tar_zst_archive(
+                package_dir,
+                temp_path,
+                entries=entries,
+                compression=compression,
+            )
+        elif archive_format == "zip":
+            write_zip_archive(
+                package_dir,
+                temp_path,
+                entries=entries,
+                compression=compression,
+            )
+        else:
+            raise AssertionError(f"unexpected archive format: {archive_format}")
+        temp_path.replace(archive_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def validate_archive_output(
+    package_dir: Path,
+    archive_path: Path,
+    *,
+    force: bool,
+    compression: str = "default",
+) -> tuple[Path, Path, str]:
     package_dir = package_dir.resolve()
     archive_path = archive_path.resolve()
     if is_relative_to(archive_path, package_dir):
         raise RuntimeError(
             f"Archive output must be outside the package directory: {archive_path}"
         )
-
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-    if archive_path.exists():
-        if not force:
-            raise RuntimeError(f"Archive output already exists: {archive_path}")
-        archive_path.unlink()
+    if archive_path.exists() and not force:
+        raise RuntimeError(f"Archive output already exists: {archive_path}")
 
     archive_format = archive_format_for_path(archive_path)
-    if archive_format == "tar.gz":
-        write_tar_archive(
-            package_dir,
-            archive_path,
-            mode="w:gz",
-            entries=entries,
-            compression=compression,
+    if compression not in {"default", "fast", "none"}:
+        raise RuntimeError(f"Unsupported archive compression mode: {compression}")
+    if archive_format == "tar.gz" and compression == "none":
+        raise RuntimeError(
+            "compression 'none' conflicts with a .tar.gz/.tgz output; "
+            "use a .tar.zst or .zip output, or a gzip compression level."
         )
-    elif archive_format == "tar.zst":
-        write_tar_zst_archive(
-            package_dir,
-            archive_path,
-            entries=entries,
-            compression=compression,
-        )
-    elif archive_format == "zip":
-        write_zip_archive(
-            package_dir,
-            archive_path,
-            entries=entries,
-            compression=compression,
-        )
-    else:
-        raise AssertionError(f"unexpected archive format: {archive_format}")
+    return package_dir, archive_path, archive_format
 
 
 def is_relative_to(path: Path, parent: Path) -> bool:
@@ -214,7 +248,15 @@ def archive_member_name(path: Path, package_dir: Path) -> str:
 
 
 def package_entries(package_dir: Path) -> list[Path]:
+    entries: list[Path] = []
+    for relative_path in MANAGED_PACKAGE_PATHS:
+        root = package_dir / relative_path
+        if not root.exists():
+            continue
+        entries.append(root)
+        if root.is_dir():
+            entries.extend(root.rglob("*"))
     return sorted(
-        package_dir.rglob("*"),
+        entries,
         key=lambda path: path.relative_to(package_dir).as_posix(),
     )

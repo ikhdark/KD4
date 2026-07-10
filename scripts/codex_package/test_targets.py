@@ -89,6 +89,19 @@ class TargetMetadataTest(unittest.TestCase):
         self.assertEqual(normalize_machine("arm64"), "aarch64")
         self.assertEqual(normalize_machine("mips64"), "mips64")
 
+    def test_unsupported_host_is_sampled_once_for_consistent_error(self) -> None:
+        default_target.cache_clear()
+        with (
+            patch.object(targets.platform, "system", return_value="Plan9") as system,
+            patch.object(targets.platform, "machine", return_value="mips64") as machine,
+            self.assertRaisesRegex(RuntimeError, "Plan9/mips64"),
+        ):
+            default_target()
+
+        system.assert_called_once_with()
+        machine.assert_called_once_with()
+        default_target.cache_clear()
+
 
 class ResolveInputPathTest(unittest.TestCase):
     def test_missing_path_does_not_resolve(self) -> None:

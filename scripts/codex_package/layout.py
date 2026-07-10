@@ -18,34 +18,46 @@ from .zsh import ZSH_RESOURCE_PATH
 LAYOUT_VERSION = 1
 APPLY_PATCH_ALIASES = ("apply_patch", "applypatch")
 CODEX_CORE_APPLY_PATCH_ARG1 = "--codex-run-as-apply-patch"
+MANAGED_PACKAGE_PATHS = (
+    Path("bin"),
+    Path("codex-resources"),
+    Path("codex-path"),
+    Path("codex-package.json"),
+)
 
 
 def prepare_package_dir(package_dir: Path, *, force: bool, reuse: bool = False) -> None:
+    validate_package_dir_destination(package_dir, force=force, reuse=reuse)
     if package_dir.exists():
-        if not package_dir.is_dir():
-            raise RuntimeError(
-                f"Package output exists and is not a directory: {package_dir}"
-            )
         if reuse:
             clean_managed_package_paths(package_dir)
-        if any(package_dir.iterdir()) and not reuse:
-            if not force:
-                raise RuntimeError(
-                    f"Package output directory is not empty: {package_dir}. "
-                    "Pass --force to replace it."
-                )
+        elif any(package_dir.iterdir()):
             remove_tree_allow_readonly(package_dir)
 
     package_dir.mkdir(parents=True, exist_ok=True)
 
 
+def validate_package_dir_destination(
+    package_dir: Path,
+    *,
+    force: bool,
+    reuse: bool = False,
+) -> None:
+    if not package_dir.exists():
+        return
+    if not package_dir.is_dir():
+        raise RuntimeError(
+            f"Package output exists and is not a directory: {package_dir}"
+        )
+    if any(package_dir.iterdir()) and not (force or reuse):
+        raise RuntimeError(
+            f"Package output directory is not empty: {package_dir}. "
+            "Pass --force to replace it."
+        )
+
+
 def clean_managed_package_paths(package_dir: Path) -> None:
-    for relative_path in [
-        Path("bin"),
-        Path("codex-resources"),
-        Path("codex-path"),
-        Path("codex-package.json"),
-    ]:
+    for relative_path in MANAGED_PACKAGE_PATHS:
         path = package_dir / relative_path
         if path.is_dir():
             remove_tree_allow_readonly(path)
@@ -94,6 +106,11 @@ def build_package_dir(
     copy_executable(
         inputs.entrypoint_bin,
         bin_dir / entrypoint_name,
+        is_windows=spec.is_windows,
+    )
+    copy_executable(
+        inputs.code_mode_host_bin,
+        bin_dir / spec.code_mode_host_name,
         is_windows=spec.is_windows,
     )
     copy_executable(
@@ -171,6 +188,12 @@ def validate_package_dir(
     with open(metadata_path, encoding="utf-8") as fh:
         metadata = json.load(fh)
 
+    version = metadata.get("version")
+    if not isinstance(version, str) or not version:
+        raise RuntimeError(
+            f"Invalid package metadata field 'version': expected a non-empty string, got {version!r}"
+        )
+
     expected_metadata = {
         "layoutVersion": LAYOUT_VERSION,
         "target": spec.target,
@@ -190,6 +213,7 @@ def validate_package_dir(
 
     required_files = [
         Path("bin") / variant.entrypoint_name(spec),
+        Path("bin") / spec.code_mode_host_name,
         Path("codex-path") / spec.rg_name,
     ]
     executable_files = list(required_files)

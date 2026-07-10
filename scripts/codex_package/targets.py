@@ -10,6 +10,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = SCRIPT_DIR.parent
+CODE_MODE_HOST_STEM = "codex-code-mode-host"
 
 
 MACHINE_ALIASES: dict[str, str] = {
@@ -28,11 +29,17 @@ class TargetSpec:
     dotslash_platform: str
     exe_suffix: str = field(init=False)
     rg_name: str = field(init=False)
+    code_mode_host_name: str = field(init=False)
 
     def __post_init__(self) -> None:
         exe_suffix = ".exe" if self.is_windows else ""
         object.__setattr__(self, "exe_suffix", exe_suffix)
         object.__setattr__(self, "rg_name", f"rg{exe_suffix}")
+        object.__setattr__(
+            self,
+            "code_mode_host_name",
+            f"{CODE_MODE_HOST_STEM}{exe_suffix}",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +77,7 @@ class PackageVariant:
 @dataclass(frozen=True, slots=True)
 class PackageInputs:
     entrypoint_bin: Path
+    code_mode_host_bin: Path
     rg_bin: Path
     zsh_bin: Path | None
     bwrap_bin: Path | None
@@ -207,13 +215,15 @@ HOST_RELEASE_TARGETS: dict[tuple[str, str], str] = {
 
 @cache
 def default_target() -> str:
-    system = platform.system().lower()
-    machine = normalize_machine(platform.machine())
+    system_name = platform.system()
+    machine_name = platform.machine()
+    system = system_name.lower()
+    machine = normalize_machine(machine_name)
     target = HOST_RELEASE_TARGETS.get((system, machine))
     if target is None:
         supported = ", ".join(SUPPORTED_TARGETS)
         raise RuntimeError(
-            f"Unsupported host platform {platform.system()}/{platform.machine()}. "
+            f"Unsupported host platform {system_name}/{machine_name}. "
             f"Pass --target explicitly. Supported targets: {supported}"
         )
     return target

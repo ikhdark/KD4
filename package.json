@@ -3,6 +3,7 @@
   "private": true,
   "description": "Tools for repo-wide maintenance.",
   "scripts": {
+    "audit:scripts": "python scripts/root_maintenance.py audit-scripts",
     "format": "prettier --check *.json *.md docs/*.md .github/workflows/*.yml **/*.js",
     "format:fix": "prettier --write *.json *.md docs/*.md .github/workflows/*.yml **/*.js",
     "format:python": "python scripts/root_maintenance.py format-python",

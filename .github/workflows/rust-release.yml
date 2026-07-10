@@ -1257,7 +1257,7 @@ jobs:
 
       - name: Stage installer scripts
         run: |
-          cp scripts/install/install.sh dist/install.sh
+          python3 scripts/install/build_install_sh.py --output dist/install.sh
           cp scripts/install/install.ps1 dist/install.ps1
 
       - name: Create GitHub Release

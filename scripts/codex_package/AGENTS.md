@@ -7,18 +7,20 @@ and the repository root `AGENTS.md`.
 
 This package owns the canonical Codex package assembly contract for CLI,
 app-server, and local packaging proof. Keep package layout, archive contents,
-native binary staging, shell completions, DotSlash metadata, bundled ripgrep,
-target metadata, version derivation, and V8/rusty_v8 support synchronized.
+native binary staging, the sibling code-mode host, the patched zsh runtime,
+DotSlash metadata, bundled ripgrep, target metadata, version derivation, and
+V8/rusty_v8 support synchronized.
 
 ## File Context
 
 - `archive.py` and `test_archive.py`: archive creation and packaged artifact
   contents. Preserve deterministic layout and metadata where tests depend on it.
-- `cargo.py` and `test_cargo.py`: Cargo metadata/build artifact helpers. Prefer
-  `cargo metadata` over hand-maintained package lists.
+- `cargo.py` and `test_cargo.py`: Cargo build, source-output reuse, and artifact
+  fingerprint helpers. Keep the entrypoint and code-mode host in the same source
+  build/reuse contract.
 - `cli.py` and `test_cli.py`: Codex CLI binary/package entrypoint assembly.
-- `dotslash.py` and `test_dotslash.py`: DotSlash metadata generation and
-  validation. Keep emitted JSON/paths stable for release tooling.
+- `dotslash.py` and `test_dotslash.py`: DotSlash manifest parsing, verified
+  download caching, and safe executable extraction.
 - `layout.py` and `test_layout.py`: canonical package directory structure,
   metadata, and Windows `apply_patch` alias validation. Treat layout changes as
   packaging contract changes.
@@ -31,8 +33,8 @@ target metadata, version derivation, and V8/rusty_v8 support synchronized.
 - `v8.py` and `test_v8.py`: V8/rusty_v8 packaging support and release-pair logic.
 - `version.py` and `test_version.py`: package version derivation. Avoid changing
   version semantics without checking downstream package consumers.
-- `zsh.py`, `codex-zsh`, and `test_zsh.py`: zsh completion packaging. Preserve
-  installed completion names and script behavior.
+- `zsh.py`, `codex-zsh`, and `test_zsh.py`: patched zsh runtime packaging.
+  Preserve its installed resource path and caller-selectable manifest behavior.
 - `__init__.py`: package marker and public module boundary.
 - `__pycache__/` and `*.pyc`: ignored Python bytecode caches. Do not edit or
   use them as source evidence.

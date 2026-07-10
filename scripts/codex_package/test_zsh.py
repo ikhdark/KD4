@@ -37,7 +37,39 @@ class ZshResolverTest(unittest.TestCase):
             actual = zsh.resolve_zsh_bin(TARGET_SPECS["x86_64-unknown-linux-musl"])
 
         self.assertEqual(actual, expected)
-        fetch.assert_called_once()
+        fetch.assert_called_once_with(
+            TARGET_SPECS["x86_64-unknown-linux-musl"],
+            manifest_path=zsh.ZSH_MANIFEST,
+            artifact_label=zsh.ZSH_ARTIFACT_LABEL,
+            cache_key="x86_64-unknown-linux-musl-zsh",
+            dest_name=zsh.ZSH_DEST_NAME,
+            missing_ok=True,
+        )
+
+    def test_manifest_override_is_strict(self) -> None:
+        expected = Path("zsh")
+        manifest = Path("standalone-codex-zsh")
+        with mock.patch.object(
+            zsh,
+            "fetch_dotslash_executable",
+            return_value=expected,
+        ) as fetch:
+            actual = zsh.resolve_zsh_bin(
+                TARGET_SPECS["x86_64-unknown-linux-musl"],
+                manifest_path=manifest,
+            )
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(fetch.call_args.kwargs["manifest_path"], manifest)
+        self.assertFalse(fetch.call_args.kwargs["missing_ok"])
+
+    def test_explicit_binary_and_manifest_are_mutually_exclusive(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "cannot be used together"):
+            zsh.resolve_zsh_bin(
+                TARGET_SPECS["x86_64-unknown-linux-musl"],
+                Path("zsh"),
+                manifest_path=Path("manifest"),
+            )
 
     def test_explicit_zsh_bin_uses_standard_executable_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
