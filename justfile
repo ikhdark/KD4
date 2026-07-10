@@ -589,6 +589,17 @@ release-build-fast *args:
 mcp-server-run *args:
     cargo run -p codex-mcp-server -- {args}
 
+# Regenerate the thread-config protobuf bindings through the platform-native wrapper.
+[no-cd]
+[unix]
+generate-config-proto:
+    {{ justfile_directory() }}/codex-rs/config/scripts/generate-proto.sh
+
+[no-cd]
+[windows]
+generate-config-proto:
+    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\codex-rs\config\scripts\generate-proto.ps1"
+
 # Regenerate the json schema for config.toml from the current config types.
 write-config-schema:
     cargo run -p codex-core --bin codex-write-config-schema

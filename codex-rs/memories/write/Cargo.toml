@@ -35,6 +35,7 @@ codex-utils-template = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["fs", "rt", "sync", "time"] }
 tracing = { workspace = true, features = ["log"] }
 uuid = { workspace = true, features = ["v4", "v5"] }
@@ -44,6 +45,5 @@ codex-model-provider-info = { workspace = true }
 codex-models-manager = { workspace = true }
 core_test_support = { workspace = true }
 pretty_assertions = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros"] }
 wiremock = { workspace = true }

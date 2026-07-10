@@ -5,6 +5,8 @@ use codex_git_utils::ensure_git_baseline_repository;
 use codex_git_utils::reset_git_repository;
 use std::path::Path;
 
+use crate::generated_files::write_generated_file;
+
 /// Prepares the memory directory for git-baseline diffing.
 ///
 /// This keeps an existing usable `.git/` baseline intact. It initializes a new git baseline when the
@@ -31,7 +33,8 @@ pub async fn memory_workspace_diff(root: &Path) -> anyhow::Result<GitBaselineDif
 /// Writes `phase2_workspace_diff.md` with a bounded git-style diff from the current baseline.
 pub async fn write_workspace_diff(root: &Path, diff: &GitBaselineDiff) -> anyhow::Result<()> {
     let path = root.join(crate::workspace_diff::FILENAME);
-    tokio::fs::write(&path, render_workspace_diff_file(diff))
+    let contents = render_workspace_diff_file(diff);
+    write_generated_file(&path, &contents)
         .await
         .with_context(|| format!("write memory workspace diff file {}", path.display()))
 }

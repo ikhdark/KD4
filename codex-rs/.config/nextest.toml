@@ -69,8 +69,11 @@ test-group = 'core_apply_patch_cli_integration'
 [[profile.default.overrides]]
 # These tests create restricted-token Windows child processes and private desktops.
 # Serialize them to avoid exhausting Windows session/global desktop resources in CI.
+# Private-desktop startup can run close to the default 60s timeout on local Windows
+# machines under build or disk pressure, so give this serialized lane extra headroom.
 filter = 'package(codex-windows-sandbox) & test(legacy_)'
 test-group = 'windows_sandbox_legacy_sessions'
+slow-timeout = { period = "30s", terminate-after = 4 }
 
 [[profile.default.overrides]]
 # This Codex-home startup path still exceeded the broader Windows-heavy ceiling

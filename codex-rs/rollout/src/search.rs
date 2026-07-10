@@ -12,6 +12,7 @@ use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::strip_user_message_prefix;
 use regex::Regex;
 use regex::RegexBuilder;
+use serde_json::Value;
 use tokio::process::Command;
 
 use super::ARCHIVED_SESSIONS_SUBDIR;
@@ -50,13 +51,17 @@ pub async fn search_rollout_matches(
         SESSIONS_SUBDIR
     });
     let json_search_term = json_escaped_search_term(search_term)?;
-    let Some(plain_matches) =
-        ripgrep_rollout_paths(rg_command, root.as_path(), json_search_term.as_str()).await?
+    let Some(plain_matches) = ripgrep_rollout_paths(
+        rg_command,
+        root.as_path(),
+        json_search_term.as_str(),
+        search_term,
+    )
+    .await?
     else {
         return scan_rollout_matches(root.as_path(), json_search_term.as_str(), search_term).await;
     };
-    let mut matches: RolloutSearchMatches =
-        plain_matches.into_iter().map(|path| (path, None)).collect();
+    let mut matches = plain_matches;
     matches.extend(scan_compressed_rollout_matches(root.as_path(), search_term).await?);
     Ok(matches)
 }
@@ -64,21 +69,22 @@ pub async fn search_rollout_matches(
 async fn ripgrep_rollout_paths(
     rg_command: &Path,
     root: &Path,
+    json_search_term: &str,
     search_term: &str,
-) -> io::Result<Option<HashSet<PathBuf>>> {
+) -> io::Result<Option<RolloutSearchMatches>> {
     if !tokio::fs::try_exists(root).await.unwrap_or(false) {
-        return Ok(Some(HashSet::new()));
+        return Ok(Some(HashMap::new()));
     }
 
     let output = match Command::new(rg_command)
-        .arg("-l")
+        .arg("--json")
         .arg("--fixed-strings")
         .arg("--ignore-case")
         .arg("--no-ignore")
         .arg("--glob")
         .arg("*.jsonl")
         .arg("--")
-        .arg(search_term)
+        .arg(json_search_term)
         .arg(root)
         .output()
         .await
@@ -91,7 +97,7 @@ async fn ripgrep_rollout_paths(
     };
     if !output.status.success() {
         if output.status.code() == Some(1) && output.stderr.is_empty() {
-            return Ok(Some(HashSet::new()));
+            return Ok(Some(HashMap::new()));
         }
 
         return Err(io::Error::other(format!(
@@ -100,18 +106,52 @@ async fn ripgrep_rollout_paths(
         )));
     }
 
-    let mut matches = HashSet::new();
+    let search_term = case_insensitive_literal_regex(search_term)?;
+    let mut matches = HashMap::new();
     for line in String::from_utf8_lossy(output.stdout.as_slice()).lines() {
-        let path = PathBuf::from(line);
-        let path = if path.is_absolute() {
-            path
-        } else {
-            root.join(path)
+        let Some((path, snippet)) = parse_ripgrep_rollout_match(line, root, &search_term) else {
+            continue;
         };
-        matches.insert(path);
+        insert_rollout_match(&mut matches, path, snippet);
     }
 
     Ok(Some(matches))
+}
+
+fn parse_ripgrep_rollout_match(
+    line: &str,
+    root: &Path,
+    search_term: &Regex,
+) -> Option<(PathBuf, Option<String>)> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    if value.get("type")?.as_str()? != "match" {
+        return None;
+    }
+    let data = value.get("data")?;
+    let path_text = data.get("path")?.get("text")?.as_str()?;
+    let path = PathBuf::from(path_text);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    let snippet = data
+        .get("lines")
+        .and_then(|lines| lines.get("text"))
+        .and_then(Value::as_str)
+        .and_then(|jsonl_line| content_match_snippet(jsonl_line, search_term));
+    Some((path, snippet))
+}
+
+fn insert_rollout_match(
+    matches: &mut RolloutSearchMatches,
+    path: PathBuf,
+    snippet: Option<String>,
+) {
+    let existing = matches.entry(path).or_insert(None);
+    if existing.is_none() {
+        *existing = snippet;
+    }
 }
 
 async fn scan_rollout_matches(
@@ -154,7 +194,9 @@ async fn scan_rollout_matches(
                 continue;
             }
             if rollout_contains(rollout_file.path(), &json_search_term).await? {
-                matches.insert(rollout_file.into_path(), None);
+                let snippet =
+                    first_rollout_content_match_snippet(rollout_file.path(), search_term).await?;
+                matches.insert(rollout_file.into_path(), snippet);
             }
         }
     }
@@ -340,4 +382,79 @@ fn char_end_after(text: &str, byte_index: usize, chars_after: usize) -> usize {
         .nth(chars_after)
         .map(|(offset, _)| byte_index.saturating_add(offset))
         .unwrap_or(text.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::protocol::UserMessageEvent;
+    use pretty_assertions::assert_eq;
+
+    fn user_rollout_line(timestamp: &str, message: &str) -> String {
+        serde_json::to_string(&RolloutLine {
+            timestamp: timestamp.to_string(),
+            item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: message.to_string(),
+                ..Default::default()
+            })),
+        })
+        .expect("serialize rollout line")
+    }
+
+    fn ripgrep_match(path: &str, jsonl_line: &str) -> String {
+        serde_json::json!({
+            "type": "match",
+            "data": {
+                "path": { "text": path },
+                "lines": { "text": format!("{jsonl_line}\n") }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn parse_ripgrep_rollout_match_returns_bounded_plain_snippet() {
+        let root = Path::new("sessions");
+        let path = "2026/07/09/rollout-test.jsonl";
+        let message = format!("{}needle{}", "a".repeat(80), "b".repeat(140));
+        let jsonl_line = user_rollout_line("2026-07-09T00:00:00Z", &message);
+        let output = ripgrep_match(path, &jsonl_line);
+        let search_term = case_insensitive_literal_regex("needle").expect("search regex");
+
+        let (parsed_path, snippet) =
+            parse_ripgrep_rollout_match(&output, root, &search_term).expect("match event");
+        let snippet = snippet.expect("conversation snippet");
+
+        assert_eq!(parsed_path, root.join(path));
+        assert!(snippet.starts_with("... "));
+        assert!(snippet.ends_with(" ..."));
+        assert!(snippet.contains("needle"));
+        assert!(snippet.chars().count() <= 170, "snippet was {snippet:?}");
+    }
+
+    #[test]
+    fn parse_ripgrep_rollout_match_retains_path_without_conversation_snippet() {
+        let root = Path::new("sessions");
+        let path = "rollout-metadata-match.jsonl";
+        let jsonl_line = user_rollout_line("needle", "unrelated conversation");
+        let output = ripgrep_match(path, &jsonl_line);
+        let search_term = case_insensitive_literal_regex("needle").expect("search regex");
+
+        assert_eq!(
+            parse_ripgrep_rollout_match(&output, root, &search_term),
+            Some((root.join(path), None))
+        );
+    }
+
+    #[test]
+    fn insert_rollout_match_upgrades_missing_snippet_without_replacing_first_snippet() {
+        let path = PathBuf::from("rollout.jsonl");
+        let mut matches = RolloutSearchMatches::new();
+
+        insert_rollout_match(&mut matches, path.clone(), None);
+        insert_rollout_match(&mut matches, path.clone(), Some("first".to_string()));
+        insert_rollout_match(&mut matches, path.clone(), Some("later".to_string()));
+
+        assert_eq!(matches.get(&path), Some(&Some("first".to_string())));
+    }
 }
