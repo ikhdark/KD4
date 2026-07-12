@@ -50,6 +50,7 @@ use codex_app_server_protocol::RawResponseItemCompletedNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequestPayload;
+use codex_app_server_protocol::TaskCompletionGate;
 use codex_app_server_protocol::ThreadGoalUpdatedNotification;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadRealtimeClosedNotification;
@@ -1216,6 +1217,7 @@ async fn handle_turn_plan_update(
 struct TurnCompletionMetadata {
     status: TurnStatus,
     error: Option<TurnError>,
+    completion: Option<TaskCompletionGate>,
     started_at: Option<i64>,
     completed_at: Option<i64>,
     duration_ms: Option<i64>,
@@ -1239,6 +1241,7 @@ async fn emit_turn_completed_with_status(
             completed_at: turn_completion_metadata.completed_at,
             duration_ms: turn_completion_metadata.duration_ms,
         },
+        completion: turn_completion_metadata.completion,
     };
     outgoing
         .send_server_notification(ServerNotification::TurnCompleted(notification))
@@ -1426,6 +1429,7 @@ async fn handle_turn_complete(
         TurnCompletionMetadata {
             status,
             error,
+            completion: turn_complete_event.completion.map(Into::into),
             started_at: turn_summary.started_at,
             completed_at: turn_complete_event.completed_at,
             duration_ms: turn_complete_event.duration_ms,
@@ -1450,6 +1454,7 @@ async fn handle_turn_interrupted(
         TurnCompletionMetadata {
             status: TurnStatus::Interrupted,
             error: None,
+            completion: None,
             started_at: turn_summary.started_at,
             completed_at: turn_aborted_event.completed_at,
             duration_ms: turn_aborted_event.duration_ms,
@@ -2195,6 +2200,7 @@ mod tests {
             completed_at: Some(TEST_TURN_COMPLETED_AT),
             duration_ms: Some(TEST_TURN_DURATION_MS),
             time_to_first_token_ms: None,
+            completion: None,
         }
     }
 
@@ -3457,6 +3463,12 @@ mod tests {
             ThreadId::new(),
         );
         let thread_state = new_thread_state();
+        let mut completion_event = turn_complete_event(&event_turn_id);
+        completion_event.completion = Some(codex_protocol::protocol::TaskCompletionGate {
+            status: codex_protocol::protocol::TaskCompletionStatus::Partial,
+            reasons: vec!["focused validation is stale".to_string()],
+            evidence_path: Some("task-evidence/thread.json".to_string()),
+        });
         {
             let mut state = thread_state.lock().await;
             state.track_current_turn_event(
@@ -3471,14 +3483,14 @@ mod tests {
             );
             state.track_current_turn_event(
                 &event_turn_id,
-                &EventMsg::TurnComplete(turn_complete_event(&event_turn_id)),
+                &EventMsg::TurnComplete(completion_event.clone()),
             );
         }
 
         handle_turn_complete(
             conversation_id,
             event_turn_id.clone(),
-            turn_complete_event(&event_turn_id),
+            completion_event,
             &outgoing,
             &thread_state,
         )
@@ -3495,6 +3507,12 @@ mod tests {
                 assert_eq!(n.turn.started_at, Some(42));
                 assert_eq!(n.turn.completed_at, Some(TEST_TURN_COMPLETED_AT));
                 assert_eq!(n.turn.duration_ms, Some(TEST_TURN_DURATION_MS));
+                let completion = n.completion.expect("completion gate");
+                assert_eq!(
+                    completion.status,
+                    codex_app_server_protocol::TaskCompletionStatus::Partial
+                );
+                assert_eq!(completion.reasons, ["focused validation is stale"]);
             }
             other => bail!("unexpected message: {other:?}"),
         }
@@ -3625,12 +3643,26 @@ mod tests {
             explanation: Some("need plan".to_string()),
             plan: vec![
                 PlanItemArg {
+                    id: Some("first".to_string()),
                     step: "first".to_string(),
                     status: StepStatus::Pending,
+                    depends_on: Vec::new(),
+                    acceptance_criteria: vec!["inspect owner".to_string()],
+                    runtime_paths: vec!["src/first.rs".to_string()],
+                    generated_artifacts: Vec::new(),
+                    risks: Vec::new(),
+                    requires_desktop_activation: false,
                 },
                 PlanItemArg {
+                    id: Some("second".to_string()),
                     step: "second".to_string(),
-                    status: StepStatus::Completed,
+                    status: StepStatus::Passed,
+                    depends_on: vec!["first".to_string()],
+                    acceptance_criteria: Vec::new(),
+                    runtime_paths: Vec::new(),
+                    generated_artifacts: Vec::new(),
+                    risks: Vec::new(),
+                    requires_desktop_activation: false,
                 },
             ],
         };
@@ -3648,8 +3680,11 @@ mod tests {
                 assert_eq!(n.plan.len(), 2);
                 assert_eq!(n.plan[0].step, "first");
                 assert_eq!(n.plan[0].status, TurnPlanStepStatus::Pending);
+                assert_eq!(n.plan[0].id.as_deref(), Some("first"));
+                assert_eq!(n.plan[0].acceptance_criteria, ["inspect owner"]);
                 assert_eq!(n.plan[1].step, "second");
-                assert_eq!(n.plan[1].status, TurnPlanStepStatus::Completed);
+                assert_eq!(n.plan[1].status, TurnPlanStepStatus::Passed);
+                assert_eq!(n.plan[1].depends_on, ["first"]);
             }
             other => bail!("unexpected message: {other:?}"),
         }

@@ -11,12 +11,13 @@ default.
 | Edit anything under `.codex` | [`AGENTS.md`](AGENTS.md) |
 | Prepare ignored files for a Codex worktree | [`environments/README.md`](environments/README.md) |
 | Plan or preserve evidence for a durable task | [`harness/README.md`](harness/README.md) |
-| Follow the harness lifecycle and finish gate | [`harness/workflow.md`](harness/workflow.md) |
-| Implement or change KD4 repository behavior | [`skills/kd4-crosscheck-and-finish/SKILL.md`](skills/kd4-crosscheck-and-finish/SKILL.md) |
-| Create, audit, or run harness artifacts | [`skills/kd4-harness/SKILL.md`](skills/kd4-harness/SKILL.md) |
+| Implement or change KD4 repository behavior | [`../AGENTS.md`](../AGENTS.md) |
+| Follow the optional durable-artifact lifecycle | [`harness/workflow.md`](harness/workflow.md) |
+| Create, audit, or run durable harness artifacts | [`skills/kd4-harness/SKILL.md`](skills/kd4-harness/SKILL.md) |
 
 Use the smallest relevant surface. Routine work does not need a harness run
-directory, and specialized skills should be loaded only when their task applies.
+directory, and the harness skill should load only when durable workflow state or
+harness maintenance is actually requested.
 
 ## Source And State Boundary
 

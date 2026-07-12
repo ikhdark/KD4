@@ -38,6 +38,7 @@ impl ChatWidget {
                 self.handle_turn_completed_notification(
                     TurnCompletedNotification {
                         thread_id: self.thread_id.map(|id| id.to_string()).unwrap_or_default(),
+                        completion: None,
                         turn: Turn {
                             id: turn_id,
                             items_view: codex_app_server_protocol::TurnItemsView::NotLoaded,

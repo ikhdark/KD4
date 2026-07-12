@@ -11,6 +11,8 @@ use codex_protocol::models::ImageDetail;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::plan_tool::PlanItemArg as CorePlanItemArg;
 use codex_protocol::plan_tool::StepStatus as CorePlanStepStatus;
+use codex_protocol::protocol::TaskCompletionGate as CoreTaskCompletionGate;
+use codex_protocol::protocol::TaskCompletionStatus as CoreTaskCompletionStatus;
 use codex_protocol::user_input::ByteRange as CoreByteRange;
 use codex_protocol::user_input::TextElement as CoreTextElement;
 use codex_protocol::user_input::UserInput as CoreUserInput;
@@ -392,6 +394,50 @@ pub struct Usage {
 pub struct TurnCompletedNotification {
     pub thread_id: String,
     pub turn: Turn,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub completion: Option<TaskCompletionGate>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TaskCompletionGate {
+    pub status: TaskCompletionStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub evidence_path: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub enum TaskCompletionStatus {
+    Passed,
+    Partial,
+    Blocked,
+}
+
+impl From<CoreTaskCompletionGate> for TaskCompletionGate {
+    fn from(value: CoreTaskCompletionGate) -> Self {
+        Self {
+            status: value.status.into(),
+            reasons: value.reasons,
+            evidence_path: value.evidence_path,
+        }
+    }
+}
+
+impl From<CoreTaskCompletionStatus> for TaskCompletionStatus {
+    fn from(value: CoreTaskCompletionStatus) -> Self {
+        match value {
+            CoreTaskCompletionStatus::Passed => Self::Passed,
+            CoreTaskCompletionStatus::Partial => Self::Partial,
+            CoreTaskCompletionStatus::Blocked => Self::Blocked,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
@@ -415,28 +461,55 @@ pub struct TurnPlanUpdatedNotification {
     pub plan: Vec<TurnPlanStep>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub struct TurnPlanStep {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub id: Option<String>,
     pub step: String,
     pub status: TurnPlanStepStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance_criteria: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub generated_artifacts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub risks: Vec<String>,
+    #[serde(default)]
+    pub requires_desktop_activation: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, JsonSchema, TS)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export_to = "v2/")]
 pub enum TurnPlanStepStatus {
+    #[default]
     Pending,
     InProgress,
+    Implemented,
+    Passed,
+    Blocked,
+    Skipped,
     Completed,
 }
 
 impl From<CorePlanItemArg> for TurnPlanStep {
     fn from(value: CorePlanItemArg) -> Self {
         Self {
+            id: value.id,
             step: value.step,
             status: value.status.into(),
+            depends_on: value.depends_on,
+            acceptance_criteria: value.acceptance_criteria,
+            runtime_paths: value.runtime_paths,
+            generated_artifacts: value.generated_artifacts,
+            risks: value.risks,
+            requires_desktop_activation: value.requires_desktop_activation,
         }
     }
 }
@@ -446,6 +519,10 @@ impl From<CorePlanStepStatus> for TurnPlanStepStatus {
         match value {
             CorePlanStepStatus::Pending => Self::Pending,
             CorePlanStepStatus::InProgress => Self::InProgress,
+            CorePlanStepStatus::Implemented => Self::Implemented,
+            CorePlanStepStatus::Passed => Self::Passed,
+            CorePlanStepStatus::Blocked => Self::Blocked,
+            CorePlanStepStatus::Skipped => Self::Skipped,
             CorePlanStepStatus::Completed => Self::Completed,
         }
     }

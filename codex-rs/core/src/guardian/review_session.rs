@@ -1185,6 +1185,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms,
+                completion: None,
             }),
         }
     }

@@ -1951,10 +1951,34 @@ pub struct SafetyBufferingEvent {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ContextCompactedEvent;
 
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum TaskCompletionStatus {
+    Passed,
+    Partial,
+    Blocked,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+pub struct TaskCompletionGate {
+    pub status: TaskCompletionStatus,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub evidence_path: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct TurnCompleteEvent {
     pub turn_id: String,
     pub last_agent_message: Option<String>,
+    /// Machine-derived completion proof. Absent for read-only or non-KD4 turns
+    /// that never entered the durable task-evidence workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub completion: Option<TaskCompletionGate>,
     /// Unix timestamp (in seconds) when the turn completed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null", optional)]
@@ -4394,6 +4418,35 @@ mod tests {
             serde_json::from_value::<ThreadSource>(json!("automation"))?,
             source
         );
+        Ok(())
+    }
+
+    #[test]
+    fn turn_complete_completion_gate_is_typed_and_backward_compatible() -> Result<()> {
+        let event = TurnCompleteEvent {
+            turn_id: "turn-1".to_string(),
+            last_agent_message: None,
+            completion: Some(TaskCompletionGate {
+                status: TaskCompletionStatus::Partial,
+                reasons: vec!["validation is stale".to_string()],
+                evidence_path: Some("task-evidence/thread.json".to_string()),
+            }),
+            completed_at: None,
+            duration_ms: None,
+            time_to_first_token_ms: None,
+        };
+        let value = serde_json::to_value(&event)?;
+        assert_eq!(value["completion"]["status"], json!("partial"));
+        assert_eq!(
+            value["completion"]["reasons"],
+            json!(["validation is stale"])
+        );
+
+        let legacy = serde_json::from_value::<TurnCompleteEvent>(json!({
+            "turn_id": "turn-1",
+            "last_agent_message": null
+        }))?;
+        assert!(legacy.completion.is_none());
         Ok(())
     }
 

@@ -4,15 +4,14 @@
 
 - [ ] User objective is concrete enough to act on
 - [ ] Task lane chosen from root `AGENTS.md`
-- [ ] Wiring Guard/KDWG-triggered implementation work treated as harnessed when
-      applicable
+- [ ] Durable harness state is justified for this task
 - [ ] Nearest scoped `AGENTS.md` inspected when editing files
 - [ ] Existing dirty-worktree changes identified and preserved
 
 ## Implementation
 
-- [ ] `kd4-crosscheck-and-finish` applied for implementation or repo-behavior
-      work
+- [ ] Root `AGENTS.md` and any active specialist skill applied for
+      implementation or repo-behavior work
 - [ ] Wiring Guard/KDWG intent declared before implementation-shaped edits when
       active
 - [ ] Owner files inspected

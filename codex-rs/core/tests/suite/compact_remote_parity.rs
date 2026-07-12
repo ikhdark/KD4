@@ -938,6 +938,7 @@ fn normalize_string(value: &str) -> String {
     }
 
     let mut text = value.to_string();
+    normalize_raw_output_artifact_paths(&mut text);
     normalize_tmp_prefix_before_marker(&mut text, "/skills/");
     normalize_tmp_prefix_before_marker(&mut text, "\\skills\\");
 
@@ -975,6 +976,22 @@ fn normalize_string(value: &str) -> String {
         }
     }
     text
+}
+
+fn normalize_raw_output_artifact_paths(text: &mut String) {
+    const PREFIX: &str = "Raw output artifact: ";
+    const PLACEHOLDER: &str = "<RAW_OUTPUT_ARTIFACT>";
+
+    let mut search_start = 0;
+    while let Some(relative_start) = text[search_start..].find(PREFIX) {
+        let path_start = search_start + relative_start + PREFIX.len();
+        let Some(relative_end) = text[path_start..].find(" (") else {
+            break;
+        };
+        let path_end = path_start + relative_end;
+        text.replace_range(path_start..path_end, PLACEHOLDER);
+        search_start = path_start + PLACEHOLDER.len();
+    }
 }
 
 #[test]
@@ -1069,6 +1086,20 @@ fn normalize_string_rewrites_shell_wall_times() {
         text,
         "Exit code: 0\nWall time: <WALL_TIME> seconds\nOutput:\nok\n\
          Exit code: 0\nWall time: <WALL_TIME> seconds\nOutput:\nok"
+    );
+}
+
+#[test]
+fn normalize_string_rewrites_raw_output_artifact_paths() {
+    let text = normalize_string(
+        "Raw output artifact: C:\\Users\\runner\\AppData\\Local\\Temp\\.tmpA\\tool-output\\thread\\call.log (35 bytes retained before model summarization)\n\
+         Raw output artifact: /tmp/.tmpB/tool-output/thread/call.log (23 bytes retained before model summarization)",
+    );
+
+    assert_eq!(
+        text,
+        "Raw output artifact: <RAW_OUTPUT_ARTIFACT> (35 bytes retained before model summarization)\n\
+         Raw output artifact: <RAW_OUTPUT_ARTIFACT> (23 bytes retained before model summarization)"
     );
 }
 

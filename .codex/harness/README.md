@@ -24,11 +24,12 @@ unused placeholder sections instead of filling artifacts for completeness.
 
 ## Execution Rules
 
-Choose the task lane from the root `AGENTS.md`. Apply
-[`kd4-crosscheck-and-finish`](../skills/kd4-crosscheck-and-finish/SKILL.md) for
-implementation and repository-behavior work. When Wiring Guard/KDWG is active,
-use it for static reachability proof and treat the task as harnessed in
-lightweight mode even when no run directory is created.
+Choose the task lane and apply the implementation, validation, and completion
+rules from the root [`AGENTS.md`](../../AGENTS.md). The harness records durable
+decisions and evidence; it does not define a second implementation discipline.
+For implementation inside a harnessed task, use Wiring Guard/KDWG when required
+by root policy or an active specialist skill. Wiring Guard alone does not
+require a run directory or activate the harness skill.
 
 ## Generated Task State
 

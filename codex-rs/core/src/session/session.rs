@@ -1047,6 +1047,12 @@ impl Session {
                     thread_store: &thread_extension_data,
                 }).await;
             }
+            let task_evidence = crate::task_evidence::TaskEvidenceLedger::load_or_new(
+                config.codex_home.to_path_buf(),
+                thread_id,
+                session_configuration.cwd().as_path(),
+            )
+            .await;
 
             let services = SessionServices {
                 // Initialize the MCP connection manager with an uninitialized
@@ -1065,6 +1071,7 @@ impl Session {
                 ),
                 command_execution:
                     crate::tools::command_execution::CommandExecutionLedger::default(),
+                task_evidence,
                 elicitations: crate::elicitation::ElicitationService::new(),
                 shell_zsh_path: config.zsh_path.clone(),
                 main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),

@@ -85,6 +85,7 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
+use codex_protocol::items::HookPromptFragment;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::build_hook_prompt_message;
@@ -371,6 +372,56 @@ pub(crate) async fn run_turn(
 
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
+                    let automatic_plan_summary = if let Some(changed_paths) = sess
+                        .services
+                        .task_evidence
+                        .take_automatic_verify_plan_request()
+                        .await
+                    {
+                        Some(
+                            crate::tools::handlers::run_automatic_verify_local_plan(
+                                Arc::clone(&sess),
+                                Arc::clone(&step_context),
+                                Arc::clone(&turn_diff_tracker),
+                                changed_paths,
+                                cancellation_token.child_token(),
+                            )
+                            .await
+                            .unwrap_or_else(|err| {
+                                format!("automatic verify_local plan failed: {err:?}")
+                            }),
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(repair_prompt) = sess
+                        .services
+                        .task_evidence
+                        .take_finalization_repair_prompt()
+                        .await
+                    {
+                        let repair_prompt = automatic_plan_summary
+                            .as_deref()
+                            .filter(|summary| !summary.trim().is_empty())
+                            .map(|summary| {
+                                format!(
+                                    "Automatic verify_local plan result:\n{summary}\n\n{repair_prompt}"
+                                )
+                            })
+                            .unwrap_or(repair_prompt);
+                        let fragment = HookPromptFragment::from_single_hook(
+                            repair_prompt,
+                            format!("kd4-task-evidence-{}", turn_context.sub_id),
+                        );
+                        if let Some(repair_message) = build_hook_prompt_message(&[fragment]) {
+                            sess.record_response_item_and_emit_turn_item(
+                                &turn_context,
+                                repair_message,
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
                     let stop_outcome = run_turn_stop_hooks(
                         &sess,
                         &turn_context,

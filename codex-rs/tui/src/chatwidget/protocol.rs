@@ -105,12 +105,25 @@ impl ChatWidget {
                         .plan
                         .into_iter()
                         .map(|step| UpdatePlanItemArg {
+                            id: step.id,
                             step: step.step,
                             status: match step.status {
                                 TurnPlanStepStatus::Pending => UpdatePlanItemStatus::Pending,
                                 TurnPlanStepStatus::InProgress => UpdatePlanItemStatus::InProgress,
+                                TurnPlanStepStatus::Implemented => {
+                                    UpdatePlanItemStatus::Implemented
+                                }
+                                TurnPlanStepStatus::Passed => UpdatePlanItemStatus::Passed,
+                                TurnPlanStepStatus::Blocked => UpdatePlanItemStatus::Blocked,
+                                TurnPlanStepStatus::Skipped => UpdatePlanItemStatus::Skipped,
                                 TurnPlanStepStatus::Completed => UpdatePlanItemStatus::Completed,
                             },
+                            depends_on: step.depends_on,
+                            acceptance_criteria: step.acceptance_criteria,
+                            runtime_paths: step.runtime_paths,
+                            generated_artifacts: step.generated_artifacts,
+                            risks: step.risks,
+                            requires_desktop_activation: step.requires_desktop_activation,
                         })
                         .collect(),
                 })
@@ -238,6 +251,30 @@ impl ChatWidget {
         // this TUI already rendered locally. Once that turn ends, another
         // client can submit the same text and it still needs its own user cell.
         self.last_rendered_user_message_display = None;
+        if let Some(completion) = notification.completion.as_ref() {
+            let status = match completion.status {
+                TaskCompletionStatus::Passed => "passed",
+                TaskCompletionStatus::Partial => "partial",
+                TaskCompletionStatus::Blocked => "blocked",
+            };
+            let reasons = completion
+                .reasons
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ");
+            let message = if reasons.is_empty() {
+                format!("Task completion gate: {status}")
+            } else {
+                format!("Task completion gate: {status} — {reasons}")
+            };
+            if completion.status == TaskCompletionStatus::Passed {
+                self.add_to_history(history_cell::new_info_event(message, None));
+            } else {
+                self.add_to_history(history_cell::new_warning_event(message));
+            }
+        }
         match notification.turn.status {
             TurnStatus::Completed => {
                 self.last_non_retry_error = None;

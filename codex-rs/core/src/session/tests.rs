@@ -3133,6 +3133,7 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id,
                 last_agent_message: None,
+                completion: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -3336,6 +3337,7 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
+            completion: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
@@ -3365,6 +3367,7 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
+            completion: None,
         })),
     ])
     .await;
@@ -3454,6 +3457,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
+            completion: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
@@ -3478,6 +3482,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
+            completion: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
@@ -3510,6 +3515,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
+            completion: None,
         })),
     ])
     .await;
@@ -3583,6 +3589,7 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
+            completion: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
@@ -3610,6 +3617,7 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
+            completion: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
@@ -3637,6 +3645,7 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
+            completion: None,
         })),
     ])
     .await;
@@ -5457,6 +5466,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
             config.background_terminal_max_timeout,
         ),
         command_execution: crate::tools::command_execution::CommandExecutionLedger::default(),
+        task_evidence: crate::task_evidence::TaskEvidenceLedger::disabled(),
         elicitations: crate::elicitation::ElicitationService::new(),
         shell_zsh_path: None,
         main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
@@ -7589,6 +7599,7 @@ where
             config.background_terminal_max_timeout,
         ),
         command_execution: crate::tools::command_execution::CommandExecutionLedger::default(),
+        task_evidence: crate::task_evidence::TaskEvidenceLedger::disabled(),
         elicitations: crate::elicitation::ElicitationService::new(),
         shell_zsh_path: None,
         main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),

@@ -95,7 +95,7 @@ fn assert_shell_command_output(output: &str, expected: &str) -> Result<()> {
         .to_string();
 
     let expected_pattern = format!(
-        r"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\n{expected}\n?$"
+        r"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nRaw output artifact: .+? \([0-9]+ bytes retained before model summarization\)\nOutput:\n{expected}\n?$"
     );
 
     assert_regex_match(&expected_pattern, &normalized_output);
@@ -247,7 +247,7 @@ async fn shell_command_times_out_with_timeout_ms() -> anyhow::Result<()> {
         .replace('\r', "\n")
         .trim_end_matches('\n')
         .to_string();
-    let expected_pattern = r"(?s)^Exit code: 124\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\ncommand timed out after [0-9]+ milliseconds\n?$";
+    let expected_pattern = r"(?s)^Exit code: 124\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nOutput:\ncommand timed out after [0-9]+ milliseconds(?:\nERROR: Input redirection is not supported, exiting the process immediately\.)?\n?$";
     assert_regex_match(expected_pattern, &normalized_output);
 
     Ok(())

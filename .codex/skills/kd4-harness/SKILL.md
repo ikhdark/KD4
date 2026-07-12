@@ -1,38 +1,24 @@
 ---
 name: kd4-harness
-description: Create, maintain, audit, or use KD4-local harness artifacts under `.codex/harness`. Use when the user asks to create a harness system, start or plan a durable KD4 task, design agent/team workflows, update harness templates, define evals, audit harness quality, manage context handoff/compaction, capture implementation/check/finalization evidence, or work on KD4 implementation tasks that invoke Wiring Guard/KDWG, `wire-implementations`, or static wiring proof.
+description: Create, maintain, audit, or use durable KD4 workflow artifacts under `.codex/harness`, including plans, implementation logs, evals, QA checklists, handoffs, context-management guidance, and explicitly requested agent/team workflows. Use for harness creation or maintenance, durable or resumable task state, harness audits, template changes, eval design, handoffs, or compaction; do not use as the default implementation skill for ordinary KD4 code changes.
 ---
 
 # KD4 Harness
 
-Use this skill for KD4-local harness work: durable planning artifacts,
-implementation logs, checklists, optional coordination templates, and workflow
-guidance under `.codex/harness`.
-
-Trigger this skill alongside Wiring Guard/KDWG for KD4 implementation work. In
-that mode, default to the lightweight harness path: no run directory unless
-durable state is useful, but still apply intake, check, and finish evidence
-expectations.
+Use this skill only for KD4's durable workflow layer. Root `AGENTS.md` owns task
+lanes, repository implementation discipline, validation, and completion
+reporting. Wiring Guard/KDWG owns static reachability proof when it is active.
+The harness may record those decisions and results, but must not redefine them
+or trigger merely because ordinary implementation work is in scope.
 
 ## Required Reading
 
 1. Read the root `AGENTS.md` instructions for KD4.
 2. Read `.codex/AGENTS.md` for repo-local Codex file policy.
-3. Read `.codex/harness/workflow.md`.
-4. For implementation, debugging, refactoring, integration, migration, or
-   repo-behavior work, read and apply
-   `.codex/skills/kd4-crosscheck-and-finish/SKILL.md`.
-5. For implementation changes, use the Wiring Guard/KDWG plugin
-   (`wire-implementations`) as the static reachability proof layer when it is
-   active.
-   When this skill is selected because Wiring Guard/KDWG or
-   `wire-implementations` is in scope, continue to apply the harness
-   intake/check/finish gate even if no durable artifact is created.
-6. Read only the reference file that matches the task:
-   - `references/workflow.md` for lifecycle or harness usage questions.
+3. Read `.codex/harness/README.md` and `.codex/harness/workflow.md`.
+4. Read only the reference file that matches the task:
    - `references/task-artifacts.md` for task/run artifact layout.
    - `references/agent-patterns.md` for multi-agent or orchestrator design.
-   - `references/quality-gates.md` for validation and finish gates.
    - `references/audit-rubric.md` for harness scoring and hardening.
    - `references/evals.md` for capability or regression evals.
    - `references/context-management.md` for phase modes, handoff, and
@@ -46,14 +32,13 @@ expectations.
   automation.
 - Do not copy Trellis implementation code into KD4. Pattern-level adaptation is
   acceptable.
-- The harness does not replace `kd4-crosscheck-and-finish`; implementation
-  work inside a harnessed task must use that skill as the execution discipline.
-- The harness does not replace Wiring Guard/KDWG; implementation work inside a
-  harnessed task must use the plugin for static reachability proof when it is
-  active.
-- Treat any KD4 implementation task that explicitly uses Wiring Guard/KDWG,
-  `wire-implementations`, or static wiring proof as harnessed at least in
-  lightweight mode.
+- Do not create a run directory unless durable state will help a broad,
+  resumable, multi-step, multi-agent, or explicitly auditable task.
+- For implementation inside an already harnessed task, follow root `AGENTS.md`
+  and any active specialist skill. Record Wiring Guard/KDWG evidence when that
+  independent proof layer applies.
+- Do not activate this skill solely because Wiring Guard/KDWG or an
+  implementation-oriented skill is active.
 - Use subagents only when the user or active instructions explicitly ask for
   delegation or parallel agent work.
 - Follow KD4's no-commit, no-publish default unless the user asks.
@@ -72,36 +57,28 @@ expectations.
 ### Start A Harnessed Task
 
 1. Choose the lightest valid task lane from root `AGENTS.md`.
-2. Apply `kd4-crosscheck-and-finish` when the task involves implementation or
-   repository behavior.
-3. Declare Wiring Guard/KDWG intent for implementation changes when the plugin
-   is active.
-4. Create a run directory only if durable state is useful.
-5. Copy relevant templates from `.codex/harness/templates`.
-6. Fill only the sections that materially help the task.
-7. Keep generated logs and bulky runtime evidence out of reviewable changes
+2. Create a run directory only if durable state is useful.
+3. Copy relevant templates from `.codex/harness/templates`.
+4. Fill only the sections that materially help the task.
+5. For implementation, record the owner path, validation intent, and any
+   Wiring Guard/KDWG session required by root policy or an active skill.
+6. Keep generated logs and bulky runtime evidence out of reviewable changes
    unless requested.
-8. Add `EVAL.md`, `HARNESS_AUDIT.md`, or `HANDOFF.md` only when the task needs
+7. Add `EVAL.md`, `HARNESS_AUDIT.md`, or `HANDOFF.md` only when the task needs
    explicit success criteria, hardening evidence, or resumable state.
 
 ### Finish A Harnessed Task
 
-1. Confirm `kd4-crosscheck-and-finish` evidence was followed for implementation
-   work.
-2. Confirm Wiring Guard/KDWG proof ran when active and applicable, or that
-   `--no-wiring-targets` was justified for docs, templates, planning, or
-   config-only changes.
-3. Confirm the implementation is wired through the intended owner path.
-4. Run the nearest sufficient validation.
-5. Record skipped checks and remaining risk.
-6. Final response must match the evidence.
+1. Apply the completion and reporting gate from root `AGENTS.md`.
+2. Record the focused validation and Wiring Guard/KDWG verdict when applicable.
+3. Record skipped checks and remaining risk.
+4. Write `HANDOFF.md` only when unresolved work or context must survive.
+5. Keep final claims within the evidence actually recorded.
 
 ## References
 
-- `references/workflow.md`
 - `references/task-artifacts.md`
 - `references/agent-patterns.md`
-- `references/quality-gates.md`
 - `references/audit-rubric.md`
 - `references/evals.md`
 - `references/context-management.md`

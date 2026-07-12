@@ -940,6 +940,7 @@ async fn plan_implementation_popup_skips_without_proposed_plan() {
         plan: vec![PlanItemArg {
             step: "First".to_string(),
             status: StepStatus::Pending,
+            ..Default::default()
         }],
     });
     chat.on_task_complete(
@@ -1080,6 +1081,7 @@ async fn plan_implementation_popup_skips_when_rate_limit_prompt_pending() {
         plan: vec![PlanItemArg {
             step: "First".to_string(),
             status: StepStatus::Pending,
+            ..Default::default()
         }],
     });
     chat.on_rate_limit_snapshot(Some(snapshot(/*percent*/ 92.0)));
@@ -1175,6 +1177,7 @@ async fn submit_user_message_queues_while_compaction_turn_is_running() {
     chat.handle_server_notification(
         ServerNotification::TurnCompleted(TurnCompletedNotification {
             thread_id: thread_id.to_string(),
+            completion: None,
             turn: AppServerTurn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1641,14 +1644,17 @@ async fn plan_update_renders_history_cell() {
             PlanItemArg {
                 step: "Explore codebase".into(),
                 status: StepStatus::Completed,
+                ..Default::default()
             },
             PlanItemArg {
                 step: "Implement feature".into(),
                 status: StepStatus::InProgress,
+                ..Default::default()
             },
             PlanItemArg {
                 step: "Write tests".into(),
                 status: StepStatus::Pending,
+                ..Default::default()
             },
         ],
     };

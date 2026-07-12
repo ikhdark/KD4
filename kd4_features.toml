@@ -560,12 +560,57 @@ contains = ".codex/harness/workflow.md"
 [[features]]
 id = "task-evidence-completion-gate"
 version = 1
-status = "planned"
+status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
 summary = "Fresh task evidence and machine-derived passed, partial, or blocked status."
 upstream_equivalent = "none"
 config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/task_evidence.rs"
+contains = "pub(crate) struct TaskEvidenceLedger"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/state/service.rs"
+contains = "pub(crate) task_evidence: TaskEvidenceLedger"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/plan.rs"
+contains = ".record_plan_update(&args)"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/events.rs"
+contains = ".record_edit_intent(ctx.call_id"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/verify_local.rs"
+contains = "run_automatic_verify_local_plan"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/session/turn.rs"
+contains = ".take_automatic_verify_plan_request()"
+
+[[features.evidence]]
+kind = "protocol"
+path = "codex-rs/protocol/src/protocol.rs"
+contains = "pub enum TaskCompletionStatus"
+
+[[features.evidence]]
+kind = "protocol"
+path = "codex-rs/app-server-protocol/src/protocol/v2/turn.rs"
+contains = "pub struct TaskCompletionGate"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/task_evidence.rs"
+contains = "automatic_verify_plan_is_requested_once_per_mutation_epoch"
 
 [[features]]
 id = "desktop-runtime-receipt"

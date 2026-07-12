@@ -215,6 +215,19 @@ impl ToolEmitter {
                 },
                 ToolEventStage::Begin,
             ) => {
+                let paths = changes.keys().cloned().collect::<Vec<_>>();
+                if let Some(cwd) = ctx
+                    .turn
+                    .environments
+                    .primary()
+                    .and_then(|environment| environment.cwd().to_abs_path().ok())
+                {
+                    ctx.session
+                        .services
+                        .task_evidence
+                        .record_edit_intent(ctx.call_id, cwd.as_path(), &paths)
+                        .await;
+                }
                 ctx.session
                     .emit_turn_item_started(
                         ctx.turn,
@@ -550,15 +563,30 @@ async fn emit_exec_end(
     exec_input: ExecCommandInput<'_>,
     exec_result: ExecCommandResult,
 ) {
+    let possible_mutation = crate::turn_diff_tracker::command_may_mutate(exec_input.command);
     if let Some(tracker) = ctx.turn_diff_tracker {
         let native_cwd = exec_input.cwd.to_abs_path().ok();
         tracker.lock().await.record_exec_command_end_at(
             exec_input.command,
             exec_result.exit_code,
             exec_result.timed_out,
-            native_cwd.as_ref().map(|cwd| cwd.as_path()),
+            native_cwd
+                .as_ref()
+                .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
         );
     }
+    ctx.session
+        .services
+        .task_evidence
+        .record_command(
+            exec_input.command,
+            exec_input.cwd,
+            exec_result.exit_code,
+            exec_result.timed_out,
+            u64::try_from(exec_result.duration.as_millis()).unwrap_or(u64::MAX),
+            possible_mutation,
+        )
+        .await;
 
     ctx.session
         .emit_turn_item_completed(
@@ -591,6 +619,16 @@ async fn emit_patch_end(
     status: PatchApplyStatus,
     tracker_update: TurnDiffTrackerUpdate<'_>,
 ) {
+    let outcome = match &status {
+        PatchApplyStatus::Completed => "completed",
+        PatchApplyStatus::Failed => "failed",
+        PatchApplyStatus::Declined => "declined",
+    };
+    ctx.session
+        .services
+        .task_evidence
+        .record_edit_result(ctx.call_id, outcome)
+        .await;
     ctx.session
         .emit_turn_item_completed(
             ctx.turn,

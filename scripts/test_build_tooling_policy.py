@@ -116,17 +116,14 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn('let samples_dir = Path::new("src/assets/samples");', text)
         self.assertIn("if !samples_dir.exists()", text)
 
-    def test_repo_local_skill_tree_is_local_build_focused(self) -> None:
-        required = {
-            "kd4-crosscheck-and-finish",
-            "kd4-harness",
-        }
+    def test_repo_local_workflow_skill_has_one_owner(self) -> None:
         skills_dir = REPO_ROOT / ".codex" / "skills"
         if not skills_dir.exists():
             self.skipTest("repo-local skills directory is not materialized")
         actual = {path.name for path in skills_dir.iterdir() if path.is_dir()}
 
-        self.assertTrue(required.issubset(actual))
+        self.assertIn("kd4-harness", actual)
+        self.assertNotIn("kd4-crosscheck-and-finish", actual)
 
     def test_repo_local_skill_frontmatter_names_match_folders(self) -> None:
         skills_dir = REPO_ROOT / ".codex" / "skills"
@@ -163,7 +160,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
         skill_names = sorted(
             path.name for path in skills_dir.iterdir() if path.is_dir()
         )
-        self.assertIn("kd4-crosscheck-and-finish", skill_names)
         self.assertIn("kd4-harness", skill_names)
         self.assertIn("`.codex/skills`", agents)
         for phrase in ("fork-local skills", "validation workflows"):

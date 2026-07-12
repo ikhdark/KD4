@@ -404,6 +404,7 @@ fn should_backfill_turn_completed_items_skips_ephemeral_threads() {
     let notification =
         ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
+            completion: None,
             turn: codex_app_server_protocol::Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,

@@ -287,8 +287,7 @@ pub(super) async fn run_exec_like(
         content.push_str(&repair_notice);
     }
     if let Some(raw_output_artifact) = raw_output_artifact {
-        content.push_str("\n\n");
-        content.push_str(&raw_output_artifact.render_for_model());
+        insert_metadata_before_output(&mut content, &raw_output_artifact.render_for_model());
     }
     Ok(FunctionToolOutput {
         body: vec![
@@ -297,6 +296,17 @@ pub(super) async fn run_exec_like(
         success: Some(true),
         post_tool_use_response,
     })
+}
+
+fn insert_metadata_before_output(content: &mut String, metadata: &str) {
+    const OUTPUT_SECTION: &str = "\nOutput:\n";
+
+    if let Some(output_index) = content.find(OUTPUT_SECTION) {
+        content.insert_str(output_index, &format!("\n{metadata}"));
+    } else {
+        content.push_str("\n\n");
+        content.push_str(metadata);
+    }
 }
 
 #[cfg(test)]

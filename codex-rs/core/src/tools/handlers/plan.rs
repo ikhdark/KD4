@@ -88,6 +88,11 @@ impl PlanHandler {
         }
 
         let args = parse_update_plan_arguments(&arguments)?;
+        let args = session
+            .services
+            .task_evidence
+            .record_plan_update(&args)
+            .await;
         session
             .send_event(turn.as_ref(), EventMsg::PlanUpdate(args))
             .await;

@@ -5,6 +5,7 @@ use codex_app_server_protocol::CommandExecutionStatus;
 use codex_app_server_protocol::McpToolCallStatus;
 use codex_app_server_protocol::PatchApplyStatus;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::TaskCompletionStatus;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::TurnStatus;
@@ -297,40 +298,57 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 self.last_total_token_usage = Some(notification.token_usage);
                 CodexStatus::Running
             }
-            ServerNotification::TurnCompleted(notification) => match notification.turn.status {
-                TurnStatus::Completed => {
-                    let rendered_message = self
-                        .final_message_rendered
-                        .then(|| self.final_message.clone())
-                        .flatten();
-                    if let Some(final_message) =
-                        final_message_from_turn_items(notification.turn.items.as_slice())
-                    {
-                        self.final_message_rendered =
-                            rendered_message.as_deref() == Some(final_message.as_str());
-                        self.final_message = Some(final_message);
+            ServerNotification::TurnCompleted(notification) => {
+                if let Some(completion) = notification.completion.as_ref() {
+                    let (status, style) = match completion.status {
+                        TaskCompletionStatus::Passed => ("passed", self.green),
+                        TaskCompletionStatus::Partial => ("partial", self.yellow),
+                        TaskCompletionStatus::Blocked => ("blocked", self.red),
+                    };
+                    eprintln!(
+                        "{} {}",
+                        "completion gate:".style(self.bold),
+                        status.style(style)
+                    );
+                    for reason in completion.reasons.iter().take(4) {
+                        eprintln!("  {}", reason.style(self.dimmed));
                     }
-                    self.emit_final_message_on_shutdown = true;
-                    CodexStatus::InitiateShutdown
                 }
-                TurnStatus::Failed => {
-                    self.final_message = None;
-                    self.final_message_rendered = false;
-                    self.emit_final_message_on_shutdown = false;
-                    if let Some(error) = notification.turn.error {
-                        eprintln!("{} {}", "ERROR:".style(self.red).style(self.bold), error);
+                match notification.turn.status {
+                    TurnStatus::Completed => {
+                        let rendered_message = self
+                            .final_message_rendered
+                            .then(|| self.final_message.clone())
+                            .flatten();
+                        if let Some(final_message) =
+                            final_message_from_turn_items(notification.turn.items.as_slice())
+                        {
+                            self.final_message_rendered =
+                                rendered_message.as_deref() == Some(final_message.as_str());
+                            self.final_message = Some(final_message);
+                        }
+                        self.emit_final_message_on_shutdown = true;
+                        CodexStatus::InitiateShutdown
                     }
-                    CodexStatus::InitiateShutdown
+                    TurnStatus::Failed => {
+                        self.final_message = None;
+                        self.final_message_rendered = false;
+                        self.emit_final_message_on_shutdown = false;
+                        if let Some(error) = notification.turn.error {
+                            eprintln!("{} {}", "ERROR:".style(self.red).style(self.bold), error);
+                        }
+                        CodexStatus::InitiateShutdown
+                    }
+                    TurnStatus::Interrupted => {
+                        self.final_message = None;
+                        self.final_message_rendered = false;
+                        self.emit_final_message_on_shutdown = false;
+                        eprintln!("{}", "turn interrupted".style(self.dimmed));
+                        CodexStatus::InitiateShutdown
+                    }
+                    TurnStatus::InProgress => CodexStatus::Running,
                 }
-                TurnStatus::Interrupted => {
-                    self.final_message = None;
-                    self.final_message_rendered = false;
-                    self.emit_final_message_on_shutdown = false;
-                    eprintln!("{}", "turn interrupted".style(self.dimmed));
-                    CodexStatus::InitiateShutdown
-                }
-                TurnStatus::InProgress => CodexStatus::Running,
-            },
+            }
             ServerNotification::TurnDiffUpdated(notification) => {
                 if !notification.diff.trim().is_empty() {
                     eprintln!("{}", notification.diff);
@@ -343,11 +361,25 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 }
                 for step in notification.plan {
                     match step.status {
-                        codex_app_server_protocol::TurnPlanStepStatus::Completed => {
+                        codex_app_server_protocol::TurnPlanStepStatus::Passed
+                        | codex_app_server_protocol::TurnPlanStepStatus::Completed => {
                             eprintln!("  {} {}", "✓".style(self.green), step.step);
                         }
                         codex_app_server_protocol::TurnPlanStepStatus::InProgress => {
                             eprintln!("  {} {}", "→".style(self.cyan), step.step);
+                        }
+                        codex_app_server_protocol::TurnPlanStepStatus::Implemented => {
+                            eprintln!("  {} {}", "◇".style(self.yellow), step.step);
+                        }
+                        codex_app_server_protocol::TurnPlanStepStatus::Blocked => {
+                            eprintln!("  {} {}", "✗".style(self.red), step.step);
+                        }
+                        codex_app_server_protocol::TurnPlanStepStatus::Skipped => {
+                            eprintln!(
+                                "  {} {}",
+                                "–".style(self.dimmed),
+                                step.step.style(self.dimmed)
+                            );
                         }
                         codex_app_server_protocol::TurnPlanStepStatus::Pending => {
                             eprintln!(

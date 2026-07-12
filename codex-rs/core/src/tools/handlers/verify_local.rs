@@ -4,8 +4,11 @@ use crate::exec_env::create_env;
 use crate::exec_env::inject_permission_profile_env;
 use crate::function_tool::FunctionCallError;
 use crate::sandboxing::SandboxPermissions;
+use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -17,6 +20,7 @@ use crate::tools::handlers::verify_local_spec::VerifyLocalToolOptions;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
+use codex_protocol::models::ResponseInputItem;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -24,6 +28,8 @@ use codex_utils_path_uri::PathUri;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 const VERIFY_LOCAL_JSON_SCHEMA_VERSION: u64 = 1;
 const VERIFY_LOCAL_JSON_PRODUCER: &str = "kd4.verify_local";
@@ -37,6 +43,17 @@ struct VerifyLocalArgs {
     no_cache: bool,
     json: bool,
     environment_id: Option<String>,
+}
+
+impl VerifyLocalArgs {
+    fn mode(&self) -> &'static str {
+        match self.mode_flag {
+            "--plan" => "plan",
+            "--fast" => "fast",
+            "--final" => "final",
+            _ => "unknown",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -221,7 +238,7 @@ impl VerifyLocalHandler {
             shell_type: None,
             additional_permissions: None,
             prefix_rule: None,
-            session,
+            session: Arc::clone(&session),
             turn,
             turn_environment: environment.clone(),
             tracker,
@@ -233,6 +250,29 @@ impl VerifyLocalHandler {
         })
         .await?;
         let (output, run) = finalize_verify_local_output(output, raw_json);
+        let (active_files, stale_reasons) = run
+            .scope
+            .as_ref()
+            .map(|scope| {
+                (
+                    scope.active_files.as_slice(),
+                    scope.stale_reasons.as_slice(),
+                )
+            })
+            .unwrap_or((&[], &[]));
+        session
+            .services
+            .task_evidence
+            .record_verify_local(
+                args.mode(),
+                run.verdict_text.as_deref(),
+                run.tool_success,
+                run.is_proof_bearing(),
+                active_files,
+                stale_reasons,
+                run.json.as_ref(),
+            )
+            .await;
         if run.is_proof_bearing()
             && let Some(scope) = &run.scope
         {
@@ -246,6 +286,47 @@ impl VerifyLocalHandler {
             );
         }
         Ok(boxed_tool_output(output))
+    }
+}
+
+pub(crate) async fn run_automatic_verify_local_plan(
+    session: Arc<Session>,
+    step_context: Arc<StepContext>,
+    tracker: SharedTurnDiffTracker,
+    changed: Vec<String>,
+    cancellation_token: CancellationToken,
+) -> Result<String, FunctionCallError> {
+    let call_id = format!("kd4-auto-verify-plan-{}", uuid::Uuid::now_v7());
+    let scope_current = changed.is_empty();
+    let arguments = serde_json::json!({
+        "mode": "plan",
+        "changed": changed,
+        "staged": false,
+        "scope_current": scope_current,
+        "no_cache": false,
+        "json": false,
+        "environment_id": null,
+    })
+    .to_string();
+    let payload = ToolPayload::Function { arguments };
+    let output = VerifyLocalHandler::for_verify_local_environment_id(true)
+        .handle_call(ToolInvocation {
+            session,
+            turn: Arc::clone(&step_context.turn),
+            step_context,
+            cancellation_token,
+            tracker,
+            call_id: call_id.clone(),
+            tool_name: ToolName::plain(VERIFY_LOCAL_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        })
+        .await?;
+    match output.to_response_item(&call_id, &payload) {
+        ResponseInputItem::FunctionCallOutput { output, .. } => {
+            Ok(output.body.to_text().unwrap_or_default())
+        }
+        _ => Ok(output.log_preview()),
     }
 }
 
@@ -520,8 +601,7 @@ fn parse_verify_local_json(stdout: &str) -> Option<Value> {
                 .char_indices()
                 .filter_map(|(idx, ch)| (ch == '{').then_some(idx))
                 .filter_map(|idx| parse_json_object_at(stdout, idx))
-                .filter(|value| value.get("verdict").is_some())
-                .last()
+                .rfind(|value| value.get("verdict").is_some())
         })
 }
 

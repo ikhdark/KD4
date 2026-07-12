@@ -82,10 +82,12 @@ fn map_todo_items_preserves_text_and_completion_state() {
         TurnPlanStep {
             step: "inspect bootstrap".to_string(),
             status: TurnPlanStepStatus::InProgress,
+            ..Default::default()
         },
         TurnPlanStep {
             step: "drop legacy notifications".to_string(),
             status: TurnPlanStepStatus::Completed,
+            ..Default::default()
         },
     ]);
 
@@ -1034,10 +1036,12 @@ fn plan_update_emits_started_then_updated_then_completed() {
                 TurnPlanStep {
                     step: "step one".to_string(),
                     status: TurnPlanStepStatus::Pending,
+                    ..Default::default()
                 },
                 TurnPlanStep {
                     step: "step two".to_string(),
                     status: TurnPlanStepStatus::InProgress,
+                    ..Default::default()
                 },
             ],
         },
@@ -1075,10 +1079,12 @@ fn plan_update_emits_started_then_updated_then_completed() {
                 TurnPlanStep {
                     step: "step one".to_string(),
                     status: TurnPlanStepStatus::Completed,
+                    ..Default::default()
                 },
                 TurnPlanStep {
                     step: "step two".to_string(),
                     status: TurnPlanStepStatus::InProgress,
+                    ..Default::default()
                 },
             ],
         },
@@ -1110,6 +1116,7 @@ fn plan_update_emits_started_then_updated_then_completed() {
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
+            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1164,12 +1171,14 @@ fn plan_update_after_completion_starts_new_todo_list_with_new_id() {
             plan: vec![TurnPlanStep {
                 step: "only".to_string(),
                 status: TurnPlanStepStatus::Pending,
+                ..Default::default()
             }],
         },
     ));
     let _ = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
+            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1191,6 +1200,7 @@ fn plan_update_after_completion_starts_new_todo_list_with_new_id() {
             plan: vec![TurnPlanStep {
                 step: "again".to_string(),
                 status: TurnPlanStepStatus::Pending,
+                ..Default::default()
             }],
         },
     ));
@@ -1253,6 +1263,7 @@ fn token_usage_update_is_emitted_on_turn_completion() {
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
+            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1288,6 +1299,7 @@ fn turn_completion_recovers_final_message_from_turn_items() {
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
+            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1361,6 +1373,7 @@ fn turn_completion_reconciles_started_items_from_turn_items() {
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
+            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1429,6 +1442,7 @@ fn turn_completion_overwrites_stale_final_message_from_turn_items() {
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
+            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1479,6 +1493,7 @@ fn turn_completion_preserves_streamed_final_message_when_turn_items_are_empty() 
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
+            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1528,6 +1543,7 @@ fn failed_turn_clears_stale_final_message() {
     let collected = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
+            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1556,6 +1572,7 @@ fn turn_completion_falls_back_to_final_plan_text() {
     let completed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
+            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -1611,6 +1628,7 @@ fn turn_failure_prefers_structured_error_message() {
     let failed = processor.collect_thread_events(ServerNotification::TurnCompleted(
         TurnCompletedNotification {
             thread_id: "thread-1".to_string(),
+            completion: None,
             turn: Turn {
                 id: "turn-1".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,

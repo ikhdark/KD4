@@ -14792,6 +14792,37 @@
       ],
       "type": "object"
     },
+    "TaskCompletionGate": {
+      "properties": {
+        "evidencePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasons": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "status": {
+          "$ref": "#/definitions/TaskCompletionStatus"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "TaskCompletionStatus": {
+      "enum": [
+        "passed",
+        "partial",
+        "blocked"
+      ],
+      "type": "string"
+    },
     "TerminalInteractionNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
@@ -17865,6 +17896,16 @@
     "TurnCompletedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "completion": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TaskCompletionGate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "threadId": {
           "type": "string"
         },
@@ -18012,6 +18053,46 @@
     },
     "TurnPlanStep": {
       "properties": {
+        "acceptanceCriteria": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "dependsOn": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "generatedArtifacts": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requiresDesktopActivation": {
+          "default": false,
+          "type": "boolean"
+        },
+        "risks": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "runtimePaths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "status": {
           "$ref": "#/definitions/TurnPlanStepStatus"
         },
@@ -18029,6 +18110,10 @@
       "enum": [
         "pending",
         "inProgress",
+        "implemented",
+        "passed",
+        "blocked",
+        "skipped",
         "completed"
       ],
       "type": "string"

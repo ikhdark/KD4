@@ -1016,6 +1016,10 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
     })
 }
 
+pub(crate) fn command_may_mutate(command: &[String]) -> bool {
+    looks_like_mutating_command(command)
+}
+
 fn normalized_command_tokens(command: &[String]) -> Vec<String> {
     command
         .iter()

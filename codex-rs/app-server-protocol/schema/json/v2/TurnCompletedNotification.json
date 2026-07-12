@@ -663,6 +663,37 @@
       ],
       "type": "string"
     },
+    "TaskCompletionGate": {
+      "properties": {
+        "evidencePath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reasons": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "status": {
+          "$ref": "#/definitions/TaskCompletionStatus"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "TaskCompletionStatus": {
+      "enum": [
+        "passed",
+        "partial",
+        "blocked"
+      ],
+      "type": "string"
+    },
     "TextElement": {
       "properties": {
         "byteRange": {
@@ -1802,6 +1833,16 @@
     }
   },
   "properties": {
+    "completion": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/TaskCompletionGate"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "threadId": {
       "type": "string"
     },

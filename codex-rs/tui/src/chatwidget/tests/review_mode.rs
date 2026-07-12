@@ -1253,6 +1253,7 @@ async fn interrupted_turn_after_goal_budget_limited_uses_budget_message_snapshot
         codex_app_server_protocol::ServerNotification::TurnCompleted(
             codex_app_server_protocol::TurnCompletedNotification {
                 thread_id: "thread-1".to_string(),
+                completion: None,
                 turn: codex_app_server_protocol::Turn {
                     id: "turn-1".to_string(),
                     items_view: codex_app_server_protocol::TurnItemsView::Full,

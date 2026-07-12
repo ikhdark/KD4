@@ -185,6 +185,7 @@ fn turn_complete_item(turn_id: String, completed_at: Option<i64>) -> RolloutItem
         completed_at,
         duration_ms: None,
         time_to_first_token_ms: None,
+        completion: None,
     }))
 }
 

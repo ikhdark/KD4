@@ -1216,6 +1216,7 @@ mod tests {
     fn turn_completed_notification() -> ServerNotification {
         ServerNotification::TurnCompleted(codex_app_server_protocol::TurnCompletedNotification {
             thread_id: "thread".to_string(),
+            completion: None,
             turn: codex_app_server_protocol::Turn {
                 id: "turn".to_string(),
                 items_view: codex_app_server_protocol::TurnItemsView::Full,
@@ -2136,6 +2137,7 @@ mod tests {
                 codex_app_server_protocol::ServerNotification::TurnCompleted(
                     codex_app_server_protocol::TurnCompletedNotification {
                         thread_id: "thread".to_string(),
+                        completion: None,
                         turn: codex_app_server_protocol::Turn {
                             id: "turn".to_string(),
                             items_view: codex_app_server_protocol::TurnItemsView::Full,

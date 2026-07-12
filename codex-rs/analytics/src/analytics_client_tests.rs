@@ -388,6 +388,7 @@ fn sample_turn_completed_notification(
 ) -> ServerNotification {
     ServerNotification::TurnCompleted(TurnCompletedNotification {
         thread_id: thread_id.to_string(),
+        completion: None,
         turn: Turn {
             id: turn_id.to_string(),
             items_view: codex_app_server_protocol::TurnItemsView::Full,

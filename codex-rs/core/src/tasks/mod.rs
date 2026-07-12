@@ -750,6 +750,11 @@ impl Session {
                 turn_id: turn_context.sub_id.clone(),
                 profile: turn_context.turn_timing_state.complete_profile(),
             });
+        let completion = if abort_reason.is_none() {
+            self.services.task_evidence.completion_gate().await
+        } else {
+            None
+        };
         let event = if let Some(reason) = abort_reason {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
@@ -769,6 +774,7 @@ impl Session {
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: turn_context.sub_id.clone(),
                 last_agent_message,
+                completion,
                 completed_at,
                 duration_ms,
                 time_to_first_token_ms,

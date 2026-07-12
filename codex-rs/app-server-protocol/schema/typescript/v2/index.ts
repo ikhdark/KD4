@@ -387,6 +387,8 @@ export type { SortDirection } from "./SortDirection";
 export type { SpendControlLimitSnapshot } from "./SpendControlLimitSnapshot";
 export type { SubAgentActivityKind } from "./SubAgentActivityKind";
 export type { SubagentMigration } from "./SubagentMigration";
+export type { TaskCompletionGate } from "./TaskCompletionGate";
+export type { TaskCompletionStatus } from "./TaskCompletionStatus";
 export type { TerminalInteractionNotification } from "./TerminalInteractionNotification";
 export type { TextElement } from "./TextElement";
 export type { TextPosition } from "./TextPosition";

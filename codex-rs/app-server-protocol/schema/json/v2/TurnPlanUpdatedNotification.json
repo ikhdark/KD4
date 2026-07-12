@@ -3,6 +3,46 @@
   "definitions": {
     "TurnPlanStep": {
       "properties": {
+        "acceptanceCriteria": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "dependsOn": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "generatedArtifacts": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requiresDesktopActivation": {
+          "default": false,
+          "type": "boolean"
+        },
+        "risks": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "runtimePaths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "status": {
           "$ref": "#/definitions/TurnPlanStepStatus"
         },
@@ -20,6 +60,10 @@
       "enum": [
         "pending",
         "inProgress",
+        "implemented",
+        "passed",
+        "blocked",
+        "skipped",
         "completed"
       ],
       "type": "string"
