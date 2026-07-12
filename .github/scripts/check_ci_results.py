@@ -12,8 +12,8 @@ import os
 
 
 def main() -> None:
-    # Keep result policy in one script so blocking-ci and postmerge-ci cannot
-    # drift in how they interpret dependency conclusions.
+    # Keep result policy in one script so parent workflows cannot drift in how
+    # they interpret dependency conclusions.
     needs = json.loads(os.environ["NEEDS"])
     failures = sorted(
         (name, dependency["result"])

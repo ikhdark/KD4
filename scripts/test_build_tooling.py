@@ -816,8 +816,8 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         with mock.patch.object(
             format_script,
-            "buildifier_formatter_group",
-            side_effect=AssertionError("buildifier should not be constructed"),
+            "prettier_formatter_group",
+            side_effect=AssertionError("prettier should not be constructed"),
         ):
             groups = format_script.formatter_groups(
                 check=True,

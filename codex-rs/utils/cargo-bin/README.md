@@ -1,20 +1,14 @@
-# codex-utils-cargo-bin runfiles strategy
+# Cargo Test Binary And Resource Resolution
 
-We disable the directory-based runfiles strategy and rely on the manifest
-strategy across all platforms. This avoids Windows path length issues and keeps
-behavior consistent in local and remote builds on all platforms. Bazel sets
-`RUNFILES_MANIFEST_FILE`, and the `codex-utils-cargo-bin` helpers use the
-`runfiles` crate to resolve runfiles via that manifest.
+`codex-utils-cargo-bin` centralizes Cargo test helpers used across the Rust
+workspace.
 
-Function behavior:
-- `cargo_bin`: reads `CARGO_BIN_EXE_*` environment variables (set by Cargo or
-  Bazel) and resolves them via the runfiles manifest when `RUNFILES_MANIFEST_FILE`
-  is present. When not under runfiles, it only accepts absolute paths from
-  `CARGO_BIN_EXE_*` and returns an error otherwise.
-- `find_resource!`: used by tests to locate fixtures. It chooses the Bazel
-  runfiles resolution path when `RUNFILES_MANIFEST_FILE` is set, otherwise it
-  falls back to a `CARGO_MANIFEST_DIR`-relative path for Cargo runs.
+- `cargo_bin` reads Cargo's `CARGO_BIN_EXE_*` environment variables and falls
+  back to `assert_cmd` when necessary.
+- `find_resource!` resolves fixtures relative to the consuming crate's
+  `CARGO_MANIFEST_DIR`.
+- `repo_root` walks from this crate's checked-in `repo_root.marker` to the
+  workspace repository root.
 
-Background:
-- https://bazel.build/docs/runfiles
-- https://bazel.build/docs/runfiles#runfiles-manifest
+These helpers are intended for test code. The packaged Codex CLI remains a
+standalone binary with no dependency on repository resources.

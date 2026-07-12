@@ -11,8 +11,8 @@ is the current source map for the checked-in script tooling.
 - PowerShell utilities own Windows local-build lanes, local publish flows,
   PowerShell invocation, Rust performance environment setup, install routing,
   and target cleanup helpers.
-- Shell utilities own Unix install, debug, remote-environment, Bazel target
-  listing, and helper launch paths.
+- Shell utilities own Unix install, debug, remote-environment, and helper launch
+  paths.
 - `scripts/codex_package/` owns the canonical Codex package directory/archive
   builder for CLI and app-server artifacts.
 - `scripts/install/` owns platform install entrypoints for shell and PowerShell
@@ -67,6 +67,13 @@ is the current source map for the checked-in script tooling.
   metadata over hand-maintained crate lists.
 - `invoke-rust-perf-env.ps1` and `sccache-perf.ps1`: local Rust performance and
   cache diagnostics. Do not change cache topology without measured need.
+- `check_kd4_features.py`: validates `kd4_features.toml` ownership, registration,
+  test, and static evidence markers. Use `--strict` when orphaned features must
+  fail the gate.
+- `kd4_sync_audit.py`: reports branch divergence, dirty-worktree risk, and a
+  non-mutating `git merge-tree` conflict forecast before upstream integration.
+- `kd4_perf_snapshot.py`: records cold-first and warm-repeat timing snapshots for
+  quick checks or the full Phase 0 local build/app-server/Desktop baseline.
 - `build_codex_package.py`, `stage_npm_packages.py`, and
   `test_stage_npm_packages.py`: package assembly/staging. Keep generated package
   layout aligned with `scripts/codex_package/`.
@@ -87,9 +94,6 @@ is the current source map for the checked-in script tooling.
   helpers. Preserve cross-platform path assumptions and environment forwarding.
 - `just-shell.py`: just shell wrapper. Treat quoting/argument forwarding as the
   primary compatibility surface.
-- `list-bazel-clippy-targets.sh`, `list-bazel-release-targets.sh`, and
-  `check-module-bazel-lock.sh`: Bazel target/lock helpers. Keep output parsable
-  for CI or justfile callers.
 - `tool_versions.py`: centralized tool-version reporting. Avoid network or
   machine mutation in version probes.
 - `pyproject.toml`: Python script tooling metadata.

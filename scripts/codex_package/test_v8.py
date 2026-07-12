@@ -16,7 +16,7 @@ from codex_package.targets import TARGET_SPECS
 
 class V8ArtifactCacheTest(unittest.TestCase):
     def test_resolve_env_uses_paired_v8_overrides_without_fetching(self) -> None:
-        spec = TARGET_SPECS["x86_64-apple-darwin"]
+        spec = TARGET_SPECS["x86_64-unknown-linux-musl"]
         environ = {
             "RUSTY_V8_ARCHIVE": "prebuilt-v8.a.gz",
             "RUSTY_V8_SRC_BINDING_PATH": "src_binding.rs",
@@ -33,7 +33,7 @@ class V8ArtifactCacheTest(unittest.TestCase):
             )
 
     def test_resolve_env_skips_fetch_when_v8_from_source_is_truthy(self) -> None:
-        spec = TARGET_SPECS["x86_64-apple-darwin"]
+        spec = TARGET_SPECS["x86_64-unknown-linux-musl"]
 
         for value in [
             "1",
@@ -62,13 +62,25 @@ class V8ArtifactCacheTest(unittest.TestCase):
                 )
 
     def test_resolve_env_rejects_unpaired_v8_override(self) -> None:
-        spec = TARGET_SPECS["x86_64-apple-darwin"]
+        spec = TARGET_SPECS["x86_64-unknown-linux-musl"]
 
         with self.assertRaisesRegex(RuntimeError, "set together"):
             v8.resolve_codex_v8_cargo_env(
                 spec,
                 environ={"RUSTY_V8_ARCHIVE": "prebuilt-v8.a.gz"},
             )
+
+    def test_resolve_env_uses_upstream_archive_for_supported_target(self) -> None:
+        spec = TARGET_SPECS["x86_64-apple-darwin"]
+
+        with mock.patch.object(
+            v8,
+            "fetch_codex_v8_artifacts",
+            side_effect=AssertionError(
+                "supported targets should use upstream archives"
+            ),
+        ):
+            self.assertEqual(v8.resolve_codex_v8_cargo_env(spec, environ={}), {})
 
     def test_verified_checksum_stamp_skips_warm_cache_hash(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -108,7 +120,7 @@ class V8ArtifactCacheTest(unittest.TestCase):
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_root = Path(temp_dir)
-            spec = TARGET_SPECS["x86_64-apple-darwin"]
+            spec = TARGET_SPECS["x86_64-unknown-linux-musl"]
             cache_dir = cache_root / f"rusty-v8-1.2.3-{spec.target}"
             archive = cache_dir / f"librusty_v8_release_{spec.target}.a.gz"
             binding = cache_dir / f"src_binding_release_{spec.target}.rs"
@@ -151,7 +163,7 @@ class V8ArtifactCacheTest(unittest.TestCase):
     def test_fetch_artifacts_validates_archive_and_binding(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_root = Path(temp_dir)
-            spec = TARGET_SPECS["x86_64-apple-darwin"]
+            spec = TARGET_SPECS["x86_64-unknown-linux-musl"]
 
             def fake_download(_url: str, dest: Path) -> None:
                 dest.parent.mkdir(parents=True, exist_ok=True)

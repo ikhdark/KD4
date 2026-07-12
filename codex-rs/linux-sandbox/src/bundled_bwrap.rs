@@ -9,7 +9,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use crate::bazel_bwrap;
 use crate::exec_util::argv_to_cstrings;
 use crate::exec_util::make_files_inheritable;
 use codex_install_context::InstallContext;
@@ -100,9 +99,6 @@ fn legacy_candidates_for_exe(exe: &Path) -> Vec<PathBuf> {
         candidates.push(package_target_dir.join("codex-resources").join("bwrap"));
     }
     candidates.push(exe_dir.join("bwrap"));
-    if let Some(path) = bazel_bwrap::candidate() {
-        candidates.push(path);
-    }
     candidates
 }
 

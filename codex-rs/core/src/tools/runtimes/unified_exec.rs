@@ -13,6 +13,7 @@ use crate::sandboxing::ExecServerEnvConfig;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
+use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::flat_tool_name;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
@@ -62,6 +63,10 @@ use tracing::error;
 #[derive(Clone, Debug)]
 pub struct UnifiedExecRequest {
     pub command: Vec<String>,
+    /// Semantically equivalent, inspectable command used for approvals and
+    /// approval caching when `command` contains an encoded runtime payload.
+    pub command_for_approval: Vec<String>,
+    pub raw_output_artifact: RawOutputArtifact,
     pub shell_type: ShellType,
     pub hook_command: String,
     pub process_id: i32,
@@ -159,7 +164,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
     fn approval_keys(&self, req: &UnifiedExecRequest) -> Vec<Self::ApprovalKey> {
         vec![UnifiedExecApprovalKey {
             environment_id: req.turn_environment.environment_id.clone(),
-            command: canonicalize_command_for_approval(&req.command),
+            command: canonicalize_command_for_approval(&req.command_for_approval),
             cwd: req.cwd.clone(),
             tty: req.tty,
             sandbox_permissions: req.sandbox_permissions,
@@ -176,7 +181,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
         let session = ctx.session;
         let turn = ctx.turn;
         let call_id = ctx.call_id.to_string();
-        let command = req.command.clone();
+        let command = req.command_for_approval.clone();
         let environment_id = Some(req.turn_environment.environment_id.clone());
         let reason = ctx
             .retry_reason
@@ -223,7 +228,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
     ) -> std::io::Result<ApprovalAction> {
         Ok(ApprovalAction::ExecCommand {
             id: ctx.call_id.to_string(),
-            command: req.command.clone(),
+            command: req.command_for_approval.clone(),
             cwd: req.cwd.to_abs_path()?,
             sandbox_permissions: req.sandbox_permissions,
             additional_permissions: req.additional_permissions.clone(),
@@ -434,6 +439,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                             &prepared.exec_request,
                             req.tty,
                             prepared.spawn_lifecycle,
+                            Some(req.raw_output_artifact.clone()),
                             req.turn_environment.environment.as_ref(),
                         )
                         .await
@@ -479,6 +485,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                 req.exec_server_env_config.clone(),
                 req.tty,
                 Box::new(NoopSpawnLifecycle),
+                Some(req.raw_output_artifact.clone()),
                 req.turn_environment.environment.as_ref(),
             )
             .await
@@ -550,6 +557,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
+        let manager = UnifiedExecProcessManager::default();
+        let runtime = UnifiedExecRuntime::new(&manager, UnifiedExecShellMode::Direct);
+        let mut request = test_request(
+            SandboxPermissions::UseDefault,
+            ExecApprovalRequirement::Skip {
+                bypass_sandbox: false,
+                proposed_execpolicy_amendment: None,
+            },
+        );
+        request.command = vec![
+            "pwsh".to_string(),
+            "-EncodedCommand".to_string(),
+            "RwBlAHQALQBDAGgAaQBsAGQASQB0AGUAbQA=".to_string(),
+        ];
+        request.command_for_approval = vec![
+            "pwsh".to_string(),
+            "-Command".to_string(),
+            "Get-ChildItem".to_string(),
+        ];
+
+        let keys = runtime.approval_keys(&request);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].command,
+            canonicalize_command_for_approval(&request.command_for_approval)
+        );
+        assert_ne!(
+            keys[0].command,
+            canonicalize_command_for_approval(&request.command)
+        );
+    }
+
+    #[tokio::test]
     async fn unified_exec_uses_the_trusted_sandbox_cwd() {
         let cwd_dir = tempdir().expect("create process temp dir");
         let sandbox_dir = tempdir().expect("create sandbox temp dir");
@@ -561,6 +602,10 @@ mod tests {
         let runtime = UnifiedExecRuntime::new(&manager, UnifiedExecShellMode::Direct);
         let request = UnifiedExecRequest {
             command: vec!["pwd".to_string()],
+            command_for_approval: vec!["pwd".to_string()],
+            raw_output_artifact: RawOutputArtifact::Failed {
+                message: "test fixture".to_string(),
+            },
             shell_type: ShellType::Sh,
             hook_command: "pwd".to_string(),
             process_id: 1000,
@@ -663,6 +708,10 @@ mod tests {
             .expect("current dir is absolute");
         UnifiedExecRequest {
             command: vec!["zsh".to_string(), "-c".to_string(), "echo hi".to_string()],
+            command_for_approval: vec!["zsh".to_string(), "-c".to_string(), "echo hi".to_string()],
+            raw_output_artifact: RawOutputArtifact::Failed {
+                message: "test fixture".to_string(),
+            },
             shell_type: ShellType::Zsh,
             hook_command: "echo hi".to_string(),
             process_id: 1000,

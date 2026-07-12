@@ -1,4 +1,4 @@
-"""Codex-built V8 artifact overrides for package Cargo builds."""
+"""Codex-hosted V8 artifact overrides for Cargo targets without upstream archives."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ def resolve_codex_v8_cargo_env(
     environ: Mapping[str, str] | None = None,
     cache_root: Path | None = None,
 ) -> dict[str, str]:
-    if spec.is_windows:
+    if not spec.target.endswith("-musl"):
         return {}
 
     environ = os.environ if environ is None else environ
@@ -62,9 +62,9 @@ def fetch_codex_v8_artifacts(
     version: str | None = None,
     cache_root: Path | None = None,
 ) -> RustyV8ArtifactPair:
-    if spec.is_windows:
+    if not spec.target.endswith("-musl"):
         raise RuntimeError(
-            f"No Codex-built V8 release artifacts for target: {spec.target}"
+            f"No Codex-hosted V8 fallback is required for target: {spec.target}"
         )
 
     version = version or resolved_v8_crate_version()
@@ -194,7 +194,7 @@ def ensure_valid_artifact(artifact: Path, checksum: str, url: str) -> None:
 
     artifact.unlink(missing_ok=True)
     raise RuntimeError(
-        f"Codex-built V8 artifact {artifact} failed checksum validation."
+        f"Codex-hosted V8 artifact {artifact} failed checksum validation."
     )
 
 

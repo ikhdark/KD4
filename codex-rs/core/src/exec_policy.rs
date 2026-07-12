@@ -238,6 +238,10 @@ pub(crate) struct ExecPolicyManager {
 
 pub(crate) struct ExecApprovalRequest<'a> {
     pub(crate) command: &'a [String],
+    /// Optional semantically equivalent command used only for policy parsing.
+    /// This keeps encoded shell payloads executable without hiding their plain
+    /// command shape from safety and approval rules.
+    pub(crate) command_for_safety: Option<&'a [String]>,
     pub(crate) approval_policy: AskForApproval,
     pub(crate) permission_profile: PermissionProfile,
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
@@ -272,18 +276,20 @@ impl ExecPolicyManager {
     ) -> ExecApprovalRequirement {
         let ExecApprovalRequest {
             command,
+            command_for_safety,
             approval_policy,
             permission_profile,
             windows_sandbox_level,
             sandbox_permissions,
             prefix_rule,
         } = req;
+        let policy_command = command_for_safety.unwrap_or(command);
         let exec_policy = self.current();
         let ExecPolicyCommands {
             commands,
             used_complex_parsing,
             command_origin,
-        } = commands_for_exec_policy(command);
+        } = commands_for_exec_policy(policy_command);
         // Keep heredoc prefix parsing for rule evaluation so existing
         // allow/prompt/forbidden rules still apply, but avoid auto-derived
         // amendments when only the heredoc fallback parser matched.
@@ -325,7 +331,7 @@ impl ExecPolicyManager {
 
         match evaluation.decision {
             Decision::Forbidden => ExecApprovalRequirement::Forbidden {
-                reason: derive_forbidden_reason(command, &evaluation),
+                reason: derive_forbidden_reason(policy_command, &evaluation),
             },
             Decision::Prompt => {
                 let prompt_is_rule = evaluation.matched_rules.iter().any(|rule_match| {
@@ -336,7 +342,7 @@ impl ExecPolicyManager {
                         reason: reason.to_string(),
                     },
                     None => ExecApprovalRequirement::NeedsApproval {
-                        reason: derive_prompt_reason(command, &evaluation),
+                        reason: derive_prompt_reason(policy_command, &evaluation),
                         proposed_execpolicy_amendment: requested_amendment.or_else(|| {
                             if auto_amendment_allowed {
                                 try_derive_execpolicy_amendment_for_prompt_rules(

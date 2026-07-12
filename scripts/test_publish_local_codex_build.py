@@ -101,6 +101,77 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertNotIn("inherited-target", result.stdout)
             self.assert_no_publish_temps(install_dir)
 
+    def test_new_content_stamp_overrides_old_sidecar_mtime(self) -> None:
+        self.init_repo_fixture()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            install_dir = temp_path / "install"
+            install_dir.mkdir()
+            source_timestamp = FIXTURE_TIME + 100
+            sidecar_timestamp = FIXTURE_TIME - 100
+            self.touch_tracked_source(source_timestamp)
+            built_dir = (
+                self.repo_root / "codex-rs" / "target" / "publish-release" / "release"
+            )
+            built_codex = built_dir / "codex.exe"
+            built_code_mode_host = built_dir / "codex-code-mode-host.exe"
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            fake_cargo = fake_bin / "cargo.cmd"
+            fake_cargo.write_text(
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        "echo fake cargo %*",
+                        f'if not exist "{built_dir}" mkdir "{built_dir}"',
+                        f'copy /y "%ComSpec%" "{built_codex}" >nul',
+                        f'copy /y "%ComSpec%" "{built_code_mode_host}" >nul',
+                        (
+                            'python -c "import os; '
+                            f"os.utime(r'{built_code_mode_host}', "
+                            f"({sidecar_timestamp}, {sidecar_timestamp}))\""
+                        ),
+                        "exit /b 0",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            env = clean_env()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+
+            result = self.run_script(
+                "-SourceExe",
+                str(built_codex),
+                "-SourceCodeModeHostExe",
+                str(built_code_mode_host),
+                "-InstallDir",
+                str(install_dir),
+                env=env,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assert_proof_value(
+                result.stdout,
+                "buildStamp",
+                "written: content and artifact hashes recorded",
+            )
+            self.assert_proof_value(
+                result.stdout,
+                "sourceBuildFreshnessBasis",
+                "content-bound build stamp",
+            )
+            self.assert_proof_value(
+                result.stdout,
+                "codeModeHostSourceBuildStale",
+                "False",
+            )
+            self.assert_proof_value(result.stdout, "sourceBuildStale", "False")
+            self.assertNotIn("sourceBuildStaleRemedy:", result.stdout)
+
     def test_build_only_returns_after_build_stamp_and_proof(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -52,7 +52,7 @@ use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tokio_tungstenite::tungstenite::http::header::ORIGIN;
 
 // macOS and Windows CI can spend tens of seconds starting the app-server test
-// binary under Bazel before it accepts JSON-RPC or reports its websocket bind
+// binary before it accepts JSON-RPC or reports its websocket bind
 // address.
 #[cfg(any(target_os = "macos", windows))]
 pub(super) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);

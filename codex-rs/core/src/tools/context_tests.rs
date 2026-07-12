@@ -435,6 +435,8 @@ fn exec_command_tool_output_formats_truncated_response() {
         exit_code: Some(0),
         original_token_count: Some(10),
         hook_command: None,
+        raw_output_artifact: None,
+        repair_notice: None,
     }
     .to_response_item("call-42", &payload);
 
@@ -460,4 +462,57 @@ fn exec_command_tool_output_formats_truncated_response() {
         }
         other => panic!("expected FunctionCallOutput, got {other:?}"),
     }
+}
+
+#[test]
+fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
+    let raw_output = (0..900)
+        .map(|index| {
+            if index == 450 {
+                format!("error: exact retained failure marker {index}")
+            } else {
+                format!("ordinary-{index:04}-{}", "x".repeat(72))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let artifact_path = std::path::PathBuf::from(r"C:\codex\tool-output\raw.log");
+    let output = ExecCommandToolOutput {
+        event_call_id: "call-summary".to_string(),
+        chunk_id: "chunk-summary".to_string(),
+        wall_time: std::time::Duration::from_millis(25),
+        raw_output: raw_output.as_bytes().to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: None,
+        process_id: None,
+        exit_code: Some(1),
+        original_token_count: Some(20_000),
+        hook_command: Some("cargo test".to_string()),
+        raw_output_artifact: Some(RawOutputArtifact::Stored {
+            path: artifact_path.clone(),
+            bytes: raw_output.len() as u64,
+        }),
+        repair_notice: Some("Command preflight applied one repair".to_string()),
+    };
+
+    let response = output.response_text();
+    assert!(response.contains("Shell output summary:"));
+    assert!(response.contains("error: exact retained failure marker 450"));
+    assert!(!response.contains("ordinary-0300"));
+    assert!(response.contains(&artifact_path.display().to_string()));
+    assert!(response.contains("Command preflight applied one repair"));
+
+    let code_mode = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".to_string(),
+    });
+    assert_eq!(
+        code_mode["raw_output_artifact"],
+        artifact_path.to_string_lossy().as_ref()
+    );
+    assert_eq!(code_mode["raw_output_artifact_bytes"], raw_output.len());
+    assert!(
+        code_mode["output"]
+            .as_str()
+            .is_some_and(|value| value.contains("Shell output summary:"))
+    );
 }

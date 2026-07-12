@@ -120,7 +120,6 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     "scripts/build_codex_package.py": ("scripts.test_stage_npm_packages",),
     "scripts/cargo-lane-trash-cleanup.ps1": ("scripts.test_cargo_lane",),
     "scripts/cargo-lane.ps1": ("scripts.test_cargo_lane",),
-    "scripts/check-module-bazel-lock.sh": ("scripts.test_shell_helpers",),
     "scripts/common-rust-env.ps1": ("scripts.test_build_tooling_performance",),
     "scripts/codex_package/codex-zsh": (
         "scripts.codex_package.test_dotslash",
@@ -144,8 +143,6 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
     ),
     "scripts/install/install_release.sh": ("scripts.install.test_install_sh",),
     "scripts/just-shell.py": ("scripts.test_build_tooling",),
-    "scripts/list-bazel-clippy-targets.sh": ("scripts.test_shell_helpers",),
-    "scripts/list-bazel-release-targets.sh": ("scripts.test_shell_helpers",),
     "scripts/publish-local-codex-wsl.sh": (
         "scripts.test_dev_environment",
         "scripts.test_publish_local_codex",
@@ -800,6 +797,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Treat optimization advisories such as large or syntax-only scripts as failures.",
     )
+
     return parser
 
 

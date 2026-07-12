@@ -25,8 +25,8 @@ working tree.
 - PowerShell utilities own Windows local-build lanes, local publish flows,
   PowerShell invocation wrappers, Rust performance environment setup, install
   routing, and target cleanup helpers.
-- Shell utilities own Unix install, debug, remote-environment, Bazel target
-  listing, and helper launch paths.
+- Shell utilities own Unix install, debug, remote-environment, and helper launch
+  paths.
 - `codex_package/` owns the canonical Codex package directory/archive builder for
   CLI and app-server artifacts.
 - `install/` owns platform install entrypoints for shell and PowerShell install
@@ -75,7 +75,7 @@ owner crosses script/package boundaries or remains ambiguous.
 - Script wrappers such as `just-shell.py` and `run-powershell-script.ps1` treat
   quoting, argument forwarding, and exit-code propagation as compatibility
   surfaces.
-- Mock websocket server, Bazel helper, and repository-check
+- Mock websocket server and repository-check
   output/schema changes are contract changes for their callers/tests.
 
 ## Editing Rules

@@ -208,7 +208,8 @@ jobs:
           target_no_jitter="${target_no_jitter//-/_}"
           echo "${target_no_jitter}=1" >> "$GITHUB_ENV"
 
-      - name: Configure rusty_v8 artifact overrides and verify checksums
+      - if: ${{ contains(matrix.target, 'musl') }}
+        name: Configure rusty_v8 musl artifact override
         uses: ./.github/actions/setup-rusty-v8
         with:
           target: ${{ matrix.target }}

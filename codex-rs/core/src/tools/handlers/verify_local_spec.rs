@@ -52,7 +52,8 @@ pub(crate) fn create_verify_local_tool(options: VerifyLocalToolOptions) -> ToolS
         (
             "json".to_string(),
             JsonSchema::boolean(Some(
-                "Return raw JSON output instead of a compact verdict summary.".to_string(),
+                "Return the verifier's raw versioned JSON instead of the bounded human-readable summary."
+                    .to_string(),
             )),
         ),
     ]);
@@ -74,7 +75,7 @@ pub(crate) fn create_verify_local_tool(options: VerifyLocalToolOptions) -> ToolS
     ToolSpec::Function(ResponsesApiTool {
         name: VERIFY_LOCAL_TOOL_NAME.to_string(),
         description:
-            "Run bounded repo-local validation through scripts/verify_local.py. This tool only accepts read-only narrowing fields; broad workspace or mutating verifier flags are human CLI-only."
+            "Run bounded repo-local validation through scripts/verify_local.py using the normal command approval, sandbox, hook, and cancellation path. The verifier may write repo-local validation logs/cache under .codex/verify-local and ordinary build/test artifacts allowed by the active sandbox. CODEX_HOME and CODEX_SQLITE_HOME are isolated per call. Broad workspace or explicitly mutating verifier flags remain human CLI-only."
                 .to_string(),
         strict: true,
         defer_loading: None,
@@ -86,6 +87,9 @@ pub(crate) fn create_verify_local_tool(options: VerifyLocalToolOptions) -> ToolS
         output_schema: None,
     })
 }
+
+pub(crate) const VERIFY_LOCAL_TOOL_BUILDER: fn(VerifyLocalToolOptions) -> ToolSpec =
+    self::create_verify_local_tool;
 
 fn required_verify_local_fields(options: VerifyLocalToolOptions) -> Vec<String> {
     let mut fields = vec![

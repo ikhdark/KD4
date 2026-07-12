@@ -73,7 +73,7 @@ ownership remains ambiguous or the task touches a cross-cutting surface.
   migration/session behavior: `cloud-config`, `cloud-tasks`,
   `cloud-tasks-client`, `cloud-tasks-mock-client`, `agent-identity`,
   `agent-graph-store`, `external-agent-migration`, `external-agent-sessions`.
-- Build metadata, Bazel, Cargo workspace, toolchain, dependency pins, and
+- Build metadata, Cargo workspace, toolchain, dependency pins, and
   Bubblewrap helper build inputs: root files under `codex-rs`, `bwrap`, and
   checked-in patch inputs.
 - Support crates, sample binaries, UDS helpers, and narrow shared utilities:
@@ -109,13 +109,11 @@ stay non-mutating unless the user explicitly asks for edits.
 - Do not delete package caches, lane caches, or `target` directories while Rust
   jobs may be running. Use `just rust-build-doctor`, `just target-disk`, and
   `just target-prune` for target cleanup.
-- Keep generated schema, snapshot, lockfile, vendor, and Bazel metadata edits tied
+- Keep generated schema, snapshot, lockfile, and vendor edits tied
   to the owning source change and generator. Do not hand-edit generated outputs
   unless the owning workflow explicitly requires it.
-- If Rust dependencies change, refresh Bazel lock state with the repo recipe and
-  include the lockfile update in the same change.
-- If adding `include_str!`, `include_bytes!`, `sqlx::migrate!`, or similar
-  compile-time file reads, update the crate `BUILD.bazel` data inputs as needed.
+- If Rust dependencies change, refresh `Cargo.lock` through Cargo and include the
+  lockfile update in the same change.
 - Preserve public CLI flags, app-server APIs, config loading, sandbox behavior,
   stored sessions, rollout compatibility, and installed-binary behavior unless the
   user explicitly asks to change that surface.
@@ -159,8 +157,8 @@ Choose the smallest useful proof for the touched surface:
   schema artifacts for a wire contract change; use direct
   `just write-app-server-schema` only when the owning workflow explicitly needs
   the raw generator.
-- Dependency changes: run the relevant Rust check/test plus Bazel lock update/check
-  recipes.
+- Dependency changes: run the relevant Rust check/test and validate locked Cargo
+  metadata.
 - Formatting-only or docs-only changes: use `git diff --check` on touched files;
   do not claim runtime behavior changed.
 
@@ -173,6 +171,6 @@ Choose the smallest useful proof for the touched surface:
 - Avoid mutating process environment in tests when a passed dependency or flag is
   practical.
 - Prefer `codex_utils_cargo_bin::cargo_bin` and `find_resource!` for first-party
-  binaries/resources so tests work under Cargo and Bazel.
+  binaries/resources so tests resolve Cargo-built artifacts consistently.
 - For core end-to-end tests, prefer `core_test_support::responses` helpers and
   structured request assertions over manual JSON digging.

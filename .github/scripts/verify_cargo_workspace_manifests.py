@@ -66,10 +66,9 @@ def main() -> int:
         "features."
     )
     print(
-        "Workspace crate features are disallowed because our Bazel build setup "
-        "does not honor them today, which can let issues hidden behind feature "
-        "gates go unnoticed, and because they add extra crate build "
-        "permutations we want to avoid."
+        "Workspace crate features are disallowed because they can hide issues "
+        "behind untested feature gates and add crate build permutations we want "
+        "to avoid."
     )
     print(
         "Cargo only applies `codex-rs/Cargo.toml` `[workspace.lints.clippy]` "
@@ -79,10 +78,7 @@ def main() -> int:
     print("[lints]")
     print("workspace = true")
     print()
-    print(
-        "Without that opt-in, `cargo clippy` can miss violations that Bazel clippy "
-        "catches."
-    )
+    print("Without that opt-in, `cargo clippy` can miss workspace lint violations.")
     print()
     print(
         "Package-name checks apply to `codex-rs/<crate>/Cargo.toml` and "
@@ -167,7 +163,9 @@ def manifest_errors(
                         "create crate features"
                     )
 
-            if not is_internal_dependency(path, dependency_name, dependency, internal_package_names):
+            if not is_internal_dependency(
+                path, dependency_name, dependency, internal_package_names
+            ):
                 continue
 
             dependency_features = dependency.get("features")
@@ -225,7 +223,7 @@ def is_workspace_reference(value: object) -> bool:
 
 
 def manifest_key(path: Path) -> str:
-    return str(path.relative_to(ROOT))
+    return path.relative_to(ROOT).as_posix()
 
 
 def normalize_feature_mapping(value: object) -> dict[str, tuple[str, ...]] | None:
@@ -354,7 +352,9 @@ def add_unused_exception_errors(
         )
 
 
-def add_failure(failures_by_path: dict[str, list[str]], path_key: str, error: str) -> None:
+def add_failure(
+    failures_by_path: dict[str, list[str]], path_key: str, error: str
+) -> None:
     failures_by_path.setdefault(path_key, []).append(error)
 
 

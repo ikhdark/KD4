@@ -24,9 +24,6 @@ jobs:
       - name: Verify codex-tui does not import codex-core directly
         run: python3 .github/scripts/verify_tui_core_boundary.py
 
-      - name: Verify Bazel clippy flags match Cargo workspace lints
-        run: python3 .github/scripts/verify_bazel_clippy_lints.py
-
       - name: Test Codex package builder
         run: python3 -m unittest discover -s scripts/codex_package -p 'test_*.py'
 

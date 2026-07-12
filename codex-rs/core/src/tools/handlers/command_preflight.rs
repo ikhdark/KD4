@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::path::Path;
 
 use crate::shell::ShellType;
+use crate::tools::handlers::command_shape::CommandInvocation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandPreflightIssueCode {
@@ -28,12 +29,24 @@ pub(crate) enum CommandPreflightRejected {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CommandPreflightIssue {
-    pub(crate) code: CommandPreflightIssueCode,
-    pub(crate) rejected: CommandPreflightRejected,
-    pub(crate) detail: String,
-    pub(crate) guidance: Option<String>,
-    pub(crate) retry: Option<CommandPreflightRetry>,
+struct CommandPreflightIssue {
+    code: CommandPreflightIssueCode,
+    rejected: CommandPreflightRejected,
+    detail: String,
+    guidance: Option<String>,
+    retry: Option<CommandPreflightRetry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandPreflightOutcome {
+    pub(crate) invocation: CommandInvocation,
+    pub(crate) repair_notice: Option<String>,
+}
+
+impl CommandPreflightOutcome {
+    pub(crate) fn repaired(&self) -> bool {
+        self.repair_notice.is_some()
+    }
 }
 
 impl CommandPreflightIssue {
@@ -127,6 +140,7 @@ impl CommandPreflightRetry {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn preflight_command(
     command: &[String],
     shell_type: Option<ShellType>,
@@ -134,7 +148,7 @@ pub(crate) fn preflight_command(
     preflight_command_issue(command, shell_type).map_err(|issue| issue.render_for_model())
 }
 
-pub(crate) fn preflight_command_issue(
+fn preflight_command_issue(
     command: &[String],
     shell_type: Option<ShellType>,
 ) -> Result<(), CommandPreflightIssue> {
@@ -157,6 +171,77 @@ pub(crate) fn preflight_command_issue(
     }
 
     Ok(())
+}
+
+pub(crate) fn preflight_invocation_with_equivalent_repair(
+    invocation: &CommandInvocation,
+    command: &[String],
+    shell_type: Option<ShellType>,
+) -> Result<CommandPreflightOutcome, String> {
+    preflight_invocation_with_equivalent_repair_detailed(invocation, command, shell_type)
+        .map_err(|issue| issue.render_for_model())
+}
+
+fn preflight_invocation_with_equivalent_repair_detailed(
+    invocation: &CommandInvocation,
+    command: &[String],
+    shell_type: Option<ShellType>,
+) -> Result<CommandPreflightOutcome, CommandPreflightIssue> {
+    let issue = match preflight_command_issue(command, shell_type) {
+        Ok(()) => {
+            return Ok(CommandPreflightOutcome {
+                invocation: invocation.clone(),
+                repair_notice: None,
+            });
+        }
+        Err(issue) => issue,
+    };
+
+    // A repair is execution-safe only for direct argv. Rewriting a script could
+    // discard pipelines, redirection, variable expansion, or a later mutating
+    // command even when the first parsed argv happens to look read-only.
+    if !invocation.is_argv() {
+        return Err(issue);
+    }
+
+    let Some(CommandPreflightRetry::Argv { program, args }) = issue.retry.as_ref() else {
+        return Err(issue);
+    };
+    let program_name = program_name(program);
+    let read_only_equivalent = match issue.code {
+        CommandPreflightIssueCode::KnownFlagTypo => {
+            matches_ignore_ascii_case(program_name, &["rg", "rga", "grep"])
+        }
+        CommandPreflightIssueCode::RgGlobPathSeparator => {
+            matches_ignore_ascii_case(program_name, &["rg", "rga"])
+        }
+        _ => false,
+    };
+    if !read_only_equivalent {
+        return Err(issue);
+    }
+
+    let repaired = CommandInvocation::Argv {
+        program: program.clone(),
+        args: args.clone(),
+    };
+    let Some(repaired_command) = repaired.to_direct_argv() else {
+        return Err(issue);
+    };
+    // One repair is the hard limit. If the repaired command has another issue,
+    // reject it rather than chaining mechanical transformations.
+    preflight_command_issue(&repaired_command, /*shell_type*/ None)?;
+
+    let notice = format!(
+        "Command preflight applied one read-only equivalent repair ({}) before execution.\nOriginal: {}\nExecuted: {}",
+        issue.code.tool_error_kind(),
+        invocation.display_command(),
+        repaired.display_command()
+    );
+    Ok(CommandPreflightOutcome {
+        invocation: repaired,
+        repair_notice: Some(notice),
+    })
 }
 
 fn json_string(value: &str) -> String {
@@ -351,25 +436,13 @@ fn lint_balanced_quotes(
     shell_type: Option<ShellType>,
 ) -> Result<(), CommandPreflightIssue> {
     let normalized_script = script_without_multiline_literal_bodies(script, shell_type);
-    let mut single = false;
-    let mut double = false;
-    let mut escaped = false;
-
-    for ch in normalized_script.chars() {
-        if escaped {
-            escaped = false;
-            continue;
+    let (single, double) = match shell_type {
+        Some(ShellType::PowerShell) => powershell_unclosed_quotes(&normalized_script),
+        Some(ShellType::Cmd) => (false, cmd_has_unclosed_double_quote(&normalized_script)),
+        Some(ShellType::Bash | ShellType::Zsh | ShellType::Sh) | None => {
+            posix_unclosed_quotes(&normalized_script)
         }
-        if ch == '\\' && !single {
-            escaped = true;
-            continue;
-        }
-        match ch {
-            '\'' if !double => single = !single,
-            '"' if !single => double = !double,
-            _ => {}
-        }
-    }
+    };
 
     if single || double {
         let quote = if single { "single" } else { "double" };
@@ -386,6 +459,87 @@ fn lint_balanced_quotes(
     }
 
     Ok(())
+}
+
+fn posix_unclosed_quotes(script: &str) -> (bool, bool) {
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+
+    for ch in script.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !single {
+            escaped = true;
+            continue;
+        }
+        match ch {
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            _ => {}
+        }
+    }
+    (single, double)
+}
+
+fn powershell_unclosed_quotes(script: &str) -> (bool, bool) {
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    let mut in_comment = false;
+    let mut chars = script.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if in_comment {
+            if matches!(ch, '\n' | '\r') {
+                in_comment = false;
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if !single && ch == '`' {
+            escaped = true;
+            continue;
+        }
+        if !single && !double && ch == '#' {
+            in_comment = true;
+            continue;
+        }
+        match ch {
+            '\'' if !double => {
+                if single && chars.peek() == Some(&'\'') {
+                    chars.next();
+                } else {
+                    single = !single;
+                }
+            }
+            '"' if !single => double = !double,
+            _ => {}
+        }
+    }
+    (single, double)
+}
+
+fn cmd_has_unclosed_double_quote(script: &str) -> bool {
+    let mut double = false;
+    let mut escaped = false;
+    for ch in script.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '^' {
+            escaped = true;
+        } else if ch == '"' {
+            double = !double;
+        }
+    }
+    double
 }
 
 fn lint_shell_mismatch(

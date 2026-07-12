@@ -5456,6 +5456,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         unified_exec_manager: UnifiedExecProcessManager::new(
             config.background_terminal_max_timeout,
         ),
+        command_execution: crate::tools::command_execution::CommandExecutionLedger::default(),
         elicitations: crate::elicitation::ElicitationService::new(),
         shell_zsh_path: None,
         main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
@@ -7587,6 +7588,7 @@ where
         unified_exec_manager: UnifiedExecProcessManager::new(
             config.background_terminal_max_timeout,
         ),
+        command_execution: crate::tools::command_execution::CommandExecutionLedger::default(),
         elicitations: crate::elicitation::ElicitationService::new(),
         shell_zsh_path: None,
         main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
@@ -10799,6 +10801,7 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
         .exec_policy
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
+            command_for_safety: None,
             approval_policy: turn_context.approval_policy.value(),
             permission_profile: turn_context.permission_profile(),
             windows_sandbox_level: turn_context.windows_sandbox_level,

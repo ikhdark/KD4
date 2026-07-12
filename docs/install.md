@@ -26,7 +26,7 @@ rustup component add rustfmt
 rustup component add clippy
 # Install helper tools used by the workspace justfile:
 cargo install --locked just
-# DotSlash fetches pinned development tools such as buildifier on first use.
+# DotSlash fetches pinned development tools on first use.
 cargo install --locked dotslash
 # Install nextest for the `just test` helper.
 cargo install --locked cargo-nextest

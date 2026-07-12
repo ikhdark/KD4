@@ -13,6 +13,8 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::exec::is_likely_sandbox_denied;
+use crate::tools::command_output_artifact::RawOutputArtifact;
+use crate::tools::command_output_artifact::RawOutputArtifactWriter;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEvent;
 use codex_exec_server::ProcessSignal as ExecServerProcessSignal;
@@ -85,6 +87,7 @@ pub(crate) struct UnifiedExecProcess {
     state_tx: watch::Sender<ProcessState>,
     state_rx: watch::Receiver<ProcessState>,
     output_task: Option<JoinHandle<()>>,
+    raw_output_artifact: Option<Arc<Mutex<RawOutputArtifact>>>,
     sandbox_type: SandboxType,
     _spawn_lifecycle: Option<SpawnLifecycleHandle>,
 }
@@ -104,6 +107,7 @@ impl UnifiedExecProcess {
         process_handle: ProcessHandle,
         sandbox_type: SandboxType,
         spawn_lifecycle: Option<SpawnLifecycleHandle>,
+        raw_output_artifact: Option<RawOutputArtifact>,
     ) -> Self {
         let output_buffer = Arc::new(Mutex::new(HeadTailBuffer::default()));
         let output_notify = Arc::new(Notify::new());
@@ -126,6 +130,7 @@ impl UnifiedExecProcess {
             state_tx,
             state_rx,
             output_task: None,
+            raw_output_artifact: raw_output_artifact.map(|artifact| Arc::new(Mutex::new(artifact))),
             sandbox_type,
             _spawn_lifecycle: spawn_lifecycle,
         }
@@ -176,6 +181,13 @@ impl UnifiedExecProcess {
 
     pub(super) fn output_drained_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.output_drained)
+    }
+
+    pub(super) async fn raw_output_artifact(&self) -> Option<RawOutputArtifact> {
+        match &self.raw_output_artifact {
+            Some(artifact) => Some(artifact.lock().await.clone()),
+            None => None,
+        }
     }
 
     pub(super) fn has_exited(&self) -> bool {
@@ -318,6 +330,7 @@ impl UnifiedExecProcess {
         spawned: SpawnedPty,
         sandbox_type: SandboxType,
         spawn_lifecycle: SpawnLifecycleHandle,
+        raw_output_artifact: Option<RawOutputArtifact>,
     ) -> Result<Self, UnifiedExecError> {
         let SpawnedPty {
             session: process_handle,
@@ -325,19 +338,19 @@ impl UnifiedExecProcess {
             stderr_rx,
             mut exit_rx,
         } = spawned;
-        let output_rx = codex_utils_pty::combine_output_receivers(stdout_rx, stderr_rx);
         let mut managed = Self::new(
             ProcessHandle::Local(Box::new(process_handle)),
             sandbox_type,
             Some(spawn_lifecycle),
+            raw_output_artifact,
         );
+        let output_handles = managed.output_handles();
         managed.output_task = Some(Self::spawn_local_output_task(
-            output_rx,
-            Arc::clone(&managed.output_buffer),
-            Arc::clone(&managed.output_notify),
-            Arc::clone(&managed.output_closed),
-            Arc::clone(&managed.output_closed_notify),
+            stdout_rx,
+            stderr_rx,
+            output_handles,
             managed.output_tx.clone(),
+            managed.raw_output_artifact.clone(),
         ));
 
         match exit_rx.try_recv() {
@@ -376,12 +389,14 @@ impl UnifiedExecProcess {
 
     pub(super) async fn from_exec_server_started(
         started: StartedExecProcess,
+        raw_output_artifact: Option<RawOutputArtifact>,
     ) -> Result<Self, UnifiedExecError> {
         let process_handle = ProcessHandle::ExecServer(Arc::clone(&started.process));
         let mut managed = Self::new(
             process_handle,
             SandboxType::None,
             /*spawn_lifecycle*/ None,
+            raw_output_artifact,
         );
         let output_handles = managed.output_handles();
         managed.output_task = Some(Self::spawn_exec_server_output_task(
@@ -389,6 +404,7 @@ impl UnifiedExecProcess {
             output_handles,
             managed.output_tx.clone(),
             managed.state_tx.clone(),
+            managed.raw_output_artifact.clone(),
         ));
 
         let mut state_rx = managed.state_rx.clone();
@@ -417,6 +433,7 @@ impl UnifiedExecProcess {
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
         state_tx: watch::Sender<ProcessState>,
+        raw_output_artifact: Option<Arc<Mutex<RawOutputArtifact>>>,
     ) -> JoinHandle<()> {
         let OutputHandles {
             output_buffer,
@@ -428,6 +445,8 @@ impl UnifiedExecProcess {
         let process = started.process;
         let mut events = process.subscribe_events();
         tokio::spawn(async move {
+            let mut artifact_writer =
+                RawOutputArtifactWriter::open(raw_output_artifact.as_ref()).await;
             let mut last_seq: u64 = 0;
             loop {
                 let event = match events.recv().await {
@@ -491,6 +510,11 @@ impl UnifiedExecProcess {
                     } = response;
                     for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
                         let bytes = chunk.chunk.into_inner();
+                        if let Some(writer) = artifact_writer.as_mut() {
+                            writer
+                                .write_chunk(raw_output_artifact.as_ref(), &bytes)
+                                .await;
+                        }
                         let mut guard = output_buffer.lock().await;
                         guard.push_chunk(bytes.clone());
                         drop(guard);
@@ -534,6 +558,11 @@ impl UnifiedExecProcess {
                         }
                         last_seq = chunk.seq;
                         let bytes = chunk.chunk.into_inner();
+                        if let Some(writer) = artifact_writer.as_mut() {
+                            writer
+                                .write_chunk(raw_output_artifact.as_ref(), &bytes)
+                                .await;
+                        }
                         let mut guard = output_buffer.lock().await;
                         guard.push_chunk(bytes.clone());
                         drop(guard);
@@ -572,34 +601,66 @@ impl UnifiedExecProcess {
                     }
                 }
             }
+            if let Some(writer) = artifact_writer.as_mut() {
+                writer.finish(raw_output_artifact.as_ref()).await;
+            }
         })
     }
 
     fn spawn_local_output_task(
-        mut receiver: tokio::sync::broadcast::Receiver<Vec<u8>>,
-        buffer: OutputBuffer,
-        output_notify: Arc<Notify>,
-        output_closed: Arc<AtomicBool>,
-        output_closed_notify: Arc<Notify>,
+        mut stdout_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        mut stderr_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
+        raw_output_artifact: Option<Arc<Mutex<RawOutputArtifact>>>,
     ) -> JoinHandle<()> {
+        let OutputHandles {
+            output_buffer,
+            output_notify,
+            output_closed,
+            output_closed_notify,
+            cancellation_token: _,
+        } = output_handles;
         tokio::spawn(async move {
+            let mut artifact_writer =
+                RawOutputArtifactWriter::open(raw_output_artifact.as_ref()).await;
+            let mut stdout_open = true;
+            let mut stderr_open = true;
             loop {
-                match receiver.recv().await {
-                    Ok(chunk) => {
-                        let mut guard = buffer.lock().await;
-                        guard.push_chunk(chunk.clone());
-                        drop(guard);
-                        let _ = output_tx.send(chunk);
-                        output_notify.notify_waiters();
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        output_closed.store(true, Ordering::Release);
-                        output_closed_notify.notify_waiters();
-                        break;
-                    }
+                let chunk = tokio::select! {
+                    chunk = stdout_rx.recv(), if stdout_open => match chunk {
+                        Some(chunk) => Some(chunk),
+                        None => {
+                            stdout_open = false;
+                            None
+                        }
+                    },
+                    chunk = stderr_rx.recv(), if stderr_open => match chunk {
+                        Some(chunk) => Some(chunk),
+                        None => {
+                            stderr_open = false;
+                            None
+                        }
+                    },
+                    else => break,
                 };
+                if let Some(chunk) = chunk {
+                    if let Some(writer) = artifact_writer.as_mut() {
+                        writer
+                            .write_chunk(raw_output_artifact.as_ref(), &chunk)
+                            .await;
+                    }
+                    let mut guard = output_buffer.lock().await;
+                    guard.push_chunk(chunk.clone());
+                    drop(guard);
+                    let _ = output_tx.send(chunk);
+                    output_notify.notify_waiters();
+                }
+            }
+            output_closed.store(true, Ordering::Release);
+            output_closed_notify.notify_waiters();
+            if let Some(writer) = artifact_writer.as_mut() {
+                writer.finish(raw_output_artifact.as_ref()).await;
             }
         })
     }

@@ -6,7 +6,8 @@ use crate::shell::Shell;
 use crate::shell::ShellType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommandKind {
+enum CommandKind {
+    Legacy,
     Script,
     Argv,
     PowerShellScript,
@@ -15,11 +16,12 @@ pub(crate) enum CommandKind {
 impl CommandKind {
     fn parse(value: &str) -> Result<Self, FunctionCallError> {
         match value {
+            "legacy" => Ok(Self::Legacy),
             "script" => Ok(Self::Script),
             "argv" => Ok(Self::Argv),
             "powershell_script" => Ok(Self::PowerShellScript),
             other => Err(FunctionCallError::RespondToModel(format!(
-                "unsupported command kind `{other}`; use `script`, `argv`, or `powershell_script`."
+                "unsupported command kind `{other}`; use `legacy`, `script`, `argv`, or `powershell_script`."
             ))),
         }
     }
@@ -56,8 +58,8 @@ impl CommandInvocation {
             None => None,
         };
 
-        match kind.unwrap_or(CommandKind::Script) {
-            CommandKind::Script => {
+        match kind.unwrap_or(CommandKind::Legacy) {
+            CommandKind::Legacy | CommandKind::Script => {
                 if has_argv_fields {
                     return Err(FunctionCallError::RespondToModel(format!(
                         "{tool_name} received argv fields in script mode; omit `program`/`args` or set `kind` to `argv`."
@@ -151,6 +153,16 @@ impl CommandInvocation {
 
     pub(crate) fn is_argv(&self) -> bool {
         matches!(self, Self::Argv { .. })
+    }
+
+    pub(crate) fn to_direct_argv(&self) -> Option<Vec<String>> {
+        let Self::Argv { program, args } = self else {
+            return None;
+        };
+        let mut command = Vec::with_capacity(args.len() + 1);
+        command.push(program.clone());
+        command.extend(args.iter().cloned());
+        Some(command)
     }
 
     pub(crate) fn is_powershell_script(&self) -> bool {

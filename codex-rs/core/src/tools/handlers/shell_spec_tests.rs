@@ -33,7 +33,45 @@ fn exec_command_tool_matches_expected_spec() {
     let mut properties = BTreeMap::from([
         (
             "cmd".to_string(),
-            JsonSchema::string(Some("Shell command to execute.".to_string())),
+            JsonSchema::string(Some(
+                "Legacy shell script to execute. Use this for pipes, redirects, variable expansion, here-docs, compound shell syntax, and shell builtins. For a standalone executable, prefer `kind: \"argv\"`; for complex PowerShell, prefer `kind: \"powershell_script\"`."
+                    .to_string(),
+            )),
+        ),
+        (
+            "kind".to_string(),
+            JsonSchema::string_enum(
+                vec![
+                    json!("legacy"),
+                    json!("script"),
+                    json!("argv"),
+                    json!("powershell_script"),
+                ],
+                Some(
+                    "Command encoding. `legacy` preserves the historical untagged `cmd` string; `script` explicitly uses `cmd`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`."
+                        .to_string(),
+                ),
+            ),
+        ),
+        (
+            "program".to_string(),
+            JsonSchema::string(Some(
+                "Executable to launch directly when `kind` is `argv`.".to_string(),
+            )),
+        ),
+        (
+            "args".to_string(),
+            JsonSchema::array(
+                JsonSchema::string(/*description*/ None),
+                Some("Arguments for direct argv mode, excluding the program name.".to_string()),
+            ),
+        ),
+        (
+            "script_body".to_string(),
+            JsonSchema::string(Some(
+                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime."
+                    .to_string(),
+            )),
         ),
         (
             "workdir".to_string(),
@@ -85,11 +123,7 @@ fn exec_command_tool_matches_expected_spec() {
             description,
             strict: false,
             defer_loading: None,
-            parameters: JsonSchema::object(
-                properties,
-                Some(vec!["cmd".to_string()]),
-                Some(false.into())
-            ),
+            parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
             output_schema: Some(unified_exec_output_schema()),
         })
     );
@@ -229,7 +263,43 @@ Examples of valid command strings:
         (
             "command".to_string(),
             JsonSchema::string(Some(
-                "Shell script to run in the user's default shell.".to_string(),
+                "Legacy shell script to execute. Use this for pipes, redirects, variable expansion, here-docs, compound shell syntax, and shell builtins. For a standalone executable, prefer `kind: \"argv\"`; for complex PowerShell, prefer `kind: \"powershell_script\"`."
+                    .to_string(),
+            )),
+        ),
+        (
+            "kind".to_string(),
+            JsonSchema::string_enum(
+                vec![
+                    json!("legacy"),
+                    json!("script"),
+                    json!("argv"),
+                    json!("powershell_script"),
+                ],
+                Some(
+                    "Command encoding. `legacy` preserves the historical untagged `command` string; `script` explicitly uses `command`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`."
+                        .to_string(),
+                ),
+            ),
+        ),
+        (
+            "program".to_string(),
+            JsonSchema::string(Some(
+                "Executable to launch directly when `kind` is `argv`.".to_string(),
+            )),
+        ),
+        (
+            "args".to_string(),
+            JsonSchema::array(
+                JsonSchema::string(/*description*/ None),
+                Some("Arguments for direct argv mode, excluding the program name.".to_string()),
+            ),
+        ),
+        (
+            "script_body".to_string(),
+            JsonSchema::string(Some(
+                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime."
+                    .to_string(),
             )),
         ),
         (
@@ -263,11 +333,7 @@ Examples of valid command strings:
             description,
             strict: false,
             defer_loading: None,
-            parameters: JsonSchema::object(
-                properties,
-                Some(vec!["command".to_string()]),
-                Some(false.into())
-            ),
+            parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
             output_schema: None,
         })
     );

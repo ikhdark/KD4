@@ -47,6 +47,7 @@ use supports_color::Stream;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod app_cmd;
 mod build_info;
+mod config_cmd;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod desktop_app;
 mod doctor;
@@ -141,6 +142,9 @@ enum Subcommand {
 
     /// Manage Codex plugins.
     Plugin(PluginCli),
+
+    /// Inspect Codex configuration options.
+    Config(config_cmd::ConfigCli),
 
     /// Start Codex as an MCP server (stdio).
     McpServer(McpServerCommand),
@@ -1097,6 +1101,14 @@ async fn cli_main(
                     plugin_cmd::run_plugin_remove(overrides, args).await?;
                 }
             }
+        }
+        Some(Subcommand::Config(config_cli)) => {
+            reject_remote_mode_for_subcommand(
+                root_remote.as_deref(),
+                root_remote_auth_token_env.as_deref(),
+                config_cmd::ConfigCli::config_subcommand_name(&config_cli),
+            )?;
+            config_cmd::run(config_cli);
         }
         Some(Subcommand::AppServer(app_server_cli)) => {
             let AppServerCommand {
@@ -2125,6 +2137,7 @@ fn unsupported_subcommand_name_for_strict_config(
         Some(Subcommand::RemoteControl(remote_control)) => Some(remote_control.subcommand_name()),
         Some(Subcommand::Mcp(_)) => Some("mcp"),
         Some(Subcommand::Plugin(_)) => Some("plugin"),
+        Some(Subcommand::Config(_)) => Some("config"),
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         Some(Subcommand::App(_)) => Some("app"),
         Some(Subcommand::Login(_)) => Some("login"),
@@ -3994,6 +4007,19 @@ mod tests {
             panic!("expected features enable");
         };
         assert_eq!(feature, "unified_exec");
+    }
+
+    #[test]
+    fn config_explain_parses_optional_filter() {
+        let cli = MultitoolCli::try_parse_from(["codex", "config", "explain", "sandbox"])
+            .expect("parse should succeed");
+        let Some(Subcommand::Config(config_cmd::ConfigCli {
+            subcommand: config_cmd::ConfigSubcommand::Explain(args),
+        })) = cli.subcommand
+        else {
+            panic!("expected config explain subcommand");
+        };
+        assert_eq!(args.filter.as_deref(), Some("sandbox"));
     }
 
     #[test]

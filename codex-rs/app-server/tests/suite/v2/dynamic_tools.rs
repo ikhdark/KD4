@@ -42,7 +42,7 @@ const TINY_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAA
 const REMOTE_IMAGE_URL_ERROR: &str =
     "remote image URLs are not supported; use an inline data URL instead";
 
-// macOS and Windows Bazel CI can spend tens of seconds starting app-server
+// macOS and Windows CI can spend tens of seconds starting app-server
 // subprocesses or processing test RPCs under load.
 #[cfg(any(target_os = "macos", windows))]
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);

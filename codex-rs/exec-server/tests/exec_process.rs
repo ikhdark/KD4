@@ -425,7 +425,7 @@ async fn assert_exec_process_write_then_read(use_remote: bool) -> Result<()> {
             process_id: process_id.clone().into(),
             argv: vec![
                 // Use `/bin/sh` instead of Python so this stdin round-trip test
-                // stays portable across Bazel and non-macOS runners where
+                // stays portable across Linux runners where
                 // `/usr/bin/python3` is not guaranteed to exist.
                 "/bin/sh".to_string(),
                 "-c".to_string(),

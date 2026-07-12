@@ -72,7 +72,7 @@ impl TestEnvironment {
             }
             Self::WineExec => {
                 // Each Wine-exec test process has an isolated filesystem root, so this drive-root
-                // path cannot collide with a different Bazel shard.
+                // path cannot collide with a different parallel test shard.
                 PathUri::parse(&format!("file:///C:/codex-core-test-cwd-{instance_id}"))?
             }
         };

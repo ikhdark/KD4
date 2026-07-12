@@ -30,7 +30,8 @@ V8/rusty_v8 support synchronized.
 - `targets.py` and `test_targets.py`: package target matrix and artifact naming.
   Keep target triples, native package names, and archive names aligned with
   release and installer consumers.
-- `v8.py` and `test_v8.py`: V8/rusty_v8 packaging support and release-pair logic.
+- `v8.py` and `test_v8.py`: checksum-verified V8/rusty_v8 fallback support for
+  package targets that lack upstream Cargo archives.
 - `version.py` and `test_version.py`: package version derivation. Avoid changing
   version semantics without checking downstream package consumers.
 - `zsh.py`, `codex-zsh`, and `test_zsh.py`: patched zsh runtime packaging.

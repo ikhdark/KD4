@@ -10,11 +10,6 @@ on:
 jobs:
   # Keep reusable workflow calls alphabetized. The `required` job below is the
   # version-controlled list that the main-branch ruleset should require.
-  bazel:
-    name: Bazel
-    uses: ./.github/workflows/bazel.yml
-    secrets: inherit
-
   blob-size-policy:
     name: Blob size policy
     uses: ./.github/workflows/blob-size-policy.yml
@@ -23,6 +18,11 @@ jobs:
   cargo-deny:
     name: cargo-deny
     uses: ./.github/workflows/cargo-deny.yml
+    secrets: inherit
+
+  cargo-full:
+    name: Cargo full
+    uses: ./.github/workflows/rust-ci-full.yml
     secrets: inherit
 
   codespell:
@@ -51,9 +51,9 @@ jobs:
     # required check can appear successful instead of reporting the failure.
     if: ${{ always() }}
     needs:
-      - bazel
       - blob-size-policy
       - cargo-deny
+      - cargo-full
       - codespell
       - repo-checks
       - rust-ci

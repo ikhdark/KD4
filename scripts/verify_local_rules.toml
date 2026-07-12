@@ -179,6 +179,21 @@ validation_command = ["just", "source-map-check"]
 skip_owner_tests = true
 
 [[surface]]
+id = "kd4-feature-manifest"
+owned_packages = []
+paths = [
+  "kd4_features.toml",
+  "scripts/check_kd4_features.py",
+  "scripts/test_check_kd4_features.py",
+  "scripts/kd4_sync_audit.py",
+  "scripts/test_kd4_sync_audit.py",
+  "scripts/kd4_perf_snapshot.py",
+  "scripts/test_kd4_perf_snapshot.py",
+]
+validation_command = ["just", "check-kd4-features", "--strict"]
+skip_owner_tests = true
+
+[[surface]]
 id = "sdk-typescript"
 owned_packages = []
 paths = [

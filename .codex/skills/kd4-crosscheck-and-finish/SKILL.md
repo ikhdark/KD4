@@ -77,8 +77,8 @@ edits overlap the task, compare the versions, keep or produce the stronger
 one, integrate compatible improvements where practical, and continue
 without reverting unrelated work.
 
-Do not hand-edit generated files, vendored code, lockfiles, Bazel metadata,
-or build outputs unless the source change requires regeneration or an
+Do not hand-edit generated files, vendored code, lockfiles, or build outputs
+unless the source change requires regeneration or an
 owning workflow requires the update.
 
 ## Validate Locally

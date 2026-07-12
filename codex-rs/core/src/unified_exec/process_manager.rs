@@ -333,13 +333,14 @@ async fn emit_failed_initial_exec_end_if_unstored(
         Arc::clone(&context.session),
         Arc::clone(&context.turn),
         context.call_id.clone(),
-        request.command.clone(),
+        request.command_for_safety.clone(),
         cwd,
         Some(request.process_id.to_string()),
         transcript,
         fallback_output,
         message,
         wall_time,
+        context.tracker.clone(),
     )
     .await;
 }
@@ -437,10 +438,10 @@ impl UnifiedExecProcessManager {
             context.session.as_ref(),
             context.turn.as_ref(),
             &context.call_id,
-            /*turn_diff_tracker*/ None,
+            context.tracker.as_ref(),
         );
         let emitter = ToolEmitter::unified_exec(
-            &request.command,
+            &request.command_for_safety,
             cwd.clone(),
             ExecCommandSource::UnifiedExecStartup,
             Some(request.process_id.to_string()),
@@ -457,12 +458,14 @@ impl UnifiedExecProcessManager {
             self.store_process(
                 Arc::clone(&process),
                 context,
-                &request.command,
+                &request.command_for_safety,
                 request.hook_command.clone(),
                 cwd.clone(),
                 start,
                 request.process_id,
                 request.tty,
+                request.attempt_key.clone(),
+                request.raw_output_artifact.clone(),
                 deferred_network_approval.clone(),
                 Arc::clone(&transcript),
                 Arc::clone(&initial_exec_command_active),
@@ -601,13 +604,14 @@ impl UnifiedExecProcessManager {
                 Arc::clone(&context.session),
                 Arc::clone(&context.turn),
                 context.call_id.clone(),
-                request.command.clone(),
+                request.command_for_safety.clone(),
                 cwd.clone(),
                 Some(process_id.to_string()),
                 Arc::clone(&transcript),
                 text.clone(),
                 exit,
                 wall_time,
+                context.tracker.clone(),
             )
             .await;
 
@@ -628,6 +632,8 @@ impl UnifiedExecProcessManager {
             exit_code,
             original_token_count: Some(original_token_count),
             hook_command: Some(request.hook_command.clone()),
+            raw_output_artifact: process.raw_output_artifact().await,
+            repair_notice: None,
         };
 
         Ok(response)
@@ -783,6 +789,8 @@ impl UnifiedExecProcessManager {
             exit_code,
             original_token_count: Some(original_token_count),
             hook_command: Some(hook_command),
+            raw_output_artifact: process.raw_output_artifact().await,
+            repair_notice: None,
         };
 
         Ok(response)
@@ -865,6 +873,8 @@ impl UnifiedExecProcessManager {
         started_at: Instant,
         process_id: i32,
         tty: bool,
+        attempt_key: crate::tools::command_execution::CommandAttemptKey,
+        raw_output_artifact: crate::tools::command_output_artifact::RawOutputArtifact,
         network_approval: Option<DeferredNetworkApproval>,
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
         initial_exec_command_active: Arc<AtomicBool>,
@@ -894,6 +904,13 @@ impl UnifiedExecProcessManager {
             pruned_entry.process.terminate();
         }
 
+        context
+            .session
+            .services
+            .command_execution
+            .track_running_process(process_id, attempt_key, raw_output_artifact.clone())
+            .await;
+
         spawn_exit_watcher(
             Arc::clone(&process),
             Arc::clone(&context.session),
@@ -904,6 +921,7 @@ impl UnifiedExecProcessManager {
             process_id,
             transcript,
             started_at,
+            context.tracker.clone(),
         );
     }
 
@@ -919,6 +937,7 @@ impl UnifiedExecProcessManager {
         exec_server_env_config: Option<ExecServerEnvConfig>,
         tty: bool,
         spawn_lifecycle: SpawnLifecycleHandle,
+        raw_output_artifact: Option<crate::tools::command_output_artifact::RawOutputArtifact>,
         environment: &codex_exec_server::Environment,
     ) -> Result<UnifiedExecProcess, ToolError> {
         let mut request = if environment.is_remote() {
@@ -933,6 +952,7 @@ impl UnifiedExecProcessManager {
             &request,
             tty,
             spawn_lifecycle,
+            raw_output_artifact,
             environment,
         )
         .await
@@ -953,6 +973,7 @@ impl UnifiedExecProcessManager {
         request: &ExecRequest,
         tty: bool,
         mut spawn_lifecycle: SpawnLifecycleHandle,
+        raw_output_artifact: Option<crate::tools::command_output_artifact::RawOutputArtifact>,
         environment: &codex_exec_server::Environment,
     ) -> Result<UnifiedExecProcess, UnifiedExecError> {
         let inherited_fds = spawn_lifecycle.inherited_fds();
@@ -1040,6 +1061,7 @@ impl UnifiedExecProcessManager {
                 spawned.map_err(|err| UnifiedExecError::create_process(err.to_string()))?,
                 request.sandbox,
                 spawn_lifecycle,
+                raw_output_artifact,
             )
             .await;
         }
@@ -1056,7 +1078,8 @@ impl UnifiedExecProcessManager {
                 .await
                 .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
             spawn_lifecycle.after_spawn();
-            return UnifiedExecProcess::from_exec_server_started(started).await;
+            return UnifiedExecProcess::from_exec_server_started(started, raw_output_artifact)
+                .await;
         }
 
         // TODO(anp): Keep PathUri through the local PTY/process launch boundary.
@@ -1096,7 +1119,13 @@ impl UnifiedExecProcessManager {
         let spawned =
             spawn_result.map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
         spawn_lifecycle.after_spawn();
-        UnifiedExecProcess::from_spawned(spawned, request.sandbox, spawn_lifecycle).await
+        UnifiedExecProcess::from_spawned(
+            spawned,
+            request.sandbox,
+            spawn_lifecycle,
+            raw_output_artifact,
+        )
+        .await
     }
 
     pub(super) async fn open_session_with_sandbox(
@@ -1131,6 +1160,7 @@ impl UnifiedExecProcessManager {
             .exec_policy
             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
                 command: &request.command,
+                command_for_safety: Some(&request.command_for_safety),
                 approval_policy: context.turn.approval_policy.value(),
                 permission_profile: context.turn.permission_profile(),
                 windows_sandbox_level: context.turn.windows_sandbox_level,
@@ -1144,6 +1174,8 @@ impl UnifiedExecProcessManager {
             .await;
         let req = UnifiedExecToolRequest {
             command: request.command.clone(),
+            command_for_approval: request.command_for_safety.clone(),
+            raw_output_artifact: request.raw_output_artifact.clone(),
             shell_type: request.shell_type,
             hook_command: request.hook_command.clone(),
             process_id: request.process_id,

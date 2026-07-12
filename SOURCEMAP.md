@@ -23,6 +23,7 @@ entrypoint to generated, package, SDK, or desktop-visible outputs.
 - [Top-level ownership](#top-level-ownership)
 - [Rust workspace routing](#rust-workspace-routing)
 - [Build, package, and publish paths](#build-package-and-publish-paths)
+- [KD4 extension boundary](#kd4-extension-boundary)
 - [Contracts and generated artifacts](#contracts-and-generated-artifacts)
 - [Documentation and policy](#documentation-and-policy)
 - [Cross-cutting change routes](#cross-cutting-change-routes)
@@ -61,11 +62,9 @@ owner documentation directly.
 | --- | --- |
 | `.codex/` | Repo-local Codex policy, environments, harness artifacts, skills, and generated local workflow state |
 | `.github/` | CI, release, repository checks, issue templates, and automation |
-| `bazel/`, `BUILD.bazel`, `MODULE.bazel`, `defs.bzl`, `rbe.bzl` | Bazel modules, rules, platforms, toolchains, remote execution, and dependency lock state |
 | `codex-cli/` | npm-facing `@openai/codex` wrapper, native binary discovery, and package staging inputs |
 | `codex-rs/` | Primary Rust workspace and nearly all CLI, runtime, app-server, TUI, tool, protocol, state, plugin, and sandbox behavior |
 | `docs/` | User, contributor, configuration, authentication, sandbox, command, and skill documentation |
-| `patches/` | Bazel patch inputs that must remain synchronized with their consumers |
 | `scripts/` | Build lanes, local publish, package assembly, installers, schema helpers, repository checks, and maintenance tooling |
 | `sdk/` | TypeScript, Python, and Python runtime SDK/package surfaces |
 | `third_party/` | Checked-in or vendored integration inputs; edit only through the owning workflow |
@@ -102,7 +101,6 @@ and validation.
 | Flow | Owner and entrypoint |
 | --- | --- |
 | Rust build and tests | `codex-rs/Cargo.toml`, root `justfile`, crate-local tests, `codex-rs/AGENTS.md` |
-| Bazel build and dependency state | `MODULE.bazel`, `MODULE.bazel.lock`, `BUILD.bazel`, `defs.bzl`, `bazel/`, `patches/` |
 | npm package staging | `scripts/stage_npm_packages.py`, `codex-cli/scripts/build_npm_package.py`, `codex-cli/` |
 | Canonical package archives | `scripts/codex_package/` and `scripts/codex_package/AGENTS.md` |
 | Platform installers | `scripts/install/install.sh`, `scripts/install/install.ps1`, `scripts/install/AGENTS.md` |
@@ -116,6 +114,22 @@ The installed Windows runtime target for this fork is
 `C:\Users\kuh\Desktop\LOCAL-KD\codex.exe`. Source changes do not become visible
 in Codex Desktop until the owning local publish and restart chain succeeds.
 
+## KD4 extension boundary
+
+Prefer the existing `codex-rs/ext/extension-api` registry before adding a
+fork-only host hook. The accepted migration seams are:
+
+| KD4 capability | Existing seam | Owning phase |
+| --- | --- | --- |
+| Repository-native tools such as `repo_query` | `ToolContributor` | Repository intelligence |
+| Task evidence observation around tool execution | `ToolLifecycleContributor` | Completion evidence |
+| Task Capsule context injection | `ContextContributor` | Durable task state |
+
+Completion evaluation and app-server initialization receipts do not currently
+have an equivalent contributor contract. Add those seams only in their owning
+phase, after the required protocol/state shape is known. Do not introduce a
+general KD4 hook framework up front.
+
 ## Contracts and generated artifacts
 
 | Contract or output | Source owner | Update path |
@@ -123,7 +137,7 @@ in Codex Desktop until the owning local publish and restart chain succeeds.
 | App-server protocol/schema | `codex-rs/app-server`, `codex-rs/app-server-protocol`, `codex-rs/protocol` | Focused app-server tests plus `just app-server-schema-check`; intentional regeneration uses the owning force/generator recipe |
 | Config schema | `codex-rs/config`, `codex-rs/features`, `codex-rs/core` | Focused config/core tests plus `just config-schema-check`; generated output is `codex-rs/core/config.schema.json` |
 | npm package layout | `codex-cli`, `scripts/stage_npm_packages.py`, `scripts/codex_package/` | Package staging tests and dry-run/package inspection |
-| Cargo/Bazel dependency state | `codex-rs/Cargo.toml`, root Bazel files, patch inputs | Owning dependency and lock update recipes; never hand-edit generated lock state |
+| Cargo dependency state | `codex-rs/Cargo.toml`, crate manifests, and `codex-rs/Cargo.lock` | Owning Cargo dependency and lock update commands; never hand-edit generated lock state |
 | JavaScript dependency state | `package.json`, workspace package manifests | `pnpm-lock.yaml` through the owning package-manager workflow |
 | Rust snapshots and schema fixtures | Owning crate tests or schema generator | Regenerate through the owning test or generator, then inspect focused diffs |
 | Build outputs and vendored trees | `codex-rs/target`, `node_modules`, `codex-rs/vendor`, `third_party` | Do not hand-edit; rebuild, reinstall, or run the owning update workflow |
@@ -164,4 +178,4 @@ when the task needs cross-cutting context.
 | Stored thread/session behavior | `state`, `thread-store`, `rollout*`, `message-history`, `memories/*` -> app-server/TUI consumers |
 | npm packaging or install behavior | `codex-cli` -> `scripts/stage_npm_packages.py`/`scripts/codex_package` -> installer/release workflow |
 | SDK/API surface | app-server protocol/schema -> `sdk/typescript` and/or `sdk/python` -> generated artifacts and focused SDK tests |
-| Dependency or build-system change | owning Cargo/package manifest -> Bazel/workspace lock state -> focused build/test/package proof |
+| Dependency or build-system change | owning Cargo/package manifest -> Cargo lock state -> focused build/test/package proof |

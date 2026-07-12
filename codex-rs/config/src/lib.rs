@@ -1,5 +1,6 @@
 mod cloud_config_bundle;
 mod cloud_config_layers;
+mod config_explain;
 mod config_layer_source;
 mod config_requirements;
 pub mod config_toml;
@@ -48,6 +49,9 @@ pub use cloud_config_layers::cloud_config_layers_from_fragments;
 pub use codex_protocol::config_types::ProfileV2Name;
 pub use codex_protocol::config_types::ProfileV2NameParseError;
 pub use codex_utils_absolute_path::AbsolutePathBuf;
+pub use config_explain::CONFIG_OPTION_DOCS;
+pub use config_explain::ConfigOptionDoc;
+pub use config_explain::render_config_explain;
 pub use config_layer_source::ConfigLayer;
 pub use config_layer_source::ConfigLayerMetadata;
 pub use config_layer_source::ConfigLayerSource;

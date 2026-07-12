@@ -551,12 +551,12 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             ["--show-stats", "--zero-stats"],
         )
 
-    def test_justfile_bench_and_bazel_fast_paths_are_explicit(self) -> None:
+    def test_justfile_bench_and_validation_fast_paths_are_explicit(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
         self.assertIn("bench package bench_name *args:", justfile)
         self.assertIn("bench-workspace *args:", justfile)
-        self.assertIn("Pass explicit Bazel test targets.", justfile)
+        self.assertIn("build-for-release *args:", justfile)
         self.assertIn("target-optimize-dry-run *args:", justfile)
         self.assertIn("app-server-runtime-check:", justfile)
         self.assertIn("app-server-command-exec-check:", justfile)

@@ -1,9 +1,9 @@
 //! Cargo entry point for the minimal exec-server integration-test fixture.
 //!
-//! This mirrors `//codex-rs/exec-server/testing:exec-server` so Cargo-backed
-//! app-server integration tests can receive `CARGO_BIN_EXE_exec-server`. It
-//! also handles the filesystem-helper argv mode because exec-server re-execs
-//! `codex_self_exe` for sandboxed filesystem requests.
+//! App-server integration tests receive this binary through
+//! `CARGO_BIN_EXE_exec-server`. It also handles the filesystem-helper argv mode
+//! because exec-server re-execs `codex_self_exe` for sandboxed filesystem
+//! requests.
 
 use codex_exec_server::ExecServerRuntimePaths;
 use std::ffi::OsStr;

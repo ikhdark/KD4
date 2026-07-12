@@ -87,6 +87,11 @@ def test_root_fmt_recipes_use_shared_formatter_driver() -> None:
     justfile = ROOT.parents[1] / "justfile"
     lines = justfile.read_text().splitlines()
     fmt_index = lines.index("fmt:")
+    fmt_next_recipe_index = next(
+        index
+        for index in range(fmt_index + 1, len(lines))
+        if lines[index] and not lines[index].startswith((" ", "\t", "#"))
+    )
     fmt_check_index = lines.index("fmt-check:")
     next_recipe_index = next(
         index
@@ -98,7 +103,7 @@ def test_root_fmt_recipes_use_shared_formatter_driver() -> None:
         "fmt_comment": next(line for line in reversed(lines[:fmt_index]) if line.startswith("#")),
         "fmt_commands": [
             line.strip()
-            for line in lines[fmt_index + 1 : fmt_check_index]
+            for line in lines[fmt_index + 1 : fmt_next_recipe_index]
             if line.strip() and not line.startswith("#")
         ],
         "fmt_check_comment": next(
@@ -110,12 +115,10 @@ def test_root_fmt_recipes_use_shared_formatter_driver() -> None:
     }
     expected = {
         "working_directory": 'set working-directory := "codex-rs"',
-        "fmt_comment": (
-            "# Format the justfile, Rust, Bazel/Starlark, Python SDK code, and Python scripts."
-        ),
-        "fmt_commands": ["@{{ python }} ../scripts/format.py"],
+        "fmt_comment": "# Format the justfile and Rust code for the high-frequency local edit path.",
+        "fmt_commands": ["{{ python }} ../scripts/format.py --fast-local"],
         "fmt_check_comment": "# Check formatting without modifying files.",
-        "fmt_check_commands": ["@{{ python }} ../scripts/format.py --check"],
+        "fmt_check_commands": ["{{ python }} ../scripts/format.py --check"],
     }
 
     assert actual == expected, (
@@ -126,33 +129,16 @@ def test_root_fmt_recipes_use_shared_formatter_driver() -> None:
     )
 
 
-def test_root_format_driver_covers_all_formatter_groups(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_root_format_driver_covers_all_formatter_groups() -> None:
     """The shared driver should retain every formatter in both modes."""
     script = _load_root_format_script_module()
-    git_ls_files_args = [
-        "git",
-        "ls-files",
-        "-z",
-        "--cached",
-        "--others",
-        "--exclude-standard",
-    ]
-
-    def fake_check_output(args, *, cwd):
-        assert args == git_ls_files_args
-        assert cwd == script.REPO_ROOT
-        return b"MODULE.bazel\0README.md\0third_party/v8/libcxx.BUILD.bazel\0"
-
-    monkeypatch.setattr(script.subprocess, "check_output", fake_check_output)
     formatters = script.formatter_groups(check=False)
     checks = script.formatter_groups(check=True)
 
     assert [group.name for group in formatters] == [
         "Just",
         "Rust",
-        "Bazel/Starlark",
+        "Prettier",
         "Python SDK",
         "Python scripts",
     ]
@@ -204,37 +190,14 @@ def test_root_format_driver_covers_all_formatter_groups(
     assert checks[0].commands[-1].args == ("just", "--unstable", "--fmt", "--check")
     assert formatters[1].commands[-1].args == (
         "cargo",
+        f"+{script.RUSTFMT_TOOLCHAIN}",
         "fmt",
-        "--",
-        "--config",
-        "imports_granularity=Item",
     )
     assert checks[1].commands[-1].args == (
         "cargo",
+        f"+{script.RUSTFMT_TOOLCHAIN}",
         "fmt",
-        "--",
-        "--config",
-        "imports_granularity=Item",
         "--check",
-    )
-    format_buildifier_args = formatters[2].commands[-1].args
-    check_buildifier_args = checks[2].commands[-1].args
-    assert format_buildifier_args[:4] == (
-        "dotslash",
-        str(script.REPO_ROOT / "tools" / "buildifier"),
-        "-mode=fix",
-        "-lint=off",
-    )
-    assert check_buildifier_args[:4] == (
-        "dotslash",
-        str(script.REPO_ROOT / "tools" / "buildifier"),
-        "-mode=check",
-        "-lint=off",
-    )
-    assert format_buildifier_args[4:] == check_buildifier_args[4:]
-    assert format_buildifier_args[4:] == (
-        "MODULE.bazel",
-        "third_party/v8/libcxx.BUILD.bazel",
     )
     assert [group.commands[-1].args[-3:] for group in formatters[3:]] == [
         ("ruff", "format", "sdk/python"),
@@ -264,18 +227,22 @@ def test_root_format_driver_discards_successful_command_output(
 
     assert script.run_formatter_group(group) == script.FormatterResult(
         "Test",
-        "$ second\nfailure output\n",
+        "$ first\nroutine output\n$ second\nfailure output\n",
         2,
     )
 
 
-def test_root_format_driver_is_silent_when_all_formatters_succeed(
+def test_root_format_driver_reports_progress_when_all_formatters_succeed(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     script = _load_root_format_script_module()
     groups = (script.FormatterGroup("Quiet", ()),)
-    monkeypatch.setattr(script, "formatter_groups", lambda *, check: groups)
+    monkeypatch.setattr(
+        script,
+        "formatter_groups",
+        lambda *, check, fast_local=False, selected_groups=None: groups,
+    )
     monkeypatch.setattr(
         script,
         "run_formatter_group",
@@ -285,10 +252,13 @@ def test_root_format_driver_is_silent_when_all_formatters_succeed(
 
     assert script.main() == 0
     captured = capsys.readouterr()
-    assert (captured.out, captured.err) == ("", "")
+    assert "Starting Quiet formatter..." in captured.out
+    assert "==> Quiet formatter finished" in captured.out
+    assert "hidden output" in captured.out
+    assert captured.err == ""
 
 
-def test_root_format_driver_reports_only_failed_formatters(
+def test_root_format_driver_reports_all_formatter_results(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -297,7 +267,11 @@ def test_root_format_driver_reports_only_failed_formatters(
         script.FormatterGroup("Quiet", ()),
         script.FormatterGroup("Broken", ()),
     )
-    monkeypatch.setattr(script, "formatter_groups", lambda *, check: groups)
+    monkeypatch.setattr(
+        script,
+        "formatter_groups",
+        lambda *, check, fast_local=False, selected_groups=None: groups,
+    )
 
     def fake_run(group):
         if group.name == "Broken":
@@ -309,10 +283,13 @@ def test_root_format_driver_reports_only_failed_formatters(
 
     assert script.main() == 1
     captured = capsys.readouterr()
-    assert captured.out == ""
-    assert captured.err == (
-        "==> Broken formatter failed\n$ broken\nfailure output\nFormatting failed: Broken\n"
-    )
+    assert "Starting Quiet formatter..." in captured.out
+    assert "Starting Broken formatter..." in captured.out
+    assert "==> Quiet formatter finished" in captured.out
+    assert "hidden output" in captured.out
+    assert "==> Broken formatter finished" in captured.out
+    assert "$ broken\nfailure output\n" in captured.out
+    assert captured.err == "Formatting failed: Broken\n"
 
 
 def test_generate_types_wires_all_generation_steps() -> None:

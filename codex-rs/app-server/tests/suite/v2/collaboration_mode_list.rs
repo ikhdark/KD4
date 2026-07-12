@@ -20,7 +20,7 @@ use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use tokio::time::timeout;
 
-// Bazel CI can spend tens of seconds starting app-server subprocesses or
+// Loaded CI hosts can spend tens of seconds starting app-server subprocesses or
 // processing list RPCs under load.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 

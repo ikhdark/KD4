@@ -270,6 +270,20 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
             "-lc".to_string(),
             "echo before".to_string(),
         ],
+        command_for_safety: vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "echo before".to_string(),
+        ],
+        attempt_key: crate::tools::command_execution::CommandAttemptKey::new(
+            "exec_command",
+            "test",
+            "test-cwd",
+            &["echo before".to_string()],
+        ),
+        raw_output_artifact: crate::tools::command_output_artifact::RawOutputArtifact::Failed {
+            message: "test fixture".to_string(),
+        },
         shell_type: crate::shell::ShellType::Sh,
         hook_command: "echo before".to_string(),
         process_id: 123,

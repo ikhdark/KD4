@@ -3525,9 +3525,8 @@ async fn incomplete_response_emits_content_filter_error_message() -> anyhow::Res
 /// process-wide and unsafe. Though for this test, we want to simulate the
 /// presence of an environment variable that the provider will read for auth, so
 /// we pick a commonly existing env var that is guaranteed to have a non-empty
-/// value on both Windows and Unix. Note that this test must also work when run
-/// under Bazel in CI, which uses a restricted environment, so PATH seems like
-/// the safest choice.
+/// value on both Windows and Unix. CI can use a restricted environment, so PATH
+/// is the safest choice.
 const EXISTING_ENV_VAR_WITH_NON_EMPTY_VALUE: &str = "PATH";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

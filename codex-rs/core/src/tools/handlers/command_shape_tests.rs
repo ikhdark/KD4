@@ -61,6 +61,34 @@ fn argv_mode_accepts_program_and_args_without_script() {
 }
 
 #[test]
+fn untagged_command_preserves_legacy_compatibility() {
+    let invocation = parse(Some("rg --files"), None, None, None, None)
+        .expect("untagged command should remain compatible");
+
+    assert_eq!(
+        invocation,
+        CommandInvocation::Script("rg --files".to_string())
+    );
+}
+
+#[test]
+fn tagged_script_and_legacy_shapes_are_explicit() {
+    let script =
+        parse(Some("Write-Output ok"), Some("script"), None, None, None).expect("tagged script");
+    let legacy =
+        parse(Some("Write-Output ok"), Some("legacy"), None, None, None).expect("tagged legacy");
+
+    assert_eq!(
+        script,
+        CommandInvocation::Script("Write-Output ok".to_string())
+    );
+    assert_eq!(
+        legacy,
+        CommandInvocation::Script("Write-Output ok".to_string())
+    );
+}
+
+#[test]
 fn powershell_script_mode_builds_encoded_args_without_host_powershell() {
     let script_body = "$value = 'quoted value'; Write-Output $value";
     let invocation = parse(

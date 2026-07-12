@@ -53,6 +53,9 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug)]
 pub struct ShellRequest {
     pub command: Vec<String>,
+    /// Semantically equivalent, inspectable command used for approvals and
+    /// approval caching when `command` contains an encoded runtime payload.
+    pub command_for_approval: Vec<String>,
     pub turn_environment: TurnEnvironment,
     pub shell_type: Option<ShellType>,
     pub hook_command: String,
@@ -128,7 +131,7 @@ impl Approvable<ShellRequest> for ShellRuntime {
     fn approval_keys(&self, req: &ShellRequest) -> Vec<Self::ApprovalKey> {
         vec![ApprovalKey {
             environment_id: req.turn_environment.environment_id.clone(),
-            command: canonicalize_command_for_approval(&req.command),
+            command: canonicalize_command_for_approval(&req.command_for_approval),
             cwd: req.cwd.clone(),
             sandbox_permissions: req.sandbox_permissions,
             additional_permissions: req.additional_permissions.clone(),
@@ -141,7 +144,7 @@ impl Approvable<ShellRequest> for ShellRuntime {
         ctx: ApprovalCtx<'a>,
     ) -> BoxFuture<'a, ReviewDecision> {
         let keys = self.approval_keys(req);
-        let command = req.command.clone();
+        let command = req.command_for_approval.clone();
         let cwd = req.cwd.clone();
         let environment_id = Some(req.turn_environment.environment_id.clone());
         let reason = ctx
@@ -183,7 +186,7 @@ impl Approvable<ShellRequest> for ShellRuntime {
     ) -> std::io::Result<ApprovalAction> {
         Ok(ApprovalAction::Shell {
             id: ctx.call_id.to_string(),
-            command: req.command.clone(),
+            command: req.command_for_approval.clone(),
             cwd: req.cwd.clone(),
             sandbox_permissions: req.sandbox_permissions,
             additional_permissions: req.additional_permissions.clone(),

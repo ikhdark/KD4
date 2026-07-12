@@ -209,7 +209,7 @@ the closest scoped `AGENTS.md` instead of duplicating them here.
 
 ## Protected and generated paths
 
-Do not hand-edit generated files, vendored code, lockfiles, Bazel metadata, or
+Do not hand-edit generated files, vendored code, lockfiles, or
 build outputs unless the source change requires regeneration or an owning
 workflow requires the update. In particular, do not hand-edit files under:
 

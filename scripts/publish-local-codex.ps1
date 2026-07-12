@@ -130,6 +130,7 @@ if ($TestRun -and $SkipBuild) {
     throw "-TestRun cannot be combined with -SkipBuild."
 }
 
+$sourceBuildStampMustRemainValid = $false
 if ($AutoSkipBuild -and -not $SkipBuild -and -not $BuildOnly) {
     $autoSkipBuildDecision = Get-AutoSkipBuildDecision `
         -RepoRoot $repoRoot `
@@ -139,6 +140,7 @@ if ($AutoSkipBuild -and -not $SkipBuild -and -not $BuildOnly) {
         -SourceCodeModeHostExe $SourceCodeModeHostExe
     if ($autoSkipBuildDecision.CanSkip) {
         $SkipBuild = $true
+        $sourceBuildStampMustRemainValid = $true
         Write-ProofLine "autoSkipBuild" "true"
         Write-ProofLine "autoSkipBuildReason" $autoSkipBuildDecision.Reason
     }
@@ -175,6 +177,7 @@ if (-not $SkipBuild) {
             -SourceExe $SourceExe `
             -SourceCodeModeHostExe $SourceCodeModeHostExe `
             -SourceNewestUtc $builtSourceNewestUtc
+        $sourceBuildStampMustRemainValid = $true
         Write-ProofLine "buildStamp" "written: content and artifact hashes recorded"
     }
 }
@@ -273,12 +276,42 @@ Write-ProofLine "sourceLastWriteUtc" (Format-UtcTimestamp $sourceLastWriteUtc)
 Write-ProofLine "sourceCodeModeHostLastWriteUtc" (Format-UtcTimestamp $sourceCodeModeHostLastWriteUtc)
 Write-ProofLine "targetBeforeLastWriteUtc" (Format-UtcTimestamp $targetBeforeLastWriteUtc)
 Write-ProofLine "codeModeHostTargetBeforeLastWriteUtc" (Format-UtcTimestamp $codeModeHostTargetBeforeLastWriteUtc)
-$codexSourceBuildStale = Test-FileStaleAgainstSource `
-    -SourceNewestUtc $sourceTreeNewestUtc `
-    -FileLastWriteUtc $sourceLastWriteUtc
-$codeModeHostSourceBuildStale = Test-FileStaleAgainstSource `
-    -SourceNewestUtc $sourceTreeNewestUtc `
-    -FileLastWriteUtc $sourceCodeModeHostLastWriteUtc
+$sourceBuildFreshnessProvenByStamp = $false
+$sourceBuildStampInvalidated = $false
+if ($SkipBuild -or $sourceBuildStampMustRemainValid) {
+    $finalBuildStampDecision = Get-AutoSkipBuildDecision `
+        -RepoRoot $repoRoot `
+        -StampPath $buildStampPath `
+        -Profile $Profile `
+        -SourceExe $SourceExe `
+        -SourceCodeModeHostExe $SourceCodeModeHostExe
+    Write-ProofLine "sourceBuildStampValidation" $finalBuildStampDecision.Reason
+    if ($finalBuildStampDecision.CanSkip) {
+        $sourceBuildFreshnessProvenByStamp = $true
+    }
+    elseif ($sourceBuildStampMustRemainValid) {
+        $sourceBuildStampInvalidated = $true
+    }
+}
+if ($sourceBuildFreshnessProvenByStamp) {
+    $codexSourceBuildStale = $false
+    $codeModeHostSourceBuildStale = $false
+    Write-ProofLine "sourceBuildFreshnessBasis" "content-bound build stamp"
+}
+elseif ($sourceBuildStampInvalidated) {
+    $codexSourceBuildStale = $true
+    $codeModeHostSourceBuildStale = $true
+    Write-ProofLine "sourceBuildFreshnessBasis" "content-bound build stamp invalidated before publish"
+}
+else {
+    $codexSourceBuildStale = Test-FileStaleAgainstSource `
+        -SourceNewestUtc $sourceTreeNewestUtc `
+        -FileLastWriteUtc $sourceLastWriteUtc
+    $codeModeHostSourceBuildStale = Test-FileStaleAgainstSource `
+        -SourceNewestUtc $sourceTreeNewestUtc `
+        -FileLastWriteUtc $sourceCodeModeHostLastWriteUtc
+    Write-ProofLine "sourceBuildFreshnessBasis" "source/artifact timestamps"
+}
 $sourceBuildStale = $codexSourceBuildStale -or $codeModeHostSourceBuildStale
 Write-ProofLine "codexSourceBuildStale" $codexSourceBuildStale
 Write-ProofLine "codeModeHostSourceBuildStale" $codeModeHostSourceBuildStale
@@ -358,7 +391,7 @@ else {
 if ($binaryChanged) {
     Write-VersionProofBlock -Prefix "targetBefore" -Path $targetPath
 }
-$skipBuildBlockedByStaleSource = $SkipBuild -and $sourceBuildStale
+$skipBuildBlockedByStaleSource = ($SkipBuild -or $sourceBuildStampInvalidated) -and $sourceBuildStale
 if ($targetExists) {
     Write-ProofLine "backupPath" $backupPath
 }
@@ -435,6 +468,9 @@ if ($DryRun) {
 if ($skipBuildBlockedByStaleSource) {
     Write-ProofLine "replace" "blocked: source build stale"
     Write-ProofLine "restartRequired" "unknown until rebuild"
+    if ($sourceBuildStampInvalidated) {
+        throw "The content-bound build stamp no longer matches the source bundle at the final publish gate. Rerun just publish-local-codex -Profile $Profile -RunDoctor without -SkipBuild."
+    }
     throw "SkipBuild cannot publish the newest Codex bundle because tracked source files are newer than one or more source artifacts. Run just publish-local-codex -Profile $Profile -RunDoctor without -SkipBuild."
 }
 
@@ -486,8 +522,27 @@ if (-not $binaryChanged) {
 
 $publishedCodeModeHost = $false
 $publishedCodex = $false
+$assertSourceBuildStampAtPublishGate = {
+    param([string]$ArtifactName)
+
+    if (-not $sourceBuildFreshnessProvenByStamp) {
+        return
+    }
+
+    $publishGateDecision = Get-AutoSkipBuildDecision `
+        -RepoRoot $repoRoot `
+        -StampPath $buildStampPath `
+        -Profile $Profile `
+        -SourceExe $SourceExe `
+        -SourceCodeModeHostExe $SourceCodeModeHostExe
+    Write-ProofLine "sourceBuildStampPublishGate" "$ArtifactName`: $($publishGateDecision.Reason)"
+    if (-not $publishGateDecision.CanSkip) {
+        throw "The content-bound build stamp no longer matches the source bundle immediately before publishing $ArtifactName. Rerun just publish-local-codex -Profile $Profile -RunDoctor without -SkipBuild."
+    }
+}
 try {
     if ($codeModeHostBinaryChanged) {
+        & $assertSourceBuildStampAtPublishGate "codex-code-mode-host.exe"
         Publish-CodexBinary `
             -SourcePath $SourceCodeModeHostExe `
             -TargetPath $codeModeHostTargetPath `
@@ -495,6 +550,7 @@ try {
         $publishedCodeModeHost = $true
     }
     if ($codexBinaryChanged) {
+        & $assertSourceBuildStampAtPublishGate "codex.exe"
         Publish-CodexBinary -SourcePath $SourceExe -TargetPath $targetPath -BackupPath $backupPath
         $publishedCodex = $true
     }

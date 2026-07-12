@@ -11,6 +11,8 @@ use super::process::UnifiedExecProcess;
 use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::tools::command_output_artifact::append_raw_output_artifact;
+use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::events::ToolEventFailure;
@@ -114,6 +116,7 @@ pub(crate) fn spawn_exit_watcher(
     process_id: i32,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
+    tracker: Option<SharedTurnDiffTracker>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_notify();
@@ -123,36 +126,71 @@ pub(crate) fn spawn_exit_watcher(
         output_drained.notified().await;
 
         let duration = Instant::now().saturating_duration_since(started_at);
-        if let Some(message) = process.failure_message() {
+        let (exit_code, failure_message) = if let Some(message) = process.failure_message() {
             emit_failed_exec_end_for_unified_exec(
-                session_ref,
+                Arc::clone(&session_ref),
                 turn_ref,
                 call_id,
                 command,
                 cwd,
                 Some(process_id.to_string()),
-                transcript,
+                Arc::clone(&transcript),
                 String::new(),
-                message,
+                message.clone(),
                 duration,
+                tracker,
             )
             .await;
+            (-1, Some(message))
         } else {
             let exit_code = process.exit_code().unwrap_or(-1);
             emit_exec_end_for_unified_exec(
-                session_ref,
+                Arc::clone(&session_ref),
                 turn_ref,
                 call_id,
                 command,
                 cwd,
                 Some(process_id.to_string()),
-                transcript,
+                Arc::clone(&transcript),
                 String::new(),
                 exit_code,
                 duration,
+                tracker,
             )
             .await;
+            (exit_code, None)
+        };
+
+        if let Some(mut finalized_artifact) = process.raw_output_artifact().await {
+            if let Some(message) = failure_message {
+                let separator = if matches!(
+                    finalized_artifact,
+                    crate::tools::command_output_artifact::RawOutputArtifact::Stored {
+                        bytes: 0,
+                        ..
+                    }
+                ) {
+                    ""
+                } else {
+                    "\n"
+                };
+                finalized_artifact = append_raw_output_artifact(
+                    &finalized_artifact,
+                    format!("{separator}{message}").as_bytes(),
+                )
+                .await;
+            }
+            session_ref
+                .services
+                .command_execution
+                .update_running_artifact(process_id, finalized_artifact)
+                .await;
         }
+        session_ref
+            .services
+            .command_execution
+            .mark_running_process_completed(process_id, exit_code)
+            .await;
     });
 }
 
@@ -203,6 +241,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     fallback_output: String,
     exit_code: i32,
     duration: Duration,
+    tracker: Option<SharedTurnDiffTracker>,
 ) {
     let aggregated_output = resolve_aggregated_output(&transcript, fallback_output).await;
     let output = ExecToolCallOutput {
@@ -217,7 +256,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         session_ref.as_ref(),
         turn_ref.as_ref(),
         &call_id,
-        /*turn_diff_tracker*/ None,
+        tracker.as_ref(),
     );
     let emitter = ToolEmitter::unified_exec(
         &command,
@@ -248,6 +287,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     fallback_output: String,
     message: String,
     duration: Duration,
+    tracker: Option<SharedTurnDiffTracker>,
 ) {
     let stdout = if fallback_output.is_empty() {
         resolve_aggregated_output(&transcript, fallback_output).await
@@ -271,7 +311,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         session_ref.as_ref(),
         turn_ref.as_ref(),
         &call_id,
-        /*turn_diff_tracker*/ None,
+        tracker.as_ref(),
     );
     let emitter = ToolEmitter::unified_exec(
         &command,

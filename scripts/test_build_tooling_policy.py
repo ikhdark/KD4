@@ -98,31 +98,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("build_info::emit();", cli_build)
         self.assertIn("cargo:rustc-link-arg=-ObjC", cli_build)
 
-    def test_bazel_build_scripts_include_shared_build_info_source(
-        self,
-    ) -> None:
-        macro = (REPO_ROOT / "defs.bzl").read_text(encoding="utf-8")
-        workspace_build = (
-            REPO_ROOT / "codex-rs" / "BUILD.bazel"
-        ).read_text(encoding="utf-8")
-        cli_build = (REPO_ROOT / "codex-rs" / "cli" / "BUILD.bazel").read_text(
-            encoding="utf-8"
-        )
-        app_server_build = (
-            REPO_ROOT / "codex-rs" / "app-server" / "BUILD.bazel"
-        ).read_text(encoding="utf-8")
-
-        self.assertIn("MACOS_WEBRTC_RUSTC_LINK_FLAGS", cli_build)
-        self.assertIn("extra_binaries_non_windows", app_server_build)
-        self.assertIn('"build_info.rs"', workspace_build)
-        self.assertIn("build_script_srcs = []", macro)
-        self.assertIn('srcs = ["build.rs"] + build_script_srcs', macro)
-        for crate_build in (cli_build, app_server_build):
-            self.assertIn(
-                'build_script_srcs = ["//codex-rs:build_info.rs"]',
-                crate_build,
-            )
-
     def test_bwrap_build_script_tracks_resolved_source_dir(self) -> None:
         text = (REPO_ROOT / "codex-rs" / "bwrap" / "build.rs").read_text(
             encoding="utf-8"
@@ -587,7 +562,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "build-dev-small package:",
             "run-dev-small package *args:",
             "local-release package:",
-            "bazel-test-changed *targets:",
+            "build-for-release *args:",
             "bench-workspace *args:",
             "test-lane-fast lane *args:",
             "test-windows-sandbox-processes *args:",

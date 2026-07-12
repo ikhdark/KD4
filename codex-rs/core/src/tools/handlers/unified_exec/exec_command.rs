@@ -3,18 +3,23 @@ use std::sync::Arc;
 
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
+use crate::tools::command_execution::CommandAttemptKey;
+use crate::tools::command_output_artifact::create_raw_output_artifact;
+use crate::tools::command_output_artifact::replace_raw_output_artifact;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
+use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
+use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_tool_environment;
-use crate::tools::handlers::rewrite_function_string_argument;
+use crate::tools::handlers::rewrite_function_script_argument;
 use crate::tools::handlers::updated_hook_command;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
@@ -127,7 +132,12 @@ impl ExecCommandHandler {
         };
 
         let manager: &UnifiedExecProcessManager = &session.services.unified_exec_manager;
-        let context = UnifiedExecContext::new(session.clone(), turn.clone(), call_id.clone());
+        let context = UnifiedExecContext::with_tracker(
+            session.clone(),
+            turn.clone(),
+            call_id.clone(),
+            tracker.clone(),
+        );
         let environment_args: ExecCommandEnvironmentArgs = parse_arguments(&arguments)?;
         let Some(turn_environment) = resolve_tool_environment(
             &step_context.environments,
@@ -189,17 +199,9 @@ impl ExecCommandHandler {
                 parse_arguments(&arguments)?
             }
         };
-        let hook_command = args.cmd.clone();
-        // TODO(anp) wire PathUri through implicit skills instead of skipping on foreign paths
-        if let Some(native_cwd) = native_cwd.as_ref() {
-            maybe_emit_implicit_skill_invocation(
-                session.as_ref(),
-                context.turn.as_ref(),
-                &hook_command,
-                native_cwd,
-            )
-            .await;
-        }
+        let original_invocation = args
+            .command_invocation()
+            .map_err(FunctionCallError::RespondToModel)?;
         let shell_mode =
             shell_mode_for_environment(&turn.unified_exec_shell_mode, environment.as_ref());
         // Remote environments may use a different OS and must build commands with their native
@@ -212,7 +214,7 @@ impl ExecCommandHandler {
         // TODO(anp): Resolve requested shells in remote environments instead of restricting
         // commands to the reported default shell.
         if environment.is_remote()
-            && let Some(requested_shell) = args.shell.take()
+            && let Some(requested_shell) = args.shell.as_deref()
         {
             let Some(remote_shell) = turn_environment.shell.as_ref() else {
                 return Err(FunctionCallError::RespondToModel(format!(
@@ -220,7 +222,7 @@ impl ExecCommandHandler {
                     turn_environment.environment_id
                 )));
             };
-            if detect_shell_type(Path::new(&requested_shell)) != Some(remote_shell.shell_type) {
+            if detect_shell_type(Path::new(requested_shell)) != Some(remote_shell.shell_type) {
                 return Err(FunctionCallError::RespondToModel(format!(
                     "environment `{}` only supports `{}`",
                     turn_environment.environment_id,
@@ -228,17 +230,76 @@ impl ExecCommandHandler {
                 )));
             }
         }
-        let process_id = manager.allocate_process_id().await;
-        let resolved_command = get_command(
+        let original_resolved_command = get_command(
             &args,
-            shell,
+            Arc::clone(&shell),
             &shell_mode,
             turn.config.permissions.allow_login_shell,
+            environment.is_remote(),
         )
         .map_err(FunctionCallError::RespondToModel)?;
+        let original_safety_command = original_resolved_command.safety_command.clone();
+        let preflight = preflight_invocation_with_equivalent_repair(
+            &original_invocation,
+            &original_safety_command,
+            original_resolved_command.preflight_shell_type,
+        )
+        .map_err(|issue| {
+            FunctionCallError::RespondToModel(format!(
+                "{}\nRegenerate the command and call `exec_command` again.",
+                issue
+            ))
+        })?;
+        let repaired = preflight.repaired();
+        let command_invocation = preflight.invocation;
+        let repair_notice = preflight.repair_notice;
+        if repaired {
+            args.replace_command_invocation(&command_invocation);
+        }
+        let resolved_command = if repair_notice.is_some() {
+            get_command(
+                &args,
+                Arc::clone(&shell),
+                &shell_mode,
+                turn.config.permissions.allow_login_shell,
+                environment.is_remote(),
+            )
+            .map_err(FunctionCallError::RespondToModel)?
+        } else {
+            original_resolved_command
+        };
+        let hook_command = command_invocation.display_command();
+        // Implicit skill detection requires a native path, so foreign PathUri
+        // workdirs are intentionally skipped here.
+        if let Some(native_cwd) = native_cwd.as_ref() {
+            maybe_emit_implicit_skill_invocation(
+                session.as_ref(),
+                context.turn.as_ref(),
+                &hook_command,
+                native_cwd,
+            )
+            .await;
+        }
         let command = resolved_command.command;
+        let safety_command = resolved_command.safety_command;
         let shell_type = resolved_command.shell_type;
-        let command_for_display = codex_shell_command::parse_command::shlex_join(&command);
+        let attempt_key = CommandAttemptKey::new(
+            self.tool_name().name.as_str(),
+            &turn_environment.environment_id,
+            cwd.to_string(),
+            &original_safety_command,
+        );
+        session
+            .services
+            .command_execution
+            .begin_attempt(&attempt_key, repair_notice.is_some())
+            .await
+            .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
+        // Reserve an interactive process id only after all fallible command
+        // normalization and preflight checks. Rejected commands never reach
+        // the process manager and must not consume an id.
+        let process_id = manager.allocate_process_id().await;
+        let command_for_display = hook_command.clone();
 
         let ExecCommandArgs {
             tty,
@@ -311,6 +372,13 @@ impl ExecCommandHandler {
             }
         };
 
+        let raw_output_artifact = create_raw_output_artifact(
+            turn.config.codex_home.as_path(),
+            &session.thread_id.to_string(),
+            b"",
+        )
+        .await;
+
         if let Some(output) = intercept_apply_patch(
             &command,
             &cwd,
@@ -325,17 +393,27 @@ impl ExecCommandHandler {
         .await?
         {
             manager.release_process_id(process_id).await;
+            let raw_output = output.into_text().into_bytes();
+            let raw_output_artifact =
+                replace_raw_output_artifact(&raw_output_artifact, &raw_output).await;
+            session
+                .services
+                .command_execution
+                .record_exit(&attempt_key, 0)
+                .await;
             return Ok(boxed_tool_output(ExecCommandToolOutput {
                 event_call_id: String::new(),
                 chunk_id: String::new(),
                 wall_time: std::time::Duration::ZERO,
-                raw_output: output.into_text().into_bytes(),
+                raw_output,
                 truncation_policy: turn.model_info.truncation_policy.into(),
                 max_output_tokens,
                 process_id: None,
                 exit_code: None,
                 original_token_count: None,
                 hook_command: None,
+                raw_output_artifact: Some(raw_output_artifact),
+                repair_notice,
             }));
         }
 
@@ -344,6 +422,9 @@ impl ExecCommandHandler {
             .exec_command(
                 ExecCommandRequest {
                     command,
+                    command_for_safety: safety_command,
+                    attempt_key: attempt_key.clone(),
+                    raw_output_artifact: raw_output_artifact.clone(),
                     shell_type,
                     hook_command: hook_command.clone(),
                     process_id,
@@ -366,10 +447,61 @@ impl ExecCommandHandler {
             )
             .await
         {
-            Ok(response) => Ok(boxed_tool_output(response)),
+            Ok(mut response) => {
+                let finalized_artifact = response
+                    .raw_output_artifact
+                    .clone()
+                    .unwrap_or_else(|| raw_output_artifact.clone());
+                response.repair_notice = repair_notice;
+                if let Some(process_id) = response.process_id {
+                    session
+                        .services
+                        .command_execution
+                        .update_running_artifact(process_id, finalized_artifact)
+                        .await;
+                } else if let Some(exit_code) = response.exit_code {
+                    let tracked = session
+                        .services
+                        .command_execution
+                        .finish_running_process(process_id, Some(exit_code))
+                        .await;
+                    if !tracked {
+                        session
+                            .services
+                            .command_execution
+                            .record_exit(&attempt_key, exit_code)
+                            .await;
+                    }
+                }
+                Ok(boxed_tool_output(response))
+            }
             Err(UnifiedExecError::SandboxDenied { output, .. }) => {
                 let output_text = output.aggregated_output.text;
+                let finalized_artifact =
+                    replace_raw_output_artifact(&raw_output_artifact, output_text.as_bytes()).await;
+                let tracked = session
+                    .services
+                    .command_execution
+                    .finish_running_process(process_id, Some(output.exit_code))
+                    .await;
+                if !tracked {
+                    session
+                        .services
+                        .command_execution
+                        .record_exit(&attempt_key, output.exit_code)
+                        .await;
+                }
+                let advisory = powershell_script_failure_advisory(
+                    Some(shell_type),
+                    Some(output.exit_code),
+                    &output_text,
+                );
                 let original_token_count = approx_token_count(&output_text);
+                let output_text = if let Some(advisory) = advisory {
+                    format!("{output_text}\n\n{advisory}")
+                } else {
+                    output_text
+                };
                 Ok(boxed_tool_output(ExecCommandToolOutput {
                     event_call_id: context.call_id.clone(),
                     chunk_id: generate_chunk_id(),
@@ -383,11 +515,28 @@ impl ExecCommandHandler {
                     exit_code: Some(output.exit_code),
                     original_token_count: Some(original_token_count),
                     hook_command: Some(hook_command),
+                    raw_output_artifact: Some(finalized_artifact),
+                    repair_notice,
                 }))
             }
-            Err(err) => Err(FunctionCallError::RespondToModel(format!(
-                "exec_command failed for `{command_for_display}`: {err:?}"
-            ))),
+            Err(err) => {
+                if matches!(
+                    &err,
+                    UnifiedExecError::CreateProcess { .. } | UnifiedExecError::ProcessFailed { .. }
+                ) {
+                    session
+                        .services
+                        .command_execution
+                        .record_exit(&attempt_key, -1)
+                        .await;
+                }
+                let repair = repair_notice
+                    .as_deref()
+                    .map_or(String::new(), |notice| format!("\n{notice}"));
+                Err(FunctionCallError::RespondToModel(format!(
+                    "exec_command failed for `{command_for_display}`: {err:?}{repair}"
+                )))
+            }
         }
     }
 }
@@ -404,9 +553,10 @@ impl CoreToolRuntime for ExecCommandHandler {
 
         parse_arguments::<ExecCommandArgs>(arguments)
             .ok()
+            .and_then(|args| args.command_invocation().ok())
             .map(|args| PreToolUsePayload {
                 tool_name: HookToolName::bash(),
-                tool_input: serde_json::json!({ "command": args.cmd }),
+                tool_input: serde_json::json!({ "command": args.display_command() }),
             })
     }
 
@@ -421,7 +571,7 @@ impl CoreToolRuntime for ExecCommandHandler {
             ));
         };
         invocation.payload = ToolPayload::Function {
-            arguments: rewrite_function_string_argument(
+            arguments: rewrite_function_script_argument(
                 &arguments,
                 "exec_command",
                 "cmd",

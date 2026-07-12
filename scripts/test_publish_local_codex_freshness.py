@@ -299,6 +299,169 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             self.assertIn("buildCommand: <skipped>", result.stdout)
             self.assertIn("sourceBuildStale: False", result.stdout)
 
+    def test_auto_skip_build_uses_content_stamp_when_sidecar_mtime_is_old(
+        self,
+    ) -> None:
+        self.init_repo_fixture()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            install_dir = temp_path / "install"
+            source_timestamp = FIXTURE_TIME + 100
+            sidecar_timestamp = FIXTURE_TIME - 100
+            fake_codex = self.write_fake_codex(
+                temp_path / "fake-codex.cmd",
+                timestamp=source_timestamp,
+            )
+            os.utime(
+                self.source_code_mode_host,
+                (sidecar_timestamp, sidecar_timestamp),
+            )
+            self.write_build_stamp("release", source_timestamp, fake_codex)
+
+            result = self.run_script(
+                "-DryRun",
+                "-AutoSkipBuild",
+                "-FailOnStaleSourceBuild",
+                "-SourceExe",
+                str(fake_codex),
+                "-InstallDir",
+                str(install_dir),
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assert_proof_value(result.stdout, "autoSkipBuild", "true")
+            self.assert_proof_value(
+                result.stdout,
+                "autoSkipBuildReason",
+                "source artifacts and tracked publish inputs match build stamp",
+            )
+            self.assert_proof_value(
+                result.stdout,
+                "sourceBuildFreshnessBasis",
+                "content-bound build stamp",
+            )
+            self.assert_proof_value(
+                result.stdout,
+                "codeModeHostSourceBuildStale",
+                "False",
+            )
+            self.assert_proof_value(result.stdout, "sourceBuildStale", "False")
+            self.assertNotIn("sourceBuildStaleRemedy:", result.stdout)
+
+    def test_explicit_skip_build_uses_content_stamp_when_sidecar_mtime_is_old(
+        self,
+    ) -> None:
+        self.init_repo_fixture()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            install_dir = temp_path / "install"
+            source_timestamp = FIXTURE_TIME + 100
+            sidecar_timestamp = FIXTURE_TIME - 100
+            fake_codex = self.write_fake_codex(
+                temp_path / "fake-codex.cmd",
+                timestamp=source_timestamp,
+            )
+            os.utime(
+                self.source_code_mode_host,
+                (sidecar_timestamp, sidecar_timestamp),
+            )
+            self.write_build_stamp("release", source_timestamp, fake_codex)
+
+            result = self.run_script(
+                "-DryRun",
+                "-SkipBuild",
+                "-FailOnStaleSourceBuild",
+                "-SourceExe",
+                str(fake_codex),
+                "-InstallDir",
+                str(install_dir),
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assert_proof_value(
+                result.stdout,
+                "sourceBuildStampValidation",
+                "source artifacts and tracked publish inputs match build stamp",
+            )
+            self.assert_proof_value(
+                result.stdout,
+                "sourceBuildFreshnessBasis",
+                "content-bound build stamp",
+            )
+            self.assert_proof_value(
+                result.stdout,
+                "codeModeHostSourceBuildStale",
+                "False",
+            )
+            self.assert_proof_value(result.stdout, "sourceBuildStale", "False")
+            self.assertNotIn("sourceBuildStaleRemedy:", result.stdout)
+
+    def test_auto_skip_revalidates_stamp_after_source_version_probe(self) -> None:
+        self.init_repo_fixture()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            install_dir = temp_path / "install"
+            source_timestamp = FIXTURE_TIME + 100
+            tracked = self.repo_root / "codex-rs" / "tracked-source.rs"
+            fake_codex = temp_path / "fake-codex.cmd"
+            fake_codex.write_text(
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        f'> "{tracked}" echo changed-during-version-probe',
+                        "echo codex 9.9.9",
+                        "echo commit: test-commit",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            os.utime(fake_codex, (source_timestamp, source_timestamp))
+            self.write_build_stamp("release", source_timestamp, fake_codex)
+
+            result = self.run_script(
+                "-AutoSkipBuild",
+                "-SourceExe",
+                str(fake_codex),
+                "-InstallDir",
+                str(install_dir),
+            )
+
+            self.assertNotEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assert_proof_value(result.stdout, "autoSkipBuild", "true")
+            self.assert_proof_value(
+                result.stdout,
+                "sourceBuildStampValidation",
+                "tracked publish inputs changed",
+            )
+            self.assert_proof_value(
+                result.stdout,
+                "sourceBuildFreshnessBasis",
+                "content-bound build stamp invalidated before publish",
+            )
+            self.assert_proof_value(result.stdout, "sourceBuildStale", "True")
+            self.assert_proof_value(
+                result.stdout,
+                "replace",
+                "blocked: source build stale",
+            )
+            self.assertIn(
+                "content-bound build stamp no longer matches",
+                result.stderr,
+            )
+            self.assertFalse((install_dir / "codex.exe").exists())
+
     def test_auto_skip_build_detects_same_size_same_mtime_artifact_change(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:

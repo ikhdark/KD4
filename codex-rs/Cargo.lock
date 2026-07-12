@@ -2653,6 +2653,7 @@ dependencies = [
  "codex-extension-items",
  "codex-features",
  "codex-feedback",
+ "codex-file-search",
  "codex-file-system",
  "codex-git-utils",
  "codex-home",
@@ -4275,7 +4276,6 @@ name = "codex-utils-cargo-bin"
 version = "0.0.0"
 dependencies = [
  "assert_cmd",
- "runfiles",
  "thiserror 2.0.18",
 ]
 
@@ -11633,11 +11633,6 @@ name = "rtrb"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7204ed6420f698836b76d4d5c2ec5dec7585fd5c3a788fd1cde855d1de598239"
-
-[[package]]
-name = "runfiles"
-version = "0.1.0"
-source = "git+https://github.com/dzbarsky/rules_rust?rev=b56cbaa8465e74127f1ea216f813cd377295ad81#b56cbaa8465e74127f1ea216f813cd377295ad81"
 
 [[package]]
 name = "rust-embed"

@@ -8,6 +8,7 @@ use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use std::time::Instant;
@@ -48,6 +49,335 @@ async fn apply_verified_patch(root: &Path, patch: &str) -> AppliedPatchDelta {
 
 fn tracker_with_root(root: &Path) -> TurnDiffTracker {
     TurnDiffTracker::with_environment_display_roots([("".to_string(), root.to_path_buf())])
+}
+
+trait TestTurnDiffTrackerExt {
+    fn record_exec_command_end(&mut self, command: &[String], exit_code: i32, timed_out: bool);
+}
+
+impl TestTurnDiffTrackerExt for TurnDiffTracker {
+    fn record_exec_command_end(&mut self, command: &[String], exit_code: i32, timed_out: bool) {
+        self.record_exec_command_end_at(command, exit_code, timed_out, None);
+    }
+}
+
+#[tokio::test]
+async fn validation_freshness_tracks_format_timeout_broad_success_and_staleness() {
+    let dir = tempdir().expect("tempdir");
+    let mut tracker = tracker_with_root(dir.path());
+    let add = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: a.txt\n+foo\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &add);
+
+    assert!(tracker.has_unvalidated_mutation());
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::None
+    );
+
+    tracker.record_exec_command_end(&["just".into(), "fmt".into()], 0, false);
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::FormatOnly
+    );
+
+    tracker.record_exec_command_end(&["cargo".into(), "test".into()], 1, true);
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::TimedOut
+    );
+
+    tracker.record_exec_command_end(
+        &[
+            "just".into(),
+            "test-fast".into(),
+            "-E".into(),
+            "test(core) | test(protocol)".into(),
+        ],
+        0,
+        false,
+    );
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::AdvisoryBroadFilter
+    );
+    assert!(tracker.has_unvalidated_mutation());
+
+    tracker.record_exec_command_end(&["cargo".into(), "check".into()], 0, false);
+    assert!(!tracker.has_unvalidated_mutation());
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::PassedAfterLastMutation
+    );
+
+    let second = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: b.txt\n+bar\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &second);
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::StaleAfterLastMutation
+    );
+}
+
+#[tokio::test]
+async fn verified_validation_clears_only_the_paths_it_covered() {
+    let dir = tempdir().expect("tempdir");
+    let mut tracker = tracker_with_root(dir.path());
+    for (path, content) in [("a.txt", "foo"), ("b.txt", "bar")] {
+        let delta = apply_verified_patch(
+            dir.path(),
+            &format!("*** Begin Patch\n*** Add File: {path}\n+{content}\n*** End Patch"),
+        )
+        .await;
+        tracker.track_delta("", &delta);
+    }
+
+    assert!(!tracker.record_verified_validation(
+        vec!["just".into(), "verify-local".into()],
+        "",
+        &[PathBuf::from("a.txt")],
+        false,
+    ));
+    assert!(tracker.has_unvalidated_mutation());
+
+    assert!(tracker.record_verified_validation(
+        vec!["just".into(), "verify-local".into()],
+        "",
+        &[PathBuf::from("b.txt")],
+        false,
+    ));
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::PassedAfterLastMutation
+    );
+
+    tracker.record_unknown_mutation();
+    assert!(tracker.record_verified_validation(
+        vec!["just".into(), "verify-local".into()],
+        "",
+        &[],
+        true,
+    ));
+}
+
+#[tokio::test]
+async fn scoped_shell_validation_clears_only_matching_changed_paths() {
+    let dir = tempdir().expect("tempdir");
+    let mut tracker = tracker_with_root(dir.path());
+    for path in ["tests/a.py", "src/b.rs"] {
+        let delta = apply_verified_patch(
+            dir.path(),
+            &format!("*** Begin Patch\n*** Add File: {path}\n+changed\n*** End Patch"),
+        )
+        .await;
+        tracker.track_delta("", &delta);
+    }
+
+    tracker.record_exec_command_end_at(
+        &["pytest".into(), "tests/a.py".into()],
+        0,
+        false,
+        Some(dir.path()),
+    );
+
+    assert!(tracker.has_unvalidated_mutation());
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::ScopedValidationIncomplete
+    );
+    assert!(tracker.record_verified_validation(
+        vec!["just".into(), "verify-local".into()],
+        "",
+        &[PathBuf::from("src/b.rs")],
+        false,
+    ));
+}
+
+#[tokio::test]
+async fn package_scoped_validation_maps_codex_package_to_its_crate_directory() {
+    let dir = tempdir().expect("tempdir");
+    let mut tracker = tracker_with_root(dir.path());
+    for path in ["codex-rs/core/src/a.rs", "codex-rs/protocol/src/b.rs"] {
+        let delta = apply_verified_patch(
+            dir.path(),
+            &format!("*** Begin Patch\n*** Add File: {path}\n+changed\n*** End Patch"),
+        )
+        .await;
+        tracker.track_delta("", &delta);
+    }
+
+    tracker.record_exec_command_end_at(
+        &[
+            "cargo".into(),
+            "check".into(),
+            "-p".into(),
+            "codex-core".into(),
+        ],
+        0,
+        false,
+        Some(dir.path()),
+    );
+
+    assert!(tracker.has_unvalidated_mutation());
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::ScopedValidationIncomplete
+    );
+    assert!(tracker.record_verified_validation(
+        vec!["just".into(), "verify-local".into()],
+        "",
+        &[PathBuf::from("codex-rs/protocol/src/b.rs")],
+        false,
+    ));
+}
+
+#[tokio::test]
+async fn unproven_validator_scope_does_not_clear_unrelated_changes() {
+    let dir = tempdir().expect("tempdir");
+    let mut tracker = tracker_with_root(dir.path());
+    let delta = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: src/a.ts\n+changed\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &delta);
+
+    tracker.record_exec_command_end_at(&["npm".into(), "test".into()], 0, false, Some(dir.path()));
+
+    assert!(tracker.has_unvalidated_mutation());
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::ScopedValidationIncomplete
+    );
+}
+
+#[tokio::test]
+async fn cargo_audit_does_not_count_as_source_correctness_validation() {
+    let dir = tempdir().expect("tempdir");
+    let mut tracker = tracker_with_root(dir.path());
+    let delta = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: src/lib.rs\n+changed\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &delta);
+
+    tracker.record_exec_command_end_at(
+        &["cargo".into(), "audit".into()],
+        0,
+        false,
+        Some(dir.path()),
+    );
+
+    assert!(tracker.has_unvalidated_mutation());
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::ScopedValidationIncomplete
+    );
+}
+
+#[test]
+fn generated_powershell_validation_is_recognized_without_echo_false_positives() {
+    let generated = [r#"$out = & just test-fast -p codex-core 2>&1
+$code = $LASTEXITCODE
+$out | Select-Object -Last 160
+exit $code"#
+        .to_string()];
+    assert!(is_validation_command(&generated));
+    assert!(!is_validation_command(&[
+        "echo".to_string(),
+        "cargo test".to_string()
+    ]));
+    assert!(
+        ValidationFreshnessStatus::None
+            .final_warning_message()
+            .is_some()
+    );
+    assert!(
+        ValidationFreshnessStatus::PassedAfterLastMutation
+            .final_warning_message()
+            .is_none()
+    );
+}
+
+#[test]
+fn successful_mutating_shell_commands_create_unknown_unvalidated_state() {
+    let mut tracker = TurnDiffTracker::new();
+    tracker.record_exec_command_end(
+        &[
+            "pwsh".to_string(),
+            "-Command".to_string(),
+            "Set-Content -LiteralPath a.txt -Value changed".to_string(),
+        ],
+        0,
+        false,
+    );
+    assert!(tracker.has_unvalidated_mutation());
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::None
+    );
+
+    tracker.record_exec_command_end(&["cargo".into(), "check".into()], 0, false);
+    assert!(!tracker.has_unvalidated_mutation());
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::PassedAfterLastMutation
+    );
+}
+
+#[test]
+fn failed_or_timed_out_mutators_still_create_unknown_mutation_state() {
+    for timed_out in [false, true] {
+        let mut tracker = TurnDiffTracker::new();
+        tracker.record_exec_command_end(
+            &[
+                "pwsh".to_string(),
+                "-Command".to_string(),
+                "Set-Content -LiteralPath a.txt -Value changed; exit 1".to_string(),
+            ],
+            1,
+            timed_out,
+        );
+        assert!(tracker.has_unvalidated_mutation());
+    }
+}
+
+#[test]
+fn just_fix_is_a_mutation_and_cannot_validate_its_own_edits() {
+    let mut tracker = TurnDiffTracker::new();
+    tracker.record_unknown_mutation();
+    tracker.record_exec_command_end(&["cargo".into(), "check".into()], 0, false);
+    assert!(!tracker.has_unvalidated_mutation());
+
+    tracker.record_exec_command_end(
+        &[
+            "just".into(),
+            "fix".into(),
+            "-p".into(),
+            "codex-core".into(),
+        ],
+        0,
+        false,
+    );
+    assert!(tracker.has_unvalidated_mutation());
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::StaleAfterLastMutation
+    );
+}
+
+#[test]
+fn read_only_shell_commands_do_not_create_mutation_state() {
+    let mut tracker = TurnDiffTracker::new();
+    tracker.record_exec_command_end(&["git".into(), "status".into()], 0, false);
+    assert!(!tracker.has_unvalidated_mutation());
 }
 
 #[tokio::test]

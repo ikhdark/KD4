@@ -493,7 +493,7 @@ fn create_filesystem_args(
                 // Writable roots are rebound by real target below; mirror that
                 // for their restricted-read bootstrap mount. Plain read-only
                 // roots must stay logical because callers may execute those
-                // paths inside bwrap, such as Bazel runfiles helper binaries.
+                // paths inside bwrap, such as packaged helper binaries.
                 let mount_root = if writable_roots
                     .iter()
                     .any(|writable_root| root.starts_with(writable_root.root.as_path()))

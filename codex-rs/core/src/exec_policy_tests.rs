@@ -1363,6 +1363,7 @@ async fn mixed_rule_and_sandbox_prompt_prioritizes_rule_for_rejection_decision()
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
+            command_for_safety: None,
             approval_policy: AskForApproval::Granular(GranularApprovalConfig {
                 sandbox_approval: true,
                 rules: true,
@@ -1384,6 +1385,51 @@ async fn mixed_rule_and_sandbox_prompt_prioritizes_rule_for_rejection_decision()
 }
 
 #[tokio::test]
+async fn encoded_command_policy_reason_uses_plain_safety_command() {
+    let mut parser = PolicyParser::new();
+    parser
+        .parse(
+            "test.rules",
+            r#"prefix_rule(pattern=["git"], decision="prompt")"#,
+        )
+        .expect("parse policy");
+    let manager = ExecPolicyManager::new(Arc::new(parser.build()));
+    let encoded = vec![
+        "pwsh".to_string(),
+        "-EncodedCommand".to_string(),
+        "ZwBpAHQAIABzAHQAYQB0AHUAcwA=".to_string(),
+    ];
+    let inspectable = vec![
+        "pwsh".to_string(),
+        "-Command".to_string(),
+        "git status".to_string(),
+    ];
+
+    let requirement = manager
+        .create_exec_approval_requirement_for_command(ExecApprovalRequest {
+            command: &encoded,
+            command_for_safety: Some(&inspectable),
+            approval_policy: AskForApproval::OnRequest,
+            permission_profile: PermissionProfile::Disabled,
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            prefix_rule: None,
+        })
+        .await;
+
+    let ExecApprovalRequirement::NeedsApproval {
+        reason: Some(reason),
+        ..
+    } = requirement
+    else {
+        panic!("prompt rule should require approval");
+    };
+    assert!(reason.contains("git status"));
+    assert!(!reason.contains("EncodedCommand"));
+    assert!(!reason.contains("ZwBpAHQ"));
+}
+
+#[tokio::test]
 async fn mixed_rule_and_sandbox_prompt_rejects_when_granular_rules_are_disabled() {
     let policy_src = r#"prefix_rule(pattern=["git"], decision="prompt")"#;
     let mut parser = PolicyParser::new();
@@ -1400,6 +1446,7 @@ async fn mixed_rule_and_sandbox_prompt_rejects_when_granular_rules_are_disabled(
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
+            command_for_safety: None,
             approval_policy: AskForApproval::Granular(GranularApprovalConfig {
                 sandbox_approval: true,
                 rules: false,
@@ -1430,6 +1477,7 @@ async fn exec_approval_requirement_falls_back_to_heuristics() {
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
+            command_for_safety: None,
             approval_policy: AskForApproval::UnlessTrusted,
             permission_profile: PermissionProfile::read_only(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -1455,6 +1503,7 @@ async fn empty_bash_lc_script_falls_back_to_original_command() {
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
+            command_for_safety: None,
             approval_policy: AskForApproval::UnlessTrusted,
             permission_profile: PermissionProfile::read_only(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -1484,6 +1533,7 @@ async fn whitespace_bash_lc_script_falls_back_to_original_command() {
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
+            command_for_safety: None,
             approval_policy: AskForApproval::UnlessTrusted,
             permission_profile: PermissionProfile::read_only(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -1513,6 +1563,7 @@ async fn request_rule_uses_prefix_rule() {
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
+            command_for_safety: None,
             approval_policy: AskForApproval::OnRequest,
             permission_profile: PermissionProfile::read_only(),
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -1545,6 +1596,7 @@ async fn request_rule_falls_back_when_prefix_rule_does_not_approve_all_commands(
     let requirement = manager
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
+            command_for_safety: None,
             approval_policy: AskForApproval::OnRequest,
             permission_profile: PermissionProfile::Disabled,
             windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -1584,6 +1636,7 @@ async fn heuristics_apply_when_other_commands_match_policy() {
         ExecPolicyManager::new(policy)
             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
                 command: &command,
+                command_for_safety: None,
                 approval_policy: AskForApproval::UnlessTrusted,
                 permission_profile: PermissionProfile::Disabled,
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -2065,6 +2118,7 @@ async fn verify_approval_requirement_for_unsafe_powershell_command() {
         policy
             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
                 command: &sneaky_command,
+                command_for_safety: None,
                 approval_policy: AskForApproval::OnRequest,
                 permission_profile: PermissionProfile::read_only(),
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -2089,6 +2143,7 @@ async fn verify_approval_requirement_for_unsafe_powershell_command() {
         policy
             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
                 command: &dangerous_command,
+                command_for_safety: None,
                 approval_policy: AskForApproval::OnRequest,
                 permission_profile: PermissionProfile::read_only(),
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -2109,6 +2164,7 @@ async fn verify_approval_requirement_for_unsafe_powershell_command() {
         policy
             .create_exec_approval_requirement_for_command(ExecApprovalRequest {
                 command: &dangerous_command,
+                command_for_safety: None,
                 approval_policy: AskForApproval::Never,
                 permission_profile: PermissionProfile::read_only(),
                 windows_sandbox_level: WindowsSandboxLevel::Disabled,
@@ -2204,6 +2260,7 @@ async fn exec_approval_requirement_for_command(
     ExecPolicyManager::new(policy)
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &command,
+            command_for_safety: None,
             approval_policy,
             permission_profile,
             windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,

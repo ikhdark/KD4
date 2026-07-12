@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use codex_features::Feature;
@@ -343,6 +344,74 @@ fn duplicate_primary_environment(turn: &mut TurnContext) {
     let mut second_environment = turn.environments.turn_environments[0].clone();
     second_environment.environment_id = "secondary".to_string();
     turn.environments.turn_environments.push(second_environment);
+}
+
+fn set_primary_environment_cwd(turn: &mut TurnContext, cwd: &Path) {
+    let primary = turn.environments.turn_environments[0].clone();
+    turn.environments.turn_environments[0] = crate::session::turn_context::TurnEnvironment::new(
+        primary.environment_id,
+        primary.environment,
+        codex_utils_path_uri::PathUri::from_host_native_path(cwd).expect("absolute test cwd"),
+        primary.shell,
+    );
+}
+
+#[tokio::test]
+async fn verify_local_is_registered_only_for_a_supported_local_repo() {
+    let unsupported = tempfile::tempdir().expect("tempdir");
+    let unavailable = probe(|turn| set_primary_environment_cwd(turn, unsupported.path())).await;
+    unavailable.assert_visible_lacks(&["verify_local"]);
+    unavailable.assert_registered_lacks(&["verify_local"]);
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("codex-core should be nested under the repository root");
+    let available = probe(|turn| set_primary_environment_cwd(turn, repo_root)).await;
+    available.assert_visible_contains(&["verify_local"]);
+    available.assert_registered_contains(&["verify_local"]);
+    assert!(!has_parameter(
+        available.visible_spec("verify_local"),
+        "environment_id"
+    ));
+
+    let multiple = probe(|turn| {
+        set_primary_environment_cwd(turn, repo_root);
+        duplicate_primary_environment(turn);
+    })
+    .await;
+    assert!(has_parameter(
+        multiple.visible_spec("verify_local"),
+        "environment_id"
+    ));
+}
+
+#[tokio::test]
+async fn source_tools_are_registered_only_when_enabled() {
+    let disabled = probe(|_| {}).await;
+    disabled.assert_visible_lacks(&["search_source", "read_file_span"]);
+    disabled.assert_registered_lacks(&["search_source", "read_file_span"]);
+
+    let enabled = probe(|turn| {
+        set_feature(turn, Feature::SourceTools, /*enabled*/ true);
+    })
+    .await;
+    enabled.assert_visible_contains(&["search_source", "read_file_span"]);
+    enabled.assert_registered_contains(&["search_source", "read_file_span"]);
+    assert!(!has_parameter(
+        enabled.visible_spec("search_source"),
+        "environment_id"
+    ));
+
+    let multiple = probe(|turn| {
+        set_feature(turn, Feature::SourceTools, /*enabled*/ true);
+        duplicate_primary_environment(turn);
+    })
+    .await;
+    assert!(has_parameter(
+        multiple.visible_spec("read_file_span"),
+        "environment_id"
+    ));
 }
 
 fn mcp_tool(server: &str, namespace: &str, name: &str) -> ToolInfo {

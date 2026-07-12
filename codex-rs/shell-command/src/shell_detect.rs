@@ -30,9 +30,35 @@ pub struct DetectedShell {
     pub shell_path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PowerShellHostKind {
+    Pwsh,
+    WindowsPowerShell,
+}
+
 impl DetectedShell {
     pub fn name(&self) -> &'static str {
         self.shell_type.name()
+    }
+
+    pub fn powershell_host_kind(&self) -> Option<PowerShellHostKind> {
+        (self.shell_type == ShellType::PowerShell)
+            .then(|| powershell_host_kind(&self.shell_path))
+            .flatten()
+    }
+}
+
+pub fn powershell_host_kind(path: impl AsRef<std::path::Path>) -> Option<PowerShellHostKind> {
+    match path
+        .as_ref()
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("pwsh") => Some(PowerShellHostKind::Pwsh),
+        Some("powershell") => Some(PowerShellHostKind::WindowsPowerShell),
+        _ => None,
     }
 }
 
@@ -213,20 +239,40 @@ const POWERSHELL_FALLBACK_PATHS: &[&str] =
 const POWERSHELL_FALLBACK_PATHS: &[&str] = &[];
 
 fn get_powershell_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {
-    let shell_path = get_shell_path(ShellType::PowerShell, path, "pwsh", PWSH_FALLBACK_PATHS)
-        .or_else(|| {
-            get_shell_path(
-                ShellType::PowerShell,
-                path,
-                "powershell",
-                POWERSHELL_FALLBACK_PATHS,
-            )
-        });
+    let provided = path.and_then(|path| file_exists(path));
+    let pwsh = find_binary_or_fallback("pwsh", PWSH_FALLBACK_PATHS);
+    let default_powershell = get_user_shell_path().and_then(|default_shell_path| {
+        (detect_shell_type(&default_shell_path) == Some(ShellType::PowerShell))
+            .then(|| file_exists(&default_shell_path))
+            .flatten()
+    });
+    let windows_powershell = find_binary_or_fallback("powershell", POWERSHELL_FALLBACK_PATHS);
+    let shell_path = select_powershell_host(provided, pwsh, default_powershell, windows_powershell);
 
     shell_path.map(|shell_path| DetectedShell {
         shell_type: ShellType::PowerShell,
         shell_path,
     })
+}
+
+fn find_binary_or_fallback(binary_name: &str, fallback_paths: &[&str]) -> Option<PathBuf> {
+    which::which(binary_name).ok().or_else(|| {
+        fallback_paths
+            .iter()
+            .find_map(|path| file_exists(std::path::Path::new(path)))
+    })
+}
+
+fn select_powershell_host(
+    provided: Option<PathBuf>,
+    pwsh: Option<PathBuf>,
+    default_powershell: Option<PathBuf>,
+    windows_powershell: Option<PathBuf>,
+) -> Option<PathBuf> {
+    provided
+        .or(pwsh)
+        .or(default_powershell)
+        .or(windows_powershell)
 }
 
 fn get_cmd_shell(path: Option<&PathBuf>) -> Option<DetectedShell> {
@@ -363,6 +409,55 @@ mod tests {
         assert_eq!(
             detect_shell_type(PathBuf::from("cmd.exe")),
             Some(ShellType::Cmd)
+        );
+    }
+
+    #[test]
+    fn powershell_resolver_prefers_pwsh_then_compatibility_host() {
+        let pwsh = PathBuf::from("C:/Program Files/PowerShell/7/pwsh.exe");
+        let default = PathBuf::from("D:/custom/powershell.exe");
+        let compatibility = PathBuf::from("C:/Windows/System32/powershell.exe");
+
+        assert_eq!(
+            select_powershell_host(
+                None,
+                Some(pwsh.clone()),
+                Some(default.clone()),
+                Some(compatibility.clone())
+            ),
+            Some(pwsh)
+        );
+        assert_eq!(
+            select_powershell_host(
+                None,
+                None,
+                Some(default.clone()),
+                Some(compatibility.clone())
+            ),
+            Some(default)
+        );
+        assert_eq!(
+            select_powershell_host(None, None, None, Some(compatibility.clone())),
+            Some(compatibility)
+        );
+    }
+
+    #[test]
+    fn explicit_powershell_host_overrides_preference_order() {
+        let provided = PathBuf::from("D:/pinned/powershell.exe");
+        let pwsh = PathBuf::from("C:/Program Files/PowerShell/7/pwsh.exe");
+
+        assert_eq!(
+            select_powershell_host(Some(provided.clone()), Some(pwsh), None, None),
+            Some(provided)
+        );
+        assert_eq!(
+            powershell_host_kind("C:/Program Files/PowerShell/7/pwsh.exe"),
+            Some(PowerShellHostKind::Pwsh)
+        );
+        assert_eq!(
+            powershell_host_kind("C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"),
+            Some(PowerShellHostKind::WindowsPowerShell)
         );
     }
 }

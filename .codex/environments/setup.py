@@ -33,12 +33,7 @@ class SetupError(RuntimeError):
     pass
 
 
-COPY_SPECS: tuple[CopySpec, ...] = (
-    CopySpec(
-        repo_relative_path="user.bazelrc",
-        reason="Bazel user config imported by checked-in .bazelrc",
-    ),
-)
+COPY_SPECS: tuple[CopySpec, ...] = ()
 
 
 @cache
@@ -49,7 +44,9 @@ def worktree_paths() -> WorktreePaths:
     main_worktree = common_git_dir.parent
 
     if not main_worktree.is_dir():
-        raise SetupError(f"could not resolve main worktree from git common dir: {common_git_dir}")
+        raise SetupError(
+            f"could not resolve main worktree from git common dir: {common_git_dir}"
+        )
 
     return WorktreePaths(current=worktree_root, main=main_worktree)
 
@@ -170,9 +167,10 @@ def main() -> None:
         "Declared setup files only; generated, vendored, cache, and broad ignored "
         "paths are not copied unless listed."
     )
-    # See codex-rs/docs/bazel.md for the repository's Bazel workflow.
     results = [
-        copy_from_main_worktree_to_worktree(spec, dry_run=args.dry_run, force=args.force)
+        copy_from_main_worktree_to_worktree(
+            spec, dry_run=args.dry_run, force=args.force
+        )
         for spec in COPY_SPECS
     ]
     print_summary(results)

@@ -8,6 +8,10 @@ license.workspace = true
 name = "codex-file-search"
 path = "src/main.rs"
 
+[[bin]]
+name = "codex-source-search"
+path = "src/source_search_main.rs"
+
 [lib]
 name = "codex_file_search"
 path = "src/lib.rs"

@@ -67,7 +67,7 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
-        let response = session
+        let mut response = session
             .services
             .unified_exec_manager
             .write_stdin(WriteStdinRequest {
@@ -81,6 +81,32 @@ impl WriteStdinHandler {
             .map_err(|err| {
                 FunctionCallError::RespondToModel(format!("write_stdin failed: {err}"))
             })?;
+
+        if let Some(running) = session
+            .services
+            .command_execution
+            .running_process(args.session_id)
+            .await
+        {
+            let artifact = response
+                .raw_output_artifact
+                .clone()
+                .unwrap_or(running.artifact);
+            response.raw_output_artifact = Some(artifact.clone());
+            if response.process_id.is_some() {
+                session
+                    .services
+                    .command_execution
+                    .update_running_artifact(args.session_id, artifact)
+                    .await;
+            } else {
+                session
+                    .services
+                    .command_execution
+                    .finish_running_process(args.session_id, response.exit_code)
+                    .await;
+            }
+        }
 
         // Empty stdin is a background poll, so emit it only while there is
         // still a live process for the UI to wait on. Non-empty stdin is a real

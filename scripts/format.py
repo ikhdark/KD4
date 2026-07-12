@@ -2,7 +2,6 @@
 """Format repository sources or check that they are already formatted."""
 
 import argparse
-import os
 import shlex
 import subprocess
 import sys
@@ -59,38 +58,6 @@ def rust_formatter_group(*, check: bool) -> FormatterGroup:
         REPO_ROOT / "codex-rs",
     )
     return FormatterGroup("Rust", (command,))
-
-
-def buildifier_formatter_group(*, check: bool) -> FormatterGroup:
-    repository_files = subprocess.check_output(
-        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-        cwd=REPO_ROOT,
-    ).split(b"\0")
-    buildifier_files: list[str] = []
-    for encoded_path in repository_files:
-        if not encoded_path:
-            continue
-        path = Path(os.fsdecode(encoded_path))
-        name = path.name
-        if (
-            name in {"BUILD", "WORKSPACE", "MODULE.bazel"}
-            or name.startswith(("BUILD.", "WORKSPACE."))
-            or name.endswith((".BUILD.bazel", ".MODULE.bazel", ".bzl", ".sky"))
-            or ".bzl." in name
-            or ".sky." in name
-        ):
-            buildifier_files.append(path.as_posix())
-    buildifier_files.sort()
-
-    # Invoke DotSlash explicitly because Windows does not honor shebangs.
-    buildifier_args = [
-        "dotslash",
-        str(REPO_ROOT / "tools" / "buildifier"),
-        "-mode=check" if check else "-mode=fix",
-        "-lint=off",
-        *buildifier_files,
-    ]
-    return FormatterGroup("Bazel/Starlark", (Command(tuple(buildifier_args)),))
 
 
 def prettier_formatter_group(*, check: bool) -> FormatterGroup:
@@ -168,7 +135,6 @@ def formatter_groups(
         factories.extend(
             [
                 ("prettier", lambda: prettier_formatter_group(check=check)),
-                ("bazel/starlark", lambda: buildifier_formatter_group(check=check)),
                 ("python sdk", lambda: python_sdk_formatter_group(check=check)),
                 ("python scripts", lambda: python_scripts_formatter_group(check=check)),
             ]
@@ -232,7 +198,6 @@ def main() -> int:
             "just",
             "rust",
             "prettier",
-            "bazel/starlark",
             "python sdk",
             "python scripts",
         ),

@@ -1,0 +1,608 @@
+schema_version = 1
+fork = "KD4"
+upstream_commit = "9e552e9d15ba52bed7077d5357f3e18e330f8f38"
+
+[[features]]
+id = "kd4-feature-manifest"
+version = 1
+status = "enabled"
+capability_kind = "workflow"
+owner = "scripts"
+summary = "Declared KD4 feature ownership with deterministic static evidence checks."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "scripts/check_kd4_features.py"
+contains = "def main(argv: Sequence[str] | None = None) -> int"
+
+[[features.evidence]]
+kind = "registration"
+path = "justfile"
+contains = "check-kd4-features *args:"
+
+[[features.evidence]]
+kind = "test"
+path = "scripts/test_check_kd4_features.py"
+contains = "test_repository_manifest_passes_non_strict"
+
+[[features]]
+id = "kd4-sync-audit"
+version = 1
+status = "enabled"
+capability_kind = "workflow"
+owner = "scripts"
+summary = "Non-mutating branch divergence, worktree safety, and merge-conflict forecast."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "scripts/kd4_sync_audit.py"
+contains = "def main(argv: Sequence[str] | None = None) -> int"
+
+[[features.evidence]]
+kind = "registration"
+path = "justfile"
+contains = "kd4-sync-audit *args:"
+
+[[features.evidence]]
+kind = "test"
+path = "scripts/test_kd4_sync_audit.py"
+contains = "test_conflicting_trial_merge_requires_isolated_strategy"
+
+[[features]]
+id = "kd4-perf-snapshot"
+version = 1
+status = "enabled"
+capability_kind = "workflow"
+owner = "scripts"
+summary = "Structured cold-first and warm-repeat local workflow timing snapshots."
+upstream_equivalent = "none"
+config_keys = ["CODEX_LOCAL_PUBLISH_DIR"]
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "scripts/kd4_perf_snapshot.py"
+contains = "def main(argv: Sequence[str] | None = None) -> int"
+
+[[features.evidence]]
+kind = "registration"
+path = "justfile"
+contains = "kd4-perf-snapshot *args:"
+
+[[features.evidence]]
+kind = "test"
+path = "scripts/test_kd4_perf_snapshot.py"
+contains = "test_phase0_profile_covers_required_baseline_categories"
+
+[[features]]
+id = "extension-boundary-core"
+version = 1
+status = "enabled"
+capability_kind = "runtime"
+owner = "codex-rs/ext/extension-api"
+summary = "Reuse ToolContributor, ToolLifecycleContributor, and ContextContributor before adding KD4-only hooks."
+upstream_equivalent = "codex extension-api contributor registry"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/ext/extension-api/src/contributors.rs"
+contains = "pub trait ToolContributor: Send + Sync"
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/ext/extension-api/src/contributors.rs"
+contains = "pub trait ToolLifecycleContributor: Send + Sync"
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/ext/extension-api/src/contributors.rs"
+contains = "pub trait ContextContributor: Send + Sync"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/ext/extension-api/src/registry.rs"
+contains = "pub fn tool_contributor(&mut self, contributor: Arc<dyn ToolContributor>)"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/ext/extension-api/src/registry.rs"
+contains = "pub fn tool_lifecycle_contributor(&mut self, contributor: Arc<dyn ToolLifecycleContributor>)"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/ext/extension-api/src/registry.rs"
+contains = "pub fn prompt_contributor(&mut self, contributor: Arc<dyn ContextContributor>)"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/ext/extension-api/tests/registry.rs"
+contains = "build_round_trips_every_contributor_category"
+
+[[features]]
+id = "verify-local"
+version = 1
+status = "enabled"
+capability_kind = "runtime"
+owner = "codex-rs/core"
+summary = "Repository-aware local verification exposed to the coding agent."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/tools/handlers/verify_local.rs"
+contains = "pub struct VerifyLocalHandler"
+
+[[features.evidence]]
+kind = "module"
+path = "codex-rs/core/src/tools/handlers/mod.rs"
+contains = "mod verify_local;"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/spec_plan.rs"
+contains = "crate::tools::handlers::VerifyLocalHandler::for_verify_local_environment_id"
+
+[[features.evidence]]
+kind = "workflow"
+path = "justfile"
+contains = "verify-local *args:"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/spec_plan_tests.rs"
+contains = "verify_local_is_registered_only_for_a_supported_local_repo"
+
+[[features]]
+id = "structured-command-execution"
+version = 2
+status = "enabled"
+capability_kind = "runtime"
+owner = "codex-rs/core"
+summary = "Explicit legacy, script, argv, and internally encoded PowerShell command shapes."
+upstream_equivalent = "partial"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/tools/handlers/command_shape.rs"
+contains = "CommandKind::Legacy | CommandKind::Script"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/shell_spec.rs"
+contains = "json!(\"legacy\")"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/shell.rs"
+contains = "CommandInvocation::from_parts"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/unified_exec.rs"
+contains = "CommandInvocation::from_parts"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/handlers/command_shape_tests.rs"
+contains = "tagged_script_and_legacy_shapes_are_explicit"
+
+[[features]]
+id = "command-preflight"
+version = 2
+status = "enabled"
+capability_kind = "runtime"
+owner = "codex-rs/core"
+summary = "Active preflight with one bounded read-only equivalent repair and rejection-only mutating commands."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/tools/handlers/command_preflight.rs"
+contains = "pub(crate) fn preflight_invocation_with_equivalent_repair("
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/shell/shell_command.rs"
+contains = "preflight_invocation_with_equivalent_repair("
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs"
+contains = "preflight_invocation_with_equivalent_repair("
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/handlers/command_preflight_tests.rs"
+contains = "never_repairs_mutating_command_flag_typos"
+
+[[features]]
+id = "shell-output-summary"
+version = 2
+status = "enabled"
+capability_kind = "runtime"
+owner = "codex-rs/core"
+summary = "Bounded failure-focused output on classic and unified execution paths."
+upstream_equivalent = "partial"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/tools/shell_output_summary.rs"
+contains = "pub(crate) fn summarize_shell_output_for_model("
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/mod.rs"
+contains = "summarize_shell_output_for_model("
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/context.rs"
+contains = "let summarized = summarize_shell_output_for_model("
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/shell_output_summary_tests.rs"
+contains = "failed_output_keeps_exact_error_lines"
+
+[[features]]
+id = "command-attempt-ledger"
+version = 1
+status = "enabled"
+capability_kind = "runtime"
+owner = "codex-rs/core"
+summary = "Session-bounded command fingerprints with repair accounting and third-identical-failure prevention."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/tools/command_execution.rs"
+contains = "pub(crate) struct CommandExecutionLedger"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/state/service.rs"
+contains = "pub(crate) command_execution: CommandExecutionLedger"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs"
+contains = ".begin_attempt(&attempt_key, repair_notice.is_some())"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/unified_exec/async_watcher.rs"
+contains = ".mark_running_process_completed(process_id, exit_code)"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/command_execution.rs"
+contains = "blocks_third_identical_attempt_after_two_failures"
+
+[[features]]
+id = "command-output-artifacts"
+version = 1
+status = "enabled"
+capability_kind = "runtime"
+owner = "codex-rs/core"
+summary = "Addressable full raw command output streamed before bounded transcript retention or model summarization, including background completion."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/tools/command_output_artifact.rs"
+contains = "pub(crate) struct RawOutputArtifactWriter"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/shell.rs"
+contains = "create_raw_output_artifact("
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs"
+contains = "create_raw_output_artifact("
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/unified_exec/process.rs"
+contains = "RawOutputArtifactWriter::open(raw_output_artifact.as_ref()).await"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/handlers/unified_exec_tests.rs"
+contains = "unpolled_background_failure_finalizes_artifact_and_attempt_ledger"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/handlers/unified_exec_tests.rs"
+contains = "foreground_output_artifact_retains_bytes_beyond_transcript_cap"
+
+[[features]]
+id = "preferred-powershell-host"
+version = 1
+status = "enabled"
+capability_kind = "runtime"
+owner = "codex-rs/shell-command"
+summary = "Explicit PowerShell paths win, otherwise pwsh is preferred with Windows PowerShell compatibility fallback."
+upstream_equivalent = "partial"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/shell-command/src/shell_detect.rs"
+contains = "fn select_powershell_host("
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/shell-command/src/shell_detect.rs"
+contains = "let shell_path = select_powershell_host("
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/shell-command/src/shell_detect.rs"
+contains = "powershell_resolver_prefers_pwsh_then_compatibility_host"
+
+[[features]]
+id = "windows-command-corpus"
+version = 1
+status = "enabled"
+capability_kind = "workflow"
+owner = "codex-rs/core"
+summary = "Measured Windows corpus for argv, encoded PowerShell, repair, failure prevention, artifacts, and output reduction."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/tools/handlers/command_windows_corpus_tests.rs"
+contains = "windows_command_corpus_measures_phase2_exit_gate"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/mod.rs"
+contains = "mod command_windows_corpus_tests;"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/handlers/command_windows_corpus_tests.rs"
+contains = "target: \"kd4_windows_command_corpus\""
+
+[[features]]
+id = "app-server-runtime-provenance"
+version = 1
+status = "enabled"
+capability_kind = "runtime"
+owner = "codex-rs/app-server"
+summary = "Build, install, runtime, and KD4 watermark metadata at initialization."
+upstream_equivalent = "partial"
+config_keys = []
+generated_artifacts = [
+  "codex-rs/app-server-protocol/schema/json/v1/InitializeResponse.json",
+  "codex-rs/app-server-protocol/schema/typescript/ServerRuntimeInfo.ts",
+]
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/app-server/src/runtime_provenance.rs"
+contains = "pub(crate) fn current() -> ServerRuntimeInfo"
+
+[[features.evidence]]
+kind = "module"
+path = "codex-rs/app-server/src/lib.rs"
+contains = "mod runtime_provenance;"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/app-server/src/request_processors/initialize_processor.rs"
+contains = "runtime_info: Some(crate::runtime_provenance::current())"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/app-server/tests/suite/v2/initialize.rs"
+contains = "initialize_response_includes_local_runtime_metadata"
+
+[[features]]
+id = "local-desktop-publish"
+version = 1
+status = "enabled"
+capability_kind = "workflow"
+owner = "scripts"
+summary = "Atomic local Codex publish, rollback, doctor, and Desktop routing."
+upstream_equivalent = "none"
+config_keys = ["CODEX_LOCAL_PUBLISH_DIR"]
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "scripts/publish-local-codex.ps1"
+contains = ". (Join-Path $PSScriptRoot \"publish-local-codex.desktop.ps1\")"
+
+[[features.evidence]]
+kind = "registration"
+path = "justfile"
+contains = "publish-local-codex-final *args:"
+
+[[features.evidence]]
+kind = "test"
+path = "scripts/test_publish_local_codex_dry_run.py"
+contains = "class PublishLocalCodexDryRunTest"
+
+[[features]]
+id = "tool-search-routing"
+version = 1
+status = "enabled"
+capability_kind = "runtime"
+owner = "codex-rs/core"
+summary = "Cached and diversified discovery of deferred core and extension tools."
+upstream_equivalent = "partial"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/tools/handlers/tool_search.rs"
+contains = "pub(crate) struct ToolSearchHandlerCache"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/spec_plan.rs"
+contains = "tool_search_handler_cache.get_or_build(search_infos)"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/router.rs"
+contains = "ToolSearchHandlerCache"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/spec_plan_tests.rs"
+contains = "tool_search_cache_rebuilds_when_deferred_sources_change"
+
+[[features]]
+id = "source-tools"
+version = 1
+status = "disabled"
+capability_kind = "runtime"
+owner = "codex-rs/file-search"
+summary = "Feature-gated structured source search and bounded file-span reads."
+upstream_equivalent = "none"
+config_keys = ["features.source_tools"]
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/tools/handlers/source.rs"
+contains = "pub struct SearchSourceHandler"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/spec_plan.rs"
+contains = "features.enabled(Feature::SourceTools)"
+
+[[features.evidence]]
+kind = "config"
+path = "codex-rs/features/src/lib.rs"
+contains = "key: \"source_tools\""
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tools/spec_plan_tests.rs"
+contains = "source_tools_are_registered_only_when_enabled"
+
+[[features]]
+id = "config-explain"
+version = 1
+status = "enabled"
+capability_kind = "runtime"
+owner = "codex-rs/config"
+summary = "Human-readable configuration reference exposed through codex config explain."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/config/src/config_explain.rs"
+contains = "pub fn render_config_explain(filter: Option<&str>) -> String"
+
+[[features.evidence]]
+kind = "module"
+path = "codex-rs/config/src/lib.rs"
+contains = "mod config_explain;"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/cli/src/main.rs"
+contains = "Config(config_cmd::ConfigCli)"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/cli/src/main.rs"
+contains = "config_explain_parses_optional_filter"
+
+[[features]]
+id = "coding-budgets"
+version = 1
+status = "replaced"
+capability_kind = "library"
+owner = "codex-rs/config"
+summary = "Retired duplicate budget table whose values conflicted with live owner-local defaults."
+upstream_equivalent = "owner-local constants and typed config defaults"
+config_keys = []
+retired_paths = ["codex-rs/config/src/coding_budgets.rs"]
+
+[[features]]
+id = "kd4-harness"
+version = 1
+status = "enabled"
+capability_kind = "guidance"
+owner = ".codex/harness"
+summary = "Fork-local durable planning, evidence, handoff, and completion workflow."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features.evidence]]
+kind = "entrypoint"
+path = ".codex/harness/workflow.md"
+contains = "# KD4 Harness Workflow"
+
+[[features.evidence]]
+kind = "registration"
+path = ".codex/skills/kd4-harness/SKILL.md"
+contains = ".codex/harness/workflow.md"
+
+[[features]]
+id = "task-evidence-completion-gate"
+version = 1
+status = "planned"
+capability_kind = "runtime"
+owner = "codex-rs/core"
+summary = "Fresh task evidence and machine-derived passed, partial, or blocked status."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features]]
+id = "desktop-runtime-receipt"
+version = 1
+status = "planned"
+capability_kind = "runtime"
+owner = "codex-rs/app-server"
+summary = "Publish-ID-bound proof that Codex Desktop initialized the intended binary."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features]]
+id = "repository-intelligence"
+version = 1
+status = "planned"
+capability_kind = "runtime"
+owner = "codex-rs"
+summary = "Incremental ownership, reachability, impact, test, and generated-output graph."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features]]
+id = "task-capsules-and-discovery-cards"
+version = 1
+status = "planned"
+capability_kind = "runtime"
+owner = "codex-rs/state"
+summary = "Typed resumable task state and freshness-checked repository discoveries."
+upstream_equivalent = "none"
+config_keys = []
+
+[[features]]
+id = "measured-local-scheduler"
+version = 1
+status = "planned"
+capability_kind = "workflow"
+owner = "scripts"
+summary = "Impact- and fingerprint-aware local validation, build, and publish scheduling."
+upstream_equivalent = "none"
+config_keys = []

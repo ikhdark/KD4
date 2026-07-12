@@ -41,6 +41,9 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
+use crate::tools::command_execution::CommandAttemptKey;
+use crate::tools::command_output_artifact::RawOutputArtifact;
+use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::network_approval::DeferredNetworkApproval;
 
 mod async_watcher;
@@ -76,14 +79,31 @@ pub(crate) struct UnifiedExecContext {
     pub session: Arc<Session>,
     pub turn: Arc<TurnContext>,
     pub call_id: String,
+    pub tracker: Option<SharedTurnDiffTracker>,
 }
 
 impl UnifiedExecContext {
+    #[cfg(test)]
     pub fn new(session: Arc<Session>, turn: Arc<TurnContext>, call_id: String) -> Self {
         Self {
             session,
             turn,
             call_id,
+            tracker: None,
+        }
+    }
+
+    pub fn with_tracker(
+        session: Arc<Session>,
+        turn: Arc<TurnContext>,
+        call_id: String,
+        tracker: SharedTurnDiffTracker,
+    ) -> Self {
+        Self {
+            session,
+            turn,
+            call_id,
+            tracker: Some(tracker),
         }
     }
 }
@@ -91,6 +111,9 @@ impl UnifiedExecContext {
 #[derive(Debug)]
 pub(crate) struct ExecCommandRequest {
     pub command: Vec<String>,
+    pub command_for_safety: Vec<String>,
+    pub attempt_key: CommandAttemptKey,
+    pub raw_output_artifact: RawOutputArtifact,
     pub shell_type: ShellType,
     pub hook_command: String,
     pub process_id: i32,

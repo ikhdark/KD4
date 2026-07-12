@@ -35,6 +35,8 @@ use nucleo::pattern::AtomKind;
 use nucleo::pattern::Pattern;
 
 mod cli;
+pub mod source_routes;
+pub mod source_search;
 
 pub use cli::Cli;
 

@@ -114,3 +114,16 @@ fn disabled_summarizer_returns_unchanged_signal() {
         None
     );
 }
+
+#[test]
+fn oversized_single_line_retains_bounded_head_and_tail() {
+    let output = format!("HEAD{}TAIL", "x".repeat(DEFAULT_SUMMARY_AFTER_BYTES + 1024));
+
+    let summary =
+        summarize_shell_output_for_model(&output, 0, false, options(None, false)).unwrap();
+
+    assert!(summary.contains("HEAD"));
+    assert!(summary.contains("TAIL"));
+    assert!(summary.contains("[line truncated]"));
+    assert!(summary.len() <= SUMMARY_MAX_BYTES + "\n[summary capped]".len());
+}

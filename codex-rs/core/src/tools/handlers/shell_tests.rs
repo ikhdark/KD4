@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use codex_exec_server::Environment;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_protocol::models::ShellCommandToolCallParams;
 use pretty_assertions::assert_eq;
@@ -20,12 +21,15 @@ use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::ShellCommandHandler;
+use crate::tools::handlers::command_shape::CommandInvocation;
+use crate::tools::handlers::shell::shell_command::resolve_command_shell;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_shell_command::powershell::try_find_powershell_executable_blocking;
 use codex_shell_command::powershell::try_find_pwsh_executable_blocking;
+use codex_tools::ToolExecutor;
 use codex_utils_path_uri::PathUri;
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -71,6 +75,39 @@ fn assert_safe(shell: &Shell, command: &str) {
     assert!(is_known_safe_command(&shell.derive_exec_args(
         command, /* use_login_shell */ /*use_login_shell*/ false
     )));
+}
+
+#[test]
+fn powershell_script_rejects_non_powershell_remote_environment() {
+    let cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(
+        std::env::current_dir().expect("current dir"),
+    )
+    .expect("absolute current dir");
+    let remote = Arc::new(
+        Environment::create_for_tests(Some("ws://127.0.0.1:1/remote".to_string()))
+            .expect("remote environment"),
+    );
+    let environment = TurnEnvironment::new(
+        "remote".to_string(),
+        remote,
+        PathUri::from_abs_path(&cwd),
+        Some(Shell {
+            shell_type: ShellType::Bash,
+            shell_path: PathBuf::from("/bin/bash"),
+        }),
+    );
+    let invocation = CommandInvocation::PowerShellScript("Get-ChildItem".to_string());
+    let session_shell = Shell {
+        shell_type: ShellType::Bash,
+        shell_path: PathBuf::from("/bin/bash"),
+    };
+
+    let err = resolve_command_shell(&invocation, &environment, &session_shell)
+        .expect_err("host PowerShell must not be substituted for a remote shell");
+    assert!(
+        err.to_string()
+            .contains("remote environment to report PowerShell")
+    );
 }
 
 #[tokio::test]
@@ -119,7 +156,11 @@ async fn shell_command_handler_to_exec_params_uses_selected_environment() {
     inject_permission_profile_env(&mut expected_env, active_permission_profile.as_ref());
 
     let params = ShellCommandToolCallParams {
-        command,
+        command: Some(command.clone()),
+        kind: None,
+        program: None,
+        args: None,
+        script_body: None,
         workdir,
         login,
         timeout_ms,
@@ -131,6 +172,7 @@ async fn shell_command_handler_to_exec_params_uses_selected_environment() {
 
     let exec_params = ShellCommandHandler::to_exec_params(
         &params,
+        &CommandInvocation::Script(command),
         &session,
         &turn_context,
         &selected_environment,
@@ -200,7 +242,11 @@ async fn shell_command_handler_defaults_to_non_login_when_disallowed() {
         .to_abs_path()
         .expect("native environment cwd");
     let params = ShellCommandToolCallParams {
-        command: "echo hello".to_string(),
+        command: Some("echo hello".to_string()),
+        kind: None,
+        program: None,
+        args: None,
+        script_body: None,
         workdir: None,
         login: None,
         timeout_ms: None,
@@ -212,6 +258,7 @@ async fn shell_command_handler_defaults_to_non_login_when_disallowed() {
 
     let exec_params = ShellCommandHandler::to_exec_params(
         &params,
+        &CommandInvocation::Script("echo hello".to_string()),
         &session,
         &turn_context,
         turn_environment,
@@ -226,6 +273,56 @@ async fn shell_command_handler_defaults_to_non_login_when_disallowed() {
             .user_shell()
             .derive_exec_args("echo hello", /*use_login_shell*/ false)
     );
+}
+
+#[tokio::test]
+async fn shell_command_handler_preserves_structured_argv_shape() {
+    let (session, turn_context) = make_session_and_context().await;
+    let turn_environment = turn_context
+        .environments
+        .primary()
+        .expect("primary environment");
+    let cwd = turn_environment
+        .cwd()
+        .to_abs_path()
+        .expect("native environment cwd");
+    let params = ShellCommandToolCallParams {
+        command: None,
+        kind: Some("argv".to_string()),
+        program: Some("rg".to_string()),
+        args: Some(vec!["--files".to_string()]),
+        script_body: None,
+        workdir: None,
+        login: None,
+        timeout_ms: None,
+        sandbox_permissions: None,
+        additional_permissions: None,
+        prefix_rule: None,
+        justification: None,
+    };
+    let invocation = CommandInvocation::from_parts(
+        "shell_command",
+        "command",
+        params.command.as_deref(),
+        params.kind.as_deref(),
+        params.program.as_deref(),
+        params.args.as_deref(),
+        params.script_body.as_deref(),
+    )
+    .expect("valid argv shape");
+
+    let exec_params = ShellCommandHandler::to_exec_params(
+        &params,
+        &invocation,
+        &session,
+        &turn_context,
+        turn_environment,
+        cwd,
+        /*allow_login_shell*/ false,
+    )
+    .expect("argv command should resolve");
+
+    assert_eq!(exec_params.command, vec!["rg", "--files"]);
 }
 
 #[test]
@@ -267,6 +364,40 @@ async fn shell_command_pre_tool_use_payload_uses_raw_command() {
             tool_input: json!({ "command": "printf shell command" }),
         })
     );
+}
+
+#[tokio::test]
+async fn shell_command_active_path_applies_read_only_repair_and_retains_output() {
+    let payload = ToolPayload::Function {
+        arguments: json!({
+            "kind": "argv",
+            "program": "rg",
+            "args": ["--ignorecase", "--version"]
+        })
+        .to_string(),
+    };
+    let (session, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
+    let handler = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic);
+    let output = handler
+        .handle(ToolInvocation {
+            session: session.into(),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "shell-preflight-repair".to_string(),
+            tool_name: codex_tools::ToolName::plain("shell_command"),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        })
+        .await
+        .expect("read-only typo should be repaired and executed");
+
+    let rendered = output.code_mode_result(&payload).to_string();
+    assert!(rendered.contains("known_flag_typo"));
+    assert!(rendered.contains("Raw output artifact:"));
+    assert!(rendered.contains("ripgrep"));
 }
 
 #[tokio::test]

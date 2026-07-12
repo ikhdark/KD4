@@ -40,6 +40,8 @@ from scripts.verify_local_context import (
 
 
 _RUNTIME: ModuleType | None = None
+VERIFY_LOCAL_JSON_SCHEMA_VERSION = 1
+VERIFY_LOCAL_JSON_PRODUCER = "kd4.verify_local"
 
 
 def configure_runtime(runtime: ModuleType) -> None:
@@ -399,6 +401,8 @@ def ledger_entry(
     cache_miss_reasons: list[str],
 ) -> dict[str, Any]:
     return {
+        "schema_version": VERIFY_LOCAL_JSON_SCHEMA_VERSION,
+        "producer": VERIFY_LOCAL_JSON_PRODUCER,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "scope": _runtime().scope_to_json(plan.scope),
         "verdict": verdict,
@@ -555,6 +559,9 @@ def plan_to_json(
     cache_miss_reasons: list[str],
 ) -> dict[str, Any]:
     return {
+        "schema_version": VERIFY_LOCAL_JSON_SCHEMA_VERSION,
+        "producer": VERIFY_LOCAL_JSON_PRODUCER,
+        "mode": plan.mode,
         "scope": _runtime().scope_to_json(plan.scope),
         "planned": [
             {
@@ -582,4 +589,13 @@ def plan_to_json(
         ),
         "cache_miss_reasons": cache_miss_reasons,
         "verdict": verdict or plan.verdict or "PLANNED",
+    }
+
+
+def error_to_json(verdict: str, error: object) -> dict[str, Any]:
+    return {
+        "schema_version": VERIFY_LOCAL_JSON_SCHEMA_VERSION,
+        "producer": VERIFY_LOCAL_JSON_PRODUCER,
+        "verdict": verdict,
+        "error": str(error),
     }

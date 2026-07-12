@@ -1,10 +1,4 @@
-//! Bazel-wired proof-of-concept crate reserved for future V8 experiments.
-
-/// Returns the Bazel label for this proof-of-concept crate.
-#[must_use]
-pub fn bazel_target() -> &'static str {
-    "//codex-rs/v8-poc:v8-poc"
-}
+//! Cargo-built proof-of-concept crate reserved for future V8 experiments.
 
 /// Returns the embedded V8 version.
 #[must_use]
@@ -28,8 +22,6 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::sync::Once;
 
-    use super::bazel_target;
-
     fn initialize_v8() {
         static INIT: Once = Once::new();
 
@@ -52,11 +44,6 @@ mod tests {
         let result = script.run(scope).expect("expression should evaluate");
 
         result.to_rust_string_lossy(scope)
-    }
-
-    #[test]
-    fn exposes_expected_bazel_target() {
-        assert_eq!(bazel_target(), "//codex-rs/v8-poc:v8-poc");
     }
 
     #[test]

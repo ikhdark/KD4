@@ -23,6 +23,78 @@ fn rejects_known_rg_flag_typo_for_direct_argv() {
 }
 
 #[test]
+fn repairs_one_read_only_direct_argv_typo() {
+    let invocation = CommandInvocation::Argv {
+        program: "rg".to_string(),
+        args: strings(&["--ignorecase", "TODO", "src"]),
+    };
+    let outcome = preflight_invocation_with_equivalent_repair(
+        &invocation,
+        &invocation.to_direct_argv().expect("argv"),
+        None,
+    )
+    .expect("read-only typo should be repaired");
+
+    assert_eq!(
+        outcome.invocation,
+        CommandInvocation::Argv {
+            program: "rg".to_string(),
+            args: strings(&["--ignore-case", "TODO", "src"]),
+        }
+    );
+    assert!(outcome.repaired());
+    assert!(
+        outcome
+            .repair_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("read-only equivalent repair"))
+    );
+}
+
+#[test]
+fn never_repairs_mutating_command_flag_typos() {
+    let invocation = CommandInvocation::Argv {
+        program: "git".to_string(),
+        args: strings(&["--worktree", "status"]),
+    };
+    let issue = preflight_invocation_with_equivalent_repair_detailed(
+        &invocation,
+        &invocation.to_direct_argv().expect("argv"),
+        None,
+    )
+    .expect_err("mutating-capable tools must never be repaired automatically");
+
+    assert_eq!(issue.code, CommandPreflightIssueCode::KnownFlagTypo);
+    assert_eq!(
+        issue.retry,
+        Some(CommandPreflightRetry::Argv {
+            program: "git".to_string(),
+            args: strings(&["--work-tree", "status"]),
+        })
+    );
+}
+
+#[test]
+fn never_repairs_script_even_when_first_command_is_read_only() {
+    let invocation =
+        CommandInvocation::Script("rg --ignorecase TODO .; Remove-Item -Recurse build".to_string());
+    let command = strings(&[
+        "pwsh",
+        "-NoProfile",
+        "-Command",
+        "rg --ignorecase TODO .; Remove-Item -Recurse build",
+    ]);
+
+    let issue = preflight_invocation_with_equivalent_repair_detailed(
+        &invocation,
+        &command,
+        Some(ShellType::PowerShell),
+    )
+    .expect_err("scripts must be rejection-only");
+    assert_eq!(issue.code, CommandPreflightIssueCode::KnownFlagTypo);
+}
+
+#[test]
 fn rejects_known_flag_typos_case_insensitively() {
     let issue = preflight_command_issue(
         &strings(&["RG", "--IGNORECASE", "TODO", "src"]),
@@ -184,6 +256,34 @@ fn rejects_unbalanced_quotes_in_shell_script() {
             .render_for_model()
             .contains("missing closing single quote")
     );
+}
+
+#[test]
+fn accepts_powershell_backslash_before_closing_quote() {
+    preflight_command(
+        &strings(&[
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            r#"Write-Output "C:\foo\""#,
+        ]),
+        Some(ShellType::PowerShell),
+    )
+    .expect("PowerShell uses backticks rather than backslashes as quote escapes");
+}
+
+#[test]
+fn accepts_powershell_backtick_escaped_quote_and_comment_apostrophe() {
+    preflight_command(
+        &strings(&[
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            "Write-Output \"a`\"b\" # user's text",
+        ]),
+        Some(ShellType::PowerShell),
+    )
+    .expect("PowerShell quote escapes and comment text should be parsed with PowerShell rules");
 }
 
 #[test]

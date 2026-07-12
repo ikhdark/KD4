@@ -326,6 +326,35 @@ class VerifyLocalPlannerTest(unittest.TestCase):
 
         self.assertEqual(parsed, {"newer": True})
 
+    def test_plan_json_contract_is_versioned_and_mode_explicit(self) -> None:
+        scope = self.v.Scope(
+            scope_id="fixture",
+            source="changed",
+            active_files=[Path("kd4_features.toml")],
+            owned_packages=[],
+        )
+        plan = self.v.Plan("plan", scope, [], [])
+
+        payload = self.v.plan_to_json(plan, "PLANNED", [], [])
+
+        self.assertEqual(payload["schema_version"], 1)
+        self.assertEqual(payload["producer"], "kd4.verify_local")
+        self.assertEqual(payload["mode"], "plan")
+        self.assertEqual(payload["verdict"], "PLANNED")
+
+    def test_error_json_uses_the_same_versioned_contract(self) -> None:
+        payload = self.v.error_to_json(self.v.TOOLING_ERROR, "broken")
+
+        self.assertEqual(
+            payload,
+            {
+                "schema_version": 1,
+                "producer": "kd4.verify_local",
+                "verdict": self.v.TOOLING_ERROR,
+                "error": "broken",
+            },
+        )
+
     def test_scope_add_includes_new_path(self) -> None:
         state = {"scope_id": "s", "owned_paths": ["codex-rs/core/src/lib.rs"]}
         with (

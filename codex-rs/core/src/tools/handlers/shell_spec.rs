@@ -26,7 +26,45 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
     let mut properties = BTreeMap::from([
         (
             "cmd".to_string(),
-            JsonSchema::string(Some("Shell command to execute.".to_string())),
+            JsonSchema::string(Some(
+                "Legacy shell script to execute. Use this for pipes, redirects, variable expansion, here-docs, compound shell syntax, and shell builtins. For a standalone executable, prefer `kind: \"argv\"`; for complex PowerShell, prefer `kind: \"powershell_script\"`."
+                    .to_string(),
+            )),
+        ),
+        (
+            "kind".to_string(),
+            JsonSchema::string_enum(
+                vec![
+                    json!("legacy"),
+                    json!("script"),
+                    json!("argv"),
+                    json!("powershell_script"),
+                ],
+                Some(
+                    "Command encoding. `legacy` preserves the historical untagged `cmd` string; `script` explicitly uses `cmd`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`."
+                        .to_string(),
+                ),
+            ),
+        ),
+        (
+            "program".to_string(),
+            JsonSchema::string(Some(
+                "Executable to launch directly when `kind` is `argv`.".to_string(),
+            )),
+        ),
+        (
+            "args".to_string(),
+            JsonSchema::array(
+                JsonSchema::string(/*description*/ None),
+                Some("Arguments for direct argv mode, excluding the program name.".to_string()),
+            ),
+        ),
+        (
+            "script_body".to_string(),
+            JsonSchema::string(Some(
+                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime."
+                    .to_string(),
+            )),
         ),
         (
             "workdir".to_string(),
@@ -98,11 +136,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         },
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(
-            properties,
-            Some(vec!["cmd".to_string()]),
-            Some(false.into()),
-        ),
+        parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
         output_schema: Some(unified_exec_output_schema()),
     })
 }
@@ -156,7 +190,43 @@ pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
         (
             "command".to_string(),
             JsonSchema::string(Some(
-                "Shell script to run in the user's default shell.".to_string(),
+                "Legacy shell script to execute. Use this for pipes, redirects, variable expansion, here-docs, compound shell syntax, and shell builtins. For a standalone executable, prefer `kind: \"argv\"`; for complex PowerShell, prefer `kind: \"powershell_script\"`."
+                    .to_string(),
+            )),
+        ),
+        (
+            "kind".to_string(),
+            JsonSchema::string_enum(
+                vec![
+                    json!("legacy"),
+                    json!("script"),
+                    json!("argv"),
+                    json!("powershell_script"),
+                ],
+                Some(
+                    "Command encoding. `legacy` preserves the historical untagged `command` string; `script` explicitly uses `command`; `argv` launches `program` directly with `args`; `powershell_script` runtime-encodes `script_body`."
+                        .to_string(),
+                ),
+            ),
+        ),
+        (
+            "program".to_string(),
+            JsonSchema::string(Some(
+                "Executable to launch directly when `kind` is `argv`.".to_string(),
+            )),
+        ),
+        (
+            "args".to_string(),
+            JsonSchema::array(
+                JsonSchema::string(/*description*/ None),
+                Some("Arguments for direct argv mode, excluding the program name.".to_string()),
+            ),
+        ),
+        (
+            "script_body".to_string(),
+            JsonSchema::string(Some(
+                "Plain PowerShell script for `kind: \"powershell_script\"`; Codex encodes it at runtime."
+                    .to_string(),
             )),
         ),
         (
@@ -212,11 +282,7 @@ Examples of valid command strings:
         description,
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(
-            properties,
-            Some(vec!["command".to_string()]),
-            Some(false.into()),
-        ),
+        parameters: JsonSchema::object(properties, /*required*/ None, Some(false.into())),
         output_schema: None,
     })
 }
@@ -281,6 +347,22 @@ fn unified_exec_output_schema() -> Value {
             "original_token_count": {
                 "type": "number",
                 "description": "Approximate token count before output truncation."
+            },
+            "raw_output_artifact": {
+                "type": "string",
+                "description": "Path to output retained before model summarization."
+            },
+            "raw_output_artifact_bytes": {
+                "type": "number",
+                "description": "Cumulative bytes retained in the raw output artifact."
+            },
+            "raw_output_artifact_error": {
+                "type": "string",
+                "description": "Artifact persistence failure, when retention was unavailable."
+            },
+            "repair": {
+                "type": "string",
+                "description": "One pre-execution read-only equivalent repair applied to the command."
             },
             "output": {
                 "type": "string",

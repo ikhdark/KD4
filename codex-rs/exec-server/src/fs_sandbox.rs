@@ -31,15 +31,6 @@ use crate::rpc::internal_error;
 use crate::rpc::invalid_request;
 
 const FS_HELPER_ENV_ALLOWLIST: &[&str] = &["PATH", "TMPDIR", "TMP", "TEMP"];
-#[cfg(debug_assertions)]
-const FS_HELPER_BAZEL_BWRAP_ENV_ALLOWLIST: &[&str] = &[
-    "CARGO_BIN_EXE_bwrap",
-    "RUNFILES_DIR",
-    "RUNFILES_MANIFEST_FILE",
-    "RUNFILES_MANIFEST_ONLY",
-    "TEST_SRCDIR",
-    "TEST_WORKSPACE",
-];
 
 #[derive(Debug, PartialEq, Eq)]
 struct SandboxCwd {
@@ -283,18 +274,7 @@ fn helper_env_key_is_allowed(key: &str) -> bool {
     FS_HELPER_ENV_ALLOWLIST.contains(&key)
         // CoreFoundation consults this before falling back to user lookup during helper startup.
         || (cfg!(target_os = "macos") && key == "__CF_USER_TEXT_ENCODING")
-        || bazel_bwrap_env_key_is_allowed(key)
         || (cfg!(windows) && key.eq_ignore_ascii_case("PATH"))
-}
-
-#[cfg(debug_assertions)]
-fn bazel_bwrap_env_key_is_allowed(key: &str) -> bool {
-    option_env!("BAZEL_PACKAGE").is_some() && FS_HELPER_BAZEL_BWRAP_ENV_ALLOWLIST.contains(&key)
-}
-
-#[cfg(not(debug_assertions))]
-fn bazel_bwrap_env_key_is_allowed(_key: &str) -> bool {
-    false
 }
 
 async fn run_command(

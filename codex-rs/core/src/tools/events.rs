@@ -472,6 +472,7 @@ struct ExecCommandResult {
     duration: Duration,
     formatted_output: String,
     status: ExecCommandStatus,
+    timed_out: bool,
 }
 
 async fn emit_exec_stage(
@@ -509,6 +510,7 @@ async fn emit_exec_stage(
                 } else {
                     ExecCommandStatus::Failed
                 },
+                timed_out: output.timed_out,
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
         }
@@ -522,6 +524,7 @@ async fn emit_exec_stage(
                 duration: Duration::ZERO,
                 formatted_output: text,
                 status: ExecCommandStatus::Failed,
+                timed_out: false,
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
         }
@@ -535,6 +538,7 @@ async fn emit_exec_stage(
                 duration: Duration::ZERO,
                 formatted_output: text,
                 status: ExecCommandStatus::Declined,
+                timed_out: false,
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
         }
@@ -546,6 +550,16 @@ async fn emit_exec_end(
     exec_input: ExecCommandInput<'_>,
     exec_result: ExecCommandResult,
 ) {
+    if let Some(tracker) = ctx.turn_diff_tracker {
+        let native_cwd = exec_input.cwd.to_abs_path().ok();
+        tracker.lock().await.record_exec_command_end_at(
+            exec_input.command,
+            exec_result.exit_code,
+            exec_result.timed_out,
+            native_cwd.as_ref().map(|cwd| cwd.as_path()),
+        );
+    }
+
     ctx.session
         .emit_turn_item_completed(
             ctx.turn,
@@ -604,7 +618,7 @@ async fn emit_patch_end(
                     true
                 }
                 TurnDiffTrackerUpdate::Invalidate => {
-                    guard.invalidate();
+                    guard.record_unknown_mutation();
                     true
                 }
                 TurnDiffTrackerUpdate::None => false,
@@ -817,5 +831,39 @@ mod tests {
                 break;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn exec_completion_records_timeout_in_validation_freshness() {
+        let (session, turn, _rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        tracker.lock().await.record_unknown_mutation();
+        let dir = tempdir().expect("tempdir");
+        let cwd = AbsolutePathBuf::from_absolute_path(dir.path()).expect("absolute cwd");
+        let emitter = ToolEmitter::shell(
+            vec!["cargo".to_string(), "test".to_string()],
+            cwd,
+            ExecCommandSource::Agent,
+        );
+        let output = ExecToolCallOutput {
+            exit_code: 1,
+            timed_out: true,
+            ..Default::default()
+        };
+
+        emitter
+            .finish(
+                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", Some(&tracker)),
+                Ok(output),
+                None,
+            )
+            .await
+            .expect_err("timed out validation should fail for the model");
+
+        assert_eq!(
+            tracker.lock().await.validation_freshness_status(),
+            crate::turn_diff_tracker::ValidationFreshnessStatus::TimedOut
+        );
     }
 }

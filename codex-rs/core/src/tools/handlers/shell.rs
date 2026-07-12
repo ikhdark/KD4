@@ -10,12 +10,16 @@ use crate::function_tool::FunctionCallError;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
+use crate::tools::command_execution::CommandAttemptKey;
+use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
+use crate::tools::handlers::command_shape::CommandInvocation;
+use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
@@ -41,31 +45,50 @@ fn shell_command_payload_command(payload: &ToolPayload) -> Option<String> {
 
     parse_arguments::<ShellCommandToolCallParams>(arguments)
         .ok()
-        .map(|params| params.command)
+        .and_then(|params| {
+            CommandInvocation::from_parts(
+                "shell_command",
+                "command",
+                params.command.as_deref(),
+                params.kind.as_deref(),
+                params.program.as_deref(),
+                params.args.as_deref(),
+                params.script_body.as_deref(),
+            )
+            .ok()
+            .map(|command| command.display_command())
+        })
 }
 
-struct RunExecLikeArgs {
-    tool_name: ToolName,
-    exec_params: ExecParams,
-    cancellation_token: CancellationToken,
-    hook_command: String,
-    shell_type: Option<ShellType>,
-    additional_permissions: Option<AdditionalPermissionProfile>,
-    prefix_rule: Option<Vec<String>>,
-    session: Arc<crate::session::session::Session>,
-    turn: Arc<TurnContext>,
-    turn_environment: TurnEnvironment,
-    tracker: crate::tools::context::SharedTurnDiffTracker,
-    call_id: String,
-    shell_runtime_backend: ShellRuntimeBackend,
+pub(super) struct RunExecLikeArgs {
+    pub(super) tool_name: ToolName,
+    pub(super) exec_params: ExecParams,
+    pub(super) cancellation_token: CancellationToken,
+    pub(super) hook_command: String,
+    pub(super) safety_command: Vec<String>,
+    pub(super) shell_type: Option<ShellType>,
+    pub(super) additional_permissions: Option<AdditionalPermissionProfile>,
+    pub(super) prefix_rule: Option<Vec<String>>,
+    pub(super) session: Arc<crate::session::session::Session>,
+    pub(super) turn: Arc<TurnContext>,
+    pub(super) turn_environment: TurnEnvironment,
+    pub(super) tracker: crate::tools::context::SharedTurnDiffTracker,
+    pub(super) call_id: String,
+    pub(super) shell_runtime_backend: ShellRuntimeBackend,
+    pub(super) track_validation_freshness: bool,
+    pub(super) attempt_key: Option<CommandAttemptKey>,
+    pub(super) repair_notice: Option<String>,
 }
 
-async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, FunctionCallError> {
+pub(super) async fn run_exec_like(
+    args: RunExecLikeArgs,
+) -> Result<FunctionToolOutput, FunctionCallError> {
     let RunExecLikeArgs {
         tool_name,
         exec_params,
         cancellation_token,
         hook_command,
+        safety_command,
         shell_type,
         additional_permissions,
         prefix_rule,
@@ -75,6 +98,9 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         tracker,
         call_id,
         shell_runtime_backend,
+        track_validation_freshness,
+        attempt_key,
+        repair_notice,
     } = args;
 
     let fs = turn_environment.environment.get_filesystem();
@@ -156,13 +182,9 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
     }
 
     let source = ExecCommandSource::Agent;
-    let emitter = ToolEmitter::shell(exec_params.command.clone(), exec_params.cwd.clone(), source);
-    let event_ctx = ToolEventCtx::new(
-        session.as_ref(),
-        turn.as_ref(),
-        &call_id,
-        /*turn_diff_tracker*/ None,
-    );
+    let emitter = ToolEmitter::shell(safety_command.clone(), exec_params.cwd.clone(), source);
+    let event_tracker = track_validation_freshness.then_some(&tracker);
+    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
     emitter.begin(event_ctx).await;
 
     let exec_approval_requirement = session
@@ -170,6 +192,7 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         .exec_policy
         .create_exec_approval_requirement_for_command(ExecApprovalRequest {
             command: &exec_params.command,
+            command_for_safety: Some(&safety_command),
             approval_policy: turn.approval_policy.value(),
             permission_profile: turn.permission_profile(),
             windows_sandbox_level: turn.windows_sandbox_level,
@@ -184,6 +207,7 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
 
     let req = ShellRequest {
         command: exec_params.command.clone(),
+        command_for_approval: safety_command,
         turn_environment: turn_environment.clone(),
         shell_type,
         hook_command,
@@ -219,12 +243,7 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
         )
         .await
         .map(|result| result.output);
-    let event_ctx = ToolEventCtx::new(
-        session.as_ref(),
-        turn.as_ref(),
-        &call_id,
-        /*turn_diff_tracker*/ None,
-    );
+    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
     let post_tool_use_response = out
         .as_ref()
         .ok()
@@ -232,9 +251,45 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
             crate::tools::format_exec_output_str(output, turn.model_info.truncation_policy.into())
         })
         .map(JsonValue::String);
-    let content = emitter
+    let advisory = out.as_ref().ok().and_then(|output| {
+        powershell_script_failure_advisory(
+            shell_type,
+            Some(output.exit_code),
+            &output.aggregated_output.text,
+        )
+    });
+    let raw_output_artifact = if let (Some(attempt_key), Ok(output)) = (&attempt_key, &out) {
+        session
+            .services
+            .command_execution
+            .record_exit(attempt_key, output.exit_code)
+            .await;
+        Some(
+            create_raw_output_artifact(
+                turn.config.codex_home.as_path(),
+                &session.thread_id.to_string(),
+                output.aggregated_output.text.as_bytes(),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let mut content = emitter
         .finish(event_ctx, out, /*applied_patch_delta*/ None)
         .await?;
+    if let Some(advisory) = advisory {
+        content.push_str("\n\n");
+        content.push_str(advisory);
+    }
+    if let Some(repair_notice) = repair_notice {
+        content.push_str("\n\n");
+        content.push_str(&repair_notice);
+    }
+    if let Some(raw_output_artifact) = raw_output_artifact {
+        content.push_str("\n\n");
+        content.push_str(&raw_output_artifact.render_for_model());
+    }
     Ok(FunctionToolOutput {
         body: vec![
             codex_protocol::models::FunctionCallOutputContentItem::InputText { text: content },

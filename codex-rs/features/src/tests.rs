@@ -800,3 +800,10 @@ code_mode = true
         message
     );
 }
+
+#[test]
+fn source_tools_are_explicitly_opt_in() {
+    assert_eq!(Feature::SourceTools.stage(), Stage::UnderDevelopment);
+    assert_eq!(Feature::SourceTools.default_enabled(), false);
+    assert_eq!(feature_for_key("source_tools"), Some(Feature::SourceTools));
+}

@@ -16,8 +16,8 @@ Treat wording changes as behavior changes.
   this crate; those belong to consuming crates.
 - Be especially careful with permissions, approval, sandbox, goal-completion, and
   apply_patch wording because it directly steers model behavior.
-- If adding a template file used with `include_str!`, update the crate
-  `BUILD.bazel` data inputs if required.
+- If adding a template file used with `include_str!`, keep it inside the crate
+  package boundary and add focused rendering coverage.
 
 ## Validation
 

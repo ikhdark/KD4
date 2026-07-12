@@ -113,6 +113,7 @@ async fn exec_command_with_tty(
                 &request,
                 tty,
                 Box::new(NoopSpawnLifecycle),
+                None,
                 turn.environments
                     .primary()
                     .expect("turn environment")
@@ -198,6 +199,8 @@ async fn exec_command_with_tty(
         exit_code,
         original_token_count: Some(approx_token_count(&text)),
         hook_command: Some(cmd.to_string()),
+        raw_output_artifact: None,
+        repair_notice: None,
     })
 }
 
@@ -287,14 +290,17 @@ async fn blocking_terminate_unified_process(
 ) -> anyhow::Result<Arc<UnifiedExecProcess>> {
     let (wake_tx, _wake_rx) = watch::channel(0);
     Ok(Arc::new(
-        UnifiedExecProcess::from_exec_server_started(StartedExecProcess {
-            process: Arc::new(BlockingTerminateExecProcess {
-                process_id: process_id.to_string().into(),
-                terminate_started,
-                allow_terminate,
-                wake_tx,
-            }),
-        })
+        UnifiedExecProcess::from_exec_server_started(
+            StartedExecProcess {
+                process: Arc::new(BlockingTerminateExecProcess {
+                    process_id: process_id.to_string().into(),
+                    terminate_started,
+                    allow_terminate,
+                    wake_tx,
+                }),
+            },
+            None,
+        )
         .await?,
     ))
 }
@@ -813,6 +819,7 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
             &request,
             /*tty*/ false,
             Box::new(NoopSpawnLifecycle),
+            None,
             &environment,
         )
         .await?;
@@ -853,6 +860,7 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
             &request,
             /*tty*/ true,
             Box::new(NoopSpawnLifecycle),
+            None,
             remote_test_env.environment(),
         )
         .await?;
@@ -910,6 +918,7 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
             Box::new(TestSpawnLifecycle {
                 inherited_fds: vec![42],
             }),
+            None,
             turn.environments
                 .primary()
                 .expect("turn environment")

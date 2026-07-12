@@ -59,7 +59,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-// Bazel CI can spend tens of seconds starting app-server subprocesses or
+// Loaded CI hosts can spend tens of seconds starting app-server subprocesses or
 // processing app-list RPCs under load.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 

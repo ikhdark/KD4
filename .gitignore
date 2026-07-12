@@ -9,8 +9,6 @@ node_modules
 
 # build
 dist/
-bazel-*
-user.bazelrc
 build/
 out/
 storybook-static/
@@ -61,7 +59,6 @@ yarn-error.log*
 .vercel/
 .netlify/
 /.tmp/sdk-ci/
-/upstream-rusty-v8/
 
 # patches
 apply_patch/

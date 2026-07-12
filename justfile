@@ -71,7 +71,7 @@ fmt:
 fmt-check-fast:
     {{ python }} {{ justfile_directory() }}/scripts/format.py --check --fast-local
 
-# Format the justfile, Rust, Prettier targets, Bazel/Starlark, Python SDK code, and Python scripts.
+# Format the justfile, Rust, Prettier targets, Python SDK code, and Python scripts.
 fmt-full:
     {{ python }} ../scripts/format.py
 
@@ -82,6 +82,18 @@ fmt-check:
 [no-cd]
 verify-local *args:
     @{{ python }} {{ justfile_directory() }}/scripts/verify_local.py {args}
+
+[no-cd]
+check-kd4-features *args:
+    @{{ python }} {{ justfile_directory() }}/scripts/check_kd4_features.py {args}
+
+[no-cd]
+kd4-sync-audit *args:
+    @{{ python }} {{ justfile_directory() }}/scripts/kd4_sync_audit.py {args}
+
+[no-cd]
+kd4-perf-snapshot *args:
+    @{{ python }} {{ justfile_directory() }}/scripts/kd4_perf_snapshot.py {args}
 
 [no-cd]
 audit-scripts *args:
@@ -522,59 +534,9 @@ bench-workspace *args:
 bench-smoke:
     cargo bench -p codex-utils-image --bench prompt_images -- --test
 
-# Build and run Codex from source using Bazel.
-# On Unix, use `[no-cd]` and `--run_under="cd $PWD &&"` to ensure Bazel runs
-# the command in the current working directory.
-[no-cd]
-[unix]
-bazel-codex *args:
-    bazel run //codex-rs/cli:codex --run_under="cd $PWD &&" -- "$@"
-
-[windows]
-bazel-codex *args:
-    bazel run //codex-rs/cli:codex --run_under='cd /d "{{ invocation_directory_native() }}" &&' -- {args}
-
-[no-cd]
-bazel-lock-update:
-    bazel mod deps --lockfile_mode=update
-
-[no-cd]
-[unix]
-bazel-lock-check:
-    {{ justfile_directory() }}/scripts/check-module-bazel-lock.sh
-
-[windows]
-bazel-lock-check:
-    bazel mod deps --lockfile_mode=error; if ($LASTEXITCODE -ne 0) { Write-Error "MODULE.bazel.lock is out of date. Run 'just bazel-lock-update' and commit the updated lockfile."; exit 1 }
-
-bazel-test:
-    bazel test --test_tag_filters=-argument-comment-lint //... --keep_going
-
-[unix]
-bazel-test-changed *targets:
-    if [ "$#" -eq 0 ]; then echo "Pass explicit Bazel test targets."; exit 2; fi; bazel test --test_tag_filters=-argument-comment-lint "$@"
-
-[windows]
-bazel-test-changed *targets:
-    $forwarded_args = {args}; if ($forwarded_args.Count -eq 0) { Write-Error "Pass explicit Bazel test targets."; exit 2 }; bazel test --test_tag_filters=-argument-comment-lint @forwarded_args
-
-[no-cd]
-[unix]
-bazel-clippy:
-    bazel_targets="$({{ justfile_directory() }}/scripts/list-bazel-clippy-targets.sh)" && bazel build --config=clippy -- ${bazel_targets}
-
-[no-cd]
-[unix]
-bazel-argument-comment-lint:
-    bazel build --config=argument-comment-lint -- $({{ justfile_directory() }}/tools/argument-comment-lint/list-bazel-targets.sh)
-
-[no-cd]
-[windows]
-bazel-argument-comment-lint:
-    $targets = @(& {{ python }} {{ justfile_directory() }}/tools/argument-comment-lint/list-bazel-targets.py | Where-Object { $_ }); if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; bazel build --config=argument-comment-lint -- @targets
-
-build-for-release:
-    bazel build //codex-rs/cli:release_binaries
+# Build the default Cargo workspace members with the release profile.
+build-for-release *args:
+    cargo build --release {args}
 
 # Show duplicate crate versions in the CLI build graph.
 deps-duplicates *args:
@@ -741,16 +703,12 @@ write-hooks-schema:
 [no-cd]
 [unix]
 argument-comment-lint *args:
-    if [ "$#" -eq 0 ]; then \
-      bazel build --config=argument-comment-lint -- $({{ justfile_directory() }}/tools/argument-comment-lint/list-bazel-targets.sh); \
-    else \
-      {{ justfile_directory() }}/tools/argument-comment-lint/run-prebuilt-linter.py "$@"; \
-    fi
+    {{ justfile_directory() }}/tools/argument-comment-lint/run-prebuilt-linter.py "$@"
 
 [no-cd]
 [windows]
 argument-comment-lint *args:
-    $forwarded_args = {args}; if ($forwarded_args.Count -eq 0) { just bazel-argument-comment-lint } else { {{ python }} {{ justfile_directory() }}/tools/argument-comment-lint/run-prebuilt-linter.py @forwarded_args }
+    $forwarded_args = {args}; {{ python }} {{ justfile_directory() }}/tools/argument-comment-lint/run-prebuilt-linter.py @forwarded_args
 
 [no-cd]
 [unix]

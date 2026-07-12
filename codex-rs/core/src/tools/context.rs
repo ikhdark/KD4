@@ -6,6 +6,9 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::TELEMETRY_PREVIEW_MAX_BYTES;
 use crate::tools::TELEMETRY_PREVIEW_MAX_LINES;
 use crate::tools::TELEMETRY_PREVIEW_TRUNCATION_NOTICE;
+use crate::tools::command_output_artifact::RawOutputArtifact;
+use crate::tools::shell_output_summary::ShellOutputSummaryOptions;
+use crate::tools::shell_output_summary::summarize_shell_output_for_model;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::resolve_max_tokens;
 use codex_protocol::mcp::CallToolResult;
@@ -320,6 +323,8 @@ pub struct ExecCommandToolOutput {
     pub exit_code: Option<i32>,
     pub original_token_count: Option<usize>,
     pub hook_command: Option<String>,
+    pub raw_output_artifact: Option<RawOutputArtifact>,
+    pub repair_notice: Option<String>,
 }
 
 impl ToolOutput for ExecCommandToolOutput {
@@ -378,8 +383,27 @@ impl ToolOutput for ExecCommandToolOutput {
             session_id: Option<i32>,
             #[serde(skip_serializing_if = "Option::is_none")]
             original_token_count: Option<usize>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            raw_output_artifact: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            raw_output_artifact_bytes: Option<u64>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            raw_output_artifact_error: Option<String>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            repair: Option<String>,
             output: String,
         }
+
+        let (raw_output_artifact, raw_output_artifact_bytes, raw_output_artifact_error) =
+            match self.raw_output_artifact.as_ref() {
+                Some(RawOutputArtifact::Stored { path, bytes }) => (
+                    Some(path.to_string_lossy().into_owned()),
+                    Some(*bytes),
+                    None,
+                ),
+                Some(RawOutputArtifact::Failed { message }) => (None, None, Some(message.clone())),
+                None => (None, None, None),
+            };
 
         let result = UnifiedExecCodeModeResult {
             chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
@@ -387,10 +411,11 @@ impl ToolOutput for ExecCommandToolOutput {
             exit_code: self.exit_code,
             session_id: self.process_id,
             original_token_count: self.original_token_count,
-            output: match self.max_output_tokens {
-                Some(max_tokens) => self.truncated_output(max_tokens),
-                None => String::from_utf8_lossy(&self.raw_output).to_string(),
-            },
+            raw_output_artifact,
+            raw_output_artifact_bytes,
+            raw_output_artifact_error,
+            repair: self.repair_notice.clone(),
+            output: self.model_output(self.model_output_max_tokens()),
         };
 
         serde_json::to_value(result).unwrap_or_else(|err| {
@@ -407,6 +432,22 @@ impl ExecCommandToolOutput {
     pub(crate) fn truncated_output(&self, max_tokens: usize) -> String {
         let text = String::from_utf8_lossy(&self.raw_output).to_string();
         formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens))
+    }
+
+    fn model_output(&self, max_tokens: usize) -> String {
+        let raw = String::from_utf8_lossy(&self.raw_output);
+        let summarized = summarize_shell_output_for_model(
+            raw.as_ref(),
+            self.exit_code.unwrap_or_default(),
+            /*timed_out*/ false,
+            ShellOutputSummaryOptions {
+                enabled: true,
+                turn_cost_guard: false,
+                command_text: self.hook_command.as_deref(),
+            },
+        );
+        let content = summarized.as_deref().unwrap_or(raw.as_ref());
+        formatted_truncate_text(content, TruncationPolicy::Tokens(max_tokens))
     }
 
     fn response_text(&self) -> String {
@@ -431,8 +472,16 @@ impl ExecCommandToolOutput {
             sections.push(format!("Original token count: {original_token_count}"));
         }
 
+        if let Some(repair_notice) = &self.repair_notice {
+            sections.push(repair_notice.clone());
+        }
+
+        if let Some(raw_output_artifact) = &self.raw_output_artifact {
+            sections.push(raw_output_artifact.render_for_model());
+        }
+
         sections.push("Output:".to_string());
-        sections.push(self.truncated_output(self.model_output_max_tokens()));
+        sections.push(self.model_output(self.model_output_max_tokens()));
 
         sections.join("\n")
     }

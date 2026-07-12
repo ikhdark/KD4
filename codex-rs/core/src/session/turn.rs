@@ -2494,6 +2494,27 @@ async fn try_run_sampling_request(
         }
     }
 
+    if let Ok(result) = &outcome
+        && !result.needs_follow_up
+    {
+        let validation_warning = {
+            let tracker = turn_diff_tracker.lock().await;
+            tracker
+                .has_unvalidated_mutation()
+                .then(|| {
+                    tracker
+                        .validation_freshness_status()
+                        .final_warning_message()
+                })
+                .flatten()
+                .map(str::to_string)
+        };
+        if let Some(message) = validation_warning {
+            sess.send_event(&turn_context, EventMsg::Warning(WarningEvent { message }))
+                .await;
+        }
+    }
+
     outcome
 }
 

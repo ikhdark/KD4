@@ -4,6 +4,7 @@ use app_test_support::create_final_assistant_message_sse_response;
 use app_test_support::create_mock_responses_server_sequence_unchecked;
 use app_test_support::to_response;
 use codex_app_server_protocol::ClientInfo;
+use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::InitializeCapabilities;
 use codex_app_server_protocol::InitializeResponse;
 use codex_app_server_protocol::JSONRPCMessage;
@@ -336,6 +337,76 @@ async fn initialize_opt_out_notification_methods_filters_notifications() -> Resu
         thread_started.is_err(),
         "thread/started should be filtered by optOutNotificationMethods"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn initialize_installs_effective_loaders_after_non_strict_config_preload_failure()
+-> Result<()> {
+    let codex_home = TempDir::new()?;
+    std::fs::write(codex_home.path().join("config.toml"), "model = ")?;
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .with_args(&[
+            "-c",
+            "experimental_thread_config_endpoint=\"http://127.0.0.1:0\"",
+        ])
+        .build()
+        .await?;
+
+    timeout(DEFAULT_READ_TIMEOUT, mcp.initialize()).await??;
+
+    let fallback_warning = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_notification_message("configWarning"),
+    )
+    .await??;
+    let fallback_warning: ConfigWarningNotification = serde_json::from_value(
+        fallback_warning
+            .params
+            .expect("configWarning should include params"),
+    )?;
+    assert_eq!(
+        fallback_warning.summary,
+        "Invalid configuration; using defaults."
+    );
+    assert!(
+        fallback_warning
+            .details
+            .as_deref()
+            .is_some_and(|details| details.contains("config.toml")),
+        "expected fallback warning details to mention config.toml, got {fallback_warning:?}"
+    );
+    let duplicate_warning = timeout(
+        Duration::from_millis(250),
+        mcp.read_stream_until_notification_message("configWarning"),
+    )
+    .await;
+    assert!(
+        duplicate_warning.is_err(),
+        "startup should emit one user-facing config warning, got {duplicate_warning:?}"
+    );
+
+    // Repair the user config after startup so thread/start reaches the loader that the
+    // effective fallback config installed. A bootstrap NoopThreadConfigLoader would let
+    // this request continue instead of reporting the unreachable configured endpoint.
+    std::fs::write(codex_home.path().join("config.toml"), "")?;
+    let request_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams::default())
+        .await?;
+    let error = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(request_id)),
+    )
+    .await??;
+    assert!(
+        error
+            .error
+            .message
+            .contains("failed to connect to remote thread config loader"),
+        "expected effective remote thread config loader error, got {error:?}"
+    );
+
     Ok(())
 }
 

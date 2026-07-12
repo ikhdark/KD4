@@ -1,8 +1,7 @@
 # Codex Environments
 
-`setup.py` prepares declared ignored files for Codex-created worktrees. It
-currently handles only `user.bazelrc`, because the checked-in `.bazelrc` imports
-that local file.
+`setup.py` prepares explicitly declared ignored files for Codex-created
+worktrees. There are currently no repository-specific files to copy.
 
 - Keep copied paths explicit in `setup.py`; do not add broad directory copies or
   glob synchronization.

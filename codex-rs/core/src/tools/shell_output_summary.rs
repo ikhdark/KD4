@@ -1,28 +1,16 @@
 use std::collections::BTreeSet;
 
-use codex_config::coding_budgets::SHELL_OUTPUT_DEFAULT_SUMMARY_AFTER_BYTES;
-use codex_config::coding_budgets::SHELL_OUTPUT_DEFAULT_SUMMARY_AFTER_LINES;
-use codex_config::coding_budgets::SHELL_OUTPUT_EARLY_SUMMARY_AFTER_BYTES;
-use codex_config::coding_budgets::SHELL_OUTPUT_EARLY_SUMMARY_AFTER_LINES;
-use codex_config::coding_budgets::SHELL_OUTPUT_FAILURE_TAIL_LINES;
-use codex_config::coding_budgets::SHELL_OUTPUT_FOCUS_CONTEXT_LINES;
-use codex_config::coding_budgets::SHELL_OUTPUT_MAX_FOCUS_MATCHES;
-use codex_config::coding_budgets::SHELL_OUTPUT_SUCCESS_HEAD_LINES;
-use codex_config::coding_budgets::SHELL_OUTPUT_SUCCESS_TAIL_LINES;
-use codex_config::coding_budgets::SHELL_OUTPUT_SUMMARY_MAX_BYTES;
-use codex_config::coding_budgets::SHELL_OUTPUT_SUMMARY_MAX_LINES;
-
-const DEFAULT_SUMMARY_AFTER_BYTES: usize = SHELL_OUTPUT_DEFAULT_SUMMARY_AFTER_BYTES;
-const DEFAULT_SUMMARY_AFTER_LINES: usize = SHELL_OUTPUT_DEFAULT_SUMMARY_AFTER_LINES;
-const EARLY_SUMMARY_AFTER_BYTES: usize = SHELL_OUTPUT_EARLY_SUMMARY_AFTER_BYTES;
-const EARLY_SUMMARY_AFTER_LINES: usize = SHELL_OUTPUT_EARLY_SUMMARY_AFTER_LINES;
-const SUMMARY_MAX_BYTES: usize = SHELL_OUTPUT_SUMMARY_MAX_BYTES;
-const SUMMARY_MAX_LINES: usize = SHELL_OUTPUT_SUMMARY_MAX_LINES;
-const SUCCESS_HEAD_LINES: usize = SHELL_OUTPUT_SUCCESS_HEAD_LINES;
-const SUCCESS_TAIL_LINES: usize = SHELL_OUTPUT_SUCCESS_TAIL_LINES;
-const FAILURE_TAIL_LINES: usize = SHELL_OUTPUT_FAILURE_TAIL_LINES;
-const FOCUS_CONTEXT_LINES: usize = SHELL_OUTPUT_FOCUS_CONTEXT_LINES;
-const MAX_FOCUS_MATCHES: usize = SHELL_OUTPUT_MAX_FOCUS_MATCHES;
+const DEFAULT_SUMMARY_AFTER_BYTES: usize = 48 * 1024;
+const DEFAULT_SUMMARY_AFTER_LINES: usize = 600;
+const EARLY_SUMMARY_AFTER_BYTES: usize = 10 * 1024;
+const EARLY_SUMMARY_AFTER_LINES: usize = 160;
+const SUMMARY_MAX_BYTES: usize = 32 * 1024;
+const SUMMARY_MAX_LINES: usize = 240;
+const SUCCESS_HEAD_LINES: usize = 24;
+const SUCCESS_TAIL_LINES: usize = 64;
+const FAILURE_TAIL_LINES: usize = 140;
+const FOCUS_CONTEXT_LINES: usize = 3;
+const MAX_FOCUS_MATCHES: usize = 48;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ShellOutputSummaryOptions<'a> {
@@ -231,18 +219,30 @@ impl SummaryBuilder {
         }
 
         let line = line.as_ref();
-        let additional_bytes = line.len() + usize::from(!self.text.is_empty());
-        if self.lines + 1 > SUMMARY_MAX_LINES
-            || self.text.len().saturating_add(additional_bytes) > SUMMARY_MAX_BYTES
-        {
+        if self.lines + 1 > SUMMARY_MAX_LINES {
             self.capped = true;
             return;
         }
 
+        let separator_bytes = usize::from(!self.text.is_empty());
+        let remaining = SUMMARY_MAX_BYTES
+            .saturating_sub(self.text.len())
+            .saturating_sub(separator_bytes);
+        if remaining == 0 {
+            self.capped = true;
+            return;
+        }
+        let rendered = if line.len() > remaining {
+            self.capped = true;
+            summarize_oversized_line(line, remaining)
+        } else {
+            line.to_string()
+        };
+
         if !self.text.is_empty() {
             self.text.push('\n');
         }
-        self.text.push_str(line);
+        self.text.push_str(&rendered);
         self.lines += 1;
     }
 
@@ -262,6 +262,39 @@ impl SummaryBuilder {
         }
         Some(self.text)
     }
+}
+
+fn summarize_oversized_line(line: &str, max_bytes: usize) -> String {
+    const MARKER: &str = " ... [line truncated] ... ";
+    if line.len() <= max_bytes {
+        return line.to_string();
+    }
+    if max_bytes <= MARKER.len() {
+        return take_prefix_at_char_boundary(line, max_bytes).to_string();
+    }
+
+    let payload_bytes = max_bytes - MARKER.len();
+    let head_bytes = payload_bytes / 2;
+    let tail_bytes = payload_bytes - head_bytes;
+    let head = take_prefix_at_char_boundary(line, head_bytes);
+    let tail = take_suffix_at_char_boundary(line, tail_bytes);
+    format!("{head}{MARKER}{tail}")
+}
+
+fn take_prefix_at_char_boundary(value: &str, max_bytes: usize) -> &str {
+    let mut end = value.len().min(max_bytes);
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
+fn take_suffix_at_char_boundary(value: &str, max_bytes: usize) -> &str {
+    let mut start = value.len().saturating_sub(max_bytes);
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    &value[start..]
 }
 
 #[cfg(test)]

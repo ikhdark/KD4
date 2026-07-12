@@ -19,6 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from scripts import verify_local_execution  # noqa: E402
 from scripts.verify_local_context import (  # noqa: E402
     BASH_PARSE_SCRIPT_TEMPLATE as BASH_PARSE_SCRIPT_TEMPLATE,
     CACHE_PATH as CACHE_PATH,
@@ -106,6 +107,7 @@ from scripts.verify_local_execution import (  # noqa: E402
     execute_plan as execute_plan,
     print_plan as print_plan,
     plan_to_json as plan_to_json,
+    error_to_json as error_to_json,
     configure_runtime as _configure_execution_runtime,
 )
 
@@ -806,7 +808,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if scope is None:
             if args.json:
                 print(
-                    json.dumps({"verdict": NEEDS_SCOPE, "error": scope_error}, indent=2)
+                    json.dumps(
+                        verify_local_execution.error_to_json(NEEDS_SCOPE, scope_error),
+                        indent=2,
+                    )
                 )
             else:
                 print(f"{NEEDS_SCOPE}: {scope_error}")
@@ -822,7 +827,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if args.json:
                 print(
                     json.dumps(
-                        plan_to_json(plan, verdict, [], []), indent=2, default=str
+                        verify_local_execution.plan_to_json(plan, verdict, [], []),
+                        indent=2,
+                        default=str,
                     )
                 )
             else:
@@ -832,7 +839,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.json:
             print(
                 json.dumps(
-                    plan_to_json(plan, verdict, results, cache_miss_reasons),
+                    verify_local_execution.plan_to_json(
+                        plan, verdict, results, cache_miss_reasons
+                    ),
                     indent=2,
                     default=str,
                 )
@@ -848,13 +857,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     except subprocess.CalledProcessError as exc:
         message = exc.stderr or exc.output or str(exc)
         if args.json:
-            print(json.dumps({"verdict": TOOLING_ERROR, "error": message}, indent=2))
+            print(
+                json.dumps(
+                    verify_local_execution.error_to_json(TOOLING_ERROR, message),
+                    indent=2,
+                )
+            )
         else:
             print(f"{TOOLING_ERROR}: {message}")
         return EXIT_CODES[TOOLING_ERROR]
     except Exception as exc:
         if args.json:
-            print(json.dumps({"verdict": TOOLING_ERROR, "error": str(exc)}, indent=2))
+            print(
+                json.dumps(
+                    verify_local_execution.error_to_json(TOOLING_ERROR, exc),
+                    indent=2,
+                )
+            )
         else:
             print(f"{TOOLING_ERROR}: {exc}")
         return EXIT_CODES[TOOLING_ERROR]
