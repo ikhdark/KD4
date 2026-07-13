@@ -579,6 +579,7 @@ async fn live_app_server_turn_completed_clears_working_status_after_answer_item(
                 completed_at: Some(0),
                 duration_ms: None,
             },
+            timing: None,
         }),
         /*replay_kind*/ None,
     );
@@ -609,6 +610,7 @@ async fn live_app_server_turn_completed_renders_completion_gate() {
                 completed_at: Some(0),
                 duration_ms: None,
             },
+            timing: None,
         }),
         /*replay_kind*/ None,
     );
@@ -1039,6 +1041,7 @@ async fn live_app_server_failed_turn_does_not_duplicate_error_history() {
                 completed_at: Some(0),
                 duration_ms: None,
             },
+            timing: None,
         }),
         /*replay_kind*/ None,
     );

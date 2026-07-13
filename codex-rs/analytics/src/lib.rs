@@ -51,6 +51,8 @@ pub use facts::SubAgentThreadStartedInput;
 pub use facts::ThreadInitializationMode;
 pub use facts::TrackEventsContext;
 pub use facts::TurnCodexErrorFact;
+pub use facts::TurnDeliveryFact;
+pub use facts::TurnDeliveryStatus;
 pub use facts::TurnProfile;
 pub use facts::TurnProfileFact;
 pub use facts::TurnResolvedConfigFact;

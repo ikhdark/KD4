@@ -2,10 +2,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use codex_analytics::AnalyticsEventsClient;
+use codex_analytics::TurnDeliveryFact;
+use codex_analytics::TurnDeliveryStatus;
 use codex_app_server_protocol::ClientResponsePayload;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
@@ -18,9 +22,13 @@ use codex_otel::span_w3c_trace_context;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::Instrument;
 use tracing::Span;
 use tracing::warn;
@@ -37,6 +45,9 @@ pub(crate) use codex_app_server_transport::QueuedOutgoingMessage;
 use codex_protocol::account::PlanType;
 
 pub(crate) type ClientRequestResult = std::result::Result<Result, JSONRPCErrorError>;
+
+const TURN_DELIVERY_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
+const TURN_DELIVERY_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Stable identifier for a client request scoped to a transport connection.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -102,6 +113,9 @@ pub(crate) struct OutgoingMessageSender {
     /// disconnect cleanup all get handled.
     request_contexts: Mutex<HashMap<ConnectionRequestId, RequestContext>>,
     analytics_events_client: AnalyticsEventsClient,
+    delivery_tasks: TaskTracker,
+    delivery_shutdown: CancellationToken,
+    delivery_accepting: Mutex<bool>,
 }
 
 #[derive(Clone)]
@@ -115,6 +129,28 @@ struct PendingCallbackEntry {
     callback: oneshot::Sender<ClientRequestResult>,
     thread_id: Option<ThreadId>,
     request: ServerRequest,
+}
+
+struct PendingTurnDeliveryReceipt {
+    connection_id: ConnectionId,
+    receiver: Option<oneshot::Receiver<()>>,
+    immediate_outcome: Option<TurnDeliveryOutcomeKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnDeliveryOutcomeKind {
+    Success,
+    Failure,
+    Timeout,
+    ShutdownCancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TurnDeliveryOutcome {
+    connection_id: ConnectionId,
+    kind: TurnDeliveryOutcomeKind,
+    successful_elapsed_ms: Option<u64>,
+    post_core_delivery_latency_ms: Option<u64>,
 }
 
 impl ThreadScopedOutgoingMessageSender {
@@ -169,6 +205,56 @@ impl ThreadScopedOutgoingMessageSender {
             .await;
     }
 
+    /// Dispatches a terminal turn notification to one frozen target set and
+    /// collects transport writer receipts without delaying core completion.
+    pub(crate) async fn send_server_notification_with_receipts(
+        &self,
+        notification: ServerNotification,
+        origin_connection_id: Option<ConnectionId>,
+    ) {
+        self.outgoing
+            .analytics_events_client
+            .track_notification(notification.clone());
+
+        let ServerNotification::TurnCompleted(completed) = &notification else {
+            if !self.connection_ids.is_empty() {
+                self.outgoing
+                    .send_server_notification_to_connections(
+                        self.connection_ids.as_slice(),
+                        notification,
+                    )
+                    .await;
+            }
+            return;
+        };
+        let turn_id = completed.turn.id.clone();
+        let core_completed_at_ms = completed
+            .timing
+            .as_ref()
+            .and_then(|timing| timing.completed_at_unix_ms)
+            .or_else(|| {
+                completed
+                    .turn
+                    .completed_at
+                    .and_then(|seconds| seconds.checked_mul(1_000))
+            })
+            .and_then(|milliseconds| u64::try_from(milliseconds).ok());
+
+        let mut target_connection_ids = self.connection_ids.as_ref().clone();
+        target_connection_ids.sort_unstable_by_key(|connection_id| connection_id.0);
+        target_connection_ids.dedup();
+        self.outgoing
+            .dispatch_turn_completed_with_receipts(
+                self.thread_id,
+                turn_id,
+                target_connection_ids,
+                origin_connection_id,
+                core_completed_at_ms,
+                notification,
+            )
+            .await;
+    }
+
     pub(crate) async fn send_global_server_notification(&self, notification: ServerNotification) {
         self.outgoing.send_server_notification(notification).await;
     }
@@ -217,6 +303,9 @@ impl OutgoingMessageSender {
             request_id_to_callback: Mutex::new(HashMap::new()),
             request_contexts: Mutex::new(HashMap::new()),
             analytics_events_client,
+            delivery_tasks: TaskTracker::new(),
+            delivery_shutdown: CancellationToken::new(),
+            delivery_accepting: Mutex::new(true),
         }
     }
 
@@ -628,6 +717,120 @@ impl OutgoingMessageSender {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_turn_completed_with_receipts(
+        &self,
+        thread_id: ThreadId,
+        turn_id: String,
+        target_connection_ids: Vec<ConnectionId>,
+        origin_connection_id: Option<ConnectionId>,
+        core_completed_at_ms: Option<u64>,
+        notification: ServerNotification,
+    ) {
+        tracing::trace!(
+            targeted_connections = target_connection_ids.len(),
+            "app-server terminal event: {notification}"
+        );
+        let dispatch_started = Instant::now();
+        let receipt_deadline = tokio::time::Instant::now() + TURN_DELIVERY_RECEIPT_TIMEOUT;
+        let post_core_dispatch_latency_ms = core_completed_at_ms
+            .map(|completed_at_ms| now_unix_timestamp_ms().saturating_sub(completed_at_ms));
+        let outgoing_message = OutgoingMessage::AppServerNotification(notification);
+        let mut receipts = Vec::with_capacity(target_connection_ids.len());
+
+        for connection_id in target_connection_ids {
+            let (write_complete_tx, write_complete_rx) = oneshot::channel();
+            let send_result = self
+                .sender
+                .send(OutgoingEnvelope::ToConnection {
+                    connection_id,
+                    message: outgoing_message.clone(),
+                    write_complete_tx: Some(write_complete_tx),
+                })
+                .await;
+            let immediate_outcome = if let Err(err) = send_result {
+                warn!("failed to dispatch terminal notification to {connection_id:?}: {err:?}");
+                Some(TurnDeliveryOutcomeKind::Failure)
+            } else {
+                None
+            };
+            receipts.push(PendingTurnDeliveryReceipt {
+                connection_id,
+                receiver: immediate_outcome.is_none().then_some(write_complete_rx),
+                immediate_outcome,
+            });
+        }
+
+        if receipts.is_empty() {
+            self.analytics_events_client
+                .track_turn_delivery(aggregate_turn_delivery(
+                    thread_id,
+                    turn_id,
+                    origin_connection_id,
+                    Vec::new(),
+                ));
+            return;
+        }
+
+        let accepting = self.delivery_accepting.lock().await;
+        if *accepting {
+            let analytics_events_client = self.analytics_events_client.clone();
+            let delivery_shutdown = self.delivery_shutdown.clone();
+            self.delivery_tasks.spawn(async move {
+                let outcomes = collect_turn_delivery_outcomes(
+                    receipts,
+                    dispatch_started,
+                    receipt_deadline,
+                    post_core_dispatch_latency_ms,
+                    delivery_shutdown,
+                )
+                .await;
+                analytics_events_client.track_turn_delivery(aggregate_turn_delivery(
+                    thread_id,
+                    turn_id,
+                    origin_connection_id,
+                    outcomes,
+                ));
+            });
+            return;
+        }
+        drop(accepting);
+
+        let outcomes = receipts
+            .into_iter()
+            .map(|receipt| TurnDeliveryOutcome {
+                connection_id: receipt.connection_id,
+                kind: receipt
+                    .immediate_outcome
+                    .unwrap_or(TurnDeliveryOutcomeKind::ShutdownCancelled),
+                successful_elapsed_ms: None,
+                post_core_delivery_latency_ms: None,
+            })
+            .collect();
+        self.analytics_events_client
+            .track_turn_delivery(aggregate_turn_delivery(
+                thread_id,
+                turn_id,
+                origin_connection_id,
+                outcomes,
+            ));
+    }
+
+    pub(crate) async fn shutdown_delivery_tasks(&self) {
+        {
+            let mut accepting = self.delivery_accepting.lock().await;
+            *accepting = false;
+            self.delivery_tasks.close();
+        }
+        if tokio::time::timeout(TURN_DELIVERY_SHUTDOWN_GRACE, self.delivery_tasks.wait())
+            .await
+            .is_err()
+        {
+            self.delivery_shutdown.cancel();
+            self.delivery_tasks.wait().await;
+        }
+    }
+
     pub(crate) async fn send_server_notification_to_connection_and_wait(
         &self,
         connection_id: ConnectionId,
@@ -719,6 +922,166 @@ impl OutgoingMessageSender {
     }
 }
 
+async fn collect_turn_delivery_outcomes(
+    receipts: Vec<PendingTurnDeliveryReceipt>,
+    dispatch_started: Instant,
+    receipt_deadline: tokio::time::Instant,
+    post_core_dispatch_latency_ms: Option<u64>,
+    delivery_shutdown: CancellationToken,
+) -> Vec<TurnDeliveryOutcome> {
+    let mut pending = FuturesUnordered::new();
+    for receipt in receipts {
+        let delivery_shutdown = delivery_shutdown.clone();
+        pending.push(async move {
+            if let Some(kind) = receipt.immediate_outcome {
+                return TurnDeliveryOutcome {
+                    connection_id: receipt.connection_id,
+                    kind,
+                    successful_elapsed_ms: None,
+                    post_core_delivery_latency_ms: None,
+                };
+            }
+            let Some(receiver) = receipt.receiver else {
+                return TurnDeliveryOutcome {
+                    connection_id: receipt.connection_id,
+                    kind: TurnDeliveryOutcomeKind::Failure,
+                    successful_elapsed_ms: None,
+                    post_core_delivery_latency_ms: None,
+                };
+            };
+            let receipt_result = tokio::select! {
+                biased;
+                result = tokio::time::timeout_at(receipt_deadline, receiver) => Some(result),
+                _ = delivery_shutdown.cancelled() => None,
+            };
+            match receipt_result {
+                Some(Ok(Ok(()))) => {
+                    let successful_elapsed_ms = elapsed_millis(dispatch_started);
+                    TurnDeliveryOutcome {
+                        connection_id: receipt.connection_id,
+                        kind: TurnDeliveryOutcomeKind::Success,
+                        successful_elapsed_ms: Some(successful_elapsed_ms),
+                        post_core_delivery_latency_ms: post_core_dispatch_latency_ms.map(
+                            |dispatch_latency_ms| {
+                                dispatch_latency_ms.saturating_add(successful_elapsed_ms)
+                            },
+                        ),
+                    }
+                }
+                Some(Ok(Err(_))) => TurnDeliveryOutcome {
+                    connection_id: receipt.connection_id,
+                    kind: TurnDeliveryOutcomeKind::Failure,
+                    successful_elapsed_ms: None,
+                    post_core_delivery_latency_ms: None,
+                },
+                Some(Err(_)) => TurnDeliveryOutcome {
+                    connection_id: receipt.connection_id,
+                    kind: TurnDeliveryOutcomeKind::Timeout,
+                    successful_elapsed_ms: None,
+                    post_core_delivery_latency_ms: None,
+                },
+                None => TurnDeliveryOutcome {
+                    connection_id: receipt.connection_id,
+                    kind: TurnDeliveryOutcomeKind::ShutdownCancelled,
+                    successful_elapsed_ms: None,
+                    post_core_delivery_latency_ms: None,
+                },
+            }
+        });
+    }
+
+    let mut outcomes = Vec::with_capacity(pending.len());
+    while let Some(outcome) = pending.next().await {
+        outcomes.push(outcome);
+    }
+    outcomes.sort_unstable_by_key(|outcome| outcome.connection_id.0);
+    outcomes
+}
+
+fn aggregate_turn_delivery(
+    thread_id: ThreadId,
+    turn_id: String,
+    origin_connection_id: Option<ConnectionId>,
+    outcomes: Vec<TurnDeliveryOutcome>,
+) -> TurnDeliveryFact {
+    let origin_outcome = origin_connection_id.and_then(|origin| {
+        outcomes
+            .iter()
+            .find(|outcome| outcome.connection_id == origin)
+    });
+    let origin_target_present = origin_outcome.is_some();
+    let origin_delivery_status = match origin_outcome.map(|outcome| outcome.kind) {
+        None => TurnDeliveryStatus::NotTargeted,
+        Some(TurnDeliveryOutcomeKind::Success) => TurnDeliveryStatus::Success,
+        Some(TurnDeliveryOutcomeKind::Failure) => TurnDeliveryStatus::Failure,
+        Some(TurnDeliveryOutcomeKind::Timeout) => TurnDeliveryStatus::Timeout,
+        Some(TurnDeliveryOutcomeKind::ShutdownCancelled) => TurnDeliveryStatus::ShutdownCancelled,
+    };
+    let success_count = outcomes
+        .iter()
+        .filter(|outcome| outcome.kind == TurnDeliveryOutcomeKind::Success)
+        .count();
+    let failure_count = outcomes
+        .iter()
+        .filter(|outcome| {
+            matches!(
+                outcome.kind,
+                TurnDeliveryOutcomeKind::Failure | TurnDeliveryOutcomeKind::ShutdownCancelled
+            )
+        })
+        .count();
+    let timeout_count = outcomes
+        .iter()
+        .filter(|outcome| outcome.kind == TurnDeliveryOutcomeKind::Timeout)
+        .count();
+    let shutdown_cancelled_count = outcomes
+        .iter()
+        .filter(|outcome| outcome.kind == TurnDeliveryOutcomeKind::ShutdownCancelled)
+        .count();
+    let first_successful_elapsed_ms = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.successful_elapsed_ms)
+        .min();
+    let last_successful_elapsed_ms = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.successful_elapsed_ms)
+        .max();
+    let first_post_core_delivery_latency_ms = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.post_core_delivery_latency_ms)
+        .min();
+    let last_post_core_delivery_latency_ms = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.post_core_delivery_latency_ms)
+        .max();
+
+    TurnDeliveryFact {
+        thread_id: thread_id.to_string(),
+        turn_id,
+        target_count: count_u32(outcomes.len()),
+        success_count: count_u32(success_count),
+        failure_count: count_u32(failure_count),
+        timeout_count: count_u32(timeout_count),
+        shutdown_cancelled_count: count_u32(shutdown_cancelled_count),
+        origin_target_present,
+        origin_delivery_status,
+        origin_successful_elapsed_ms: origin_outcome
+            .and_then(|outcome| outcome.successful_elapsed_ms),
+        first_successful_elapsed_ms,
+        last_successful_elapsed_ms,
+        first_post_core_delivery_latency_ms,
+        last_post_core_delivery_latency_ms,
+    }
+}
+
+fn count_u32(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 fn now_unix_timestamp_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -751,7 +1114,11 @@ mod tests {
     use codex_app_server_protocol::RateLimitWindow;
     use codex_app_server_protocol::ServerResponse;
     use codex_app_server_protocol::ToolRequestUserInputParams;
+    use codex_app_server_protocol::Turn;
+    use codex_app_server_protocol::TurnCompletedNotification;
+    use codex_app_server_protocol::TurnItemsView;
     use codex_app_server_protocol::TurnModerationMetadataNotification;
+    use codex_app_server_protocol::TurnStatus;
     use codex_protocol::ThreadId;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -760,6 +1127,24 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    fn turn_completed_notification(thread_id: ThreadId, turn_id: &str) -> ServerNotification {
+        ServerNotification::TurnCompleted(TurnCompletedNotification {
+            thread_id: thread_id.to_string(),
+            turn: Turn {
+                id: turn_id.to_string(),
+                items: Vec::new(),
+                items_view: TurnItemsView::NotLoaded,
+                error: None,
+                status: TurnStatus::Completed,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+            },
+            completion: None,
+            timing: None,
+        })
+    }
 
     #[test]
     fn verify_server_notification_serialization() {
@@ -1195,6 +1580,135 @@ mod tests {
             .await
             .expect("send task should finish after write completion is signaled")
             .expect("send task should not panic");
+    }
+
+    #[tokio::test]
+    async fn terminal_dispatch_freezes_sorts_and_deduplicates_targets() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let thread_id = ThreadId::new();
+        let scoped = ThreadScopedOutgoingMessageSender::new(
+            outgoing.clone(),
+            vec![ConnectionId(3), ConnectionId(1), ConnectionId(3)],
+            thread_id,
+        );
+
+        scoped
+            .send_server_notification_with_receipts(
+                turn_completed_notification(thread_id, "turn-1"),
+                Some(ConnectionId(3)),
+            )
+            .await;
+
+        for expected_connection_id in [ConnectionId(1), ConnectionId(3)] {
+            let envelope = timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("terminal dispatch should arrive before timeout")
+                .expect("terminal dispatch channel should stay open");
+            let OutgoingEnvelope::ToConnection {
+                connection_id,
+                message,
+                write_complete_tx,
+            } = envelope
+            else {
+                panic!("terminal notification must use targeted dispatch");
+            };
+            assert_eq!(connection_id, expected_connection_id);
+            assert!(matches!(
+                message,
+                OutgoingMessage::AppServerNotification(ServerNotification::TurnCompleted(_))
+            ));
+            write_complete_tx
+                .expect("terminal dispatch must request a writer receipt")
+                .send(())
+                .expect("receipt collector should still be waiting");
+        }
+        assert!(rx.try_recv().is_err(), "no duplicate dispatch is allowed");
+        outgoing.shutdown_delivery_tasks().await;
+    }
+
+    #[test]
+    fn turn_delivery_aggregation_preserves_origin_and_broadcast_semantics() {
+        let thread_id = ThreadId::new();
+        let fact = aggregate_turn_delivery(
+            thread_id,
+            "turn-1".to_string(),
+            Some(ConnectionId(3)),
+            vec![
+                TurnDeliveryOutcome {
+                    connection_id: ConnectionId(1),
+                    kind: TurnDeliveryOutcomeKind::Success,
+                    successful_elapsed_ms: Some(7),
+                    post_core_delivery_latency_ms: Some(17),
+                },
+                TurnDeliveryOutcome {
+                    connection_id: ConnectionId(2),
+                    kind: TurnDeliveryOutcomeKind::Timeout,
+                    successful_elapsed_ms: None,
+                    post_core_delivery_latency_ms: None,
+                },
+                TurnDeliveryOutcome {
+                    connection_id: ConnectionId(3),
+                    kind: TurnDeliveryOutcomeKind::Success,
+                    successful_elapsed_ms: Some(11),
+                    post_core_delivery_latency_ms: Some(21),
+                },
+                TurnDeliveryOutcome {
+                    connection_id: ConnectionId(4),
+                    kind: TurnDeliveryOutcomeKind::ShutdownCancelled,
+                    successful_elapsed_ms: None,
+                    post_core_delivery_latency_ms: None,
+                },
+            ],
+        );
+
+        assert_eq!(fact.thread_id, thread_id.to_string());
+        assert_eq!(fact.turn_id, "turn-1");
+        assert_eq!(fact.target_count, 4);
+        assert_eq!(fact.success_count, 2);
+        assert_eq!(fact.failure_count, 1);
+        assert_eq!(fact.timeout_count, 1);
+        assert_eq!(fact.shutdown_cancelled_count, 1);
+        assert!(fact.origin_target_present);
+        assert_eq!(fact.origin_delivery_status, TurnDeliveryStatus::Success);
+        assert_eq!(fact.origin_successful_elapsed_ms, Some(11));
+        assert_eq!(fact.first_successful_elapsed_ms, Some(7));
+        assert_eq!(fact.last_successful_elapsed_ms, Some(11));
+        assert_eq!(fact.first_post_core_delivery_latency_ms, Some(17));
+        assert_eq!(fact.last_post_core_delivery_latency_ms, Some(21));
+    }
+
+    #[tokio::test]
+    async fn receipt_collection_marks_pending_targets_shutdown_cancelled() {
+        let (_write_complete_tx, write_complete_rx) = oneshot::channel();
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let outcomes = collect_turn_delivery_outcomes(
+            vec![PendingTurnDeliveryReceipt {
+                connection_id: ConnectionId(9),
+                receiver: Some(write_complete_rx),
+                immediate_outcome: None,
+            }],
+            Instant::now(),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            Some(5),
+            shutdown,
+        )
+        .await;
+
+        assert_eq!(
+            outcomes,
+            vec![TurnDeliveryOutcome {
+                connection_id: ConnectionId(9),
+                kind: TurnDeliveryOutcomeKind::ShutdownCancelled,
+                successful_elapsed_ms: None,
+                post_core_delivery_latency_ms: None,
+            }]
+        );
     }
 
     #[tokio::test]

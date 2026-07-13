@@ -28,6 +28,7 @@ use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
+use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
 use codex_tools::ToolSpec;
@@ -348,6 +349,10 @@ pub(super) fn resolve_command_shell(
 }
 
 impl CoreToolRuntime for ShellCommandHandler {
+    fn tool_execution_timing(&self) -> ToolExecutionTiming {
+        ToolExecutionTiming::NestedRuntime
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

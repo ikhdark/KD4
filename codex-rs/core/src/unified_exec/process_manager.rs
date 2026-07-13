@@ -34,6 +34,7 @@ use crate::tools::runtimes::unified_exec::UnifiedExecRuntime;
 use crate::tools::sandboxing::SandboxAttempt;
 use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
+use crate::turn_timing::TurnLocalPhase;
 use crate::unified_exec::ExecCommandRequest;
 use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
 use crate::unified_exec::MAX_YIELD_TIME_MS;
@@ -51,7 +52,7 @@ use crate::unified_exec::async_watcher::lagged_output_marker;
 use crate::unified_exec::async_watcher::omitted_output_marker;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
 use crate::unified_exec::async_watcher::start_streaming_output;
-use crate::unified_exec::clamp_yield_time;
+use crate::unified_exec::clamp_yield_time_for_readiness;
 use crate::unified_exec::generate_chunk_id;
 use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use crate::unified_exec::process::OutputBuffer;
@@ -439,9 +440,14 @@ impl UnifiedExecProcessManager {
         context: &UnifiedExecContext,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let cwd = request.cwd.clone();
+        let executor_readiness_timing_guard = context
+            .turn
+            .turn_timing_state
+            .begin_local_phase(TurnLocalPhase::ExecutorReadinessWait);
         let process = self
             .open_session_with_sandbox(&request, cwd.clone(), context)
             .await;
+        drop(executor_readiness_timing_guard);
 
         let (process, mut deferred_network_approval) = match process {
             Ok((process, deferred_network_approval)) => {
@@ -452,6 +458,9 @@ impl UnifiedExecProcessManager {
                 return Err(err);
             }
         };
+        let executor_was_ready =
+            self.deferred_executor_enabled && self.executor_ready.swap(true, Ordering::AcqRel);
+        let tool_execution_timing_guard = context.turn.turn_timing_state.begin_tool_execution();
         if let Some(deferred) = deferred_network_approval.as_ref() {
             terminate_process_on_network_denial(
                 Arc::clone(&process),
@@ -507,7 +516,8 @@ impl UnifiedExecProcessManager {
             None
         };
 
-        let yield_time_ms = clamp_yield_time(request.yield_time_ms);
+        let yield_time_ms =
+            clamp_yield_time_for_readiness(request.yield_time_ms, executor_was_ready);
         // For the initial exec_command call, we both stream output to events
         // (via start_streaming_output above) and collect a snapshot here for
         // the tool response body.
@@ -529,6 +539,7 @@ impl UnifiedExecProcessManager {
             deadline,
         )
         .await;
+        drop(tool_execution_timing_guard);
         let wall_time = Instant::now().saturating_duration_since(start);
 
         let text = String::from_utf8_lossy(&collected).to_string();

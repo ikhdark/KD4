@@ -239,9 +239,11 @@ pub(crate) async fn execute_user_shell_command(
         tx_event: session.get_tx_event(),
     });
 
+    let standalone_work_guard = turn_context.turn_timing_state.begin_standalone_work();
     let exec_result = execute_exec_request(exec_env, stdout_stream, /*after_spawn*/ None)
         .or_cancel(&cancellation_token)
         .await;
+    drop(standalone_work_guard);
 
     match exec_result {
         Err(CancelErr::Cancelled) => {

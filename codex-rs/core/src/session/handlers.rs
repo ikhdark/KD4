@@ -6,6 +6,7 @@ use crate::realtime_conversation::handle_text as handle_realtime_conversation_te
 use async_channel::Receiver;
 use codex_otel::set_parent_from_w3c_trace_context;
 use codex_protocol::protocol::Submission;
+use std::time::Duration;
 use tracing::Instrument;
 use tracing::debug_span;
 use tracing::info_span;
@@ -597,11 +598,19 @@ pub async fn set_thread_memory_mode(sess: &Arc<Session>, sub_id: String, mode: T
 }
 
 async fn shutdown_session_runtime(sess: &Arc<Session>) {
+    sess.begin_shutdown();
     if let Some(startup_prewarm) = sess.take_session_startup_prewarm().await {
         startup_prewarm.abort().await;
     }
     let _ = sess.conversation.shutdown().await;
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+    sess.terminal_tasks.close();
+    if tokio::time::timeout(Duration::from_secs(10), sess.terminal_tasks.wait())
+        .await
+        .is_err()
+    {
+        warn!("timed out waiting for turn terminal finalization during session shutdown");
+    }
     sess.services
         .unified_exec_manager
         .terminate_all_processes()

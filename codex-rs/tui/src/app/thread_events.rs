@@ -417,6 +417,7 @@ mod tests {
                 duration_ms: Some(1),
                 ..test_turn(turn_id, status, Vec::new())
             },
+            timing: None,
         })
     }
 

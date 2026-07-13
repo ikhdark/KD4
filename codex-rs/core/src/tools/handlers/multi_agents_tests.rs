@@ -1563,6 +1563,7 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
                 duration_ms: None,
                 time_to_first_token_ms: None,
                 completion: None,
+                timing: None,
             }),
         )
         .await;
@@ -2013,6 +2014,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
                 duration_ms: None,
                 time_to_first_token_ms: None,
                 completion: None,
+                timing: None,
             }),
         )
         .await;
@@ -2055,6 +2057,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
                 duration_ms: None,
                 time_to_first_token_ms: None,
                 completion: None,
+                timing: None,
             }),
         )
         .await;
@@ -2216,6 +2219,7 @@ async fn multi_agent_v2_interrupted_turn_does_not_notify_parent() {
                 reason: TurnAbortReason::Interrupted,
                 completed_at: None,
                 duration_ms: None,
+                timing: None,
             }),
         )
         .await;

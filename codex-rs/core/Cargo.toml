@@ -169,3 +169,7 @@ zstd = { workspace = true }
 
 [package.metadata.cargo-shear]
 ignored = ["openssl-sys"]
+
+[[bench]]
+name = "turn_latency"
+harness = false

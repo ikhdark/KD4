@@ -71,6 +71,7 @@ impl SessionTask for ReviewTask {
         }
 
         // Start sub-codex conversation and get the receiver for events.
+        let standalone_work_guard = ctx.turn_timing_state.begin_standalone_work();
         let output = match start_review_conversation(
             session.clone(),
             ctx.clone(),
@@ -82,6 +83,7 @@ impl SessionTask for ReviewTask {
             Some(receiver) => process_review_events(session.clone(), ctx.clone(), receiver).await,
             None => None,
         };
+        drop(standalone_work_guard);
         if !cancellation_token.is_cancelled() {
             exit_review_mode(session.clone_session(), output.clone(), ctx.clone()).await;
         }

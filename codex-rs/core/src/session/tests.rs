@@ -131,6 +131,7 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::NetworkApprovalProtocol;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::RateLimitWindow;
+use codex_protocol::protocol::RawResponseItemEvent;
 use codex_protocol::protocol::RealtimeAudioFrame;
 use codex_protocol::protocol::RealtimeConversationListVoicesResponseEvent;
 use codex_protocol::protocol::RealtimeVoice;
@@ -488,6 +489,7 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
         reason,
         completed_at,
         duration_ms,
+        timing,
     }) = second.msg
     else {
         panic!("expected turn aborted event");
@@ -496,6 +498,7 @@ async fn interrupting_regular_turn_waiting_on_startup_prewarm_emits_turn_aborted
     assert_eq!(reason, TurnAbortReason::Interrupted);
     assert!(completed_at.is_some());
     assert!(duration_ms.is_some());
+    assert!(timing.is_some());
 }
 
 fn test_model_client_session() -> crate::client::ModelClientSession {
@@ -1754,7 +1757,7 @@ async fn record_initial_history_reconstructs_resumed_transcript() {
 
 #[tokio::test]
 async fn record_conversation_items_stamps_missing_turn_id_and_preserves_existing_turn_id() {
-    let (session, turn_context) = make_session_and_context().await;
+    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
     let fresh_item = user_message("fresh");
     let mut existing_item = assistant_message("existing");
     existing_item.set_turn_id_if_missing("older-turn");
@@ -1770,6 +1773,13 @@ async fn record_conversation_items_stamps_missing_turn_id_and_preserves_existing
         session.clone_history().await.raw_items(),
         expected_items.as_slice()
     );
+    for expected in expected_items {
+        let event = rx.recv().await.expect("ordered raw response item event");
+        assert!(matches!(
+            event.msg,
+            EventMsg::RawResponseItem(RawResponseItemEvent { item }) if item == expected
+        ));
+    }
 }
 
 #[tokio::test]
@@ -3137,6 +3147,7 @@ async fn record_initial_history_forked_hydrates_previous_turn_settings() {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             },
         )),
     ];
@@ -3338,6 +3349,7 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
             duration_ms: None,
             time_to_first_token_ms: None,
             completion: None,
+            timing: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
@@ -3368,6 +3380,7 @@ async fn thread_rollback_recomputes_previous_turn_settings_and_reference_context
             duration_ms: None,
             time_to_first_token_ms: None,
             completion: None,
+            timing: None,
         })),
     ])
     .await;
@@ -3458,6 +3471,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
             duration_ms: None,
             time_to_first_token_ms: None,
             completion: None,
+            timing: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
@@ -3483,6 +3497,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
             duration_ms: None,
             time_to_first_token_ms: None,
             completion: None,
+            timing: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
@@ -3516,6 +3531,7 @@ async fn thread_rollback_restores_cleared_reference_context_item_after_compactio
             duration_ms: None,
             time_to_first_token_ms: None,
             completion: None,
+            timing: None,
         })),
     ])
     .await;
@@ -3590,6 +3606,7 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
             duration_ms: None,
             time_to_first_token_ms: None,
             completion: None,
+            timing: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
@@ -3618,6 +3635,7 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
             duration_ms: None,
             time_to_first_token_ms: None,
             completion: None,
+            timing: None,
         })),
         RolloutItem::EventMsg(EventMsg::TurnStarted(
             codex_protocol::protocol::TurnStartedEvent {
@@ -3646,6 +3664,7 @@ async fn thread_rollback_persists_marker_and_replays_cumulatively() {
             duration_ms: None,
             time_to_first_token_ms: None,
             completion: None,
+            timing: None,
         })),
     ])
     .await;
@@ -5460,6 +5479,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let services = SessionServices {
         mcp_connection_manager: Arc::new(arc_swap::ArcSwap::from(mcp_runtime.manager_arc())),
         mcp_runtime: arc_swap::ArcSwapOption::from(Some(mcp_runtime)),
+        planning_generation: std::sync::atomic::AtomicU64::new(1),
         mcp_projection_lock: Mutex::new(()),
         mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
         unified_exec_manager: UnifiedExecProcessManager::new(
@@ -5578,6 +5598,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         "turn_id".to_string(),
         skills_snapshot,
     );
+    let startup_timing = crate::startup_timing::StartupTimingState::new(thread_id.to_string());
     let session = Session {
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
@@ -5590,11 +5611,15 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         pending_mcp_server_refresh_config: Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
+        startup_timing: Arc::clone(&startup_timing),
+        terminal_tasks: tokio_util::task::TaskTracker::new(),
+        shutting_down: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     };
+    startup_timing.finish_session_initialization();
 
     (session, turn_context)
 }
@@ -7593,6 +7618,7 @@ where
     let services = SessionServices {
         mcp_connection_manager: Arc::new(arc_swap::ArcSwap::from(mcp_runtime.manager_arc())),
         mcp_runtime: arc_swap::ArcSwapOption::from(Some(mcp_runtime)),
+        planning_generation: std::sync::atomic::AtomicU64::new(1),
         mcp_projection_lock: Mutex::new(()),
         mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
         unified_exec_manager: UnifiedExecProcessManager::new(
@@ -7711,6 +7737,7 @@ where
         "turn_id".to_string(),
         skills_snapshot,
     ));
+    let startup_timing = crate::startup_timing::StartupTimingState::new(thread_id.to_string());
     let session = Arc::new(Session {
         thread_id,
         installation_id: "11111111-1111-4111-8111-111111111111".to_string(),
@@ -7723,11 +7750,15 @@ where
         pending_mcp_server_refresh_config: Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
+        startup_timing: Arc::clone(&startup_timing),
+        terminal_tasks: tokio_util::task::TaskTracker::new(),
+        shutting_down: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     });
+    startup_timing.finish_session_initialization();
 
     (session, turn_context, rx_event)
 }
@@ -9249,6 +9280,32 @@ impl SessionTask for CompletingTask {
     }
 }
 
+#[derive(Clone)]
+struct SignalCompletingTask {
+    finish: CancellationToken,
+}
+
+impl SessionTask for SignalCompletingTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.signal_completing"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<SessionTaskContext>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        _cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        self.finish.cancelled().await;
+        Ok(None)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalEventKind {
     TurnComplete,
@@ -9363,6 +9420,38 @@ impl SessionTask for NeverEndingTask {
         loop {
             sleep(Duration::from_secs(60)).await;
         }
+    }
+}
+
+#[derive(Clone)]
+struct BlockingAbortTask {
+    abort_started: Arc<tokio::sync::Notify>,
+    release_abort: CancellationToken,
+}
+
+impl SessionTask for BlockingAbortTask {
+    fn kind(&self) -> TaskKind {
+        TaskKind::Regular
+    }
+
+    fn span_name(&self) -> &'static str {
+        "session_task.blocking_abort"
+    }
+
+    async fn run(
+        self: Arc<Self>,
+        _session: Arc<SessionTaskContext>,
+        _ctx: Arc<TurnContext>,
+        _input: Vec<TurnInput>,
+        cancellation_token: CancellationToken,
+    ) -> SessionTaskResult {
+        cancellation_token.cancelled().await;
+        Ok(None)
+    }
+
+    async fn abort(&self, _session: Arc<SessionTaskContext>, _ctx: Arc<TurnContext>) {
+        self.abort_started.notify_one();
+        self.release_abort.cancelled().await;
     }
 }
 
@@ -9648,8 +9737,144 @@ async fn abort_gracefully_emits_marker_before_turn_aborted() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn abort_caller_cancellation_does_not_cancel_claimed_terminal_finalizer() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let abort_started = Arc::new(tokio::sync::Notify::new());
+    let release_abort = CancellationToken::new();
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        BlockingAbortTask {
+            abort_started: Arc::clone(&abort_started),
+            release_abort: release_abort.clone(),
+        },
+    )
+    .await;
+    let terminal = sess
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|active_turn| active_turn.terminal.clone())
+        .expect("active turn should expose terminal coordinator");
+
+    let abort_caller = tokio::spawn({
+        let sess = Arc::clone(&sess);
+        async move {
+            sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+        }
+    });
+    timeout(Duration::from_secs(2), abort_started.notified())
+        .await
+        .expect("tracked finalizer should claim the turn and enter abort cleanup");
+    abort_caller.abort();
+    assert!(
+        abort_caller
+            .await
+            .expect_err("abort caller should be cancelled")
+            .is_cancelled()
+    );
+
+    release_abort.cancel();
+    timeout(Duration::from_secs(2), terminal.wait_completed())
+        .await
+        .expect("session-owned finalizer should survive caller cancellation");
+    let event = recv_terminal_event(&rx, TerminalEventKind::TurnAborted).await;
+    assert!(matches!(
+        event.msg,
+        EventMsg::TurnAborted(TurnAbortedEvent {
+            reason: TurnAbortReason::Interrupted,
+            ..
+        })
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panic_after_terminal_claim_uses_fail_safe_terminal_outcome() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        NeverEndingTask {
+            kind: TaskKind::Regular,
+            listen_to_cancellation_token: true,
+        },
+    )
+    .await;
+    let terminal = sess
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|active_turn| active_turn.terminal.clone())
+        .expect("active turn should expose terminal coordinator");
+    terminal.request_panic_before_worker_cancellation();
+
+    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    let event = recv_terminal_event(&rx, TerminalEventKind::TurnAborted).await;
+    assert!(matches!(
+        event.msg,
+        EventMsg::TurnAborted(TurnAbortedEvent {
+            reason: TurnAbortReason::Interrupted,
+            ..
+        })
+    ));
+    assert!(sess.active_turn.lock().await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_task_tracker_shutdown_waits_for_running_finalizer() {
+    let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let abort_started = Arc::new(tokio::sync::Notify::new());
+    let release_abort = CancellationToken::new();
+    sess.spawn_task(
+        Arc::clone(&tc),
+        Vec::new(),
+        BlockingAbortTask {
+            abort_started: Arc::clone(&abort_started),
+            release_abort: release_abort.clone(),
+        },
+    )
+    .await;
+
+    let abort_caller = tokio::spawn({
+        let sess = Arc::clone(&sess);
+        async move {
+            sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
+        }
+    });
+    timeout(Duration::from_secs(2), abort_started.notified())
+        .await
+        .expect("finalizer should enter abort cleanup");
+    sess.terminal_tasks.close();
+    let mut tracker_wait = tokio::spawn({
+        let sess = Arc::clone(&sess);
+        async move {
+            sess.terminal_tasks.wait().await;
+        }
+    });
+    assert!(
+        timeout(Duration::from_millis(50), &mut tracker_wait)
+            .await
+            .is_err(),
+        "closing the tracker must not abandon a running finalizer"
+    );
+
+    release_abort.cancel();
+    abort_caller.await.expect("abort caller should finish");
+    timeout(Duration::from_secs(2), &mut tracker_wait)
+        .await
+        .expect("tracker should drain after finalizer completion")
+        .expect("tracker waiter should not panic");
+    let event = recv_terminal_event(&rx, TerminalEventKind::TurnAborted).await;
+    assert!(matches!(event.msg, EventMsg::TurnAborted(_)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
+    let finish = CancellationToken::new();
     let input = vec![TurnInput::UserInput {
         content: vec![UserInput::Text {
             text: "hello".to_string(),
@@ -9660,9 +9885,8 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     sess.spawn_task(
         Arc::clone(&tc),
         input,
-        NeverEndingTask {
-            kind: TaskKind::Regular,
-            listen_to_cancellation_token: false,
+        SignalCompletingTask {
+            finish: finish.clone(),
         },
     )
     .await;
@@ -9687,8 +9911,15 @@ async fn task_finish_emits_turn_item_lifecycle_for_leftover_pending_user_input()
     .await
     .expect("steer pending input into active turn");
 
-    sess.on_task_finished(Arc::clone(&tc), /*task_result*/ Ok(None))
-        .await;
+    let terminal = sess
+        .active_turn
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|active_turn| active_turn.terminal.clone())
+        .expect("active turn should expose its terminal coordinator");
+    finish.cancel();
+    terminal.wait_completed().await;
 
     let history = sess.clone_history().await;
     let expected = ResponseItem::Message {
@@ -9855,6 +10086,26 @@ async fn thread_idle_lifecycle_waits_for_trigger_turn_mailbox_work() {
     session.emit_thread_idle_lifecycle_if_idle().await;
 
     assert_eq!(0, calls.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn shutdown_latch_prevents_pending_mailbox_turn_restart() {
+    let (sess, _turn_context, _rx) = make_session_and_context_with_rx().await;
+    sess.input_queue
+        .enqueue_mailbox_communication(InterAgentCommunication::new(
+            AgentPath::root(),
+            AgentPath::root(),
+            Vec::new(),
+            "pending during shutdown".to_string(),
+            /*trigger_turn*/ true,
+        ))
+        .await;
+
+    sess.begin_shutdown();
+    sess.maybe_start_turn_for_pending_work().await;
+
+    assert!(sess.active_turn.lock().await.is_none());
+    assert!(sess.input_queue.has_trigger_turn_mailbox_items().await);
 }
 
 #[tokio::test]

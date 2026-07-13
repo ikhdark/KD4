@@ -89,7 +89,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         (
             "max_output_tokens".to_string(),
             JsonSchema::number(Some(
-                "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy.".to_string(),
+                "Output token budget. Defaults adaptively to 4000 tokens for success, 8000 for failure/timeout, and up to 10000 for high-signal diagnostics; larger requests may be capped by policy.".to_string(),
             )),
         ),
     ]);
@@ -164,7 +164,7 @@ pub fn create_write_stdin_tool() -> ToolSpec {
         (
             "max_output_tokens".to_string(),
             JsonSchema::number(Some(
-                "Output token budget. Defaults to 10000 tokens; larger requests may be capped by policy.".to_string(),
+                "Output token budget. Defaults adaptively to 4000 tokens for success, 8000 for failure/timeout, and up to 10000 for high-signal diagnostics; larger requests may be capped by policy.".to_string(),
             )),
         ),
     ]);

@@ -1887,6 +1887,7 @@ fn append_interrupted_boundary(
         reason: TurnAbortReason::Interrupted,
         completed_at: None,
         duration_ms: None,
+        timing: None,
     }));
 
     match history {

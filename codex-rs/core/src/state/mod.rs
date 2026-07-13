@@ -15,3 +15,5 @@ pub(crate) use turn::PendingRequestPermissions;
 pub(crate) use turn::RunningTask;
 pub(crate) use turn::TaskKind;
 pub(crate) use turn::TurnState;
+pub(crate) use turn::TurnTerminalCoordinator;
+pub(crate) use turn::TurnTerminalPermit;

@@ -10,6 +10,7 @@ use crate::tools::handlers::request_user_input_spec::normalize_request_user_inpu
 use crate::tools::handlers::request_user_input_spec::request_user_input_tool_description;
 use crate::tools::handlers::request_user_input_spec::request_user_input_unavailable_message;
 use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::request_user_input::RequestUserInputArgs;
@@ -92,7 +93,11 @@ impl RequestUserInputHandler {
     }
 }
 
-impl CoreToolRuntime for RequestUserInputHandler {}
+impl CoreToolRuntime for RequestUserInputHandler {
+    fn tool_execution_timing(&self) -> ToolExecutionTiming {
+        ToolExecutionTiming::Interactive
+    }
+}
 
 #[cfg(test)]
 #[path = "request_user_input_tests.rs"]

@@ -1,5 +1,6 @@
 use super::*;
 use crate::mcp::McpRuntimeProjection;
+use crate::turn_timing::InteractiveWaitKind;
 use codex_exec_server::ResolvedSelectedCapabilityRoot;
 use codex_mcp::ElicitationReviewRequest;
 use codex_mcp::ElicitationReviewer;
@@ -279,6 +280,9 @@ impl Session {
                     plugin_install_telemetry.tool_name.as_str(),
                 );
         }
+        let _interactive_wait_guard = turn_context
+            .turn_timing_state
+            .begin_interactive_wait(InteractiveWaitKind::McpElicitation);
         McpServerElicitationOutcome {
             response: rx_response.await.ok(),
             sent: true,

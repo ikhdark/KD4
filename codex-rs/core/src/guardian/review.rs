@@ -23,6 +23,7 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio::time::sleep_until;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -63,6 +64,7 @@ const GUARDIAN_TIMEOUT_INSTRUCTIONS: &str = concat!(
 );
 
 const GUARDIAN_REVIEW_MAX_ATTEMPTS: i64 = 3;
+const GUARDIAN_REVIEW_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 pub(crate) fn new_guardian_review_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -598,18 +600,20 @@ pub(crate) async fn review_approval_request(
     request: GuardianApprovalRequest,
     retry_reason: Option<String>,
 ) -> ReviewDecision {
-    // Box the delegated review future so callers do not inline the entire
-    // guardian session state machine into their own async stack.
-    Box::pin(run_guardian_review(
+    let cancel_token = CancellationToken::new();
+    let cancel_guard = cancel_token.clone().drop_guard();
+    let review_rx = spawn_approval_request_review(
         Arc::clone(session),
         Arc::clone(turn),
         review_id,
         request,
         retry_reason,
         GuardianApprovalRequestSource::MainTurn,
-        /*external_cancel*/ None,
-    ))
-    .await
+        cancel_token,
+    );
+    let decision = review_rx.await.unwrap_or_default();
+    drop(cancel_guard);
+    decision
 }
 
 pub(crate) async fn review_approval_request_with_cancel(
@@ -643,25 +647,31 @@ pub(crate) fn spawn_approval_request_review(
     cancel_token: CancellationToken,
 ) -> oneshot::Receiver<ReviewDecision> {
     let (tx, rx) = oneshot::channel();
-    std::thread::spawn(move || {
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        else {
-            let _ = tx.send(ReviewDecision::Denied);
-            return;
-        };
-        let decision = runtime.block_on(review_approval_request_with_cancel(
-            &session,
-            &turn,
-            review_id,
-            request,
-            retry_reason,
-            approval_request_source,
-            cancel_token,
-        ));
-        let _ = tx.send(decision);
-    });
+    if let Err(err) = std::thread::Builder::new()
+        .name("codex-guardian-review".to_string())
+        .stack_size(GUARDIAN_REVIEW_THREAD_STACK_SIZE)
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                let _ = tx.send(ReviewDecision::Denied);
+                return;
+            };
+            let decision = runtime.block_on(review_approval_request_with_cancel(
+                &session,
+                &turn,
+                review_id,
+                request,
+                retry_reason,
+                approval_request_source,
+                cancel_token,
+            ));
+            let _ = tx.send(decision);
+        })
+    {
+        warn!(%err, "failed to spawn guardian review thread");
+    }
     rx
 }
 

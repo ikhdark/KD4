@@ -895,6 +895,7 @@ mod tests {
             &ServerNotification::TurnCompleted(TurnCompletedNotification {
                 thread_id: "thread-1".to_string(),
                 completion: None,
+                timing: None,
                 turn: Turn {
                     id: "turn-1".to_string(),
                     items: Vec::new(),

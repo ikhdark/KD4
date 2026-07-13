@@ -678,6 +678,7 @@ mod tests {
                 completed_at: Some(0),
                 duration_ms: Some(1),
             },
+            timing: None,
         })
     }
 

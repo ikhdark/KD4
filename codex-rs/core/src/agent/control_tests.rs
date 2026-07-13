@@ -354,6 +354,7 @@ async fn on_event_updates_status_from_task_complete() {
         duration_ms: None,
         time_to_first_token_ms: None,
         completion: None,
+        timing: None,
     }));
     let expected = AgentStatus::Completed(Some("done".to_string()));
     assert_eq!(status, Some(expected));
@@ -377,6 +378,7 @@ async fn on_event_updates_status_from_turn_aborted() {
         reason: TurnAbortReason::Interrupted,
         completed_at: None,
         duration_ms: None,
+        timing: None,
     }));
 
     let expected = AgentStatus::Interrupted;
@@ -2031,6 +2033,7 @@ async fn multi_agent_v2_completion_ignores_dead_direct_parent() {
                 duration_ms: None,
                 time_to_first_token_ms: None,
                 completion: None,
+                timing: None,
             }),
         )
         .await;
@@ -2119,6 +2122,7 @@ async fn multi_agent_v2_completion_queues_message_for_direct_parent() {
                 duration_ms: None,
                 time_to_first_token_ms: None,
                 completion: None,
+                timing: None,
             }),
         )
         .await;

@@ -1,6 +1,6 @@
 # Repository policy
 
-Shared policy revision: `2026-07-12`.
+Shared policy revision: `2026-07-13`.
 
 ## Synchronization contract
 
@@ -11,15 +11,15 @@ This root policy is synchronized with:
 - `C:\Users\kuh\Desktop\mdpwa-main\AGENTS.md`
 - `C:\Users\kuh\Desktop\kds-main\AGENTS.md`
 
-Every byte outside the project-context block delimited below must remain
-identical across all four files. Only that block may contain repository-specific
-identity, ownership, commands, validation, runtime, safety, install, or protected
+Every byte outside the project-context block below must remain identical across
+all four files. Only that block may contain repository-specific identity,
+ownership, commands, validation, runtime, installation, safety, or protected
 path details.
 
-When a shared rule changes, update all four files in the same task, keep the
-shared policy revision aligned, and compare normalized copies after replacing
-each project-context block with the same sentinel. Never add a repository-specific
-exception outside that block or change only one shared copy.
+When a shared rule changes, update all four files in the same task, align the
+shared revision, and compare normalized copies after replacing each
+project-context block with the same sentinel. Do not place repository-specific
+exceptions outside that block.
 
 ## Project context
 
@@ -101,163 +101,169 @@ exception outside that block or change only one shared copy.
 
 ## Instruction scope
 
-This file applies repository-wide. Before editing, discover instruction files
-from the repository root with `rg --files --hidden -g AGENTS.md` and read the
-closest applicable file. A nearer `AGENTS.md` augments this policy and takes
-precedence within its subtree. Never rely on an instruction file that is absent
+This file applies repository-wide.
+
+Before editing, locate applicable instructions with:
+
+```text
+rg --files --hidden -g AGENTS.md
+```
+
+Read the closest relevant `AGENTS.md`. A nearer file augments this policy and
+takes precedence inside its subtree. Do not rely on instruction files absent
 from the working tree.
 
-Keep shared workflow rules in the synchronized portion of this root file. Keep
-durable repository-specific rules inside the project-context block or the
-nearest nested `AGENTS.md`. README and other documentation files are not loaded
-automatically as instructions; promote operational editing rules into the
-closest `AGENTS.md` and keep documentation focused on usage, architecture, and
-background.
+Keep shared rules in the synchronized root portion, durable repository-specific
+rules inside the project-context block, and subtree-specific rules in the
+nearest nested `AGENTS.md`. README and background documentation are not loaded
+automatically as instructions.
 
-Use the ownership maps and source-of-truth documents named in the project
-context when ownership is ambiguous, the task is cross-cutting, or a
-runtime-to-package/install path must be traced. For a clear local owner, prefer
-the nearest scoped instructions and owner documentation.
+Use ownership maps or source-of-truth documents when ownership is ambiguous,
+the change is cross-cutting, or a runtime-to-install path must be traced. For a
+clear local owner, do not expand into unrelated ownership documents.
 
 ## Operating defaults
 
-- For top-N, ranking, brainstorm, optimization-list, review, recommendation, or
-  "what would you fix" requests, return findings or ranked candidates first and
-  do not edit until the user clearly asks for implementation.
-- When implementing, ignore unrelated dirty-worktree changes, untracked files,
-  generated artifacts, and failures outside the accepted task scope.
-- If task-relevant changes overlap existing local edits or duplicate
-  implementations, stop and compare them. Keep or produce the stronger
-  compatible path without reverting unrelated work.
-- Verify drift-prone repository facts before relying on them, including remotes,
-  upstream tracking, the current branch, installed paths, available recipes,
-  generated artifact freshness, and active runtime or process paths.
-- Prefer focused source changes with matching focused validation. Do not mix
-  cleanup, behavior changes, dependency changes, generated outputs, or release
-  work unless one requires another.
-- Preserve established public, product, and compatibility behavior unless the
-  user explicitly requests a change. Call out changes to public interfaces,
-  stored data, configuration, security, install, rollout, or runtime behavior.
-- Do not touch patch guards, stale-read or preflight behavior, approval,
-  permission, sandbox, validation, test-gating, or execution-safety behavior as
-  part of unrelated work unless the user names that surface.
-- If an accepted task exposes a fixable issue that directly prevents the change
-  from being complete, durable, or correctly validated, fix it within the same
-  natural ownership boundary. Report broader or unrelated issues separately.
-- Use durable harness, plan, log, eval, QA, handoff, or multi-agent artifacts
-  only when the user explicitly requests them or a nearer instruction file
-  explicitly requires them.
+Use the smallest investigation, edit, communication, and validation that safely
+completes the request.
 
-## Task lanes
+- For clear implementation requests, start work without announcing a lane,
+  plan, tool sequence, or validation intent.
+- Do not narrate routine searches, edits, or successful checks. Report only a
+  material scope expansion, conflicting task-relevant edits, a blocker, a
+  safety or compatibility decision, or information the user requested.
+- Do not ask for confirmation when the request is clear and safe.
+- For reviews, rankings, brainstorms, recommendations, or “what would you fix”
+  requests, return findings first and do not edit until the user asks.
+- Ignore unrelated dirty-worktree changes, untracked files, generated outputs,
+  and failures outside the accepted scope.
+- Preserve unrelated local edits. If the target overlaps competing local work,
+  compare the versions, keep the compatible task-relevant behavior, and avoid
+  overwriting unrelated changes.
+- Verify drift-prone facts only when the task depends on them. Examples include
+  the current branch, remotes, installed paths, active processes, available
+  recipes, and generated-artifact freshness.
+- Do not mix cleanup, optional refactoring, dependency changes, formatting
+  churn, release work, or generated-output changes into a focused fix unless
+  one is required for correctness.
+- Preserve established public, stored-data, configuration, security,
+  installation, and compatibility behavior unless the user requests a change.
+- Do not alter approval, permission, sandbox, patch-guard, stale-read,
+  validation-gating, or execution-safety behavior as part of unrelated work.
+- Use durable plans, harnesses, logs, evals, QA artifacts, handoffs, or
+  multi-agent workflows only when the user asks or a nearer instruction file
+  requires them.
 
-Choose the lightest lane that safely satisfies the request, then escalate as
-soon as inspection reveals higher risk. Before non-trivial implementation work,
-state the selected lane and validation intent briefly.
+## Fast implementation path
 
-| Lane | Use when | Minimum evidence |
-| --- | --- | --- |
-| Conversation | Casual Q&A, explanation, brainstorming, or non-coding prompts | Do not inspect the repository unless the answer depends on current files or repository behavior. |
-| Low-risk guidance | Documentation, instructions, comments, naming, or small non-runtime cleanup | Inspect the target and nearest `AGENTS.md`, review the focused diff, and use `git diff --check` when allowed and whitespace risk exists. |
-| Focused code | Narrow implementation, debugging, refactoring, integration, migration, review, audit, configuration, or repository behavior with a clear owner | Inspect the owner, nearest call path, relevant configuration or docs, and nearest tests; run the smallest allowed check that proves the touched behavior. |
-| Runtime-critical | Safety surfaces, generated artifacts, lockfiles, shared protocol or schema contracts, publish/install or user-visible runtime behavior, dependencies, broad refactors, or unclear ownership | Crosscheck the complete owning path and run the applicable generated-artifact, local-build, publish/install, or runtime proof. |
+Use this path for a bounded change with a clear owner:
 
-## Repository evidence and change workflow
+1. Read the nearest applicable instructions.
+2. Inspect the owning file and the smallest relevant surrounding code.
+3. Trace at most one relevant caller, callee, registry, configuration owner, or
+   installation hop when the connection is not already clear.
+4. Inspect the nearest relevant test or existing reproduction.
+5. Patch as soon as the defect or missing behavior is understood.
+6. Review the focused diff.
+7. Run the smallest check that proves the changed behavior.
+8. Stop when the requested behavior is implemented and proven.
 
-Use this workflow for implementation, debugging, refactoring, code review,
-code audit, integration, migration, configuration, or repository-behavior
-tasks. Do not apply it to casual Q&A unless the user requests a rigorous pass.
+Do not scan the entire repository “just in case.” Do not enumerate every
+entrypoint before editing a bounded owner. Do not repeatedly reread large files
+after patching; inspect the focused diff and targeted context instead.
 
-- Do not answer from memory when a claim depends on repository behavior.
-- Identify the smallest authoritative file set, then trace one relevant hop
-  through callers, registries, configuration or schema owners, tests, docs, and
-  install descriptors that can affect the requested path.
-- Externalize assumptions, invariants, inspected evidence, and validation intent
-  when they affect correctness.
-- For implementation work, update the complete normal runtime, discovery, or
-  install path. Check replaced and parallel paths so stale behavior does not
-  still win.
-- Do not leave task-relevant TODOs, stubs, placeholders, inert registrations, or
-  mismatched docs and tests in the intended path.
-- For bug fixes, identify the failing path and the nearest allowed validation
-  that exercises the corrected behavior.
-- For reviews and audits, state the inspected scope and keep findings within it.
-- For broad claims such as "all", "every", "complete", or "repo-wide", perform
-  an appropriate closure sweep. If the sweep is partial, state the exact scope
-  and remaining risk.
+A focused implementation should normally use one inspection pass, one edit
+pass, and one validation pass. When validation fails, diagnose that failure and
+rerun only the invalidated check. Do not restart the investigation or broaden
+the suite unless the failure reveals a wider owner or contract.
 
-## Completion and wiring gate
+Expand beyond the fast path only when evidence shows that the change affects a
+shared protocol, schema, generated artifact, lockfile, dependency, public API,
+persistence format, security boundary, installation path, multiple runtime
+registries, or unclear ownership.
 
-Before claiming an implementation is complete, verify all of the following:
+If a new required owner appears after editing, inspect and update that owner.
+Do not announce routine scope growth unless it materially changes risk, public
+behavior, or the amount of requested work.
 
-- the intended runtime or workflow path is identified and reaches the change;
-- expected callers, registrations, configuration, and replaced or parallel
-  paths were checked;
-- no new or task-relevant placeholder or stub remains in the changed code or
-  intended path;
-- the nearest practical, authorized validation ran, or its skip reason is
-  explicit.
+## Correctness and completion
 
-When Wiring Guard/KDWG is available for implementation work, use it as the
-static reachability proof layer: declare intent before implementation-shaped
-edits and run its check before a completion claim. For docs, templates,
-planning, packaging, or configuration-only work with no executable call path,
-use the current owned docs-only opt-out or no-wiring-target mechanism with a
-specific reason. Static wiring proof does not replace behavior validation.
+For implementation work:
 
-Final implementation answers must report the completion gate (`passed`,
-`partial`, or `blocked`), wiring proof, validation run, and remaining unverified
-risk. Do not claim completion when the gate is partial or blocked, or when the
-wiring verdict does not support it.
+- Change the complete intended path, including a directly competing or replaced
+  path that would otherwise continue winning at runtime.
+- Do not leave task-relevant TODOs, placeholders, stubs, inert registrations, or
+  known mismatches in the intended path.
+- For bug fixes, prefer the original failing test, reproduction, or nearest
+  owner test as proof.
+- For broad claims such as “all,” “every,” “complete,” or “repo-wide,” perform a
+  closure search appropriate to that claim. Do not perform a repo-wide closure
+  sweep for a bounded request.
+
+Use Wiring Guard/KDWG when a change adds, moves, removes, replaces, or reconnects
+executable paths, commands, hooks, registrations, configuration-driven
+discovery, or installation wiring. Run its check after the final relevant edit.
+
+Do not run Wiring Guard for:
+
+- documentation, instructions, templates, plans, or other text-only changes;
+- internal logic-only changes whose runtime path and registration are
+  unchanged and whose behavior is proven by focused tests; or
+- generated output that is owned and verified by its generator.
+
+A nearer instruction file may require Wiring Guard for additional cases. Static
+wiring proof does not replace behavior validation.
 
 ## Validation
 
-Follow the repository-specific authorization and commands in the project
-context. If the user or project context forbids tests, validation, browser
-automation, command execution, or another check, honor that restriction and
-state what was skipped. Static Wiring Guard checks remain allowed unless command
-execution is also forbidden.
+Use the nearest sufficient proof and stop when it passes.
 
-- Use the nearest sufficient proof. Stop when the smallest relevant checks prove
-  the changed path.
-- For docs or guidance, review the focused diff and use `git diff --check` when
-  allowed and applicable.
-- For behavior changes, prefer the closest owner test or focused runtime path.
-- For schema, protocol, generated artifact, lockfile, package, or install
-  changes, identify the owning contract and use its generator or official
-  recipe rather than hand-editing outputs.
-- Do not stack build, test, lint, format, audit, publish, install, and runtime
-  checks unless each proves a distinct required claim.
-- Use broad repository or CI-parity tiers only when the user requests them,
-  when preparing a PR or release, when reproducing a broad CI failure, or when
-  shared executable behavior cannot be bounded by focused checks.
-- Tooling success alone does not prove a runtime bug is fixed. Require the
-  focused failing test or the applicable user-visible/runtime evidence.
+- Documentation or instruction wording: review the focused diff and use
+  `git diff --check` only when whitespace or patch integrity is relevant.
+- Behavior changes: run the closest owner test, focused test selection, or
+  direct runtime reproduction.
+- Schema, protocol, package, lockfile, generated artifact, or installation
+  changes: use the owning generator or official recipe.
+- Do not stack build, test, lint, format, audit, install, smoke, and runtime
+  checks unless each proves a distinct claim required by the task.
+- Do not rerun an already-green source check unless a covered source or input
+  changed.
+- Documentation, installation, generated inventory updates, and unrelated dirty
+  paths do not invalidate a green source check unless they are declared inputs
+  to that check.
+- If unrelated dirty work blocks a focused proof, try supported scope or
+  baseline isolation once. If that fails, report the limitation without
+  broadening opt-outs or rerunning equivalent command variants.
+- Tool success alone does not prove a runtime defect is fixed. Require the
+  focused failing test or applicable user-visible/runtime evidence.
+
+Final responses should state only:
+
+- what materially changed;
+- the validation that ran; and
+- any known task-scope risk that remains.
+
+Do not add a formal lane, completion-gate classification, wiring report, or
+risk section when there is no unresolved risk.
 
 ## Tool use
 
-- Before non-trivial tool work, send one brief preamble grouping the next
-  actions.
-- Use `rg` or `rg --files` first for text and file discovery. Use `fd` when its
-  path predicates materially help.
-- Prefer installed purpose-built tools when they fit: `jq`/`yq` for structured
-  data, `delta` for diffs, `ast-grep` for syntax-aware search, `just` before
-  lower-level build/test/publish commands, `cargo nextest`/`cargo shear`/
-  `cargo audit`/`cargo deny` for applicable Rust workflows, `taplo`/`dprint`
-  for configured formatting, and `hyperfine`/`tokei` for measurement.
-- Use `apply_patch` for manual edits. Formatting and clearly mechanical bulk
-  rewrites may use the owning formatter or generator.
+- Use `rg` or `rg --files` for normal text and file discovery. Use `fd`,
+  `ast-grep`, `jq`, `yq`, or another purpose-built tool only when it materially
+  simplifies the task.
+- Prefer repository-owned recipes such as `just`, configured formatters,
+  generators, and focused test commands over improvised equivalents.
+- Use `apply_patch` for manual edits. Use an owning formatter or generator for
+  clearly mechanical rewrites.
 - Never publish, install globally, stage, commit, push, or open a pull request
   unless the user asks.
-- Do not re-read large files unnecessarily after a successful patch; inspect
-  targeted diffs instead.
 
-## Protected and generated material
+## Protected and sensitive material
 
 Do not hand-edit generated files, vendored code, lockfiles, build outputs,
-installed caches, or private runtime data unless the source change requires
-regeneration or the owning workflow explicitly requires the update. Use the
-project-context owners and protected-path list.
+installed caches, or private runtime data unless the source change or owning
+workflow requires it.
 
 Never expose secrets, tokens, environment values, private resident or user data,
-raw logs, or sensitive runtime state in source, docs, issues, pull requests, or
-chat. Reference variable names and privacy-safe summaries when needed.
+raw logs, or sensitive runtime state in source, documentation, issues, pull
+requests, or chat. Reference variable names and privacy-safe summaries instead.

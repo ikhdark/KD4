@@ -87,6 +87,7 @@ fn turn_completed(turn_id: &str) -> RolloutItem {
         duration_ms: None,
         time_to_first_token_ms: None,
         completion: None,
+        timing: None,
     }))
 }
 

@@ -307,6 +307,7 @@ async fn run_compact_task_inner_impl(
                         e,
                     )
                     .await;
+                    let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
                     tokio::time::sleep(delay).await;
                     continue;
                 } else {
@@ -665,7 +666,8 @@ async fn drain_to_completed(
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
 ) -> CodexResult<()> {
-    let mut stream = client_session
+    let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
+    let stream_result = client_session
         .stream(
             prompt,
             &turn_context.model_info,
@@ -678,15 +680,23 @@ async fn drain_to_completed(
             // are left untraced until the reducer has a first-class local compaction lifecycle.
             &InferenceTraceContext::disabled(),
         )
-        .await?;
+        .await;
+    drop(model_request_timing_guard);
+    let mut stream = stream_result?;
     loop {
+        let model_stream_wait_timing_guard =
+            turn_context.turn_timing_state.begin_model_stream_wait();
         let maybe_event = stream.next().await;
+        drop(model_stream_wait_timing_guard);
         let Some(event) = maybe_event else {
             return Err(CodexErr::Stream(
                 "stream closed before response.completed".into(),
                 None,
             ));
         };
+        let _model_stream_processing_timing_guard = turn_context
+            .turn_timing_state
+            .begin_model_stream_processing();
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
                 sess.record_conversation_items(turn_context, std::slice::from_ref(&item))

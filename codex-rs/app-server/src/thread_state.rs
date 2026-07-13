@@ -18,6 +18,7 @@ use codex_rollout::state_db::StateDbHandle;
 use codex_utils_path_uri::LegacyAppPathString;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
@@ -28,6 +29,99 @@ use tokio::sync::watch;
 use tracing::error;
 
 type PendingInterruptQueue = Vec<ConnectionRequestId>;
+const MAX_TRACKED_TURN_ORIGINS: usize = 256;
+
+#[derive(Default)]
+struct TurnOriginState {
+    by_turn_id: HashMap<String, ConnectionId>,
+    insertion_order: VecDeque<String>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct TurnOriginTracker {
+    state: Arc<StdMutex<TurnOriginState>>,
+}
+
+pub(crate) struct TurnOriginReservation {
+    tracker: TurnOriginTracker,
+    turn_id: String,
+    connection_id: ConnectionId,
+    committed: bool,
+}
+
+impl TurnOriginTracker {
+    pub(crate) fn reserve(
+        &self,
+        turn_id: String,
+        connection_id: ConnectionId,
+    ) -> TurnOriginReservation {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .by_turn_id
+            .insert(turn_id.clone(), connection_id)
+            .is_none()
+        {
+            state.insertion_order.push_back(turn_id.clone());
+        }
+        while state.insertion_order.len() > MAX_TRACKED_TURN_ORIGINS {
+            if let Some(expired_turn_id) = state.insertion_order.pop_front() {
+                state.by_turn_id.remove(&expired_turn_id);
+            }
+        }
+        drop(state);
+        TurnOriginReservation {
+            tracker: self.clone(),
+            turn_id,
+            connection_id,
+            committed: false,
+        }
+    }
+
+    fn take(&self, turn_id: &str) -> Option<ConnectionId> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let connection_id = state.by_turn_id.remove(turn_id);
+        if connection_id.is_some() {
+            state
+                .insertion_order
+                .retain(|candidate| candidate != turn_id);
+        }
+        connection_id
+    }
+
+    fn remove_if_matches(&self, turn_id: &str, connection_id: ConnectionId) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.by_turn_id.get(turn_id) == Some(&connection_id) {
+            state.by_turn_id.remove(turn_id);
+            state
+                .insertion_order
+                .retain(|candidate| candidate != turn_id);
+        }
+    }
+}
+
+impl TurnOriginReservation {
+    pub(crate) fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for TurnOriginReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.tracker
+                .remove_if_matches(&self.turn_id, self.connection_id);
+        }
+    }
+}
 
 pub(crate) struct PendingThreadResumeRequest {
     pub(crate) request_id: ConnectionRequestId,
@@ -72,6 +166,7 @@ pub(crate) struct TurnSummary {
     pub(crate) started_at: Option<i64>,
     pub(crate) command_execution_started: HashSet<String>,
     pub(crate) last_error: Option<TurnError>,
+    pub(crate) origin_connection_id: Option<ConnectionId>,
 }
 
 #[derive(Default)]
@@ -86,6 +181,7 @@ pub(crate) struct ThreadState {
     last_thread_settings: Option<ThreadSettings>,
     listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
     current_turn_history: ThreadHistoryBuilder,
+    turn_origin_tracker: TurnOriginTracker,
     listener_thread: Option<Weak<CodexThread>>,
     watch_registration: WatchRegistration,
 }
@@ -144,6 +240,7 @@ impl ThreadState {
     pub(crate) fn track_current_turn_event(&mut self, event_turn_id: &str, event: &EventMsg) {
         if let EventMsg::TurnStarted(payload) = event {
             self.turn_summary.started_at = payload.started_at;
+            self.turn_summary.origin_connection_id = self.turn_origin_tracker.take(event_turn_id);
         }
         self.current_turn_history.handle_event(event);
         if matches!(event, EventMsg::TurnAborted(_) | EventMsg::TurnComplete(_))
@@ -152,6 +249,10 @@ impl ThreadState {
             self.last_terminal_turn_id = Some(event_turn_id.to_string());
             self.current_turn_history.reset();
         }
+    }
+
+    pub(crate) fn turn_origin_tracker(&self) -> TurnOriginTracker {
+        self.turn_origin_tracker.clone()
     }
 
     pub(crate) fn note_thread_settings(&mut self, thread_settings: ThreadSettings) -> bool {
@@ -219,6 +320,42 @@ mod tests {
         ];
 
         assert_eq!(results, vec![true, false, true, false]);
+    }
+
+    #[test]
+    fn turn_started_claims_the_origin_reserved_for_its_canonical_id() {
+        let mut state = ThreadState::default();
+        let turn_id = "turn-1".to_string();
+        state
+            .turn_origin_tracker()
+            .reserve(turn_id.clone(), ConnectionId(7))
+            .commit();
+
+        state.track_current_turn_event(
+            &turn_id,
+            &EventMsg::TurnStarted(codex_protocol::protocol::TurnStartedEvent {
+                turn_id: turn_id.clone(),
+                trace_id: None,
+                started_at: Some(42),
+                model_context_window: None,
+                collaboration_mode_kind: ModeKind::Default,
+            }),
+        );
+
+        assert_eq!(
+            state.turn_summary.origin_connection_id,
+            Some(ConnectionId(7))
+        );
+        assert_eq!(state.turn_summary.started_at, Some(42));
+    }
+
+    #[test]
+    fn cancelled_turn_origin_reservation_is_removed() {
+        let tracker = TurnOriginTracker::default();
+        let reservation = tracker.reserve("turn-1".to_string(), ConnectionId(7));
+        drop(reservation);
+
+        assert_eq!(tracker.take("turn-1"), None);
     }
 
     fn thread_settings(model: &str) -> ThreadSettings {

@@ -49,6 +49,7 @@ impl ChatWidget {
                             completed_at,
                             duration_ms,
                         },
+                        timing: None,
                     },
                     Some(replay_kind),
                 );

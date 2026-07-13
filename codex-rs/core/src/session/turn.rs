@@ -4,8 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use crate::SkillInjections;
-use crate::build_skill_injections;
+use crate::apply_skill_injection_observability;
 use crate::client::ModelClientSession;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
@@ -27,13 +26,23 @@ use crate::hook_runtime::run_turn_stop_hooks;
 use crate::injection::ToolMentionKind;
 use crate::injection::app_id_from_path;
 use crate::injection::tool_kind_for_path;
-use crate::mcp_skill_dependencies::maybe_prompt_and_install_mcp_dependencies;
+use crate::mcp_skill_dependencies::McpDependencyEffectOutcome;
+use crate::mcp_skill_dependencies::PlannedMcpDependencyEffect;
+use crate::mcp_skill_dependencies::apply_mcp_dependency_effect;
+use crate::mcp_skill_dependencies::inventory_contains_expected;
+use crate::mcp_skill_dependencies::plan_mcp_dependencies;
 use crate::mcp_tool_exposure::build_mcp_tool_exposure;
 use crate::mentions::build_connector_slug_counts;
 use crate::mentions::build_skill_name_counts;
 use crate::mentions::collect_explicit_app_ids;
 use crate::mentions::collect_explicit_plugin_mentions;
 use crate::mentions::collect_tool_mentions_from_messages;
+use crate::pending_turn_plan::CompletedEffect;
+use crate::pending_turn_plan::EffectImpact;
+use crate::pending_turn_plan::FixedPointPlanningState;
+use crate::pending_turn_plan::PlanningSnapshotIdentity;
+use crate::plan_skill_injections;
+use crate::plugins::PluginCapabilitySummary;
 use crate::plugins::build_plugin_injections;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
@@ -65,17 +74,21 @@ use crate::tools::router::extension_tool_executors;
 use crate::tools::spec_plan::search_tool_enabled;
 use crate::tools::spec_plan::tool_suggest_enabled;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use crate::turn_timing::TurnLocalPhase;
+use crate::turn_timing::TurnTimingGuard;
 use crate::turn_timing::record_turn_ttft_metric;
 use crate::util::error_or_panic;
 use codex_analytics::AppInvocation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
 use codex_analytics::InvocationType;
+use codex_analytics::TrackEventsContext;
 use codex_analytics::TurnResolvedConfigFact;
 use codex_analytics::build_track_events_context;
 use codex_async_utils::OrCancelExt;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
+use codex_core_skills::injection::PlannedSkillInjections;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
@@ -116,6 +129,8 @@ use codex_utils_stream_parser::strip_citations;
 use futures::future::BoxFuture;
 use futures::prelude::*;
 use futures::stream::FuturesOrdered;
+use sha2::Digest;
+use sha2::Sha256;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing::error;
@@ -148,41 +163,52 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
+    let mut preparation_timing_guard = Some(
+        turn_context
+            .turn_timing_state
+            .begin_local_phase(TurnLocalPhase::Preparation),
+    );
     let mut client_session =
         prewarmed_client_session.unwrap_or_else(|| sess.services.model_client.new_session());
-    // TODO(ccunningham): Pre-turn compaction runs before context updates and the
-    // new user message are recorded. Estimate pending incoming items (context
-    // diffs/full reinjection + user input) and trigger compaction preemptively
-    // when they would push the thread over the compaction threshold.
-    if let Err(err) = run_pre_sampling_compact(&sess, &turn_context, &mut client_session).await {
-        if matches!(err, CodexErr::TurnAborted) {
-            return Err(err);
+    let planning_timing_guard = turn_context
+        .turn_timing_state
+        .begin_local_phase(TurnLocalPhase::Planning);
+    let pending_turn_plan_result = stabilize_pending_turn_plan(
+        &sess,
+        &turn_context,
+        &input,
+        &mut client_session,
+        &cancellation_token,
+    )
+    .await;
+    drop(planning_timing_guard);
+    let pending_turn_plan = match pending_turn_plan_result {
+        Ok(plan) => plan,
+        Err(err) => {
+            if matches!(err, CodexErr::TurnAborted) {
+                return Err(err);
+            }
+            let error = err.to_codex_protocol_error();
+            sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
+                .await;
+            error!("Pending-turn planning failed before persistence or model send: {err}");
+            return Ok(None);
         }
-        let error = err.to_codex_protocol_error();
-        sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
-            .await;
-        error!("Failed to run pre-sampling compact");
-        return Ok(None);
-    }
+    };
+    let PendingTurnPlan {
+        step_context: first_step_context,
+        first_router,
+        injection_items,
+        explicitly_enabled_connectors,
+        ..
+    } = pending_turn_plan;
 
-    // run_turn owns the step used to seed context and make the first sampling request.
-    let first_step_context = sess.capture_step_context(Arc::clone(&turn_context)).await;
-    // Keep the exact model-visible state used by this turn and its inline compactions.
+    // Pending-turn planning is now stable and all required effects have completed.
+    // Only now may normal turn persistence begin.
     let (mut world_state, display_roots) = tokio::join!(
         sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
         turn_diff_display_roots(turn_context.as_ref()),
     );
-
-    let Some((injection_items, explicitly_enabled_connectors)) = build_skills_and_plugins(
-        &sess,
-        first_step_context.as_ref(),
-        &input,
-        &cancellation_token,
-    )
-    .await
-    else {
-        return Ok(None);
-    };
 
     if run_pending_session_start_hooks(&sess, &turn_context).await {
         return Ok(None);
@@ -200,9 +226,16 @@ pub(crate) async fn run_turn(
         realtime_active: Some(turn_context.realtime_active),
     }))
     .await;
-    for response_item in injection_items {
-        sess.record_conversation_items(&turn_context, std::slice::from_ref(&response_item))
-            .await;
+    if !injection_items.is_empty() {
+        if crate::latency_switches::stage3_persistence_history_enabled() {
+            sess.record_conversation_items(&turn_context, &injection_items)
+                .await;
+        } else {
+            for item in &injection_items {
+                sess.record_conversation_items(&turn_context, std::slice::from_ref(item))
+                    .await;
+            }
+        }
     }
 
     track_turn_resolved_config_analytics(&sess, &turn_context, &input).await;
@@ -223,6 +256,7 @@ pub(crate) async fn run_turn(
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
 
     let mut next_step_context = Some(first_step_context);
+    let mut first_router = Some(first_router);
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
@@ -290,6 +324,8 @@ pub(crate) async fn run_turn(
                 &mut client_session,
                 &responses_metadata,
                 sampling_request_input,
+                &mut first_router,
+                &mut preparation_timing_guard,
                 cancellation_token.child_token(),
             )
             .await
@@ -558,20 +594,35 @@ async fn run_hooks_and_record_inputs(
     blocked_input && !accepted_user_input
 }
 
+struct PendingTurnPlan {
+    identity: PlanningSnapshotIdentity,
+    step_context: Arc<StepContext>,
+    first_router: Arc<ToolRouter>,
+    injection_items: Vec<ResponseItem>,
+    explicitly_enabled_connectors: HashSet<String>,
+    pending_token_estimate: i64,
+    mcp_dependency_effect: Option<PlannedMcpDependencyEffect>,
+    warnings: Vec<String>,
+    skill_plan: PlannedSkillInjections,
+    tracking: TrackEventsContext,
+    mentioned_apps: Vec<(String, Option<String>)>,
+    mentioned_plugins: Vec<PluginCapabilitySummary>,
+}
+
+enum PendingTurnPlanBuild {
+    Stale,
+    Ready(PendingTurnPlan),
+}
+
 #[instrument(level = "trace", skip_all)]
-async fn build_skills_and_plugins(
+async fn build_pure_pending_turn_plan(
     sess: &Arc<Session>,
-    step_context: &StepContext,
+    step_context: Arc<StepContext>,
     input: &[TurnInput],
     cancellation_token: &CancellationToken,
-) -> Option<(Vec<ResponseItem>, HashSet<String>)> {
+) -> CodexResult<PendingTurnPlanBuild> {
     let turn_context = step_context.turn.as_ref();
-    // Guardian input embeds the parent transcript as untrusted evidence. Do not interpret skill or
-    // plugin mentions from that generated prompt as requests to inject additional instructions.
-    if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
-        return Some((Vec::new(), HashSet::new()));
-    }
-
+    let generation = sess.services.planning_generation();
     let user_input = input
         .iter()
         .filter_map(|item| match item {
@@ -587,31 +638,68 @@ async fn build_skills_and_plugins(
         turn_context.sub_id.clone(),
         turn_context.originator.clone(),
     );
-    let loaded_plugins = sess
-        .services
-        .plugins_manager
-        .plugins_for_config(&turn_context.config.plugins_config_input())
-        .await;
-    // Structured plugin:// mentions are resolved from the current session's
-    // enabled plugins, then converted into turn-scoped guidance below.
+
+    if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
+        let (history_items, first_router) = tokio::join!(
+            async {
+                sess.clone_history()
+                    .await
+                    .for_prompt(&turn_context.model_info.input_modalities)
+            },
+            built_tools(sess.as_ref(), step_context.as_ref(), cancellation_token)
+        );
+        let first_router = first_router?;
+        let identity = PlanningSnapshotIdentity {
+            generation,
+            state_digest: planning_state_digest(
+                step_context.as_ref(),
+                &[],
+                &[],
+                &[],
+                &[],
+                &user_input,
+                first_router.as_ref(),
+                &history_items,
+            ),
+        };
+        return Ok(PendingTurnPlanBuild::Ready(PendingTurnPlan {
+            identity,
+            step_context,
+            first_router,
+            injection_items: Vec::new(),
+            explicitly_enabled_connectors: HashSet::new(),
+            pending_token_estimate: estimate_pending_tokens(&user_input, &[]),
+            mcp_dependency_effect: None,
+            warnings: Vec::new(),
+            skill_plan: PlannedSkillInjections::default(),
+            tracking,
+            mentioned_apps: Vec::new(),
+            mentioned_plugins: Vec::new(),
+        }));
+    }
+
+    // Read-only DAG roots P and E are independent. Extension contributors poll
+    // concurrently internally and collect by registration index.
+    let plugins_config_input = turn_context.config.plugins_config_input();
+    let (loaded_plugins, extension_injection_items) = tokio::join!(
+        sess.services
+            .plugins_manager
+            .plugins_for_config(&plugins_config_input),
+        build_extension_turn_input_items(sess, turn_context, &user_input, cancellation_token)
+    );
+    let extension_injection_items = extension_injection_items?;
+    // DAG edge P -> plugin mentions. Connector inventory C waits for P because
+    // plugin mentions can make inventory necessary even when apps are disabled.
     let mentioned_plugins =
         collect_explicit_plugin_mentions(&user_input, loaded_plugins.capability_summaries());
     let connector_snapshot = step_context.mcp.config().connector_snapshot.clone();
     let mcp_tools = if turn_context.apps_enabled() || !mentioned_plugins.is_empty() {
-        // Plugin mentions need raw MCP/app inventory even when app tools
-        // are normally hidden so we can describe the plugin's currently
-        // usable capabilities for this turn.
-        match step_context
+        step_context
             .mcp
             .manager_arc()
             .list_all_tools()
             .or_cancel(cancellation_token)
-            .await
-        {
-            Ok(mcp_tools) => mcp_tools,
-            Err(_) if turn_context.apps_enabled() => return None,
-            Err(_) => Vec::new(),
-        }
+            .await?
     } else {
         Vec::new()
     };
@@ -627,11 +715,10 @@ async fn build_skills_and_plugins(
     } else {
         Vec::new()
     };
+
+    // C -> SK: connector names disambiguate plaintext skill mentions.
     let skills_outcome = turn_context.turn_skills.snapshot.outcome();
     let connector_slug_counts = build_connector_slug_counts(&available_connectors);
-    let extension_injection_items =
-        build_extension_turn_input_items(sess, turn_context, &user_input, cancellation_token)
-            .await?;
     let skill_name_counts_lower =
         build_skill_name_counts(&skills_outcome.skills, &skills_outcome.disabled_paths).1;
     let mentioned_skills = collect_explicit_skill_mentions(
@@ -640,39 +727,18 @@ async fn build_skills_and_plugins(
         &skills_outcome.disabled_paths,
         &connector_slug_counts,
     );
-    maybe_prompt_and_install_mcp_dependencies(
-        sess,
-        turn_context,
-        cancellation_token,
-        &mentioned_skills,
-        Some(sess.mcp_elicitation_reviewer()),
-    )
-    .await;
-
-    let injected_host_skill_prompts = turn_context
-        .extension_data
-        .get::<InjectedHostSkillPrompts>();
-    let SkillInjections {
-        items: skill_injections,
-        warnings: skill_warnings,
-    } = build_skill_injections(
-        &mentioned_skills,
-        Some(skills_outcome),
-        Some(&turn_context.session_telemetry),
-        &sess.services.analytics_events_client,
-        tracking.clone(),
-    )
-    .await;
-
-    for message in skill_warnings {
-        sess.send_event(turn_context, EventMsg::Warning(WarningEvent { message }))
-            .await;
-    }
-
-    let skill_items: Vec<ResponseItem> = skill_injections
+    // Once SK is resolved, inventory-effect planning and pure skill materialization
+    // are independent and remain side-effect free.
+    let (planned_mcp, skill_plan) = tokio::join!(
+        plan_mcp_dependencies(sess, turn_context, &mentioned_skills),
+        plan_skill_injections(&mentioned_skills, Some(skills_outcome))
+    );
+    let skill_items = skill_plan
+        .injections
+        .items
         .iter()
         .map(|skill| ContextualUserFragment::into(crate::context::SkillInstructions::from(skill)))
-        .collect();
+        .collect::<Vec<ResponseItem>>();
     let skill_connector_ids = collect_explicit_app_ids_from_skill_items(
         &skill_items,
         &available_connectors,
@@ -685,45 +751,403 @@ async fn build_skills_and_plugins(
     let connector_names_by_id = available_connectors
         .iter()
         .map(|connector| (connector.id.as_str(), connector.name.as_str()))
-        .collect::<HashMap<&str, &str>>();
-    let mentioned_app_invocations = explicitly_enabled_connectors
+        .collect::<HashMap<_, _>>();
+    let mentioned_apps = explicitly_enabled_connectors
         .iter()
-        .map(|connector_id| AppInvocation {
-            connector_id: Some(connector_id.clone()),
-            app_name: connector_names_by_id
-                .get(connector_id.as_str())
-                .map(|name| (*name).to_string()),
-            invocation_type: Some(InvocationType::Explicit),
+        .map(|connector_id| {
+            (
+                connector_id.clone(),
+                connector_names_by_id
+                    .get(connector_id.as_str())
+                    .map(|name| (*name).to_string()),
+            )
         })
         .collect::<Vec<_>>();
-    sess.services
-        .analytics_events_client
-        .track_app_mentioned(tracking.clone(), mentioned_app_invocations);
-    for summary in &mentioned_plugins {
-        if let Some(plugin) = sess
-            .services
-            .plugins_manager
-            .telemetry_metadata_for_capability_summary(summary)
-        {
-            sess.services
-                .analytics_events_client
-                .track_plugin_used(tracking.clone(), plugin);
-        }
-    }
+    let mut mentioned_apps = mentioned_apps;
+    mentioned_apps.sort_by(|left, right| left.0.cmp(&right.0));
 
-    let mut injection_items: Vec<ResponseItem> = match injected_host_skill_prompts {
-        Some(injected_host_skill_prompts) => skill_injections
+    let injected_host_skill_prompts = turn_context
+        .extension_data
+        .get::<InjectedHostSkillPrompts>();
+    let mut injection_items = match injected_host_skill_prompts {
+        Some(injected_host_skill_prompts) => skill_plan
+            .injections
+            .items
             .iter()
             .filter(|skill| !injected_host_skill_prompts.contains_path(&skill.path))
             .map(|skill| {
                 ContextualUserFragment::into(crate::context::SkillInstructions::from(skill))
             })
-            .collect(),
+            .collect::<Vec<_>>(),
         None => skill_items,
     };
     injection_items.extend(plugin_items);
     injection_items.extend(extension_injection_items);
-    Some((injection_items, explicitly_enabled_connectors))
+
+    // Final read-only DAG leaves: capture the model-visible history and build the
+    // router concurrently, then validate the generation before accepting either.
+    let (history_items, first_router) = tokio::join!(
+        async {
+            sess.clone_history()
+                .await
+                .for_prompt(&turn_context.model_info.input_modalities)
+        },
+        built_tools(sess.as_ref(), step_context.as_ref(), cancellation_token)
+    );
+    let first_router = first_router?;
+    if sess.services.planning_generation() != generation {
+        return Ok(PendingTurnPlanBuild::Stale);
+    }
+    let mut warnings = planned_mcp.warnings;
+    warnings.extend(skill_plan.injections.warnings.iter().cloned());
+    let identity = PlanningSnapshotIdentity {
+        generation,
+        state_digest: planning_state_digest(
+            step_context.as_ref(),
+            &mcp_tools,
+            &available_connectors,
+            &mentioned_plugins,
+            &injection_items,
+            &user_input,
+            first_router.as_ref(),
+            &history_items,
+        ),
+    };
+    Ok(PendingTurnPlanBuild::Ready(PendingTurnPlan {
+        identity,
+        step_context,
+        first_router,
+        pending_token_estimate: estimate_pending_tokens(&user_input, &injection_items),
+        injection_items,
+        explicitly_enabled_connectors,
+        mcp_dependency_effect: planned_mcp.effect,
+        warnings,
+        skill_plan,
+        tracking,
+        mentioned_apps,
+        mentioned_plugins,
+    }))
+}
+
+async fn stabilize_pending_turn_plan(
+    sess: &Arc<Session>,
+    turn_context: &Arc<TurnContext>,
+    input: &[TurnInput],
+    client_session: &mut ModelClientSession,
+    cancellation_token: &CancellationToken,
+) -> CodexResult<PendingTurnPlan> {
+    let mut fixed_point = FixedPointPlanningState::default();
+    let mut check_previous_model_compaction = true;
+    loop {
+        if cancellation_token.is_cancelled() {
+            return Err(CodexErr::TurnAborted);
+        }
+
+        let completed_inventory_effects = fixed_point
+            .completed_inventory_effects()
+            .map(|(id, effect)| (id.to_string(), effect.expected_inventory_keys.clone()))
+            .collect::<Vec<_>>();
+        for (effect_id, expected_inventory_keys) in completed_inventory_effects {
+            if !inventory_contains_expected(
+                sess,
+                turn_context.config.as_ref(),
+                &expected_inventory_keys,
+            )
+            .await
+            {
+                return Err(planning_failure(format!(
+                    "completed inventory effect `{effect_id}` is missing its expected model-visible state"
+                )));
+            }
+        }
+
+        let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
+        let plan = match build_pure_pending_turn_plan(sess, step_context, input, cancellation_token)
+            .await?
+        {
+            PendingTurnPlanBuild::Stale => continue,
+            PendingTurnPlanBuild::Ready(plan) => plan,
+        };
+        fixed_point
+            .begin_iteration(&plan.identity)
+            .map_err(planning_failure)?;
+
+        // Compaction is maintenance of the pre-existing history, not persistence
+        // of this pending turn. Any compaction invalidates this pure plan and loops
+        // through a fresh snapshot before effects are applied.
+        let compaction_timing_guard = turn_context
+            .turn_timing_state
+            .begin_local_phase(TurnLocalPhase::Compaction);
+        let compacted = run_pre_sampling_compact(
+            sess,
+            turn_context,
+            client_session,
+            check_previous_model_compaction,
+            plan.pending_token_estimate,
+        )
+        .await?;
+        drop(compaction_timing_guard);
+        check_previous_model_compaction = false;
+        if compacted {
+            client_session.invalidate_incremental_history("compaction");
+            sess.services.bump_planning_generation();
+            continue;
+        }
+
+        if let Some(effect) = plan.mcp_dependency_effect.as_ref()
+            && fixed_point.completed(&effect.id).is_none()
+        {
+            let outcome = apply_mcp_dependency_effect(
+                sess,
+                turn_context,
+                cancellation_token,
+                effect,
+                Some(sess.mcp_elicitation_reviewer()),
+            )
+            .await
+            .map_err(|err| planning_failure(format!("effect `{}` failed: {err}", effect.id)))?;
+            let completed = match outcome {
+                McpDependencyEffectOutcome::Skipped => CompletedEffect {
+                    impact: EffectImpact::NonInvalidating,
+                    expected_inventory_keys: HashSet::new(),
+                },
+                McpDependencyEffectOutcome::InventoryChanged {
+                    expected_inventory_keys,
+                } => CompletedEffect {
+                    impact: EffectImpact::InvalidatesInventory,
+                    expected_inventory_keys,
+                },
+            };
+            let impact = completed.impact;
+            fixed_point
+                .record_completed(effect.id.clone(), completed)
+                .map_err(planning_failure)?;
+            if impact.invalidates_snapshot() {
+                client_session.invalidate_incremental_history("model-visible planning effect");
+                fixed_point
+                    .require_generation_advance(
+                        &plan.identity,
+                        sess.services.planning_generation(),
+                        impact,
+                    )
+                    .map_err(planning_failure)?;
+                continue;
+            }
+        }
+
+        for message in &plan.warnings {
+            let effect_id = semantic_effect_id("warning", std::slice::from_ref(message));
+            if fixed_point.completed(&effect_id).is_some() {
+                continue;
+            }
+            sess.send_event(
+                turn_context,
+                EventMsg::Warning(WarningEvent {
+                    message: message.clone(),
+                }),
+            )
+            .await;
+            fixed_point
+                .record_completed(
+                    effect_id,
+                    CompletedEffect {
+                        impact: EffectImpact::NonInvalidating,
+                        expected_inventory_keys: HashSet::new(),
+                    },
+                )
+                .map_err(planning_failure)?;
+        }
+
+        let skill_effect_values = plan
+            .skill_plan
+            .invocations
+            .iter()
+            .map(|invocation| {
+                format!(
+                    "{}:{}:{}",
+                    invocation.skill_name,
+                    invocation.skill_path.display(),
+                    invocation
+                        .plugin_id
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default()
+                )
+            })
+            .chain(
+                plan.skill_plan
+                    .metrics
+                    .iter()
+                    .map(|metric| format!("{}:{}", metric.skill_name, metric.status)),
+            )
+            .collect::<Vec<_>>();
+        if !skill_effect_values.is_empty() {
+            let effect_id = semantic_effect_id("skill_observability", &skill_effect_values);
+            if fixed_point.completed(&effect_id).is_none() {
+                apply_skill_injection_observability(
+                    &plan.skill_plan,
+                    Some(&turn_context.session_telemetry),
+                    &sess.services.analytics_events_client,
+                    plan.tracking.clone(),
+                );
+                fixed_point
+                    .record_completed(
+                        effect_id,
+                        CompletedEffect {
+                            impact: EffectImpact::NonInvalidating,
+                            expected_inventory_keys: HashSet::new(),
+                        },
+                    )
+                    .map_err(planning_failure)?;
+            }
+        }
+
+        let app_effect_values = plan
+            .mentioned_apps
+            .iter()
+            .map(|(id, name)| format!("{id}:{}", name.as_deref().unwrap_or_default()))
+            .collect::<Vec<_>>();
+        if !app_effect_values.is_empty() {
+            let effect_id = semantic_effect_id("app_analytics", &app_effect_values);
+            if fixed_point.completed(&effect_id).is_none() {
+                let invocations = plan
+                    .mentioned_apps
+                    .iter()
+                    .map(|(connector_id, app_name)| AppInvocation {
+                        connector_id: Some(connector_id.clone()),
+                        app_name: app_name.clone(),
+                        invocation_type: Some(InvocationType::Explicit),
+                    })
+                    .collect();
+                sess.services
+                    .analytics_events_client
+                    .track_app_mentioned(plan.tracking.clone(), invocations);
+                fixed_point
+                    .record_completed(
+                        effect_id,
+                        CompletedEffect {
+                            impact: EffectImpact::NonInvalidating,
+                            expected_inventory_keys: HashSet::new(),
+                        },
+                    )
+                    .map_err(planning_failure)?;
+            }
+        }
+
+        let plugin_effect_values = plan
+            .mentioned_plugins
+            .iter()
+            .map(|plugin| plugin.config_name.clone())
+            .collect::<Vec<_>>();
+        if !plugin_effect_values.is_empty() {
+            let effect_id = semantic_effect_id("plugin_analytics", &plugin_effect_values);
+            if fixed_point.completed(&effect_id).is_none() {
+                for summary in &plan.mentioned_plugins {
+                    if let Some(plugin) = sess
+                        .services
+                        .plugins_manager
+                        .telemetry_metadata_for_capability_summary(summary)
+                    {
+                        sess.services
+                            .analytics_events_client
+                            .track_plugin_used(plan.tracking.clone(), plugin);
+                    }
+                }
+                fixed_point
+                    .record_completed(
+                        effect_id,
+                        CompletedEffect {
+                            impact: EffectImpact::NonInvalidating,
+                            expected_inventory_keys: HashSet::new(),
+                        },
+                    )
+                    .map_err(planning_failure)?;
+            }
+        }
+
+        if sess.services.planning_generation() != plan.identity.generation {
+            continue;
+        }
+        return Ok(plan);
+    }
+}
+
+fn planning_failure(message: impl Into<String>) -> CodexErr {
+    CodexErr::Stream(
+        format!("pending-turn planning failure: {}", message.into()),
+        None,
+    )
+}
+
+fn semantic_effect_id(kind: &str, values: &[String]) -> String {
+    let mut values = values.to_vec();
+    values.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(kind.as_bytes());
+    for value in values {
+        hasher.update([0]);
+        hasher.update(value.as_bytes());
+    }
+    format!("{kind}:{:x}", hasher.finalize())
+}
+
+fn planning_state_digest(
+    step_context: &StepContext,
+    mcp_tools: &[codex_mcp::ToolInfo],
+    connectors: &[connectors::AppInfo],
+    plugins: &[PluginCapabilitySummary],
+    injection_items: &[ResponseItem],
+    user_input: &[UserInput],
+    router: &ToolRouter,
+    history_items: &[ResponseItem],
+) -> String {
+    let mut hasher = Sha256::new();
+    for environment in &step_context.environments.turn_environments {
+        hasher.update(environment.environment_id.as_bytes());
+        hasher.update(environment.cwd().to_string().as_bytes());
+    }
+    for starting in &step_context.environments.starting {
+        hasher.update(format!("{:?}", starting.selection).as_bytes());
+    }
+    hasher.update(format!("{:?}", step_context.selected_capability_roots).as_bytes());
+    hasher.update(format!("{:?}", step_context.loaded_agents_md).as_bytes());
+    for plugin in plugins {
+        hasher.update(plugin.config_name.as_bytes());
+        hasher.update(plugin.display_name.as_bytes());
+        for server in &plugin.mcp_server_names {
+            hasher.update(server.as_bytes());
+        }
+        for connector in &plugin.app_connector_ids {
+            hasher.update(connector.0.as_bytes());
+        }
+    }
+    for serialized in [
+        serde_json::to_vec(mcp_tools),
+        serde_json::to_vec(connectors),
+        serde_json::to_vec(injection_items),
+        serde_json::to_vec(user_input),
+        serde_json::to_vec(&router.model_visible_specs()),
+        serde_json::to_vec(history_items),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        hasher.update(serialized);
+        hasher.update([0xff]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn estimate_pending_tokens(user_input: &[UserInput], injection_items: &[ResponseItem]) -> i64 {
+    let bytes = serde_json::to_vec(user_input)
+        .map(|value| value.len())
+        .unwrap_or_default()
+        .saturating_add(
+            serde_json::to_vec(injection_items)
+                .map(|value| value.len())
+                .unwrap_or_default(),
+        );
+    i64::try_from(bytes.div_ceil(4)).unwrap_or(i64::MAX)
 }
 
 #[tracing::instrument(
@@ -736,10 +1160,10 @@ async fn build_extension_turn_input_items(
     turn_context: &TurnContext,
     user_input: &[UserInput],
     cancellation_token: &CancellationToken,
-) -> Option<Vec<ResponseItem>> {
+) -> CodexResult<Vec<ResponseItem>> {
     let contributors = sess.services.extensions.turn_input_contributors().to_vec();
     if contributors.is_empty() {
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
 
     let environments = turn_context
@@ -764,18 +1188,29 @@ async fn build_extension_turn_input_items(
         environments,
     };
 
-    let mut items = Vec::new();
+    // Contributors are independent read-only DAG leaves. FuturesOrdered polls
+    // them concurrently while preserving registration order in the result.
+    let mut pending = FuturesOrdered::new();
+    let session_extension_data = &sess.services.session_extension_data;
+    let thread_extension_data = &sess.services.thread_extension_data;
+    let turn_extension_data = turn_context.extension_data.as_ref();
     for contributor in contributors {
-        let contributed_fragments = contributor
-            .contribute(
-                input.clone(),
-                &sess.services.session_extension_data,
-                &sess.services.thread_extension_data,
-                turn_context.extension_data.as_ref(),
-            )
-            .or_cancel(cancellation_token)
-            .await
-            .ok()?;
+        let input = input.clone();
+        pending.push_back(async move {
+            contributor
+                .contribute(
+                    input,
+                    session_extension_data,
+                    thread_extension_data,
+                    turn_extension_data,
+                )
+                .or_cancel(cancellation_token)
+                .await
+        });
+    }
+    let mut items = Vec::new();
+    while let Some(contributed_fragments) = pending.next().await {
+        let contributed_fragments = contributed_fragments?;
         items.extend(
             contributed_fragments
                 .into_iter()
@@ -783,7 +1218,7 @@ async fn build_extension_turn_input_items(
         );
     }
 
-    Some(items)
+    Ok(items)
 }
 
 #[tracing::instrument(
@@ -850,13 +1285,23 @@ async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
-) -> CodexResult<()> {
-    maybe_run_previous_model_inline_compact(sess, turn_context, client_session).await?;
+    check_previous_model: bool,
+    pending_token_estimate: i64,
+) -> CodexResult<bool> {
+    if check_previous_model
+        && maybe_run_previous_model_inline_compact(sess, turn_context, client_session).await?
+    {
+        return Ok(true);
+    }
     let token_status =
         super::context_window::context_window_token_status(sess.as_ref(), turn_context.as_ref())
             .await;
-    // Compact if the configured auto-compaction budget or usable context window is exhausted.
-    if token_status.token_limit_reached {
+    // Include the pure plan's incoming user/plugin/skill contribution. This
+    // closes the old gap where pre-turn compaction considered only committed history.
+    let incoming_reaches_limit = token_status
+        .tokens_until_compaction
+        .is_some_and(|remaining| pending_token_estimate >= remaining);
+    if token_status.token_limit_reached || incoming_reaches_limit {
         // Pre-turn compaction runs before run_turn creates the normal sampling step.
         let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
         run_auto_compact(
@@ -869,8 +1314,9 @@ async fn run_pre_sampling_compact(
             CompactionPhase::PreTurn,
         )
         .await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Returns true only when both turns declare compaction compatibility hashes and they differ.
@@ -911,9 +1357,9 @@ async fn maybe_run_previous_model_inline_compact(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     client_session: &mut ModelClientSession,
-) -> CodexResult<()> {
+) -> CodexResult<bool> {
     let Some(previous_turn_settings) = sess.previous_turn_settings().await else {
-        return Ok(());
+        return Ok(false);
     };
     let should_compact_for_comp_hash_change = comp_hash_changed(
         previous_turn_settings.comp_hash.as_deref(),
@@ -946,14 +1392,14 @@ async fn maybe_run_previous_model_inline_compact(
             CompactionPhase::PreTurn,
         )
         .await?;
-        return Ok(());
+        return Ok(true);
     }
 
     let Some(old_context_window) = previous_model_turn_context.model_context_window() else {
-        return Ok(());
+        return Ok(false);
     };
     let Some(new_context_window) = turn_context.model_context_window() else {
-        return Ok(());
+        return Ok(false);
     };
     let active_context_tokens = sess.get_total_token_usage().await;
     let previous_model_limit_reached = match turn_context
@@ -993,8 +1439,9 @@ async fn maybe_run_previous_model_inline_compact(
             CompactionPhase::PreTurn,
         )
         .await?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 #[instrument(
@@ -1168,10 +1615,18 @@ async fn run_sampling_request(
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
     input: Vec<ResponseItem>,
+    prebuilt_router: &mut Option<Arc<ToolRouter>>,
+    preparation_timing_guard: &mut Option<TurnTimingGuard>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
-    let router = built_tools(sess.as_ref(), step_context.as_ref(), &cancellation_token).await?;
+    let router = match prebuilt_router
+        .take()
+        .filter(|_| crate::latency_switches::stage2_critical_path_enabled())
+    {
+        Some(router) => router,
+        None => built_tools(sess.as_ref(), step_context.as_ref(), &cancellation_token).await?,
+    };
 
     let base_instructions = sess.get_base_instructions().await;
 
@@ -1214,6 +1669,7 @@ async fn run_sampling_request(
             responses_metadata,
             Arc::clone(&turn_diff_tracker),
             &prompt,
+            preparation_timing_guard,
             cancellation_token.child_token(),
         )
         .await
@@ -1243,7 +1699,8 @@ async fn run_sampling_request(
             return Err(err);
         }
 
-        handle_retryable_response_stream_error(
+        let retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
+        let retry_result = handle_retryable_response_stream_error(
             &mut retries,
             max_retries,
             err,
@@ -1252,7 +1709,9 @@ async fn run_sampling_request(
             &turn_context,
             ResponsesStreamRequest::Sampling,
         )
-        .await?;
+        .await;
+        drop(retry_timing_guard);
+        retry_result?;
         turn_context.turn_timing_state.record_sampling_retry();
     }
 }
@@ -1271,6 +1730,9 @@ pub(crate) async fn built_tools(
     cancellation_token: &CancellationToken,
 ) -> CodexResult<Arc<ToolRouter>> {
     let turn_context = step_context.turn.as_ref();
+    let _router_build_timing_guard = turn_context
+        .turn_timing_state
+        .begin_local_phase(TurnLocalPhase::RouterBuild);
     let mcp_connection_manager = step_context.mcp.manager();
     let has_mcp_servers = mcp_connection_manager.has_servers();
     let all_mcp_tools = step_context
@@ -1998,6 +2460,7 @@ async fn try_run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
+    preparation_timing_guard: &mut Option<TurnTimingGuard>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
     feedback_tags!(
@@ -2019,7 +2482,24 @@ async fn try_run_sampling_request(
         .features
         .enabled(Feature::ConcurrentReasoningSummaries)
         && turn_context.provider.info().is_openai();
-    let mut stream = client_session
+    let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
+    drop(preparation_timing_guard.take());
+    let startup_snapshot = sess.startup_timing.complete_snapshot();
+    trace!(
+        startup_timing_schema_version = startup_snapshot.schema_version,
+        startup_timing_correlation_id = %startup_snapshot.correlation_id,
+        startup_timing_duration_ns = startup_snapshot.inclusive_duration_ns,
+        startup_timing_profile_valid = startup_snapshot.profile_valid,
+        startup_prewarm_status = ?startup_snapshot.prewarm_status,
+        startup_transport_preconnect_ns = startup_snapshot.phases.transport_preconnect_ns,
+        startup_prewarm_preparation_ns = startup_snapshot.phases.prewarm_preparation_ns,
+        startup_prewarm_request_ns = startup_snapshot.phases.prewarm_request_ns,
+        startup_first_turn_wait_ns = startup_snapshot.phases.first_turn_prewarm_wait_ns,
+        startup_executor_readiness_ns = startup_snapshot.phases.executor_readiness_ns,
+        "startup timing snapshot frozen at first model send"
+    );
+    client_session.set_turn_timing(Arc::clone(&turn_context.turn_timing_state));
+    let stream_result = client_session
         .stream(
             prompt,
             &turn_context.model_info,
@@ -2032,7 +2512,9 @@ async fn try_run_sampling_request(
         )
         .instrument(trace_span!("stream_request"))
         .or_cancel(&cancellation_token)
-        .await??;
+        .await;
+    drop(model_request_timing_guard);
+    let mut stream = stream_result??;
     let mut in_flight: FuturesOrdered<BoxFuture<'static, CodexResult<ResponseInputItem>>> =
         FuturesOrdered::new();
     let mut needs_follow_up = false;
@@ -2067,12 +2549,15 @@ async fn try_run_sampling_request(
             codex.usage.total_tokens = field::Empty,
         );
 
-        let event = match stream
+        let model_stream_wait_timing_guard =
+            turn_context.turn_timing_state.begin_model_stream_wait();
+        let stream_event = stream
             .next()
             .instrument(trace_span!(parent: &handle_responses, "receiving"))
             .or_cancel(&cancellation_token)
-            .await
-        {
+            .await;
+        drop(model_stream_wait_timing_guard);
+        let event = match stream_event {
             Ok(event) => event,
             Err(codex_async_utils::CancelErr::Cancelled) => break Err(CodexErr::TurnAborted),
         };
@@ -2088,6 +2573,9 @@ async fn try_run_sampling_request(
             }
         };
 
+        let _model_stream_processing_timing_guard = turn_context
+            .turn_timing_state
+            .begin_model_stream_processing();
         sess.services
             .session_telemetry
             .record_responses(&handle_responses, &event);

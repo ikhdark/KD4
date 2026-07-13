@@ -81,6 +81,7 @@ use codex_app_server_protocol::TurnPlanStep;
 use codex_app_server_protocol::TurnPlanUpdatedNotification;
 use codex_app_server_protocol::TurnStartedNotification;
 use codex_app_server_protocol::TurnStatus;
+use codex_app_server_protocol::TurnTiming;
 use codex_app_server_protocol::WarningNotification;
 use codex_app_server_protocol::build_item_from_guardian_event;
 use codex_app_server_protocol::command_display_string;
@@ -1221,6 +1222,8 @@ struct TurnCompletionMetadata {
     started_at: Option<i64>,
     completed_at: Option<i64>,
     duration_ms: Option<i64>,
+    timing: Option<TurnTiming>,
+    origin_connection_id: Option<crate::outgoing_message::ConnectionId>,
 }
 
 async fn emit_turn_completed_with_status(
@@ -1242,9 +1245,13 @@ async fn emit_turn_completed_with_status(
             duration_ms: turn_completion_metadata.duration_ms,
         },
         completion: turn_completion_metadata.completion,
+        timing: turn_completion_metadata.timing,
     };
     outgoing
-        .send_server_notification(ServerNotification::TurnCompleted(notification))
+        .send_server_notification_with_receipts(
+            ServerNotification::TurnCompleted(notification),
+            turn_completion_metadata.origin_connection_id,
+        )
         .await;
 }
 
@@ -1433,6 +1440,8 @@ async fn handle_turn_complete(
             started_at: turn_summary.started_at,
             completed_at: turn_complete_event.completed_at,
             duration_ms: turn_complete_event.duration_ms,
+            timing: turn_complete_event.timing,
+            origin_connection_id: turn_summary.origin_connection_id,
         },
         outgoing,
     )
@@ -1458,6 +1467,8 @@ async fn handle_turn_interrupted(
             started_at: turn_summary.started_at,
             completed_at: turn_aborted_event.completed_at,
             duration_ms: turn_aborted_event.duration_ms,
+            timing: turn_aborted_event.timing,
+            origin_connection_id: turn_summary.origin_connection_id,
         },
         outgoing,
     )
@@ -2201,6 +2212,7 @@ mod tests {
             duration_ms: Some(TEST_TURN_DURATION_MS),
             time_to_first_token_ms: None,
             completion: None,
+            timing: None,
         }
     }
 
@@ -2210,6 +2222,7 @@ mod tests {
             reason: codex_protocol::protocol::TurnAbortReason::Interrupted,
             completed_at: Some(TEST_TURN_COMPLETED_AT),
             duration_ms: Some(TEST_TURN_DURATION_MS),
+            timing: None,
         }
     }
 
@@ -3464,6 +3477,19 @@ mod tests {
         );
         let thread_state = new_thread_state();
         let mut completion_event = turn_complete_event(&event_turn_id);
+        let expected_timing = TurnTiming {
+            schema_version: 1,
+            profile_valid: true,
+            classification_complete: true,
+            started_at_unix_ms: Some(1_716_000_000_000),
+            completed_at_unix_ms: Some(1_716_000_001_234),
+            inclusive_duration_ns: 1_234_000_000,
+            inclusive_duration_ms: 1_234,
+            machine_duration_ns: 1_200_000_000,
+            machine_duration_ms: 1_200,
+            ..Default::default()
+        };
+        completion_event.timing = Some(expected_timing.clone());
         completion_event.completion = Some(codex_protocol::protocol::TaskCompletionGate {
             status: codex_protocol::protocol::TaskCompletionStatus::Partial,
             reasons: vec!["focused validation is stale".to_string()],
@@ -3513,6 +3539,7 @@ mod tests {
                     codex_app_server_protocol::TaskCompletionStatus::Partial
                 );
                 assert_eq!(completion.reasons, ["focused validation is stale"]);
+                assert_eq!(n.timing, Some(expected_timing));
             }
             other => bail!("unexpected message: {other:?}"),
         }

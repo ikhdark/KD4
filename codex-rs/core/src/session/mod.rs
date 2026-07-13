@@ -305,6 +305,7 @@ use crate::mcp::McpManager;
 use crate::network_policy_decision::execpolicy_network_rule_amendment;
 use crate::rollout::map_session_init_error;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
+use crate::session_startup_prewarm::SessionStartupTransportHandle;
 use crate::shell;
 #[cfg(test)]
 use crate::skills::SkillLoadOutcome;
@@ -324,6 +325,8 @@ use crate::tools::network_approval::build_network_policy_decider;
 #[cfg(test)]
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::sandboxing::ApprovalStore;
+use crate::turn_timing::InteractiveWaitKind;
+use crate::turn_timing::TurnLocalPhase;
 use crate::turn_timing::TurnTimingState;
 use crate::turn_timing::record_turn_ttfm_metric;
 use crate::unified_exec::UnifiedExecProcessManager;
@@ -769,15 +772,31 @@ impl Codex {
         client_user_message_id: Option<String>,
     ) -> CodexResult<String> {
         debug_assert!(matches!(op, Op::UserInput { .. }));
-        let id = new_submission_id();
+        let id = self.reserve_turn_id();
+        self.submit_user_input_with_reserved_turn_id(id.clone(), op, trace, client_user_message_id)
+            .await?;
+        Ok(id)
+    }
+
+    pub fn reserve_turn_id(&self) -> String {
+        new_submission_id()
+    }
+
+    pub async fn submit_user_input_with_reserved_turn_id(
+        &self,
+        id: String,
+        op: Op,
+        trace: Option<W3cTraceContext>,
+        client_user_message_id: Option<String>,
+    ) -> CodexResult<()> {
+        debug_assert!(matches!(op, Op::UserInput { .. }));
         let sub = Submission {
-            id: id.clone(),
+            id,
             op,
             client_user_message_id,
             trace,
         };
-        self.submit_with_id(sub).await?;
-        Ok(id)
+        self.submit_with_id(sub).await
     }
 
     /// Use sparingly: prefer `submit()` so Codex is responsible for generating
@@ -1541,6 +1560,7 @@ impl Session {
                 self.services
                     .turn_environments
                     .update_selections(updated.environment_selections());
+                self.services.bump_planning_generation();
             }
             state.session_configuration = updated;
             (previous_config, new_config, permission_profile_changed)
@@ -1576,6 +1596,21 @@ impl Session {
     pub(crate) async fn take_session_startup_prewarm(&self) -> Option<SessionStartupPrewarmHandle> {
         let mut state = self.state.lock().await;
         state.take_session_startup_prewarm()
+    }
+
+    pub(crate) async fn set_session_startup_transport(
+        &self,
+        startup_transport: SessionStartupTransportHandle,
+    ) {
+        let mut state = self.state.lock().await;
+        state.set_session_startup_transport(startup_transport);
+    }
+
+    pub(crate) async fn take_session_startup_transport(
+        &self,
+    ) -> Option<SessionStartupTransportHandle> {
+        let mut state = self.state.lock().await;
+        state.take_session_startup_transport()
     }
 
     pub(crate) async fn get_config(&self) -> std::sync::Arc<Config> {
@@ -2239,6 +2274,9 @@ impl Session {
             parsed_cmd,
         });
         self.send_event(turn_context, event).await;
+        let _interactive_wait_guard = turn_context
+            .turn_timing_state
+            .begin_interactive_wait(InteractiveWaitKind::Approval);
         rx_approve.await.unwrap_or(ReviewDecision::Abort)
     }
 
@@ -2281,6 +2319,9 @@ impl Session {
             grant_root,
         });
         self.send_event(turn_context, event).await;
+        let _interactive_wait_guard = turn_context
+            .turn_timing_state
+            .begin_interactive_wait(InteractiveWaitKind::Approval);
         rx_approve.await.unwrap_or(ReviewDecision::Abort)
     }
 
@@ -2442,6 +2483,9 @@ impl Session {
             cwd: Some(native_environment_cwd),
         });
         self.send_event(turn_context.as_ref(), event).await;
+        let _interactive_wait_guard = turn_context
+            .turn_timing_state
+            .begin_interactive_wait(InteractiveWaitKind::Permission);
         tokio::select! {
             biased;
             _ = cancellation_token.cancelled() => {
@@ -2529,6 +2573,9 @@ impl Session {
             .turn_metadata_state
             .mark_user_input_requested_during_turn();
         self.send_event(turn_context, event).await;
+        let _interactive_wait_guard = turn_context
+            .turn_timing_state
+            .begin_interactive_wait(InteractiveWaitKind::UserInput);
         rx_response.await.ok()
     }
 
@@ -2841,7 +2888,11 @@ impl Session {
                 turn_context.model_info.truncation_policy.into(),
             );
         }
+        let persistence_timing_guard = turn_context
+            .turn_timing_state
+            .begin_local_phase(TurnLocalPhase::Persistence);
         self.persist_rollout_response_items(items).await;
+        drop(persistence_timing_guard);
         self.send_raw_response_items(turn_context, items).await;
     }
 

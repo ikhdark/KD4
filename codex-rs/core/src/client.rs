@@ -24,6 +24,7 @@
 //! fails, normal stream retry/fallback logic handles recovery on the same turn.
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
@@ -57,6 +58,7 @@ use codex_api::ResponsesWsRequest;
 use codex_api::SharedAuthProvider;
 use codex_api::SseTelemetry;
 use codex_api::StreamOptions;
+use codex_api::TextControls;
 use codex_api::TransportError;
 use codex_api::WebsocketTelemetry;
 use codex_api::auth_header_telemetry;
@@ -95,6 +97,8 @@ use http::HeaderMap as ApiHeaderMap;
 use http::HeaderValue;
 use http::StatusCode as HttpStatusCode;
 use reqwest::StatusCode;
+use sha2::Digest;
+use sha2::Sha256;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -116,6 +120,8 @@ use crate::client_common::ResponseStream;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
+use crate::turn_timing::TurnLocalPhase;
+use crate::turn_timing::TurnTimingState;
 use crate::util::emit_feedback_auth_recovery_tags;
 use codex_feedback::FeedbackRequestTags;
 use codex_feedback::emit_feedback_request_tags_with_auth_env;
@@ -213,6 +219,50 @@ struct ModelClientState {
     disable_websockets: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
+    request_schema_cache: StdMutex<RequestSchemaSerializationCache>,
+}
+
+const REQUEST_SCHEMA_CACHE_CAPACITY: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestSchemaCacheKey([u8; 32]);
+
+#[derive(Debug, Clone)]
+struct RequestSchemaCacheValue {
+    tools: Vec<serde_json::Value>,
+    text: Option<TextControls>,
+}
+
+#[derive(Debug, Default)]
+struct RequestSchemaSerializationCache {
+    entries: VecDeque<(RequestSchemaCacheKey, RequestSchemaCacheValue)>,
+    hits: u64,
+    misses: u64,
+}
+
+impl RequestSchemaSerializationCache {
+    fn get(&mut self, key: RequestSchemaCacheKey) -> Option<RequestSchemaCacheValue> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(candidate, _)| *candidate == key)?;
+        let entry = self.entries.remove(index)?;
+        let value = entry.1.clone();
+        self.entries.push_back(entry);
+        self.hits = self.hits.saturating_add(1);
+        Some(value)
+    }
+
+    fn record_miss(&mut self) {
+        self.misses = self.misses.saturating_add(1);
+    }
+
+    fn insert(&mut self, key: RequestSchemaCacheKey, value: RequestSchemaCacheValue) {
+        if self.entries.len() == REQUEST_SCHEMA_CACHE_CAPACITY {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((key, value));
+    }
 }
 
 /// Resolved API client setup for a single request attempt.
@@ -272,6 +322,7 @@ pub struct ModelClient {
 pub struct ModelClientSession {
     client: ModelClient,
     websocket_session: WebsocketSession,
+    turn_timing: Option<Arc<TurnTimingState>>,
     /// Turn state for sticky routing.
     ///
     /// This is an `OnceLock` that stores the turn state value received from the server
@@ -291,13 +342,88 @@ struct LastResponse {
     items_added: Vec<ResponseItem>,
 }
 
+const WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION: u16 = 1;
+const WEBSOCKET_HISTORY_HASH_DOMAIN: &[u8] = b"codex.websocket.history.v1";
+const WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN: &[u8] = b"codex.websocket.request-properties.v1";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CanonicalPrefixHash {
+    item_count: usize,
+    digest: [u8; 32],
+}
+
+impl CanonicalPrefixHash {
+    fn empty() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(WEBSOCKET_HISTORY_HASH_DOMAIN);
+        hasher.update(WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION.to_be_bytes());
+        Self {
+            item_count: 0,
+            digest: hasher.finalize().into(),
+        }
+    }
+
+    fn from_items(items: &[ResponseItem]) -> serde_json::Result<Self> {
+        let mut prefix = Self::empty();
+        prefix.extend_items(items)?;
+        Ok(prefix)
+    }
+
+    fn extend_items(&mut self, items: &[ResponseItem]) -> serde_json::Result<()> {
+        for item in items {
+            let mut normalized = item.clone();
+            normalized.clear_internal_chat_message_metadata_passthrough();
+            let serialized = serde_json::to_vec(&normalized)?;
+            let mut hasher = Sha256::new();
+            hasher.update(WEBSOCKET_HISTORY_HASH_DOMAIN);
+            hasher.update(self.digest);
+            hasher.update((serialized.len() as u64).to_be_bytes());
+            hasher.update(serialized);
+            self.digest = hasher.finalize().into();
+            self.item_count = self.item_count.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WebsocketHistoryBaseline {
+    /// Monotonic diagnostic identity for the immutable request prefix. Equality
+    /// of this generation is never used as proof of model-visible equivalence.
+    generation: u64,
+    request_prefix: CanonicalPrefixHash,
+    request_properties_fingerprint: [u8; 32],
+    normalization_policy_version: u16,
+}
+
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
     last_request: Option<ResponsesApiRequest>,
+    last_request_history: Option<WebsocketHistoryBaseline>,
+    next_history_generation: u64,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
     last_response_from_untraced_warmup: bool,
     connection_reused: StdMutex<bool>,
+}
+
+fn responses_request_properties_fingerprint(
+    request: &ResponsesApiRequest,
+) -> serde_json::Result<[u8; 32]> {
+    // Keep this aligned with `responses_request_properties_match`: input is
+    // compared through the normalized prefix chain, while delivery-only stream
+    // options and client metadata do not affect previous_response_id reuse.
+    let mut properties = request.clone();
+    properties.input.clear();
+    properties.stream_options = None;
+    properties.client_metadata = None;
+    let serialized = serde_json::to_vec(&properties)?;
+    let mut hasher = Sha256::new();
+    hasher.update(WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN);
+    hasher.update(WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION.to_be_bytes());
+    hasher.update((serialized.len() as u64).to_be_bytes());
+    hasher.update(serialized);
+    Ok(hasher.finalize().into())
 }
 
 // This is intentionally not a `PartialEq` implementation: request equality includes `input` and
@@ -451,6 +577,7 @@ impl ModelClient {
                 disable_websockets: AtomicBool::new(false),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
+                request_schema_cache: StdMutex::new(RequestSchemaSerializationCache::default()),
             }),
             agent_identity_policy,
             prompt_cache_key_override: None,
@@ -480,6 +607,7 @@ impl ModelClient {
         ModelClientSession {
             client: self.clone(),
             websocket_session: self.take_cached_websocket_session(),
+            turn_timing: None,
             turn_state: Arc::new(OnceLock::new()),
         }
     }
@@ -505,11 +633,7 @@ impl ModelClient {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = websocket_session;
     }
 
-    pub(crate) fn force_http_fallback(
-        &self,
-        session_telemetry: &SessionTelemetry,
-        _model_info: &ModelInfo,
-    ) -> bool {
+    pub(crate) fn force_http_fallback(&self, session_telemetry: &SessionTelemetry) -> bool {
         let websocket_enabled = self.responses_websocket_enabled();
         let activated =
             websocket_enabled && !self.state.disable_websockets.swap(true, Ordering::Relaxed);
@@ -826,6 +950,77 @@ impl ModelClient {
         }
     }
 
+    fn request_schema_cache_key(
+        prompt: &Prompt,
+        verbosity: Option<VerbosityConfig>,
+        use_responses_lite: bool,
+    ) -> serde_json::Result<RequestSchemaCacheKey> {
+        let serialized = serde_json::to_vec(&(
+            prompt.tools.as_slice(),
+            &prompt.output_schema,
+            prompt.output_schema_strict,
+            format!("{verbosity:?}"),
+            use_responses_lite,
+        ))?;
+        let mut hasher = Sha256::new();
+        hasher.update(b"codex.request-schema-cache.v1");
+        hasher.update((serialized.len() as u64).to_be_bytes());
+        hasher.update(serialized);
+        Ok(RequestSchemaCacheKey(hasher.finalize().into()))
+    }
+
+    fn request_schema_components(
+        &self,
+        prompt: &Prompt,
+        verbosity: Option<VerbosityConfig>,
+        use_responses_lite: bool,
+    ) -> Result<RequestSchemaCacheValue> {
+        if !crate::latency_switches::stage3_persistence_history_enabled() {
+            return Ok(RequestSchemaCacheValue {
+                tools: create_tools_json_for_responses_api(&prompt.tools)?,
+                text: create_text_param_for_request(
+                    verbosity,
+                    &prompt.output_schema,
+                    prompt.output_schema_strict,
+                ),
+            });
+        }
+        let key = Self::request_schema_cache_key(prompt, verbosity, use_responses_lite)?;
+        {
+            let mut cache = self
+                .state
+                .request_schema_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(value) = cache.get(key) {
+                trace!("request schema serialization cache hit");
+                return Ok(value);
+            }
+            cache.record_miss();
+        }
+
+        let value = RequestSchemaCacheValue {
+            tools: create_tools_json_for_responses_api(&prompt.tools)?,
+            text: create_text_param_for_request(
+                verbosity,
+                &prompt.output_schema,
+                prompt.output_schema_strict,
+            ),
+        };
+        let mut cache = self
+            .state
+            .request_schema_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(value) = cache.get(key) {
+            // Another request populated the same immutable entry while this
+            // request serialized outside the lock.
+            return Ok(value);
+        }
+        cache.insert(key, value.clone());
+        Ok(value)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_responses_request(
         &self,
@@ -844,7 +1039,19 @@ impl ModelClient {
                 .iter_mut()
                 .for_each(ResponseItem::clear_internal_chat_message_metadata_passthrough);
         }
-        let tools = create_tools_json_for_responses_api(&prompt.tools)?;
+        let verbosity = if model_info.support_verbosity {
+            self.state.model_verbosity.or(model_info.default_verbosity)
+        } else {
+            if self.state.model_verbosity.is_some() {
+                warn!(
+                    "model_verbosity is set but ignored as the model does not support verbosity: {}",
+                    model_info.slug
+                );
+            }
+            None
+        };
+        let RequestSchemaCacheValue { tools, text } =
+            self.request_schema_components(prompt, verbosity, model_info.use_responses_lite)?;
         let (instructions, tools) = if model_info.use_responses_lite {
             let mut prefix = vec![ResponseItem::AdditionalTools {
                 id: None,
@@ -877,22 +1084,6 @@ impl ModelClient {
         } else {
             Vec::new()
         };
-        let verbosity = if model_info.support_verbosity {
-            self.state.model_verbosity.or(model_info.default_verbosity)
-        } else {
-            if self.state.model_verbosity.is_some() {
-                warn!(
-                    "model_verbosity is set but ignored as the model does not support verbosity: {}",
-                    model_info.slug
-                );
-            }
-            None
-        };
-        let text = create_text_param_for_request(
-            verbosity,
-            &prompt.output_schema,
-            prompt.output_schema_strict,
-        );
         let prompt_cache_key = Some(self.prompt_cache_key());
         let service_tier = model_info.service_tier_for_request(service_tier);
         let request = ResponsesApiRequest {
@@ -1114,17 +1305,75 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    pub(crate) fn set_turn_timing(&mut self, turn_timing: Arc<TurnTimingState>) {
+        self.turn_timing = Some(turn_timing);
+    }
+
     pub(crate) fn turn_state(&self) -> Arc<OnceLock<String>> {
         Arc::clone(&self.turn_state)
     }
 
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
-        self.websocket_session.last_request = None;
-        self.websocket_session.last_response_rx = None;
-        self.websocket_session.last_response_from_untraced_warmup = false;
+        self.invalidate_incremental_history("websocket reset");
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
+    }
+
+    /// Invalidates request-prefix reuse without discarding a healthy transport.
+    ///
+    /// Callers use this for compaction, truncation, rollback, reinjection,
+    /// history replacement, and any model-visible state change. Reconnects and
+    /// request-property/model changes are also guarded locally below.
+    pub(crate) fn invalidate_incremental_history(&mut self, reason: &'static str) {
+        if let Some(baseline) = self.websocket_session.last_request_history.as_ref() {
+            trace!(
+                reason,
+                history_generation = baseline.generation,
+                "invalidating websocket incremental history"
+            );
+        }
+        self.websocket_session.last_request = None;
+        self.websocket_session.last_request_history = None;
+        self.websocket_session.last_response_rx = None;
+        self.websocket_session.last_response_from_untraced_warmup = false;
+        self.websocket_session.next_history_generation = self
+            .websocket_session
+            .next_history_generation
+            .wrapping_add(1)
+            .max(1);
+    }
+
+    fn remember_request_history(&mut self, request: &ResponsesApiRequest) {
+        let request_prefix = CanonicalPrefixHash::from_items(&request.input);
+        let request_properties_fingerprint = responses_request_properties_fingerprint(request);
+        self.websocket_session.next_history_generation = self
+            .websocket_session
+            .next_history_generation
+            .wrapping_add(1)
+            .max(1);
+        let generation = self.websocket_session.next_history_generation;
+        self.websocket_session.last_request_history =
+            match (request_prefix, request_properties_fingerprint) {
+                (Ok(request_prefix), Ok(request_properties_fingerprint)) => {
+                    Some(WebsocketHistoryBaseline {
+                        generation,
+                        request_prefix,
+                        request_properties_fingerprint,
+                        normalization_policy_version:
+                            WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION,
+                    })
+                }
+                (request_prefix, request_properties_fingerprint) => {
+                    trace!(
+                        history_generation = generation,
+                        prefix_hash_error = ?request_prefix.err(),
+                        properties_hash_error = ?request_properties_fingerprint.err(),
+                        "websocket history hashing unavailable; retaining full-comparison fallback"
+                    );
+                    None
+                }
+            };
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1179,6 +1428,103 @@ impl ModelClientSession {
             return None;
         }
 
+        if !crate::latency_switches::stage3_persistence_history_enabled() {
+            return Self::get_incremental_items_full_compare(
+                previous_request,
+                request,
+                last_response,
+                allow_empty_delta,
+            );
+        }
+
+        if let Some(baseline) = self.websocket_session.last_request_history.as_ref()
+            && baseline.normalization_policy_version
+                == WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION
+        {
+            let Ok(current_properties_fingerprint) =
+                responses_request_properties_fingerprint(request)
+            else {
+                trace!("incremental request fingerprint unavailable; using full comparison");
+                return Self::get_incremental_items_full_compare(
+                    previous_request,
+                    request,
+                    last_response,
+                    allow_empty_delta,
+                );
+            };
+            if current_properties_fingerprint != baseline.request_properties_fingerprint {
+                trace!(
+                    history_generation = baseline.generation,
+                    "incremental request failed, request-property fingerprint didn't match"
+                );
+                return None;
+            }
+
+            let mut expected_prefix = baseline.request_prefix;
+            if let Some(response) = last_response
+                && let Err(err) = expected_prefix.extend_items(&response.items_added)
+            {
+                trace!(
+                    ?err,
+                    "response-prefix hashing unavailable; using full comparison"
+                );
+                return Self::get_incremental_items_full_compare(
+                    previous_request,
+                    request,
+                    last_response,
+                    allow_empty_delta,
+                );
+            }
+            let Some((request_items_to_compare, incremental_items)) =
+                request.input.split_at_checked(expected_prefix.item_count)
+            else {
+                trace!("incremental request failed, incompatible request length");
+                return None;
+            };
+            let request_prefix = match CanonicalPrefixHash::from_items(request_items_to_compare) {
+                Ok(request_prefix) => request_prefix,
+                Err(err) => {
+                    trace!(
+                        ?err,
+                        "candidate-prefix hashing unavailable; using full comparison"
+                    );
+                    return Self::get_incremental_items_full_compare(
+                        previous_request,
+                        request,
+                        last_response,
+                        allow_empty_delta,
+                    );
+                }
+            };
+            if request_prefix != expected_prefix {
+                trace!(
+                    history_generation = baseline.generation,
+                    "incremental request failed, normalized prefix digest didn't match"
+                );
+                return None;
+            }
+            if !allow_empty_delta && incremental_items.is_empty() {
+                return None;
+            }
+            return Some(incremental_items.to_vec());
+        }
+
+        Self::get_incremental_items_full_compare(
+            previous_request,
+            request,
+            last_response,
+            allow_empty_delta,
+        )
+    }
+
+    /// Correctness fallback for missing/unknown hash state. This retains the
+    /// prior full materialization and normalized comparison contract.
+    fn get_incremental_items_full_compare(
+        previous_request: &ResponsesApiRequest,
+        request: &ResponsesApiRequest,
+        last_response: Option<&LastResponse>,
+        allow_empty_delta: bool,
+    ) -> Option<Vec<ResponseItem>> {
         // To compare the inputs, we concatenate the previous request items with the response items,
         // then compare that against the equivalent slice of request items, ignoring metadata. If
         // they match, we can consider the remaining items the incremental request.
@@ -1280,7 +1626,7 @@ impl ModelClientSession {
             client_setup.agent_identity_telemetry.clone(),
             PendingUnauthorizedRetry::default(),
         );
-        let connection = self
+        let connection = match self
             .client
             .connect_websocket(
                 session_telemetry,
@@ -1290,7 +1636,17 @@ impl ModelClientSession {
                 auth_context,
                 RequestRouteTelemetry::for_endpoint(RESPONSES_ENDPOINT),
             )
-            .await?;
+            .await
+        {
+            Ok(connection) => connection,
+            Err(err @ ApiError::Transport(TransportError::Http { status, .. }))
+                if status == StatusCode::UPGRADE_REQUIRED =>
+            {
+                self.client.force_http_fallback(session_telemetry);
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
         self.websocket_session.connection = Some(connection);
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
@@ -1327,9 +1683,7 @@ impl ModelClientSession {
         };
 
         if needs_new {
-            self.websocket_session.last_request = None;
-            self.websocket_session.last_response_rx = None;
-            self.websocket_session.last_response_from_untraced_warmup = false;
+            self.invalidate_incremental_history("websocket reconnect");
             let new_conn = match self
                 .client
                 .connect_websocket(
@@ -1436,6 +1790,10 @@ impl ModelClientSession {
                 )
                 .await;
 
+            let serialization_timing_guard = self
+                .turn_timing
+                .as_ref()
+                .map(|timing| timing.begin_local_phase(TurnLocalPhase::Serialization));
             let mut request = self.client.build_responses_request(
                 &client_setup.api_provider,
                 prompt,
@@ -1448,6 +1806,7 @@ impl ModelClientSession {
             let store = request.store;
             self.client
                 .prepare_response_items_for_request(&mut request.input, store);
+            drop(serialization_timing_guard);
             let request_session_telemetry =
                 session_telemetry_for_request(session_telemetry, &request);
             let inference_trace_attempt = inference_trace.start_attempt();
@@ -1549,6 +1908,10 @@ impl ModelClientSession {
                 client_setup.agent_identity_telemetry.clone(),
                 pending_retry,
             );
+            let serialization_timing_guard = self
+                .turn_timing
+                .as_ref()
+                .map(|timing| timing.begin_local_phase(TurnLocalPhase::Serialization));
             let request = self.client.build_responses_request(
                 &client_setup.api_provider,
                 prompt,
@@ -1577,6 +1940,7 @@ impl ModelClientSession {
                 ),
                 ..ResponseCreateWsRequest::from(&request)
             };
+            drop(serialization_timing_guard);
             if warmup {
                 ws_payload.generate = Some(false);
             }
@@ -1639,6 +2003,7 @@ impl ModelClientSession {
             } else {
                 inference_trace_attempt.record_started(&ws_request);
             }
+            self.remember_request_history(&request);
             self.websocket_session.last_request = Some(request);
             self.websocket_session.last_response_from_untraced_warmup = warmup;
             let websocket_connection =
@@ -1835,11 +2200,9 @@ impl ModelClientSession {
     pub(crate) fn try_switch_fallback_transport(
         &mut self,
         session_telemetry: &SessionTelemetry,
-        model_info: &ModelInfo,
+        _model_info: &ModelInfo,
     ) -> bool {
-        let activated = self
-            .client
-            .force_http_fallback(session_telemetry, model_info);
+        let activated = self.client.force_http_fallback(session_telemetry);
         self.websocket_session = WebsocketSession::default();
         activated
     }

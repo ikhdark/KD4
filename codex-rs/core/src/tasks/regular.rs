@@ -7,6 +7,7 @@ use crate::session::turn::run_turn;
 use crate::session::turn_context::TurnContext;
 use crate::session_startup_prewarm::SessionStartupPrewarmResolution;
 use crate::state::TaskKind;
+use crate::turn_timing::TurnLocalPhase;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
 use tracing::Instrument;
@@ -56,8 +57,14 @@ impl SessionTask for RegularTask {
             });
             sess.send_event(ctx.as_ref(), event).await;
             sess.set_server_reasoning_included(/*included*/ false).await;
-            sess.consume_startup_prewarm_for_regular_turn(&cancellation_token)
-                .await
+            let startup_wait = ctx
+                .turn_timing_state
+                .begin_local_phase(TurnLocalPhase::StartupPrewarmWait);
+            let resolution = sess
+                .consume_startup_prewarm_for_regular_turn(&cancellation_token)
+                .await;
+            drop(startup_wait);
+            resolution
         }
         .instrument(trace_span!("regular_task.prepare_run_turn"))
         .await;

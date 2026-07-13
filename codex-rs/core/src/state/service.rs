@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use crate::SkillsService;
 use crate::agent::AgentControl;
@@ -54,6 +56,9 @@ pub(crate) struct SessionServices {
     pub(crate) mcp_connection_manager: Arc<ArcSwap<McpConnectionManager>>,
     /// The latest atomically published MCP config and manager pair.
     pub(crate) mcp_runtime: ArcSwapOption<McpRuntimeSnapshot>,
+    /// Aggregate generation for model-visible planning state. Every invalidating
+    /// publication must advance this value before a pending turn may replan.
+    pub(crate) planning_generation: AtomicU64,
     /// Serializes environment-driven runtime rebuilds.
     pub(crate) mcp_projection_lock: Mutex<()>,
     pub(crate) mcp_startup_cancellation_token: Mutex<CancellationToken>,
@@ -148,7 +153,18 @@ impl SessionServices {
             available_environment_ids,
         ));
         self.mcp_runtime.store(Some(Arc::clone(&runtime)));
+        self.bump_planning_generation();
         runtime
+    }
+
+    pub(crate) fn planning_generation(&self) -> u64 {
+        self.planning_generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn bump_planning_generation(&self) -> u64 {
+        self.planning_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
     }
 
     pub(crate) fn latest_mcp_runtime(&self) -> Arc<McpRuntimeSnapshot> {

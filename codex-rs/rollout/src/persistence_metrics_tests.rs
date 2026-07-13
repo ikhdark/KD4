@@ -56,6 +56,7 @@ fn turn_complete(turn_id: &str) -> RolloutItem {
         duration_ms: None,
         time_to_first_token_ms: None,
         completion: None,
+        timing: None,
     }))
 }
 
@@ -65,6 +66,7 @@ fn turn_aborted(turn_id: &str) -> RolloutItem {
         reason: TurnAbortReason::Interrupted,
         completed_at: None,
         duration_ms: None,
+        timing: None,
     }))
 }
 

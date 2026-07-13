@@ -79,7 +79,8 @@ pub(super) async fn run_remote_compact_attempt(
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
-    let new_history = sess
+    let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
+    let new_history_result = sess
         .services
         .model_client
         .compact_conversation_history(
@@ -99,7 +100,9 @@ pub(super) async fn run_remote_compact_attempt(
             compaction_trace,
             &responses_metadata,
         )
-        .await?;
+        .await;
+    drop(model_request_timing_guard);
+    let new_history = new_history_result?;
     Ok(RemoteCompactAttempt {
         new_history,
         trace_input_history,

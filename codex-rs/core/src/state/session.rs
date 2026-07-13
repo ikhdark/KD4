@@ -16,6 +16,7 @@ use crate::session::PreviousTurnSettings;
 use crate::session::session::SessionConfiguration;
 use crate::session::time_reminder::CurrentTimeReminderState;
 use crate::session_startup_prewarm::SessionStartupPrewarmHandle;
+use crate::session_startup_prewarm::SessionStartupTransportHandle;
 use codex_protocol::protocol::RateLimitSnapshot;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
@@ -38,6 +39,8 @@ pub(crate) struct SessionState {
     auto_compact_window: AutoCompactWindow,
     /// Startup prewarmed session prepared during session initialization.
     pub(crate) startup_prewarm: Option<SessionStartupPrewarmHandle>,
+    /// Transport-only preconnect scheduled before MCP/tool initialization.
+    pub(crate) startup_transport: Option<SessionStartupTransportHandle>,
     pub(crate) current_time_reminder: CurrentTimeReminderState,
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
@@ -70,6 +73,7 @@ impl SessionState {
             previous_turn_settings: None,
             auto_compact_window: AutoCompactWindow::new_with_ids(auto_compact_window_ids),
             startup_prewarm: None,
+            startup_transport: None,
             current_time_reminder: CurrentTimeReminderState::default(),
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
@@ -251,6 +255,19 @@ impl SessionState {
 
     pub(crate) fn take_session_startup_prewarm(&mut self) -> Option<SessionStartupPrewarmHandle> {
         self.startup_prewarm.take()
+    }
+
+    pub(crate) fn set_session_startup_transport(
+        &mut self,
+        startup_transport: SessionStartupTransportHandle,
+    ) {
+        self.startup_transport = Some(startup_transport);
+    }
+
+    pub(crate) fn take_session_startup_transport(
+        &mut self,
+    ) -> Option<SessionStartupTransportHandle> {
+        self.startup_transport.take()
     }
 
     // Adds connector IDs to the active set and returns the merged selection.

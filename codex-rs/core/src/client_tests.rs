@@ -1,5 +1,7 @@
 use super::AuthRequestTelemetryContext;
+use super::CanonicalPrefixHash;
 use super::CompactConversationRequestSettings;
+use super::LastResponse;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
@@ -18,6 +20,7 @@ use crate::test_support::responses_metadata as test_responses_metadata;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
+use codex_api::ResponsesApiRequest;
 use codex_api::TransportError;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::OutboundProxyPolicy;
@@ -38,6 +41,7 @@ use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -109,6 +113,139 @@ fn test_model_client_with_thread_id(
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
     )
+}
+
+fn history_test_item(text: &str, turn_id: Option<&str>) -> ResponseItem {
+    ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputText {
+            text: text.to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: turn_id.map(|turn_id| {
+            InternalChatMessageMetadataPassthrough {
+                turn_id: Some(turn_id.to_string()),
+            }
+        }),
+    }
+}
+
+fn history_test_request(input: Vec<ResponseItem>) -> ResponsesApiRequest {
+    ResponsesApiRequest {
+        model: "test-model".to_string(),
+        instructions: "test instructions".to_string(),
+        input,
+        tools: None,
+        tool_choice: "auto".to_string(),
+        parallel_tool_calls: true,
+        reasoning: None,
+        store: true,
+        stream: true,
+        stream_options: None,
+        include: Vec::new(),
+        service_tier: None,
+        prompt_cache_key: None,
+        text: None,
+        client_metadata: None,
+    }
+}
+
+#[test]
+fn websocket_prefix_hash_ignores_internal_metadata_only() {
+    let first = CanonicalPrefixHash::from_items(&[history_test_item("same", Some("turn-a"))])
+        .expect("hash should serialize");
+    let second = CanonicalPrefixHash::from_items(&[history_test_item("same", Some("turn-b"))])
+        .expect("hash should serialize");
+    let visible_change =
+        CanonicalPrefixHash::from_items(&[history_test_item("different", Some("turn-a"))])
+            .expect("hash should serialize");
+
+    assert_eq!(first, second);
+    assert_ne!(first, visible_change);
+}
+
+#[test]
+fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback() {
+    let client = test_model_client(SessionSource::Cli);
+    let mut session = client.new_session();
+    let original = history_test_request(vec![history_test_item("user", Some("turn-a"))]);
+    session.remember_request_history(&original);
+    session.websocket_session.last_request = Some(original.clone());
+    let response = LastResponse {
+        response_id: "response-1".to_string(),
+        items_added: vec![history_test_item("assistant", Some("turn-a"))],
+    };
+    let delta = history_test_item("next", Some("turn-b"));
+    let mut extended = original.clone();
+    extended.input.extend(response.items_added.clone());
+    extended.input.push(delta.clone());
+
+    assert_eq!(
+        session.get_incremental_items(&extended, Some(&response), false),
+        Some(vec![delta.clone()])
+    );
+
+    let mut changed_prefix = extended.clone();
+    changed_prefix.input[0] = history_test_item("changed", Some("turn-a"));
+    assert_eq!(
+        session.get_incremental_items(&changed_prefix, Some(&response), false),
+        None
+    );
+
+    // Missing hash state is uncertainty, not failure: retain the canonical
+    // full-materialization/full-comparison behavior.
+    session.websocket_session.last_request_history = None;
+    assert_eq!(
+        session.get_incremental_items(&extended, Some(&response), false),
+        Some(vec![delta])
+    );
+}
+
+#[test]
+fn websocket_incremental_history_invalidates_without_dropping_transport_contract() {
+    let client = test_model_client(SessionSource::Cli);
+    let mut session = client.new_session();
+    let request = history_test_request(vec![history_test_item("user", None)]);
+    session.remember_request_history(&request);
+    session.websocket_session.last_request = Some(request);
+    let generation_before = session.websocket_session.next_history_generation;
+
+    session.invalidate_incremental_history("test history replacement");
+
+    assert!(session.websocket_session.last_request.is_none());
+    assert!(session.websocket_session.last_request_history.is_none());
+    assert!(session.websocket_session.next_history_generation > generation_before);
+}
+
+#[test]
+fn request_schema_serialization_cache_is_keyed_by_model_visible_schema() {
+    let client = test_model_client(SessionSource::Cli);
+    let prompt = Prompt {
+        output_schema: Some(json!({"type": "object", "properties": {"value": {"type": "string"}}})),
+        ..Prompt::default()
+    };
+
+    client
+        .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
+        .expect("first serialization should succeed");
+    client
+        .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
+        .expect("cached serialization should succeed");
+    let mut changed = prompt.clone();
+    changed.output_schema = Some(json!({"type": "array"}));
+    client
+        .request_schema_components(&changed, None, /*use_responses_lite*/ false)
+        .expect("changed schema should serialize independently");
+
+    let cache = client
+        .state
+        .request_schema_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(cache.hits, 1);
+    assert_eq!(cache.misses, 2);
+    assert_eq!(cache.entries.len(), 2);
 }
 
 #[tokio::test]

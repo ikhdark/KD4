@@ -19,6 +19,7 @@ use crate::facts::PluginState;
 use crate::facts::SubAgentThreadStartedInput;
 use crate::facts::ThreadInitializationMode;
 use crate::facts::TrackEventsContext;
+use crate::facts::TurnDeliveryFact;
 use crate::facts::TurnStatus;
 use crate::facts::TurnSteerRejectionReason;
 use crate::facts::TurnSteerResult;
@@ -42,6 +43,7 @@ use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TurnTiming;
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -69,6 +71,7 @@ pub(crate) enum TrackEventRequest {
     Compaction(Box<CodexCompactionEventRequest>),
     Goal(Box<CodexGoalEventRequest>),
     TurnEvent(Box<CodexTurnEventRequest>),
+    TurnDelivery(Box<CodexTurnDeliveryEventRequest>),
     TurnSteer(CodexTurnSteerEventRequest),
     CommandExecution(CodexCommandExecutionEventRequest),
     FileChange(CodexFileChangeEventRequest),
@@ -900,6 +903,8 @@ pub(crate) struct CodexTurnEventParams {
     pub(crate) after_last_sampling_ms: u64,
     pub(crate) sampling_request_count: u32,
     pub(crate) sampling_retry_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) timing: Option<TurnTiming>,
     pub(crate) duration_ms: Option<u64>,
     pub(crate) started_at: Option<u64>,
     pub(crate) completed_at: Option<u64>,
@@ -909,6 +914,12 @@ pub(crate) struct CodexTurnEventParams {
 pub(crate) struct CodexTurnEventRequest {
     pub(crate) event_type: &'static str,
     pub(crate) event_params: CodexTurnEventParams,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CodexTurnDeliveryEventRequest {
+    pub(crate) event_type: &'static str,
+    pub(crate) event_params: TurnDeliveryFact,
 }
 
 #[derive(Serialize)]

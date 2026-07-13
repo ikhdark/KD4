@@ -13,6 +13,7 @@ use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
+use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolTelemetryTags;
 use codex_mcp::ToolInfo;
@@ -164,6 +165,10 @@ impl McpHandler {
 }
 
 impl CoreToolRuntime for McpHandler {
+    fn tool_execution_timing(&self) -> ToolExecutionTiming {
+        ToolExecutionTiming::NestedRuntime
+    }
+
     fn telemetry_tags<'a>(
         &'a self,
         _invocation: &'a ToolInvocation,

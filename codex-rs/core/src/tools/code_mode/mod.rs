@@ -35,7 +35,8 @@ use crate::tools::effective_tool_mode;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
-use crate::unified_exec::resolve_max_tokens;
+use crate::unified_exec::OutputBudgetClass;
+use crate::unified_exec::resolve_adaptive_max_tokens;
 use codex_protocol::openai_models::ToolMode;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::TruncationPolicy;
@@ -190,14 +191,22 @@ pub(super) async fn handle_runtime_response(
         RuntimeResponse::Yielded { content_items, .. } => {
             let mut content_items = into_function_call_output_content_items(content_items);
             sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
-            content_items = truncate_code_mode_result(content_items, max_output_tokens);
+            content_items = truncate_code_mode_result(
+                content_items,
+                max_output_tokens,
+                OutputBudgetClass::FailureOrTimeout,
+            );
             prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
             Ok(FunctionToolOutput::from_content(content_items, Some(true)))
         }
         RuntimeResponse::Terminated { content_items, .. } => {
             let mut content_items = into_function_call_output_content_items(content_items);
             sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
-            content_items = truncate_code_mode_result(content_items, max_output_tokens);
+            content_items = truncate_code_mode_result(
+                content_items,
+                max_output_tokens,
+                OutputBudgetClass::FailureOrTimeout,
+            );
             prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
             Ok(FunctionToolOutput::from_content(content_items, Some(true)))
         }
@@ -214,7 +223,15 @@ pub(super) async fn handle_runtime_response(
                     text: format!("Script error:\n{error_text}"),
                 });
             }
-            content_items = truncate_code_mode_result(content_items, max_output_tokens);
+            content_items = truncate_code_mode_result(
+                content_items,
+                max_output_tokens,
+                if success {
+                    OutputBudgetClass::Success
+                } else {
+                    OutputBudgetClass::FailureOrTimeout
+                },
+            );
             prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
             Ok(FunctionToolOutput::from_content(
                 content_items,
@@ -257,8 +274,22 @@ fn prepend_script_status(
 fn truncate_code_mode_result(
     items: Vec<FunctionCallOutputContentItem>,
     max_output_tokens: Option<usize>,
+    class: OutputBudgetClass,
 ) -> Vec<FunctionCallOutputContentItem> {
-    let max_output_tokens = resolve_max_tokens(max_output_tokens);
+    let diagnostic_text = if max_output_tokens.is_none() {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                FunctionCallOutputContentItem::InputText { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        String::new()
+    };
+    let max_output_tokens =
+        resolve_adaptive_max_tokens(max_output_tokens, class, None, &diagnostic_text);
     let policy = TruncationPolicy::Tokens(max_output_tokens);
     if items
         .iter()
@@ -362,6 +393,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::CodeModeService;
+    use super::OutputBudgetClass;
     use super::build_nested_tool_payload;
     use super::truncate_code_mode_result;
     use crate::tools::context::ToolPayload;
@@ -413,7 +445,7 @@ mod tests {
         }];
 
         assert_eq!(
-            truncate_code_mode_result(items, Some(5)),
+            truncate_code_mode_result(items, Some(5), OutputBudgetClass::Success),
             vec![FunctionCallOutputContentItem::InputText {
                 text: concat!(
                     "Warning: truncated output (original token count: 10)\n",

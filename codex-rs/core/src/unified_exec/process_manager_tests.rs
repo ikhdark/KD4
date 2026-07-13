@@ -1,10 +1,60 @@
 use super::*;
+use crate::unified_exec::ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS;
+use crate::unified_exec::DEFAULT_FAILURE_OUTPUT_TOKENS;
+use crate::unified_exec::DEFAULT_SUCCESS_OUTPUT_TOKENS;
+use crate::unified_exec::OutputBudgetClass;
 use crate::unified_exec::async_watcher::resolve_aggregated_output;
 use crate::unified_exec::clamp_yield_time;
+use crate::unified_exec::clamp_yield_time_for_readiness;
+use crate::unified_exec::resolve_adaptive_max_tokens;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use pretty_assertions::assert_eq;
 use tokio::time::Duration;
 use tokio::time::Instant;
+
+#[test]
+fn adaptive_output_budget_uses_4k_8k_and_diagnostic_escalation() {
+    assert_eq!(
+        resolve_adaptive_max_tokens(None, OutputBudgetClass::Success, Some("echo ok"), "ok"),
+        DEFAULT_SUCCESS_OUTPUT_TOKENS
+    );
+    assert_eq!(
+        resolve_adaptive_max_tokens(
+            None,
+            OutputBudgetClass::FailureOrTimeout,
+            Some("custom-command"),
+            "failed"
+        ),
+        DEFAULT_FAILURE_OUTPUT_TOKENS
+    );
+    assert_eq!(
+        resolve_adaptive_max_tokens(
+            None,
+            OutputBudgetClass::Success,
+            Some("cargo nextest run -p codex-core"),
+            "tests passed"
+        ),
+        ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS
+    );
+    assert_eq!(
+        resolve_adaptive_max_tokens(
+            None,
+            OutputBudgetClass::FailureOrTimeout,
+            None,
+            "Traceback (most recent call last):"
+        ),
+        ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS
+    );
+    assert_eq!(
+        resolve_adaptive_max_tokens(
+            Some(1_234),
+            OutputBudgetClass::FailureOrTimeout,
+            Some("cargo test"),
+            "test result: FAILED"
+        ),
+        1_234
+    );
+}
 
 #[test]
 fn unified_exec_env_injects_defaults() {
@@ -333,6 +383,19 @@ fn initial_exec_yield_time_uses_windows_floor() {
     assert_eq!(
         clamp_yield_time(/*yield_time_ms*/ above_max_yield_time_ms),
         crate::unified_exec::MAX_YIELD_TIME_MS
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn warm_executor_yield_time_does_not_reapply_windows_cold_floor() {
+    assert_eq!(
+        clamp_yield_time_for_readiness(/*yield_time_ms*/ 250, /*executor_ready*/ true),
+        crate::unified_exec::MIN_YIELD_TIME_MS
+    );
+    assert_eq!(
+        clamp_yield_time_for_readiness(/*yield_time_ms*/ 250, /*executor_ready*/ false),
+        crate::unified_exec::WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS
     );
 }
 

@@ -34,6 +34,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
             &turn_context.model_info,
         )
     {
+        turn_context.turn_timing_state.record_model_fallback();
         sess.send_event(
             turn_context,
             EventMsg::Warning(WarningEvent {
@@ -71,6 +72,7 @@ pub(crate) async fn handle_retryable_response_stream_error(
             )
             .await;
         }
+        let _retry_timing_guard = turn_context.turn_timing_state.begin_retry_backoff();
         tokio::time::sleep(delay).await;
         return Ok(());
     }

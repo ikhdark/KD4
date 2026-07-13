@@ -31,6 +31,7 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
 use crate::tools::registry::ToolArgumentDiffConsumer;
+use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::apply_patch::ApplyPatchRequest;
 use crate::tools::runtimes::apply_patch::ApplyPatchRuntime;
@@ -494,6 +495,10 @@ impl ApplyPatchHandler {
 }
 
 impl CoreToolRuntime for ApplyPatchHandler {
+    fn tool_execution_timing(&self) -> ToolExecutionTiming {
+        ToolExecutionTiming::NestedRuntime
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Custom { .. })
     }

@@ -12,6 +12,7 @@ use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::shell_spec::create_request_permissions_tool;
 use crate::tools::handlers::shell_spec::request_permissions_tool_description;
 use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -120,4 +121,8 @@ impl RequestPermissionsHandler {
     }
 }
 
-impl CoreToolRuntime for RequestPermissionsHandler {}
+impl CoreToolRuntime for RequestPermissionsHandler {
+    fn tool_execution_timing(&self) -> ToolExecutionTiming {
+        ToolExecutionTiming::Interactive
+    }
+}

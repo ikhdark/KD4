@@ -588,6 +588,7 @@ async fn execute_mcp_tool_call(
         .rollout_thread_trace
         .start_mcp_call_trace(call_id);
     let request_meta = mcp_call_trace.add_request_meta(request_meta);
+    let tool_execution_timing_guard = turn_context.turn_timing_state.begin_tool_execution();
     let result = manager
         .call_tool(
             &invocation.server,
@@ -595,8 +596,9 @@ async fn execute_mcp_tool_call(
             rewritten_arguments,
             request_meta,
         )
-        .await
-        .map_err(|e| format!("tool call error: {e:?}"))?;
+        .await;
+    drop(tool_execution_timing_guard);
+    let result = result.map_err(|e| format!("tool call error: {e:?}"))?;
     let result = sanitize_mcp_tool_result_for_model(
         turn_context
             .model_info

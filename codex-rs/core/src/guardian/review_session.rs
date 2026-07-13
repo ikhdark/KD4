@@ -1186,6 +1186,7 @@ mod tests {
                 duration_ms: None,
                 time_to_first_token_ms,
                 completion: None,
+                timing: None,
             }),
         }
     }
@@ -1198,6 +1199,7 @@ mod tests {
                 reason: TurnAbortReason::Interrupted,
                 completed_at: None,
                 duration_ms: None,
+                timing: None,
             }),
         }
     }

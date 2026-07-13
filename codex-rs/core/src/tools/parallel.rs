@@ -102,6 +102,8 @@ impl ToolCallRuntime {
         let session = Arc::clone(&self.session);
         let step_context = Arc::clone(&self.step_context);
         let turn = Arc::clone(&step_context.turn);
+        turn.turn_timing_state.record_tool_call();
+        let turn_tool_execution_guard = turn.turn_timing_state.begin_tool_execution();
         let tracker = Arc::clone(&self.tracker);
         let lock = Arc::clone(&self.parallel_execution);
         let invocation_cancellation_token = cancellation_token.clone();
@@ -157,6 +159,7 @@ impl ToolCallRuntime {
 
         async move {
             let _tool_call_timing_guard = tool_call_timing_guard;
+            let _turn_tool_execution_guard = turn_tool_execution_guard;
             tokio::select! {
                 res = &mut dispatch_handle => res.map_err(Self::tool_task_join_error)?,
                 _ = cancellation_token.cancelled() => {

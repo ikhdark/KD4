@@ -26,6 +26,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillScope;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TurnTiming;
 use codex_protocol::request_permissions::RequestPermissionsResponse;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -119,6 +120,35 @@ pub struct TurnProfile {
 pub struct TurnProfileFact {
     pub turn_id: String,
     pub profile: TurnProfile,
+    pub timing: Option<TurnTiming>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnDeliveryStatus {
+    NotTargeted,
+    Success,
+    Failure,
+    Timeout,
+    ShutdownCancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TurnDeliveryFact {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub target_count: u32,
+    pub success_count: u32,
+    pub failure_count: u32,
+    pub timeout_count: u32,
+    pub shutdown_cancelled_count: u32,
+    pub origin_target_present: bool,
+    pub origin_delivery_status: TurnDeliveryStatus,
+    pub origin_successful_elapsed_ms: Option<u64>,
+    pub first_successful_elapsed_ms: Option<u64>,
+    pub last_successful_elapsed_ms: Option<u64>,
+    pub first_post_core_delivery_latency_ms: Option<u64>,
+    pub last_post_core_delivery_latency_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -503,6 +533,7 @@ pub(crate) enum CustomAnalyticsFact {
     TurnResolvedConfig(Box<TurnResolvedConfigFact>),
     TurnTokenUsage(Box<TurnTokenUsageFact>),
     TurnProfile(Box<TurnProfileFact>),
+    TurnDelivery(Box<TurnDeliveryFact>),
     TurnCodexError(Box<TurnCodexErrorFact>),
     SkillInvoked(SkillInvokedInput),
     AppMentioned(AppMentionedInput),

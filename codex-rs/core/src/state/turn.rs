@@ -2,10 +2,14 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
+use tokio::task::AbortHandle;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::AbortOnDropHandle;
+use tracing::Span;
 
 use codex_extension_api::ExtensionData;
 use codex_protocol::dynamic_tools::DynamicToolResponse;
@@ -30,6 +34,7 @@ use codex_protocol::protocol::TokenUsage;
 pub(crate) struct ActiveTurn {
     pub(crate) task: Option<RunningTask>,
     pub(crate) turn_state: Arc<Mutex<TurnState>>,
+    pub(crate) terminal: Option<Arc<TurnTerminalCoordinator>>,
 }
 
 /// Whether mailbox deliveries should still be folded into the current turn.
@@ -58,6 +63,7 @@ impl Default for ActiveTurn {
         Self {
             task: None,
             turn_state: Arc::new(Mutex::new(TurnState::default())),
+            terminal: None,
         }
     }
 }
@@ -74,12 +80,108 @@ pub(crate) struct RunningTask {
     pub(crate) kind: TaskKind,
     pub(crate) task: Arc<dyn AnySessionTask>,
     pub(crate) cancellation_token: CancellationToken,
-    pub(crate) handle: AbortOnDropHandle<()>,
+    pub(crate) worker_abort_handle: AbortHandle,
+    pub(crate) _supervisor_handle: JoinHandle<()>,
+    pub(crate) task_span: Span,
     pub(crate) turn_context: Arc<TurnContext>,
     pub(crate) turn_extension_data: Arc<ExtensionData>,
     pub(crate) _agent_execution_guard: Option<AgentExecutionGuard>,
-    // Timer recorded when the task drops to capture the full turn duration.
-    pub(crate) _timer: Option<codex_otel::Timer>,
+}
+
+#[derive(Debug)]
+pub(crate) struct TurnTerminalCoordinator {
+    turn_id: String,
+    claimed: AtomicBool,
+    completed: AtomicBool,
+    terminal_event_dispatched: AtomicBool,
+    completion_notify: Notify,
+    #[cfg(test)]
+    panic_before_worker_cancellation: AtomicBool,
+}
+
+impl TurnTerminalCoordinator {
+    pub(crate) fn new(turn_id: String) -> Arc<Self> {
+        Arc::new(Self {
+            turn_id,
+            claimed: AtomicBool::new(false),
+            completed: AtomicBool::new(false),
+            terminal_event_dispatched: AtomicBool::new(false),
+            completion_notify: Notify::new(),
+            #[cfg(test)]
+            panic_before_worker_cancellation: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    pub(crate) fn try_claim(self: &Arc<Self>) -> Option<TurnTerminalPermit> {
+        self.claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        Some(TurnTerminalPermit {
+            coordinator: Arc::clone(self),
+            completed: false,
+        })
+    }
+
+    pub(crate) fn terminal_event_dispatched(&self) -> bool {
+        self.terminal_event_dispatched.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_completed(&self) {
+        loop {
+            let notified = self.completion_notify.notified();
+            if self.completed.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_panic_before_worker_cancellation(&self) {
+        self.panic_before_worker_cancellation
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_before_worker_cancellation_if_requested(&self) {
+        if self
+            .panic_before_worker_cancellation
+            .swap(false, Ordering::AcqRel)
+        {
+            panic!("injected panic before worker cancellation");
+        }
+    }
+}
+
+pub(crate) struct TurnTerminalPermit {
+    coordinator: Arc<TurnTerminalCoordinator>,
+    completed: bool,
+}
+
+impl TurnTerminalPermit {
+    pub(crate) fn mark_terminal_event_dispatched(&self) {
+        self.coordinator
+            .terminal_event_dispatched
+            .store(true, Ordering::Release);
+    }
+
+    pub(crate) fn complete(mut self) {
+        self.coordinator.completed.store(true, Ordering::Release);
+        self.coordinator.completion_notify.notify_waiters();
+        self.completed = true;
+    }
+}
+
+impl Drop for TurnTerminalPermit {
+    fn drop(&mut self) {
+        if !self.completed && !self.coordinator.terminal_event_dispatched() {
+            self.coordinator.claimed.store(false, Ordering::Release);
+        }
+    }
 }
 
 /// Mutable state for a single turn.

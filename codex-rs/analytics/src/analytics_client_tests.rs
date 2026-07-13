@@ -76,6 +76,8 @@ use crate::facts::SubAgentThreadStartedInput;
 use crate::facts::ThreadInitializationMode;
 use crate::facts::TrackEventsContext;
 use crate::facts::TurnCodexErrorFact;
+use crate::facts::TurnDeliveryFact;
+use crate::facts::TurnDeliveryStatus;
 use crate::facts::TurnProfile;
 use crate::facts::TurnProfileFact;
 use crate::facts::TurnResolvedConfigFact;
@@ -403,6 +405,7 @@ fn sample_turn_completed_notification(
             completed_at: Some(456),
             duration_ms: Some(1234),
         },
+        timing: None,
     })
 }
 
@@ -706,6 +709,7 @@ async fn ingest_turn_prerequisites(
                 TurnProfileFact {
                     turn_id: "turn-2".to_string(),
                     profile: sample_turn_profile(),
+                    timing: None,
                 },
             ))),
             out,
@@ -829,6 +833,7 @@ async fn ingest_complete_child_turn(
             TurnProfileFact {
                 turn_id: turn_id.to_string(),
                 profile: sample_turn_profile(),
+                timing: None,
             },
         ))),
         AnalyticsFact::Notification(Box::new(sample_turn_completed_notification(
@@ -3932,6 +3937,7 @@ fn turn_event_serializes_expected_shape() {
             after_last_sampling_ms: 134,
             sampling_request_count: 2,
             sampling_retry_count: 1,
+            timing: None,
             duration_ms: Some(1234),
             started_at: Some(455),
             completed_at: Some(456),
@@ -4013,6 +4019,59 @@ fn turn_event_serializes_expected_shape() {
     .expect("parse expected turn event");
 
     assert_eq!(payload, expected);
+}
+
+#[tokio::test]
+async fn turn_delivery_fact_emits_explicit_aggregate_outcomes() {
+    let mut reducer = AnalyticsReducer::default();
+    let mut out = Vec::new();
+    reducer
+        .ingest(
+            AnalyticsFact::Custom(CustomAnalyticsFact::TurnDelivery(Box::new(
+                TurnDeliveryFact {
+                    thread_id: "thread-2".to_string(),
+                    turn_id: "turn-2".to_string(),
+                    target_count: 4,
+                    success_count: 2,
+                    failure_count: 1,
+                    timeout_count: 1,
+                    shutdown_cancelled_count: 1,
+                    origin_target_present: true,
+                    origin_delivery_status: TurnDeliveryStatus::Success,
+                    origin_successful_elapsed_ms: Some(11),
+                    first_successful_elapsed_ms: Some(7),
+                    last_successful_elapsed_ms: Some(11),
+                    first_post_core_delivery_latency_ms: Some(17),
+                    last_post_core_delivery_latency_ms: Some(21),
+                },
+            ))),
+            &mut out,
+        )
+        .await;
+
+    assert_eq!(out.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&out[0]).expect("serialize turn delivery event"),
+        json!({
+            "event_type": "codex_turn_delivery",
+            "event_params": {
+                "thread_id": "thread-2",
+                "turn_id": "turn-2",
+                "target_count": 4,
+                "success_count": 2,
+                "failure_count": 1,
+                "timeout_count": 1,
+                "shutdown_cancelled_count": 1,
+                "origin_target_present": true,
+                "origin_delivery_status": "success",
+                "origin_successful_elapsed_ms": 11,
+                "first_successful_elapsed_ms": 7,
+                "last_successful_elapsed_ms": 11,
+                "first_post_core_delivery_latency_ms": 17,
+                "last_post_core_delivery_latency_ms": 21
+            }
+        })
+    );
 }
 
 #[tokio::test]

@@ -607,6 +607,7 @@ impl Session {
                         self.services
                             .turn_environments
                             .update_selections(next.environment_selections());
+                        self.services.bump_planning_generation();
                     }
                     state.session_configuration = next.clone();
                     Ok((

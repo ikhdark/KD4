@@ -1765,6 +1765,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
         ];
 
@@ -1824,6 +1825,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
         ];
 
@@ -1927,6 +1929,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
         ];
 
@@ -1979,6 +1982,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
         ];
 
@@ -2032,6 +2036,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
         ];
         let items = events
@@ -2096,6 +2101,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
         ];
 
@@ -2165,6 +2171,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
         ];
 
@@ -2244,6 +2251,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             })),
         ];
 
@@ -2355,6 +2363,7 @@ mod tests {
                 reason: TurnAbortReason::Replaced,
                 completed_at: None,
                 duration_ms: None,
+                timing: None,
             }),
             EventMsg::UserMessage(UserMessageEvent {
                 client_id: None,
@@ -2596,6 +2605,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
         ];
 
@@ -3165,6 +3175,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-b".into(),
@@ -3208,6 +3219,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
         ];
 
@@ -3265,6 +3277,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-b".into(),
@@ -3308,6 +3321,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
         ];
 
@@ -3497,6 +3511,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-b".into(),
@@ -3520,6 +3535,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "still in b".into(),
@@ -3533,6 +3549,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
         ];
 
@@ -3572,6 +3589,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-b".into(),
@@ -3593,6 +3611,7 @@ mod tests {
                 reason: TurnAbortReason::Replaced,
                 completed_at: None,
                 duration_ms: None,
+                timing: None,
             }),
             EventMsg::AgentMessage(AgentMessageEvent {
                 message: "still in b".into(),
@@ -3638,6 +3657,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             })),
         ];
 
@@ -3901,6 +3921,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
             EventMsg::Error(ErrorEvent {
                 message: "request-level failure".into(),
@@ -3967,6 +3988,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             }),
         ];
 
@@ -4023,6 +4045,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             })),
         ];
 
@@ -4105,6 +4128,7 @@ mod tests {
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
+                timing: None,
             })),
         ];
 
@@ -4271,6 +4295,7 @@ mod tests {
                 duration_ms: Some(123),
                 time_to_first_token_ms: None,
                 completion: None,
+                timing: None,
             }),
         ));
 
@@ -4352,6 +4377,7 @@ mod tests {
                 duration_ms: Some(123),
                 time_to_first_token_ms: None,
                 completion: None,
+                timing: None,
             })),
         ]);
 

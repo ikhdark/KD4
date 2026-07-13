@@ -6,6 +6,7 @@ use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
+use crate::startup_timing::StartupTimingState;
 use crate::state::ActiveTurn;
 use codex_extension_api::ExtensionDataInit;
 use codex_login::auth::AgentIdentityAuthPolicy;
@@ -41,6 +42,12 @@ pub(crate) struct Session {
     pub(super) pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
+    /// Correlated pre-turn startup phases, frozen at the first model send.
+    pub(crate) startup_timing: Arc<StartupTimingState>,
+    /// Owns terminal coordinators so request cancellation cannot strand a claimed turn.
+    pub(crate) terminal_tasks: tokio_util::task::TaskTracker,
+    /// Prevents terminal cleanup from waking queued work after shutdown begins.
+    pub(crate) shutting_down: std::sync::atomic::AtomicBool,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
@@ -528,6 +535,7 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => resumed_history.conversation_id,
         };
+        let startup_timing = StartupTimingState::new(thread_id.to_string());
         let resumed_session_id = match &initial_history {
             InitialHistory::Resumed(resumed) => {
                 resumed.history.iter().find_map(|item| match item {
@@ -1054,6 +1062,13 @@ impl Session {
             )
             .await;
 
+            let executor_readiness_timing_guard =
+                startup_timing.begin_phase(crate::startup_timing::StartupPhase::ExecutorReadiness);
+            let unified_exec_manager = UnifiedExecProcessManager::new_with_deferred_executor(
+                config.background_terminal_max_timeout,
+                config.features.enabled(Feature::DeferredExecutor),
+            );
+            drop(executor_readiness_timing_guard);
             let services = SessionServices {
                 // Initialize the MCP connection manager with an uninitialized
                 // instance. It will be replaced with one created via
@@ -1064,11 +1079,10 @@ impl Session {
                 // setup is straightforward enough and performs well.
                 mcp_connection_manager,
                 mcp_runtime: arc_swap::ArcSwapOption::empty(),
+                planning_generation: std::sync::atomic::AtomicU64::new(0),
                 mcp_projection_lock: Mutex::new(()),
                 mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
-                unified_exec_manager: UnifiedExecProcessManager::new(
-                    config.background_terminal_max_timeout,
-                ),
+                unified_exec_manager,
                 command_execution:
                     crate::tools::command_execution::CommandExecutionLedger::default(),
                 task_evidence,
@@ -1161,6 +1175,9 @@ impl Session {
                 pending_mcp_server_refresh_config: Mutex::new(None),
                 conversation: Arc::new(RealtimeConversationManager::new()),
                 active_turn: Mutex::new(None),
+                startup_timing: Arc::clone(&startup_timing),
+                terminal_tasks: tokio_util::task::TaskTracker::new(),
+                shutting_down: std::sync::atomic::AtomicBool::new(false),
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 services,
@@ -1170,6 +1187,7 @@ impl Session {
                 let mut guard = network_policy_decider_session.write().await;
                 *guard = Arc::downgrade(&sess);
             }
+            sess.schedule_startup_transport_preconnect().await;
             // Dispatch the SessionConfiguredEvent first and then report any errors.
             // If resuming, include converted initial messages in the payload so UIs can render them immediately.
             let initial_messages = initial_history.get_event_msgs();
@@ -1276,6 +1294,7 @@ impl Session {
                 let mut state = sess.state.lock().await;
                 state.queue_pending_session_start_source(session_start_source);
             }
+            startup_timing.finish_session_initialization();
             Ok(sess)
         }
         .await;

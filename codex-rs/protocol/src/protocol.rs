@@ -1951,6 +1951,111 @@ pub struct SafetyBufferingEvent {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
 pub struct ContextCompactedEvent;
 
+/// Immutable wall-clock profile captured at the core terminal boundary.
+///
+/// `exclusive` is the canonical elapsed-time partition. Values in `unions`
+/// and `local` may overlap and must not be added to that partition.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTiming {
+    pub schema_version: u16,
+    pub profile_valid: bool,
+    pub classification_complete: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub started_at_unix_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub completed_at_unix_ms: Option<i64>,
+    pub inclusive_duration_ns: u64,
+    pub inclusive_duration_ms: u64,
+    /// Inclusive duration minus only the interactive-only wait partition.
+    pub machine_duration_ns: u64,
+    pub machine_duration_ms: u64,
+    pub exclusive: TurnTimingExclusive,
+    pub unions: TurnTimingUnions,
+    pub local: TurnTimingLocal,
+    pub milestones: TurnTimingMilestones,
+    pub counters: TurnTimingCounters,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingExclusive {
+    pub model_only_ns: u64,
+    pub tool_only_ns: u64,
+    pub model_plus_tool_ns: u64,
+    pub interactive_only_wait_ns: u64,
+    pub interactive_plus_machine_ns: u64,
+    pub retry_only_ns: u64,
+    pub orchestration_ns: u64,
+    pub standalone_work_ns: u64,
+    pub finalization_ns: u64,
+    pub unclassified_ns: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingUnions {
+    pub model_active_union_ns: u64,
+    pub model_active_union_ms: u64,
+    pub model_request_wait_union_ns: u64,
+    pub model_stream_wait_union_ns: u64,
+    pub model_stream_processing_union_ns: u64,
+    pub tool_active_union_ns: u64,
+    pub tool_active_union_ms: u64,
+    pub interactive_wait_union_ns: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingLocal {
+    pub preparation_union_ns: u64,
+    pub planning_union_ns: u64,
+    pub compaction_union_ns: u64,
+    pub persistence_union_ns: u64,
+    pub serialization_union_ns: u64,
+    pub router_build_union_ns: u64,
+    pub startup_prewarm_wait_union_ns: u64,
+    pub executor_readiness_wait_union_ns: u64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingMilestones {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub first_model_output_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub first_visible_output_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null", optional)]
+    pub first_agent_message_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export_to = "v2/")]
+pub struct TurnTimingCounters {
+    pub model_request_count: u32,
+    pub model_retry_count: u32,
+    pub model_fallback_count: u32,
+    pub tool_call_count: u32,
+    pub approval_wait_count: u32,
+    pub permission_wait_count: u32,
+    pub user_input_wait_count: u32,
+    pub mcp_elicitation_wait_count: u32,
+    pub invalid_transition_count: u32,
+    pub clock_regression_count: u32,
+    pub saturation_count: u32,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(rename_all = "snake_case")]
@@ -1991,6 +2096,9 @@ pub struct TurnCompleteEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null", optional)]
     pub time_to_first_token_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub timing: Option<TurnTiming>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
@@ -4137,6 +4245,9 @@ pub struct TurnAbortedEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "number | null", optional)]
     pub duration_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub timing: Option<TurnTiming>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, JsonSchema, TS)]
@@ -4434,6 +4545,7 @@ mod tests {
             completed_at: None,
             duration_ms: None,
             time_to_first_token_ms: None,
+            timing: None,
         };
         let value = serde_json::to_value(&event)?;
         assert_eq!(value["completion"]["status"], json!("partial"));

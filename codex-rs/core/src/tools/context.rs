@@ -10,7 +10,8 @@ use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::shell_output_summary::ShellOutputSummaryOptions;
 use crate::tools::shell_output_summary::summarize_shell_output_for_model;
 use crate::turn_diff_tracker::TurnDiffTracker;
-use crate::unified_exec::resolve_max_tokens;
+use crate::unified_exec::OutputBudgetClass;
+use crate::unified_exec::resolve_adaptive_max_tokens;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -436,7 +437,19 @@ impl ToolOutput for ExecCommandToolOutput {
 
 impl ExecCommandToolOutput {
     fn model_output_max_tokens(&self) -> usize {
-        resolve_max_tokens(self.max_output_tokens).min(self.truncation_policy.token_budget())
+        let raw = String::from_utf8_lossy(&self.raw_output);
+        let class = if self.process_id.is_some() || self.exit_code != Some(0) {
+            OutputBudgetClass::FailureOrTimeout
+        } else {
+            OutputBudgetClass::Success
+        };
+        resolve_adaptive_max_tokens(
+            self.max_output_tokens,
+            class,
+            self.hook_command.as_deref(),
+            raw.as_ref(),
+        )
+        .min(self.truncation_policy.token_budget())
     }
 
     pub(crate) fn truncated_output(&self, max_tokens: usize) -> String {
@@ -449,7 +462,7 @@ impl ExecCommandToolOutput {
         let summarized = summarize_shell_output_for_model(
             raw.as_ref(),
             self.exit_code.unwrap_or_default(),
-            /*timed_out*/ false,
+            /*timed_out*/ self.process_id.is_some(),
             ShellOutputSummaryOptions {
                 enabled: true,
                 turn_cost_guard: false,

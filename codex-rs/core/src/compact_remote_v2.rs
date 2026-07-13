@@ -22,6 +22,7 @@ use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
+use crate::turn_timing::TurnTimingState;
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
 use codex_analytics::CompactionReason;
@@ -341,7 +342,8 @@ async fn run_remote_compaction_request_v2(
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
     let mut retries = 0;
     loop {
-        let result = match client_session
+        let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
+        let stream_result = client_session
             .stream(
                 prompt,
                 &turn_context.model_info,
@@ -352,9 +354,12 @@ async fn run_remote_compaction_request_v2(
                 responses_metadata,
                 &InferenceTraceContext::disabled(),
             )
-            .await
-        {
-            Ok(stream) => collect_compaction_output(stream).await,
+            .await;
+        drop(model_request_timing_guard);
+        let result = match stream_result {
+            Ok(stream) => {
+                collect_compaction_output(stream, Some(&turn_context.turn_timing_state)).await
+            }
             Err(err) => Err(err),
         };
 
@@ -379,13 +384,23 @@ async fn run_remote_compaction_request_v2(
 
 async fn collect_compaction_output(
     mut stream: ResponseStream,
+    timing_state: Option<&Arc<TurnTimingState>>,
 ) -> CodexResult<RemoteCompactionV2Output> {
     let mut output_item_count = 0usize;
     let mut compaction_count = 0usize;
     let mut compaction_output = None;
     let mut saw_completed = false;
     let mut completed_token_usage = None;
-    while let Some(event) = stream.next().await {
+    loop {
+        let model_stream_wait_timing_guard =
+            timing_state.map(|timing_state| timing_state.begin_model_stream_wait());
+        let next_event = stream.next().await;
+        drop(model_stream_wait_timing_guard);
+        let Some(event) = next_event else {
+            break;
+        };
+        let _model_stream_processing_timing_guard =
+            timing_state.map(|timing_state| timing_state.begin_model_stream_processing());
         match event? {
             ResponseEvent::OutputItemDone(item) => {
                 output_item_count += 1;
@@ -831,7 +846,7 @@ mod tests {
             }),
         ]);
 
-        let output = collect_compaction_output(stream)
+        let output = collect_compaction_output(stream, None)
             .await
             .expect("compaction should be collected");
 

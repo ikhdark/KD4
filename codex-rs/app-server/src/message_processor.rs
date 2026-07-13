@@ -678,6 +678,7 @@ impl MessageProcessor {
     pub(crate) async fn drain_background_tasks(&self) {
         self.models_refresh_worker.shutdown();
         self.thread_processor.drain_background_tasks().await;
+        self.outgoing.shutdown_delivery_tasks().await;
     }
 
     pub(crate) async fn cancel_active_login(&self) {

@@ -13,6 +13,7 @@ use codex_protocol::plan_tool::PlanItemArg as CorePlanItemArg;
 use codex_protocol::plan_tool::StepStatus as CorePlanStepStatus;
 use codex_protocol::protocol::TaskCompletionGate as CoreTaskCompletionGate;
 use codex_protocol::protocol::TaskCompletionStatus as CoreTaskCompletionStatus;
+pub use codex_protocol::protocol::TurnTiming;
 use codex_protocol::user_input::ByteRange as CoreByteRange;
 use codex_protocol::user_input::TextElement as CoreTextElement;
 use codex_protocol::user_input::UserInput as CoreUserInput;
@@ -397,6 +398,9 @@ pub struct TurnCompletedNotification {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub completion: Option<TaskCompletionGate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub timing: Option<TurnTiming>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, JsonSchema, TS)]

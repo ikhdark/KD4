@@ -20345,6 +20345,16 @@
           "threadId": {
             "type": "string"
           },
+          "timing": {
+            "anyOf": [
+              {
+                "$ref": "#/definitions/v2/TurnTiming"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "turn": {
             "$ref": "#/definitions/v2/Turn"
           }
@@ -20781,6 +20791,366 @@
           "turnId"
         ],
         "title": "TurnSteerResponse",
+        "type": "object"
+      },
+      "TurnTiming": {
+        "description": "Immutable wall-clock profile captured at the core terminal boundary.\n\n`exclusive` is the canonical elapsed-time partition. Values in `unions` and `local` may overlap and must not be added to that partition.",
+        "properties": {
+          "classificationComplete": {
+            "type": "boolean"
+          },
+          "completedAtUnixMs": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "counters": {
+            "$ref": "#/definitions/v2/TurnTimingCounters"
+          },
+          "exclusive": {
+            "$ref": "#/definitions/v2/TurnTimingExclusive"
+          },
+          "inclusiveDurationMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "inclusiveDurationNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "local": {
+            "$ref": "#/definitions/v2/TurnTimingLocal"
+          },
+          "machineDurationMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "machineDurationNs": {
+            "description": "Inclusive duration minus only the interactive-only wait partition.",
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "milestones": {
+            "$ref": "#/definitions/v2/TurnTimingMilestones"
+          },
+          "profileValid": {
+            "type": "boolean"
+          },
+          "schemaVersion": {
+            "format": "uint16",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "startedAtUnixMs": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "unions": {
+            "$ref": "#/definitions/v2/TurnTimingUnions"
+          }
+        },
+        "required": [
+          "classificationComplete",
+          "counters",
+          "exclusive",
+          "inclusiveDurationMs",
+          "inclusiveDurationNs",
+          "local",
+          "machineDurationMs",
+          "machineDurationNs",
+          "milestones",
+          "profileValid",
+          "schemaVersion",
+          "unions"
+        ],
+        "type": "object"
+      },
+      "TurnTimingCounters": {
+        "properties": {
+          "approvalWaitCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "clockRegressionCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "invalidTransitionCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "mcpElicitationWaitCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "modelFallbackCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "modelRequestCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "modelRetryCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "permissionWaitCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "saturationCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolCallCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "userInputWaitCount": {
+            "format": "uint32",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "approvalWaitCount",
+          "clockRegressionCount",
+          "invalidTransitionCount",
+          "mcpElicitationWaitCount",
+          "modelFallbackCount",
+          "modelRequestCount",
+          "modelRetryCount",
+          "permissionWaitCount",
+          "saturationCount",
+          "toolCallCount",
+          "userInputWaitCount"
+        ],
+        "type": "object"
+      },
+      "TurnTimingExclusive": {
+        "properties": {
+          "finalizationNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "interactiveOnlyWaitNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "interactivePlusMachineNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "modelOnlyNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "modelPlusToolNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "orchestrationNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "retryOnlyNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "standaloneWorkNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolOnlyNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "unclassifiedNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "finalizationNs",
+          "interactiveOnlyWaitNs",
+          "interactivePlusMachineNs",
+          "modelOnlyNs",
+          "modelPlusToolNs",
+          "orchestrationNs",
+          "retryOnlyNs",
+          "standaloneWorkNs",
+          "toolOnlyNs",
+          "unclassifiedNs"
+        ],
+        "type": "object"
+      },
+      "TurnTimingLocal": {
+        "properties": {
+          "compactionUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "executorReadinessWaitUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "persistenceUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "planningUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "preparationUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "routerBuildUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "serializationUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "startupPrewarmWaitUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "compactionUnionNs",
+          "executorReadinessWaitUnionNs",
+          "persistenceUnionNs",
+          "planningUnionNs",
+          "preparationUnionNs",
+          "routerBuildUnionNs",
+          "serializationUnionNs",
+          "startupPrewarmWaitUnionNs"
+        ],
+        "type": "object"
+      },
+      "TurnTimingMilestones": {
+        "properties": {
+          "firstAgentMessageMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "firstModelOutputMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "firstVisibleOutputMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "TurnTimingUnions": {
+        "properties": {
+          "interactiveWaitUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "modelActiveUnionMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "modelActiveUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "modelRequestWaitUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "modelStreamProcessingUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "modelStreamWaitUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolActiveUnionMs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          },
+          "toolActiveUnionNs": {
+            "format": "uint64",
+            "minimum": 0.0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "interactiveWaitUnionNs",
+          "modelActiveUnionMs",
+          "modelActiveUnionNs",
+          "modelRequestWaitUnionNs",
+          "modelStreamProcessingUnionNs",
+          "modelStreamWaitUnionNs",
+          "toolActiveUnionMs",
+          "toolActiveUnionNs"
+        ],
         "type": "object"
       },
       "TurnsPage": {

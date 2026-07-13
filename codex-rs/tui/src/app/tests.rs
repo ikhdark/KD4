@@ -4639,6 +4639,7 @@ fn turn_completed_notification(
             duration_ms: Some(1),
             ..test_turn(turn_id, status, Vec::new())
         },
+        timing: None,
     })
 }
 

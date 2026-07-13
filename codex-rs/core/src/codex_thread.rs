@@ -276,6 +276,30 @@ impl CodexThread {
             .await
     }
 
+    /// Reserves the public turn ID with the same canonical generator used by
+    /// normal core submissions.
+    pub fn reserve_turn_id(&self) -> String {
+        self.codex.reserve_turn_id()
+    }
+
+    pub async fn submit_user_input_with_reserved_turn_id(
+        &self,
+        turn_id: String,
+        op: Op,
+        trace: Option<W3cTraceContext>,
+        client_user_message_id: Option<String>,
+    ) -> CodexResult<()> {
+        self.codex
+            .session
+            .services
+            .agent_control
+            .ensure_execution_capacity_for_op(self.session_configured.thread_id, &op)
+            .await?;
+        self.codex
+            .submit_user_input_with_reserved_turn_id(turn_id, op, trace, client_user_message_id)
+            .await
+    }
+
     /// Persist whether this thread is eligible for future memory generation.
     pub async fn set_thread_memory_mode(&self, mode: ThreadMemoryMode) -> anyhow::Result<()> {
         self.codex.set_thread_memory_mode(mode).await

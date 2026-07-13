@@ -526,10 +526,19 @@ impl TurnRequestProcessor {
             additional_context,
             thread_settings,
         };
-        let turn_id = thread
-            .submit_user_input_with_client_user_message_id(
+        let turn_id = thread.reserve_turn_id();
+        let turn_origin_tracker = {
+            let thread_state = self.thread_state_manager.thread_state(thread_id).await;
+            thread_state.lock().await.turn_origin_tracker()
+        };
+        let origin_reservation =
+            turn_origin_tracker.reserve(turn_id.clone(), request_id.connection_id);
+        let request_trace_context = self.request_trace_context(&request_id).await;
+        thread
+            .submit_user_input_with_reserved_turn_id(
+                turn_id.clone(),
                 turn_op,
-                self.request_trace_context(&request_id).await,
+                request_trace_context,
                 client_user_message_id,
             )
             .await
@@ -538,6 +547,7 @@ impl TurnRequestProcessor {
                 self.track_error_response(&request_id, &error, /*error_type*/ None);
                 error
             })?;
+        origin_reservation.commit();
 
         if turn_has_input {
             let config_snapshot = thread.config_snapshot().await;

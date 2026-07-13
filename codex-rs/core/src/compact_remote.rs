@@ -238,6 +238,7 @@ async fn run_remote_compact_task_inner_impl(
                 analytics_details,
             )
             .await;
+            turn_context.turn_timing_state.record_model_fallback();
             record_model_fallback(
                 &sess.services.session_telemetry,
                 turn_context.model_info.slug.as_str(),

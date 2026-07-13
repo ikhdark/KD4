@@ -152,6 +152,55 @@ async fn to_connection_notifications_are_preserved_for_non_opted_out_clients() {
 }
 
 #[tokio::test]
+async fn to_connection_receipt_sender_reaches_the_transport_writer() {
+    let connection_id = ConnectionId(14);
+    let (writer_tx, mut writer_rx) = mpsc::channel(1);
+    let (write_complete_tx, write_complete_rx) = tokio::sync::oneshot::channel();
+
+    let mut connections = HashMap::new();
+    connections.insert(
+        connection_id,
+        OutboundConnectionState::new(
+            writer_tx,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(RwLock::new(HashSet::new())),
+            /*disconnect_sender*/ None,
+        ),
+    );
+
+    route_outgoing_envelope(
+        &mut connections,
+        OutgoingEnvelope::ToConnection {
+            connection_id,
+            message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification {
+                    summary: "receipt-probe".to_string(),
+                    details: None,
+                    path: None,
+                    range: None,
+                },
+            )),
+            write_complete_tx: Some(write_complete_tx),
+        },
+    )
+    .await;
+
+    let queued_message = writer_rx
+        .recv()
+        .await
+        .expect("notification should reach the transport writer");
+    queued_message
+        .write_complete_tx
+        .expect("routing must preserve the receipt sender")
+        .send(())
+        .expect("receipt receiver should remain live");
+    write_complete_rx
+        .await
+        .expect("transport completion should reach the receipt collector");
+}
+
+#[tokio::test]
 async fn experimental_notifications_are_dropped_without_capability() {
     let connection_id = ConnectionId(12);
     let (writer_tx, mut writer_rx) = mpsc::channel(1);

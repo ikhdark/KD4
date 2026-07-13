@@ -108,9 +108,11 @@ impl ToolOrchestrator {
                 .as_ref()
                 .map(ActiveNetworkApproval::execution_proxy),
         };
+        let tool_execution_timing_guard = tool_ctx.turn.turn_timing_state.begin_tool_execution();
         let run_result = tool
             .run(req, &attempt_with_network_approval, &attempt_tool_ctx)
             .await;
+        drop(tool_execution_timing_guard);
 
         let Some(network_approval) = network_approval else {
             return (run_result, None);

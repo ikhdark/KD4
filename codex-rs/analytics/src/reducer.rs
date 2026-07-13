@@ -34,6 +34,7 @@ use crate::events::CodexReviewEventParams;
 use crate::events::CodexReviewEventRequest;
 use crate::events::CodexRuntimeMetadata;
 use crate::events::CodexToolItemEventBase;
+use crate::events::CodexTurnDeliveryEventRequest;
 use crate::events::CodexTurnEventParams;
 use crate::events::CodexTurnEventRequest;
 use crate::events::CodexTurnSteerEventParams;
@@ -138,6 +139,7 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SkillScope;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
+use codex_protocol::protocol::TurnTiming;
 use codex_protocol::request_permissions::PermissionGrantScope as CorePermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionsResponse as CoreRequestPermissionsResponse;
 use sha1::Digest;
@@ -366,6 +368,7 @@ struct TurnState {
     started_at: Option<u64>,
     token_usage: Option<TokenUsage>,
     profile: Option<TurnProfile>,
+    timing: Option<TurnTiming>,
     completed: Option<CompletedTurnState>,
     codex_error: Option<TurnCodexError>,
     latest_diff: Option<String>,
@@ -517,6 +520,14 @@ impl AnalyticsReducer {
                 }
                 CustomAnalyticsFact::TurnProfile(input) => {
                     self.ingest_turn_profile(*input, out).await;
+                }
+                CustomAnalyticsFact::TurnDelivery(input) => {
+                    out.push(TrackEventRequest::TurnDelivery(Box::new(
+                        CodexTurnDeliveryEventRequest {
+                            event_type: "codex_turn_delivery",
+                            event_params: *input,
+                        },
+                    )));
                 }
                 CustomAnalyticsFact::TurnCodexError(input) => {
                     self.ingest_turn_codex_error(*input);
@@ -697,9 +708,14 @@ impl AnalyticsReducer {
         input: TurnProfileFact,
         out: &mut Vec<TrackEventRequest>,
     ) {
-        let TurnProfileFact { turn_id, profile } = input;
+        let TurnProfileFact {
+            turn_id,
+            profile,
+            timing,
+        } = input;
         let turn_state = self.turns.entry(turn_id.clone()).or_default();
         turn_state.profile = Some(profile);
+        turn_state.timing = timing;
         self.maybe_emit_turn_event(&turn_id, out).await;
     }
 
@@ -2695,6 +2711,7 @@ fn codex_turn_event_params(
         after_last_sampling_ms,
         sampling_request_count,
         sampling_retry_count,
+        timing: turn_state.timing.clone(),
         duration_ms: completed.duration_ms,
         started_at,
         completed_at: Some(completed.completed_at),

@@ -38,6 +38,16 @@ use tracing::instrument;
 
 pub(crate) type ToolTelemetryTags = Vec<(&'static str, String)>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ToolExecutionTiming {
+    /// Time the core handler future as the actual tool invocation.
+    Handler,
+    /// A narrower runtime boundary inside the handler owns execution timing.
+    NestedRuntime,
+    /// The handler is an interactive wait rather than machine tool execution.
+    Interactive,
+}
+
 pub use codex_tools::ToolExecutor;
 pub use codex_tools::ToolExposure;
 
@@ -46,6 +56,10 @@ pub use codex_tools::ToolExposure;
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    fn tool_execution_timing(&self) -> ToolExecutionTiming {
+        ToolExecutionTiming::Handler
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(
             payload,
@@ -278,6 +292,10 @@ impl ToolExecutor<ToolInvocation> for ExposureOverride {
 }
 
 impl CoreToolRuntime for ExposureOverride {
+    fn tool_execution_timing(&self) -> ToolExecutionTiming {
+        self.handler.tool_execution_timing()
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         self.handler.matches_kind(payload)
     }
@@ -437,6 +455,7 @@ impl ToolRegistry {
                 turn_state.tool_calls = turn_state.tool_calls.saturating_add(1);
             }
         }
+        invocation.turn.turn_timing_state.record_tool_call();
 
         let dispatch_trace = ToolDispatchTrace::start(&invocation);
         let tool = match self.tool(&tool_name) {
@@ -689,6 +708,9 @@ async fn handle_any_tool(
 ) -> Result<AnyToolResult, FunctionCallError> {
     let call_id = invocation.call_id.clone();
     let payload = invocation.payload.clone();
+    let _tool_execution_timing_guard =
+        matches!(tool.tool_execution_timing(), ToolExecutionTiming::Handler)
+            .then(|| invocation.turn.turn_timing_state.begin_tool_execution());
     let output = tool.handle(invocation.clone()).await?;
     if output.contains_external_context()
         && invocation.turn.config.memories.disable_on_external_context

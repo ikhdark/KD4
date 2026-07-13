@@ -29,6 +29,21 @@ pub struct SkillInjection {
     pub contents: String,
 }
 
+/// Read-only skill resolution result. Observability is applied separately so a
+/// pending-turn plan may be rebuilt without duplicating metrics or analytics.
+#[derive(Debug, Default)]
+pub struct PlannedSkillInjections {
+    pub injections: SkillInjections,
+    pub invocations: Vec<SkillInvocation>,
+    pub metrics: Vec<SkillInjectionMetric>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillInjectionMetric {
+    pub skill_name: String,
+    pub status: &'static str,
+}
+
 /// Host skill prompts that have already been injected by an extension for this
 /// turn.
 ///
@@ -67,15 +82,28 @@ pub async fn build_skill_injections(
     analytics_client: &AnalyticsEventsClient,
     tracking: TrackEventsContext,
 ) -> SkillInjections {
+    let plan = plan_skill_injections(mentioned_skills, loaded_skills).await;
+    apply_skill_injection_observability(&plan, otel, analytics_client, tracking);
+    plan.injections
+}
+
+/// Resolve and read skill bodies without emitting warnings, metrics, or analytics.
+pub async fn plan_skill_injections(
+    mentioned_skills: &[SkillMetadata],
+    loaded_skills: Option<&SkillLoadOutcome>,
+) -> PlannedSkillInjections {
     if mentioned_skills.is_empty() {
-        return SkillInjections::default();
+        return PlannedSkillInjections::default();
     }
 
-    let mut result = SkillInjections {
-        items: Vec::with_capacity(mentioned_skills.len()),
-        warnings: Vec::new(),
+    let mut plan = PlannedSkillInjections {
+        injections: SkillInjections {
+            items: Vec::with_capacity(mentioned_skills.len()),
+            warnings: Vec::new(),
+        },
+        invocations: Vec::new(),
+        metrics: Vec::with_capacity(mentioned_skills.len()),
     };
-    let mut invocations = Vec::new();
 
     for skill in mentioned_skills {
         let fs = loaded_skills
@@ -84,54 +112,65 @@ pub async fn build_skill_injections(
         let path = PathUri::from_abs_path(&skill.path_to_skills_md);
         match fs.read_file_text(&path, /*sandbox*/ None).await {
             Ok(contents) => {
-                emit_skill_injected_metric(otel, skill, "ok");
-                invocations.push(SkillInvocation {
+                plan.metrics.push(SkillInjectionMetric {
+                    skill_name: skill.name.clone(),
+                    status: "ok",
+                });
+                plan.invocations.push(SkillInvocation {
                     skill_name: skill.name.clone(),
                     skill_scope: skill.scope,
                     skill_path: skill.path_to_skills_md.to_path_buf(),
                     plugin_id: skill.plugin_id.clone(),
                     invocation_type: InvocationType::Explicit,
                 });
-                result.items.push(SkillInjection {
+                plan.injections.items.push(SkillInjection {
                     name: skill.name.clone(),
                     path: skill.path_to_skills_md.to_string_lossy().into_owned(),
                     contents,
                 });
             }
             Err(err) => {
-                emit_skill_injected_metric(otel, skill, "error");
+                plan.metrics.push(SkillInjectionMetric {
+                    skill_name: skill.name.clone(),
+                    status: "error",
+                });
                 let message = format!(
                     "Failed to load skill {name} at {path}: {err:#}",
                     name = skill.name,
                     path = skill.path_to_skills_md.display()
                 );
-                result.warnings.push(message);
+                plan.injections.warnings.push(message);
             }
         }
     }
 
-    analytics_client.track_skill_invocations(tracking, invocations);
+    plan
+}
 
-    result
+/// Apply the observability portion of a previously resolved skill plan exactly once.
+pub fn apply_skill_injection_observability(
+    plan: &PlannedSkillInjections,
+    otel: Option<&SessionTelemetry>,
+    analytics_client: &AnalyticsEventsClient,
+    tracking: TrackEventsContext,
+) {
+    if let Some(otel) = otel {
+        for metric in &plan.metrics {
+            emit_skill_injected_metric(otel, &metric.skill_name, metric.status);
+        }
+    }
+    analytics_client.track_skill_invocations(tracking, plan.invocations.clone());
 }
 
 fn normalize_host_skill_path(path: &str) -> String {
     normalize_skill_path(path).replace('\\', "/")
 }
 
-fn emit_skill_injected_metric(
-    otel: Option<&SessionTelemetry>,
-    skill: &SkillMetadata,
-    status: &str,
-) {
-    let Some(otel) = otel else {
-        return;
-    };
-
+fn emit_skill_injected_metric(otel: &SessionTelemetry, skill_name: &str, status: &str) {
     otel.counter(
         "codex.skill.injected",
         /*inc*/ 1,
-        &[("status", status), ("skill", skill.name.as_str())],
+        &[("status", status), ("skill", skill_name)],
     );
 }
 
