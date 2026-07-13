@@ -130,6 +130,7 @@ pub(crate) enum ToolEmitter {
         cwd: PathUri,
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
+        environment_id: String,
     },
     ApplyPatch {
         changes: HashMap<PathBuf, FileChange>,
@@ -142,17 +143,24 @@ pub(crate) enum ToolEmitter {
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
         process_id: Option<String>,
+        environment_id: String,
     },
 }
 
 impl ToolEmitter {
-    pub fn shell(command: Vec<String>, cwd: AbsolutePathBuf, source: ExecCommandSource) -> Self {
+    pub fn shell(
+        command: Vec<String>,
+        cwd: AbsolutePathBuf,
+        source: ExecCommandSource,
+        environment_id: String,
+    ) -> Self {
         let parsed_cmd = parse_command(&command);
         Self::Shell {
             command,
             cwd: PathUri::from_abs_path(&cwd),
             source,
             parsed_cmd,
+            environment_id,
         }
     }
 
@@ -173,6 +181,7 @@ impl ToolEmitter {
         cwd: PathUri,
         source: ExecCommandSource,
         process_id: Option<String>,
+        environment_id: String,
     ) -> Self {
         let parsed_cmd = parse_command(command);
         Self::UnifiedExec {
@@ -181,6 +190,7 @@ impl ToolEmitter {
             source,
             parsed_cmd,
             process_id,
+            environment_id,
         }
     }
 
@@ -192,14 +202,19 @@ impl ToolEmitter {
                     cwd,
                     source,
                     parsed_cmd,
-                    ..
+                    environment_id,
                 },
                 stage,
             ) => {
                 emit_exec_stage(
                     ctx,
                     ExecCommandInput::new(
-                        command, cwd, parsed_cmd, *source, /*interaction_input*/ None,
+                        command,
+                        cwd,
+                        environment_id,
+                        parsed_cmd,
+                        *source,
+                        /*interaction_input*/ None,
                         /*process_id*/ None,
                     ),
                     stage,
@@ -335,6 +350,7 @@ impl ToolEmitter {
                     source,
                     parsed_cmd,
                     process_id,
+                    environment_id,
                 },
                 stage,
             ) => {
@@ -343,6 +359,7 @@ impl ToolEmitter {
                     ExecCommandInput::new(
                         command,
                         cwd,
+                        environment_id,
                         parsed_cmd,
                         *source,
                         /*interaction_input*/ None,
@@ -451,6 +468,7 @@ impl ToolEmitter {
 struct ExecCommandInput<'a> {
     command: &'a [String],
     cwd: &'a PathUri,
+    environment_id: &'a str,
     parsed_cmd: &'a [ParsedCommand],
     source: ExecCommandSource,
     interaction_input: Option<&'a str>,
@@ -461,6 +479,7 @@ impl<'a> ExecCommandInput<'a> {
     fn new(
         command: &'a [String],
         cwd: &'a PathUri,
+        environment_id: &'a str,
         parsed_cmd: &'a [ParsedCommand],
         source: ExecCommandSource,
         interaction_input: Option<&'a str>,
@@ -469,6 +488,7 @@ impl<'a> ExecCommandInput<'a> {
         Self {
             command,
             cwd,
+            environment_id,
             parsed_cmd,
             source,
             interaction_input,
@@ -495,6 +515,11 @@ async fn emit_exec_stage(
 ) {
     match stage {
         ToolEventStage::Begin => {
+            ctx.session
+                .services
+                .task_evidence
+                .record_command_intent(ctx.call_id, exec_input.command)
+                .await;
             emit_exec_command_begin(
                 ctx,
                 exec_input.command,
@@ -570,6 +595,7 @@ async fn emit_exec_end(
             exec_input.command,
             exec_result.exit_code,
             exec_result.timed_out,
+            exec_input.environment_id,
             native_cwd
                 .as_ref()
                 .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
@@ -579,6 +605,7 @@ async fn emit_exec_end(
         .services
         .task_evidence
         .record_command(
+            ctx.call_id,
             exec_input.command,
             exec_input.cwd,
             exec_result.exit_code,
@@ -883,6 +910,7 @@ mod tests {
             vec!["cargo".to_string(), "test".to_string()],
             cwd,
             ExecCommandSource::Agent,
+            String::new(),
         );
         let output = ExecToolCallOutput {
             exit_code: 1,

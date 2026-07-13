@@ -47,6 +47,8 @@ use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::WriteStdinRequest;
 use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
+use crate::unified_exec::async_watcher::lagged_output_marker;
+use crate::unified_exec::async_watcher::omitted_output_marker;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
 use crate::unified_exec::async_watcher::start_streaming_output;
 use crate::unified_exec::clamp_yield_time;
@@ -106,6 +108,23 @@ fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, S
         env.insert(key.to_string(), value.to_string());
     }
     env
+}
+
+fn build_unified_exec_environment(
+    context: &UnifiedExecContext,
+) -> (HashMap<String, String>, HashMap<String, String>) {
+    let local_policy_env = create_env(
+        &context.turn.config.permissions.shell_environment_policy,
+        /*thread_id*/ None,
+    );
+    let mut env = local_policy_env.clone();
+    env.insert(
+        CODEX_THREAD_ID_ENV_VAR.to_string(),
+        context.session.thread_id.to_string(),
+    );
+    let active_permission_profile = context.turn.config.permissions.active_permission_profile();
+    inject_permission_profile_env(&mut env, active_permission_profile.as_ref());
+    (apply_unified_exec_env(env), local_policy_env)
 }
 
 fn exec_env_policy_from_shell_policy(
@@ -335,6 +354,7 @@ async fn emit_failed_initial_exec_end_if_unstored(
         context.call_id.clone(),
         request.command_for_safety.clone(),
         cwd,
+        request.turn_environment.environment_id.clone(),
         Some(request.process_id.to_string()),
         transcript,
         fallback_output,
@@ -369,6 +389,13 @@ fn terminate_process_on_network_denial(
 }
 
 impl UnifiedExecProcessManager {
+    pub(crate) fn effective_environment(
+        &self,
+        context: &UnifiedExecContext,
+    ) -> HashMap<String, String> {
+        build_unified_exec_environment(context).0
+    }
+
     pub(crate) async fn allocate_process_id(&self) -> i32 {
         loop {
             let mut store = self.process_store.lock().await;
@@ -445,6 +472,7 @@ impl UnifiedExecProcessManager {
             cwd.clone(),
             ExecCommandSource::UnifiedExecStartup,
             Some(request.process_id.to_string()),
+            request.turn_environment.environment_id.clone(),
         );
         emitter.emit(event_ctx, ToolEventStage::Begin).await;
 
@@ -461,6 +489,7 @@ impl UnifiedExecProcessManager {
                 &request.command_for_safety,
                 request.hook_command.clone(),
                 cwd.clone(),
+                request.turn_environment.environment_id.clone(),
                 start,
                 request.process_id,
                 request.tty,
@@ -606,6 +635,7 @@ impl UnifiedExecProcessManager {
                 context.call_id.clone(),
                 request.command_for_safety.clone(),
                 cwd.clone(),
+                request.turn_environment.environment_id.clone(),
                 Some(process_id.to_string()),
                 Arc::clone(&transcript),
                 text.clone(),
@@ -870,6 +900,7 @@ impl UnifiedExecProcessManager {
         command: &[String],
         hook_command: String,
         cwd: PathUri,
+        environment_id: String,
         started_at: Instant,
         process_id: i32,
         tty: bool,
@@ -901,6 +932,13 @@ impl UnifiedExecProcessManager {
         // network-approval cleanup only after dropping that lock.
         if let Some(pruned_entry) = pruned_entry {
             unregister_network_approval_for_entry(&pruned_entry).await;
+            let exit_code = pruned_entry.process.exit_code().unwrap_or(-1);
+            context
+                .session
+                .services
+                .command_execution
+                .finish_running_process(pruned_entry.process_id, Some(exit_code))
+                .await;
             pruned_entry.process.terminate();
         }
 
@@ -918,6 +956,7 @@ impl UnifiedExecProcessManager {
             context.call_id.clone(),
             command.to_vec(),
             cwd,
+            environment_id,
             process_id,
             transcript,
             started_at,
@@ -1134,18 +1173,7 @@ impl UnifiedExecProcessManager {
         cwd: PathUri,
         context: &UnifiedExecContext,
     ) -> Result<(UnifiedExecProcess, Option<DeferredNetworkApproval>), UnifiedExecError> {
-        let local_policy_env = create_env(
-            &context.turn.config.permissions.shell_environment_policy,
-            /*thread_id*/ None,
-        );
-        let mut env = local_policy_env.clone();
-        env.insert(
-            CODEX_THREAD_ID_ENV_VAR.to_string(),
-            context.session.thread_id.to_string(),
-        );
-        let active_permission_profile = context.turn.config.permissions.active_permission_profile();
-        inject_permission_profile_env(&mut env, active_permission_profile.as_ref());
-        let env = apply_unified_exec_env(env);
+        let (env, local_policy_env) = build_unified_exec_environment(context);
         let exec_server_env_config = ExecServerEnvConfig {
             policy: exec_env_policy_from_shell_policy(
                 &context.turn.config.permissions.shell_environment_policy,
@@ -1243,6 +1271,8 @@ impl UnifiedExecProcessManager {
         const POST_EXIT_CLOSE_WAIT_CAP: Duration = Duration::from_millis(50);
 
         let mut collected: Vec<u8> = Vec::with_capacity(4096);
+        let mut omitted_bytes = 0_usize;
+        let mut lagged_chunks = 0_u64;
         let mut exit_signal_received = cancellation_token.is_cancelled();
         let mut post_exit_deadline: Option<Instant> = None;
         loop {
@@ -1253,16 +1283,26 @@ impl UnifiedExecProcessManager {
             )
             .await;
             let drained_chunks: Vec<Vec<u8>>;
+            let drained_omitted_bytes: usize;
+            let drained_lagged_chunks: u64;
             let mut wait_for_output = None;
             {
                 let mut guard = output_buffer.lock().await;
                 drained_chunks = guard.drain_chunks();
-                if drained_chunks.is_empty() {
+                drained_omitted_bytes = guard.take_unreported_omitted_bytes();
+                drained_lagged_chunks = guard.take_unreported_lagged_chunks();
+                if drained_chunks.is_empty()
+                    && drained_omitted_bytes == 0
+                    && drained_lagged_chunks == 0
+                {
                     wait_for_output = Some(output_notify.notified());
                 }
             }
+            omitted_bytes = omitted_bytes.saturating_add(drained_omitted_bytes);
+            lagged_chunks = lagged_chunks.saturating_add(drained_lagged_chunks);
 
-            if drained_chunks.is_empty() {
+            if drained_chunks.is_empty() && drained_omitted_bytes == 0 && drained_lagged_chunks == 0
+            {
                 exit_signal_received |= cancellation_token.is_cancelled();
                 if exit_signal_received && output_closed.load(std::sync::atomic::Ordering::Acquire)
                 {
@@ -1317,6 +1357,12 @@ impl UnifiedExecProcessManager {
             }
         }
 
+        if omitted_bytes > 0 {
+            collected.extend_from_slice(&omitted_output_marker(omitted_bytes));
+        }
+        if lagged_chunks > 0 {
+            collected.extend_from_slice(&lagged_output_marker(lagged_chunks));
+        }
         collected
     }
 

@@ -59,6 +59,49 @@ fn fixed_string_search_treats_punctuation_literally() {
 }
 
 #[test]
+fn case_insensitive_search_matches_unicode_case_pairs() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join("source.rs"), "before\nÉCOLE\nafter\n").expect("write");
+
+    let output = search_source(search_options(repo.path(), "école")).expect("search");
+
+    assert_eq!(output.coverage.total_matches, 1);
+    assert_eq!(output.matches[0].line_number, 2);
+}
+
+#[test]
+fn case_insensitive_search_handles_sigma_and_sharp_s_folds() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        repo.path().join("unicode.rs"),
+        "const GREEK: &str = \"ΟΣ\";\nconst GERMAN: &str = \"straße\";\n",
+    )
+    .expect("write");
+
+    let sigma = search_source(search_options(repo.path(), "ος")).expect("sigma search");
+    assert_eq!(sigma.coverage.total_matches, 1);
+
+    let sharp_s = search_source(search_options(repo.path(), "STRASSE")).expect("sharp-s search");
+    assert_eq!(sharp_s.coverage.total_matches, 1);
+}
+
+#[test]
+fn case_insensitive_search_uses_complete_unicode_default_folding() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        repo.path().join("unicode_folds.rs"),
+        "const LONG_S: &str = \"ſource\";\nconst LIGATURE: &str = \"oﬃce\";\n",
+    )
+    .expect("write");
+
+    let long_s = search_source(search_options(repo.path(), "SOURCE")).expect("long-s search");
+    assert_eq!(long_s.coverage.total_matches, 1);
+
+    let ligature = search_source(search_options(repo.path(), "OFFICE")).expect("ligature search");
+    assert_eq!(ligature.coverage.total_matches, 1);
+}
+
+#[test]
 fn search_reports_match_cap_without_stopping_bounded_scan() {
     let repo = tempfile::tempdir().expect("tempdir");
     fs::write(repo.path().join("a.rs"), "needle one\nneedle two\n").expect("write");
@@ -78,7 +121,7 @@ fn search_reports_match_cap_without_stopping_bounded_scan() {
 #[test]
 fn search_result_text_never_exceeds_result_budget() {
     let repo = tempfile::tempdir().expect("tempdir");
-    let line = format!("needle {}\n", "x".repeat(SOURCE_SEARCH_MAX_LINE_BYTES));
+    let line = format!("needle {}\n", "\\\"".repeat(SOURCE_SEARCH_MAX_LINE_BYTES));
     fs::write(repo.path().join("many.rs"), line.repeat(180)).expect("write");
     let mut options = search_options(repo.path(), "needle");
     options.max_matches = SOURCE_SEARCH_MAX_MATCHES;
@@ -86,6 +129,13 @@ fn search_result_text_never_exceeds_result_budget() {
     let output = search_source(options).expect("search");
 
     assert!(output.coverage.result_bytes <= SOURCE_SEARCH_MAX_RESULT_BYTES);
+    assert_eq!(
+        output.coverage.result_bytes,
+        serde_json::to_vec_pretty(&output)
+            .expect("serialize source search output")
+            .len()
+            + 1
+    );
     assert_eq!(
         output.truncated_reason,
         Some(SourceTruncatedReason::MaxResultBytes)
@@ -95,6 +145,56 @@ fn search_result_text_never_exceeds_result_budget() {
             .matches
             .iter()
             .all(|source_match| source_match.lines[0].text.len() <= SOURCE_SEARCH_MAX_LINE_BYTES)
+    );
+}
+
+#[test]
+fn walk_errors_mark_coverage_incomplete_without_stopping_the_scan() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let options = search_options(repo.path(), "needle");
+    let mut accumulator = SourceSearchAccumulator::new(&options).expect("accumulator");
+
+    assert!(accumulator.consider_file(Path::new("a.rs"), 7));
+    accumulator.add_file_bytes(Path::new("a.rs"), b"needle\n".to_vec());
+    let walk_error = Result::<(), std::io::Error>::Err(std::io::Error::other("walk failed"));
+    assert!(recover_walk_entry(walk_error, &mut accumulator).is_none());
+    assert!(!accumulator.should_stop());
+    assert!(accumulator.consider_file(Path::new("b.rs"), 7));
+    accumulator.add_file_bytes(Path::new("b.rs"), b"needle\n".to_vec());
+
+    let output = accumulator.finish(vec![".".to_string()]);
+
+    assert_eq!(output.coverage.filesystem_errors, 1);
+    assert_eq!(output.coverage.matches_returned, 2);
+    assert!(output.truncated);
+    assert_eq!(
+        output.truncated_reason,
+        Some(SourceTruncatedReason::FilesystemErrors)
+    );
+}
+
+#[test]
+fn per_file_scan_errors_preserve_partial_results_and_continue() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let options = search_options(repo.path(), "needle");
+    let mut accumulator = SourceSearchAccumulator::new(&options).expect("accumulator");
+
+    assert!(accumulator.consider_file(Path::new("before.rs"), 7));
+    accumulator.add_file_bytes(Path::new("before.rs"), b"needle\n".to_vec());
+    recover_scan_result(
+        Err(anyhow::anyhow!("file disappeared after enumeration")),
+        &mut accumulator,
+    );
+    assert!(accumulator.consider_file(Path::new("after.rs"), 7));
+    accumulator.add_file_bytes(Path::new("after.rs"), b"needle\n".to_vec());
+
+    let output = accumulator.finish(vec![".".to_string()]);
+
+    assert_eq!(output.coverage.filesystem_errors, 1);
+    assert_eq!(output.coverage.matches_returned, 2);
+    assert_eq!(
+        output.truncated_reason,
+        Some(SourceTruncatedReason::FilesystemErrors)
     );
 }
 

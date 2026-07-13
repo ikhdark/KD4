@@ -219,6 +219,95 @@ async fn mutating_preflight_rejection_does_not_reserve_process_id() {
 }
 
 #[tokio::test]
+async fn intercepted_apply_patch_failure_releases_process_id_and_counts_retry_failure() {
+    let patch = "*** Begin Patch\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch";
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "apply_patch",
+            "args": [patch]
+        })
+        .to_string(),
+    };
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let handler = ExecCommandHandler::default();
+
+    for attempt in 0..2 {
+        let err = match handler
+            .handle(ToolInvocation {
+                session: Arc::clone(&session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                turn: Arc::clone(&turn),
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: format!("intercept-failure-{attempt}"),
+                tool_name: codex_tools::ToolName::plain("exec_command"),
+                source: ToolCallSource::Direct,
+                payload: payload.clone(),
+            })
+            .await
+        {
+            Ok(_) => panic!("invalid intercepted patch must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("apply_patch verification failed"));
+
+        let process_id = session
+            .services
+            .unified_exec_manager
+            .allocate_process_id()
+            .await;
+        assert_eq!(process_id, 1000);
+        session
+            .services
+            .unified_exec_manager
+            .release_process_id(process_id)
+            .await;
+    }
+
+    let payload_with_output_only_change = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "apply_patch",
+            "args": [patch],
+            "max_output_tokens": 1
+        })
+        .to_string(),
+    };
+    let blocked = match handler
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn: Arc::clone(&turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "intercept-failure-blocked".to_string(),
+            tool_name: codex_tools::ToolName::plain("exec_command"),
+            source: ToolCallSource::Direct,
+            payload: payload_with_output_only_change,
+        })
+        .await
+    {
+        Ok(_) => panic!("third identical failure must be blocked"),
+        Err(err) => err,
+    };
+    assert!(blocked.to_string().contains("Command blocked"));
+
+    let artifact_directory = turn
+        .config
+        .codex_home
+        .join("tool-output")
+        .join(session.thread_id.to_string());
+    assert!(
+        !tokio::fs::try_exists(artifact_directory)
+            .await
+            .expect("inspect artifact directory")
+    );
+}
+
+#[tokio::test]
 async fn unpolled_background_failure_finalizes_artifact_and_attempt_ledger() {
     let python = which::which("python")
         .or_else(|_| which::which("python3"))
@@ -261,19 +350,6 @@ async fn unpolled_background_failure_finalizes_artifact_and_attempt_ledger() {
             .to_string(),
         },
     };
-    let environment = invocation
-        .step_context
-        .environments
-        .primary()
-        .expect("primary environment")
-        .clone();
-    let attempt_key = crate::tools::command_execution::CommandAttemptKey::new(
-        "exec_command",
-        &environment.environment_id,
-        environment.cwd().to_string(),
-        &command,
-    );
-
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         ExecCommandHandler::default().handle(invocation),
@@ -284,7 +360,17 @@ async fn unpolled_background_failure_finalizes_artifact_and_attempt_ledger() {
     let code_mode = output.code_mode_result(&ToolPayload::Function {
         arguments: "{}".to_string(),
     });
-    assert!(code_mode["session_id"].is_number());
+    let process_id = code_mode["session_id"]
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok())
+        .expect("numeric background process id");
+    let attempt_key = session
+        .services
+        .command_execution
+        .running_process(process_id)
+        .await
+        .expect("background process must be tracked while it is running")
+        .key;
     let artifact_path = PathBuf::from(
         code_mode["raw_output_artifact"]
             .as_str()

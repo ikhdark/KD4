@@ -79,7 +79,18 @@ pub(crate) fn start_streaming_output(
                 received = receiver.recv() => {
                     let chunk = match received {
                         Ok(chunk) => chunk,
-                        Err(RecvError::Lagged(_)) => {
+                        Err(RecvError::Lagged(skipped)) => {
+                            {
+                                let mut guard = transcript.lock().await;
+                                guard.record_lagged_chunks(skipped);
+                            }
+                            emit_output_delta(
+                                &call_id,
+                                &session_ref,
+                                &turn_ref,
+                                &mut emitted_deltas,
+                                lagged_output_marker(skipped),
+                            ).await;
                             continue;
                         },
                         Err(RecvError::Closed) => {
@@ -103,6 +114,18 @@ pub(crate) fn start_streaming_output(
     });
 }
 
+pub(super) fn lagged_output_marker(skipped: u64) -> Vec<u8> {
+    format!("\n[output unavailable: streaming receiver lagged by {skipped} chunk(s)]\n")
+        .into_bytes()
+}
+
+pub(super) fn omitted_output_marker(omitted_bytes: usize) -> Vec<u8> {
+    format!(
+        "\n[output truncated: {omitted_bytes} byte(s) omitted from the middle by the output retention limit]\n"
+    )
+    .into_bytes()
+}
+
 /// Spawn a background watcher that waits for the PTY to exit and then emits a
 /// single ExecCommandEnd event with the aggregated transcript.
 #[allow(clippy::too_many_arguments)]
@@ -113,6 +136,7 @@ pub(crate) fn spawn_exit_watcher(
     call_id: String,
     command: Vec<String>,
     cwd: PathUri,
+    environment_id: String,
     process_id: i32,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
@@ -129,16 +153,17 @@ pub(crate) fn spawn_exit_watcher(
         let (exit_code, failure_message) = if let Some(message) = process.failure_message() {
             emit_failed_exec_end_for_unified_exec(
                 Arc::clone(&session_ref),
-                turn_ref,
-                call_id,
-                command,
-                cwd,
+                Arc::clone(&turn_ref),
+                call_id.clone(),
+                command.clone(),
+                cwd.clone(),
+                environment_id.clone(),
                 Some(process_id.to_string()),
                 Arc::clone(&transcript),
                 String::new(),
                 message.clone(),
                 duration,
-                tracker,
+                tracker.clone(),
             )
             .await;
             (-1, Some(message))
@@ -146,20 +171,30 @@ pub(crate) fn spawn_exit_watcher(
             let exit_code = process.exit_code().unwrap_or(-1);
             emit_exec_end_for_unified_exec(
                 Arc::clone(&session_ref),
-                turn_ref,
-                call_id,
-                command,
-                cwd,
+                Arc::clone(&turn_ref),
+                call_id.clone(),
+                command.clone(),
+                cwd.clone(),
+                environment_id.clone(),
                 Some(process_id.to_string()),
                 Arc::clone(&transcript),
                 String::new(),
                 exit_code,
                 duration,
-                tracker,
+                tracker.clone(),
             )
             .await;
             (exit_code, None)
         };
+
+        if let Some(tracker) = tracker.as_ref() {
+            let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
+            session_ref
+                .services
+                .command_execution
+                .observe_repository_revision(&turn_ref.sub_id, observed_mutation_revision)
+                .await;
+        }
 
         if let Some(mut finalized_artifact) = process.raw_output_artifact().await {
             if let Some(message) = failure_message {
@@ -209,21 +244,30 @@ async fn process_chunk(
             let mut guard = transcript.lock().await;
             guard.push_chunk(prefix.to_vec());
         }
-
-        if *emitted_deltas >= MAX_EXEC_OUTPUT_DELTAS_PER_CALL {
-            continue;
-        }
-
-        let event = ExecCommandOutputDeltaEvent {
-            call_id: call_id.to_string(),
-            stream: ExecOutputStream::Stdout,
-            chunk: prefix,
-        };
-        session_ref
-            .send_event(turn_ref.as_ref(), EventMsg::ExecCommandOutputDelta(event))
-            .await;
-        *emitted_deltas += 1;
+        emit_output_delta(call_id, session_ref, turn_ref, emitted_deltas, prefix).await;
     }
+}
+
+async fn emit_output_delta(
+    call_id: &str,
+    session_ref: &Arc<Session>,
+    turn_ref: &Arc<TurnContext>,
+    emitted_deltas: &mut usize,
+    chunk: Vec<u8>,
+) {
+    if *emitted_deltas >= MAX_EXEC_OUTPUT_DELTAS_PER_CALL {
+        return;
+    }
+
+    let event = ExecCommandOutputDeltaEvent {
+        call_id: call_id.to_string(),
+        stream: ExecOutputStream::Stdout,
+        chunk,
+    };
+    session_ref
+        .send_event(turn_ref.as_ref(), EventMsg::ExecCommandOutputDelta(event))
+        .await;
+    *emitted_deltas += 1;
 }
 
 /// Emit an ExecCommandEnd event for a unified exec session, using the transcript
@@ -236,6 +280,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
     call_id: String,
     command: Vec<String>,
     cwd: PathUri,
+    environment_id: String,
     process_id: Option<String>,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     fallback_output: String,
@@ -263,6 +308,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         cwd,
         ExecCommandSource::UnifiedExecStartup,
         process_id,
+        environment_id,
     );
     emitter
         .emit(
@@ -282,6 +328,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     call_id: String,
     command: Vec<String>,
     cwd: PathUri,
+    environment_id: String,
     process_id: Option<String>,
     transcript: Arc<Mutex<HeadTailBuffer>>,
     fallback_output: String,
@@ -292,7 +339,11 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
     let stdout = if fallback_output.is_empty() {
         resolve_aggregated_output(&transcript, fallback_output).await
     } else {
-        fallback_output
+        let guard = transcript.lock().await;
+        let omitted_bytes = guard.omitted_bytes();
+        let lagged_chunks = guard.lagged_chunks();
+        drop(guard);
+        append_output_loss_markers(fallback_output, omitted_bytes, lagged_chunks)
     };
     let aggregated_output = if stdout.is_empty() {
         message.clone()
@@ -318,6 +369,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         cwd,
         ExecCommandSource::UnifiedExecStartup,
         process_id,
+        environment_id,
     );
     emitter
         .emit(
@@ -357,16 +409,42 @@ fn split_valid_utf8_prefix_with_max(buffer: &mut Vec<u8>, max_bytes: usize) -> O
     Some(byte)
 }
 
-async fn resolve_aggregated_output(
+pub(super) async fn resolve_aggregated_output(
     transcript: &Arc<Mutex<HeadTailBuffer>>,
     fallback: String,
 ) -> String {
     let guard = transcript.lock().await;
-    if guard.retained_bytes() == 0 {
-        return fallback;
-    }
+    let retained = guard.to_bytes();
+    let omitted_bytes = guard.omitted_bytes();
+    let lagged_chunks = guard.lagged_chunks();
+    drop(guard);
 
-    String::from_utf8_lossy(&guard.to_bytes()).to_string()
+    let aggregated_output = if retained.is_empty() {
+        fallback
+    } else {
+        String::from_utf8_lossy(&retained).to_string()
+    };
+    append_output_loss_markers(aggregated_output, omitted_bytes, lagged_chunks)
+}
+
+fn append_output_loss_markers(
+    mut output: String,
+    omitted_bytes: usize,
+    lagged_chunks: u64,
+) -> String {
+    if omitted_bytes > 0 {
+        let marker = String::from_utf8_lossy(&omitted_output_marker(omitted_bytes)).into_owned();
+        if !output.contains(marker.as_str()) {
+            output.push_str(&marker);
+        }
+    }
+    if lagged_chunks > 0 {
+        let marker = String::from_utf8_lossy(&lagged_output_marker(lagged_chunks)).into_owned();
+        if !output.contains(marker.as_str()) {
+            output.push_str(&marker);
+        }
+    }
+    output
 }
 
 #[cfg(test)]

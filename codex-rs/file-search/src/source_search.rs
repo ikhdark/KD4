@@ -11,6 +11,7 @@ use clap::ArgAction;
 use clap::Parser;
 use ignore::WalkBuilder;
 use serde::Serialize;
+use unicode_casefold::UnicodeCaseFold;
 
 use crate::source_routes::source_map_route_for_path;
 
@@ -141,6 +142,7 @@ pub struct SourceSearchCoverage {
     pub files_scanned: usize,
     pub files_skipped_too_large: usize,
     pub files_skipped_non_utf8: usize,
+    pub filesystem_errors: usize,
     pub bytes_scanned: usize,
     pub result_bytes: usize,
     pub total_matches: usize,
@@ -162,6 +164,7 @@ pub enum SourceTruncatedReason {
     WalkLimit,
     OversizedFiles,
     NonUtf8Files,
+    FilesystemErrors,
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
@@ -357,7 +360,7 @@ impl SourceSearchAccumulator {
         let query_cmp = if options.case_sensitive {
             options.query.clone()
         } else {
-            options.query.to_ascii_lowercase()
+            unicode_case_fold(&options.query)
         };
         Ok(Self {
             query: options.query.clone(),
@@ -434,28 +437,23 @@ impl SourceSearchAccumulator {
             .get_or_insert(SourceTruncatedReason::WalkLimit);
     }
 
+    pub fn mark_filesystem_error(&mut self) {
+        self.state.filesystem_errors = self.state.filesystem_errors.saturating_add(1);
+    }
+
     pub fn finish(mut self, roots: Vec<String>) -> SourceSearchOutput {
         self.state.matches.sort_by(|left, right| {
             left.path
                 .cmp(&right.path)
                 .then_with(|| left.line_number.cmp(&right.line_number))
         });
-        let truncated_reason = self
-            .state
-            .coverage_limit
-            .or(self.state.result_limit)
-            .or_else(|| {
-                (self.state.files_skipped_too_large > 0)
-                    .then_some(SourceTruncatedReason::OversizedFiles)
-            })
-            .or_else(|| {
-                (self.state.files_skipped_non_utf8 > 0)
-                    .then_some(SourceTruncatedReason::NonUtf8Files)
-            });
+        let coverage_limit = self.state.coverage_limit;
+        let mut result_limit = self.state.result_limit;
         let coverage = SourceSearchCoverage {
             files_scanned: self.state.files_scanned,
             files_skipped_too_large: self.state.files_skipped_too_large,
             files_skipped_non_utf8: self.state.files_skipped_non_utf8,
+            filesystem_errors: self.state.filesystem_errors,
             bytes_scanned: self.state.bytes_scanned,
             result_bytes: self.state.result_bytes,
             total_matches: self.state.total_matches,
@@ -466,13 +464,44 @@ impl SourceSearchAccumulator {
             max_file_bytes: SOURCE_SEARCH_MAX_FILE_BYTES,
             max_result_bytes: SOURCE_SEARCH_MAX_RESULT_BYTES,
         };
-        SourceSearchOutput {
+        let mut output = SourceSearchOutput {
             query: self.query,
             roots,
-            truncated: truncated_reason.is_some(),
-            truncated_reason,
+            truncated: false,
+            truncated_reason: None,
             coverage,
             matches: self.state.matches,
+        };
+
+        loop {
+            output.truncated_reason = source_truncated_reason(
+                coverage_limit,
+                result_limit,
+                output.coverage.filesystem_errors,
+                output.coverage.files_skipped_too_large,
+                output.coverage.files_skipped_non_utf8,
+            );
+            output.truncated = output.truncated_reason.is_some();
+            output.coverage.matches_returned = output.matches.len();
+            let serialized_bytes = refresh_serialized_result_bytes(&mut output);
+            if serialized_bytes <= SOURCE_SEARCH_MAX_RESULT_BYTES {
+                return output;
+            }
+
+            result_limit = Some(SourceTruncatedReason::MaxResultBytes);
+            if output.matches.pop().is_none() {
+                output.truncated_reason = source_truncated_reason(
+                    coverage_limit,
+                    result_limit,
+                    output.coverage.filesystem_errors,
+                    output.coverage.files_skipped_too_large,
+                    output.coverage.files_skipped_non_utf8,
+                );
+                output.truncated = true;
+                output.coverage.matches_returned = 0;
+                refresh_serialized_result_bytes(&mut output);
+                return output;
+            }
         }
     }
 }
@@ -481,12 +510,14 @@ struct SearchState {
     files_scanned: usize,
     files_skipped_too_large: usize,
     files_skipped_non_utf8: usize,
+    filesystem_errors: usize,
     bytes_scanned: usize,
     result_bytes: usize,
     total_matches: usize,
     max_matches: usize,
     coverage_limit: Option<SourceTruncatedReason>,
     result_limit: Option<SourceTruncatedReason>,
+    matches_serialized_bytes: usize,
     matches: Vec<SourceSearchMatch>,
 }
 
@@ -496,14 +527,42 @@ impl SearchState {
             files_scanned: 0,
             files_skipped_too_large: 0,
             files_skipped_non_utf8: 0,
+            filesystem_errors: 0,
             bytes_scanned: 0,
             result_bytes: 0,
             total_matches: 0,
             max_matches,
             coverage_limit: None,
             result_limit: None,
+            matches_serialized_bytes: 2,
             matches: Vec::new(),
         }
+    }
+}
+
+fn source_truncated_reason(
+    coverage_limit: Option<SourceTruncatedReason>,
+    result_limit: Option<SourceTruncatedReason>,
+    filesystem_errors: usize,
+    files_skipped_too_large: usize,
+    files_skipped_non_utf8: usize,
+) -> Option<SourceTruncatedReason> {
+    coverage_limit
+        .or(result_limit)
+        .or_else(|| (filesystem_errors > 0).then_some(SourceTruncatedReason::FilesystemErrors))
+        .or_else(|| (files_skipped_too_large > 0).then_some(SourceTruncatedReason::OversizedFiles))
+        .or_else(|| (files_skipped_non_utf8 > 0).then_some(SourceTruncatedReason::NonUtf8Files))
+}
+
+fn refresh_serialized_result_bytes(output: &mut SourceSearchOutput) -> usize {
+    loop {
+        let serialized_bytes = serde_json::to_vec_pretty(output)
+            .map(|bytes| bytes.len().saturating_add(1))
+            .unwrap_or(usize::MAX);
+        if output.coverage.result_bytes == serialized_bytes {
+            return serialized_bytes;
+        }
+        output.coverage.result_bytes = serialized_bytes;
     }
 }
 
@@ -512,10 +571,16 @@ fn scan_root(
     root: &Path,
     accumulator: &mut SourceSearchAccumulator,
 ) -> anyhow::Result<()> {
-    let metadata = fs::metadata(root)
-        .with_context(|| format!("unable to inspect source root `{}`", root.display()))?;
+    let metadata = match fs::metadata(root) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            accumulator.mark_filesystem_error();
+            return Ok(());
+        }
+    };
     if metadata.is_file() {
-        return scan_file(repo_root, root, accumulator);
+        recover_scan_result(scan_file(repo_root, root, accumulator), accumulator);
+        return Ok(());
     }
     if !metadata.is_dir() {
         bail!(
@@ -541,18 +606,36 @@ fn scan_root(
         if accumulator.should_stop() {
             break;
         }
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
+        let Some(entry) = recover_walk_entry(entry, accumulator) else {
+            continue;
         };
         if entry
             .file_type()
             .is_some_and(|file_type| file_type.is_file())
         {
-            scan_file(repo_root, entry.path(), accumulator)?;
+            recover_scan_result(scan_file(repo_root, entry.path(), accumulator), accumulator);
         }
     }
     Ok(())
+}
+
+fn recover_walk_entry<T, E>(
+    entry: Result<T, E>,
+    accumulator: &mut SourceSearchAccumulator,
+) -> Option<T> {
+    match entry {
+        Ok(entry) => Some(entry),
+        Err(_) => {
+            accumulator.mark_filesystem_error();
+            None
+        }
+    }
+}
+
+fn recover_scan_result(result: anyhow::Result<()>, accumulator: &mut SourceSearchAccumulator) {
+    if result.is_err() {
+        accumulator.mark_filesystem_error();
+    }
 }
 
 fn scan_file(
@@ -590,7 +673,7 @@ fn collect_matches(
         let is_match = if case_sensitive {
             line.contains(query_cmp)
         } else {
-            line.to_ascii_lowercase().contains(query_cmp)
+            unicode_case_fold(line).contains(query_cmp)
         };
         if !is_match {
             continue;
@@ -619,28 +702,36 @@ fn collect_matches(
                 }
             })
             .collect::<Vec<_>>();
-        let result_bytes = relative_path.len().saturating_add(
-            source_lines
-                .iter()
-                .map(|line| line.text.len())
-                .sum::<usize>(),
-        );
-        if state.result_bytes.saturating_add(result_bytes) > SOURCE_SEARCH_MAX_RESULT_BYTES {
-            state
-                .result_limit
-                .get_or_insert(SourceTruncatedReason::MaxResultBytes);
-            continue;
-        }
-        state.result_bytes = state.result_bytes.saturating_add(result_bytes);
-        state.matches.push(SourceSearchMatch {
+        let source_match = SourceSearchMatch {
             path: relative_path.clone(),
             source_map_route: source_map_route_for_path(Path::new(&relative_path)),
             line_number: index + 1,
             start_line: start + 1,
             end_line: end,
             lines: source_lines,
-        });
+        };
+        let serialized_match_bytes = serde_json::to_vec(&source_match)
+            .map(|bytes| bytes.len())
+            .unwrap_or(usize::MAX);
+        let separator_bytes = usize::from(!state.matches.is_empty());
+        let result_bytes = state
+            .matches_serialized_bytes
+            .saturating_add(separator_bytes)
+            .saturating_add(serialized_match_bytes);
+        if result_bytes > SOURCE_SEARCH_MAX_RESULT_BYTES {
+            state
+                .result_limit
+                .get_or_insert(SourceTruncatedReason::MaxResultBytes);
+            continue;
+        }
+        state.matches.push(source_match);
+        state.matches_serialized_bytes = result_bytes;
+        state.result_bytes = result_bytes;
     }
+}
+
+fn unicode_case_fold(value: &str) -> String {
+    value.case_fold().collect()
 }
 
 fn canonical_repo_root(repo_root: &Path) -> anyhow::Result<PathBuf> {

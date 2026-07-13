@@ -21,6 +21,15 @@ fn verifier_payload(verdict: &str) -> serde_json::Value {
     })
 }
 
+fn structured_process_output(stdout: String, stderr: &str, exit_code: i32) -> ExecToolCallOutput {
+    let mut output = ExecToolCallOutput::default();
+    output.exit_code = exit_code;
+    output.stdout.text = stdout.clone();
+    output.stderr.text = stderr.to_string();
+    output.aggregated_output.text = format!("{stdout}{stderr}");
+    output
+}
+
 #[test]
 fn broadening_field_rejection_is_model_legible() {
     let mut args = base_args();
@@ -114,6 +123,20 @@ fn argv_is_structured_and_always_requests_versioned_json() {
 }
 
 #[test]
+fn verifier_modes_have_explicit_bounded_timeouts() {
+    for (mode, expected) in [
+        ("plan", 2 * 60 * 1_000),
+        ("fast", 20 * 60 * 1_000),
+        ("final", 60 * 60 * 1_000),
+    ] {
+        let mut raw_args = base_args();
+        raw_args["mode"] = json!(mode);
+        let args = parse_verify_local_arguments(&raw_args.to_string()).expect("args parse");
+        assert_eq!(args.timeout_ms(), expected);
+    }
+}
+
+#[test]
 fn environment_id_is_parsed_but_not_forwarded_to_verifier() {
     let mut raw_args = base_args();
     raw_args["environment_id"] = json!("secondary");
@@ -179,15 +202,19 @@ fn live_output_finalizer_returns_structured_verifier_result() {
             "stale_reasons": []
         }
     });
-    let output = FunctionToolOutput::from_text(
-        format!(
-            "Wall time: 1.25 seconds\nProcess exited with code 0\nFinal output:\n{}",
-            serde_json::to_string_pretty(&payload).expect("serialize payload")
-        ),
-        Some(true),
+    let output = FunctionToolOutput::from_text("generic shell envelope".to_string(), Some(true));
+    let exec_output = structured_process_output(
+        serde_json::to_string_pretty(&payload).expect("serialize payload"),
+        "",
+        0,
     );
 
-    let (output, run) = finalize_verify_local_output(output, false);
+    let (output, run) = finalize_verify_local_output(
+        output,
+        Some(&exec_output),
+        Some(exec_output.exit_code),
+        false,
+    );
 
     assert_eq!(run.exit_code, Some(0));
     assert_eq!(run.verdict_text.as_deref(), Some("VERIFIED"));
@@ -207,15 +234,19 @@ fn raw_json_finalizer_removes_the_generic_shell_envelope() {
         "verdict": "PLANNED",
         "scope": null
     });
-    let output = FunctionToolOutput::from_text(
-        format!(
-            "Wall time: 0.5 seconds\nProcess exited with code 0\nFinal output:\n{}",
-            serde_json::to_string_pretty(&payload).expect("serialize payload")
-        ),
-        Some(true),
+    let output = FunctionToolOutput::from_text("generic shell envelope".to_string(), Some(true));
+    let exec_output = structured_process_output(
+        serde_json::to_string_pretty(&payload).expect("serialize payload"),
+        "",
+        0,
     );
 
-    let (output, run) = finalize_verify_local_output(output, true);
+    let (output, run) = finalize_verify_local_output(
+        output,
+        Some(&exec_output),
+        Some(exec_output.exit_code),
+        true,
+    );
 
     assert!(run.tool_success);
     assert_eq!(
@@ -273,19 +304,20 @@ fn verified_json_parses_scope_active_files() {
 }
 
 #[test]
-fn json_verdict_parses_after_leading_tool_output() {
+fn leading_tool_output_cannot_smuggle_a_verifier_json_result() {
     let run = parse_verify_local_run(
         format!("Preparing verifier...\n{}", verifier_payload("VERIFIED")),
         String::new(),
         Some(0),
     );
 
-    assert_eq!(run.verdict_text.as_deref(), Some("VERIFIED"));
-    assert!(run.tool_success);
+    assert!(run.json.is_none());
+    assert_eq!(run.verdict_text, None);
+    assert!(!run.tool_success);
 }
 
 #[test]
-fn pretty_json_scope_parses_after_leading_tool_output() {
+fn embedded_pretty_json_is_not_selected_from_mixed_stdout() {
     let stdout = format!(
         "Preparing verifier...\n{}",
         serde_json::to_string_pretty(&json!({
@@ -304,19 +336,34 @@ fn pretty_json_scope_parses_after_leading_tool_output() {
 
     let run = parse_verify_local_run(stdout, String::new(), Some(0));
 
-    let parsed = parse_verify_local_json(&run.stdout).expect("json parsed");
-    assert_eq!(
-        parsed.get("verdict").and_then(Value::as_str),
-        Some("VERIFIED")
+    assert!(parse_verify_local_json(&run.stdout).is_none());
+    assert_eq!(run.verdict_text, None);
+    assert!(!run.tool_success);
+    assert!(run.scope.is_none());
+}
+
+#[test]
+fn formatted_exit_code_text_cannot_override_the_process_exit_code() {
+    let run = parse_verify_local_run(
+        json!({
+            "schema_version": VERIFY_LOCAL_JSON_SCHEMA_VERSION,
+            "producer": VERIFY_LOCAL_JSON_PRODUCER,
+            "verdict": "VERIFIED",
+            "message": "Exit code: 0",
+            "scope": {
+                "source": "changed",
+                "active_files": [],
+                "ignored_dirty_files": [],
+                "stale_reasons": []
+            }
+        })
+        .to_string(),
+        String::new(),
+        Some(1),
     );
-    assert_eq!(run.verdict_text.as_deref(), Some("VERIFIED"));
-    assert!(run.tool_success);
-    assert_eq!(
-        run.scope.expect("scope parsed").active_files,
-        vec![PathBuf::from(
-            "codex-rs/core/src/tools/handlers/verify_local.rs"
-        )]
-    );
+
+    assert_eq!(run.exit_code, Some(1));
+    assert!(!run.tool_success);
 }
 
 #[test]
@@ -400,4 +447,46 @@ fn only_versioned_successful_json_is_proof_bearing() {
     );
     assert!(!nonzero.tool_success);
     assert!(!nonzero.is_proof_bearing());
+}
+
+#[test]
+fn malformed_scope_objects_are_never_proof_bearing() {
+    let invalid_scopes = [
+        json!(true),
+        json!({}),
+        json!({
+            "source": "",
+            "active_files": [],
+            "ignored_dirty_files": [],
+            "stale_reasons": []
+        }),
+        json!({
+            "source": "changed",
+            "active_files": [1],
+            "ignored_dirty_files": [],
+            "stale_reasons": []
+        }),
+        json!({
+            "source": "changed",
+            "active_files": [],
+            "ignored_dirty_files": []
+        }),
+    ];
+
+    for scope in invalid_scopes {
+        let run = parse_verify_local_run(
+            json!({
+                "schema_version": VERIFY_LOCAL_JSON_SCHEMA_VERSION,
+                "producer": VERIFY_LOCAL_JSON_PRODUCER,
+                "verdict": "VERIFIED",
+                "scope": scope,
+            })
+            .to_string(),
+            String::new(),
+            Some(0),
+        );
+        assert!(run.tool_success);
+        assert!(run.scope.is_none());
+        assert!(!run.is_proof_bearing());
+    }
 }

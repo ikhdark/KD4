@@ -40,16 +40,24 @@ fn head_budget_zero_keeps_only_last_byte_in_tail() {
 }
 
 #[test]
-fn draining_resets_state() {
+fn draining_resets_bytes_but_preserves_cumulative_loss_accounting() {
     let mut buf = HeadTailBuffer::new(/*max_bytes*/ 10);
     buf.push_chunk(b"0123456789".to_vec());
     buf.push_chunk(b"ab".to_vec());
+    buf.record_lagged_chunks(3);
 
     let drained = buf.drain_chunks();
     assert!(!drained.is_empty());
 
     assert_eq!(buf.retained_bytes(), 0);
-    assert_eq!(buf.omitted_bytes(), 0);
+    assert_eq!(buf.omitted_bytes(), 2);
+    assert_eq!(buf.take_unreported_omitted_bytes(), 2);
+    assert_eq!(buf.take_unreported_omitted_bytes(), 0);
+    assert_eq!(buf.omitted_bytes(), 2);
+    assert_eq!(buf.lagged_chunks(), 3);
+    assert_eq!(buf.take_unreported_lagged_chunks(), 3);
+    assert_eq!(buf.take_unreported_lagged_chunks(), 0);
+    assert_eq!(buf.lagged_chunks(), 3);
     assert_eq!(buf.to_bytes(), b"".to_vec());
 }
 

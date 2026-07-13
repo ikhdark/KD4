@@ -15,6 +15,9 @@ pub(crate) struct HeadTailBuffer {
     head_bytes: usize,
     tail_bytes: usize,
     omitted_bytes: usize,
+    unreported_omitted_bytes: usize,
+    lagged_chunks: u64,
+    unreported_lagged_chunks: u64,
 }
 
 impl Default for HeadTailBuffer {
@@ -40,6 +43,9 @@ impl HeadTailBuffer {
             head_bytes: 0,
             tail_bytes: 0,
             omitted_bytes: 0,
+            unreported_omitted_bytes: 0,
+            lagged_chunks: 0,
+            unreported_lagged_chunks: 0,
         }
     }
 
@@ -57,6 +63,30 @@ impl HeadTailBuffer {
         self.omitted_bytes
     }
 
+    /// Consume capacity-omitted bytes not yet reported by an interim response.
+    ///
+    /// The cumulative `omitted_bytes` value remains available for final output.
+    pub(crate) fn take_unreported_omitted_bytes(&mut self) -> usize {
+        std::mem::take(&mut self.unreported_omitted_bytes)
+    }
+
+    pub(crate) fn record_lagged_chunks(&mut self, skipped: u64) {
+        self.lagged_chunks = self.lagged_chunks.saturating_add(skipped);
+        self.unreported_lagged_chunks = self.unreported_lagged_chunks.saturating_add(skipped);
+    }
+
+    pub(crate) fn lagged_chunks(&self) -> u64 {
+        self.lagged_chunks
+    }
+
+    /// Consume the lag count not yet reported by an interim tool response.
+    ///
+    /// The cumulative `lagged_chunks` value remains available for the final
+    /// aggregate, so draining output cannot make a prior gap disappear.
+    pub(crate) fn take_unreported_lagged_chunks(&mut self) -> u64 {
+        std::mem::take(&mut self.unreported_lagged_chunks)
+    }
+
     /// Append a chunk of bytes to the buffer.
     ///
     /// Bytes are first added to the head until the head budget is full; any
@@ -64,7 +94,7 @@ impl HeadTailBuffer {
     /// dropped to preserve the tail budget.
     pub(crate) fn push_chunk(&mut self, chunk: Vec<u8>) {
         if self.max_bytes == 0 {
-            self.omitted_bytes = self.omitted_bytes.saturating_add(chunk.len());
+            self.record_omitted_bytes(chunk.len());
             return;
         }
 
@@ -116,22 +146,23 @@ impl HeadTailBuffer {
         out
     }
 
-    /// Drain all retained chunks from the buffer and reset its state.
+    /// Drain all retained chunks from the buffer and reset its byte state.
     ///
     /// The drained chunks are returned in head-then-tail order. Omitted bytes
-    /// are discarded along with the retained content.
+    /// are discarded along with the retained content. Cumulative and pending
+    /// omission/lag accounting are preserved until the caller explicitly
+    /// consumes their pending counts.
     pub(crate) fn drain_chunks(&mut self) -> Vec<Vec<u8>> {
         let mut out: Vec<Vec<u8>> = self.head.drain(..).collect();
         out.extend(self.tail.drain(..));
         self.head_bytes = 0;
         self.tail_bytes = 0;
-        self.omitted_bytes = 0;
         out
     }
 
     fn push_to_tail(&mut self, chunk: Vec<u8>) {
         if self.tail_budget == 0 {
-            self.omitted_bytes = self.omitted_bytes.saturating_add(chunk.len());
+            self.record_omitted_bytes(chunk.len());
             return;
         }
 
@@ -141,10 +172,7 @@ impl HeadTailBuffer {
             let start = chunk.len().saturating_sub(self.tail_budget);
             let kept = chunk[start..].to_vec();
             let dropped = chunk.len().saturating_sub(kept.len());
-            self.omitted_bytes = self
-                .omitted_bytes
-                .saturating_add(self.tail_bytes)
-                .saturating_add(dropped);
+            self.record_omitted_bytes(self.tail_bytes.saturating_add(dropped));
             self.tail.clear();
             self.tail_bytes = kept.len();
             self.tail.push_back(kept);
@@ -159,22 +187,32 @@ impl HeadTailBuffer {
     fn trim_tail_to_budget(&mut self) {
         let mut excess = self.tail_bytes.saturating_sub(self.tail_budget);
         while excess > 0 {
-            match self.tail.front_mut() {
+            let (omitted, done) = match self.tail.front_mut() {
                 Some(front) if excess >= front.len() => {
-                    excess -= front.len();
-                    self.tail_bytes = self.tail_bytes.saturating_sub(front.len());
-                    self.omitted_bytes = self.omitted_bytes.saturating_add(front.len());
+                    let front_len = front.len();
+                    excess -= front_len;
+                    self.tail_bytes = self.tail_bytes.saturating_sub(front_len);
                     self.tail.pop_front();
+                    (front_len, false)
                 }
                 Some(front) => {
+                    let omitted = excess;
                     front.drain(..excess);
                     self.tail_bytes = self.tail_bytes.saturating_sub(excess);
-                    self.omitted_bytes = self.omitted_bytes.saturating_add(excess);
-                    break;
+                    (omitted, true)
                 }
                 None => break,
+            };
+            self.record_omitted_bytes(omitted);
+            if done {
+                break;
             }
         }
+    }
+
+    fn record_omitted_bytes(&mut self, omitted: usize) {
+        self.omitted_bytes = self.omitted_bytes.saturating_add(omitted);
+        self.unreported_omitted_bytes = self.unreported_omitted_bytes.saturating_add(omitted);
     }
 }
 

@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 use std::time::Duration;
 
+use codex_utils_path::normalize_for_path_comparison;
 use sha1::digest::Output;
 
 use codex_apply_patch::AppliedPatchChange;
@@ -19,6 +21,7 @@ const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 
 struct TrackedContent {
     content: String,
+    mode: Option<String>,
     revision: u64,
 }
 
@@ -32,7 +35,7 @@ impl TrackedPath {
     fn new(environment_id: &str, path: &Path) -> Self {
         Self {
             environment_id: environment_id.to_string(),
-            path: path.to_path_buf(),
+            path: normalize_tracked_path(path),
         }
     }
 }
@@ -95,6 +98,7 @@ pub struct TurnDiffTracker {
     current_by_path: HashMap<TrackedPath, TrackedContent>,
     origin_by_current_path: HashMap<TrackedPath, TrackedPath>,
     next_revision: u64,
+    mutation_revision: u64,
     rendered_diffs: HashMap<DiffCacheKey, Option<String>>,
     unified_diff: Option<String>,
     unvalidated_paths: HashSet<TrackedPath>,
@@ -114,6 +118,7 @@ impl Default for TurnDiffTracker {
             current_by_path: HashMap::new(),
             origin_by_current_path: HashMap::new(),
             next_revision: 0,
+            mutation_revision: 0,
             rendered_diffs: HashMap::new(),
             unified_diff: None,
             unvalidated_paths: HashSet::new(),
@@ -135,7 +140,10 @@ impl TurnDiffTracker {
         display_roots: impl IntoIterator<Item = (String, PathBuf)>,
     ) -> Self {
         let mut tracker = Self::new();
-        tracker.display_roots_by_environment = display_roots.into_iter().collect();
+        tracker.display_roots_by_environment = display_roots
+            .into_iter()
+            .map(|(environment_id, root)| (environment_id, normalize_tracked_path(&root)))
+            .collect();
         tracker
     }
 
@@ -175,6 +183,7 @@ impl TurnDiffTracker {
         command: &[String],
         exit_code: i32,
         timed_out: bool,
+        environment_id: &str,
         cwd: Option<&Path>,
     ) {
         let was_post_mutation = self.has_unvalidated_mutation();
@@ -211,10 +220,14 @@ impl TurnDiffTracker {
             self.has_successful_validation = true;
             match validation_coverage(command, cwd) {
                 ValidationCoverage::All => {
-                    self.unvalidated_paths.clear();
-                    self.unvalidated_unknown_mutation = false;
+                    self.clear_environment_paths(environment_id);
+                    if self.can_clear_unknown_for_environment(environment_id) {
+                        self.unvalidated_unknown_mutation = false;
+                    }
                 }
-                ValidationCoverage::Paths(paths) => self.clear_covered_paths(&paths),
+                ValidationCoverage::Paths(paths) => {
+                    self.clear_covered_paths(environment_id, &paths);
+                }
                 ValidationCoverage::ScopedUnknown => {}
             }
             self.last_post_mutation_validation_status = if self.has_unvalidated_mutation() {
@@ -227,11 +240,14 @@ impl TurnDiffTracker {
 
     pub(crate) fn record_verified_validation(
         &mut self,
-        _command: Vec<String>,
+        command: Vec<String>,
         environment_id: &str,
         active_files: &[PathBuf],
         clear_unknown_mutation: bool,
     ) -> bool {
+        if !is_verify_local_proof_command(&command) {
+            return false;
+        }
         let covered_candidates = active_files
             .iter()
             .flat_map(|path| {
@@ -250,7 +266,7 @@ impl TurnDiffTracker {
                     && (path.path == covered.path || path.path.starts_with(&covered.path))
             })
         });
-        if clear_unknown_mutation {
+        if clear_unknown_mutation && self.can_clear_unknown_for_environment(environment_id) {
             self.unvalidated_unknown_mutation = false;
         }
 
@@ -267,6 +283,10 @@ impl TurnDiffTracker {
         self.unvalidated_unknown_mutation || !self.unvalidated_paths.is_empty()
     }
 
+    pub(crate) fn current_mutation_revision(&self) -> u64 {
+        self.mutation_revision
+    }
+
     pub(crate) fn validation_freshness_status(&self) -> ValidationFreshnessStatus {
         if self.has_unvalidated_mutation() {
             self.last_post_mutation_validation_status.clone()
@@ -277,12 +297,38 @@ impl TurnDiffTracker {
         }
     }
 
-    fn clear_covered_paths(&mut self, covered_paths: &[PathBuf]) {
+    fn clear_covered_paths(&mut self, environment_id: &str, covered_paths: &[PathBuf]) {
+        let covered_paths = covered_paths
+            .iter()
+            .map(|path| normalize_tracked_path(path))
+            .collect::<Vec<_>>();
         self.unvalidated_paths.retain(|tracked| {
-            !covered_paths
-                .iter()
-                .any(|covered| tracked.path == *covered || tracked.path.starts_with(covered))
+            tracked.environment_id != environment_id
+                || !covered_paths
+                    .iter()
+                    .any(|covered| tracked.path == *covered || tracked.path.starts_with(covered))
         });
+    }
+
+    fn clear_environment_paths(&mut self, environment_id: &str) {
+        self.unvalidated_paths
+            .retain(|tracked| tracked.environment_id != environment_id);
+    }
+
+    fn can_clear_unknown_for_environment(&self, environment_id: &str) -> bool {
+        let mut known_environments = self
+            .display_roots_by_environment
+            .keys()
+            .map(String::as_str)
+            .chain(
+                self.unvalidated_paths
+                    .iter()
+                    .map(|tracked| tracked.environment_id.as_str()),
+            )
+            .collect::<HashSet<_>>();
+        known_environments.retain(|known| !known.is_empty());
+        known_environments.is_empty()
+            || (known_environments.len() == 1 && known_environments.contains(environment_id))
     }
 
     pub fn get_unified_diff(&self) -> Option<String> {
@@ -294,6 +340,7 @@ impl TurnDiffTracker {
     }
 
     fn record_mutation(&mut self, paths: HashSet<TrackedPath>) {
+        self.mutation_revision = self.mutation_revision.saturating_add(1);
         self.last_post_mutation_validation_status = if self.has_successful_validation {
             ValidationFreshnessStatus::StaleAfterLastMutation
         } else {
@@ -347,12 +394,7 @@ impl TurnDiffTracker {
                 right_revision: right_content.map(|content| content.revision),
             };
             let rendered = previous_diffs.remove(&key).unwrap_or_else(|| {
-                self.render_diff(
-                    left_path,
-                    left_content.map(|content| content.content.as_str()),
-                    right_path,
-                    right_content.map(|content| content.content.as_str()),
-                )
+                self.render_diff(left_path, left_content, right_path, right_content)
             });
 
             if let Some(diff) = rendered.as_deref() {
@@ -402,11 +444,11 @@ impl TurnDiffTracker {
             && !self.baseline_by_path.contains_key(&path)
             && let Some(overwritten_content) = overwritten_content
         {
-            let overwritten_content = self.tracked_content(overwritten_content);
+            let overwritten_content = self.tracked_content(&path, overwritten_content);
             self.baseline_by_path
                 .insert(path.clone(), overwritten_content);
         }
-        let content = self.tracked_content(content);
+        let content = self.tracked_content(&path, content);
         self.current_by_path.insert(path, content);
     }
 
@@ -414,7 +456,7 @@ impl TurnDiffTracker {
         if self.current_by_path.remove(&path).is_none()
             && !self.baseline_by_path.contains_key(&path)
         {
-            let content = self.tracked_content(content);
+            let content = self.tracked_content(&path, content);
             self.baseline_by_path.insert(path.clone(), content);
         }
         self.origin_by_current_path.remove(&path);
@@ -431,7 +473,7 @@ impl TurnDiffTracker {
         if !self.current_by_path.contains_key(&source_path)
             && !self.baseline_by_path.contains_key(&source_path)
         {
-            let old_content = self.tracked_content(old_content);
+            let old_content = self.tracked_content(&source_path, old_content);
             self.baseline_by_path
                 .insert(source_path.clone(), old_content);
         }
@@ -442,7 +484,8 @@ impl TurnDiffTracker {
                     && !self.baseline_by_path.contains_key(&dest_path)
                     && let Some(overwritten_move_content) = overwritten_move_content
                 {
-                    let overwritten_move_content = self.tracked_content(overwritten_move_content);
+                    let overwritten_move_content =
+                        self.tracked_content(&dest_path, overwritten_move_content);
                     self.baseline_by_path
                         .insert(dest_path.clone(), overwritten_move_content);
                 }
@@ -451,7 +494,7 @@ impl TurnDiffTracker {
                     .remove(&source_path)
                     .unwrap_or_else(|| source_path.clone());
                 self.current_by_path.remove(&source_path);
-                let new_content = self.tracked_content(new_content);
+                let new_content = self.tracked_content(&dest_path, new_content);
                 self.current_by_path.insert(dest_path.clone(), new_content);
                 self.origin_by_current_path.remove(&dest_path);
                 if dest_path != origin {
@@ -459,17 +502,28 @@ impl TurnDiffTracker {
                 }
             }
             None => {
-                let new_content = self.tracked_content(new_content);
+                let new_content = self.tracked_content(&source_path, new_content);
                 self.current_by_path.insert(source_path, new_content);
             }
         }
     }
 
-    fn tracked_content(&mut self, content: &str) -> TrackedContent {
+    fn tracked_content(&mut self, path: &TrackedPath, content: &str) -> TrackedContent {
+        let mode = self
+            .current_by_path
+            .get(path)
+            .and_then(|tracked| tracked.mode.clone())
+            .or_else(|| {
+                self.baseline_by_path
+                    .get(path)
+                    .and_then(|tracked| tracked.mode.clone())
+            })
+            .or_else(|| self.file_mode(path).map(str::to_owned));
         let revision = self.next_revision;
         self.next_revision += 1;
         TrackedContent {
             content: content.to_string(),
+            mode,
             revision,
         }
     }
@@ -495,11 +549,13 @@ impl TurnDiffTracker {
     fn render_diff(
         &self,
         left_path: &TrackedPath,
-        left_content: Option<&str>,
+        left_content: Option<&TrackedContent>,
         right_path: &TrackedPath,
-        right_content: Option<&str>,
+        right_content: Option<&TrackedContent>,
     ) -> Option<String> {
-        if left_content == right_content {
+        let left_text = left_content.map(|content| content.content.as_str());
+        let right_text = right_content.map(|content| content.content.as_str());
+        if left_text == right_text {
             return None;
         }
 
@@ -509,31 +565,42 @@ impl TurnDiffTracker {
 
         let left_display = self.display_path(left_path);
         let right_display = self.display_path(right_path);
-        let left_oid = left_content.map_or_else(
+        let left_oid = left_text.map_or_else(
             || ZERO_OID.to_string(),
             |content| git_blob_oid(content.as_bytes()),
         );
-        let right_oid = right_content.map_or_else(
+        let right_oid = right_text.map_or_else(
             || ZERO_OID.to_string(),
             |content| git_blob_oid(content.as_bytes()),
         );
-
         let mut diff = format!("diff --git a/{left_display} b/{right_display}\n");
         match (left_content, right_content) {
-            (None, Some(_)) => diff.push_str(&format!("new file mode {REGULAR_FILE_MODE}\n")),
-            (Some(_), None) => diff.push_str(&format!("deleted file mode {REGULAR_FILE_MODE}\n")),
+            (None, Some(_)) => {
+                let mode = right_content
+                    .and_then(|content| content.mode.as_deref())
+                    .or_else(|| self.file_mode(right_path))
+                    .unwrap_or(REGULAR_FILE_MODE);
+                diff.push_str(&format!("new file mode {mode}\n"));
+            }
+            (Some(_), None) => {
+                let mode = left_content
+                    .and_then(|content| content.mode.as_deref())
+                    .or_else(|| self.file_mode(left_path))
+                    .unwrap_or(REGULAR_FILE_MODE);
+                diff.push_str(&format!("deleted file mode {mode}\n"));
+            }
             (Some(_), Some(_)) => {}
             (None, None) => return None,
         }
 
         diff.push_str(&format!("index {left_oid}..{right_oid}\n"));
 
-        let old_header = if left_content.is_some() {
+        let old_header = if left_text.is_some() {
             format!("a/{left_display}")
         } else {
             DEV_NULL.to_string()
         };
-        let new_header = if right_content.is_some() {
+        let new_header = if right_text.is_some() {
             format!("b/{right_display}")
         } else {
             DEV_NULL.to_string()
@@ -542,13 +609,61 @@ impl TurnDiffTracker {
         let mut config = similar::TextDiff::configure();
         config.timeout(DIFF_TIMEOUT);
         let unified = config
-            .diff_lines(left_content.unwrap_or(""), right_content.unwrap_or(""))
+            .diff_lines(left_text.unwrap_or(""), right_text.unwrap_or(""))
             .unified_diff()
             .context_radius(3)
             .header(&old_header, &new_header)
             .to_string();
         diff.push_str(&unified);
         Some(diff)
+    }
+
+    fn file_mode(&self, path: &TrackedPath) -> Option<&'static str> {
+        let filesystem_path = if path.path.is_absolute() {
+            path.path.clone()
+        } else {
+            self.display_roots_by_environment
+                .get(&path.environment_id)
+                .map_or_else(|| path.path.clone(), |root| root.join(&path.path))
+        };
+        if let Ok(metadata) = std::fs::symlink_metadata(&filesystem_path) {
+            if metadata.file_type().is_symlink() {
+                return Some("120000");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o111 != 0 {
+                    return Some("100755");
+                }
+            }
+            return Some(REGULAR_FILE_MODE);
+        }
+
+        let root = self
+            .display_roots_by_environment
+            .get(&path.environment_id)?;
+        let relative_path = filesystem_path.strip_prefix(root).ok()?;
+        let output = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["ls-files", "--stage", "--"])
+            .arg(relative_path)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        match String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .next()?
+        {
+            "100644" => Some(REGULAR_FILE_MODE),
+            "100755" => Some("100755"),
+            "120000" => Some("120000"),
+            "160000" => Some("160000"),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -569,6 +684,59 @@ impl TurnDiffTracker {
             display
         }
     }
+}
+
+fn normalize_tracked_path(path: &Path) -> PathBuf {
+    let lexical = lexically_normalize_path(path);
+    let normalized = if lexical.is_relative() {
+        lexical
+    } else {
+        normalize_for_path_comparison(&lexical)
+            .unwrap_or_else(|_| normalize_from_existing_ancestor(&lexical).unwrap_or(lexical))
+    };
+    #[cfg(windows)]
+    {
+        return PathBuf::from(normalized.to_string_lossy().to_lowercase());
+    }
+    #[cfg(not(windows))]
+    normalized
+}
+
+fn normalize_from_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut cursor = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut normalized) = normalize_for_path_comparison(cursor) {
+            for component in missing.iter().rev() {
+                normalized.push(component);
+            }
+            return Some(normalized);
+        }
+        missing.push(cursor.file_name()?.to_os_string());
+        cursor = cursor.parent()?;
+    }
+}
+
+fn lexically_normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => match normalized.components().next_back() {
+                Some(std::path::Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(std::path::Component::Prefix(_) | std::path::Component::RootDir) => {}
+                Some(std::path::Component::CurDir | std::path::Component::ParentDir) | None => {
+                    if !path.is_absolute() {
+                        normalized.push("..");
+                    }
+                }
+            },
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
 }
 
 fn paths_touched_by_delta(environment_id: &str, delta: &AppliedPatchDelta) -> HashSet<TrackedPath> {
@@ -654,6 +822,16 @@ fn is_validation_tokens(tokens: &[String]) -> bool {
     }
 }
 
+fn is_verify_local_proof_command(command: &[String]) -> bool {
+    let tokens = normalized_command_tokens(command);
+    let tokens = unwrap_command_tokens(&tokens);
+    matches!(tokens, [first, second, ..] if command_basename(first) == "just" && second == "verify-local")
+        && tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "--fast" | "--final"))
+        && tokens.iter().any(|token| token == "--json")
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum ValidationCoverage {
     All,
@@ -683,12 +861,12 @@ fn validation_coverage_for_tokens(tokens: &[String], cwd: Option<&Path>) -> Vali
     match first {
         "cargo" => cargo_validation_coverage(tokens, cwd),
         "just" => just_validation_coverage(tokens, cwd),
-        "pytest" => path_validation_coverage(tokens, cwd, &["-k", "-m", "--lf"]),
+        "pytest" => pytest_validation_coverage(tokens, cwd),
         "python"
             if tokens.get(1).is_some_and(|token| token == "-m")
                 && tokens.get(2).is_some_and(|token| token == "pytest") =>
         {
-            path_validation_coverage(&tokens[2..], cwd, &["-k", "-m", "--lf"])
+            pytest_validation_coverage(&tokens[2..], cwd)
         }
         "eslint" | "mypy" | "playwright" | "vitest" | "jest" | "ruff" => {
             path_validation_coverage(tokens, cwd, &[])
@@ -740,12 +918,30 @@ fn cargo_validation_coverage(tokens: &[String], cwd: Option<&Path>) -> Validatio
     if let Some(package) = flag_value(tokens, &["-p", "--package"]) {
         return package_validation_coverage(package, cwd);
     }
-    if tokens.iter().any(|token| {
-        matches!(
-            token.as_str(),
-            "--test" | "--tests" | "--bin" | "--bins" | "--example" | "--examples" | "--lib"
-        )
-    }) {
+    if [
+        "--test",
+        "--tests",
+        "--bin",
+        "--bins",
+        "--example",
+        "--examples",
+        "--lib",
+        "--bench",
+        "--benches",
+        "--doc",
+        "--exclude",
+        "--no-run",
+        "--exact",
+        "--ignored",
+        "--skip",
+        "--filter-expr",
+        "--run-ignored",
+        "--partition",
+    ]
+    .iter()
+    .any(|flag| has_flag(tokens, flag))
+        || has_short_attached_value(tokens, "-E")
+    {
         return ValidationCoverage::ScopedUnknown;
     }
 
@@ -789,10 +985,13 @@ fn just_validation_coverage(tokens: &[String], cwd: Option<&Path>) -> Validation
     if let Some(package) = flag_value(tokens, &["-p", "--package"]) {
         return package_validation_coverage(package, cwd);
     }
-    if recipe.contains("lane") || recipe.contains("package") {
+    if matches!(recipe, "test-lane-package" | "check-lane" | "fix-lane") {
         if let Some(package) = tokens.iter().skip(2).find(|token| !token.starts_with('-')) {
             return package_validation_coverage(package, cwd);
         }
+        return ValidationCoverage::ScopedUnknown;
+    }
+    if matches!(recipe, "test-lane" | "test-lane-fast") {
         return ValidationCoverage::ScopedUnknown;
     }
     if tokens
@@ -801,18 +1000,82 @@ fn just_validation_coverage(tokens: &[String], cwd: Option<&Path>) -> Validation
     {
         return ValidationCoverage::ScopedUnknown;
     }
-    ValidationCoverage::All
+    if matches!(recipe, "test" | "test-fast" | "check") && tokens.len() == 2 {
+        ValidationCoverage::All
+    } else {
+        ValidationCoverage::ScopedUnknown
+    }
 }
 
 fn package_validation_coverage(package: &str, cwd: Option<&Path>) -> ValidationCoverage {
     let Some(cwd) = cwd else {
         return ValidationCoverage::ScopedUnknown;
     };
-    let directory = package.strip_prefix("codex-").unwrap_or(package);
-    ValidationCoverage::Paths(vec![
-        cwd.join(directory),
-        cwd.join("codex-rs").join(directory),
-    ])
+    find_package_directory(package, cwd)
+        .map(|path| ValidationCoverage::Paths(vec![path]))
+        .unwrap_or(ValidationCoverage::ScopedUnknown)
+}
+
+fn find_package_directory(package: &str, cwd: &Path) -> Option<PathBuf> {
+    let mut roots = Vec::new();
+    for ancestor in cwd.ancestors() {
+        for candidate in [ancestor.to_path_buf(), ancestor.join("codex-rs")] {
+            let manifest = candidate.join("Cargo.toml");
+            let Ok(contents) = std::fs::read_to_string(&manifest) else {
+                continue;
+            };
+            let Ok(value) = toml::from_str::<toml::Value>(&contents) else {
+                continue;
+            };
+            if value.get("workspace").is_some() {
+                roots.push(candidate);
+            }
+        }
+    }
+    roots.sort();
+    roots.dedup();
+
+    for root in roots {
+        if let Some(directory) = find_package_directory_in_tree(package, &root) {
+            return Some(directory);
+        }
+    }
+    None
+}
+
+fn find_package_directory_in_tree(package: &str, root: &Path) -> Option<PathBuf> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let entries = std::fs::read_dir(&directory).ok()?;
+        for entry in entries {
+            let entry = entry.ok()?;
+            let file_type = entry.file_type().ok()?;
+            if file_type.is_dir() {
+                if !matches!(
+                    entry.file_name().to_str(),
+                    Some(".git" | "target" | "vendor" | "third_party" | "node_modules")
+                ) {
+                    pending.push(entry.path());
+                }
+                continue;
+            }
+            if !file_type.is_file() || entry.file_name() != "Cargo.toml" {
+                continue;
+            }
+            let contents = std::fs::read_to_string(entry.path()).ok()?;
+            let Ok(value) = toml::from_str::<toml::Value>(&contents) else {
+                continue;
+            };
+            let name = value
+                .get("package")
+                .and_then(|package| package.get("name"))
+                .and_then(toml::Value::as_str);
+            if name == Some(package) {
+                return entry.path().parent().map(normalize_tracked_path);
+            }
+        }
+    }
+    None
 }
 
 fn path_validation_coverage(
@@ -847,6 +1110,58 @@ fn path_validation_coverage(
     }
 }
 
+fn pytest_validation_coverage(tokens: &[String], cwd: Option<&Path>) -> ValidationCoverage {
+    if ["-k", "-m", "--lf"]
+        .iter()
+        .any(|flag| has_flag(tokens, flag))
+        || ["--ignore", "--ignore-glob", "--deselect"]
+            .iter()
+            .any(|flag| has_flag(tokens, flag))
+    {
+        return ValidationCoverage::ScopedUnknown;
+    }
+
+    let mut positional = Vec::new();
+    let mut skip_next = false;
+    for token in tokens.iter().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if token.starts_with('-') {
+            if !token.contains('=')
+                && matches!(
+                    token.as_str(),
+                    "-c" | "-o"
+                        | "--basetemp"
+                        | "--confcutdir"
+                        | "--rootdir"
+                        | "--junitxml"
+                        | "--override-ini"
+                )
+            {
+                skip_next = true;
+            }
+            continue;
+        }
+        positional.push(token);
+    }
+    let paths = positional
+        .iter()
+        .filter(|token| looks_like_scope_path(token))
+        .map(|path| resolve_scope_path(path, cwd))
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        if positional.is_empty() {
+            ValidationCoverage::All
+        } else {
+            ValidationCoverage::ScopedUnknown
+        }
+    } else {
+        ValidationCoverage::Paths(paths)
+    }
+}
+
 fn project_flag_coverage(tokens: &[String], cwd: Option<&Path>) -> ValidationCoverage {
     flag_value(tokens, &["-p", "--project"]).map_or(ValidationCoverage::All, |path| {
         ValidationCoverage::Paths(vec![resolve_scope_path(path, cwd)])
@@ -854,9 +1169,47 @@ fn project_flag_coverage(tokens: &[String], cwd: Option<&Path>) -> ValidationCov
 }
 
 fn flag_value<'a>(tokens: &'a [String], flags: &[&str]) -> Option<&'a str> {
+    if let Some(value) = tokens.iter().find_map(|token| {
+        flags.iter().find_map(|flag| {
+            token
+                .strip_prefix(flag)
+                .and_then(|suffix| suffix.strip_prefix('='))
+        })
+    }) {
+        return Some(value);
+    }
+    if let Some(value) = tokens.iter().find_map(|token| {
+        flags
+            .iter()
+            .filter(|flag| flag.len() == 2)
+            .find_map(|flag| {
+                token
+                    .strip_prefix(flag)
+                    .filter(|suffix| !suffix.is_empty() && !suffix.starts_with('='))
+            })
+    }) {
+        return Some(value);
+    }
     tokens.windows(2).find_map(|window| match window {
         [flag, value] if flags.iter().any(|candidate| flag == candidate) => Some(value.as_str()),
         _ => None,
+    })
+}
+
+fn has_flag(tokens: &[String], flag: &str) -> bool {
+    tokens
+        .iter()
+        .any(|token| token == flag || token.starts_with(&format!("{flag}=")))
+}
+
+fn has_short_attached_value(tokens: &[String], flag: &str) -> bool {
+    tokens.iter().any(|token| {
+        token
+            .get(..flag.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(flag))
+            && token
+                .get(flag.len()..)
+                .is_some_and(|suffix| !suffix.is_empty() && !suffix.starts_with('='))
     })
 }
 
@@ -892,16 +1245,28 @@ fn is_broad_validation_filter_command(command: &[String]) -> bool {
             _ => None,
         })
         .or_else(|| {
+            command
+                .iter()
+                .find_map(|token| attached_filter_expression(token))
+        })
+        .or_else(|| {
             let tokens = shell_filter_tokens(&command.join(" "));
-            tokens.windows(2).find_map(|window| match window {
-                [flag, expression]
-                    if flag.eq_ignore_ascii_case("-e")
-                        || flag.eq_ignore_ascii_case("--filter-expr") =>
-                {
-                    Some(expression.clone())
-                }
-                _ => None,
-            })
+            tokens
+                .windows(2)
+                .find_map(|window| match window {
+                    [flag, expression]
+                        if flag.eq_ignore_ascii_case("-e")
+                            || flag.eq_ignore_ascii_case("--filter-expr") =>
+                    {
+                        Some(expression.clone())
+                    }
+                    _ => None,
+                })
+                .or_else(|| {
+                    tokens
+                        .iter()
+                        .find_map(|token| attached_filter_expression(token))
+                })
         });
     let Some(expression) = expression else {
         return false;
@@ -912,6 +1277,21 @@ fn is_broad_validation_filter_command(command: &[String]) -> bool {
         || expression.contains("package(")
         || expression.contains("kind(")
         || expression.contains("all()")
+}
+
+fn attached_filter_expression(token: &str) -> Option<String> {
+    if let Some((flag, expression)) = token.split_once('=')
+        && flag.eq_ignore_ascii_case("--filter-expr")
+        && !expression.is_empty()
+    {
+        return Some(expression.to_string());
+    }
+    token
+        .get(..2)
+        .filter(|flag| flag.eq_ignore_ascii_case("-e"))
+        .and_then(|_| token.get(2..))
+        .filter(|expression| !expression.is_empty())
+        .map(str::to_string)
 }
 
 fn is_format_only_command(command: &[String]) -> bool {
@@ -949,6 +1329,29 @@ fn looks_like_mutating_command(command: &[String]) -> bool {
     }
 
     let tokens = shell_filter_tokens(&joined);
+    let explicit_dry_run = tokens.iter().any(|token| token == "--dry-run");
+    let short_dry_run = tokens.iter().any(|token| token == "-n");
+    if tokens.iter().any(|token| {
+        matches!(
+            command_basename(token),
+            "chmod" | "chown" | "chgrp" | "touch" | "truncate"
+        ) || (command_basename(token) == "dd" && tokens.iter().any(|arg| arg.starts_with("of=")))
+            || (command_basename(token) == "patch" && !explicit_dry_run)
+            || (command_basename(token) == "rsync" && !(explicit_dry_run || short_dry_run))
+            || (command_basename(token) == "sed"
+                && tokens.iter().any(|arg| {
+                    arg == "-i"
+                        || arg.starts_with("-i")
+                        || arg == "--in-place"
+                        || arg.starts_with("--in-place=")
+                }))
+            || (command_basename(token) == "perl"
+                && tokens
+                    .iter()
+                    .any(|arg| arg.starts_with('-') && arg.trim_start_matches('-').contains('i')))
+    }) {
+        return true;
+    }
     if tokens.iter().any(|token| {
         matches!(
             command_basename(token),
@@ -1038,7 +1441,8 @@ fn normalized_command_tokens(command: &[String]) -> Vec<String> {
 }
 
 fn command_basename(token: &str) -> &str {
-    token.rsplit(['/', '\\']).next().unwrap_or(token)
+    let basename = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    basename.strip_suffix(".exe").unwrap_or(basename)
 }
 
 fn known_powershell_validation_tokens(command: &[String]) -> Option<Vec<String>> {

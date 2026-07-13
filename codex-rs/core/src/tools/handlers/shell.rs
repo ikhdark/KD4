@@ -1,4 +1,7 @@
 use codex_features::Feature;
+use codex_protocol::error::CodexErr;
+use codex_protocol::error::SandboxErr;
+use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::ShellCommandToolCallParams;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -14,7 +17,6 @@ use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolPayload;
-use crate::tools::events::ToolEmitter;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
@@ -28,6 +30,7 @@ use crate::tools::runtimes::shell::ShellRequest;
 use crate::tools::runtimes::shell::ShellRuntime;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
 use crate::tools::sandboxing::ToolCtx;
+use crate::tools::sandboxing::ToolError;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ExecCommandSource;
 use codex_tools::ToolName;
@@ -78,11 +81,24 @@ pub(super) struct RunExecLikeArgs {
     pub(super) track_validation_freshness: bool,
     pub(super) attempt_key: Option<CommandAttemptKey>,
     pub(super) repair_notice: Option<String>,
+    pub(super) capture_exec_output: bool,
+}
+
+pub(super) struct RunExecLikeResult {
+    pub(super) output: FunctionToolOutput,
+    pub(super) exit_code: Option<i32>,
+    pub(super) exec_output: Option<ExecToolCallOutput>,
 }
 
 pub(super) async fn run_exec_like(
     args: RunExecLikeArgs,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
+    Ok(run_exec_like_with_exit_code(args).await?.output)
+}
+
+pub(super) async fn run_exec_like_with_exit_code(
+    args: RunExecLikeArgs,
+) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {
         tool_name,
         exec_params,
@@ -101,6 +117,7 @@ pub(super) async fn run_exec_like(
         track_validation_freshness,
         attempt_key,
         repair_notice,
+        capture_exec_output,
     } = args;
 
     let fs = turn_environment.environment.get_filesystem();
@@ -136,7 +153,9 @@ pub(super) async fn run_exec_like(
                 additional_permissions_allowed,
                 turn.approval_policy.value(),
                 effective_additional_permissions.sandbox_permissions,
-                effective_additional_permissions.additional_permissions,
+                effective_additional_permissions
+                    .additional_permissions
+                    .clone(),
                 effective_additional_permissions.permissions_preapproved,
                 &exec_params.cwd,
             )
@@ -144,6 +163,16 @@ pub(super) async fn run_exec_like(
         |permissions| Ok(Some(permissions)),
     )
     .map_err(FunctionCallError::RespondToModel)?;
+
+    let effective_permission_context = format!(
+        "sandbox={:?};additional={:?};preapproved={};normalized={:?}",
+        effective_additional_permissions.sandbox_permissions,
+        effective_additional_permissions.additional_permissions,
+        effective_additional_permissions.permissions_preapproved,
+        normalized_additional_permissions,
+    );
+    let attempt_key =
+        attempt_key.map(|key| key.with_permission_context(&effective_permission_context));
 
     // Approval policy guard for explicit escalation in non-OnRequest modes.
     // Sticky turn permissions have already been approved, so they should
@@ -163,9 +192,18 @@ pub(super) async fn run_exec_like(
         )));
     }
 
+    if let Some(attempt_key) = attempt_key.as_ref() {
+        session
+            .services
+            .command_execution
+            .begin_attempt(attempt_key, repair_notice.is_some())
+            .await
+            .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
+    }
+
     // Intercept apply_patch if present.
     let apply_patch_cwd = PathUri::from_abs_path(&exec_params.cwd);
-    if let Some(output) = intercept_apply_patch(
+    let intercepted = intercept_apply_patch(
         &exec_params.command,
         &apply_patch_cwd,
         fs.as_ref(),
@@ -176,13 +214,48 @@ pub(super) async fn run_exec_like(
         &call_id,
         tool_name.name.as_str(),
     )
-    .await?
-    {
-        return Ok(output);
+    .await;
+    let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
+    session
+        .services
+        .command_execution
+        .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
+        .await;
+    let intercepted = match intercepted {
+        Ok(intercepted) => intercepted,
+        Err(err) => {
+            if let Some(attempt_key) = attempt_key.as_ref() {
+                session
+                    .services
+                    .command_execution
+                    .record_exit(attempt_key, -1)
+                    .await;
+            }
+            return Err(err);
+        }
+    };
+    if let Some(output) = intercepted {
+        if let Some(attempt_key) = attempt_key.as_ref() {
+            session
+                .services
+                .command_execution
+                .record_exit(attempt_key, 0)
+                .await;
+        }
+        return Ok(RunExecLikeResult {
+            output,
+            exit_code: Some(0),
+            exec_output: None,
+        });
     }
 
     let source = ExecCommandSource::Agent;
-    let emitter = ToolEmitter::shell(safety_command.clone(), exec_params.cwd.clone(), source);
+    let emitter = crate::tools::events::ToolEmitter::shell(
+        safety_command.clone(),
+        exec_params.cwd.clone(),
+        source,
+        turn_environment.environment_id.clone(),
+    );
     let event_tracker = track_validation_freshness.then_some(&tracker);
     let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
     emitter.begin(event_ctx).await;
@@ -243,6 +316,22 @@ pub(super) async fn run_exec_like(
         )
         .await
         .map(|result| result.output);
+    let exec_output = capture_exec_output
+        .then(|| clone_output_bearing_result(&out))
+        .flatten();
+    let exit_code = out
+        .as_ref()
+        .ok()
+        .map(|output| output.exit_code)
+        .or_else(|| exec_output.as_ref().map(|output| output.exit_code));
+    let retry_exit_code = retry_exit_code(&out);
+    if let (Some(attempt_key), Some(retry_exit_code)) = (attempt_key.as_ref(), retry_exit_code) {
+        session
+            .services
+            .command_execution
+            .record_exit(attempt_key, retry_exit_code)
+            .await;
+    }
     let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
     let post_tool_use_response = out
         .as_ref()
@@ -258,12 +347,7 @@ pub(super) async fn run_exec_like(
             &output.aggregated_output.text,
         )
     });
-    let raw_output_artifact = if let (Some(attempt_key), Ok(output)) = (&attempt_key, &out) {
-        session
-            .services
-            .command_execution
-            .record_exit(attempt_key, output.exit_code)
-            .await;
+    let raw_output_artifact = if let (Some(_attempt_key), Ok(output)) = (&attempt_key, &out) {
         Some(
             create_raw_output_artifact(
                 turn.config.codex_home.as_path(),
@@ -275,9 +359,20 @@ pub(super) async fn run_exec_like(
     } else {
         None
     };
-    let mut content = emitter
+    let finish_result = emitter
         .finish(event_ctx, out, /*applied_patch_delta*/ None)
-        .await?;
+        .await;
+    let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
+    session
+        .services
+        .command_execution
+        .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
+        .await;
+    let mut content = match finish_result {
+        Ok(content) => content,
+        Err(err) if exec_output.is_some() => err.to_string(),
+        Err(err) => return Err(err),
+    };
     if let Some(advisory) = advisory {
         content.push_str("\n\n");
         content.push_str(advisory);
@@ -289,13 +384,43 @@ pub(super) async fn run_exec_like(
     if let Some(raw_output_artifact) = raw_output_artifact {
         insert_metadata_before_output(&mut content, &raw_output_artifact.render_for_model());
     }
-    Ok(FunctionToolOutput {
-        body: vec![
-            codex_protocol::models::FunctionCallOutputContentItem::InputText { text: content },
-        ],
-        success: Some(true),
-        post_tool_use_response,
+    Ok(RunExecLikeResult {
+        output: FunctionToolOutput {
+            body: vec![
+                codex_protocol::models::FunctionCallOutputContentItem::InputText { text: content },
+            ],
+            success: Some(true),
+            post_tool_use_response,
+        },
+        exit_code,
+        exec_output,
     })
+}
+
+fn retry_exit_code(out: &Result<ExecToolCallOutput, ToolError>) -> Option<i32> {
+    match out {
+        Ok(output) => Some(output.exit_code),
+        Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output })))
+        | Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output, .. }))) => {
+            Some(output.exit_code)
+        }
+        Err(ToolError::Codex(_)) => Some(-1),
+        Err(ToolError::Rejected(message)) if message == "rejected by user" => None,
+        Err(ToolError::Rejected(_)) => Some(-1),
+    }
+}
+
+fn clone_output_bearing_result(
+    out: &Result<ExecToolCallOutput, ToolError>,
+) -> Option<ExecToolCallOutput> {
+    match out {
+        Ok(output) => Some(output.clone()),
+        Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output })))
+        | Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output, .. }))) => {
+            Some((**output).clone())
+        }
+        Err(ToolError::Codex(_)) | Err(ToolError::Rejected(_)) => None,
+    }
 }
 
 fn insert_metadata_before_output(content: &mut String, metadata: &str) {

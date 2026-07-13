@@ -51,13 +51,22 @@ fn tracker_with_root(root: &Path) -> TurnDiffTracker {
     TurnDiffTracker::with_environment_display_roots([("".to_string(), root.to_path_buf())])
 }
 
+fn verify_local_proof_command() -> Vec<String> {
+    vec![
+        "just".into(),
+        "verify-local".into(),
+        "--fast".into(),
+        "--json".into(),
+    ]
+}
+
 trait TestTurnDiffTrackerExt {
     fn record_exec_command_end(&mut self, command: &[String], exit_code: i32, timed_out: bool);
 }
 
 impl TestTurnDiffTrackerExt for TurnDiffTracker {
     fn record_exec_command_end(&mut self, command: &[String], exit_code: i32, timed_out: bool) {
-        self.record_exec_command_end_at(command, exit_code, timed_out, None);
+        self.record_exec_command_end_at(command, exit_code, timed_out, "", None);
     }
 }
 
@@ -139,7 +148,7 @@ async fn verified_validation_clears_only_the_paths_it_covered() {
     }
 
     assert!(!tracker.record_verified_validation(
-        vec!["just".into(), "verify-local".into()],
+        verify_local_proof_command(),
         "",
         &[PathBuf::from("a.txt")],
         false,
@@ -147,7 +156,7 @@ async fn verified_validation_clears_only_the_paths_it_covered() {
     assert!(tracker.has_unvalidated_mutation());
 
     assert!(tracker.record_verified_validation(
-        vec!["just".into(), "verify-local".into()],
+        verify_local_proof_command(),
         "",
         &[PathBuf::from("b.txt")],
         false,
@@ -158,12 +167,7 @@ async fn verified_validation_clears_only_the_paths_it_covered() {
     );
 
     tracker.record_unknown_mutation();
-    assert!(tracker.record_verified_validation(
-        vec!["just".into(), "verify-local".into()],
-        "",
-        &[],
-        true,
-    ));
+    assert!(tracker.record_verified_validation(verify_local_proof_command(), "", &[], true,));
 }
 
 #[tokio::test]
@@ -183,6 +187,7 @@ async fn scoped_shell_validation_clears_only_matching_changed_paths() {
         &["pytest".into(), "tests/a.py".into()],
         0,
         false,
+        "",
         Some(dir.path()),
     );
 
@@ -192,7 +197,7 @@ async fn scoped_shell_validation_clears_only_matching_changed_paths() {
         ValidationFreshnessStatus::ScopedValidationIncomplete
     );
     assert!(tracker.record_verified_validation(
-        vec!["just".into(), "verify-local".into()],
+        verify_local_proof_command(),
         "",
         &[PathBuf::from("src/b.rs")],
         false,
@@ -202,6 +207,23 @@ async fn scoped_shell_validation_clears_only_matching_changed_paths() {
 #[tokio::test]
 async fn package_scoped_validation_maps_codex_package_to_its_crate_directory() {
     let dir = tempdir().expect("tempdir");
+    fs::create_dir_all(dir.path().join("codex-rs/core/src")).expect("core directory");
+    fs::create_dir_all(dir.path().join("codex-rs/protocol/src")).expect("protocol directory");
+    fs::write(
+        dir.path().join("codex-rs/Cargo.toml"),
+        "[workspace]\nmembers = [\"core\", \"protocol\"]\n",
+    )
+    .expect("workspace manifest");
+    fs::write(
+        dir.path().join("codex-rs/core/Cargo.toml"),
+        "[package]\nname = \"codex-core\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("core manifest");
+    fs::write(
+        dir.path().join("codex-rs/protocol/Cargo.toml"),
+        "[package]\nname = \"codex-protocol\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("protocol manifest");
     let mut tracker = tracker_with_root(dir.path());
     for path in ["codex-rs/core/src/a.rs", "codex-rs/protocol/src/b.rs"] {
         let delta = apply_verified_patch(
@@ -221,6 +243,7 @@ async fn package_scoped_validation_maps_codex_package_to_its_crate_directory() {
         ],
         0,
         false,
+        "",
         Some(dir.path()),
     );
 
@@ -230,7 +253,7 @@ async fn package_scoped_validation_maps_codex_package_to_its_crate_directory() {
         ValidationFreshnessStatus::ScopedValidationIncomplete
     );
     assert!(tracker.record_verified_validation(
-        vec!["just".into(), "verify-local".into()],
+        verify_local_proof_command(),
         "",
         &[PathBuf::from("codex-rs/protocol/src/b.rs")],
         false,
@@ -248,7 +271,13 @@ async fn unproven_validator_scope_does_not_clear_unrelated_changes() {
     .await;
     tracker.track_delta("", &delta);
 
-    tracker.record_exec_command_end_at(&["npm".into(), "test".into()], 0, false, Some(dir.path()));
+    tracker.record_exec_command_end_at(
+        &["npm".into(), "test".into()],
+        0,
+        false,
+        "",
+        Some(dir.path()),
+    );
 
     assert!(tracker.has_unvalidated_mutation());
     assert_eq!(
@@ -272,6 +301,7 @@ async fn cargo_audit_does_not_count_as_source_correctness_validation() {
         &["cargo".into(), "audit".into()],
         0,
         false,
+        "",
         Some(dir.path()),
     );
 
@@ -378,6 +408,348 @@ fn read_only_shell_commands_do_not_create_mutation_state() {
     let mut tracker = TurnDiffTracker::new();
     tracker.record_exec_command_end(&["git".into(), "status".into()], 0, false);
     assert!(!tracker.has_unvalidated_mutation());
+}
+
+#[tokio::test]
+async fn command_validation_clears_only_its_environment() {
+    let dir = tempdir().expect("tempdir");
+    let first_root = dir.path().join("first");
+    let second_root = dir.path().join("second");
+    fs::create_dir_all(&first_root).expect("first root");
+    fs::create_dir_all(&second_root).expect("second root");
+    let mut tracker = TurnDiffTracker::with_environment_display_roots([
+        ("first".to_string(), first_root.clone()),
+        ("second".to_string(), second_root.clone()),
+    ]);
+    for (environment_id, root) in [("first", &first_root), ("second", &second_root)] {
+        let delta = apply_verified_patch(
+            root,
+            "*** Begin Patch\n*** Add File: src/lib.rs\n+changed\n*** End Patch",
+        )
+        .await;
+        tracker.track_delta(environment_id, &delta);
+    }
+
+    tracker.record_exec_command_end_at(
+        &["cargo".into(), "check".into()],
+        0,
+        false,
+        "first",
+        Some(&first_root),
+    );
+
+    assert!(tracker.has_unvalidated_mutation());
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::ScopedValidationIncomplete
+    );
+    assert!(tracker.record_verified_validation(
+        verify_local_proof_command(),
+        "second",
+        &[PathBuf::from("src/lib.rs")],
+        false,
+    ));
+}
+
+#[tokio::test]
+async fn command_validation_uses_exact_environment_when_roots_are_identical() {
+    let dir = tempdir().expect("tempdir");
+    let mut tracker = TurnDiffTracker::with_environment_display_roots([
+        ("first".to_string(), dir.path().to_path_buf()),
+        ("second".to_string(), dir.path().to_path_buf()),
+    ]);
+    let delta = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: src/lib.rs\n+changed\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("second", &delta);
+
+    tracker.record_exec_command_end_at(
+        &["cargo".into(), "check".into()],
+        0,
+        false,
+        "first",
+        Some(dir.path()),
+    );
+
+    assert!(tracker.has_unvalidated_mutation());
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::ScopedValidationIncomplete
+    );
+    assert!(tracker.record_verified_validation(
+        verify_local_proof_command(),
+        "second",
+        &[PathBuf::from("src/lib.rs")],
+        false,
+    ));
+}
+
+#[tokio::test]
+async fn verified_validation_requires_the_real_command_and_normalizes_paths() {
+    let dir = tempdir().expect("tempdir");
+    let mut tracker = tracker_with_root(dir.path());
+    let delta = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: src/lib.rs\n+changed\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &delta);
+
+    assert!(!tracker.record_verified_validation(
+        vec!["echo".into(), "VERIFIED".into()],
+        "",
+        &[PathBuf::from("src/lib.rs")],
+        false,
+    ));
+    assert!(tracker.has_unvalidated_mutation());
+    assert!(tracker.record_verified_validation(
+        verify_local_proof_command(),
+        "",
+        &[dir.path().join("src/../src/lib.rs")],
+        false,
+    ));
+}
+
+#[test]
+fn attached_cargo_flags_and_scoped_runner_options_are_not_broad_validation() {
+    let dir = tempdir().expect("tempdir");
+    let workspace = dir.path().join("codex-rs");
+    fs::create_dir_all(workspace.join("utils/nested/src")).expect("nested crate");
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"utils/nested\"]\n",
+    )
+    .expect("workspace manifest");
+    fs::write(
+        workspace.join("utils/nested/Cargo.toml"),
+        "[package]\nname = \"codex-utils-nested\"\nversion = \"0.0.0\"\n",
+    )
+    .expect("nested manifest");
+
+    assert_eq!(
+        cargo_validation_coverage(
+            &[
+                "cargo".into(),
+                "check".into(),
+                "--package=codex-utils-nested".into(),
+            ],
+            Some(&workspace),
+        ),
+        ValidationCoverage::Paths(vec![normalize_tracked_path(
+            &workspace.join("utils/nested")
+        )])
+    );
+    assert_eq!(
+        cargo_validation_coverage(
+            &[
+                "cargo".into(),
+                "check".into(),
+                "-pcodex-utils-nested".into(),
+            ],
+            Some(&workspace),
+        ),
+        ValidationCoverage::Paths(vec![normalize_tracked_path(
+            &workspace.join("utils/nested")
+        )])
+    );
+    assert_eq!(
+        cargo_validation_coverage(
+            &["cargo".into(), "test".into(), "--test=focused".into()],
+            Some(&workspace),
+        ),
+        ValidationCoverage::ScopedUnknown
+    );
+    assert_eq!(
+        just_validation_coverage(
+            &["just".into(), "test-fast".into(), "focused_filter".into()],
+            Some(&workspace),
+        ),
+        ValidationCoverage::ScopedUnknown
+    );
+    assert_eq!(
+        pytest_validation_coverage(
+            &["pytest".into(), "--ignore".into(), "tests/slow".into()],
+            Some(&workspace),
+        ),
+        ValidationCoverage::ScopedUnknown
+    );
+    for command in [
+        vec![
+            "cargo".into(),
+            "nextest".into(),
+            "run".into(),
+            "--filter-expr=test(focused)".into(),
+        ],
+        vec![
+            "cargo".into(),
+            "nextest".into(),
+            "run".into(),
+            "-Etest(focused)".into(),
+        ],
+        vec![
+            "cargo".into(),
+            "test".into(),
+            "--workspace".into(),
+            "--exclude=codex-utils-nested".into(),
+        ],
+        vec!["cargo".into(), "test".into(), "--doc".into()],
+        vec!["cargo".into(), "test".into(), "--bench=focused".into()],
+        vec!["cargo".into(), "test".into(), "--no-run".into()],
+    ] {
+        assert_eq!(
+            cargo_validation_coverage(&command, Some(&workspace)),
+            ValidationCoverage::ScopedUnknown,
+            "expected scoped Cargo validation: {command:?}"
+        );
+    }
+    assert!(is_broad_validation_filter_command(&[
+        "cargo".into(),
+        "nextest".into(),
+        "run".into(),
+        "--filter-expr=test(one)|test(two)".into(),
+    ]));
+}
+
+#[test]
+fn common_in_place_mutators_invalidate_validation_freshness() {
+    for command in [
+        vec!["chmod".into(), "+x".into(), "run.sh".into()],
+        vec!["touch".into(), "a.txt".into()],
+        vec!["truncate".into(), "-s".into(), "0".into(), "a.txt".into()],
+        vec!["sed".into(), "-i".into(), "s/a/b/".into(), "a.txt".into()],
+        vec![
+            "sed".into(),
+            "--in-place".into(),
+            "s/a/b/".into(),
+            "a.txt".into(),
+        ],
+        vec![
+            "perl".into(),
+            "-pi".into(),
+            "-e".into(),
+            "s/a/b/".into(),
+            "a.txt".into(),
+        ],
+        vec!["dd".into(), "if=input".into(), "of=output".into()],
+        vec!["rsync".into(), "source".into(), "dest".into()],
+        vec!["patch".into(), "-p1".into()],
+        vec!["patch".into(), "-n".into(), "-p1".into()],
+    ] {
+        assert!(
+            command_may_mutate(&command),
+            "expected mutator: {command:?}"
+        );
+    }
+}
+
+#[test]
+fn metadata_mutation_makes_successful_validation_stale() {
+    let mut tracker = TurnDiffTracker::new();
+    tracker.record_unknown_mutation();
+    tracker.record_exec_command_end_at(&["cargo".into(), "check".into()], 0, false, "local", None);
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::PassedAfterLastMutation
+    );
+
+    tracker.record_exec_command_end_at(
+        &["chmod".into(), "+x".into(), "run.sh".into()],
+        0,
+        false,
+        "local",
+        None,
+    );
+
+    assert!(tracker.has_unvalidated_mutation());
+    assert_eq!(
+        tracker.validation_freshness_status(),
+        ValidationFreshnessStatus::StaleAfterLastMutation
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn executable_add_uses_the_filesystem_mode_in_generated_diff() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().expect("tempdir");
+    let delta = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: run.sh\n+#!/bin/sh\n+exit 0\n*** End Patch",
+    )
+    .await;
+    fs::set_permissions(dir.path().join("run.sh"), fs::Permissions::from_mode(0o755))
+        .expect("executable mode");
+    let mut tracker = tracker_with_root(dir.path());
+    tracker.track_delta("", &delta);
+
+    assert!(
+        tracker
+            .get_unified_diff()
+            .expect("diff")
+            .contains("new file mode 100755")
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn later_delete_preserves_mode_of_previously_tracked_untracked_executable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("run.sh");
+    fs::write(&path, "before\n").expect("seed executable");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("executable mode");
+    let mut tracker = tracker_with_root(dir.path());
+
+    let update = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Update File: run.sh\n@@\n-before\n+after\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &update);
+    let delete = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Delete File: run.sh\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &delete);
+
+    assert!(
+        tracker
+            .get_unified_diff()
+            .expect("diff")
+            .contains("deleted file mode 100755")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tracked_symlink_mode_survives_later_filesystem_deletion() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempdir().expect("tempdir");
+    let link = dir.path().join("link.txt");
+    symlink("target.txt", &link).expect("create symlink");
+    let mut tracker = tracker_with_root(dir.path());
+    let tracked_path = TrackedPath::new("", &link);
+    let baseline = tracker.tracked_content(&tracked_path, "target.txt");
+    assert_eq!(baseline.mode.as_deref(), Some("120000"));
+    tracker
+        .baseline_by_path
+        .insert(tracked_path.clone(), baseline);
+    fs::remove_file(&link).expect("remove symlink");
+
+    tracker.refresh_unified_diff();
+
+    assert!(
+        tracker
+            .get_unified_diff()
+            .expect("diff")
+            .contains("deleted file mode 120000")
+    );
 }
 
 #[tokio::test]
@@ -792,16 +1164,18 @@ fn large_rewrite_returns_promptly_and_preserves_exact_content() {
             .expect("run git add")
             .success()
     );
-    let tracker = tracker_with_root(dir.path());
+    let mut tracker = tracker_with_root(dir.path());
     let tracked_path = TrackedPath::new("", &path);
+    let old_tracked = tracker.tracked_content(&tracked_path, &old_content);
+    let new_tracked = tracker.tracked_content(&tracked_path, &new_content);
 
     let started = Instant::now();
     let diff = tracker
         .render_diff(
             &tracked_path,
-            Some(&old_content),
+            Some(&old_tracked),
             &tracked_path,
-            Some(&new_content),
+            Some(&new_tracked),
         )
         .expect("complete rewrite should produce a diff");
 

@@ -283,22 +283,6 @@ impl ExecCommandHandler {
         let command = resolved_command.command;
         let safety_command = resolved_command.safety_command;
         let shell_type = resolved_command.shell_type;
-        let attempt_key = CommandAttemptKey::new(
-            self.tool_name().name.as_str(),
-            &turn_environment.environment_id,
-            cwd.to_string(),
-            &original_safety_command,
-        );
-        session
-            .services
-            .command_execution
-            .begin_attempt(&attempt_key, repair_notice.is_some())
-            .await
-            .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
-        // Reserve an interactive process id only after all fallible command
-        // normalization and preflight checks. Rejected commands never reach
-        // the process manager and must not consume an id.
-        let process_id = manager.allocate_process_id().await;
         let command_for_display = hook_command.clone();
 
         let ExecCommandArgs {
@@ -341,7 +325,6 @@ impl ExecCommandHandler {
             )
         {
             let approval_policy = context.turn.approval_policy.value();
-            manager.release_process_id(process_id).await;
             return Err(FunctionCallError::RespondToModel(format!(
                 "approval policy is {approval_policy:?}; reject command — you cannot ask for escalated permissions if the approval policy is {approval_policy:?}"
             )));
@@ -367,19 +350,54 @@ impl ExecCommandHandler {
         ) {
             Ok(normalized) => normalized,
             Err(err) => {
-                manager.release_process_id(process_id).await;
                 return Err(FunctionCallError::RespondToModel(err));
             }
         };
 
-        let raw_output_artifact = create_raw_output_artifact(
-            turn.config.codex_home.as_path(),
-            &session.thread_id.to_string(),
-            b"",
+        let sandbox_context = format!(
+            "requested={sandbox_permissions:?};effective={:?};additional={normalized_additional_permissions:?};preapproved={};approval={:?};windows={:?}",
+            effective_additional_permissions.sandbox_permissions,
+            effective_additional_permissions.permissions_preapproved,
+            context.turn.approval_policy.value(),
+            context.turn.windows_sandbox_level,
+        );
+        let runtime_context = format!(
+            "shell={shell_type:?};mode={shell_mode:?};tty={tty};network={:?}",
+            context.turn.network,
+        );
+        let input_context = format!("prefix={prefix_rule:?}");
+        let effective_environment = manager.effective_environment(&context);
+        let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
+        let repository_epoch = session
+            .services
+            .command_execution
+            .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
+            .await;
+        let attempt_key = CommandAttemptKey::new(
+            self.tool_name().name.as_str(),
+            &turn_environment.environment_id,
+            cwd.to_string(),
+            &command,
         )
-        .await;
+        .with_environment(&effective_environment)
+        .with_timeout_ms(None)
+        .with_sandbox_context(&sandbox_context)
+        .with_permission_context(&sandbox_context)
+        .with_input_context(&input_context)
+        .with_runtime_context(&runtime_context)
+        .with_repository_epoch(repository_epoch);
+        session
+            .services
+            .command_execution
+            .begin_attempt(&attempt_key, repair_notice.is_some())
+            .await
+            .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
+        // Reserve an interactive process id only after all fallible command,
+        // permission, and retry-identity checks. Rejected commands never
+        // consume an id.
+        let process_id = manager.allocate_process_id().await;
 
-        if let Some(output) = intercept_apply_patch(
+        let intercepted = intercept_apply_patch(
             &command,
             &cwd,
             fs.as_ref(),
@@ -390,35 +408,64 @@ impl ExecCommandHandler {
             &context.call_id,
             "exec_command",
         )
-        .await?
-        {
-            manager.release_process_id(process_id).await;
-            let raw_output = output.into_text().into_bytes();
-            let raw_output_artifact =
-                replace_raw_output_artifact(&raw_output_artifact, &raw_output).await;
-            session
-                .services
-                .command_execution
-                .record_exit(&attempt_key, 0)
+        .await;
+        let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
+        session
+            .services
+            .command_execution
+            .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
+            .await;
+        match intercepted {
+            Ok(Some(output)) => {
+                manager.release_process_id(process_id).await;
+                let raw_output = output.into_text().into_bytes();
+                let raw_output_artifact = create_raw_output_artifact(
+                    turn.config.codex_home.as_path(),
+                    &session.thread_id.to_string(),
+                    &raw_output,
+                )
                 .await;
-            return Ok(boxed_tool_output(ExecCommandToolOutput {
-                event_call_id: String::new(),
-                chunk_id: String::new(),
-                wall_time: std::time::Duration::ZERO,
-                raw_output,
-                truncation_policy: turn.model_info.truncation_policy.into(),
-                max_output_tokens,
-                process_id: None,
-                exit_code: None,
-                original_token_count: None,
-                hook_command: None,
-                raw_output_artifact: Some(raw_output_artifact),
-                repair_notice,
-            }));
+                session
+                    .services
+                    .command_execution
+                    .record_exit(&attempt_key, 0)
+                    .await;
+                return Ok(boxed_tool_output(ExecCommandToolOutput {
+                    event_call_id: String::new(),
+                    chunk_id: String::new(),
+                    wall_time: std::time::Duration::ZERO,
+                    raw_output,
+                    truncation_policy: turn.model_info.truncation_policy.into(),
+                    max_output_tokens,
+                    process_id: None,
+                    exit_code: None,
+                    original_token_count: None,
+                    hook_command: None,
+                    raw_output_artifact: Some(raw_output_artifact),
+                    repair_notice,
+                }));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                manager.release_process_id(process_id).await;
+                session
+                    .services
+                    .command_execution
+                    .record_exit(&attempt_key, -1)
+                    .await;
+                return Err(err);
+            }
         }
 
+        let raw_output_artifact = create_raw_output_artifact(
+            turn.config.codex_home.as_path(),
+            &session.thread_id.to_string(),
+            b"",
+        )
+        .await;
+
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
-        match manager
+        let exec_result = manager
             .exec_command(
                 ExecCommandRequest {
                     command,
@@ -445,8 +492,14 @@ impl ExecCommandHandler {
                 },
                 &context,
             )
-            .await
-        {
+            .await;
+        let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
+        session
+            .services
+            .command_execution
+            .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
+            .await;
+        match exec_result {
             Ok(mut response) => {
                 let finalized_artifact = response
                     .raw_output_artifact
@@ -520,15 +573,28 @@ impl ExecCommandHandler {
                 }))
             }
             Err(err) => {
-                if matches!(
+                let retry_failure = matches!(
                     &err,
                     UnifiedExecError::CreateProcess { .. } | UnifiedExecError::ProcessFailed { .. }
-                ) {
-                    session
-                        .services
-                        .command_execution
-                        .record_exit(&attempt_key, -1)
-                        .await;
+                );
+                if retry_failure {
+                    let finalized_running_process =
+                        if matches!(&err, UnifiedExecError::ProcessFailed { .. }) {
+                            session
+                                .services
+                                .command_execution
+                                .finish_running_process(process_id, Some(-1))
+                                .await
+                        } else {
+                            false
+                        };
+                    if !finalized_running_process {
+                        session
+                            .services
+                            .command_execution
+                            .record_exit(&attempt_key, -1)
+                            .await;
+                    }
                 }
                 let repair = repair_notice
                     .as_deref()

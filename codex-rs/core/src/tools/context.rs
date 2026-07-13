@@ -401,7 +401,17 @@ impl ToolOutput for ExecCommandToolOutput {
                     Some(*bytes),
                     None,
                 ),
-                Some(RawOutputArtifact::Failed { message }) => (None, None, Some(message.clone())),
+                Some(RawOutputArtifact::Failed {
+                    message,
+                    owned_path,
+                    bytes,
+                }) => (
+                    owned_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    owned_path.as_ref().map(|_| *bytes),
+                    Some(message.clone()),
+                ),
                 None => (None, None, None),
             };
 

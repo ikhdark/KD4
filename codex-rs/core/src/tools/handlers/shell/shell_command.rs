@@ -251,18 +251,6 @@ impl ShellCommandHandler {
         } else {
             Some(safety_shell.shell_type)
         };
-        let attempt_key = CommandAttemptKey::new(
-            tool_name.name.as_str(),
-            &turn_environment.environment_id,
-            cwd.to_string_lossy().into_owned(),
-            &original_safety_command,
-        );
-        session
-            .services
-            .command_execution
-            .begin_attempt(&attempt_key, repair_notice.is_some())
-            .await
-            .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
         let exec_params = Self::to_exec_params(
             &params,
             &command_invocation,
@@ -272,6 +260,41 @@ impl ShellCommandHandler {
             cwd,
             turn.config.permissions.allow_login_shell,
         )?;
+        let sandbox_context = format!(
+            "requested={:?};additional={:?};approval={:?};profile={:?};windows={:?};private_desktop={}",
+            params.sandbox_permissions.unwrap_or_default(),
+            params.additional_permissions,
+            turn.approval_policy.value(),
+            turn.permission_profile(),
+            turn.windows_sandbox_level,
+            exec_params.windows_sandbox_private_desktop,
+        );
+        let runtime_context = format!(
+            "backend={:?};shell={shell_type:?};login={use_login_shell};capture={:?};network_environment={:?};network={:?}",
+            self.backend,
+            exec_params.capture_policy,
+            exec_params.network_environment_id,
+            exec_params.network,
+        );
+        let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
+        let repository_epoch = session
+            .services
+            .command_execution
+            .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
+            .await;
+        let attempt_key = CommandAttemptKey::new(
+            tool_name.name.as_str(),
+            &turn_environment.environment_id,
+            exec_params.cwd.to_string_lossy().into_owned(),
+            &original_safety_command,
+        )
+        .with_executed_command(&exec_params.command)
+        .with_environment(&exec_params.env)
+        .with_timeout_ms(exec_params.expiration.timeout_ms())
+        .with_sandbox_context(&sandbox_context)
+        .with_input_context(&prefix_rule)
+        .with_runtime_context(&runtime_context)
+        .with_repository_epoch(repository_epoch);
         run_exec_like(RunExecLikeArgs {
             tool_name,
             exec_params,
@@ -290,6 +313,7 @@ impl ShellCommandHandler {
             track_validation_freshness: true,
             attempt_key: Some(attempt_key),
             repair_notice,
+            capture_exec_output: false,
         })
         .await
         .map(boxed_tool_output)

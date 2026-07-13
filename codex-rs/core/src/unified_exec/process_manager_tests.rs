@@ -1,4 +1,5 @@
 use super::*;
+use crate::unified_exec::async_watcher::resolve_aggregated_output;
 use crate::unified_exec::clamp_yield_time;
 use codex_network_proxy::ManagedNetworkSandboxContext;
 use pretty_assertions::assert_eq;
@@ -34,6 +35,117 @@ fn unified_exec_env_overrides_existing_values() {
 
     assert_eq!(env.get("NO_COLOR"), Some(&"1".to_string()));
     assert_eq!(env.get("PATH"), Some(&"/usr/bin".to_string()));
+}
+
+#[tokio::test]
+async fn lag_survives_drain_for_finalization_without_duplicate_interim_reports() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(32)));
+    {
+        let mut guard = output_buffer.lock().await;
+        guard.push_chunk(b"PARTIAL_OUTPUT".to_vec());
+        guard.record_lagged_chunks(4);
+    }
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(true));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    cancellation_token.cancel();
+
+    let collected = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        /*pause_state*/ None,
+        Instant::now() + Duration::from_millis(50),
+    )
+    .await;
+    let collected = String::from_utf8(collected).expect("collected output is UTF-8");
+    assert!(collected.contains("PARTIAL_OUTPUT"));
+    assert_eq!(
+        collected
+            .matches("streaming receiver lagged by 4 chunk(s)")
+            .count(),
+        1
+    );
+
+    let second_drain = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        /*pause_state*/ None,
+        Instant::now() + Duration::from_millis(50),
+    )
+    .await;
+    assert!(second_drain.is_empty());
+
+    let final_output = resolve_aggregated_output(&output_buffer, "FINAL_OUTPUT".to_string()).await;
+    assert!(final_output.contains("FINAL_OUTPUT"));
+    assert_eq!(
+        final_output
+            .matches("streaming receiver lagged by 4 chunk(s)")
+            .count(),
+        1
+    );
+    assert_eq!(output_buffer.lock().await.lagged_chunks(), 4);
+}
+
+#[tokio::test]
+async fn capacity_omission_is_reported_once_per_drain_and_preserved_for_finalization() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(8)));
+    output_buffer
+        .lock()
+        .await
+        .push_chunk(b"0123456789abcdef".to_vec());
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(true));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    cancellation_token.cancel();
+
+    let collected = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        /*pause_state*/ None,
+        Instant::now() + Duration::from_millis(50),
+    )
+    .await;
+    let collected = String::from_utf8(collected).expect("collected output is UTF-8");
+    assert_eq!(
+        collected
+            .matches("8 byte(s) omitted from the middle")
+            .count(),
+        1
+    );
+    assert!(!collected.contains("streaming receiver lagged"));
+
+    let second_drain = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        /*pause_state*/ None,
+        Instant::now() + Duration::from_millis(50),
+    )
+    .await;
+    assert!(second_drain.is_empty());
+
+    let final_output = resolve_aggregated_output(&output_buffer, "FINAL_OUTPUT".to_string()).await;
+    assert_eq!(
+        final_output
+            .matches("8 byte(s) omitted from the middle")
+            .count(),
+        1
+    );
+    assert!(!final_output.contains("streaming receiver lagged"));
+    assert_eq!(output_buffer.lock().await.omitted_bytes(), 8);
 }
 
 #[test]
@@ -283,6 +395,8 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         ),
         raw_output_artifact: crate::tools::command_output_artifact::RawOutputArtifact::Failed {
             message: "test fixture".to_string(),
+            owned_path: None,
+            bytes: 0,
         },
         shell_type: crate::shell::ShellType::Sh,
         hook_command: "echo before".to_string(),

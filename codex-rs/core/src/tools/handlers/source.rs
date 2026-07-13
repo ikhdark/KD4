@@ -162,15 +162,18 @@ async fn handle_search_source(
     options.include_generated = args.include_generated;
     options.include_vendor = args.include_vendor;
     options.include_locks = args.include_locks;
+    let recover_explicit_root_failures = !options.roots.is_empty();
     let roots = resolve_search_roots(&source_context, &options.roots).await?;
     let mut accumulator = SourceSearchAccumulator::new(&options)
         .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
-    for root in &roots {
-        if accumulator.should_stop() {
-            break;
-        }
-        scan_source_root(&source_context, root, &options, &mut accumulator).await?;
-    }
+    scan_source_roots(
+        &source_context,
+        &roots,
+        &options,
+        &mut accumulator,
+        recover_explicit_root_failures,
+    )
+    .await?;
     let output = accumulator.finish(
         roots
             .iter()
@@ -407,11 +410,18 @@ async fn scan_source_root(
             break;
         }
         directories_seen = directories_seen.saturating_add(1);
-        let mut entries = context
+        let entries_result = context
             .fs
             .read_directory(&directory, Some(&context.sandbox))
-            .await
-            .map_err(|err| source_fs_error("read directory", &directory, err))?;
+            .await;
+        let mut entries = if depth == 0 {
+            entries_result.map_err(|err| source_fs_error("read directory", &directory, err))?
+        } else {
+            let Some(entries) = recover_scan_result(entries_result, accumulator) else {
+                continue;
+            };
+            entries
+        };
         entries.sort_by(|left, right| left.file_name.cmp(&right.file_name));
 
         for entry in entries {
@@ -423,20 +433,26 @@ async fn scan_source_root(
                 return Ok(());
             }
             entries_seen = entries_seen.saturating_add(1);
-            let child = directory.join(&entry.file_name).map_err(|err| {
-                FunctionCallError::RespondToModel(format!(
-                    "unable to resolve source path below `{}`: {err}",
-                    directory.inferred_native_path_string()
-                ))
-            })?;
-            let child_metadata = context
-                .fs
-                .get_metadata(&child, Some(&context.sandbox))
-                .await
-                .map_err(|err| source_fs_error("inspect", &child, err))?;
+            let Some(child) = recover_scan_result(directory.join(&entry.file_name), accumulator)
+            else {
+                continue;
+            };
+            let Some(child_metadata) = recover_scan_result(
+                context
+                    .fs
+                    .get_metadata(&child, Some(&context.sandbox))
+                    .await,
+                accumulator,
+            ) else {
+                continue;
+            };
 
             if child_metadata.is_directory {
-                let relative = relative_source_path(context, &child)?;
+                let Some(relative) =
+                    recover_scan_result(relative_source_path(context, &child), accumulator)
+                else {
+                    continue;
+                };
                 if child_metadata.is_symlink
                     || !should_descend_source_path(
                         Path::new(&relative),
@@ -456,7 +472,11 @@ async fn scan_source_root(
             if !child_metadata.is_file {
                 continue;
             }
-            let relative = relative_source_path(context, &child)?;
+            let Some(relative) =
+                recover_scan_result(relative_source_path(context, &child), accumulator)
+            else {
+                continue;
+            };
             if !should_scan_source_file(
                 Path::new(&relative),
                 options.include_generated,
@@ -465,18 +485,44 @@ async fn scan_source_root(
             ) {
                 continue;
             }
-            let canonical = context
-                .fs
-                .canonicalize(&child, Some(&context.sandbox))
-                .await
-                .map_err(|err| source_fs_error("canonicalize", &child, err))?;
+            let Some(canonical) = recover_scan_result(
+                context
+                    .fs
+                    .canonicalize(&child, Some(&context.sandbox))
+                    .await,
+                accumulator,
+            ) else {
+                continue;
+            };
             if !canonical.starts_with(&context.repo_root) {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "source file `{relative}` resolves outside repository root `{}`",
-                    context.repo_root.inferred_native_path_string()
-                )));
+                accumulator.mark_filesystem_error();
+                continue;
             }
-            add_source_file(context, &canonical, accumulator).await?;
+            let _ = recover_scan_result(
+                add_source_file(context, &canonical, accumulator).await,
+                accumulator,
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn scan_source_roots(
+    context: &LocalSourceContext,
+    roots: &[PathUri],
+    options: &SourceSearchOptions,
+    accumulator: &mut SourceSearchAccumulator,
+    recover_root_failures: bool,
+) -> Result<(), FunctionCallError> {
+    for root in roots {
+        if accumulator.should_stop() {
+            break;
+        }
+        let result = scan_source_root(context, root, options, accumulator).await;
+        if recover_root_failures {
+            let _ = recover_scan_result(result, accumulator);
+        } else {
+            result?;
         }
     }
     Ok(())
@@ -493,7 +539,10 @@ async fn add_source_file(
         .await
         .map_err(|err| source_fs_error("inspect", path, err))?;
     if !metadata.is_file {
-        return Ok(());
+        return Err(FunctionCallError::RespondToModel(format!(
+            "source path `{}` is not a file",
+            path.inferred_native_path_string()
+        )));
     }
     let relative = relative_source_path(context, path)?;
     let file_len = usize::try_from(metadata.size).unwrap_or(usize::MAX);
@@ -507,6 +556,19 @@ async fn add_source_file(
         .map_err(|err| source_fs_error("read", path, err))?;
     accumulator.add_file_bytes(Path::new(&relative), bytes);
     Ok(())
+}
+
+fn recover_scan_result<T, E>(
+    result: Result<T, E>,
+    accumulator: &mut SourceSearchAccumulator,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(_) => {
+            accumulator.mark_filesystem_error();
+            None
+        }
+    }
 }
 
 fn relative_source_path(
@@ -537,22 +599,34 @@ fn source_fs_error(action: &str, path: &PathUri, err: std::io::Error) -> Functio
 }
 
 fn render_search_output(output: &SourceSearchOutput) -> String {
+    let rendered = render_search_output_inner(output, false);
+    if rendered.len() <= SOURCE_TOOL_MAX_RENDERED_BYTES {
+        return rendered;
+    }
+    bound_model_output(render_search_output_inner(output, true))
+}
+
+fn render_search_output_inner(output: &SourceSearchOutput, render_truncated: bool) -> String {
     let mut rendered = vec![
         "Source search evidence:".to_string(),
         format!("query: {}", output.query),
         format!(
-            "coverage: files={} skipped_too_large={} skipped_non_utf8={} bytes={} total_matches={} returned={} truncated={}",
+            "coverage: files={} skipped_too_large={} skipped_non_utf8={} filesystem_errors={} bytes={} total_matches={} returned={} truncated={}",
             output.coverage.files_scanned,
             output.coverage.files_skipped_too_large,
             output.coverage.files_skipped_non_utf8,
+            output.coverage.filesystem_errors,
             output.coverage.bytes_scanned,
             output.coverage.total_matches,
             output.coverage.matches_returned,
-            output.truncated
+            output.truncated || render_truncated
         ),
     ];
     if let Some(reason) = output.truncated_reason {
         rendered.push(format!("truncated_reason: {reason:?}"));
+    }
+    if render_truncated {
+        rendered.push("render_truncated_reason: MaxRenderedBytes".to_string());
     }
     for source_match in &output.matches {
         rendered.push(String::new());
@@ -575,10 +649,18 @@ fn render_search_output(output: &SourceSearchOutput) -> String {
             format!("{:>6} | {}{suffix}", line.line_number, line.text)
         }));
     }
-    bound_model_output(rendered.join("\n"))
+    rendered.join("\n")
 }
 
 fn render_read_output(output: &ReadFileSpanOutput) -> String {
+    let rendered = render_read_output_inner(output, false);
+    if rendered.len() <= SOURCE_TOOL_MAX_RENDERED_BYTES {
+        return rendered;
+    }
+    bound_model_output(render_read_output_inner(output, true))
+}
+
+fn render_read_output_inner(output: &ReadFileSpanOutput, render_truncated: bool) -> String {
     let citation = match (output.start_line, output.end_line) {
         (Some(start), Some(end)) => format!("{}:{start}-{end}", output.path),
         _ => format!("{}:<empty>", output.path),
@@ -588,9 +670,14 @@ fn render_read_output(output: &ReadFileSpanOutput) -> String {
         format!("citation: {citation}"),
         format!(
             "total_lines: {} bytes_returned: {} truncated: {}",
-            output.total_lines, output.bytes_returned, output.truncated
+            output.total_lines,
+            output.bytes_returned,
+            output.truncated || render_truncated
         ),
     ];
+    if render_truncated {
+        rendered.push("render_truncated_reason: MaxRenderedBytes".to_string());
+    }
     if let Some(route) = &output.source_map_route {
         rendered.push(format!("source_route: {route}"));
     }
@@ -602,7 +689,7 @@ fn render_read_output(output: &ReadFileSpanOutput) -> String {
         };
         format!("{:>6} | {}{suffix}", line.line_number, line.text)
     }));
-    bound_model_output(rendered.join("\n"))
+    rendered.join("\n")
 }
 
 fn bound_model_output(rendered: String) -> String {

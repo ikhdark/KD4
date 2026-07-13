@@ -14,12 +14,13 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::shell::RunExecLikeArgs;
-use crate::tools::handlers::shell::run_exec_like;
+use crate::tools::handlers::shell::run_exec_like_with_exit_code;
 use crate::tools::handlers::verify_local_spec::VERIFY_LOCAL_TOOL_NAME;
 use crate::tools::handlers::verify_local_spec::VerifyLocalToolOptions;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
+use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::models::ResponseInputItem;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -52,6 +53,15 @@ impl VerifyLocalArgs {
             "--fast" => "fast",
             "--final" => "final",
             _ => "unknown",
+        }
+    }
+
+    fn timeout_ms(&self) -> u64 {
+        match self.mode_flag {
+            "--plan" => 2 * 60 * 1_000,
+            "--fast" => 20 * 60 * 1_000,
+            "--final" => 60 * 60 * 1_000,
+            _ => 20 * 60 * 1_000,
         }
     }
 }
@@ -211,7 +221,7 @@ impl VerifyLocalHandler {
         let exec_params = ExecParams {
             command: argv.clone(),
             cwd,
-            expiration: None.into(),
+            expiration: args.timeout_ms().into(),
             capture_policy: ExecCapturePolicy::ShellTool,
             env,
             network: turn.network.clone(),
@@ -229,7 +239,12 @@ impl VerifyLocalHandler {
         // Keep the temporary CODEX_HOME/SQLite directories alive until the
         // orchestrated command and cancellation cleanup have fully completed.
         let _isolation = isolation;
-        let output = run_exec_like(RunExecLikeArgs {
+        let validation_start = session
+            .services
+            .task_evidence
+            .begin_verify_local_validation()
+            .await;
+        let result = run_exec_like_with_exit_code(RunExecLikeArgs {
             tool_name: self.tool_name(),
             exec_params,
             cancellation_token,
@@ -247,9 +262,15 @@ impl VerifyLocalHandler {
             track_validation_freshness: false,
             attempt_key: None,
             repair_notice: None,
+            capture_exec_output: true,
         })
         .await?;
-        let (output, run) = finalize_verify_local_output(output, raw_json);
+        let (output, run) = finalize_verify_local_output(
+            result.output,
+            result.exec_output.as_ref(),
+            result.exit_code,
+            raw_json,
+        );
         let (active_files, stale_reasons) = run
             .scope
             .as_ref()
@@ -260,7 +281,7 @@ impl VerifyLocalHandler {
                 )
             })
             .unwrap_or((&[], &[]));
-        session
+        let proof_accepted = session
             .services
             .task_evidence
             .record_verify_local(
@@ -268,14 +289,13 @@ impl VerifyLocalHandler {
                 run.verdict_text.as_deref(),
                 run.tool_success,
                 run.is_proof_bearing(),
+                validation_start.as_ref(),
                 active_files,
                 stale_reasons,
                 run.json.as_ref(),
             )
             .await;
-        if run.is_proof_bearing()
-            && let Some(scope) = &run.scope
-        {
+        if proof_accepted && let Some(scope) = &run.scope {
             let mut tracker = validation_tracker.lock().await;
             crate::turn_diff_tracker::TurnDiffTracker::record_verified_validation(
                 &mut tracker,
@@ -515,7 +535,6 @@ fn parse_verify_local_run(
     } else {
         parse_text_verdict(&stdout, &stderr)
     };
-    let exit_code = exit_code.or_else(|| parse_formatted_exit_code(&stdout));
     let (semantic_success, guidance) = if json.is_some() && !has_versioned_json {
         (
             false,
@@ -576,101 +595,46 @@ fn parse_verify_local_run(
 }
 
 fn is_versioned_verify_local_json(value: &Value) -> bool {
-    value.get("schema_version").and_then(Value::as_u64)
-        == Some(self::VERIFY_LOCAL_JSON_SCHEMA_VERSION)
+    value.is_object()
+        && value.get("schema_version").and_then(Value::as_u64)
+            == Some(self::VERIFY_LOCAL_JSON_SCHEMA_VERSION)
         && value.get("producer").and_then(Value::as_str) == Some(self::VERIFY_LOCAL_JSON_PRODUCER)
+        && value.get("verdict").and_then(Value::as_str).is_some()
 }
 
 fn parse_verify_local_json(stdout: &str) -> Option<Value> {
-    if let Ok(value) = serde_json::from_str::<Value>(stdout) {
-        return Some(value);
-    }
-
-    stdout
-        .lines()
-        .rev()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .find_map(|line| {
-            serde_json::from_str::<Value>(line)
-                .ok()
-                .filter(Value::is_object)
-        })
-        .or_else(|| {
-            stdout
-                .char_indices()
-                .filter_map(|(idx, ch)| (ch == '{').then_some(idx))
-                .filter_map(|idx| parse_json_object_at(stdout, idx))
-                .rfind(|value| value.get("verdict").is_some())
-        })
-}
-
-fn parse_json_object_at(stdout: &str, start: usize) -> Option<Value> {
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    for (offset, ch) in stdout[start..].char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-
-        match ch {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    let end = start + offset + ch.len_utf8();
-                    return serde_json::from_str::<Value>(&stdout[start..end]).ok();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    None
+    serde_json::from_str::<Value>(stdout)
+        .ok()
+        .filter(Value::is_object)
 }
 
 fn parse_json_scope_value(value: &Value) -> Option<VerifyLocalScope> {
-    let scope = value.get("scope")?;
-    if scope.is_null() {
-        return None;
-    }
+    let scope = value.get("scope")?.as_object()?;
     let source = scope
         .get("source")
         .and_then(Value::as_str)
-        .unwrap_or_default()
+        .filter(|source| !source.trim().is_empty())?
         .to_string();
     Some(VerifyLocalScope {
         source,
-        active_files: parse_path_array(scope.get("active_files")),
-        ignored_dirty_files: parse_path_array(scope.get("ignored_dirty_files")),
-        stale_reasons: parse_string_array(scope.get("stale_reasons")),
+        active_files: parse_path_array(scope.get("active_files")?)?,
+        ignored_dirty_files: parse_path_array(scope.get("ignored_dirty_files")?)?,
+        stale_reasons: parse_string_array(scope.get("stale_reasons")?)?,
     })
 }
 
-fn parse_path_array(value: Option<&Value>) -> Vec<PathBuf> {
-    parse_string_array(value)
+fn parse_path_array(value: &Value) -> Option<Vec<PathBuf>> {
+    parse_string_array(value)?
         .into_iter()
-        .map(PathBuf::from)
+        .map(|path| (!path.trim().is_empty()).then(|| PathBuf::from(path)))
         .collect()
 }
 
-fn parse_string_array(value: Option<&Value>) -> Vec<String> {
+fn parse_string_array(value: &Value) -> Option<Vec<String>> {
     value
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str().map(str::to_string))
         .collect()
 }
 
@@ -682,25 +646,23 @@ fn parse_text_verdict(stdout: &str, stderr: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn parse_formatted_exit_code(output: &str) -> Option<i32> {
-    ["Process exited with code ", "Exit code: "]
-        .into_iter()
-        .find_map(|prefix| {
-            output.lines().find_map(|line| {
-                line.trim()
-                    .strip_prefix(prefix)
-                    .and_then(|value| value.split_whitespace().next())
-                    .and_then(|value| value.parse().ok())
-            })
-        })
-}
-
 fn finalize_verify_local_output(
     output: FunctionToolOutput,
+    exec_output: Option<&ExecToolCallOutput>,
+    exit_code: Option<i32>,
     raw_json: bool,
 ) -> (FunctionToolOutput, VerifyLocalRun) {
     let original_post_tool_use_response = output.post_tool_use_response.clone();
-    let run = parse_verify_local_run(output.into_text(), String::new(), None);
+    let run = exec_output.map_or_else(
+        || parse_verify_local_run(String::new(), String::new(), None),
+        |exec_output| {
+            parse_verify_local_run(
+                exec_output.stdout.text.clone(),
+                exec_output.stderr.text.clone(),
+                exit_code,
+            )
+        },
+    );
     let mut transformed = FunctionToolOutput::from_text(
         render_verify_local_output(&run, raw_json),
         Some(run.tool_success),
