@@ -601,38 +601,6 @@ model_reasoning_effort = "low"
 }
 
 #[test]
-fn blocking_set_hide_full_access_warning_preserves_table() {
-    let tmp = tempdir().expect("tmpdir");
-    let codex_home = tmp.path();
-    std::fs::write(
-        codex_home.join(CONFIG_TOML_FILE),
-        r#"# Global comment
-
-[notice]
-# keep me
-existing = "value"
-"#,
-    )
-    .expect("seed");
-
-    apply_blocking(
-        codex_home,
-        &[ConfigEdit::SetNoticeHideFullAccessWarning(true)],
-    )
-    .expect("persist");
-
-    let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
-    let expected = r#"# Global comment
-
-[notice]
-# keep me
-existing = "value"
-hide_full_access_warning = true
-"#;
-    assert_eq!(contents, expected);
-}
-
-#[test]
 fn blocking_set_hide_rate_limit_model_nudge_preserves_table() {
     let tmp = tempdir().expect("tmpdir");
     let codex_home = tmp.path();
@@ -1333,7 +1301,7 @@ async fn blocking_set_asynchronous_helpers_available() {
     let codex_home = tmp.path().to_path_buf();
 
     ConfigEditsBuilder::new(&codex_home)
-        .set_hide_full_access_warning(/*acknowledged*/ true)
+        .set_hide_world_writable_warning(/*acknowledged*/ true)
         .apply()
         .await
         .expect("persist");
@@ -1343,7 +1311,7 @@ async fn blocking_set_asynchronous_helpers_available() {
         .expect("parse config")
         .get("notice")
         .and_then(|item| item.as_table())
-        .and_then(|tbl| tbl.get("hide_full_access_warning"))
+        .and_then(|tbl| tbl.get("hide_world_writable_warning"))
         .and_then(toml::Value::as_bool);
     assert_eq!(notice, Some(true));
 }

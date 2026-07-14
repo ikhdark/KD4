@@ -380,12 +380,12 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             f"{scripts_bin}{just_shell.os.pathsep}C:/Windows/System32",
         )
 
-    def test_local_just_shell_uses_physical_core_count_for_python(self) -> None:
+    def test_local_just_shell_limits_python_to_thirty_logical_cpus(self) -> None:
         just_shell = load_just_shell_module()
 
         self.assertEqual(
             just_shell.python_cpu_env({}),
-            {"PYTHON_CPU_COUNT": "16"},
+            {"PYTHON_CPU_COUNT": "30"},
         )
         self.assertEqual(
             just_shell.python_cpu_env({"PYTHON_CPU_COUNT": "8"}),

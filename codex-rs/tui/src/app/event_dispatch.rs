@@ -1833,9 +1833,6 @@ impl App {
             AppEvent::SkipNextWorldWritableScan => {
                 self.windows_sandbox.skip_world_writable_scan_once = true;
             }
-            AppEvent::UpdateFullAccessWarningAcknowledged(ack) => {
-                self.chat_widget.set_full_access_warning_acknowledged(ack);
-            }
             AppEvent::UpdateWorldWritableWarningAcknowledged(ack) => {
                 self.chat_widget
                     .set_world_writable_warning_acknowledged(ack);
@@ -1848,21 +1845,6 @@ impl App {
                 self.chat_widget.set_plan_mode_reasoning_effort(effort);
                 self.sync_active_thread_plan_mode_reasoning_setting(app_server)
                     .await;
-            }
-            AppEvent::PersistFullAccessWarningAcknowledged => {
-                if let Err(err) = ConfigEditsBuilder::for_config(&self.config)
-                    .set_hide_full_access_warning(/*acknowledged*/ true)
-                    .apply()
-                    .await
-                {
-                    tracing::error!(
-                        error = %err,
-                        "failed to persist full access warning acknowledgement"
-                    );
-                    self.chat_widget.add_error_message(format!(
-                        "Failed to save full access confirmation preference: {err}"
-                    ));
-                }
             }
             AppEvent::PersistWorldWritableWarningAcknowledged => {
                 if let Err(err) = ConfigEditsBuilder::for_config(&self.config)

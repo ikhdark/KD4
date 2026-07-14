@@ -38,8 +38,6 @@ pub enum ConfigEdit {
     SetServiceTier { service_tier: Option<String> },
     /// Update the active (or default) model personality.
     SetModelPersonality { personality: Option<Personality> },
-    /// Toggle the acknowledgement flag under `[notice]`.
-    SetNoticeHideFullAccessWarning(bool),
     /// Toggle the Windows world-writable directories warning acknowledgement flag.
     SetNoticeHideWorldWritableWarning(bool),
     /// Toggle the rate limit model nudge acknowledgement flag.
@@ -245,10 +243,6 @@ impl ConfigDocument {
             ConfigEdit::SetModelPersonality { personality } => Ok(self.write_optional_value(
                 &["personality"],
                 personality.map(|personality| value(personality.to_string())),
-            )),
-            ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged) => Ok(self.write_value(
-                &[NOTICE_TABLE_KEY, "hide_full_access_warning"],
-                value(*acknowledged),
             )),
             ConfigEdit::SetNoticeHideWorldWritableWarning(acknowledged) => Ok(self.write_value(
                 &[NOTICE_TABLE_KEY, "hide_world_writable_warning"],
@@ -792,12 +786,6 @@ impl ConfigEditsBuilder {
     pub fn set_personality(mut self, personality: Option<Personality>) -> Self {
         self.edits
             .push(ConfigEdit::SetModelPersonality { personality });
-        self
-    }
-
-    pub fn set_hide_full_access_warning(mut self, acknowledged: bool) -> Self {
-        self.edits
-            .push(ConfigEdit::SetNoticeHideFullAccessWarning(acknowledged));
         self
     }
 
