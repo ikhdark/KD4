@@ -5,6 +5,8 @@ use std::sync::OnceLock;
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
+use tokio::sync::SemaphorePermit;
 
 fn max_retained_artifacts_per_thread() -> usize {
     128
@@ -131,7 +133,6 @@ impl RawOutputArtifactWriter {
                 format!("failed to flush `{}`: {err}", path.display()),
             )
             .await;
-            return;
         }
     }
 }
@@ -399,7 +400,7 @@ async fn failed_with_owned_path(
 }
 
 async fn enforce_retention(directory: &Path, keep_path: &Path) {
-    let _retention_guard = retention_sweep_lock().lock().await;
+    let _retention_permit = retention_sweep_permit().await;
     enforce_retention_locked(directory, keep_path).await;
 }
 
@@ -442,7 +443,7 @@ async fn enforce_retention_locked(directory: &Path, keep_path: &Path) {
 
 #[cfg(test)]
 async fn enforce_global_retention(tool_output_root: &Path, keep_path: &Path) {
-    let _retention_guard = retention_sweep_lock().lock().await;
+    let _retention_permit = retention_sweep_permit().await;
     enforce_global_retention_locked(tool_output_root, keep_path).await;
 }
 
@@ -492,9 +493,16 @@ async fn enforce_global_retention_locked(tool_output_root: &Path, keep_path: &Pa
     }
 }
 
-fn retention_sweep_lock() -> &'static Mutex<()> {
-    static RETENTION_SWEEP_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    RETENTION_SWEEP_LOCK.get_or_init(|| Mutex::new(()))
+async fn retention_sweep_permit() -> SemaphorePermit<'static> {
+    match retention_sweep_semaphore().acquire().await {
+        Ok(permit) => permit,
+        Err(_) => unreachable!("the process-wide retention sweep semaphore is never closed"),
+    }
+}
+
+fn retention_sweep_semaphore() -> &'static Semaphore {
+    static RETENTION_SWEEP_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+    RETENTION_SWEEP_SEMAPHORE.get_or_init(|| Semaphore::new(1))
 }
 
 #[cfg(test)]

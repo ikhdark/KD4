@@ -156,7 +156,7 @@ pub(crate) async fn inventory_contains_expected(
 
 fn semantic_install_effect_id(missing: &HashMap<String, McpServerConfig>) -> String {
     let mut entries = missing.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_by_key(|(left, _)| *left);
     let mut hasher = Sha256::new();
     for (name, config) in entries {
         hasher.update(name.as_bytes());
@@ -184,7 +184,7 @@ async fn install_planned_mcp_dependencies(
     })?;
     let mut added = Vec::new();
     let mut entries = missing.iter().collect::<Vec<_>>();
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    entries.sort_by_key(|(left, _)| *left);
     for (name, server_config) in entries {
         if servers.contains_key(name) {
             continue;

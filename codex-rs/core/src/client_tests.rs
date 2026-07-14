@@ -232,7 +232,7 @@ fn request_schema_serialization_cache_is_keyed_by_model_visible_schema() {
     client
         .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
         .expect("cached serialization should succeed");
-    let mut changed = prompt.clone();
+    let mut changed = prompt;
     changed.output_schema = Some(json!({"type": "array"}));
     client
         .request_schema_components(&changed, None, /*use_responses_lite*/ false)

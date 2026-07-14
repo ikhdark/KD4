@@ -696,7 +696,7 @@ fn normalize_tracked_path(path: &Path) -> PathBuf {
     };
     #[cfg(windows)]
     {
-        return PathBuf::from(normalized.to_string_lossy().to_lowercase());
+        PathBuf::from(normalized.to_string_lossy().to_lowercase())
     }
     #[cfg(not(windows))]
     normalized

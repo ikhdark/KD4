@@ -98,7 +98,6 @@ use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
-use codex_protocol::items::HookPromptFragment;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::build_hook_prompt_message;
@@ -408,55 +407,41 @@ pub(crate) async fn run_turn(
 
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
-                    let automatic_plan_summary = if let Some(changed_paths) = sess
+                    if let Some(changed_paths) = sess
                         .services
                         .task_evidence
                         .take_automatic_verify_plan_request()
                         .await
                     {
-                        Some(
-                            crate::tools::handlers::run_automatic_verify_local_plan(
-                                Arc::clone(&sess),
-                                Arc::clone(&step_context),
-                                Arc::clone(&turn_diff_tracker),
-                                changed_paths,
-                                cancellation_token.child_token(),
-                            )
-                            .await
-                            .unwrap_or_else(|err| {
-                                format!("automatic verify_local plan failed: {err:?}")
-                            }),
+                        if let Err(err) = crate::tools::handlers::run_automatic_verify_local_plan(
+                            Arc::clone(&sess),
+                            Arc::clone(&step_context),
+                            Arc::clone(&turn_diff_tracker),
+                            changed_paths,
+                            cancellation_token.child_token(),
                         )
-                    } else {
-                        None
-                    };
-                    if let Some(repair_prompt) = sess
-                        .services
-                        .task_evidence
-                        .take_finalization_repair_prompt()
                         .await
-                    {
-                        let repair_prompt = automatic_plan_summary
-                            .as_deref()
-                            .filter(|summary| !summary.trim().is_empty())
-                            .map(|summary| {
-                                format!(
-                                    "Automatic verify_local plan result:\n{summary}\n\n{repair_prompt}"
-                                )
-                            })
-                            .unwrap_or(repair_prompt);
-                        let fragment = HookPromptFragment::from_single_hook(
-                            repair_prompt,
-                            format!("kd4-task-evidence-{}", turn_context.sub_id),
-                        );
-                        if let Some(repair_message) = build_hook_prompt_message(&[fragment]) {
-                            sess.record_response_item_and_emit_turn_item(
+                        {
+                            sess.send_event(
                                 &turn_context,
-                                repair_message,
+                                EventMsg::Warning(WarningEvent {
+                                    message: format!("automatic verify_local plan failed: {err:?}"),
+                                }),
                             )
                             .await;
-                            continue;
                         }
+                    }
+                    if let Some(warning) = sess
+                        .services
+                        .task_evidence
+                        .take_finalization_warning()
+                        .await
+                    {
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Warning(WarningEvent { message: warning }),
+                        )
+                        .await;
                     }
                     let stop_outcome = run_turn_stop_hooks(
                         &sess,
@@ -611,7 +596,7 @@ struct PendingTurnPlan {
 
 enum PendingTurnPlanBuild {
     Stale,
-    Ready(PendingTurnPlan),
+    Ready(Box<PendingTurnPlan>),
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -651,18 +636,18 @@ async fn build_pure_pending_turn_plan(
         let first_router = first_router?;
         let identity = PlanningSnapshotIdentity {
             generation,
-            state_digest: planning_state_digest(
-                step_context.as_ref(),
-                &[],
-                &[],
-                &[],
-                &[],
-                &user_input,
-                first_router.as_ref(),
-                &history_items,
-            ),
+            state_digest: planning_state_digest(PlanningStateDigestInput {
+                step_context: step_context.as_ref(),
+                mcp_tools: &[],
+                connectors: &[],
+                plugins: &[],
+                injection_items: &[],
+                user_input: &user_input,
+                router: first_router.as_ref(),
+                history_items: &history_items,
+            }),
         };
-        return Ok(PendingTurnPlanBuild::Ready(PendingTurnPlan {
+        return Ok(PendingTurnPlanBuild::Ready(Box::new(PendingTurnPlan {
             identity,
             step_context,
             first_router,
@@ -675,7 +660,7 @@ async fn build_pure_pending_turn_plan(
             tracking,
             mentioned_apps: Vec::new(),
             mentioned_plugins: Vec::new(),
-        }));
+        })));
     }
 
     // Read-only DAG roots P and E are independent. Extension contributors poll
@@ -802,18 +787,18 @@ async fn build_pure_pending_turn_plan(
     warnings.extend(skill_plan.injections.warnings.iter().cloned());
     let identity = PlanningSnapshotIdentity {
         generation,
-        state_digest: planning_state_digest(
-            step_context.as_ref(),
-            &mcp_tools,
-            &available_connectors,
-            &mentioned_plugins,
-            &injection_items,
-            &user_input,
-            first_router.as_ref(),
-            &history_items,
-        ),
+        state_digest: planning_state_digest(PlanningStateDigestInput {
+            step_context: step_context.as_ref(),
+            mcp_tools: &mcp_tools,
+            connectors: &available_connectors,
+            plugins: &mentioned_plugins,
+            injection_items: &injection_items,
+            user_input: &user_input,
+            router: first_router.as_ref(),
+            history_items: &history_items,
+        }),
     };
-    Ok(PendingTurnPlanBuild::Ready(PendingTurnPlan {
+    Ok(PendingTurnPlanBuild::Ready(Box::new(PendingTurnPlan {
         identity,
         step_context,
         first_router,
@@ -826,7 +811,7 @@ async fn build_pure_pending_turn_plan(
         tracking,
         mentioned_apps,
         mentioned_plugins,
-    }))
+    })))
 }
 
 async fn stabilize_pending_turn_plan(
@@ -866,7 +851,7 @@ async fn stabilize_pending_turn_plan(
             .await?
         {
             PendingTurnPlanBuild::Stale => continue,
-            PendingTurnPlanBuild::Ready(plan) => plan,
+            PendingTurnPlanBuild::Ready(plan) => *plan,
         };
         fixed_point
             .begin_iteration(&plan.identity)
@@ -1091,16 +1076,28 @@ fn semantic_effect_id(kind: &str, values: &[String]) -> String {
     format!("{kind}:{:x}", hasher.finalize())
 }
 
-fn planning_state_digest(
-    step_context: &StepContext,
-    mcp_tools: &[codex_mcp::ToolInfo],
-    connectors: &[connectors::AppInfo],
-    plugins: &[PluginCapabilitySummary],
-    injection_items: &[ResponseItem],
-    user_input: &[UserInput],
-    router: &ToolRouter,
-    history_items: &[ResponseItem],
-) -> String {
+struct PlanningStateDigestInput<'a> {
+    step_context: &'a StepContext,
+    mcp_tools: &'a [codex_mcp::ToolInfo],
+    connectors: &'a [connectors::AppInfo],
+    plugins: &'a [PluginCapabilitySummary],
+    injection_items: &'a [ResponseItem],
+    user_input: &'a [UserInput],
+    router: &'a ToolRouter,
+    history_items: &'a [ResponseItem],
+}
+
+fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
+    let PlanningStateDigestInput {
+        step_context,
+        mcp_tools,
+        connectors,
+        plugins,
+        injection_items,
+        user_input,
+        router,
+        history_items,
+    } = input;
     let mut hasher = Sha256::new();
     for environment in &step_context.environments.turn_environments {
         hasher.update(environment.environment_id.as_bytes());

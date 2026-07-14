@@ -393,14 +393,14 @@ async fn collect_compaction_output(
     let mut completed_token_usage = None;
     loop {
         let model_stream_wait_timing_guard =
-            timing_state.map(|timing_state| timing_state.begin_model_stream_wait());
+            timing_state.map(super::turn_timing::TurnTimingState::begin_model_stream_wait);
         let next_event = stream.next().await;
         drop(model_stream_wait_timing_guard);
         let Some(event) = next_event else {
             break;
         };
         let _model_stream_processing_timing_guard =
-            timing_state.map(|timing_state| timing_state.begin_model_stream_processing());
+            timing_state.map(super::turn_timing::TurnTimingState::begin_model_stream_processing);
         match event? {
             ResponseEvent::OutputItemDone(item) => {
                 output_item_count += 1;

@@ -247,8 +247,7 @@ impl ExecCommandHandler {
         )
         .map_err(|issue| {
             FunctionCallError::RespondToModel(format!(
-                "{}\nRegenerate the command and call `exec_command` again.",
-                issue
+                "{issue}\nRegenerate the command and call `exec_command` again."
             ))
         })?;
         let repaired = preflight.repaired();

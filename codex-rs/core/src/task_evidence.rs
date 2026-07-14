@@ -21,8 +21,11 @@ use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use tracing::warn;
 
 const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 2;
@@ -40,7 +43,8 @@ pub(crate) struct TaskEvidenceLedger {
     repo_root: Option<PathBuf>,
     trusted_wiring_guard_root: Option<PathBuf>,
     document: Mutex<Option<TaskEvidenceDocument>>,
-    persistence: Mutex<Option<u64>>,
+    persistence_gate: Semaphore,
+    last_persisted_revision: AtomicU64,
     wiring_ledger_starts: Mutex<BTreeMap<String, WiringLedgerFingerprint>>,
 }
 
@@ -267,7 +271,7 @@ impl TaskEvidenceLedger {
             load_existing_document(&evidence_path, &thread_id_text, &repository_root).await;
         let mut storage_failure_reason = None;
         let existing = match existing {
-            ExistingDocument::Loaded(document) => Some(document),
+            ExistingDocument::Loaded(document) => Some(*document),
             ExistingDocument::Missing => None,
             ExistingDocument::Rejected { kind, reason } => {
                 let quarantine = quarantine_evidence_file(&evidence_path, kind).await;
@@ -347,7 +351,8 @@ impl TaskEvidenceLedger {
             repo_root: Some(repo_root),
             trusted_wiring_guard_root,
             document: Mutex::new(Some(document.clone())),
-            persistence: Mutex::new(None),
+            persistence_gate: Semaphore::new(1),
+            last_persisted_revision: AtomicU64::new(0),
             wiring_ledger_starts: Mutex::new(BTreeMap::new()),
         };
         if storage_failure_reason.is_none() {
@@ -362,7 +367,8 @@ impl TaskEvidenceLedger {
             repo_root: None,
             trusted_wiring_guard_root: None,
             document: Mutex::new(None),
-            persistence: Mutex::new(None),
+            persistence_gate: Semaphore::new(1),
+            last_persisted_revision: AtomicU64::new(0),
             wiring_ledger_starts: Mutex::new(BTreeMap::new()),
         }
     }
@@ -927,39 +933,38 @@ impl TaskEvidenceLedger {
         accepted_proof
     }
 
-    pub(crate) async fn take_finalization_repair_prompt(&self) -> Option<String> {
+    pub(crate) async fn take_finalization_warning(&self) -> Option<String> {
         let gate = self.completion_gate().await?;
         if gate.status == TaskCompletionStatus::Passed {
             return None;
         }
-        let (changed_paths, snapshot) = self
+        let (should_warn, snapshot) = self
             .update_document(|document| {
                 if document.repair_turns_used >= 1 {
                     return None;
                 }
                 document.repair_turns_used += 1;
                 document.updated_at = timestamp();
-                Some(
-                    document
-                        .latest_file_hashes
-                        .keys()
-                        .take(20)
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                )
+                Some(())
             })
             .await?;
-        let changed_paths = changed_paths?;
+        should_warn?;
         self.persist_document(&snapshot).await;
 
-        let reasons = gate.reasons.iter().take(4).cloned().collect::<Vec<_>>();
-        let reasons = format!(
-            "{} Changed paths: [{}]",
-            reasons.join("; "),
-            changed_paths.join(", ")
-        );
+        let reasons = gate.reasons.iter().take(2).cloned().collect::<Vec<_>>();
+        let reason_summary = if reasons.is_empty() {
+            "evidence is incomplete".to_string()
+        } else {
+            reasons.join("; ")
+        };
+        let remaining = gate.reasons.len().saturating_sub(reasons.len());
+        let remaining = if remaining == 0 {
+            String::new()
+        } else {
+            format!("; and {remaining} more")
+        };
         Some(format!(
-            "KD4 task-evidence finalization is {status}. This is the single bounded evidence-repair continuation. If an automatic read-only verify_local plan result is included above, inspect it; otherwise call plan mode with the changed paths. Address the plan, then call verify_local in `fast` or `final` mode for a proof-bearing JSON receipt. If code changed, also run the declared Wiring Guard check; if Desktop activation is required, obtain its runtime receipt. Do not claim completion unless the resulting machine gate is passed. Current reasons: {reasons}.",
+            "KD4 task evidence is {status}: {reason_summary}{remaining}. No automatic repair turn was started.",
             status = completion_status_name(gate.status),
         ))
     }
@@ -1220,12 +1225,19 @@ impl TaskEvidenceLedger {
                 return PersistOutcome::Failed;
             }
         };
-        let mut last_persisted_revision = self.persistence.lock().await;
-        if let Some(revision) = *last_persisted_revision {
-            if revision > document.revision {
+        let _persistence_permit = match self.persistence_gate.acquire().await {
+            Ok(permit) => permit,
+            Err(err) => {
+                warn!("KD4 task-evidence persistence gate unexpectedly closed: {err}");
+                return PersistOutcome::Failed;
+            }
+        };
+        let last_persisted_revision = self.last_persisted_revision.load(Ordering::Acquire);
+        if last_persisted_revision != 0 {
+            if last_persisted_revision > document.revision {
                 return PersistOutcome::Superseded;
             }
-            if revision == document.revision {
+            if last_persisted_revision == document.revision {
                 return PersistOutcome::Persisted;
             }
         }
@@ -1233,7 +1245,8 @@ impl TaskEvidenceLedger {
         match tokio::task::spawn_blocking(move || atomic_write_evidence(&write_path, &bytes)).await
         {
             Ok(Ok(())) => {
-                *last_persisted_revision = Some(document.revision);
+                self.last_persisted_revision
+                    .store(document.revision, Ordering::Release);
                 PersistOutcome::Persisted
             }
             Ok(Err(err)) => {
@@ -1250,7 +1263,7 @@ impl TaskEvidenceLedger {
 
 enum ExistingDocument {
     Missing,
-    Loaded(TaskEvidenceDocument),
+    Loaded(Box<TaskEvidenceDocument>),
     Rejected { kind: &'static str, reason: String },
 }
 
@@ -1318,7 +1331,7 @@ async fn load_existing_document(
             reason: "repository root does not match the requested checkout".to_string(),
         };
     }
-    ExistingDocument::Loaded(document)
+    ExistingDocument::Loaded(Box::new(document))
 }
 
 async fn quarantine_evidence_file(path: &Path, kind: &str) -> io::Result<PathBuf> {
@@ -1936,7 +1949,7 @@ fn command_display(command: &[String]) -> String {
         .iter()
         .map(|argument| {
             if argument.is_empty() || argument.chars().any(char::is_whitespace) {
-                format!("{:?}", argument)
+                format!("{argument:?}")
             } else {
                 argument.clone()
             }
@@ -2211,15 +2224,13 @@ fn trusted_wiring_guard_check_invocation(
         })
         .filter(|word| !word.is_empty())
         .collect::<Vec<_>>();
-    let Some(executable_index) = words.iter().position(|word| {
+    let executable_index = words.iter().position(|word| {
         let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
         matches!(
             name.to_ascii_lowercase().as_str(),
             "wiring_guard.py" | "wiring_guard.cmd" | "wiring_guard.sh"
         )
-    }) else {
-        return None;
-    };
+    })?;
     if words.iter().enumerate().any(|(index, word)| {
         if word == "&" {
             return index + 1 != executable_index;
@@ -2236,12 +2247,9 @@ fn trusted_wiring_guard_check_invocation(
     let launcher =
         validate_trusted_wiring_guard_launcher(Path::new(&words[executable_index]), trusted_root)?;
     let arguments = &words[executable_index + 1..];
-    let Some(check_index) = arguments
+    let check_index = arguments
         .iter()
-        .position(|word| word.eq_ignore_ascii_case("check"))
-    else {
-        return None;
-    };
+        .position(|word| word.eq_ignore_ascii_case("check"))?;
     arguments[check_index + 1..]
         .iter()
         .any(|word| word.eq_ignore_ascii_case("--ledger"))
@@ -2527,7 +2535,7 @@ fn valid_wiring_findings(value: &Value) -> bool {
             findings
                 .get(*name)
                 .and_then(json_object_array)
-                .is_some_and(|entries| entries.is_empty())
+                .is_some_and(std::vec::Vec::is_empty)
         })
         && findings
             .get("replaces")
@@ -2946,7 +2954,7 @@ mod tests {
             "proof_graph": {
                 "schema_id": "wiring-guard/proof-graph",
                 "schema_version": WIRING_GUARD_PROOF_GRAPH_SCHEMA_VERSION,
-                "graph_id": graph_id.clone(),
+                "graph_id": graph_id,
                 "verdict": "WIRED",
                 "nodes": [{}],
                 "edges": [],
@@ -3163,13 +3171,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalization_repair_is_bounded_to_one_continuation() {
+    async fn finalization_warning_is_bounded_and_does_not_request_a_turn() {
         let (_temp, ledger) = ledger_fixture().await;
         ledger
             .record_plan_update(&plan(StepStatus::Completed))
             .await;
-        assert!(ledger.take_finalization_repair_prompt().await.is_some());
-        assert!(ledger.take_finalization_repair_prompt().await.is_none());
+        let warning = ledger.take_finalization_warning().await.expect("warning");
+        assert!(warning.contains("No automatic repair turn was started"));
+        assert!(ledger.take_finalization_warning().await.is_none());
     }
 
     #[tokio::test]

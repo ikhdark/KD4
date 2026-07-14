@@ -652,7 +652,7 @@ fn finalize_verify_local_output(
     exit_code: Option<i32>,
     raw_json: bool,
 ) -> (FunctionToolOutput, VerifyLocalRun) {
-    let original_post_tool_use_response = output.post_tool_use_response.clone();
+    let original_post_tool_use_response = output.post_tool_use_response;
     let run = exec_output.map_or_else(
         || parse_verify_local_run(String::new(), String::new(), None),
         |exec_output| {
@@ -695,15 +695,58 @@ fn render_verify_local_output(run: &VerifyLocalRun, raw_json: bool) -> String {
         text.push_str("\nGuidance: ");
         text.push_str(guidance);
     }
+    if let Some(value) = &run.json {
+        append_structured_summary(&mut text, value);
+    }
     if !run.stderr.trim().is_empty() {
         text.push_str("\n\nStderr:\n");
         text.push_str(run.stderr.trim());
     }
-    if run.verdict_text.as_deref() != Some("VERIFIED") && !run.stdout.trim().is_empty() {
+    if run.json.is_none()
+        && run.verdict_text.as_deref() != Some("VERIFIED")
+        && !run.stdout.trim().is_empty()
+    {
         text.push_str("\n\nStdout:\n");
         text.push_str(run.stdout.trim());
     }
     text
+}
+
+fn append_structured_summary(text: &mut String, value: &Value) {
+    if let Some(mode) = value.get("mode").and_then(Value::as_str) {
+        text.push_str("\nMode: ");
+        text.push_str(mode);
+    }
+    append_entry_summary(text, value, "planned", "Planned checks");
+    append_entry_summary(text, value, "results", "Results");
+    if let Some(error) = value.get("error").and_then(Value::as_str) {
+        text.push_str("\nError: ");
+        text.push_str(error);
+    }
+    if let Some(rerun) = value.get("rerun").and_then(Value::as_str) {
+        text.push_str("\nRerun: ");
+        text.push_str(rerun);
+    }
+}
+
+fn append_entry_summary(text: &mut String, value: &Value, field: &str, label: &str) {
+    let Some(entries) = value.get(field).and_then(Value::as_array) else {
+        return;
+    };
+    text.push_str(&format!("\n{label}: {}", entries.len()));
+    let ids = entries
+        .iter()
+        .filter_map(|entry| entry.get("id").and_then(Value::as_str))
+        .take(4)
+        .collect::<Vec<_>>();
+    if !ids.is_empty() {
+        text.push_str(" (");
+        text.push_str(&ids.join(", "));
+        if entries.len() > ids.len() {
+            text.push_str(&format!(", +{} more", entries.len() - ids.len()));
+        }
+        text.push(')');
+    }
 }
 
 fn render_raw_output(run: &VerifyLocalRun) -> String {

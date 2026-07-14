@@ -121,6 +121,7 @@ mod tests {
             .expect("read final metadata")
             .permissions();
         #[cfg(windows)]
+        #[allow(clippy::permissions_set_readonly_false)]
         permissions.set_readonly(false);
         #[cfg(unix)]
         permissions.set_mode(0o600);

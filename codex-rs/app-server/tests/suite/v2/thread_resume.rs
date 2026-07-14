@@ -2271,6 +2271,7 @@ async fn thread_resume_token_usage_replay_can_belong_to_interrupted_turn() -> Re
                 reason: TurnAbortReason::Interrupted,
                 completed_at: None,
                 duration_ms: None,
+                timing: None,
             }))?,
         })
         .to_string(),

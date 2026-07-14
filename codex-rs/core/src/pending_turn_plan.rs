@@ -46,8 +46,7 @@ impl FixedPointPlanningState {
         self.iterations = self.iterations.saturating_add(1);
         if self.iterations > MAX_FIXED_POINT_ITERATIONS {
             return Err(format!(
-                "pending-turn planning did not reach a fixed point after {} iterations",
-                MAX_FIXED_POINT_ITERATIONS
+                "pending-turn planning did not reach a fixed point after {MAX_FIXED_POINT_ITERATIONS} iterations"
             ));
         }
         let visits = self

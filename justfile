@@ -113,7 +113,6 @@ vscode-runtime-proof *args:
 
 [no-cd]
 dead-code *args:
-    @pnpm --dir "{{ justfile_directory() }}" run dead-code
     @just --justfile "{{ justfile_directory() }}/justfile" cargo-shear {args}
 
 [unix]

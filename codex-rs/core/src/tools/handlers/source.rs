@@ -148,7 +148,7 @@ async fn handle_search_source(
             "search_source received unsupported payload".to_string(),
         ));
     };
-    let args: SearchSourceArgs = serde_json::from_str(&arguments).map_err(|err| {
+    let args: SearchSourceArgs = serde_json::from_str(arguments).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to parse search_source arguments: {err}"))
     })?;
     let source_context = local_source_context(&invocation, args.environment_id.as_deref()).await?;
@@ -195,7 +195,7 @@ async fn handle_read_file_span(
             "read_file_span received unsupported payload".to_string(),
         ));
     };
-    let args: ReadFileSpanArgs = serde_json::from_str(&arguments).map_err(|err| {
+    let args: ReadFileSpanArgs = serde_json::from_str(arguments).map_err(|err| {
         FunctionCallError::RespondToModel(format!(
             "failed to parse read_file_span arguments: {err}"
         ))
@@ -696,10 +696,8 @@ fn bound_model_output(rendered: String) -> String {
     if rendered.len() <= SOURCE_TOOL_MAX_RENDERED_BYTES {
         return rendered;
     }
-    let marker = format!(
-        "\n[source tool output truncated at {} bytes]",
-        SOURCE_TOOL_MAX_RENDERED_BYTES
-    );
+    let marker =
+        format!("\n[source tool output truncated at {SOURCE_TOOL_MAX_RENDERED_BYTES} bytes]");
     let max_content_bytes = SOURCE_TOOL_MAX_RENDERED_BYTES.saturating_sub(marker.len());
     let mut end = max_content_bytes.min(rendered.len());
     while end > 0 && !rendered.is_char_boundary(end) {

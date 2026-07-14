@@ -148,7 +148,7 @@ async fn retention_sweeps_are_serialized() {
     tokio::fs::write(&keep_path, b"keep")
         .await
         .expect("keep artifact");
-    let retention_guard = retention_sweep_lock().lock().await;
+    let retention_permit = retention_sweep_permit().await;
     let mut sweep = tokio::spawn({
         let directory = directory.clone();
         let keep_path = keep_path.clone();
@@ -161,7 +161,7 @@ async fn retention_sweeps_are_serialized() {
             .is_err(),
         "a concurrent sweep must wait for the process-wide retention lock"
     );
-    drop(retention_guard);
+    drop(retention_permit);
     tokio::time::timeout(std::time::Duration::from_secs(1), &mut sweep)
         .await
         .expect("retention sweep should resume after lock release")

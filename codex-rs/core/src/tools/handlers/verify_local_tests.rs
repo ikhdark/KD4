@@ -22,8 +22,10 @@ fn verifier_payload(verdict: &str) -> serde_json::Value {
 }
 
 fn structured_process_output(stdout: String, stderr: &str, exit_code: i32) -> ExecToolCallOutput {
-    let mut output = ExecToolCallOutput::default();
-    output.exit_code = exit_code;
+    let mut output = ExecToolCallOutput {
+        exit_code,
+        ..Default::default()
+    };
     output.stdout.text = stdout.clone();
     output.stderr.text = stderr.to_string();
     output.aggregated_output.text = format!("{stdout}{stderr}");
@@ -258,14 +260,34 @@ fn raw_json_finalizer_removes_the_generic_shell_envelope() {
 #[test]
 fn planned_json_is_successful_but_not_proof_bearing() {
     let run = parse_verify_local_run(
-        verifier_payload("PLANNED").to_string(),
+        json!({
+            "schema_version": VERIFY_LOCAL_JSON_SCHEMA_VERSION,
+            "producer": VERIFY_LOCAL_JSON_PRODUCER,
+            "mode": "plan",
+            "verdict": "PLANNED",
+            "planned": [
+                {"id": "fmt"},
+                {"id": "core-tests"},
+                {"id": "schema-check"},
+                {"id": "clippy"},
+                {"id": "wiring"}
+            ]
+        })
+        .to_string(),
         String::new(),
         Some(0),
     );
 
     assert_eq!(run.verdict_text.as_deref(), Some("PLANNED"));
     assert!(run.tool_success);
-    assert!(render_verify_local_output(&run, false).contains("proof-bearing validation"));
+    let rendered = render_verify_local_output(&run, false);
+    assert!(rendered.contains("proof-bearing validation"));
+    assert!(rendered.contains("Mode: plan"));
+    assert!(
+        rendered.contains("Planned checks: 5 (fmt, core-tests, schema-check, clippy, +1 more)")
+    );
+    assert!(!rendered.contains("\"producer\""));
+    assert!(!rendered.contains("\n\nStdout:"));
 }
 
 #[test]
@@ -407,7 +429,7 @@ fn only_versioned_successful_json_is_proof_bearing() {
             "schema_version": VERIFY_LOCAL_JSON_SCHEMA_VERSION,
             "producer": VERIFY_LOCAL_JSON_PRODUCER,
             "verdict": "VERIFIED",
-            "scope": scope.clone(),
+            "scope": scope,
         })
         .to_string(),
         String::new(),
@@ -419,13 +441,13 @@ fn only_versioned_successful_json_is_proof_bearing() {
         json!({
             "producer": VERIFY_LOCAL_JSON_PRODUCER,
             "verdict": "VERIFIED",
-            "scope": scope.clone(),
+            "scope": scope,
         }),
         json!({
             "schema_version": VERIFY_LOCAL_JSON_SCHEMA_VERSION,
             "producer": "some.other.producer",
             "verdict": "VERIFIED",
-            "scope": scope.clone(),
+            "scope": scope,
         }),
     ] {
         let run = parse_verify_local_run(invalid.to_string(), String::new(), Some(0));

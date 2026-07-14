@@ -232,8 +232,7 @@ impl ShellCommandHandler {
         )
         .map_err(|issue| {
             FunctionCallError::RespondToModel(format!(
-                "{}\nRegenerate the command and call `shell_command` again.",
-                issue
+                "{issue}\nRegenerate the command and call `shell_command` again."
             ))
         })?;
         let command_invocation = preflight.invocation;

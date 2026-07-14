@@ -154,6 +154,56 @@ struct TurnDeliveryOutcome {
 }
 
 impl ThreadScopedOutgoingMessageSender {
+    /// Dispatches a terminal turn notification to one frozen target set and
+    /// collects transport writer receipts without delaying core completion.
+    pub(crate) async fn send_server_notification_with_receipts(
+        &self,
+        notification: ServerNotification,
+        origin_connection_id: Option<ConnectionId>,
+    ) {
+        self.outgoing
+            .analytics_events_client
+            .track_notification(notification.clone());
+
+        let ServerNotification::TurnCompleted(completed) = &notification else {
+            if !self.connection_ids.is_empty() {
+                self.outgoing
+                    .send_server_notification_to_connections(
+                        self.connection_ids.as_slice(),
+                        notification,
+                    )
+                    .await;
+            }
+            return;
+        };
+        let turn_id = completed.turn.id.clone();
+        let core_completed_at_ms = completed
+            .timing
+            .as_ref()
+            .and_then(|timing| timing.completed_at_unix_ms)
+            .or_else(|| {
+                completed
+                    .turn
+                    .completed_at
+                    .and_then(|seconds| seconds.checked_mul(1_000))
+            })
+            .and_then(|milliseconds| u64::try_from(milliseconds).ok());
+
+        let mut target_connection_ids = self.connection_ids.as_ref().clone();
+        target_connection_ids.sort_unstable_by_key(|connection_id| connection_id.0);
+        target_connection_ids.dedup();
+        self.outgoing
+            .dispatch_turn_completed_with_receipts(
+                self.thread_id,
+                turn_id,
+                target_connection_ids,
+                origin_connection_id,
+                core_completed_at_ms,
+                notification,
+            )
+            .await;
+    }
+
     pub(crate) fn new(
         outgoing: Arc<OutgoingMessageSender>,
         connection_ids: Vec<ConnectionId>,
@@ -202,56 +252,6 @@ impl ThreadScopedOutgoingMessageSender {
         }
         self.outgoing
             .send_server_notification_to_connections(self.connection_ids.as_slice(), notification)
-            .await;
-    }
-
-    /// Dispatches a terminal turn notification to one frozen target set and
-    /// collects transport writer receipts without delaying core completion.
-    pub(crate) async fn send_server_notification_with_receipts(
-        &self,
-        notification: ServerNotification,
-        origin_connection_id: Option<ConnectionId>,
-    ) {
-        self.outgoing
-            .analytics_events_client
-            .track_notification(notification.clone());
-
-        let ServerNotification::TurnCompleted(completed) = &notification else {
-            if !self.connection_ids.is_empty() {
-                self.outgoing
-                    .send_server_notification_to_connections(
-                        self.connection_ids.as_slice(),
-                        notification,
-                    )
-                    .await;
-            }
-            return;
-        };
-        let turn_id = completed.turn.id.clone();
-        let core_completed_at_ms = completed
-            .timing
-            .as_ref()
-            .and_then(|timing| timing.completed_at_unix_ms)
-            .or_else(|| {
-                completed
-                    .turn
-                    .completed_at
-                    .and_then(|seconds| seconds.checked_mul(1_000))
-            })
-            .and_then(|milliseconds| u64::try_from(milliseconds).ok());
-
-        let mut target_connection_ids = self.connection_ids.as_ref().clone();
-        target_connection_ids.sort_unstable_by_key(|connection_id| connection_id.0);
-        target_connection_ids.dedup();
-        self.outgoing
-            .dispatch_turn_completed_with_receipts(
-                self.thread_id,
-                turn_id,
-                target_connection_ids,
-                origin_connection_id,
-                core_completed_at_ms,
-                notification,
-            )
             .await;
     }
 

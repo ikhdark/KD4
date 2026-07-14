@@ -623,10 +623,9 @@ impl Session {
                 let Some(permit) = coordinator.try_claim() else {
                     return TerminalSchedule::AlreadyRunning(coordinator);
                 };
-                let task = active_turn
-                    .task
-                    .take()
-                    .expect("running task checked before claiming terminal ownership");
+                let Some(task) = active_turn.task.take() else {
+                    return TerminalSchedule::AlreadyRunning(coordinator);
+                };
                 (
                     task,
                     Arc::clone(&active_turn.turn_state),

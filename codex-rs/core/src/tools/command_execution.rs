@@ -466,7 +466,7 @@ mod tests {
 
         assert_ne!(
             base.fingerprint(),
-            base.clone().with_repository_epoch(2).fingerprint()
+            base.with_repository_epoch(2).fingerprint()
         );
     }
 

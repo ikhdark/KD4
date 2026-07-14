@@ -37,7 +37,7 @@ pub(crate) struct SessionStartupTransportHandle {
 }
 
 enum SessionStartupTransportResolution {
-    Ready(ModelClientSession),
+    Ready(Box<ModelClientSession>),
     Unavailable,
 }
 
@@ -205,7 +205,9 @@ impl SessionStartupTransportHandle {
 
     async fn resolve(self) -> SessionStartupTransportResolution {
         match self.task.await {
-            Ok(Ok(client_session)) => SessionStartupTransportResolution::Ready(client_session),
+            Ok(Ok(client_session)) => {
+                SessionStartupTransportResolution::Ready(Box::new(client_session))
+            }
             Ok(Err(err)) => {
                 warn!(
                     "startup websocket preconnect failed; continuing with send-boundary fallback: {err:#}"
@@ -286,7 +288,7 @@ impl Session {
             let preconnected_session = match startup_transport {
                 Some(startup_transport) => match startup_transport.resolve().await {
                     SessionStartupTransportResolution::Ready(client_session) => {
-                        Some(client_session)
+                        Some(*client_session)
                     }
                     SessionStartupTransportResolution::Unavailable => {
                         return Err(CodexErr::Stream(
