@@ -42,14 +42,13 @@ use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::unified_exec::MIN_YIELD_TIME_MS;
 use crate::unified_exec::ProcessEntry;
 use crate::unified_exec::ProcessStore;
+use crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::WriteStdinRequest;
 use crate::unified_exec::async_watcher::emit_exec_end_for_unified_exec;
 use crate::unified_exec::async_watcher::emit_failed_exec_end_for_unified_exec;
-use crate::unified_exec::async_watcher::lagged_output_marker;
-use crate::unified_exec::async_watcher::omitted_output_marker;
 use crate::unified_exec::async_watcher::spawn_exit_watcher;
 use crate::unified_exec::async_watcher::start_streaming_output;
 use crate::unified_exec::clamp_yield_time_for_readiness;
@@ -84,7 +83,15 @@ const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
 const NETWORK_ACCESS_DENIED_MESSAGE: &str =
     "Network access was denied by the Codex sandbox network proxy.";
 const LATE_NETWORK_DENIAL_GRACE_PERIOD: Duration = Duration::from_millis(100);
+const OUTPUT_QUIET_PERIOD: Duration = Duration::from_millis(100);
 const INTERRUPT: &str = "\u{3}";
+
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) enum CollectionMode {
+    UntilDeadline,
+    AfterQuietPeriod(Duration),
+}
 
 /// Test-only override for deterministic unified exec process IDs.
 ///
@@ -469,7 +476,12 @@ impl UnifiedExecProcessManager {
             );
         }
 
-        let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
+        let transcript = Arc::new(tokio::sync::Mutex::new(
+            HeadTailBuffer::new_with_recovery_evidence(
+                UNIFIED_EXEC_OUTPUT_MAX_BYTES,
+                process.recovery_evidence(),
+            ),
+        ));
         let event_ctx = ToolEventCtx::new(
             context.session.as_ref(),
             context.turn.as_ref(),
@@ -527,6 +539,7 @@ impl UnifiedExecProcessManager {
             output_closed,
             output_closed_notify,
             cancellation_token,
+            recovery_evidence: _,
         } = process.output_handles();
         let deadline = start + Duration::from_millis(yield_time_ms);
         let collected = Self::collect_output_until_deadline(
@@ -537,6 +550,7 @@ impl UnifiedExecProcessManager {
             &cancellation_token,
             Some(context.session.subscribe_elicitation_pause_state()),
             deadline,
+            CollectionMode::AfterQuietPeriod(OUTPUT_QUIET_PERIOD),
         )
         .await;
         drop(tool_execution_timing_guard);
@@ -713,11 +727,7 @@ impl UnifiedExecProcessManager {
                 }
             } else {
                 match process.write(request.input.as_bytes()).await {
-                    Ok(()) => {
-                        // Give the remote process a brief window to react so that we are
-                        // more likely to capture its output in the poll below.
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
+                    Ok(()) => {}
                     Err(err) => {
                         let status = self.refresh_process_state(process_id).await;
                         if matches!(status, ProcessStatus::Exited { .. }) {
@@ -754,6 +764,7 @@ impl UnifiedExecProcessManager {
             &cancellation_token,
             pause_state,
             deadline,
+            CollectionMode::AfterQuietPeriod(OUTPUT_QUIET_PERIOD),
         )
         .await;
         let wall_time = Instant::now().saturating_duration_since(start);
@@ -879,6 +890,7 @@ impl UnifiedExecProcessManager {
             output_closed,
             output_closed_notify,
             cancellation_token,
+            recovery_evidence: _,
         } = entry.process.output_handles();
         let pause_state = entry
             .session
@@ -1278,109 +1290,108 @@ impl UnifiedExecProcessManager {
         cancellation_token: &CancellationToken,
         mut pause_state: Option<watch::Receiver<bool>>,
         mut deadline: Instant,
+        mode: CollectionMode,
     ) -> Vec<u8> {
         const POST_EXIT_CLOSE_WAIT_CAP: Duration = Duration::from_millis(50);
 
-        let mut collected: Vec<u8> = Vec::with_capacity(4096);
-        let mut omitted_bytes = 0_usize;
+        let mut collected = HeadTailBuffer::new(UNIFIED_EXEC_OUTPUT_MAX_BYTES);
+        let mut source_omitted_bytes = 0_usize;
         let mut lagged_chunks = 0_u64;
         let mut exit_signal_received = cancellation_token.is_cancelled();
         let mut post_exit_deadline: Option<Instant> = None;
+        let mut quiet_deadline: Option<Instant> = None;
         loop {
             Self::extend_deadlines_while_paused(
                 &mut pause_state,
                 &mut deadline,
                 &mut post_exit_deadline,
+                &mut quiet_deadline,
             )
             .await;
             let drained_chunks: Vec<Vec<u8>>;
             let drained_omitted_bytes: usize;
             let drained_lagged_chunks: u64;
+            let drained_recovery_detail: Option<String>;
             let mut wait_for_output = None;
             {
                 let mut guard = output_buffer.lock().await;
                 drained_chunks = guard.drain_chunks();
                 drained_omitted_bytes = guard.take_unreported_omitted_bytes();
                 drained_lagged_chunks = guard.take_unreported_lagged_chunks();
+                drained_recovery_detail = guard.take_unreported_recovery_detail();
                 if drained_chunks.is_empty()
                     && drained_omitted_bytes == 0
                     && drained_lagged_chunks == 0
+                    && drained_recovery_detail.is_none()
                 {
                     wait_for_output = Some(output_notify.notified());
                 }
             }
-            omitted_bytes = omitted_bytes.saturating_add(drained_omitted_bytes);
+            source_omitted_bytes = source_omitted_bytes.saturating_add(drained_omitted_bytes);
             lagged_chunks = lagged_chunks.saturating_add(drained_lagged_chunks);
 
-            if drained_chunks.is_empty() && drained_omitted_bytes == 0 && drained_lagged_chunks == 0
-            {
-                exit_signal_received |= cancellation_token.is_cancelled();
-                if exit_signal_received && output_closed.load(std::sync::atomic::Ordering::Acquire)
-                {
-                    break;
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining == Duration::ZERO {
-                    break;
-                }
-
-                if exit_signal_received {
-                    let now = Instant::now();
-                    let close_wait_deadline = *post_exit_deadline
-                        .get_or_insert_with(|| now + remaining.min(POST_EXIT_CLOSE_WAIT_CAP));
-                    let close_wait_remaining = close_wait_deadline.saturating_duration_since(now);
-                    if close_wait_remaining == Duration::ZERO {
-                        break;
-                    }
-                    let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
-                    let closed = output_closed_notify.notified();
-                    tokio::pin!(notified);
-                    tokio::pin!(closed);
-                    tokio::select! {
-                        _ = &mut notified => {}
-                        _ = &mut closed => {}
-                        _ = tokio::time::sleep(close_wait_remaining) => break,
-                        _ = Self::wait_for_pause_change(pause_state.as_ref()) => {}
-                    }
-                    continue;
-                }
-
-                let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
-                tokio::pin!(notified);
-                let exit_notified = cancellation_token.cancelled();
-                tokio::pin!(exit_notified);
-                tokio::select! {
-                    _ = &mut notified => {}
-                    _ = &mut exit_notified => exit_signal_received = true,
-                    _ = tokio::time::sleep(remaining) => break,
-                    _ = Self::wait_for_pause_change(pause_state.as_ref()) => {}
-                }
-                continue;
-            }
-
+            let evidence_arrived = !drained_chunks.is_empty()
+                || drained_omitted_bytes > 0
+                || drained_lagged_chunks > 0
+                || drained_recovery_detail.is_some();
             for chunk in drained_chunks {
-                collected.extend_from_slice(&chunk);
+                collected.push_chunk(chunk);
+            }
+            if let Some(detail) = drained_recovery_detail {
+                collected.record_recovery_detail(detail);
+            }
+            if evidence_arrived && let CollectionMode::AfterQuietPeriod(quiet_period) = mode {
+                quiet_deadline = Some(Instant::now() + quiet_period);
             }
 
             exit_signal_received |= cancellation_token.is_cancelled();
-            if Instant::now() >= deadline {
+            let closed_notified = output_closed_notify.notified();
+            tokio::pin!(closed_notified);
+            if output_closed.load(std::sync::atomic::Ordering::Acquire) {
                 break;
+            }
+
+            let now = Instant::now();
+            if now >= deadline || quiet_deadline.is_some_and(|quiet| now >= quiet) {
+                break;
+            }
+
+            let wait_deadline = if exit_signal_received {
+                let close_deadline =
+                    *post_exit_deadline.get_or_insert_with(|| now + POST_EXIT_CLOSE_WAIT_CAP);
+                deadline.min(close_deadline)
+            } else {
+                quiet_deadline.map_or(deadline, |quiet| quiet.min(deadline))
+            };
+            if now >= wait_deadline {
+                break;
+            }
+
+            let notified = wait_for_output.unwrap_or_else(|| output_notify.notified());
+            tokio::pin!(notified);
+            let exit_notified = cancellation_token.cancelled();
+            tokio::pin!(exit_notified);
+            let pause_changed = Self::wait_for_pause_change(pause_state.as_mut());
+            tokio::pin!(pause_changed);
+            tokio::select! {
+                _ = &mut notified => {}
+                _ = &mut closed_notified => {}
+                _ = &mut exit_notified => exit_signal_received = true,
+                _ = tokio::time::sleep_until(wait_deadline) => break,
+                _ = &mut pause_changed => {}
             }
         }
 
-        if omitted_bytes > 0 {
-            collected.extend_from_slice(&omitted_output_marker(omitted_bytes));
-        }
-        if lagged_chunks > 0 {
-            collected.extend_from_slice(&lagged_output_marker(lagged_chunks));
-        }
-        collected
+        collected.record_external_omitted_bytes(source_omitted_bytes);
+        collected.record_lagged_chunks(lagged_chunks);
+        collected.render_bytes()
     }
 
     async fn extend_deadlines_while_paused(
         pause_state: &mut Option<watch::Receiver<bool>>,
         deadline: &mut Instant,
         post_exit_deadline: &mut Option<Instant>,
+        quiet_deadline: &mut Option<Instant>,
     ) {
         let Some(receiver) = pause_state.as_mut() else {
             return;
@@ -1401,13 +1412,15 @@ impl UnifiedExecProcessManager {
         if let Some(post_exit_deadline) = post_exit_deadline.as_mut() {
             *post_exit_deadline += paused_for;
         }
+        if let Some(quiet_deadline) = quiet_deadline.as_mut() {
+            *quiet_deadline += paused_for;
+        }
     }
 
-    async fn wait_for_pause_change(pause_state: Option<&watch::Receiver<bool>>) {
+    async fn wait_for_pause_change(pause_state: Option<&mut watch::Receiver<bool>>) {
         match pause_state {
             Some(pause_state) => {
-                let mut receiver = pause_state.clone();
-                let _ = receiver.changed().await;
+                let _ = pause_state.changed().await;
             }
             None => std::future::pending::<()>().await,
         }

@@ -89,7 +89,7 @@ fn unified_exec_env_overrides_existing_values() {
 
 #[tokio::test]
 async fn lag_survives_drain_for_finalization_without_duplicate_interim_reports() {
-    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(32)));
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(256)));
     {
         let mut guard = output_buffer.lock().await;
         guard.push_chunk(b"PARTIAL_OUTPUT".to_vec());
@@ -109,6 +109,7 @@ async fn lag_survives_drain_for_finalization_without_duplicate_interim_reports()
         &cancellation_token,
         /*pause_state*/ None,
         Instant::now() + Duration::from_millis(50),
+        CollectionMode::UntilDeadline,
     )
     .await;
     let collected = String::from_utf8(collected).expect("collected output is UTF-8");
@@ -128,6 +129,7 @@ async fn lag_survives_drain_for_finalization_without_duplicate_interim_reports()
         &cancellation_token,
         /*pause_state*/ None,
         Instant::now() + Duration::from_millis(50),
+        CollectionMode::UntilDeadline,
     )
     .await;
     assert!(second_drain.is_empty());
@@ -145,11 +147,8 @@ async fn lag_survives_drain_for_finalization_without_duplicate_interim_reports()
 
 #[tokio::test]
 async fn capacity_omission_is_reported_once_per_drain_and_preserved_for_finalization() {
-    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(8)));
-    output_buffer
-        .lock()
-        .await
-        .push_chunk(b"0123456789abcdef".to_vec());
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(256)));
+    output_buffer.lock().await.push_chunk(vec![b'a'; 512]);
     let output_notify = Arc::new(Notify::new());
     let output_closed = Arc::new(AtomicBool::new(true));
     let output_closed_notify = Arc::new(Notify::new());
@@ -164,12 +163,13 @@ async fn capacity_omission_is_reported_once_per_drain_and_preserved_for_finaliza
         &cancellation_token,
         /*pause_state*/ None,
         Instant::now() + Duration::from_millis(50),
+        CollectionMode::UntilDeadline,
     )
     .await;
     let collected = String::from_utf8(collected).expect("collected output is UTF-8");
     assert_eq!(
         collected
-            .matches("8 byte(s) omitted from the middle")
+            .matches("256 byte(s) omitted from the middle")
             .count(),
         1
     );
@@ -183,6 +183,7 @@ async fn capacity_omission_is_reported_once_per_drain_and_preserved_for_finaliza
         &cancellation_token,
         /*pause_state*/ None,
         Instant::now() + Duration::from_millis(50),
+        CollectionMode::UntilDeadline,
     )
     .await;
     assert!(second_drain.is_empty());
@@ -190,12 +191,162 @@ async fn capacity_omission_is_reported_once_per_drain_and_preserved_for_finaliza
     let final_output = resolve_aggregated_output(&output_buffer, "FINAL_OUTPUT".to_string()).await;
     assert_eq!(
         final_output
-            .matches("8 byte(s) omitted from the middle")
+            .matches("256 byte(s) omitted from the middle")
             .count(),
         1
     );
     assert!(!final_output.contains("streaming receiver lagged"));
-    assert_eq!(output_buffer.lock().await.omitted_bytes(), 8);
+    assert_eq!(output_buffer.lock().await.omitted_bytes(), 256);
+}
+
+#[tokio::test]
+async fn output_closure_without_output_returns_immediately() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(32)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(true));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let started = Instant::now();
+
+    let collected = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started + Duration::from_secs(5),
+        CollectionMode::UntilDeadline,
+    )
+    .await;
+
+    assert!(collected.is_empty());
+    assert!(started.elapsed() < Duration::from_millis(100));
+}
+
+#[tokio::test]
+async fn quiet_period_starts_after_evidence_and_returns_live_output() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(32)));
+    output_buffer.lock().await.push_chunk(b"READY".to_vec());
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let started = Instant::now();
+
+    let collected = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started + Duration::from_secs(1),
+        CollectionMode::AfterQuietPeriod(Duration::from_millis(25)),
+    )
+    .await;
+
+    assert_eq!(collected, b"READY".to_vec());
+    assert!(started.elapsed() >= Duration::from_millis(20));
+    assert!(started.elapsed() < Duration::from_millis(250));
+}
+
+#[tokio::test]
+async fn recovery_evidence_wakes_collection_without_output_bytes() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(128)));
+    output_buffer
+        .lock()
+        .await
+        .record_recovery_detail("multiple disjoint recovery gaps".to_string());
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+
+    let collected = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        Instant::now() + Duration::from_secs(1),
+        CollectionMode::AfterQuietPeriod(Duration::from_millis(10)),
+    )
+    .await;
+
+    assert!(
+        String::from_utf8(collected)
+            .expect("marker is UTF-8")
+            .contains("multiple disjoint recovery gaps")
+    );
+}
+
+#[tokio::test]
+async fn continuous_output_stops_at_the_maximum_deadline() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(128)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let producer_buffer = Arc::clone(&output_buffer);
+    let producer_notify = Arc::clone(&output_notify);
+    let producer = tokio::spawn(async move {
+        loop {
+            producer_buffer.lock().await.push_chunk(vec![b'x']);
+            producer_notify.notify_waiters();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    });
+    let started = Instant::now();
+
+    let collected = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started + Duration::from_millis(60),
+        CollectionMode::AfterQuietPeriod(Duration::from_millis(20)),
+    )
+    .await;
+    producer.abort();
+    let _ = producer.await;
+
+    assert!(!collected.is_empty());
+    assert!(started.elapsed() >= Duration::from_millis(40));
+    assert!(started.elapsed() < Duration::from_millis(200));
+}
+
+#[tokio::test]
+async fn process_termination_wakes_collection_without_output() {
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(32)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let cancel = cancellation_token.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        cancel.cancel();
+    });
+    let started = Instant::now();
+
+    let collected = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        None,
+        started + Duration::from_secs(5),
+        CollectionMode::UntilDeadline,
+    )
+    .await;
+
+    assert!(collected.is_empty());
+    assert!(started.elapsed() < Duration::from_millis(200));
 }
 
 #[test]

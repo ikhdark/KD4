@@ -3,6 +3,8 @@ use ansi_to_tui::IntoText;
 use ratatui::text::Line;
 use ratatui::text::Text;
 
+const DIAGNOSTIC_PREVIEW_CHARS: usize = 256;
+
 // Expand tabs in a best-effort way for transcript rendering.
 // Tabs can interact poorly with left-gutter prefixes in our TUI and CLI
 // transcript views (e.g., `nl` separates line numbers from content with a tab).
@@ -31,7 +33,11 @@ pub fn ansi_escape_line(s: &str) -> Line<'static> {
         [] => "".into(),
         [only] => only.clone(),
         [first, rest @ ..] => {
-            tracing::warn!("ansi_escape_line: expected a single line, got {first:?} and {rest:?}");
+            tracing::warn!(
+                line_count = rest.len().saturating_add(1),
+                preview = %bounded_escaped_preview(&s),
+                "ansi_escape_line: expected a single line"
+            );
             first.clone()
         }
     }
@@ -45,14 +51,61 @@ pub fn ansi_escape(s: &str) -> Text<'static> {
         Err(err) => match err {
             Error::NomError(message) => {
                 tracing::error!(
-                    "ansi_to_tui NomError docs claim should never happen when parsing `{s}`: {message}"
+                    error = %message,
+                    preview = %bounded_escaped_preview(s),
+                    "ansi_to_tui failed to parse ANSI text"
                 );
-                panic!();
+                Text::raw(s.to_owned())
             }
             Error::Utf8Error(utf8error) => {
-                tracing::error!("Utf8Error: {utf8error}");
-                panic!();
+                tracing::error!(
+                    error = %utf8error,
+                    preview = %bounded_escaped_preview(s),
+                    "ansi_to_tui reported invalid UTF-8"
+                );
+                Text::raw(s.to_owned())
             }
         },
+    }
+}
+
+fn bounded_escaped_preview(input: &str) -> String {
+    let content_budget = DIAGNOSTIC_PREVIEW_CHARS.saturating_sub(1);
+    let mut preview = String::new();
+    let mut rendered_chars = 0_usize;
+
+    for ch in input.chars() {
+        let escaped = ch.escape_default();
+        let escaped_len = escaped.clone().count();
+        if rendered_chars.saturating_add(escaped_len) > content_budget {
+            preview.push('…');
+            return preview;
+        }
+        preview.extend(escaped);
+        rendered_chars = rendered_chars.saturating_add(escaped_len);
+    }
+
+    preview
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_preview_is_bounded_after_escaping() {
+        let input = "\n".repeat(DIAGNOSTIC_PREVIEW_CHARS);
+        let preview = bounded_escaped_preview(&input);
+
+        assert!(preview.chars().count() <= DIAGNOSTIC_PREVIEW_CHARS);
+        assert!(preview.ends_with('…'));
+        assert!(!preview.contains('\n'));
+    }
+
+    #[test]
+    fn malformed_ansi_never_panics() {
+        for input in ["\u{1b}", "\u{1b}[", "\u{1b}[38;2", "\u{1b}]8;;"] {
+            let _ = ansi_escape(input);
+        }
     }
 }

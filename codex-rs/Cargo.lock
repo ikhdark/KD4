@@ -3953,6 +3953,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
+ "tokio",
  "tree-sitter",
  "tree-sitter-bash",
  "url",

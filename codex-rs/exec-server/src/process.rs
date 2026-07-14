@@ -168,6 +168,16 @@ impl ExecProcessEventReceiver {
 
         self.live_rx.recv().await
     }
+
+    /// Returns the next replayed or immediately available live event without
+    /// waiting.
+    pub fn try_recv(&mut self) -> Result<ExecProcessEvent, broadcast::error::TryRecvError> {
+        if let Some(event) = self.replay.pop_front() {
+            return Ok(event);
+        }
+
+        self.live_rx.try_recv()
+    }
 }
 
 /// Handle for an executor-managed process.
@@ -189,6 +199,17 @@ pub trait ExecProcess: Send + Sync {
         max_bytes: Option<usize>,
         wait_ms: Option<u64>,
     ) -> ExecProcessFuture<'_, ReadResponse>;
+
+    fn read_with_limits(
+        &self,
+        after_seq: Option<u64>,
+        max_bytes: Option<usize>,
+        max_chunks: Option<usize>,
+        wait_ms: Option<u64>,
+    ) -> ExecProcessFuture<'_, ReadResponse> {
+        let _ = max_chunks;
+        self.read(after_seq, max_bytes, wait_ms)
+    }
 
     fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse>;
 

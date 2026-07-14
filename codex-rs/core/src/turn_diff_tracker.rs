@@ -178,6 +178,7 @@ impl TurnDiffTracker {
         self.invalidate();
     }
 
+    #[cfg(test)]
     pub(crate) fn record_exec_command_end_at(
         &mut self,
         command: &[String],
@@ -186,11 +187,30 @@ impl TurnDiffTracker {
         environment_id: &str,
         cwd: Option<&Path>,
     ) {
+        let possible_mutation = looks_like_mutating_command(command);
+        self.record_exec_command_end_at_with_mutation(
+            command,
+            exit_code,
+            timed_out,
+            environment_id,
+            cwd,
+            possible_mutation,
+        );
+    }
+
+    pub(crate) fn record_exec_command_end_at_with_mutation(
+        &mut self,
+        command: &[String],
+        exit_code: i32,
+        timed_out: bool,
+        environment_id: &str,
+        cwd: Option<&Path>,
+        possible_mutation: bool,
+    ) {
         let was_post_mutation = self.has_unvalidated_mutation();
         let is_validation = is_validation_command(command);
         let format_only = is_format_only_command(command);
         let broad_filter = is_broad_validation_filter_command(command);
-        let possible_mutation = looks_like_mutating_command(command);
 
         // A command can write before failing or timing out, so known mutators
         // always invalidate exact diff/freshness state.

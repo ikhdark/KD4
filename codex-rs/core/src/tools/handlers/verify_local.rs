@@ -79,13 +79,16 @@ struct VerifyLocalRun {
 }
 
 impl VerifyLocalRun {
+    fn has_versioned_contract(&self) -> bool {
+        self.json
+            .as_ref()
+            .is_some_and(self::is_versioned_verify_local_json)
+    }
+
     fn is_proof_bearing(&self) -> bool {
         self.tool_success
             && self.verdict_text.as_deref() == Some("VERIFIED")
-            && self
-                .json
-                .as_ref()
-                .is_some_and(self::is_versioned_verify_local_json)
+            && self.has_versioned_contract()
             && self.scope.is_some()
     }
 }
@@ -265,6 +268,10 @@ impl VerifyLocalHandler {
             capture_exec_output: true,
         })
         .await?;
+        let completed_normally = result
+            .exec_output
+            .as_ref()
+            .is_some_and(|output| !output.timed_out);
         let (output, run) = finalize_verify_local_output(
             result.output,
             result.exec_output.as_ref(),
@@ -289,6 +296,7 @@ impl VerifyLocalHandler {
                 run.verdict_text.as_deref(),
                 run.tool_success,
                 run.is_proof_bearing(),
+                run.has_versioned_contract() && completed_normally,
                 validation_start.as_ref(),
                 active_files,
                 stale_reasons,

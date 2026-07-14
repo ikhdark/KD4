@@ -43,6 +43,7 @@ use crate::protocol::ExecOutputDeltaNotification;
 use crate::protocol::ExecOutputStream;
 use crate::protocol::ExecParams;
 use crate::protocol::ExecResponse;
+use crate::protocol::OutputGap;
 use crate::protocol::ProcessOutputChunk;
 use crate::protocol::ProcessSignal;
 use crate::protocol::ReadParams;
@@ -85,6 +86,7 @@ struct RunningProcess {
     pipe_stdin: bool,
     accepted_stdin_write_ids: Arc<Mutex<AcceptedStdinWriteIds>>,
     output: VecDeque<RetainedOutputChunk>,
+    output_gaps: Vec<OutputGap>,
     retained_bytes: usize,
     next_seq: u64,
     exit_code: Option<i32>,
@@ -326,6 +328,7 @@ impl LocalProcess {
                         Mutex::new(AcceptedStdinWriteIds::default()),
                     ),
                     output: VecDeque::new(),
+                    output_gaps: Vec::new(),
                     retained_bytes: 0,
                     next_seq: 1,
                     exit_code: None,
@@ -385,6 +388,7 @@ impl LocalProcess {
     ) -> Result<ReadResponse, JSONRPCErrorError> {
         let after_seq = params.after_seq.unwrap_or(0);
         let max_bytes = params.max_bytes.unwrap_or(usize::MAX);
+        let max_chunks = params.max_chunks.unwrap_or(usize::MAX);
         let wait = Duration::from_millis(params.wait_ms.unwrap_or(0));
         let deadline = tokio::time::Instant::now() + wait;
 
@@ -402,11 +406,19 @@ impl LocalProcess {
                 };
 
                 let mut chunks = Vec::new();
-                let mut total_bytes = 0;
+                let mut total_bytes: usize = 0;
                 let mut next_seq = process.next_seq;
+                let mut limited = false;
                 for retained in process.output.iter().filter(|chunk| chunk.seq > after_seq) {
+                    if chunks.len() >= max_chunks {
+                        next_seq = retained.seq;
+                        limited = true;
+                        break;
+                    }
                     let chunk_len = retained.chunk.len();
-                    if !chunks.is_empty() && total_bytes + chunk_len > max_bytes {
+                    if total_bytes.saturating_add(chunk_len) > max_bytes {
+                        next_seq = retained.seq;
+                        limited = true;
                         break;
                     }
                     total_bytes += chunk_len;
@@ -416,16 +428,23 @@ impl LocalProcess {
                         chunk: retained.chunk.clone().into(),
                     });
                     next_seq = retained.seq + 1;
-                    if total_bytes >= max_bytes {
-                        break;
-                    }
                 }
-                if params.max_bytes.is_none() {
+                if !limited {
                     next_seq = process.next_seq;
                 }
+                let output_gaps = process
+                    .output_gaps
+                    .iter()
+                    .filter(|gap| gap.last_missing_seq > after_seq)
+                    .map(|gap| OutputGap {
+                        first_missing_seq: gap.first_missing_seq.max(after_seq.saturating_add(1)),
+                        last_missing_seq: gap.last_missing_seq,
+                    })
+                    .collect();
                 (
                     ReadResponse {
                         chunks,
+                        output_gaps,
                         next_seq,
                         exited: process.exit_code.is_some(),
                         exit_code: process.exit_code,
@@ -440,6 +459,7 @@ impl LocalProcess {
             let has_new_terminal_event =
                 response.exited && after_seq < response.next_seq.saturating_sub(1);
             if !response.chunks.is_empty()
+                || !response.output_gaps.is_empty()
                 || response.closed
                 || has_new_terminal_event
                 || tokio::time::Instant::now() >= deadline
@@ -631,10 +651,11 @@ impl LocalExecProcess {
         &self,
         after_seq: Option<u64>,
         max_bytes: Option<usize>,
+        max_chunks: Option<usize>,
         wait_ms: Option<u64>,
     ) -> Result<ReadResponse, ExecServerError> {
         self.backend
-            .read(&self.process_id, after_seq, max_bytes, wait_ms)
+            .read(&self.process_id, after_seq, max_bytes, max_chunks, wait_ms)
             .await
     }
 
@@ -670,7 +691,21 @@ impl ExecProcess for LocalExecProcess {
         max_bytes: Option<usize>,
         wait_ms: Option<u64>,
     ) -> ExecProcessFuture<'_, ReadResponse> {
-        Box::pin(LocalExecProcess::read(self, after_seq, max_bytes, wait_ms))
+        Box::pin(LocalExecProcess::read(
+            self, after_seq, max_bytes, None, wait_ms,
+        ))
+    }
+
+    fn read_with_limits(
+        &self,
+        after_seq: Option<u64>,
+        max_bytes: Option<usize>,
+        max_chunks: Option<usize>,
+        wait_ms: Option<u64>,
+    ) -> ExecProcessFuture<'_, ReadResponse> {
+        Box::pin(LocalExecProcess::read(
+            self, after_seq, max_bytes, max_chunks, wait_ms,
+        ))
     }
 
     fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
@@ -692,12 +727,14 @@ impl LocalProcess {
         process_id: &ProcessId,
         after_seq: Option<u64>,
         max_bytes: Option<usize>,
+        max_chunks: Option<usize>,
         wait_ms: Option<u64>,
     ) -> Result<ReadResponse, ExecServerError> {
         self.exec_read(ReadParams {
             process_id: process_id.clone(),
             after_seq,
             max_bytes,
+            max_chunks,
             wait_ms,
         })
         .await
@@ -758,6 +795,19 @@ fn map_handler_error(error: JSONRPCErrorError) -> ExecServerError {
     }
 }
 
+fn record_output_gap(gaps: &mut Vec<OutputGap>, seq: u64) {
+    if let Some(last) = gaps.last_mut()
+        && seq <= last.last_missing_seq.saturating_add(1)
+    {
+        last.last_missing_seq = last.last_missing_seq.max(seq);
+        return;
+    }
+    gaps.push(OutputGap {
+        first_missing_seq: seq,
+        last_missing_seq: seq,
+    });
+}
+
 async fn stream_output(
     process_id: ProcessId,
     stream: ExecOutputStream,
@@ -788,6 +838,7 @@ async fn stream_output(
                     break;
                 };
                 process.retained_bytes = process.retained_bytes.saturating_sub(evicted.chunk.len());
+                record_output_gap(&mut process.output_gaps, evicted.seq);
             }
             let _ = process.wake_tx.send(seq);
             let output = ProcessOutputChunk {
@@ -1176,6 +1227,7 @@ mod tests {
             exit_response,
             ReadResponse {
                 chunks: Vec::new(),
+                output_gaps: Vec::new(),
                 next_seq: 2,
                 exited: true,
                 exit_code: Some(0),
@@ -1218,11 +1270,117 @@ mod tests {
                 process_id: process.process_id.clone(),
                 after_seq: Some(1),
                 max_bytes: None,
+                max_chunks: None,
                 wait_ms: Some(0),
             })
             .await
             .expect("closed process should remain readable");
         assert_eq!(replay_after_exit.next_seq, 4);
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn read_honors_max_chunks() {
+        let backend = LocalProcess::default();
+        let process = spawn_test_process(&backend, "proc-max-chunks").await;
+
+        for chunk in [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()] {
+            process.stdout_tx.send(chunk).await.expect("send stdout");
+        }
+        wait_for_retained_output_count(&backend, &process.process_id, 3).await;
+
+        let response = backend
+            .exec_read(ReadParams {
+                process_id: process.process_id.clone(),
+                after_seq: None,
+                max_bytes: None,
+                max_chunks: Some(2),
+                wait_ms: Some(0),
+            })
+            .await
+            .expect("read process");
+
+        assert_eq!(
+            response
+                .chunks
+                .iter()
+                .map(|chunk| chunk.seq)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(response.next_seq, 3);
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn read_enforces_max_bytes_for_first_chunk() {
+        let backend = LocalProcess::default();
+        let process = spawn_test_process(&backend, "proc-max-bytes").await;
+
+        process
+            .stdout_tx
+            .send(b"oversized".to_vec())
+            .await
+            .expect("send stdout");
+        wait_for_retained_output_count(&backend, &process.process_id, 1).await;
+
+        let response = backend
+            .exec_read(ReadParams {
+                process_id: process.process_id.clone(),
+                after_seq: None,
+                max_bytes: Some(4),
+                max_chunks: None,
+                wait_ms: Some(0),
+            })
+            .await
+            .expect("read process");
+
+        assert!(response.chunks.is_empty());
+        assert_eq!(response.next_seq, 1);
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn read_returns_gap_only_response_without_waiting() {
+        let backend = LocalProcess::default();
+        let process = spawn_test_process(&backend, "proc-gap-only").await;
+        {
+            let mut processes = backend.inner.processes.lock().await;
+            let ProcessEntry::Running(entry) = processes
+                .get_mut(&process.process_id)
+                .expect("test process")
+            else {
+                panic!("test process should be running");
+            };
+            entry.output_gaps.push(OutputGap {
+                first_missing_seq: 1,
+                last_missing_seq: 2,
+            });
+            entry.next_seq = 3;
+        }
+
+        let response = timeout(
+            Duration::from_millis(50),
+            backend.exec_read(ReadParams {
+                process_id: process.process_id.clone(),
+                after_seq: None,
+                max_bytes: None,
+                max_chunks: None,
+                wait_ms: Some(1_000),
+            }),
+        )
+        .await
+        .expect("gap-only response should not long-poll")
+        .expect("read process");
+
+        assert_eq!(
+            response.output_gaps,
+            vec![OutputGap {
+                first_missing_seq: 1,
+                last_missing_seq: 2,
+            }]
+        );
+        assert_eq!(response.next_seq, 3);
         backend.shutdown().await;
     }
 
@@ -1298,6 +1456,7 @@ mod tests {
                 pipe_stdin: false,
                 accepted_stdin_write_ids: Arc::new(Mutex::new(AcceptedStdinWriteIds::default())),
                 output: VecDeque::new(),
+                output_gaps: Vec::new(),
                 retained_bytes: 0,
                 next_seq: 1,
                 exit_code: None,
@@ -1344,6 +1503,32 @@ mod tests {
         }
     }
 
+    async fn wait_for_retained_output_count(
+        backend: &LocalProcess,
+        process_id: &ProcessId,
+        expected: usize,
+    ) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let retained = {
+                    let processes = backend.inner.processes.lock().await;
+                    let ProcessEntry::Running(process) =
+                        processes.get(process_id).expect("test process")
+                    else {
+                        panic!("test process should be running");
+                    };
+                    process.output.len()
+                };
+                if retained >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("output should be retained");
+    }
+
     fn dummy_session() -> ExecCommandSession {
         let (writer_tx, _writer_rx) = mpsc::channel(1);
         let (_stdout_tx, stdout_rx) = tokio::sync::broadcast::channel(1);
@@ -1373,6 +1558,7 @@ mod tests {
                 process_id: process_id.clone(),
                 after_seq,
                 max_bytes: None,
+                max_chunks: None,
                 wait_ms: Some(1_000),
             }),
         )

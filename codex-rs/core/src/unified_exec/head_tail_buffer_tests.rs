@@ -95,3 +95,52 @@ fn fills_head_then_tail_across_multiple_chunks() {
     assert_eq!(buf.to_bytes(), b"012346789a".to_vec());
     assert_eq!(buf.omitted_bytes(), 1);
 }
+
+#[test]
+fn rendered_marker_reserves_its_actual_length_and_preserves_head_and_tail() {
+    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 100);
+    buf.push_chunk([vec![b'H'; 100], vec![b'T'; 100]].concat());
+
+    let rendered = buf.render_bytes();
+
+    assert_eq!(rendered.len(), 100);
+    assert!(rendered.starts_with(b"H"));
+    assert!(rendered.ends_with(b"T"));
+    let text = String::from_utf8(rendered).expect("marker is UTF-8");
+    assert_eq!(text.matches("output truncated").count(), 1);
+}
+
+#[test]
+fn rendered_marker_uses_only_its_prefix_when_the_cap_is_tiny() {
+    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 8);
+    buf.push_chunk(b"0123456789".to_vec());
+
+    assert_eq!(buf.render_bytes(), b"\n[output".to_vec());
+}
+
+#[test]
+fn rendered_output_without_evidence_is_exact() {
+    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 64);
+    buf.push_chunk(b"exact output".to_vec());
+
+    assert_eq!(buf.render_bytes(), b"exact output".to_vec());
+}
+
+#[test]
+fn recovery_evidence_is_shared_and_reported_once_per_buffer() {
+    let evidence = std::sync::Arc::new(std::sync::Mutex::new(Default::default()));
+    let mut first = HeadTailBuffer::new_with_recovery_evidence(128, evidence.clone());
+    let second = HeadTailBuffer::new_with_recovery_evidence(128, evidence);
+
+    assert!(first.record_recovery_detail("missing sequences 2-4, 8-9".to_string()));
+    assert_eq!(
+        first.take_unreported_recovery_detail().as_deref(),
+        Some("missing sequences 2-4, 8-9")
+    );
+    assert_eq!(first.take_unreported_recovery_detail(), None);
+    assert!(
+        String::from_utf8(second.render_bytes())
+            .expect("rendered output")
+            .contains("missing sequences 2-4, 8-9")
+    );
+}

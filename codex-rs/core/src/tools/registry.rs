@@ -448,15 +448,6 @@ impl ToolRegistry {
             ),
         ];
 
-        {
-            let mut active = invocation.session.active_turn.lock().await;
-            if let Some(active_turn) = active.as_mut() {
-                let mut turn_state = active_turn.turn_state.lock().await;
-                turn_state.tool_calls = turn_state.tool_calls.saturating_add(1);
-            }
-        }
-        invocation.turn.turn_timing_state.record_tool_call();
-
         let dispatch_trace = ToolDispatchTrace::start(&invocation);
         let tool = match self.tool(&tool_name) {
             Some(tool) => tool,
@@ -590,7 +581,7 @@ impl ToolRegistry {
             Ok((_, success)) => *success,
             Err(_) => false,
         };
-        emit_metric_for_tool_read(&invocation, success);
+        emit_metric_for_tool_read(&invocation, success).await;
         let post_tool_use_payload = if success {
             let guard = response_cell.lock().await;
             guard

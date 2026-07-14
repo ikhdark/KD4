@@ -18,7 +18,7 @@ use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
-use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
+use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair_async;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_workdir_base_path;
@@ -225,11 +225,12 @@ impl ShellCommandHandler {
         } else {
             Some(original_safety_shell.shell_type)
         };
-        let preflight = preflight_invocation_with_equivalent_repair(
+        let preflight = preflight_invocation_with_equivalent_repair_async(
             &original_invocation,
             &original_safety_command,
             original_shell_type,
         )
+        .await
         .map_err(|issue| {
             FunctionCallError::RespondToModel(format!(
                 "{issue}\nRegenerate the command and call `shell_command` again."

@@ -518,7 +518,7 @@ async fn emit_exec_stage(
             ctx.session
                 .services
                 .task_evidence
-                .record_command_intent(ctx.call_id, exec_input.command)
+                .record_command_intent(ctx.call_id, exec_input.command, exec_input.cwd)
                 .await;
             emit_exec_command_begin(
                 ctx,
@@ -588,20 +588,14 @@ async fn emit_exec_end(
     exec_input: ExecCommandInput<'_>,
     exec_result: ExecCommandResult,
 ) {
-    let possible_mutation = crate::turn_diff_tracker::command_may_mutate(exec_input.command);
-    if let Some(tracker) = ctx.turn_diff_tracker {
-        let native_cwd = exec_input.cwd.to_abs_path().ok();
-        tracker.lock().await.record_exec_command_end_at(
-            exec_input.command,
-            exec_result.exit_code,
-            exec_result.timed_out,
-            exec_input.environment_id,
-            native_cwd
-                .as_ref()
-                .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
-        );
-    }
-    ctx.session
+    let command_for_classification = exec_input.command.to_vec();
+    let possible_mutation = tokio::task::spawn_blocking(move || {
+        crate::turn_diff_tracker::command_may_mutate(&command_for_classification)
+    })
+    .await
+    .unwrap_or(true);
+    let mutation_observation = ctx
+        .session
         .services
         .task_evidence
         .record_command(
@@ -614,6 +608,29 @@ async fn emit_exec_end(
             possible_mutation,
         )
         .await;
+    let tracker_mutation = mutation_observation.map_or(possible_mutation, |observation| {
+        matches!(
+            observation,
+            crate::task_evidence::MutationObservation::Changed
+                | crate::task_evidence::MutationObservation::Unknown
+        )
+    });
+    if let Some(tracker) = ctx.turn_diff_tracker {
+        let native_cwd = exec_input.cwd.to_abs_path().ok();
+        tracker
+            .lock()
+            .await
+            .record_exec_command_end_at_with_mutation(
+                exec_input.command,
+                exec_result.exit_code,
+                exec_result.timed_out,
+                exec_input.environment_id,
+                native_cwd
+                    .as_ref()
+                    .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
+                tracker_mutation,
+            );
+    }
 
     ctx.session
         .emit_turn_item_completed(

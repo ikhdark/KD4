@@ -25,6 +25,7 @@ use crate::client_transport::ExecServerReconnectStrategy;
 use crate::process::ExecProcessEvent;
 use crate::protocol::EXEC_READ_METHOD;
 use crate::protocol::EXEC_TERMINATE_METHOD;
+use crate::protocol::OutputGap;
 use crate::protocol::ReadParams;
 use crate::protocol::ReadResponse;
 use crate::protocol::TerminateParams;
@@ -54,6 +55,7 @@ impl SessionState {
     fn recover_events(&self, response: ReadResponse) -> Result<bool, ExecServerError> {
         let ReadResponse {
             chunks,
+            output_gaps,
             next_seq,
             exited,
             exit_code,
@@ -79,6 +81,14 @@ impl SessionState {
             {
                 return Ok(false);
             }
+            register_recovery_gaps(
+                &mut ordered_events,
+                output_gaps,
+                &chunks,
+                target_seq,
+                closed,
+            )?;
+            let mut published_closed = self.publish_ready(&mut ordered_events);
             let pending_exit = ordered_events.pending.range_mut(..=target_seq).find_map(
                 |(_, event)| match event {
                     ExecProcessEvent::Exited {
@@ -104,7 +114,6 @@ impl SessionState {
                     "process close sequence {target_seq} conflicts with recovered output"
                 )));
             }
-            let mut published_closed = false;
             for chunk in chunks {
                 if chunk.seq > target_seq {
                     return Err(ExecServerError::Protocol(format!(
@@ -150,14 +159,8 @@ impl SessionState {
 
             let event_count = target_seq.saturating_sub(ordered_events.last_published_seq);
             let first_unpublished_seq = ordered_events.last_published_seq.saturating_add(1);
-            let retained_count = if first_unpublished_seq <= target_seq {
-                ordered_events
-                    .pending
-                    .range(first_unpublished_seq..=target_seq)
-                    .count() as u64
-            } else {
-                0
-            };
+            let retained_count =
+                pending_sequence_coverage(&ordered_events, first_unpublished_seq, target_seq);
             let missing_count = event_count.saturating_sub(retained_count);
             if exited && !exit_known {
                 if missing_count != 1 {
@@ -188,17 +191,165 @@ impl SessionState {
     }
 }
 
+fn register_recovery_gaps(
+    events: &mut OrderedSessionEvents,
+    reported: Vec<OutputGap>,
+    response_chunks: &[crate::protocol::ProcessOutputChunk],
+    target_seq: u64,
+    closed: bool,
+) -> Result<(), ExecServerError> {
+    if reported.is_empty() {
+        return Ok(());
+    }
+
+    let first_unpublished = events.last_published_seq.saturating_add(1);
+    let mut gaps = normalize_recovery_gaps(reported)?
+        .into_iter()
+        .filter_map(|gap| {
+            (gap.last_missing_seq >= first_unpublished).then_some(OutputGap {
+                first_missing_seq: gap.first_missing_seq.max(first_unpublished),
+                last_missing_seq: gap.last_missing_seq,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    for gap in &gaps {
+        if gap.last_missing_seq > target_seq
+            || (closed && gap.first_missing_seq <= target_seq && target_seq <= gap.last_missing_seq)
+        {
+            return Err(ExecServerError::Protocol(format!(
+                "evicted output range {}..={} exceeds the recovery boundary {target_seq}",
+                gap.first_missing_seq, gap.last_missing_seq
+            )));
+        }
+        if response_chunks
+            .iter()
+            .any(|chunk| gap.first_missing_seq <= chunk.seq && chunk.seq <= gap.last_missing_seq)
+        {
+            return Err(ExecServerError::Protocol(format!(
+                "evicted output range {}..={} overlaps recovered output",
+                gap.first_missing_seq, gap.last_missing_seq
+            )));
+        }
+        if events
+            .pending
+            .range(gap.first_missing_seq..=gap.last_missing_seq)
+            .any(|(_, event)| {
+                matches!(
+                    event,
+                    ExecProcessEvent::Exited { .. } | ExecProcessEvent::Closed { .. }
+                )
+            })
+        {
+            return Err(ExecServerError::Protocol(format!(
+                "evicted output range {}..={} overlaps a lifecycle event",
+                gap.first_missing_seq, gap.last_missing_seq
+            )));
+        }
+    }
+
+    let mut covered = events.recovery_gaps.clone();
+    covered.extend(events.pending.iter().filter_map(|(seq, event)| {
+        matches!(event, ExecProcessEvent::Output(_)).then_some(OutputGap {
+            first_missing_seq: *seq,
+            last_missing_seq: *seq,
+        })
+    }));
+    for covered_range in normalize_recovery_gaps(covered)? {
+        gaps = subtract_gap_range(gaps, &covered_range);
+    }
+
+    let mut combined = events.recovery_gaps.clone();
+    combined.extend(gaps);
+    events.recovery_gaps = normalize_recovery_gaps(combined)?;
+    Ok(())
+}
+
+fn normalize_recovery_gaps(mut gaps: Vec<OutputGap>) -> Result<Vec<OutputGap>, ExecServerError> {
+    for gap in &gaps {
+        if gap.first_missing_seq == 0 || gap.first_missing_seq > gap.last_missing_seq {
+            return Err(ExecServerError::Protocol(format!(
+                "invalid evicted output range {}..={}",
+                gap.first_missing_seq, gap.last_missing_seq
+            )));
+        }
+    }
+    gaps.sort_by_key(|gap| (gap.first_missing_seq, gap.last_missing_seq));
+    let mut normalized: Vec<OutputGap> = Vec::with_capacity(gaps.len());
+    for gap in gaps {
+        if let Some(last) = normalized.last_mut()
+            && gap.first_missing_seq <= last.last_missing_seq.saturating_add(1)
+        {
+            last.last_missing_seq = last.last_missing_seq.max(gap.last_missing_seq);
+        } else {
+            normalized.push(gap);
+        }
+    }
+    Ok(normalized)
+}
+
+fn subtract_gap_range(gaps: Vec<OutputGap>, covered: &OutputGap) -> Vec<OutputGap> {
+    let mut remaining = Vec::with_capacity(gaps.len().saturating_add(1));
+    for gap in gaps {
+        if covered.last_missing_seq < gap.first_missing_seq
+            || covered.first_missing_seq > gap.last_missing_seq
+        {
+            remaining.push(gap);
+            continue;
+        }
+        if gap.first_missing_seq < covered.first_missing_seq {
+            remaining.push(OutputGap {
+                first_missing_seq: gap.first_missing_seq,
+                last_missing_seq: covered.first_missing_seq.saturating_sub(1),
+            });
+        }
+        if covered.last_missing_seq < gap.last_missing_seq {
+            remaining.push(OutputGap {
+                first_missing_seq: covered.last_missing_seq.saturating_add(1),
+                last_missing_seq: gap.last_missing_seq,
+            });
+        }
+    }
+    remaining
+}
+
+fn pending_sequence_coverage(events: &OrderedSessionEvents, first: u64, last: u64) -> u64 {
+    if first > last {
+        return 0;
+    }
+    let pending = events.pending.range(first..=last).count() as u64;
+    let gaps = events
+        .recovery_gaps
+        .iter()
+        .map(|gap| {
+            let covered_first = gap.first_missing_seq.max(first);
+            let covered_last = gap.last_missing_seq.min(last);
+            if covered_first > covered_last {
+                0
+            } else {
+                covered_last.saturating_sub(covered_first).saturating_add(1)
+            }
+        })
+        .sum::<u64>();
+    pending.saturating_add(gaps)
+}
+
 fn first_missing_seq(events: &OrderedSessionEvents, target_seq: u64) -> u64 {
     let mut expected = events.last_published_seq.saturating_add(1);
-    for seq in events
-        .pending
-        .range(expected..=target_seq)
-        .map(|(seq, _)| *seq)
-    {
-        if seq != expected {
-            break;
+    while expected <= target_seq {
+        if events.pending.contains_key(&expected) {
+            expected = expected.saturating_add(1);
+            continue;
         }
-        expected = expected.saturating_add(1);
+        if let Some(gap) = events
+            .recovery_gaps
+            .iter()
+            .find(|gap| gap.first_missing_seq <= expected && expected <= gap.last_missing_seq)
+        {
+            expected = gap.last_missing_seq.saturating_add(1);
+            continue;
+        }
+        break;
     }
     expected
 }
@@ -467,6 +618,7 @@ impl Inner {
                         process_id: process_id.clone(),
                         after_seq: Some(session.last_published_seq()),
                         max_bytes: None,
+                        max_chunks: None,
                         wait_ms: Some(0),
                     },
                 )

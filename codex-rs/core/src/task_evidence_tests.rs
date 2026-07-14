@@ -2,6 +2,32 @@ use super::*;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 
+#[cfg(windows)]
+fn trusted_noop_command() -> Vec<String> {
+    vec!["where.exe".to_string()]
+}
+
+#[cfg(not(windows))]
+fn trusted_noop_command() -> Vec<String> {
+    vec!["true".to_string()]
+}
+
+#[cfg(windows)]
+fn trusted_exact_write_command(path: &str) -> Vec<String> {
+    vec![
+        "fsutil.exe".to_string(),
+        "file".to_string(),
+        "createnew".to_string(),
+        path.to_string(),
+        "0".to_string(),
+    ]
+}
+
+#[cfg(not(windows))]
+fn trusted_exact_write_command(path: &str) -> Vec<String> {
+    vec!["touch".to_string(), path.to_string()]
+}
+
 async fn install_wiring_guard_fixture(codex_home: &Path) -> PathBuf {
     let root = codex_home
         .join("plugins/cache/local-wiring-guards/wiring-guard")
@@ -71,9 +97,7 @@ async fn ledger_fixture() -> (tempfile::TempDir, PathBuf, TaskEvidenceLedger) {
 }
 
 async fn initialize_git_repo(repo: &Path) {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
+    let output = isolated_git_command(repo)
         .args(["init", "--quiet"])
         .output()
         .await
@@ -83,6 +107,43 @@ async fn initialize_git_repo(repo: &Path) {
         "git init failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+async fn run_git(repo: &Path, args: &[&str]) {
+    let output = isolated_git_command(repo)
+        .args(args)
+        .output()
+        .await
+        .expect("git command should run");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn isolated_git_command(repo: &Path) -> tokio::process::Command {
+    let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(repo)
+        .args([
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.hooksPath=.git/no-hooks",
+        ])
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", null_config)
+        .env("GIT_CONFIG_GLOBAL", null_config);
+    command
+}
+
+fn repo_uri(repo: &Path) -> PathUri {
+    PathUri::from_host_native_path(repo).expect("repository URI")
 }
 
 fn plan_item(id: &str, status: StepStatus) -> PlanItemArg {
@@ -118,6 +179,8 @@ fn command_receipt(id: &str) -> CommandReceipt {
         timed_out: false,
         duration_ms: 1,
         possible_mutation: false,
+        observation: None,
+        coverage: None,
     }
 }
 
@@ -131,6 +194,7 @@ fn validation_receipt(id: &str) -> ValidationReceipt {
         verdict: Some("VERIFIED".to_string()),
         tool_success: true,
         proof_bearing: true,
+        conclusion: Some(ValidationConclusion::Passed),
         active_files: Vec::new(),
         stale_reasons: Vec::new(),
         payload: None,
@@ -290,6 +354,7 @@ async fn generated_artifact_mutation_invalidates_validation_freshness() {
             Some("VERIFIED"),
             true,
             true,
+            true,
             Some(&validation_start),
             &[],
             &[],
@@ -333,6 +398,7 @@ async fn generated_artifact_mutation_invalidates_validation_freshness() {
         .record_verify_local(
             "final",
             Some("VERIFIED"),
+            true,
             true,
             true,
             Some(&revalidation_start),
@@ -520,6 +586,7 @@ async fn validation_rejects_files_that_change_after_the_start_snapshot() {
             Some("VERIFIED"),
             true,
             true,
+            true,
             Some(&validation_start),
             &[PathBuf::from("src/step.rs")],
             &[],
@@ -571,6 +638,7 @@ async fn validation_rejects_a_newly_discovered_active_file_that_changes_mid_run(
             Some("VERIFIED"),
             true,
             true,
+            true,
             Some(&validation_start),
             &[PathBuf::from("src/discovered.rs")],
             &[],
@@ -604,6 +672,10 @@ async fn older_persistence_snapshot_is_reported_as_superseded() {
     older.revision = document.revision.saturating_add(1);
     let mut newer = document;
     newer.revision = older.revision.saturating_add(1);
+    {
+        let mut guard = ledger.document.lock().await;
+        *guard.as_mut().expect("document") = newer.clone();
+    }
 
     assert_eq!(
         ledger.persist_document(&newer).await,
@@ -612,6 +684,728 @@ async fn older_persistence_snapshot_is_reported_as_superseded() {
     assert_eq!(
         ledger.persist_document(&older).await,
         PersistOutcome::Superseded
+    );
+}
+
+#[tokio::test]
+async fn complete_coverage_noop_is_unchanged_without_advancing_the_epoch() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    initialize_git_repo(&repo).await;
+    let cwd = repo_uri(&repo);
+    let command = trusted_noop_command();
+
+    ledger.record_command_intent("noop", &command, &cwd).await;
+    let observation = ledger
+        .record_command("noop", &command, &cwd, 0, false, 1, false)
+        .await;
+
+    assert_eq!(observation, Some(MutationObservation::Unchanged));
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    assert_eq!(document.evidence_epoch, 0);
+    let receipt = document.command_receipts.last().expect("command receipt");
+    assert_eq!(receipt.coverage, Some(MutationCoverage::Complete));
+    assert_eq!(receipt.observation, observation);
+}
+
+#[tokio::test]
+async fn git_failure_keeps_complete_syntax_observation_unknown() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    let cwd = repo_uri(&repo);
+    let command = trusted_noop_command();
+
+    ledger
+        .record_command_intent("git-failure", &command, &cwd)
+        .await;
+    assert_eq!(
+        ledger
+            .record_command("git-failure", &command, &cwd, 0, false, 1, false)
+            .await,
+        Some(MutationObservation::Unknown)
+    );
+}
+
+#[tokio::test]
+async fn incomplete_coverage_noop_is_unknown_and_advances_the_epoch() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    initialize_git_repo(&repo).await;
+    let cwd = repo_uri(&repo);
+    let command = vec!["echo".to_string(), "ok".to_string()];
+
+    ledger
+        .record_command_intent("unknown-noop", &command, &cwd)
+        .await;
+    let observation = ledger
+        .record_command("unknown-noop", &command, &cwd, 0, false, 1, false)
+        .await;
+
+    assert_eq!(observation, Some(MutationObservation::Unknown));
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    assert_eq!(document.evidence_epoch, 1);
+    assert_eq!(
+        document
+            .command_receipts
+            .last()
+            .and_then(|receipt| receipt.coverage),
+        Some(MutationCoverage::Incomplete)
+    );
+}
+
+#[tokio::test]
+async fn complete_coverage_detects_existing_untracked_content_changes_even_on_failure() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    initialize_git_repo(&repo).await;
+    tokio::fs::write(repo.join("existing.txt"), "before")
+        .await
+        .expect("write untracked file");
+    let cwd = repo_uri(&repo);
+    let command = trusted_exact_write_command("existing.txt");
+
+    ledger
+        .record_command_intent("untracked-change", &command, &cwd)
+        .await;
+    tokio::fs::write(repo.join("existing.txt"), "after")
+        .await
+        .expect("modify untracked file");
+    let observation = ledger
+        .record_command("untracked-change", &command, &cwd, 1, false, 1, true)
+        .await;
+
+    assert_eq!(observation, Some(MutationObservation::Changed));
+    assert_eq!(
+        ledger
+            .document
+            .lock()
+            .await
+            .as_ref()
+            .expect("document")
+            .evidence_epoch,
+        1
+    );
+}
+
+#[tokio::test]
+async fn complete_coverage_detects_changes_to_an_already_dirty_tracked_file() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    initialize_git_repo(&repo).await;
+    tokio::fs::write(repo.join("tracked.txt"), "clean")
+        .await
+        .expect("tracked file");
+    run_git(&repo, &["add", "tracked.txt"]).await;
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=KD4 Test",
+            "-c",
+            "user.email=kd4@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ],
+    )
+    .await;
+    tokio::fs::write(repo.join("tracked.txt"), "dirty-before")
+        .await
+        .expect("initial dirty content");
+    let cwd = repo_uri(&repo);
+    let command = trusted_exact_write_command("tracked.txt");
+
+    ledger
+        .record_command_intent("dirty-tracked-change", &command, &cwd)
+        .await;
+    tokio::fs::write(repo.join("tracked.txt"), "dirty-after")
+        .await
+        .expect("changed dirty content");
+
+    assert_eq!(
+        ledger
+            .record_command("dirty-tracked-change", &command, &cwd, 1, false, 1, true,)
+            .await,
+        Some(MutationObservation::Changed)
+    );
+}
+
+#[tokio::test]
+async fn fingerprint_is_content_sensitive_for_dirty_index_and_head_state() {
+    let (_temp, repo, _ledger) = ledger_fixture().await;
+    initialize_git_repo(&repo).await;
+    tokio::fs::write(repo.join("tracked.txt"), "one")
+        .await
+        .expect("tracked file");
+    run_git(&repo, &["add", "tracked.txt"]).await;
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=KD4 Test",
+            "-c",
+            "user.email=kd4@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ],
+    )
+    .await;
+    let artifacts = BTreeSet::new();
+    let clean = capture_stable_mutation_fingerprint(&repo, &artifacts)
+        .await
+        .expect("clean fingerprint");
+
+    tokio::fs::write(repo.join("tracked.txt"), "two")
+        .await
+        .expect("first dirty content");
+    let dirty = capture_stable_mutation_fingerprint(&repo, &artifacts)
+        .await
+        .expect("dirty fingerprint");
+    assert_ne!(clean, dirty);
+
+    tokio::fs::write(repo.join("tracked.txt"), "three")
+        .await
+        .expect("second dirty content");
+    let dirtier = capture_stable_mutation_fingerprint(&repo, &artifacts)
+        .await
+        .expect("content-sensitive dirty fingerprint");
+    assert_ne!(dirty, dirtier);
+
+    run_git(&repo, &["add", "tracked.txt"]).await;
+    let staged = capture_stable_mutation_fingerprint(&repo, &artifacts)
+        .await
+        .expect("staged fingerprint");
+    assert_ne!(dirtier, staged);
+
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=KD4 Test",
+            "-c",
+            "user.email=kd4@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "second",
+        ],
+    )
+    .await;
+    let committed = capture_stable_mutation_fingerprint(&repo, &artifacts)
+        .await
+        .expect("committed fingerprint");
+    assert_ne!(staged, committed);
+}
+
+#[tokio::test]
+async fn fingerprint_ignores_configured_pagers_external_diff_and_textconv() {
+    let (_temp, repo, _ledger) = ledger_fixture().await;
+    initialize_git_repo(&repo).await;
+    tokio::fs::write(repo.join(".gitattributes"), "*.txt diff=kd4\n")
+        .await
+        .expect("attributes");
+    tokio::fs::write(repo.join("tracked.txt"), "one")
+        .await
+        .expect("tracked file");
+    run_git(&repo, &["add", ".gitattributes", "tracked.txt"]).await;
+    run_git(
+        &repo,
+        &[
+            "-c",
+            "user.name=KD4 Test",
+            "-c",
+            "user.email=kd4@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ],
+    )
+    .await;
+    tokio::fs::write(repo.join("tracked.txt"), "two")
+        .await
+        .expect("dirty tracked file");
+    let artifacts = BTreeSet::new();
+    let baseline = capture_stable_mutation_fingerprint(&repo, &artifacts)
+        .await
+        .expect("baseline fingerprint");
+
+    run_git(&repo, &["config", "color.ui", "always"]).await;
+    run_git(&repo, &["config", "core.pager", "definitely-not-a-pager"]).await;
+    run_git(
+        &repo,
+        &["config", "diff.external", "definitely-not-an-external-diff"],
+    )
+    .await;
+    run_git(
+        &repo,
+        &["config", "diff.kd4.textconv", "definitely-not-a-textconv"],
+    )
+    .await;
+    run_git(&repo, &["config", "core.autocrlf", "true"]).await;
+    run_git(&repo, &["config", "core.quotePath", "true"]).await;
+    run_git(&repo, &["config", "diff.submodule", "log"]).await;
+    run_git(&repo, &["config", "diff.ignoreSubmodules", "all"]).await;
+    run_git(&repo, &["config", "diff.orderFile", "missing-order-file"]).await;
+
+    let configured = capture_stable_mutation_fingerprint(&repo, &artifacts)
+        .await
+        .expect("fixed invocation must ignore configurable presentation helpers");
+    assert_eq!(configured, baseline);
+}
+
+#[tokio::test]
+async fn fingerprint_rejects_a_covered_root_nested_below_git_toplevel() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let parent = temp.path().join("parent");
+    let nested = parent.join("nested");
+    tokio::fs::create_dir_all(&nested)
+        .await
+        .expect("nested root");
+    initialize_git_repo(&parent).await;
+
+    assert_eq!(
+        capture_stable_mutation_fingerprint(&nested, &BTreeSet::new()).await,
+        None
+    );
+}
+
+#[tokio::test]
+async fn ignored_target_requires_exact_registered_artifact_coverage() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    initialize_git_repo(&repo).await;
+    tokio::fs::write(repo.join(".gitignore"), "ignored.txt\n")
+        .await
+        .expect("gitignore");
+    let cwd = repo_uri(&repo);
+    let command = trusted_exact_write_command("ignored.txt");
+
+    ledger
+        .record_command_intent("ignored-unknown", &command, &cwd)
+        .await;
+    tokio::fs::write(repo.join("ignored.txt"), "created")
+        .await
+        .expect("ignored file");
+    assert_eq!(
+        ledger
+            .record_command("ignored-unknown", &command, &cwd, 0, false, 1, true)
+            .await,
+        Some(MutationObservation::Unknown)
+    );
+
+    {
+        let mut guard = ledger.document.lock().await;
+        let document = guard.as_mut().expect("document");
+        document
+            .generated_artifact_requirements
+            .push(GeneratedArtifactRequirement {
+                id: "ignored-artifact".to_string(),
+                step_id: None,
+                path: Some("ignored.txt".to_string()),
+                validation_command: Vec::new(),
+                source: "test".to_string(),
+                validation_receipt_ids: Vec::new(),
+            });
+        document.revision = document.revision.saturating_add(1);
+    }
+    ledger
+        .record_command_intent("ignored-known", &command, &cwd)
+        .await;
+    tokio::fs::write(repo.join("ignored.txt"), "modified")
+        .await
+        .expect("modify ignored artifact");
+    assert_eq!(
+        ledger
+            .record_command("ignored-known", &command, &cwd, 0, false, 1, true)
+            .await,
+        Some(MutationObservation::Changed)
+    );
+}
+
+#[tokio::test]
+async fn dynamic_touch_target_is_unknown() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    initialize_git_repo(&repo).await;
+    let cwd = repo_uri(&repo);
+    let command = vec!["touch".to_string(), "*.txt".to_string()];
+
+    ledger
+        .record_command_intent("dynamic", &command, &cwd)
+        .await;
+    assert_eq!(
+        ledger
+            .record_command("dynamic", &command, &cwd, 0, false, 1, true)
+            .await,
+        Some(MutationObservation::Unknown)
+    );
+}
+
+#[tokio::test]
+async fn untrusted_touch_executable_is_unknown() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    initialize_git_repo(&repo).await;
+    let executable = repo.join(if cfg!(windows) { "touch.exe" } else { "touch" });
+    tokio::fs::write(&executable, b"untrusted fixture")
+        .await
+        .expect("write untrusted executable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = tokio::fs::metadata(&executable)
+            .await
+            .expect("untrusted executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&executable, permissions)
+            .await
+            .expect("make fixture executable");
+    }
+    let cwd = repo_uri(&repo);
+    let command = vec![
+        executable.to_string_lossy().into_owned(),
+        "outside-model.txt".to_string(),
+    ];
+
+    ledger
+        .record_command_intent("untrusted-touch", &command, &cwd)
+        .await;
+    assert_eq!(
+        ledger
+            .record_command("untrusted-touch", &command, &cwd, 0, false, 1, true)
+            .await,
+        Some(MutationObservation::Unknown)
+    );
+}
+
+#[test]
+fn legacy_receipts_default_new_evidence_fields_conservatively() {
+    let mut command =
+        serde_json::to_value(command_receipt("legacy-command")).expect("serialize command receipt");
+    command
+        .as_object_mut()
+        .expect("command object")
+        .remove("observation");
+    command
+        .as_object_mut()
+        .expect("command object")
+        .remove("coverage");
+    let command: CommandReceipt =
+        serde_json::from_value(command).expect("deserialize legacy command receipt");
+    assert_eq!(command.observation, None);
+    assert_eq!(command.coverage, None);
+
+    let mut validation = serde_json::to_value(validation_receipt("legacy-validation"))
+        .expect("serialize validation receipt");
+    validation
+        .as_object_mut()
+        .expect("validation object")
+        .remove("conclusion");
+    let validation: ValidationReceipt =
+        serde_json::from_value(validation).expect("deserialize legacy validation receipt");
+    assert_eq!(validation.conclusion, None);
+}
+
+#[tokio::test]
+async fn final_failure_suppresses_later_fast_pass_for_the_epoch() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let final_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("final start");
+    assert!(
+        !ledger
+            .record_verify_local(
+                "final",
+                Some("FAILED"),
+                false,
+                false,
+                true,
+                Some(&final_start),
+                &[],
+                &[],
+                Some(&serde_json::json!({"verdict": "FAILED"})),
+            )
+            .await
+    );
+    let fast_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("fast start");
+    assert!(
+        !ledger
+            .record_verify_local(
+                "fast",
+                Some("VERIFIED"),
+                true,
+                true,
+                true,
+                Some(&fast_start),
+                &[],
+                &[],
+                Some(&serde_json::json!({"verdict": "VERIFIED"})),
+            )
+            .await
+    );
+
+    assert_eq!(
+        ledger
+            .document
+            .lock()
+            .await
+            .as_ref()
+            .expect("document")
+            .validation_epoch,
+        None
+    );
+}
+
+#[tokio::test]
+async fn inconclusive_final_does_not_suppress_fast_pass() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let final_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("final start");
+    ledger
+        .record_verify_local(
+            "final",
+            Some("INCONCLUSIVE"),
+            false,
+            false,
+            true,
+            Some(&final_start),
+            &[],
+            &[],
+            Some(&serde_json::json!({"verdict": "INCONCLUSIVE"})),
+        )
+        .await;
+    let fast_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("fast start");
+    assert!(
+        ledger
+            .record_verify_local(
+                "fast",
+                Some("VERIFIED"),
+                true,
+                true,
+                true,
+                Some(&fast_start),
+                &[],
+                &[],
+                Some(&serde_json::json!({"verdict": "VERIFIED"})),
+            )
+            .await
+    );
+}
+
+#[tokio::test]
+async fn failed_verdict_without_conclusive_completion_suppresses_nothing() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let final_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("final start");
+    ledger
+        .record_verify_local(
+            "final",
+            Some("FAILED"),
+            false,
+            false,
+            false,
+            Some(&final_start),
+            &[],
+            &[],
+            Some(&serde_json::json!({"verdict": "FAILED"})),
+        )
+        .await;
+    let fast_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("fast start");
+    assert!(
+        ledger
+            .record_verify_local(
+                "fast",
+                Some("VERIFIED"),
+                true,
+                true,
+                true,
+                Some(&fast_start),
+                &[],
+                &[],
+                Some(&serde_json::json!({"verdict": "VERIFIED"})),
+            )
+            .await
+    );
+}
+
+#[tokio::test]
+async fn conclusive_fast_suppresses_later_plan_for_the_epoch() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let fast_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("fast start");
+    ledger
+        .record_verify_local(
+            "fast",
+            Some("FAILED"),
+            false,
+            false,
+            true,
+            Some(&fast_start),
+            &[],
+            &[],
+            Some(&serde_json::json!({"verdict": "FAILED"})),
+        )
+        .await;
+    let plan_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("plan start");
+    assert!(
+        !ledger
+            .record_verify_local(
+                "plan",
+                Some("VERIFIED"),
+                true,
+                true,
+                true,
+                Some(&plan_start),
+                &[],
+                &[],
+                Some(&serde_json::json!({"verdict": "VERIFIED"})),
+            )
+            .await
+    );
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    assert_eq!(document.validation_epoch, None);
+    assert_eq!(document.verify_plan_epoch, None);
+}
+
+#[tokio::test]
+async fn authoritative_final_receipt_survives_history_trimming() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let mut guard = ledger.document.lock().await;
+    let document = guard.as_mut().expect("document");
+    let mut final_receipt = validation_receipt("authoritative-final");
+    final_receipt.conclusion = Some(ValidationConclusion::Failed);
+    document.validation_receipts.push(final_receipt);
+    for index in 0..=MAX_VALIDATION_RECEIPTS {
+        let mut receipt = validation_receipt(&format!("later-plan-{index}"));
+        receipt.mode = "plan".to_string();
+        receipt.conclusion = None;
+        document.validation_receipts.push(receipt);
+    }
+
+    trim_validation_receipts(document);
+
+    assert_eq!(document.validation_receipts.len(), MAX_VALIDATION_RECEIPTS);
+    assert!(
+        document
+            .validation_receipts
+            .iter()
+            .any(|receipt| receipt.id == "authoritative-final")
+    );
+    assert_eq!(
+        strongest_conclusive_validation_strength(document, document.evidence_epoch),
+        Some(validation_mode_strength("final"))
+    );
+}
+
+#[tokio::test]
+async fn final_pass_supersedes_fast_failure_and_late_plan_is_suppressed() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let fast_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("fast start");
+    ledger
+        .record_verify_local(
+            "fast",
+            Some("FAILED"),
+            false,
+            false,
+            true,
+            Some(&fast_start),
+            &[],
+            &[],
+            Some(&serde_json::json!({"verdict": "FAILED"})),
+        )
+        .await;
+    let final_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("final start");
+    assert!(
+        ledger
+            .record_verify_local(
+                "final",
+                Some("VERIFIED"),
+                true,
+                true,
+                true,
+                Some(&final_start),
+                &[],
+                &[],
+                Some(&serde_json::json!({"verdict": "VERIFIED"})),
+            )
+            .await
+    );
+    let plan_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("plan start");
+    ledger
+        .record_verify_local(
+            "plan",
+            Some("PLANNED"),
+            true,
+            false,
+            true,
+            Some(&plan_start),
+            &[],
+            &[],
+            Some(&serde_json::json!({"planned": []})),
+        )
+        .await;
+
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    assert_eq!(document.validation_epoch, Some(document.evidence_epoch));
+    assert_eq!(document.verify_plan_epoch, None);
+    assert!(
+        document
+            .risks
+            .iter()
+            .filter(|risk| risk.source == "verify_local")
+            .all(|risk| risk.resolved)
+    );
+}
+
+#[tokio::test]
+async fn finalization_exhaustion_returns_a_conservative_non_pass() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item(
+            "unstable",
+            StepStatus::Implemented,
+        )]))
+        .await;
+    ledger
+        .last_persisted_revision
+        .store(u64::MAX, Ordering::Release);
+
+    let gate = ledger.completion_gate().await.expect("completion gate");
+
+    assert_ne!(gate.status, TaskCompletionStatus::Passed);
+    assert!(
+        gate.reasons
+            .iter()
+            .any(|reason| { reason.contains("evidence changed during finalization") })
     );
 }
 

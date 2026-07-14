@@ -55,9 +55,12 @@ impl RemoteExecProcess {
         &self,
         after_seq: Option<u64>,
         max_bytes: Option<usize>,
+        max_chunks: Option<usize>,
         wait_ms: Option<u64>,
     ) -> Result<ReadResponse, crate::ExecServerError> {
-        self.session.read(after_seq, max_bytes, wait_ms).await
+        self.session
+            .read_with_limits(after_seq, max_bytes, max_chunks, wait_ms)
+            .await
     }
 
     async fn write(&self, chunk: Vec<u8>) -> Result<WriteResponse, crate::ExecServerError> {
@@ -95,7 +98,21 @@ impl ExecProcess for RemoteExecProcess {
         max_bytes: Option<usize>,
         wait_ms: Option<u64>,
     ) -> ExecProcessFuture<'_, ReadResponse> {
-        Box::pin(RemoteExecProcess::read(self, after_seq, max_bytes, wait_ms))
+        Box::pin(RemoteExecProcess::read(
+            self, after_seq, max_bytes, None, wait_ms,
+        ))
+    }
+
+    fn read_with_limits(
+        &self,
+        after_seq: Option<u64>,
+        max_bytes: Option<usize>,
+        max_chunks: Option<usize>,
+        wait_ms: Option<u64>,
+    ) -> ExecProcessFuture<'_, ReadResponse> {
+        Box::pin(RemoteExecProcess::read(
+            self, after_seq, max_bytes, max_chunks, wait_ms,
+        ))
     }
 
     fn write(&self, chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {

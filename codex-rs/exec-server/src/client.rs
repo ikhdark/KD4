@@ -91,6 +91,7 @@ use crate::protocol::INITIALIZE_METHOD;
 use crate::protocol::INITIALIZED_METHOD;
 use crate::protocol::InitializeParams;
 use crate::protocol::InitializeResponse;
+use crate::protocol::OutputGap;
 use crate::protocol::ProcessOutputChunk;
 use crate::protocol::ProcessSignal;
 use crate::protocol::ReadParams;
@@ -171,6 +172,10 @@ struct OrderedSessionEvents {
     last_published_seq: u64,
     exit_published: bool,
     closed_published: bool,
+    // Proven evicted-output ranges are sequence coverage, but not process
+    // events. Recovery uses them to unblock later retained and lifecycle
+    // events while the watch channel wakes readers to collect the metadata.
+    recovery_gaps: Vec<OutputGap>,
     // Server-side output, exit, and closed notifications are emitted by
     // different tasks and can reach the client out of order. Keep future events
     // here until all lower sequence numbers have been published.
@@ -1009,6 +1014,12 @@ impl SessionState {
         loop {
             let next_seq = ordered_events.last_published_seq.saturating_add(1);
             let Some(event) = ordered_events.pending.remove(&next_seq) else {
+                if let Some(gap) = ordered_events.recovery_gaps.iter().find(|gap| {
+                    gap.first_missing_seq <= next_seq && next_seq <= gap.last_missing_seq
+                }) {
+                    ordered_events.last_published_seq = gap.last_missing_seq;
+                    continue;
+                }
                 break;
             };
             ordered_events.pending_bytes = ordered_events
@@ -1054,6 +1065,7 @@ impl SessionState {
         let next_seq = (*self.wake_tx.borrow()).saturating_add(1);
         ReadResponse {
             chunks: Vec::new(),
+            output_gaps: Vec::new(),
             next_seq,
             exited: true,
             exit_code: None,
@@ -1075,6 +1087,37 @@ impl OrderedSessionEvents {
         let Some(seq) = event.seq() else {
             return Err("cannot reorder an unsequenced process event".to_string());
         };
+        if self
+            .recovery_gaps
+            .iter()
+            .any(|gap| gap.first_missing_seq <= seq && seq <= gap.last_missing_seq)
+        {
+            if !matches!(event, ExecProcessEvent::Output(_)) {
+                return Err(format!(
+                    "lifecycle event sequence {seq} overlaps evicted output"
+                ));
+            }
+            let mut repaired = Vec::with_capacity(self.recovery_gaps.len().saturating_add(1));
+            for gap in self.recovery_gaps.drain(..) {
+                if seq < gap.first_missing_seq || seq > gap.last_missing_seq {
+                    repaired.push(gap);
+                    continue;
+                }
+                if gap.first_missing_seq < seq {
+                    repaired.push(OutputGap {
+                        first_missing_seq: gap.first_missing_seq,
+                        last_missing_seq: seq.saturating_sub(1),
+                    });
+                }
+                if seq < gap.last_missing_seq {
+                    repaired.push(OutputGap {
+                        first_missing_seq: seq.saturating_add(1),
+                        last_missing_seq: gap.last_missing_seq,
+                    });
+                }
+            }
+            self.recovery_gaps = repaired;
+        }
         if self.pending.contains_key(&seq) {
             return Ok(());
         }
@@ -1145,10 +1188,22 @@ impl Session {
         self.state.subscribe_events()
     }
 
+    #[cfg(test)]
     pub(crate) async fn read(
         &self,
         after_seq: Option<u64>,
         max_bytes: Option<usize>,
+        wait_ms: Option<u64>,
+    ) -> Result<ReadResponse, ExecServerError> {
+        self.read_with_limits(after_seq, max_bytes, None, wait_ms)
+            .await
+    }
+
+    pub(crate) async fn read_with_limits(
+        &self,
+        after_seq: Option<u64>,
+        max_bytes: Option<usize>,
+        max_chunks: Option<usize>,
         wait_ms: Option<u64>,
     ) -> Result<ReadResponse, ExecServerError> {
         loop {
@@ -1162,6 +1217,7 @@ impl Session {
                     process_id: self.process_id.clone(),
                     after_seq,
                     max_bytes,
+                    max_chunks,
                     wait_ms,
                 })
                 .await
@@ -2181,6 +2237,7 @@ mod tests {
                     id: recovery_read.id,
                     result: serde_json::to_value(ReadResponse {
                         chunks: Vec::new(),
+                        output_gaps: Vec::new(),
                         next_seq: 1,
                         exited: false,
                         exit_code: None,

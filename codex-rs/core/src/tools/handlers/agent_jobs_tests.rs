@@ -1,6 +1,7 @@
 use super::*;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use tokio::sync::watch;
 
 #[test]
 fn parse_csv_supports_quotes_and_commas() {
@@ -59,4 +60,49 @@ fn ensure_unique_headers_rejects_duplicates() {
         err,
         FunctionCallError::RespondToModel("csv header path is duplicated".to_string())
     );
+}
+
+#[test]
+fn changed_agent_status_is_consumed_once() {
+    let (status_tx, status_rx) = watch::channel(AgentStatus::Running);
+    let mut item = ActiveJobItem {
+        item_id: "item-1".to_string(),
+        started_at: Instant::now(),
+        status_rx: Some(status_rx),
+    };
+
+    status_tx
+        .send(AgentStatus::Completed(Some("done".to_string())))
+        .expect("status receiver should remain open");
+
+    assert_eq!(
+        take_changed_status(&mut item),
+        Some(AgentStatus::Completed(Some("done".to_string())))
+    );
+    assert_eq!(take_changed_status(&mut item), None);
+}
+
+#[tokio::test]
+async fn closed_status_receiver_uses_bounded_polling_fallback() {
+    let (status_tx, status_rx) = watch::channel(AgentStatus::Running);
+    drop(status_tx);
+    let thread_id = ThreadId::new();
+    let active_items = HashMap::from([(
+        thread_id,
+        ActiveJobItem {
+            item_id: "item-closed".to_string(),
+            started_at: Instant::now(),
+            status_rx: Some(status_rx),
+        },
+    )]);
+    let started = Instant::now();
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_status_change(&active_items),
+    )
+    .await
+    .expect("closed watch fallback should remain bounded");
+
+    assert!(started.elapsed() >= STATUS_POLL_INTERVAL);
 }

@@ -1,5 +1,17 @@
 use crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+const OUTPUT_EVIDENCE_MARKER_MAX_BYTES: usize = 256;
+
+#[derive(Debug, Default)]
+pub(crate) struct OutputRecoveryEvidence {
+    generation: u64,
+    detail: Option<String>,
+}
+
+pub(crate) type SharedOutputRecoveryEvidence = Arc<Mutex<OutputRecoveryEvidence>>;
 
 /// A capped buffer that preserves a stable prefix ("head") and suffix ("tail"),
 /// dropping the middle once it exceeds the configured maximum. The buffer is
@@ -18,6 +30,8 @@ pub(crate) struct HeadTailBuffer {
     unreported_omitted_bytes: usize,
     lagged_chunks: u64,
     unreported_lagged_chunks: u64,
+    recovery_evidence: SharedOutputRecoveryEvidence,
+    reported_recovery_generation: u64,
 }
 
 impl Default for HeadTailBuffer {
@@ -32,6 +46,13 @@ impl HeadTailBuffer {
     /// The retained output is split across a prefix ("head") and suffix ("tail")
     /// budget, dropping bytes from the middle once the limit is exceeded.
     pub(crate) fn new(max_bytes: usize) -> Self {
+        Self::new_with_recovery_evidence(max_bytes, Arc::new(Mutex::new(Default::default())))
+    }
+
+    pub(crate) fn new_with_recovery_evidence(
+        max_bytes: usize,
+        recovery_evidence: SharedOutputRecoveryEvidence,
+    ) -> Self {
         let head_budget = max_bytes / 2;
         let tail_budget = max_bytes.saturating_sub(head_budget);
         Self {
@@ -46,7 +67,44 @@ impl HeadTailBuffer {
             unreported_omitted_bytes: 0,
             lagged_chunks: 0,
             unreported_lagged_chunks: 0,
+            recovery_evidence,
+            reported_recovery_generation: 0,
         }
+    }
+
+    pub(crate) fn record_recovery_detail(&self, detail: String) -> bool {
+        Self::record_shared_recovery_detail(&self.recovery_evidence, detail)
+    }
+
+    pub(crate) fn record_shared_recovery_detail(
+        recovery_evidence: &SharedOutputRecoveryEvidence,
+        detail: String,
+    ) -> bool {
+        let mut evidence = recovery_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if evidence.detail.as_deref() == Some(detail.as_str()) {
+            return false;
+        }
+        evidence.detail = Some(detail);
+        evidence.generation = evidence.generation.saturating_add(1);
+        true
+    }
+
+    pub(crate) fn take_unreported_recovery_detail(&mut self) -> Option<String> {
+        let evidence = self
+            .recovery_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if evidence.generation <= self.reported_recovery_generation {
+            return None;
+        }
+        self.reported_recovery_generation = evidence.generation;
+        evidence.detail.clone()
+    }
+
+    pub(crate) fn record_external_omitted_bytes(&mut self, omitted: usize) {
+        self.record_omitted_bytes(omitted);
     }
 
     // Used for tests.
@@ -75,6 +133,7 @@ impl HeadTailBuffer {
         self.unreported_lagged_chunks = self.unreported_lagged_chunks.saturating_add(skipped);
     }
 
+    #[allow(dead_code)]
     pub(crate) fn lagged_chunks(&self) -> u64 {
         self.lagged_chunks
     }
@@ -146,6 +205,48 @@ impl HeadTailBuffer {
         out
     }
 
+    pub(crate) fn render_bytes(&self) -> Vec<u8> {
+        self.render_with_fallback(&[])
+    }
+
+    pub(crate) fn render_with_fallback(&self, fallback: &[u8]) -> Vec<u8> {
+        let retained = self.to_bytes();
+        let data = if retained.is_empty() {
+            fallback
+        } else {
+            retained.as_slice()
+        };
+        let recovery_detail = self
+            .recovery_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .detail
+            .clone();
+        render_capped_output(
+            data,
+            self.max_bytes,
+            self.omitted_bytes,
+            self.lagged_chunks,
+            recovery_detail.as_deref(),
+        )
+    }
+
+    pub(crate) fn render_external_bytes(&self, data: &[u8]) -> Vec<u8> {
+        let recovery_detail = self
+            .recovery_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .detail
+            .clone();
+        render_capped_output(
+            data,
+            self.max_bytes,
+            self.omitted_bytes,
+            self.lagged_chunks,
+            recovery_detail.as_deref(),
+        )
+    }
+
     /// Drain all retained chunks from the buffer and reset its byte state.
     ///
     /// The drained chunks are returned in head-then-tail order. Omitted bytes
@@ -214,6 +315,94 @@ impl HeadTailBuffer {
         self.omitted_bytes = self.omitted_bytes.saturating_add(omitted);
         self.unreported_omitted_bytes = self.unreported_omitted_bytes.saturating_add(omitted);
     }
+}
+
+fn render_capped_output(
+    data: &[u8],
+    cap: usize,
+    recorded_omitted_bytes: usize,
+    lagged_chunks: u64,
+    recovery_detail: Option<&str>,
+) -> Vec<u8> {
+    if cap == 0 {
+        return Vec::new();
+    }
+
+    let base_omitted_bytes = recorded_omitted_bytes.saturating_add(data.len().saturating_sub(cap));
+    if base_omitted_bytes == 0 && lagged_chunks == 0 && recovery_detail.is_none() {
+        return data.to_vec();
+    }
+
+    let mut omitted_bytes = base_omitted_bytes;
+    let mut marker = output_evidence_marker(omitted_bytes, lagged_chunks, recovery_detail);
+    for _ in 0..8 {
+        let data_budget = cap.saturating_sub(marker.len());
+        let stabilized_omitted =
+            recorded_omitted_bytes.saturating_add(data.len().saturating_sub(data_budget));
+        let stabilized_marker =
+            output_evidence_marker(stabilized_omitted, lagged_chunks, recovery_detail);
+        if stabilized_omitted == omitted_bytes && stabilized_marker.len() == marker.len() {
+            marker = stabilized_marker;
+            break;
+        }
+        omitted_bytes = stabilized_omitted;
+        marker = stabilized_marker;
+    }
+
+    if marker.len() >= cap {
+        marker.truncate(cap);
+        return marker;
+    }
+
+    let data_budget = cap.saturating_sub(marker.len());
+    let head_budget = data_budget / 2;
+    let tail_budget = data_budget.saturating_sub(head_budget);
+    let head_len = data.len().min(head_budget);
+    let tail_len = data.len().saturating_sub(head_len).min(tail_budget);
+    let mut output = Vec::with_capacity(head_len + marker.len() + tail_len);
+    output.extend_from_slice(&data[..head_len]);
+    output.extend_from_slice(&marker);
+    if tail_len > 0 {
+        output.extend_from_slice(&data[data.len() - tail_len..]);
+    }
+    output
+}
+
+fn output_evidence_marker(
+    omitted_bytes: usize,
+    lagged_chunks: u64,
+    recovery_detail: Option<&str>,
+) -> Vec<u8> {
+    let mut marker = match (omitted_bytes, lagged_chunks, recovery_detail) {
+        (omitted_bytes, 0, None) => format!(
+            "\n[output truncated: {omitted_bytes} byte(s) omitted from the middle by the output retention limit]\n"
+        ),
+        (0, lagged_chunks, None) => format!(
+            "\n[output unavailable: streaming receiver lagged by {lagged_chunks} chunk(s)]\n"
+        ),
+        _ => {
+            let mut details = Vec::new();
+            if omitted_bytes > 0 {
+                details.push(format!(
+                    "{omitted_bytes} byte(s) omitted from the middle by the output retention limit"
+                ));
+            }
+            if lagged_chunks > 0 {
+                details.push(format!(
+                    "streaming receiver lagged by {lagged_chunks} chunk(s)"
+                ));
+            }
+            if let Some(recovery_detail) = recovery_detail {
+                details.push(recovery_detail.to_string());
+            }
+            format!("\n[output incomplete: {}]\n", details.join("; "))
+        }
+    }
+    .into_bytes();
+    if marker.len() > OUTPUT_EVIDENCE_MARKER_MAX_BYTES {
+        marker = b"\n[output incomplete]\n".to_vec();
+    }
+    marker
 }
 
 #[cfg(test)]

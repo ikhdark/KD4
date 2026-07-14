@@ -3,18 +3,23 @@ use std::os::unix::process::ExitStatusExt;
 
 use std::collections::HashMap;
 use std::io;
+use std::io::SeekFrom;
 #[cfg(target_os = "windows")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use async_channel::Sender;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
+use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
+use tokio::sync::Mutex as TokioMutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::sandboxing::ExecOptions;
@@ -23,6 +28,7 @@ use crate::sandboxing::SandboxPermissions;
 use crate::spawn::SpawnChildRequest;
 use crate::spawn::StdioPolicy;
 use crate::spawn::spawn_child_async;
+use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
@@ -87,6 +93,7 @@ pub(crate) const MAX_EXEC_OUTPUT_DELTAS_PER_CALL: usize = 10_000;
 // That would cause the `read_capped` tasks to block on `read()`
 // indefinitely, effectively hanging the whole agent.
 pub const IO_DRAIN_TIMEOUT_MS: u64 = 2_000; // 2 s should be plenty for local pipes
+const IO_DRAIN_INCOMPLETE_MARKER: &[u8] = b"\n[output incomplete: stdout/stderr drain timed out]\n";
 
 #[derive(Debug)]
 pub struct ExecParams {
@@ -759,6 +766,8 @@ async fn exec_windows_sandbox(
         stderr,
         aggregated_output,
         timed_out: capture.timed_out,
+        io_drain_incomplete: false,
+        retained_bytes_cap: capture_policy.retained_bytes_cap(),
     })
 }
 
@@ -790,7 +799,14 @@ fn finalize_exec_result(
 
             let stdout = raw_output.stdout.from_utf8_lossy();
             let stderr = raw_output.stderr.from_utf8_lossy();
-            let aggregated_output = raw_output.aggregated_output.from_utf8_lossy();
+            let mut aggregated_output = raw_output.aggregated_output;
+            if raw_output.io_drain_incomplete {
+                aggregated_output.text = insert_io_drain_incomplete_marker(
+                    aggregated_output.text,
+                    raw_output.retained_bytes_cap,
+                );
+            }
+            let aggregated_output = aggregated_output.from_utf8_lossy();
             let exec_output = ExecToolCallOutput {
                 exit_code,
                 stdout,
@@ -829,16 +845,34 @@ struct RawExecToolCallOutput {
     pub stderr: StreamOutput<Vec<u8>>,
     pub aggregated_output: StreamOutput<Vec<u8>>,
     pub timed_out: bool,
+    pub io_drain_incomplete: bool,
+    pub retained_bytes_cap: Option<usize>,
 }
 
-#[inline]
-fn append_capped(dst: &mut Vec<u8>, src: &[u8], max_bytes: usize) {
-    if dst.len() >= max_bytes {
-        return;
+fn insert_io_drain_incomplete_marker(mut data: Vec<u8>, max_bytes: Option<usize>) -> Vec<u8> {
+    let Some(max_bytes) = max_bytes else {
+        data.extend_from_slice(IO_DRAIN_INCOMPLETE_MARKER);
+        return data;
+    };
+    if max_bytes == 0 {
+        return Vec::new();
     }
-    let remaining = max_bytes.saturating_sub(dst.len());
-    let take = remaining.min(src.len());
-    dst.extend_from_slice(&src[..take]);
+    if IO_DRAIN_INCOMPLETE_MARKER.len() >= max_bytes {
+        return IO_DRAIN_INCOMPLETE_MARKER[..max_bytes].to_vec();
+    }
+
+    let data_budget = max_bytes.saturating_sub(IO_DRAIN_INCOMPLETE_MARKER.len());
+    if data.len() <= data_budget {
+        data.extend_from_slice(IO_DRAIN_INCOMPLETE_MARKER);
+        return data;
+    }
+    let head_len = data_budget / 2;
+    let tail_len = data_budget.saturating_sub(head_len);
+    let mut rendered = Vec::with_capacity(max_bytes);
+    rendered.extend_from_slice(&data[..head_len]);
+    rendered.extend_from_slice(IO_DRAIN_INCOMPLETE_MARKER);
+    rendered.extend_from_slice(&data[data.len().saturating_sub(tail_len)..]);
+    rendered
 }
 
 fn aggregate_output(
@@ -980,17 +1014,22 @@ async fn consume_output(
     })?;
 
     let retained_bytes_cap = capture_policy.retained_bytes_cap();
+    let fallback_bytes_cap = retained_bytes_cap.unwrap_or(EXEC_OUTPUT_MAX_BYTES);
+    let stdout_output = Arc::new(TokioMutex::new(HeadTailBuffer::new(fallback_bytes_cap)));
+    let stderr_output = Arc::new(TokioMutex::new(HeadTailBuffer::new(fallback_bytes_cap)));
     let stdout_handle = tokio::spawn(read_output(
         BufReader::new(stdout_reader),
         stdout_stream.clone(),
         /*is_stderr*/ false,
-        retained_bytes_cap,
+        Arc::clone(&stdout_output),
+        retained_bytes_cap.is_none(),
     ));
     let stderr_handle = tokio::spawn(read_output(
         BufReader::new(stderr_reader),
         stdout_stream.clone(),
         /*is_stderr*/ true,
-        retained_bytes_cap,
+        Arc::clone(&stderr_output),
+        retained_bytes_cap.is_none(),
     ));
 
     let expiration_wait = async {
@@ -1058,34 +1097,67 @@ async fn consume_output(
         }
     };
 
-    // We need mutable bindings so we can `abort()` them on timeout.
-    use tokio::task::JoinHandle;
-
-    async fn await_output(
-        handle: &mut JoinHandle<std::io::Result<StreamOutput<Vec<u8>>>>,
-        timeout: Duration,
-    ) -> std::io::Result<StreamOutput<Vec<u8>>> {
-        match tokio::time::timeout(timeout, &mut *handle).await {
-            Ok(join_res) => match join_res {
-                Ok(io_res) => io_res,
-                Err(join_err) => Err(std::io::Error::other(join_err)),
-            },
-            Err(_elapsed) => {
-                // Timeout: abort the task to avoid hanging on open pipes.
-                handle.abort();
-                Ok(StreamOutput {
-                    text: Vec::new(),
-                    truncated_after_lines: None,
-                })
-            }
-        }
-    }
-
     let mut stdout_handle = stdout_handle;
     let mut stderr_handle = stderr_handle;
-
-    let stdout = await_output(&mut stdout_handle, capture_policy.io_drain_timeout()).await?;
-    let stderr = await_output(&mut stderr_handle, capture_policy.io_drain_timeout()).await?;
+    let drain_deadline = tokio::time::sleep(capture_policy.io_drain_timeout());
+    tokio::pin!(drain_deadline);
+    let mut stdout_result = None;
+    let mut stderr_result = None;
+    let io_drain_incomplete = loop {
+        if stdout_result.is_some() && stderr_result.is_some() {
+            break false;
+        }
+        tokio::select! {
+            result = &mut stdout_handle, if stdout_result.is_none() => {
+                stdout_result = Some(result);
+            }
+            result = &mut stderr_handle, if stderr_result.is_none() => {
+                stderr_result = Some(result);
+            }
+            _ = &mut drain_deadline => {
+                break true;
+            }
+        }
+    };
+    if io_drain_incomplete {
+        if stdout_result.is_none() {
+            stdout_handle.abort();
+            let _ = stdout_handle.await;
+        }
+        if stderr_result.is_none() {
+            stderr_handle.abort();
+            let _ = stderr_handle.await;
+        }
+    }
+    let completed_output = |result: Option<
+        std::result::Result<std::io::Result<Option<Vec<u8>>>, tokio::task::JoinError>,
+    >|
+     -> std::io::Result<Option<Vec<u8>>> {
+        match result {
+            Some(result) => result.map_err(std::io::Error::other)?,
+            None => Ok(None),
+        }
+    };
+    let stdout_completed = completed_output(stdout_result)?;
+    let stderr_completed = completed_output(stderr_result)?;
+    let stdout_fallback = stdout_output.lock().await.to_bytes();
+    let stderr_fallback = stderr_output.lock().await.to_bytes();
+    let stdout = StreamOutput {
+        text: if io_drain_incomplete {
+            stdout_fallback
+        } else {
+            stdout_completed.unwrap_or(stdout_fallback)
+        },
+        truncated_after_lines: None,
+    };
+    let stderr = StreamOutput {
+        text: if io_drain_incomplete {
+            stderr_fallback
+        } else {
+            stderr_completed.unwrap_or(stderr_fallback)
+        },
+        truncated_after_lines: None,
+    };
     let aggregated_output = aggregate_output(&stdout, &stderr, retained_bytes_cap);
 
     Ok(RawExecToolCallOutput {
@@ -1094,6 +1166,8 @@ async fn consume_output(
         stderr,
         aggregated_output,
         timed_out,
+        io_drain_incomplete,
+        retained_bytes_cap,
     })
 }
 
@@ -1101,13 +1175,14 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
     stream: Option<StdoutStream>,
     is_stderr: bool,
-    max_bytes: Option<usize>,
-) -> io::Result<StreamOutput<Vec<u8>>> {
-    let mut buf = Vec::with_capacity(
-        max_bytes.map_or(AGGREGATE_BUFFER_INITIAL_CAPACITY, |max_bytes| {
-            AGGREGATE_BUFFER_INITIAL_CAPACITY.min(max_bytes)
-        }),
-    );
+    retained_output: Arc<TokioMutex<HeadTailBuffer>>,
+    retain_full_output: bool,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut full_output = if retain_full_output {
+        Some(tokio::fs::File::from_std(tempfile::tempfile()?))
+    } else {
+        None
+    };
     let mut tmp = [0u8; READ_CHUNK_SIZE];
     let mut emitted_deltas: usize = 0;
 
@@ -1139,18 +1214,21 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
             emitted_deltas += 1;
         }
 
-        if let Some(max_bytes) = max_bytes {
-            append_capped(&mut buf, &tmp[..n], max_bytes);
-        } else {
-            buf.extend_from_slice(&tmp[..n]);
+        retained_output.lock().await.push_chunk(tmp[..n].to_vec());
+        if let Some(full_output) = full_output.as_mut() {
+            full_output.write_all(&tmp[..n]).await?;
         }
         // Continue reading to EOF to avoid back-pressure
     }
 
-    Ok(StreamOutput {
-        text: buf,
-        truncated_after_lines: None,
-    })
+    let Some(mut full_output) = full_output else {
+        return Ok(None);
+    };
+    full_output.flush().await?;
+    full_output.seek(SeekFrom::Start(0)).await?;
+    let mut contents = Vec::with_capacity(AGGREGATE_BUFFER_INITIAL_CAPACITY);
+    full_output.read_to_end(&mut contents).await?;
+    Ok(Some(contents))
 }
 
 #[cfg(unix)]

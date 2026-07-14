@@ -119,6 +119,7 @@ pub(super) fn lagged_output_marker(skipped: u64) -> Vec<u8> {
         .into_bytes()
 }
 
+#[cfg(test)]
 pub(super) fn omitted_output_marker(omitted_bytes: usize) -> Vec<u8> {
     format!(
         "\n[output truncated: {omitted_bytes} byte(s) omitted from the middle by the output retention limit]\n"
@@ -340,10 +341,8 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         resolve_aggregated_output(&transcript, fallback_output).await
     } else {
         let guard = transcript.lock().await;
-        let omitted_bytes = guard.omitted_bytes();
-        let lagged_chunks = guard.lagged_chunks();
-        drop(guard);
-        append_output_loss_markers(fallback_output, omitted_bytes, lagged_chunks)
+        String::from_utf8_lossy(&guard.render_external_bytes(fallback_output.as_bytes()))
+            .into_owned()
     };
     let aggregated_output = if stdout.is_empty() {
         message.clone()
@@ -414,19 +413,10 @@ pub(super) async fn resolve_aggregated_output(
     fallback: String,
 ) -> String {
     let guard = transcript.lock().await;
-    let retained = guard.to_bytes();
-    let omitted_bytes = guard.omitted_bytes();
-    let lagged_chunks = guard.lagged_chunks();
-    drop(guard);
-
-    let aggregated_output = if retained.is_empty() {
-        fallback
-    } else {
-        String::from_utf8_lossy(&retained).to_string()
-    };
-    append_output_loss_markers(aggregated_output, omitted_bytes, lagged_chunks)
+    String::from_utf8_lossy(&guard.render_with_fallback(fallback.as_bytes())).into_owned()
 }
 
+#[cfg(test)]
 fn append_output_loss_markers(
     mut output: String,
     omitted_bytes: usize,

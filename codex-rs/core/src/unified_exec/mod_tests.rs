@@ -153,6 +153,7 @@ async fn exec_command_with_tty(
         output_closed,
         output_closed_notify,
         cancellation_token,
+        recovery_evidence: _,
     } = process.output_handles();
     let deadline = started_at + Duration::from_millis(yield_time_ms);
     let collected = UnifiedExecProcessManager::collect_output_until_deadline(
@@ -163,6 +164,7 @@ async fn exec_command_with_tty(
         &cancellation_token,
         Some(session.subscribe_elicitation_pause_state()),
         deadline,
+        process_manager::CollectionMode::AfterQuietPeriod(Duration::from_millis(100)),
     )
     .await;
     let wall_time = Instant::now().saturating_duration_since(started_at);
@@ -226,6 +228,7 @@ impl BlockingTerminateExecProcess {
     async fn read(&self) -> Result<ReadResponse, codex_exec_server::ExecServerError> {
         Ok(ReadResponse {
             chunks: Vec::new(),
+            output_gaps: Vec::new(),
             next_seq: 1,
             exited: false,
             exit_code: None,
@@ -874,6 +877,7 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
         output_closed,
         output_closed_notify,
         cancellation_token,
+        recovery_evidence: _,
     } = process.output_handles();
     let collected = UnifiedExecProcessManager::collect_output_until_deadline(
         &output_buffer,
@@ -883,6 +887,7 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
         &cancellation_token,
         /*pause_state*/ None,
         Instant::now() + Duration::from_millis(2_500),
+        process_manager::CollectionMode::UntilDeadline,
     )
     .await;
 

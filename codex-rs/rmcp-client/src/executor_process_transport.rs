@@ -279,6 +279,15 @@ impl ExecutorProcessTransport {
             )
             .await
             .map_err(io::Error::other)?;
+        if !response.output_gaps.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "remote MCP stdout is incomplete after retained-output eviction: {:?}",
+                    response.output_gaps
+                ),
+            ));
+        }
         for chunk in response.chunks {
             self.push_process_output_if_new(chunk);
         }

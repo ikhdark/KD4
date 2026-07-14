@@ -100,10 +100,9 @@ impl ToolCallRuntime {
         let supports_parallel = self.router.tool_supports_parallel(&call);
         let router = Arc::clone(&self.router);
         let session = Arc::clone(&self.session);
+        let accepted_session = Arc::clone(&session);
         let step_context = Arc::clone(&self.step_context);
         let turn = Arc::clone(&step_context.turn);
-        turn.turn_timing_state.record_tool_call();
-        let turn_tool_execution_guard = turn.turn_timing_state.begin_tool_execution();
         let tracker = Arc::clone(&self.tracker);
         let lock = Arc::clone(&self.parallel_execution);
         let invocation_cancellation_token = cancellation_token.clone();
@@ -130,8 +129,22 @@ impl ToolCallRuntime {
         );
         let abort_dispatch_span = dispatch_span.clone();
 
-        let mut dispatch_handle: AbortOnDropHandle<Result<AnyToolResult, FunctionCallError>> =
-            AbortOnDropHandle::new(tokio::spawn(async move {
+        async move {
+            turn.turn_timing_state.record_tool_call();
+            {
+                let mut active = accepted_session.active_turn.lock().await;
+                if let Some(active_turn) = active.as_mut() {
+                    let mut turn_state = active_turn.turn_state.lock().await;
+                    turn_state.tool_calls = turn_state.tool_calls.saturating_add(1);
+                }
+            }
+
+            let turn_tool_execution_guard = turn.turn_timing_state.begin_tool_execution();
+            let _tool_call_timing_guard = tool_call_timing_guard;
+            let _turn_tool_execution_guard = turn_tool_execution_guard;
+            let mut dispatch_handle: AbortOnDropHandle<
+                Result<AnyToolResult, FunctionCallError>,
+            > = AbortOnDropHandle::new(tokio::spawn(async move {
                 let _guard = if supports_parallel {
                     Either::Left(lock.read().await)
                 } else {
@@ -156,10 +169,6 @@ impl ToolCallRuntime {
                     .instrument(dispatch_span.clone())
                     .await
             }));
-
-        async move {
-            let _tool_call_timing_guard = tool_call_timing_guard;
-            let _turn_tool_execution_guard = turn_tool_execution_guard;
             tokio::select! {
                 res = &mut dispatch_handle => res.map_err(Self::tool_task_join_error)?,
                 _ = cancellation_token.cancelled() => {
@@ -407,11 +416,110 @@ mod tests {
         });
     }
 
+    async fn accepted_tool_call_count(session: &Session) -> u64 {
+        let active = session.active_turn.lock().await;
+        let turn_state = Arc::clone(
+            &active
+                .as_ref()
+                .expect("test session should have an active turn")
+                .turn_state,
+        );
+        drop(active);
+        turn_state.lock().await.tool_calls
+    }
+
+    #[tokio::test]
+    async fn accepted_tool_calls_are_counted_once_at_the_common_envelope() -> anyhow::Result<()> {
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+        let turn_context = Arc::new(turn_context);
+        let tool_name = codex_tools::ToolName::plain("test_tool");
+        let handler = Arc::new(ImmediateHandler {
+            tool_name: tool_name.clone(),
+        }) as Arc<dyn CoreToolRuntime>;
+        let failing_tool_name = codex_tools::ToolName::plain("failing_tool");
+        let failing_handler = Arc::new(FailingHandler {
+            tool_name: failing_tool_name.clone(),
+        }) as Arc<dyn CoreToolRuntime>;
+        let step_context = StepContext::for_test(Arc::clone(&turn_context));
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([handler, failing_handler]),
+            Vec::new(),
+        ));
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let runtime = ToolCallRuntime::new(router, Arc::clone(&session), step_context, tracker);
+        let initial_count = accepted_tool_call_count(session.as_ref()).await;
+
+        runtime
+            .clone()
+            .handle_tool_call(
+                ToolCall {
+                    tool_name: tool_name.clone(),
+                    call_id: "direct-call".to_string(),
+                    payload: ToolPayload::Function {
+                        arguments: "{}".to_string(),
+                    },
+                },
+                CancellationToken::new(),
+            )
+            .await?;
+        runtime
+            .clone()
+            .handle_tool_call_with_source(
+                ToolCall {
+                    tool_name,
+                    call_id: "code-mode-call".to_string(),
+                    payload: ToolPayload::Function {
+                        arguments: "{}".to_string(),
+                    },
+                },
+                ToolCallSource::CodeMode {
+                    cell_id: "cell-1".to_string(),
+                    runtime_tool_call_id: "runtime-call-1".to_string(),
+                },
+                CancellationToken::new(),
+            )
+            .await?;
+        runtime
+            .clone()
+            .handle_tool_call(
+                ToolCall {
+                    tool_name: failing_tool_name,
+                    call_id: "failed-call".to_string(),
+                    payload: ToolPayload::Function {
+                        arguments: "{}".to_string(),
+                    },
+                },
+                CancellationToken::new(),
+            )
+            .await?;
+        runtime
+            .handle_tool_call(
+                ToolCall {
+                    tool_name: codex_tools::ToolName::plain("unsupported_tool"),
+                    call_id: "unsupported-call".to_string(),
+                    payload: ToolPayload::Function {
+                        arguments: "{}".to_string(),
+                    },
+                },
+                CancellationToken::new(),
+            )
+            .await?;
+
+        assert_eq!(
+            accepted_tool_call_count(session.as_ref()).await,
+            initial_count.saturating_add(4)
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn cancellation_before_dispatch_admission_logs_dispatch_only_timing() -> anyhow::Result<()>
     {
         let (session, turn_context) = crate::session::tests::make_session_and_context().await;
         let session = Arc::new(session);
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
         let turn_context = Arc::new(turn_context);
         let tool_name = codex_tools::ToolName::plain("test_tool");
         let handler = Arc::new(ImmediateHandler {
@@ -423,7 +531,8 @@ mod tests {
             Vec::new(),
         ));
         let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-        let runtime = ToolCallRuntime::new(router, session, step_context, tracker);
+        let runtime = ToolCallRuntime::new(router, Arc::clone(&session), step_context, tracker);
+        let initial_count = accepted_tool_call_count(session.as_ref()).await;
         let execution_gate = Arc::clone(&runtime.parallel_execution);
         let execution_gate_guard = execution_gate
             .try_write_owned()
@@ -461,6 +570,11 @@ mod tests {
             .expect("timed out waiting for cancelled tool response")
             .expect("cancelled tool response task should join")
             .expect("cancelled tool call should produce a response");
+        assert_eq!(
+            accepted_tool_call_count(session.as_ref()).await,
+            initial_count.saturating_add(1),
+            "an accepted call cancelled before handler admission still counts exactly once"
+        );
 
         let logs = String::from_utf8(
             buffer
@@ -542,6 +656,37 @@ mod tests {
     }
 
     impl CoreToolRuntime for ImmediateHandler {}
+
+    struct FailingHandler {
+        tool_name: codex_tools::ToolName,
+    }
+
+    impl ToolExecutor<ToolInvocation> for FailingHandler {
+        fn tool_name(&self) -> codex_tools::ToolName {
+            self.tool_name.clone()
+        }
+
+        fn spec(&self) -> codex_tools::ToolSpec {
+            codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+                name: self.tool_name.name.clone(),
+                description: "Failing test tool.".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+            })
+        }
+
+        fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+            Box::pin(async {
+                Err(FunctionCallError::RespondToModel(
+                    "expected handler failure".to_string(),
+                ))
+            })
+        }
+    }
+
+    impl CoreToolRuntime for FailingHandler {}
 
     struct CancellationCleanupHandler {
         tool_name: codex_tools::ToolName,

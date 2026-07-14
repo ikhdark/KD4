@@ -491,7 +491,10 @@ async fn exec_command_consumes_pushed_remote_process_events(
             assert!(saw_exec_command_begin);
             assert_eq!(output.matches(RECOVERED_OUTPUT).count(), 1);
             assert_eq!(output.matches(RETAINED_OUTPUT).count(), 1);
-            assert_eq!(process_read_requests, 1, "expected replay recovery read");
+            assert_eq!(
+                process_read_requests, 9,
+                "expected bounded replay recovery pagination"
+            );
         }
     }
 

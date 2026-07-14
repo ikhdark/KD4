@@ -104,15 +104,21 @@ async fn read_output_limits_retained_bytes_for_shell_capture() {
         writer.write_all(&bytes).await.expect("write");
     });
 
-    let out = read_output(
+    let retained_output = Arc::new(TokioMutex::new(HeadTailBuffer::new(EXEC_OUTPUT_MAX_BYTES)));
+    let full_output = read_output(
         reader,
         /*stream*/ None,
         /*is_stderr*/ false,
-        Some(EXEC_OUTPUT_MAX_BYTES),
+        Arc::clone(&retained_output),
+        /*retain_full_output*/ false,
     )
     .await
     .expect("read");
-    assert_eq!(out.text.len(), EXEC_OUTPUT_MAX_BYTES);
+    assert_eq!(full_output, None);
+    assert_eq!(
+        retained_output.lock().await.to_bytes().len(),
+        EXEC_OUTPUT_MAX_BYTES
+    );
 }
 
 #[test]
@@ -205,12 +211,18 @@ async fn read_output_retains_all_bytes_for_full_buffer_capture() {
         writer.write_all(&bytes).await.expect("write");
     });
 
+    let retained_output = Arc::new(TokioMutex::new(HeadTailBuffer::new(EXEC_OUTPUT_MAX_BYTES)));
     let out = read_output(
-        reader, /*stream*/ None, /*is_stderr*/ false, /*max_bytes*/ None,
+        reader,
+        /*stream*/ None,
+        /*is_stderr*/ false,
+        retained_output,
+        /*retain_full_output*/ true,
     )
     .await
-    .expect("read");
-    assert_eq!(out.text.len(), expected_len);
+    .expect("read")
+    .expect("full buffer output");
+    assert_eq!(out.len(), expected_len);
 }
 
 #[test]
@@ -296,6 +308,7 @@ async fn exec_full_buffer_capture_ignores_expiration() -> Result<()> {
 #[tokio::test]
 async fn exec_full_buffer_capture_keeps_io_drain_timeout_when_descendant_holds_pipe_open()
 -> Result<()> {
+    let started = tokio::time::Instant::now();
     let output = tokio::time::timeout(
         Duration::from_millis(IO_DRAIN_TIMEOUT_MS * 3),
         exec(
@@ -326,6 +339,17 @@ async fn exec_full_buffer_capture_keeps_io_drain_timeout_when_descendant_holds_p
     .expect("full-buffer exec should return once the I/O drain guard fires")?;
 
     assert!(!output.timed_out);
+    assert!(started.elapsed() < Duration::from_millis(IO_DRAIN_TIMEOUT_MS * 2));
+    assert!(output.stdout.text.contains("hello"));
+    assert!(output.aggregated_output.text.contains("hello"));
+    assert_eq!(
+        output
+            .aggregated_output
+            .text
+            .matches("stdout/stderr drain timed out")
+            .count(),
+        1
+    );
 
     Ok(())
 }

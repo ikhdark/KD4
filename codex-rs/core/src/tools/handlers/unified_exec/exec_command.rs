@@ -12,7 +12,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
-use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
+use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair_async;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
@@ -240,11 +240,12 @@ impl ExecCommandHandler {
         )
         .map_err(FunctionCallError::RespondToModel)?;
         let original_safety_command = original_resolved_command.safety_command.clone();
-        let preflight = preflight_invocation_with_equivalent_repair(
+        let preflight = preflight_invocation_with_equivalent_repair_async(
             &original_invocation,
             &original_safety_command,
             original_resolved_command.preflight_shell_type,
         )
+        .await
         .map_err(|issue| {
             FunctionCallError::RespondToModel(format!(
                 "{issue}\nRegenerate the command and call `exec_command` again."

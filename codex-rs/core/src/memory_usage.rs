@@ -7,14 +7,17 @@ use codex_memories_read::usage::MEMORIES_USAGE_METRIC;
 use codex_memories_read::usage::memories_usage_kinds_from_command;
 use codex_protocol::models::ShellCommandToolCallParams;
 
-pub(crate) fn emit_metric_for_tool_read(invocation: &ToolInvocation, success: bool) {
+pub(crate) async fn emit_metric_for_tool_read(invocation: &ToolInvocation, success: bool) {
     let Some(command) = shell_script_for_invocation(invocation) else {
         return;
     };
+    let kinds = tokio::task::spawn_blocking(move || memories_usage_kinds_from_command(&command))
+        .await
+        .unwrap_or_default();
 
     let success = if success { "true" } else { "false" };
     let tool_name = flat_tool_name(&invocation.tool_name);
-    for kind in memories_usage_kinds_from_command(&command) {
+    for kind in kinds {
         invocation.turn.session_telemetry.counter(
             MEMORIES_USAGE_METRIC,
             /*inc*/ 1,

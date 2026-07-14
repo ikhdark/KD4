@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io;
 use std::io::Write;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -26,6 +27,7 @@ use std::sync::atomic::Ordering;
 use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
+use tokio::time::Duration;
 use tracing::warn;
 
 const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 2;
@@ -46,6 +48,7 @@ pub(crate) struct TaskEvidenceLedger {
     persistence_gate: Semaphore,
     last_persisted_revision: AtomicU64,
     wiring_ledger_starts: Mutex<BTreeMap<String, WiringLedgerFingerprint>>,
+    command_mutation_starts: Mutex<BTreeMap<String, CommandMutationStart>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -53,6 +56,33 @@ struct WiringLedgerFingerprint {
     entry_count: usize,
     last_entry_sha1: Option<String>,
     trusted_launcher: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct CommandMutationStart {
+    epoch: u64,
+    artifact_paths: BTreeSet<String>,
+    coverage: MutationCoverage,
+    fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum MutationObservation {
+    Unchanged,
+    Changed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum MutationCoverage {
+    Complete,
+    Incomplete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ValidationConclusion {
+    Passed,
+    Failed,
 }
 
 #[derive(Debug, Clone)]
@@ -187,6 +217,10 @@ struct CommandReceipt {
     timed_out: bool,
     duration_ms: u64,
     possible_mutation: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    observation: Option<MutationObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coverage: Option<MutationCoverage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +233,8 @@ struct ValidationReceipt {
     verdict: Option<String>,
     tool_success: bool,
     proof_bearing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    conclusion: Option<ValidationConclusion>,
     active_files: Vec<FileHashSnapshot>,
     stale_reasons: Vec<String>,
     payload: Option<Value>,
@@ -354,6 +390,7 @@ impl TaskEvidenceLedger {
             persistence_gate: Semaphore::new(1),
             last_persisted_revision: AtomicU64::new(0),
             wiring_ledger_starts: Mutex::new(BTreeMap::new()),
+            command_mutation_starts: Mutex::new(BTreeMap::new()),
         };
         if storage_failure_reason.is_none() {
             let _ = ledger.persist_document(&document).await;
@@ -370,6 +407,7 @@ impl TaskEvidenceLedger {
             persistence_gate: Semaphore::new(1),
             last_persisted_revision: AtomicU64::new(0),
             wiring_ledger_starts: Mutex::new(BTreeMap::new()),
+            command_mutation_starts: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -649,10 +687,66 @@ impl TaskEvidenceLedger {
         self.persist_document(&snapshot).await;
     }
 
-    pub(crate) async fn record_command_intent(&self, call_id: &str, command: &[String]) {
+    async fn capture_command_mutation_start(
+        &self,
+        command: &[String],
+        cwd: &PathUri,
+    ) -> CommandMutationStart {
+        let (epoch, artifact_paths) = {
+            let guard = self.document.lock().await;
+            guard.as_ref().map_or((0, BTreeSet::new()), |document| {
+                (document.evidence_epoch, registered_artifact_paths(document))
+            })
+        };
+        let Some(repo_root) = self.repo_root.as_ref() else {
+            return CommandMutationStart {
+                epoch,
+                artifact_paths,
+                coverage: MutationCoverage::Incomplete,
+                fingerprint: None,
+            };
+        };
+        let cwd = cwd
+            .to_abs_path()
+            .ok()
+            .map(|path| path.as_path().to_path_buf());
+        let mut coverage = match cwd.as_deref() {
+            Some(cwd) => {
+                mutation_coverage_for_command(repo_root, cwd, command, &artifact_paths).await
+            }
+            None => MutationCoverage::Incomplete,
+        };
+        let fingerprint = if coverage == MutationCoverage::Complete {
+            capture_stable_mutation_fingerprint(repo_root, &artifact_paths).await
+        } else {
+            None
+        };
+        if fingerprint.is_none() {
+            coverage = MutationCoverage::Incomplete;
+        }
+        CommandMutationStart {
+            epoch,
+            artifact_paths,
+            coverage,
+            fingerprint,
+        }
+    }
+
+    pub(crate) async fn record_command_intent(
+        &self,
+        call_id: &str,
+        command: &[String],
+        cwd: &PathUri,
+    ) {
         let Some(repo_root) = self.repo_root.as_ref() else {
             return;
         };
+        let mutation_start = self.capture_command_mutation_start(command, cwd).await;
+        self.command_mutation_starts
+            .lock()
+            .await
+            .insert(call_id.to_string(), mutation_start);
+
         let Some(trusted_launcher) = trusted_wiring_guard_check_invocation(
             command,
             self.trusted_wiring_guard_root.as_deref(),
@@ -681,9 +775,26 @@ impl TaskEvidenceLedger {
         timed_out: bool,
         duration_ms: u64,
         possible_mutation: bool,
-    ) {
+    ) -> Option<MutationObservation> {
         let Some(repo_root) = self.repo_root.as_ref() else {
-            return;
+            return None;
+        };
+        let mutation_start = self.command_mutation_starts.lock().await.remove(call_id);
+        let (candidate_observation, candidate_coverage) = match mutation_start.as_ref() {
+            Some(start) if start.coverage == MutationCoverage::Complete => {
+                match capture_stable_mutation_fingerprint(repo_root, &start.artifact_paths).await {
+                    Some(after) => (
+                        if start.fingerprint.as_ref() == Some(&after) {
+                            MutationObservation::Unchanged
+                        } else {
+                            MutationObservation::Changed
+                        },
+                        MutationCoverage::Complete,
+                    ),
+                    None => (MutationObservation::Unknown, MutationCoverage::Incomplete),
+                }
+            }
+            _ => (MutationObservation::Unknown, MutationCoverage::Incomplete),
         };
         let wiring_ledger_start = self.wiring_ledger_starts.lock().await.remove(call_id);
         let command_succeeded = exit_code == 0 && !timed_out;
@@ -704,9 +815,26 @@ impl TaskEvidenceLedger {
         } else {
             None
         };
-        let Some((_, snapshot)) = self
+        let Some((observation, snapshot)) = self
             .update_document(|document| {
-                if possible_mutation {
+                let start_matches = mutation_start.as_ref().is_some_and(|start| {
+                    start.epoch == document.evidence_epoch
+                        && start.artifact_paths == registered_artifact_paths(document)
+                });
+                let observation = if start_matches {
+                    candidate_observation
+                } else {
+                    MutationObservation::Unknown
+                };
+                let coverage = if start_matches {
+                    candidate_coverage
+                } else {
+                    MutationCoverage::Incomplete
+                };
+                if matches!(
+                    observation,
+                    MutationObservation::Changed | MutationObservation::Unknown
+                ) {
                     invalidate_for_mutation(document);
                     let epoch = document.evidence_epoch;
                     if let Some(active_step_id) = document.active_step_id.clone()
@@ -715,23 +843,25 @@ impl TaskEvidenceLedger {
                             .iter_mut()
                             .find(|step| step.id == active_step_id)
                         && command_succeeded
+                        && observation == MutationObservation::Changed
                         && !matches!(step.status, StepStatus::Blocked | StepStatus::Skipped)
                     {
                         step.status = StepStatus::Implemented;
                     }
-                    upsert_risk(
-                        document,
-                        EvidenceRisk {
-                            id: format!("unknown-command-mutation-{epoch}"),
-                            description:
-                                "a command may have mutated files without exact path/hash attribution"
+                    if observation == MutationObservation::Unknown {
+                        upsert_risk(
+                            document,
+                            EvidenceRisk {
+                                id: format!("unknown-command-mutation-{epoch}"),
+                                description: "command mutation coverage was incomplete; validation evidence was conservatively invalidated"
                                     .to_string(),
-                            source: "command".to_string(),
-                            blocking: false,
-                            resolved: false,
-                            epoch,
-                        },
-                    );
+                                source: "command".to_string(),
+                                blocking: false,
+                                resolved: false,
+                                epoch,
+                            },
+                        );
+                    }
                 }
                 let receipt_id = next_receipt_id(
                     "command",
@@ -748,6 +878,8 @@ impl TaskEvidenceLedger {
                     timed_out,
                     duration_ms,
                     possible_mutation,
+                    observation: Some(observation),
+                    coverage: Some(coverage),
                 });
                 trim_to_last(&mut document.command_receipts, MAX_COMMAND_RECEIPTS);
                 if let Some(wiring_proof) = wiring_proof {
@@ -761,12 +893,14 @@ impl TaskEvidenceLedger {
                 }
                 document.updated_at = timestamp();
                 document.completion = None;
+                observation
             })
             .await
         else {
-            return;
+            return None;
         };
         self.persist_document(&snapshot).await;
+        Some(observation)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -776,6 +910,7 @@ impl TaskEvidenceLedger {
         verdict: Option<&str>,
         tool_success: bool,
         proof_bearing: bool,
+        contract_valid: bool,
         validation_start: Option<&TaskEvidenceValidationStart>,
         active_files: &[PathBuf],
         stale_reasons: &[String],
@@ -815,7 +950,26 @@ impl TaskEvidenceLedger {
                 let run_matches_start = validation_start.is_some_and(|start| {
                     start.epoch == document.evidence_epoch && snapshots_unchanged
                 });
-                let accepted_proof = proof_bearing && tool_success && run_matches_start;
+                let conclusion = if run_matches_start && contract_valid {
+                    match verdict {
+                        Some("VERIFIED") if proof_bearing && tool_success => {
+                            Some(ValidationConclusion::Passed)
+                        }
+                        Some("FAILED" | "NEEDS_REGEN") => Some(ValidationConclusion::Failed),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let existing_strength = strongest_conclusive_validation_strength(
+                    document,
+                    document.evidence_epoch,
+                );
+                let mode_strength = validation_mode_strength(mode);
+                let authoritative = conclusion.is_some()
+                    && existing_strength.is_none_or(|strength| mode_strength >= strength);
+                let accepted_proof =
+                    authoritative && conclusion == Some(ValidationConclusion::Passed);
                 let receipt_id =
                     next_receipt_id("validation", &mut document.next_validation_receipt_sequence);
                 document.validation_receipts.push(ValidationReceipt {
@@ -827,13 +981,20 @@ impl TaskEvidenceLedger {
                     verdict: verdict.map(str::to_string),
                     tool_success,
                     proof_bearing,
+                    conclusion,
                     active_files: file_snapshots.clone(),
                     stale_reasons: stale_reasons.to_vec(),
                     payload: payload.cloned(),
                 });
-                trim_to_last(&mut document.validation_receipts, MAX_VALIDATION_RECEIPTS);
+                trim_validation_receipts(document);
 
-                if mode == "plan" && tool_success && run_matches_start {
+                if mode == "plan"
+                    && tool_success
+                    && run_matches_start
+                    && existing_strength.is_none_or(|strength| {
+                        strength <= validation_mode_strength("plan")
+                    })
+                {
                     document.verify_plan_epoch = Some(document.evidence_epoch);
                     rebuild_verifier_requirements(document, payload);
                 }
@@ -876,8 +1037,35 @@ impl TaskEvidenceLedger {
                         }
                     }
                     resolve_risks_by_source(document, "verify_local");
+                    resolve_risks_by_source(document, "command");
                     resolve_risks_by_source(document, "generated_artifact_freshness");
                     resolve_risks_by_source(document, "freshness");
+                } else if authoritative
+                    && conclusion == Some(ValidationConclusion::Failed)
+                {
+                    document.validation_epoch = None;
+                    for step in &mut document.plan {
+                        step.validation_receipt_ids.clear();
+                    }
+                    for requirement in &mut document.generated_artifact_requirements {
+                        requirement.validation_receipt_ids.clear();
+                    }
+                    upsert_risk(
+                        document,
+                        EvidenceRisk {
+                            id: "verify-local-conclusive-failure".to_string(),
+                            description: format!(
+                                "verify_local {mode} validation conclusively failed for the current evidence epoch"
+                            ),
+                            source: "verify_local".to_string(),
+                            blocking: true,
+                            resolved: false,
+                            epoch: document.evidence_epoch,
+                        },
+                    );
+                } else if conclusion == Some(ValidationConclusion::Failed) {
+                    // A weaker conclusive result is retained as history but cannot
+                    // override the stronger current-epoch result.
                 } else if proof_bearing && tool_success && !run_matches_start {
                     upsert_risk(
                         document,
@@ -1031,7 +1219,7 @@ impl TaskEvidenceLedger {
             self.demote_gate_for_persistence(
                 gate,
                 None,
-                "task-evidence changed repeatedly while completion was being persisted; a stable completion snapshot was not recorded",
+                "evidence changed during finalization; no stable completion revision was persisted",
             )
             .await,
         )
@@ -1215,22 +1403,22 @@ impl TaskEvidenceLedger {
     }
 
     async fn persist_document(&self, document: &TaskEvidenceDocument) -> PersistOutcome {
-        let Some(path) = self.evidence_path.as_ref() else {
-            return PersistOutcome::Persisted;
-        };
-        let bytes = match serde_json::to_vec_pretty(document) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                warn!("failed to serialize KD4 task evidence: {err}");
-                return PersistOutcome::Failed;
-            }
-        };
         let _persistence_permit = match self.persistence_gate.acquire().await {
             Ok(permit) => permit,
             Err(err) => {
                 warn!("KD4 task-evidence persistence gate unexpectedly closed: {err}");
                 return PersistOutcome::Failed;
             }
+        };
+        let document_guard = self.document.lock().await;
+        let Some(current_document) = document_guard.as_ref() else {
+            return PersistOutcome::Superseded;
+        };
+        if current_document.revision != document.revision {
+            return PersistOutcome::Superseded;
+        }
+        let Some(path) = self.evidence_path.as_ref() else {
+            return PersistOutcome::Failed;
         };
         let last_persisted_revision = self.last_persisted_revision.load(Ordering::Acquire);
         if last_persisted_revision != 0 {
@@ -1241,23 +1429,34 @@ impl TaskEvidenceLedger {
                 return PersistOutcome::Persisted;
             }
         }
-        let write_path = path.clone();
-        match tokio::task::spawn_blocking(move || atomic_write_evidence(&write_path, &bytes)).await
-        {
-            Ok(Ok(())) => {
-                self.last_persisted_revision
-                    .store(document.revision, Ordering::Release);
-                PersistOutcome::Persisted
-            }
-            Ok(Err(err)) => {
-                warn!("failed to persist KD4 task evidence: {err}");
-                PersistOutcome::Failed
-            }
+        let bytes = match serde_json::to_vec_pretty(document) {
+            Ok(bytes) => bytes,
             Err(err) => {
-                warn!("KD4 task-evidence persistence task failed: {err}");
-                PersistOutcome::Failed
+                warn!("failed to serialize KD4 task evidence: {err}");
+                return PersistOutcome::Failed;
             }
-        }
+        };
+        let write_path = path.clone();
+        let outcome =
+            match tokio::task::spawn_blocking(move || atomic_write_evidence(&write_path, &bytes))
+                .await
+            {
+                Ok(Ok(())) => {
+                    self.last_persisted_revision
+                        .store(document.revision, Ordering::Release);
+                    PersistOutcome::Persisted
+                }
+                Ok(Err(err)) => {
+                    warn!("failed to persist KD4 task evidence: {err}");
+                    PersistOutcome::Failed
+                }
+                Err(err) => {
+                    warn!("KD4 task-evidence persistence task failed: {err}");
+                    PersistOutcome::Failed
+                }
+            };
+        drop(document_guard);
+        outcome
     }
 }
 
@@ -1504,6 +1703,520 @@ fn find_kd4_repo_root(cwd: &Path) -> Option<PathBuf> {
                 && candidate.join("kd4_features.toml").is_file()
         })
         .map(Path::to_path_buf)
+}
+
+fn registered_artifact_paths(document: &TaskEvidenceDocument) -> BTreeSet<String> {
+    document
+        .generated_artifact_requirements
+        .iter()
+        .filter_map(|requirement| requirement.path.as_deref())
+        .map(normalize_evidence_path)
+        .collect()
+}
+
+fn normalize_evidence_path(path: &str) -> String {
+    path.replace('\\', "/").trim_start_matches("./").to_string()
+}
+
+async fn closed_write_targets(
+    repo_root: &Path,
+    cwd: &Path,
+    command: &[String],
+) -> Option<Vec<String>> {
+    let executable_path = tokio::fs::canonicalize(which::which(command.first()?).ok()?)
+        .await
+        .ok()?;
+    let canonical_root = tokio::fs::canonicalize(repo_root).await.ok()?;
+    let canonical_cwd = tokio::fs::canonicalize(cwd).await.ok()?;
+    if executable_path.starts_with(&canonical_root)
+        || executable_path.starts_with(&canonical_cwd)
+        || !is_trusted_system_executable(&executable_path)
+    {
+        return None;
+    }
+    let executable = executable_path.file_name()?.to_str()?.to_ascii_lowercase();
+    let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
+    if executable == "true" || (cfg!(windows) && executable == "where") {
+        return (command.len() == 1).then(Vec::new);
+    }
+    if cfg!(windows)
+        && executable == "fsutil"
+        && command.len() == 5
+        && command[1].eq_ignore_ascii_case("file")
+        && command[2].eq_ignore_ascii_case("createnew")
+        && command[4].parse::<u64>().is_ok()
+        && is_literal_write_target(&command[3])
+    {
+        return Some(vec![command[3].clone()]);
+    }
+    if executable != "touch" {
+        return None;
+    }
+
+    let mut arguments = command.get(1..)?;
+    if arguments.first().is_some_and(|argument| argument == "--") {
+        arguments = &arguments[1..];
+    }
+    if arguments.is_empty()
+        || arguments
+            .iter()
+            .any(|argument| !is_literal_write_target(argument))
+    {
+        return None;
+    }
+    Some(arguments.to_vec())
+}
+
+fn is_literal_write_target(argument: &str) -> bool {
+    !argument.starts_with('-')
+        && !argument.chars().any(|character| {
+            matches!(
+                character,
+                '*' | '?' | '[' | ']' | '{' | '}' | '$' | '%' | '`'
+            )
+        })
+}
+
+#[cfg(unix)]
+fn is_trusted_system_executable(path: &Path) -> bool {
+    path.parent().is_some_and(|parent| {
+        matches!(
+            parent.to_str(),
+            Some("/usr/bin" | "/bin" | "/usr/sbin" | "/sbin")
+        )
+    })
+}
+
+#[cfg(windows)]
+fn is_trusted_system_executable(path: &Path) -> bool {
+    let normalized = path
+        .to_string_lossy()
+        .replace('/', "\\")
+        .to_ascii_lowercase();
+    [
+        std::env::var_os("ProgramFiles"),
+        std::env::var_os("ProgramFiles(x86)"),
+        std::env::var_os("SystemRoot"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(PathBuf::from)
+    .filter_map(|root| std::fs::canonicalize(root).ok())
+    .map(|root| {
+        root.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+    })
+    .any(|root| {
+        normalized == root
+            || normalized
+                .strip_prefix(&root)
+                .is_some_and(|suffix| suffix.starts_with('\\'))
+    })
+}
+
+async fn mutation_coverage_for_command(
+    repo_root: &Path,
+    cwd: &Path,
+    command: &[String],
+    artifact_paths: &BTreeSet<String>,
+) -> MutationCoverage {
+    let Some(targets) = closed_write_targets(repo_root, cwd, command).await else {
+        return MutationCoverage::Incomplete;
+    };
+    let Some(canonical_root) = tokio::fs::canonicalize(repo_root).await.ok() else {
+        return MutationCoverage::Incomplete;
+    };
+    let Some(canonical_cwd) = tokio::fs::canonicalize(cwd).await.ok() else {
+        return MutationCoverage::Incomplete;
+    };
+    if !canonical_cwd.starts_with(&canonical_root) {
+        return MutationCoverage::Incomplete;
+    }
+
+    for target in targets {
+        let Some(target) = resolve_possible_target(&canonical_cwd, &target).await else {
+            return MutationCoverage::Incomplete;
+        };
+        if !target.starts_with(&canonical_root) {
+            return MutationCoverage::Incomplete;
+        }
+        if tokio::fs::metadata(&target)
+            .await
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            return MutationCoverage::Incomplete;
+        }
+        let Some(relative) = target
+            .strip_prefix(&canonical_root)
+            .ok()
+            .and_then(Path::to_str)
+            .map(normalize_evidence_path)
+        else {
+            return MutationCoverage::Incomplete;
+        };
+        let Some(check_ignored) = run_fixed_git(
+            &canonical_root,
+            &["check-ignore", "-q", "--", relative.as_str()],
+        )
+        .await
+        else {
+            return MutationCoverage::Incomplete;
+        };
+        match check_ignored.code {
+            Some(0) if !artifact_paths.contains(&relative) => {
+                return MutationCoverage::Incomplete;
+            }
+            Some(0 | 1) => {}
+            _ => return MutationCoverage::Incomplete,
+        }
+    }
+    MutationCoverage::Complete
+}
+
+async fn resolve_possible_target(cwd: &Path, target: &str) -> Option<PathBuf> {
+    let target = Path::new(target);
+    let combined = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        cwd.join(target)
+    };
+    let normalized = normalize_path_lexically(&combined)?;
+    let mut existing = normalized.as_path();
+    let mut suffix = Vec::new();
+    loop {
+        match tokio::fs::symlink_metadata(existing).await {
+            Ok(_) => break,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                suffix.push(existing.file_name()?.to_os_string());
+                existing = existing.parent()?;
+            }
+            Err(_) => return None,
+        }
+    }
+    let mut resolved = tokio::fs::canonicalize(existing).await.ok()?;
+    for component in suffix.into_iter().rev() {
+        resolved.push(component);
+    }
+    normalize_path_lexically(&resolved)
+}
+
+fn normalize_path_lexically(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(component) => normalized.push(component),
+        }
+    }
+    Some(normalized)
+}
+
+struct FixedGitOutput {
+    code: Option<i32>,
+    stdout: Vec<u8>,
+}
+
+async fn run_fixed_git(repo_root: &Path, args: &[&str]) -> Option<FixedGitOutput> {
+    let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut command = tokio::process::Command::new("git");
+    command
+        .current_dir(repo_root)
+        .kill_on_drop(true)
+        .args([
+            "--no-pager",
+            "-c",
+            "core.pager=cat",
+            "-c",
+            "pager.diff=false",
+            "-c",
+            "color.ui=false",
+            "-c",
+            "color.diff=false",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.eol=lf",
+            "-c",
+            "core.safecrlf=false",
+            "-c",
+            "core.filemode=true",
+            "-c",
+            "core.ignorecase=false",
+            "-c",
+            "core.precomposeunicode=false",
+            "-c",
+            "core.symlinks=true",
+            "-c",
+            "core.quotepath=false",
+            "-c",
+            "diff.external=",
+            "-c",
+            "diff.submodule=short",
+            "-c",
+            "diff.ignoreSubmodules=none",
+            "-c",
+            "diff.renames=false",
+            "-c",
+            "diff.indentHeuristic=false",
+            "-c",
+            "diff.algorithm=myers",
+            "-c",
+            "submodule.recurse=false",
+        ])
+        .arg("-c")
+        .arg(format!("core.attributesFile={null_config}"))
+        .arg("-c")
+        .arg(format!("core.excludesFile={null_config}"))
+        .arg("-c")
+        .arg(format!("diff.orderFile={null_config}"))
+        .args(args)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_SYSTEM", null_config)
+        .env("GIT_CONFIG_GLOBAL", null_config)
+        .env("GIT_ATTR_NOSYSTEM", "1")
+        .env("GIT_CONFIG_COUNT", "0")
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .env("NO_COLOR", "1")
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .env_remove("GIT_DIFF_OPTS");
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.stderr.is_empty() {
+        return None;
+    }
+    Some(FixedGitOutput {
+        code: output.status.code(),
+        stdout: output.stdout,
+    })
+}
+
+async fn run_fixed_git_success(repo_root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = run_fixed_git(repo_root, args).await?;
+    (output.code == Some(0)).then_some(output.stdout)
+}
+
+async fn capture_stable_mutation_fingerprint(
+    repo_root: &Path,
+    artifact_paths: &BTreeSet<String>,
+) -> Option<String> {
+    let first = capture_mutation_fingerprint(repo_root, artifact_paths).await?;
+    tokio::task::yield_now().await;
+    let second = capture_mutation_fingerprint(repo_root, artifact_paths).await?;
+    (first == second).then_some(first)
+}
+
+async fn capture_mutation_fingerprint(
+    repo_root: &Path,
+    artifact_paths: &BTreeSet<String>,
+) -> Option<String> {
+    let canonical_root = tokio::fs::canonicalize(repo_root).await.ok()?;
+    let worktree =
+        run_fixed_git_success(&canonical_root, &["rev-parse", "--show-toplevel"]).await?;
+    let worktree = std::str::from_utf8(trim_ascii_whitespace(&worktree)).ok()?;
+    let canonical_worktree = tokio::fs::canonicalize(worktree).await.ok()?;
+    if canonical_worktree != canonical_root {
+        return None;
+    }
+    let common_dir = run_fixed_git_success(
+        &canonical_root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .await?;
+    let common_dir = std::str::from_utf8(trim_ascii_whitespace(&common_dir)).ok()?;
+    let canonical_common_dir = tokio::fs::canonicalize(common_dir).await.ok()?;
+    let mut hasher = Sha256::new();
+    hash_fingerprint_component(
+        &mut hasher,
+        b"worktree",
+        canonical_worktree.to_str()?.as_bytes(),
+    );
+    hash_fingerprint_component(
+        &mut hasher,
+        b"common-dir",
+        canonical_common_dir.to_str()?.as_bytes(),
+    );
+
+    let head = run_fixed_git(
+        &canonical_root,
+        &["rev-parse", "--verify", "--quiet", "HEAD"],
+    )
+    .await?;
+    match head.code {
+        Some(0) => {
+            hash_fingerprint_component(&mut hasher, b"head", trim_ascii_whitespace(&head.stdout))
+        }
+        Some(1) if head.stdout.is_empty() => {
+            hash_fingerprint_component(&mut hasher, b"head", b"<unborn>")
+        }
+        _ => return None,
+    }
+
+    const DIFF_ARGS: &[&str] = &[
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--binary",
+        "--full-index",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+        "--unified=0",
+        "--diff-algorithm=myers",
+        "--no-renames",
+        "--no-indent-heuristic",
+        "--submodule=short",
+        "--ignore-submodules=none",
+        "--no-relative",
+    ];
+    let unstaged = run_fixed_git_success(&canonical_root, DIFF_ARGS).await?;
+    let mut staged_args = DIFF_ARGS.to_vec();
+    staged_args.push("--cached");
+    let staged = run_fixed_git_success(&canonical_root, &staged_args).await?;
+    hash_fingerprint_component(&mut hasher, b"unstaged-diff", &unstaged);
+    hash_fingerprint_component(&mut hasher, b"staged-diff", &staged);
+
+    let untracked = run_fixed_git_success(
+        &canonical_root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .await?;
+    let mut untracked_paths = untracked
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    untracked_paths.sort();
+    for path_bytes in untracked_paths {
+        let path_text = std::str::from_utf8(&path_bytes).ok()?;
+        let relative = safe_relative_evidence_path(path_text)?;
+        hash_fingerprint_component(&mut hasher, b"untracked-path", &path_bytes);
+        hash_file_state(&mut hasher, &canonical_root.join(relative)).await?;
+    }
+
+    for artifact_path in artifact_paths {
+        let relative = safe_relative_evidence_path(artifact_path)?;
+        hash_fingerprint_component(&mut hasher, b"artifact-path", artifact_path.as_bytes());
+        hash_file_state(&mut hasher, &canonical_root.join(relative)).await?;
+    }
+
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn safe_relative_evidence_path(path: &str) -> Option<PathBuf> {
+    let path = Path::new(path);
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    Some(path.to_path_buf())
+}
+
+async fn hash_file_state(hasher: &mut Sha256, path: &Path) -> Option<()> {
+    let before = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            tokio::task::yield_now().await;
+            if !matches!(
+                tokio::fs::symlink_metadata(path).await,
+                Err(err) if err.kind() == io::ErrorKind::NotFound
+            ) {
+                return None;
+            }
+            hash_fingerprint_component(hasher, b"file-type", b"absent");
+            return Some(());
+        }
+        Err(_) => return None,
+    };
+    if before.file_type().is_symlink() {
+        let first_target = tokio::fs::read_link(path).await.ok()?;
+        tokio::task::yield_now().await;
+        let second_target = tokio::fs::read_link(path).await.ok()?;
+        let after = tokio::fs::symlink_metadata(path).await.ok()?;
+        if first_target != second_target || !same_file_metadata(&before, &after) {
+            return None;
+        }
+        hash_fingerprint_component(hasher, b"file-type", b"symlink");
+        hash_fingerprint_component(
+            hasher,
+            b"symlink-target",
+            &path_identity_bytes(first_target.as_os_str()),
+        );
+    } else if before.is_file() {
+        let first_contents = tokio::fs::read(path).await.ok()?;
+        let middle = tokio::fs::symlink_metadata(path).await.ok()?;
+        tokio::task::yield_now().await;
+        let second_contents = tokio::fs::read(path).await.ok()?;
+        let after = tokio::fs::symlink_metadata(path).await.ok()?;
+        if first_contents != second_contents
+            || !same_file_metadata(&before, &middle)
+            || !same_file_metadata(&middle, &after)
+        {
+            return None;
+        }
+        hash_fingerprint_component(hasher, b"file-type", b"file");
+        hash_fingerprint_component(hasher, b"file-content", &first_contents);
+    } else {
+        return None;
+    }
+    Some(())
+}
+
+fn same_file_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.file_type().is_file() == right.file_type().is_file()
+        && left.file_type().is_symlink() == right.file_type().is_symlink()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+}
+
+#[cfg(unix)]
+fn path_identity_bytes(path: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn path_identity_bytes(path: &std::ffi::OsStr) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt;
+    path.encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>()
+}
+
+fn hash_fingerprint_component(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
+    hasher.update((label.len() as u64).to_le_bytes());
+    hasher.update(label);
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &bytes[start..end]
 }
 
 async fn git_dirty_paths(repo_root: &Path) -> BTreeSet<String> {
@@ -2117,11 +2830,62 @@ fn task_is_tracked(document: &TaskEvidenceDocument) -> bool {
         || document
             .command_receipts
             .iter()
-            .any(|receipt| receipt.possible_mutation)
+            .any(|receipt| match receipt.observation {
+                Some(MutationObservation::Changed | MutationObservation::Unknown) => true,
+                Some(MutationObservation::Unchanged) => false,
+                None => receipt.possible_mutation,
+            })
         || document
             .risks
             .iter()
             .any(|risk| risk.source == "task_evidence_storage" && !risk.resolved)
+}
+
+fn validation_mode_strength(mode: &str) -> u8 {
+    match mode {
+        "final" => 3,
+        "fast" => 2,
+        "plan" => 1,
+        _ => 0,
+    }
+}
+
+fn strongest_conclusive_validation_strength(
+    document: &TaskEvidenceDocument,
+    epoch: u64,
+) -> Option<u8> {
+    document
+        .validation_receipts
+        .iter()
+        .filter(|receipt| receipt.epoch == epoch && receipt.conclusion.is_some())
+        .map(|receipt| validation_mode_strength(&receipt.mode))
+        .max()
+}
+
+fn trim_validation_receipts(document: &mut TaskEvidenceDocument) {
+    if document.validation_receipts.len() <= MAX_VALIDATION_RECEIPTS {
+        return;
+    }
+    let retained_authoritative_id = document
+        .validation_receipts
+        .iter()
+        .enumerate()
+        .filter(|(_, receipt)| {
+            receipt.epoch == document.evidence_epoch && receipt.conclusion.is_some()
+        })
+        .max_by_key(|(index, receipt)| (validation_mode_strength(&receipt.mode), *index))
+        .map(|(_, receipt)| receipt.id.clone());
+
+    while document.validation_receipts.len() > MAX_VALIDATION_RECEIPTS {
+        let removal_index = retained_authoritative_id.as_ref().map_or(0, |retained_id| {
+            document
+                .validation_receipts
+                .iter()
+                .position(|receipt| &receipt.id != retained_id)
+                .unwrap_or(0)
+        });
+        document.validation_receipts.remove(removal_index);
+    }
 }
 
 fn step_requires_wiring(step: &EvidencePlanStep) -> bool {
@@ -3075,6 +3839,7 @@ mod tests {
                 Some("PLANNED"),
                 true,
                 false,
+                true,
                 Some(&plan_validation_start),
                 &[PathBuf::from("src/lib.rs")],
                 &[],
@@ -3089,6 +3854,7 @@ mod tests {
             .record_verify_local(
                 "final",
                 Some("VERIFIED"),
+                true,
                 true,
                 true,
                 Some(&final_validation_start),
@@ -3109,7 +3875,7 @@ mod tests {
             "--ledger".to_string(),
         ];
         ledger
-            .record_command_intent("wiring-1", &wiring_command)
+            .record_command_intent("wiring-1", &wiring_command, &cwd_uri)
             .await;
         let ledger_path = repo
             .join(".git")
@@ -3127,6 +3893,40 @@ mod tests {
         .expect("write ledger");
         ledger
             .record_command("wiring-1", &wiring_command, &cwd_uri, 0, false, 10, false)
+            .await;
+        let plan_validation_start = ledger
+            .begin_verify_local_validation()
+            .await
+            .expect("plan validation start after wiring");
+        ledger
+            .record_verify_local(
+                "plan",
+                Some("PLANNED"),
+                true,
+                false,
+                true,
+                Some(&plan_validation_start),
+                &[PathBuf::from("src/lib.rs")],
+                &[],
+                Some(&serde_json::json!({"planned": []})),
+            )
+            .await;
+        let final_validation_start = ledger
+            .begin_verify_local_validation()
+            .await
+            .expect("final validation start after wiring");
+        ledger
+            .record_verify_local(
+                "final",
+                Some("VERIFIED"),
+                true,
+                true,
+                true,
+                Some(&final_validation_start),
+                &[PathBuf::from("src/lib.rs")],
+                &[],
+                Some(&serde_json::json!({"verdict": "VERIFIED"})),
+            )
             .await;
         assert_eq!(
             ledger.completion_gate().await.expect("gate").status,

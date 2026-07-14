@@ -142,6 +142,7 @@ fn recovery_handles_dense_tail_output_and_newer_notification() {
         !state
             .recover_events(ReadResponse {
                 chunks,
+                output_gaps: Vec::new(),
                 next_seq: last_seq + 1,
                 exited: true,
                 exit_code: Some(17),
@@ -177,6 +178,7 @@ fn recovery_rejects_output_at_closed_sequence() {
                 stream: ExecOutputStream::Stdout,
                 chunk: b"output".to_vec().into(),
             }],
+            output_gaps: Vec::new(),
             next_seq: 2,
             exited: false,
             exit_code: None,
@@ -191,6 +193,152 @@ fn recovery_rejects_output_at_closed_sequence() {
             .to_string()
             .contains("conflicts with recovered output")
     );
+}
+
+#[tokio::test]
+async fn recovery_surfaces_tail_only_output_gap_through_wake() {
+    let state = SessionState::new(/*recoverable*/ true);
+    let mut wake = state.subscribe();
+
+    assert!(
+        !state
+            .recover_events(ReadResponse {
+                chunks: Vec::new(),
+                output_gaps: vec![OutputGap {
+                    first_missing_seq: 1,
+                    last_missing_seq: 2,
+                }],
+                next_seq: 3,
+                exited: false,
+                exit_code: None,
+                closed: false,
+                failure: None,
+                sandbox_denied: false,
+            })
+            .expect("tail-only gap should recover conservatively")
+    );
+
+    wake.changed().await.expect("recovery should wake readers");
+    assert_eq!(*wake.borrow_and_update(), 2);
+    let ordered = state
+        .ordered_events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(ordered.last_published_seq, 2);
+    assert_eq!(
+        ordered.recovery_gaps,
+        vec![OutputGap {
+            first_missing_seq: 1,
+            last_missing_seq: 2,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn recovery_gap_precedes_retained_output() {
+    let state = SessionState::new(/*recoverable*/ true);
+
+    state
+        .recover_events(ReadResponse {
+            chunks: vec![ProcessOutputChunk {
+                seq: 3,
+                stream: ExecOutputStream::Stdout,
+                chunk: b"retained".to_vec().into(),
+            }],
+            output_gaps: vec![OutputGap {
+                first_missing_seq: 1,
+                last_missing_seq: 2,
+            }],
+            next_seq: 4,
+            exited: false,
+            exit_code: None,
+            closed: false,
+            failure: None,
+            sandbox_denied: false,
+        })
+        .expect("retained output after a gap should recover");
+
+    let mut events = state.subscribe_events();
+    assert!(matches!(
+        events.recv().await,
+        Ok(ExecProcessEvent::Output(ProcessOutputChunk { seq: 3, .. }))
+    ));
+}
+
+#[tokio::test]
+async fn recovery_gap_splits_around_pending_live_output() {
+    let state = SessionState::new(/*recoverable*/ true);
+    assert!(
+        !state
+            .publish_ordered_event(ExecProcessEvent::Output(ProcessOutputChunk {
+                seq: 2,
+                stream: ExecOutputStream::Stdout,
+                chunk: b"live".to_vec().into(),
+            }))
+            .expect("future live output should remain pending")
+    );
+
+    state
+        .recover_events(ReadResponse {
+            chunks: Vec::new(),
+            output_gaps: vec![OutputGap {
+                first_missing_seq: 1,
+                last_missing_seq: 3,
+            }],
+            next_seq: 4,
+            exited: false,
+            exit_code: None,
+            closed: false,
+            failure: None,
+            sandbox_denied: false,
+        })
+        .expect("pending output should split the reported gap");
+
+    let ordered = state
+        .ordered_events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(ordered.last_published_seq, 3);
+    assert_eq!(
+        ordered.recovery_gaps,
+        vec![
+            OutputGap {
+                first_missing_seq: 1,
+                last_missing_seq: 1,
+            },
+            OutputGap {
+                first_missing_seq: 3,
+                last_missing_seq: 3,
+            },
+        ]
+    );
+}
+
+#[test]
+fn recovery_rejects_gap_overlapping_returned_output() {
+    let state = SessionState::new(/*recoverable*/ true);
+
+    let error = state
+        .recover_events(ReadResponse {
+            chunks: vec![ProcessOutputChunk {
+                seq: 2,
+                stream: ExecOutputStream::Stdout,
+                chunk: b"conflict".to_vec().into(),
+            }],
+            output_gaps: vec![OutputGap {
+                first_missing_seq: 1,
+                last_missing_seq: 2,
+            }],
+            next_seq: 3,
+            exited: false,
+            exit_code: None,
+            closed: false,
+            failure: None,
+            sandbox_denied: false,
+        })
+        .expect_err("gap/output overlap should be rejected");
+
+    assert!(error.to_string().contains("overlaps recovered output"));
 }
 
 #[tokio::test]
@@ -213,6 +361,7 @@ async fn recovery_adds_sandbox_denial_to_pending_exit_event() {
                 stream: ExecOutputStream::Stderr,
                 chunk: b"sandbox denied".to_vec().into(),
             }],
+            output_gaps: Vec::new(),
             next_seq: 3,
             exited: true,
             exit_code: Some(1),

@@ -1,9 +1,12 @@
 use super::process::UnifiedExecProcess;
+use super::process::merge_recovery_gap;
+use super::process::recovery_incomplete_detail;
 use crate::unified_exec::UnifiedExecError;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEventReceiver;
 use codex_exec_server::ExecProcessFuture;
 use codex_exec_server::ExecServerError;
+use codex_exec_server::OutputGap;
 use codex_exec_server::ProcessId;
 use codex_exec_server::ProcessSignal;
 use codex_exec_server::ReadResponse;
@@ -11,8 +14,10 @@ use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteResponse;
 use codex_exec_server::WriteStatus;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 
@@ -33,6 +38,7 @@ impl MockExecProcess {
             .pop_front()
             .unwrap_or(ReadResponse {
                 chunks: Vec::new(),
+                output_gaps: Vec::new(),
                 next_seq: 1,
                 exited: false,
                 exit_code: None,
@@ -108,6 +114,59 @@ async fn remote_process(
 }
 
 #[tokio::test]
+async fn tail_only_recovery_gap_is_observed_from_the_wake_channel() {
+    let (wake_tx, _wake_rx) = watch::channel(0);
+    let mock = Arc::new(MockExecProcess {
+        process_id: "gap-process".to_string().into(),
+        write_response: WriteResponse {
+            status: WriteStatus::Accepted,
+        },
+        read_responses: Mutex::new(VecDeque::from([ReadResponse {
+            chunks: Vec::new(),
+            output_gaps: vec![OutputGap {
+                first_missing_seq: 1,
+                last_missing_seq: 2,
+            }],
+            next_seq: 3,
+            exited: false,
+            exit_code: None,
+            closed: false,
+            failure: None,
+            sandbox_denied: false,
+        }])),
+        terminate_error: None,
+        wake_tx,
+    });
+    let process = UnifiedExecProcess::from_exec_server_started(
+        StartedExecProcess {
+            process: Arc::clone(&mock) as Arc<dyn ExecProcess>,
+        },
+        None,
+    )
+    .await
+    .expect("remote process should start");
+
+    mock.wake_tx.send(2).expect("wake recovery reader");
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let rendered = process
+                .output_handles()
+                .output_buffer
+                .lock()
+                .await
+                .render_bytes();
+            if String::from_utf8_lossy(&rendered).contains("missing sequences 1-2") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("tail-only recovery gap should become durable evidence");
+}
+
+#[tokio::test]
 async fn remote_write_unknown_process_marks_process_exited() {
     let process = remote_process(WriteStatus::UnknownProcess, /*terminate_error*/ None).await;
 
@@ -171,4 +230,95 @@ async fn remote_terminate_confirmed_updates_state_on_success_only() {
         .expect("terminate should succeed");
 
     assert!(process.has_exited());
+}
+
+#[test]
+fn recovery_gaps_merge_only_when_adjacent_or_overlapping() {
+    let recovered = BTreeSet::new();
+    let mut gaps = Vec::new();
+
+    assert!(merge_recovery_gap(
+        &mut gaps,
+        OutputGap {
+            first_missing_seq: 2,
+            last_missing_seq: 3,
+        },
+        &recovered,
+    ));
+    assert!(merge_recovery_gap(
+        &mut gaps,
+        OutputGap {
+            first_missing_seq: 4,
+            last_missing_seq: 5,
+        },
+        &recovered,
+    ));
+    assert!(merge_recovery_gap(
+        &mut gaps,
+        OutputGap {
+            first_missing_seq: 9,
+            last_missing_seq: 10,
+        },
+        &recovered,
+    ));
+
+    assert_eq!(
+        gaps,
+        vec![
+            OutputGap {
+                first_missing_seq: 2,
+                last_missing_seq: 5,
+            },
+            OutputGap {
+                first_missing_seq: 9,
+                last_missing_seq: 10,
+            },
+        ]
+    );
+}
+
+#[test]
+fn recovery_gap_rejects_recovered_output_and_preserves_existing_ranges() {
+    let recovered = BTreeSet::from([4]);
+    let mut gaps = vec![OutputGap {
+        first_missing_seq: 8,
+        last_missing_seq: 9,
+    }];
+
+    assert!(!merge_recovery_gap(
+        &mut gaps,
+        OutputGap {
+            first_missing_seq: 3,
+            last_missing_seq: 5,
+        },
+        &recovered,
+    ));
+    assert_eq!(
+        gaps,
+        vec![OutputGap {
+            first_missing_seq: 8,
+            last_missing_seq: 9,
+        }]
+    );
+}
+
+#[test]
+fn recovery_detail_preserves_disjoint_ranges_without_widening_them() {
+    let gaps = vec![
+        OutputGap {
+            first_missing_seq: 2,
+            last_missing_seq: 4,
+        },
+        OutputGap {
+            first_missing_seq: 8,
+            last_missing_seq: 9,
+        },
+    ];
+    let reasons = BTreeSet::from(["recovery page limit was exhausted".to_string()]);
+
+    let detail = recovery_incomplete_detail(&gaps, &reasons);
+
+    assert!(detail.contains("2-4, 8-9"));
+    assert!(!detail.contains("2-9"));
+    assert!(detail.contains("page limit"));
 }

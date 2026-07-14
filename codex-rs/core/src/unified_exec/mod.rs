@@ -49,7 +49,7 @@ use crate::tools::network_approval::DeferredNetworkApproval;
 
 mod async_watcher;
 mod errors;
-mod head_tail_buffer;
+pub(crate) mod head_tail_buffer;
 mod process;
 mod process_manager;
 mod process_state;
@@ -297,7 +297,6 @@ pub(crate) fn generate_chunk_id() -> String {
 }
 
 #[cfg(test)]
-#[cfg(unix)]
 #[path = "process_tests.rs"]
 mod process_tests;
 #[cfg(test)]
