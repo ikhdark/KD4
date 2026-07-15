@@ -16,6 +16,12 @@ struct CodeEnvironment {
     task_count: Option<i64>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum EnvironmentListDiagnostic {
+    Pretty(String),
+    Raw(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct AutodetectSelection {
     pub id: String,
@@ -85,29 +91,9 @@ pub async fn autodetect_environment_id(
         .to_string();
     let body = res.text().await.unwrap_or_default();
     crate::append_error_log(format!("env: status={status} content-type={ct}"));
-    if !status.is_success() {
-        match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(value) => {
-                let pretty = serde_json::to_string_pretty(&value).unwrap_or(body.clone());
-                crate::append_error_log(format!("env: /environments JSON (pretty):\n{pretty}"));
-            }
-            Err(_) => crate::append_error_log(format!("env: /environments (raw):\n{body}")),
-        }
-        anyhow::bail!("GET {list_url} failed: {status}; content-type={ct}; body={body}");
-    }
-    let all_envs: Vec<CodeEnvironment> = match serde_json::from_str(&body) {
-        Ok(all_envs) => {
-            let pretty = serde_json::to_string_pretty(&all_envs).unwrap_or(body.clone());
-            crate::append_error_log(format!("env: /environments JSON (pretty):\n{pretty}"));
-            all_envs
-        }
-        Err(error) => {
-            crate::append_error_log(format!("env: /environments (raw):\n{body}"));
-            return Err(anyhow::anyhow!(
-                "Decode error for {list_url}: {error}; content-type={ct}; body={body}"
-            ));
-        }
-    };
+    let (all_envs, diagnostic) = decode_environment_list_response(&list_url, status, &ct, &body);
+    log_environment_list_diagnostic(diagnostic);
+    let all_envs = all_envs?;
     if let Some(env) = pick_environment_row(&all_envs, desired_label.as_deref()) {
         return Ok(AutodetectSelection {
             id: env.id.clone(),
@@ -115,6 +101,57 @@ pub async fn autodetect_environment_id(
         });
     }
     anyhow::bail!("no environments available")
+}
+
+fn decode_environment_list_response(
+    list_url: &str,
+    status: reqwest::StatusCode,
+    content_type: &str,
+    body: &str,
+) -> (
+    anyhow::Result<Vec<CodeEnvironment>>,
+    EnvironmentListDiagnostic,
+) {
+    if !status.is_success() {
+        let diagnostic = match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(value) => EnvironmentListDiagnostic::Pretty(
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| body.to_string()),
+            ),
+            Err(_) => EnvironmentListDiagnostic::Raw(body.to_string()),
+        };
+        return (
+            Err(anyhow::anyhow!(
+                "GET {list_url} failed: {status}; content-type={content_type}; body={body}"
+            )),
+            diagnostic,
+        );
+    }
+
+    match serde_json::from_str::<Vec<CodeEnvironment>>(body) {
+        Ok(environments) => {
+            let diagnostic = EnvironmentListDiagnostic::Pretty(
+                serde_json::to_string_pretty(&environments).unwrap_or_else(|_| body.to_string()),
+            );
+            (Ok(environments), diagnostic)
+        }
+        Err(error) => (
+            Err(anyhow::anyhow!(
+                "Decode error for {list_url}: {error}; content-type={content_type}; body={body}"
+            )),
+            EnvironmentListDiagnostic::Raw(body.to_string()),
+        ),
+    }
+}
+
+fn log_environment_list_diagnostic(diagnostic: EnvironmentListDiagnostic) {
+    match diagnostic {
+        EnvironmentListDiagnostic::Pretty(pretty) => {
+            crate::append_error_log(format!("env: /environments JSON (pretty):\n{pretty}"));
+        }
+        EnvironmentListDiagnostic::Raw(raw) => {
+            crate::append_error_log(format!("env: /environments (raw):\n{raw}"));
+        }
+    }
 }
 
 fn pick_environment_row(
@@ -369,4 +406,123 @@ pub async fn list_environments(
         a.id.cmp(&b.id)
     });
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+    use reqwest::StatusCode;
+
+    use super::EnvironmentListDiagnostic;
+    use super::decode_environment_list_response;
+
+    #[test]
+    fn successful_environment_response_uses_typed_result_for_diagnostics() {
+        let body = r#"[{"id":"env-1","label":"Production","unknown":"ignored"}]"#;
+
+        let (result, diagnostic) = decode_environment_list_response(
+            "https://example.test/environments",
+            StatusCode::OK,
+            "application/json",
+            body,
+        );
+        let environments = result.expect("typed environment response");
+
+        assert_eq!(environments.len(), 1);
+        assert_eq!(environments[0].id, "env-1");
+        assert_eq!(environments[0].label.as_deref(), Some("Production"));
+        assert_eq!(
+            diagnostic,
+            EnvironmentListDiagnostic::Pretty(
+                r#"[
+  {
+    "id": "env-1",
+    "label": "Production",
+    "is_pinned": null,
+    "task_count": null
+  }
+]"#
+                .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn malformed_success_response_keeps_raw_diagnostic_and_decode_context() {
+        let body = r#"{"id":"env-1"}"#;
+
+        let (result, diagnostic) = decode_environment_list_response(
+            "https://example.test/environments",
+            StatusCode::OK,
+            "application/json",
+            body,
+        );
+        let error = result.expect_err("object is not an environment list");
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("Decode error for https://example.test/environments: "),
+            "{error}"
+        );
+        assert!(
+            error
+                .to_string()
+                .ends_with("; content-type=application/json; body={\"id\":\"env-1\"}"),
+            "{error}"
+        );
+        assert_eq!(diagnostic, EnvironmentListDiagnostic::Raw(body.to_string()));
+    }
+
+    #[test]
+    fn unsuccessful_environment_response_preserves_dynamic_json_diagnostic() {
+        let body = r#"{"error":{"code":"bad_request"},"unknown":true}"#;
+
+        let (result, diagnostic) = decode_environment_list_response(
+            "https://example.test/environments",
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            body,
+        );
+        let error = result.expect_err("HTTP failure");
+
+        assert_eq!(
+            error.to_string(),
+            "GET https://example.test/environments failed: 400 Bad Request; \
+             content-type=application/json; \
+             body={\"error\":{\"code\":\"bad_request\"},\"unknown\":true}"
+        );
+        assert_eq!(
+            diagnostic,
+            EnvironmentListDiagnostic::Pretty(
+                r#"{
+  "error": {
+    "code": "bad_request"
+  },
+  "unknown": true
+}"#
+                .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn unsuccessful_non_json_environment_response_keeps_raw_diagnostic() {
+        let body = "upstream unavailable";
+
+        let (result, diagnostic) = decode_environment_list_response(
+            "https://example.test/environments",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "text/plain",
+            body,
+        );
+        let error = result.expect_err("HTTP failure");
+
+        assert_eq!(
+            error.to_string(),
+            "GET https://example.test/environments failed: 503 Service Unavailable; \
+             content-type=text/plain; body=upstream unavailable"
+        );
+        assert_eq!(diagnostic, EnvironmentListDiagnostic::Raw(body.to_string()));
+    }
 }

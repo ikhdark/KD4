@@ -359,3 +359,69 @@ impl LiveThread {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::InMemoryThreadStore;
+    use crate::ThreadPersistenceMetadata;
+    use codex_protocol::protocol::AgentMessageContentDeltaEvent;
+    use codex_protocol::protocol::EventMsg;
+    use codex_protocol::protocol::PlanDeltaEvent;
+
+    #[tokio::test]
+    async fn empty_and_transient_only_batches_make_zero_store_calls() {
+        let store = Arc::new(InMemoryThreadStore::default());
+        let thread_id = ThreadId::new();
+        let live_thread = LiveThread::resume(
+            store.clone(),
+            ThreadHistoryMode::Legacy,
+            ResumeThreadParams {
+                thread_id,
+                rollout_path: None,
+                history: Some(Arc::new(Vec::new())),
+                include_archived: false,
+                metadata: ThreadPersistenceMetadata {
+                    cwd: None,
+                    model_provider: "test-provider".to_string(),
+                    memory_mode: ThreadMemoryMode::Enabled,
+                },
+            },
+        )
+        .await
+        .expect("resume in-memory live thread");
+        let transient = vec![
+            RolloutItem::EventMsg(EventMsg::AgentMessageContentDelta(
+                AgentMessageContentDeltaEvent {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "item-1".to_string(),
+                    delta: "first".to_string(),
+                },
+            )),
+            RolloutItem::EventMsg(EventMsg::PlanDelta(PlanDeltaEvent {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-1".to_string(),
+                item_id: "item-2".to_string(),
+                delta: "second".to_string(),
+            })),
+        ];
+
+        live_thread
+            .append_items(&[])
+            .await
+            .expect("empty append succeeds");
+        live_thread
+            .append_items(&transient)
+            .await
+            .expect("transient batch succeeds");
+        live_thread
+            .append_item(&transient[0])
+            .await
+            .expect("transient single append succeeds");
+
+        let calls = store.calls().await;
+        assert_eq!(calls.append_persisted_items, 0);
+        assert_eq!(calls.append_items, 0);
+    }
+}

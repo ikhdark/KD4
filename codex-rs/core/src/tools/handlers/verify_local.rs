@@ -8,7 +8,6 @@ use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
-use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -21,7 +20,20 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
 use codex_protocol::exec_output::ExecToolCallOutput;
-use codex_protocol::models::ResponseInputItem;
+use codex_verify_local::PlanMode;
+use codex_verify_local::PlanRequest;
+use codex_verify_local::RawPath;
+use codex_verify_local::RepositorySnapshot;
+use codex_verify_local::CommandResultV2;
+use codex_verify_local::LaunchErrorKind;
+use codex_verify_local::LogState;
+use codex_verify_local::SnapshotRecord;
+use codex_verify_local::SnapshotSource;
+use codex_verify_local::finalize_plan;
+use codex_verify_local::plan_verification;
+use codex_verify_local::random_hex_128;
+use codex_verify_local::render_human;
+use codex_verify_local::serialize_legacy_v1;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -189,131 +201,298 @@ impl VerifyLocalHandler {
         }
         let repo_root = find_verify_local_repo_root(environment.cwd()).ok_or_else(|| {
             FunctionCallError::RespondToModel(
-                "verify_local is unavailable: expected scripts/verify_local.py and justfile in this repo"
+                "verify_local is unavailable: expected codex-rs/verify-local and justfile in this repo"
                     .to_string(),
             )
         })?;
 
-        let argv = build_verify_local_argv(&args);
-        let raw_json = args.json;
-        let validation_command = argv.clone();
+        let mode = match args.mode_flag {
+            "--fast" => PlanMode::Fast,
+            "--final" => PlanMode::Final,
+            _ => PlanMode::Plan,
+        };
+        let changed = args
+            .changed
+            .iter()
+            .map(|path| RawPath::from_utf8(path.replace('\\', "/")))
+            .collect::<Vec<_>>();
+        let snapshot = if !changed.is_empty() || args.scope_current {
+            RepositorySnapshot::from_explicit_paths(&repo_root, changed.clone())
+        } else {
+            RepositorySnapshot::from_worktree(&repo_root)
+        }
+        .unwrap_or_else(|error| RepositorySnapshot::full_fallback(&repo_root, error.to_string()));
+        let plan = plan_verification(
+            PlanRequest {
+                mode: Some(mode),
+                changed,
+                staged: args.staged,
+                scope_current: args.scope_current,
+                no_cache: args.no_cache,
+                ..PlanRequest::default()
+            },
+            snapshot,
+        );
+        let validation_command = vec!["verify_local".to_string(), args.mode_flag.to_string()];
         let validation_tracker = tracker.clone();
         let validation_environment_id = environment.environment_id.clone();
         let (isolation, isolated_codex_home, isolated_sqlite_home) =
             create_isolated_validation_state()?;
-
-        let mut env = create_env(
+        let _isolation = isolation;
+        let mut base_env = create_env(
             &turn.config.permissions.shell_environment_policy,
             Some(session.thread_id),
         );
         let active_permission_profile = turn.config.permissions.active_permission_profile();
-        inject_permission_profile_env(&mut env, active_permission_profile.as_ref());
-        env.insert(
+        inject_permission_profile_env(&mut base_env, active_permission_profile.as_ref());
+        base_env.insert(
             "CODEX_HOME".to_string(),
             isolated_codex_home.to_string_lossy().into_owned(),
         );
-        env.insert(
+        base_env.insert(
             "CODEX_SQLITE_HOME".to_string(),
             isolated_sqlite_home.to_string_lossy().into_owned(),
         );
-
-        let cwd = AbsolutePathBuf::from_absolute_path(repo_root).map_err(|err| {
-            FunctionCallError::RespondToModel(format!("invalid verify_local repo root: {err}"))
-        })?;
-        let hook_command = codex_shell_command::parse_command::shlex_join(&argv);
-        let exec_params = ExecParams {
-            command: argv.clone(),
-            cwd,
-            expiration: args.timeout_ms().into(),
-            capture_policy: ExecCapturePolicy::ShellTool,
-            env,
-            network: turn.network.clone(),
-            network_environment_id: Some(environment.environment_id.clone()),
-            sandbox_permissions: SandboxPermissions::UseDefault,
-            windows_sandbox_level: turn.windows_sandbox_level,
-            windows_sandbox_private_desktop: turn
-                .config
-                .permissions
-                .windows_sandbox_private_desktop,
-            justification: None,
-            arg0: None,
-        };
-
-        // Keep the temporary CODEX_HOME/SQLite directories alive until the
-        // orchestrated command and cancellation cleanup have fully completed.
-        let _isolation = isolation;
         let validation_start = session
             .services
             .task_evidence
             .begin_verify_local_validation()
             .await;
-        let result = run_exec_like_with_exit_code(RunExecLikeArgs {
-            tool_name: self.tool_name(),
-            exec_params,
-            cancellation_token,
-            hook_command,
-            safety_command: argv,
-            shell_type: None,
-            additional_permissions: None,
-            prefix_rule: None,
-            session: Arc::clone(&session),
-            turn,
-            turn_environment: environment.clone(),
-            tracker,
-            call_id,
-            shell_runtime_backend: ShellRuntimeBackend::ShellCommandClassic,
-            track_validation_freshness: false,
-            attempt_key: None,
-            repair_notice: None,
-            capture_exec_output: true,
-        })
-        .await?;
-        let completed_normally = result
-            .exec_output
-            .as_ref()
-            .is_some_and(|output| !output.timed_out);
-        let (output, run) = finalize_verify_local_output(
-            result.output,
-            result.exec_output.as_ref(),
-            result.exit_code,
-            raw_json,
-        );
-        let (active_files, stale_reasons) = run
+        let mut facts = Vec::with_capacity(plan.commands.len());
+        if mode != PlanMode::Plan && plan.verdict.is_none() {
+            for (ordinal, command) in plan.commands.iter().enumerate() {
+                let nonce = random_hex_128().unwrap_or_else(|_| "0".repeat(32));
+                if cancellation_token.is_cancelled() {
+                    facts.push(cancelled_command_result(&plan, command, ordinal, nonce));
+                    continue;
+                }
+                let Some(argv) = command
+                    .args
+                    .iter()
+                    .map(|argument| argument.legacy_text().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    facts.push(unsupported_path_result(&plan, command, ordinal, nonce));
+                    continue;
+                };
+                let cwd = AbsolutePathBuf::from_absolute_path(repo_root.clone()).map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "invalid verify_local repo root: {err}"
+                    ))
+                })?;
+                let hook_command = codex_shell_command::parse_command::shlex_join(&argv);
+                let exec_params = ExecParams {
+                    command: argv.clone(),
+                    cwd,
+                    expiration: command.timeout_ms.into(),
+                    capture_policy: ExecCapturePolicy::ShellTool,
+                    env: base_env.clone(),
+                    network: turn.network.clone(),
+                    network_environment_id: Some(environment.environment_id.clone()),
+                    sandbox_permissions: SandboxPermissions::UseDefault,
+                    windows_sandbox_level: turn.windows_sandbox_level,
+                    windows_sandbox_private_desktop: turn
+                        .config
+                        .permissions
+                        .windows_sandbox_private_desktop,
+                    justification: None,
+                    arg0: None,
+                };
+                let command_call_id = format!("{call_id}-{ordinal}");
+                let executed = run_exec_like_with_exit_code(RunExecLikeArgs {
+                    tool_name: self.tool_name(),
+                    exec_params,
+                    cancellation_token: cancellation_token.clone(),
+                    hook_command,
+                    safety_command: argv,
+                    shell_type: None,
+                    additional_permissions: None,
+                    prefix_rule: None,
+                    session: Arc::clone(&session),
+                    turn: Arc::clone(&turn),
+                    turn_environment: environment.clone(),
+                    tracker: tracker.clone(),
+                    call_id: command_call_id,
+                    shell_runtime_backend: ShellRuntimeBackend::ShellCommandClassic,
+                    track_validation_freshness: false,
+                    attempt_key: None,
+                    repair_notice: None,
+                    capture_exec_output: true,
+                })
+                .await;
+                facts.push(match executed {
+                    Ok(executed) => command_result_from_core_execution(
+                        &plan,
+                        command,
+                        ordinal,
+                        nonce,
+                        executed.exec_output.as_ref(),
+                        executed.exit_code,
+                    ),
+                    Err(error) if cancellation_token.is_cancelled() => {
+                        cancelled_command_result(&plan, command, ordinal, nonce)
+                    }
+                    Err(error) => CommandResultV2 {
+                        runner_error: Some(format!("{error:?}")),
+                        ..base_command_result(&plan, command, ordinal, nonce)
+                    },
+                });
+            }
+        }
+        let completed_normally = facts
+            .iter()
+            .all(|result| !result.timed_out && !result.cancelled && result.runner_error.is_none());
+        let finalized = finalize_plan(plan, facts);
+        let contract_bytes = serialize_legacy_v1(&finalized, cfg!(windows)).map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "verify_local could not render its V1 contract: {error}"
+            ))
+        })?;
+        let contract_text = String::from_utf8(contract_bytes).map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "verify_local rendered invalid UTF-8: {error}"
+            ))
+        })?;
+        let contract_json = serde_json::from_str::<Value>(&contract_text).ok();
+        let output_text = if args.json {
+            contract_text
+        } else {
+            render_human(&finalized)
+        };
+        let active_files = finalized
+            .plan
             .scope
             .as_ref()
             .map(|scope| {
-                (
-                    scope.active_files.as_slice(),
-                    scope.stale_reasons.as_slice(),
-                )
+                scope
+                    .active_files
+                    .iter()
+                    .filter_map(RawPath::as_utf8)
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>()
             })
-            .unwrap_or((&[], &[]));
+            .unwrap_or_default();
+        let stale_reasons = finalized
+            .plan
+            .scope
+            .as_ref()
+            .map(|scope| scope.stale_reasons.clone())
+            .unwrap_or_default();
+        let tool_success = finalized.exit_code == 0;
         let proof_accepted = session
             .services
             .task_evidence
             .record_verify_local(
                 args.mode(),
-                run.verdict_text.as_deref(),
-                run.tool_success,
-                run.is_proof_bearing(),
-                run.has_versioned_contract() && completed_normally,
+                Some(finalized.verdict.as_str()),
+                tool_success,
+                finalized.verdict.is_proof_bearing(),
+                contract_json.is_some() && completed_normally,
                 validation_start.as_ref(),
-                active_files,
-                stale_reasons,
-                run.json.as_ref(),
+                &active_files,
+                &stale_reasons,
+                contract_json.as_ref(),
             )
             .await;
-        if proof_accepted && let Some(scope) = &run.scope {
+        if proof_accepted {
             let mut tracker = validation_tracker.lock().await;
             crate::turn_diff_tracker::TurnDiffTracker::record_verified_validation(
                 &mut tracker,
                 validation_command,
                 &validation_environment_id,
-                &scope.active_files,
+                &active_files,
                 /*clear_unknown_mutation*/ false,
             );
         }
-        Ok(boxed_tool_output(output))
+        Ok(boxed_tool_output(FunctionToolOutput::from_text(
+            output_text,
+            Some(tool_success),
+        )))
+    }
+}
+
+fn base_command_result(
+    plan: &codex_verify_local::PlanEnvelopeV2,
+    command: &codex_verify_local::CommandSpecV2,
+    ordinal: usize,
+    nonce: String,
+) -> CommandResultV2 {
+    CommandResultV2 {
+        schema_version: 2,
+        invocation_id: plan.invocation_id.clone(),
+        command_id: command.id.clone(),
+        command_ordinal: ordinal,
+        runner_nonce: nonce,
+        exit_code: None,
+        signal: None,
+        duration_ns: 0,
+        timed_out: false,
+        cancelled: false,
+        runner_error: None,
+        launch_error: None,
+        log_state: LogState::Complete,
+        log_path: None,
+        diagnostic: String::new(),
+        cached: false,
+        flaky: false,
+        baseline: None,
+    }
+}
+
+fn cancelled_command_result(
+    plan: &codex_verify_local::PlanEnvelopeV2,
+    command: &codex_verify_local::CommandSpecV2,
+    ordinal: usize,
+    nonce: String,
+) -> CommandResultV2 {
+    CommandResultV2 {
+        cancelled: true,
+        ..base_command_result(plan, command, ordinal, nonce)
+    }
+}
+
+fn unsupported_path_result(
+    plan: &codex_verify_local::PlanEnvelopeV2,
+    command: &codex_verify_local::CommandSpecV2,
+    ordinal: usize,
+    nonce: String,
+) -> CommandResultV2 {
+    CommandResultV2 {
+        runner_error: Some("command contains a path that Core cannot represent losslessly".to_string()),
+        launch_error: Some(LaunchErrorKind::UnsupportedPath),
+        ..base_command_result(plan, command, ordinal, nonce)
+    }
+}
+
+fn command_result_from_core_execution(
+    plan: &codex_verify_local::PlanEnvelopeV2,
+    command: &codex_verify_local::CommandSpecV2,
+    ordinal: usize,
+    nonce: String,
+    output: Option<&ExecToolCallOutput>,
+    exit_code: Option<i32>,
+) -> CommandResultV2 {
+    let Some(output) = output else {
+        return CommandResultV2 {
+            exit_code,
+            runner_error: Some("Core execution returned no process facts".to_string()),
+            ..base_command_result(plan, command, ordinal, nonce)
+        };
+    };
+    let mut diagnostic = output.aggregated_output.text.clone();
+    if diagnostic.len() > 64 * 1024 {
+        let mut boundary = 64 * 1024;
+        while !diagnostic.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        diagnostic.truncate(boundary);
+    }
+    CommandResultV2 {
+        exit_code: exit_code.or(Some(output.exit_code)),
+        duration_ns: u64::try_from(output.duration.as_nanos()).unwrap_or(u64::MAX),
+        timed_out: output.timed_out,
+        diagnostic,
+        ..base_command_result(plan, command, ordinal, nonce)
     }
 }
 
@@ -324,38 +503,52 @@ pub(crate) async fn run_automatic_verify_local_plan(
     changed: Vec<String>,
     cancellation_token: CancellationToken,
 ) -> Result<String, FunctionCallError> {
-    let call_id = format!("kd4-auto-verify-plan-{}", uuid::Uuid::now_v7());
+    let _ = (session, tracker, cancellation_token);
     let scope_current = changed.is_empty();
-    let arguments = serde_json::json!({
-        "mode": "plan",
-        "changed": changed,
-        "staged": false,
-        "scope_current": scope_current,
-        "no_cache": false,
-        "json": false,
-        "environment_id": null,
-    })
-    .to_string();
-    let payload = ToolPayload::Function { arguments };
-    let output = VerifyLocalHandler::for_verify_local_environment_id(true)
-        .handle_call(ToolInvocation {
-            session,
-            turn: Arc::clone(&step_context.turn),
-            step_context,
-            cancellation_token,
-            tracker,
-            call_id: call_id.clone(),
-            tool_name: ToolName::plain(VERIFY_LOCAL_TOOL_NAME),
-            source: ToolCallSource::Direct,
-            payload: payload.clone(),
-        })
-        .await?;
-    match output.to_response_item(&call_id, &payload) {
-        ResponseInputItem::FunctionCallOutput { output, .. } => {
-            Ok(output.body.to_text().unwrap_or_default())
-        }
-        _ => Ok(output.log_preview()),
+    let environment = resolve_tool_environment(&step_context.environments, None)?.ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "automatic verify_local planning requires a selected local environment".to_string(),
+        )
+    })?;
+    if environment.environment.is_remote() {
+        return Err(FunctionCallError::RespondToModel(
+            "automatic verify_local planning is available only locally".to_string(),
+        ));
     }
+    let repo_root = find_verify_local_repo_root(environment.cwd()).ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "automatic verify_local planning could not locate the repository root".to_string(),
+        )
+    })?;
+    let changed_paths = changed.into_iter().map(RawPath::from_utf8).collect::<Vec<_>>();
+    let snapshot = RepositorySnapshot {
+        repository_root: Some(repo_root),
+        source: SnapshotSource::ExplicitPaths,
+        records: changed_paths
+            .iter()
+            .cloned()
+            .map(|path| SnapshotRecord {
+                status: "M".to_string(),
+                path,
+                original_path: None,
+                staged: false,
+                unstaged: false,
+                submodule_state: None,
+            })
+            .collect(),
+        complete: true,
+        fallback_reasons: Vec::new(),
+    };
+    let plan = plan_verification(
+        PlanRequest {
+            mode: Some(PlanMode::Plan),
+            changed: changed_paths,
+            scope_current,
+            ..PlanRequest::default()
+        },
+        snapshot,
+    );
+    Ok(render_human(&finalize_plan(plan, Vec::new())))
 }
 
 fn parse_verify_local_arguments(arguments: &str) -> Result<VerifyLocalArgs, FunctionCallError> {
@@ -495,7 +688,11 @@ fn build_verify_local_argv(args: &VerifyLocalArgs) -> Vec<String> {
 fn find_verify_local_repo_root(cwd: &PathUri) -> Option<PathBuf> {
     let cwd = cwd.to_abs_path().ok()?;
     for candidate in cwd.as_path().ancestors() {
-        if candidate.join("scripts").join("verify_local.py").is_file()
+        if candidate
+            .join("codex-rs")
+            .join("verify-local")
+            .join("Cargo.toml")
+            .is_file()
             && candidate.join("justfile").is_file()
         {
             return Some(candidate.to_path_buf());

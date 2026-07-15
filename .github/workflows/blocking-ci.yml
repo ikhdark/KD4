@@ -8,41 +8,130 @@ on:
     branches: [main]
 
 jobs:
+  classify:
+    name: Classify CI scope
+    runs-on: ubuntu-24.04
+    outputs:
+      decision_id: ${{ steps.classify.outputs.decision_id }}
+      artifact_name: ${{ steps.classify.outputs.artifact_name }}
+      full_fallback: ${{ steps.classify.outputs.full_fallback }}
+      run_blob_size_policy: ${{ steps.classify.outputs.run_blob_size_policy }}
+      run_cargo_deny: ${{ steps.classify.outputs.run_cargo_deny }}
+      run_cargo_full: ${{ steps.classify.outputs.run_cargo_full }}
+      run_codespell: ${{ steps.classify.outputs.run_codespell }}
+      run_repo_checks: ${{ steps.classify.outputs.run_repo_checks }}
+      run_rust_ci: ${{ steps.classify.outputs.run_rust_ci }}
+      run_sdk: ${{ steps.classify.outputs.run_sdk }}
+      rust_matrix: ${{ steps.classify.outputs.rust_matrix }}
+      rust_shards: ${{ steps.classify.outputs.rust_shards }}
+    steps:
+      - name: Checkout repository with comparison history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Produce canonical CI decision
+        id: classify
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          COMPARISON_MODE: ${{ github.event_name == 'pull_request' && 'pull-request' || 'direct' }}
+        run: |
+          set -euo pipefail
+          cargo run --quiet --locked \
+            --manifest-path codex-rs/Cargo.toml \
+            -p codex-verify-local -- \
+            ci-scope \
+            --base "$BASE_SHA" \
+            --head "$HEAD_SHA" \
+            --comparison-mode "$COMPARISON_MODE" \
+            --event "${{ github.event_name }}" \
+            --artifact "${RUNNER_TEMP}/ci-decision.json" \
+            --github-output "$GITHUB_OUTPUT" \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --cache-readonly
+      - name: Upload canonical CI decision
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: ${{ steps.classify.outputs.artifact_name }}
+          path: ${{ runner.temp }}/ci-decision.json
+          if-no-files-found: error
+          retention-days: 1
+
   # Keep reusable workflow calls alphabetized. The `required` job below is the
   # version-controlled list that the main-branch ruleset should require.
   blob-size-policy:
     name: Blob size policy
+    needs: classify
+    if: ${{ needs.classify.outputs.run_blob_size_policy == 'true' }}
     uses: ./.github/workflows/blob-size-policy.yml
+    with:
+      decision_id: ${{ needs.classify.outputs.decision_id }}
+      decision_artifact: ${{ needs.classify.outputs.artifact_name }}
     secrets: inherit
 
   cargo-deny:
     name: cargo-deny
+    needs: classify
+    if: ${{ needs.classify.outputs.run_cargo_deny == 'true' }}
     uses: ./.github/workflows/cargo-deny.yml
+    with:
+      decision_id: ${{ needs.classify.outputs.decision_id }}
+      decision_artifact: ${{ needs.classify.outputs.artifact_name }}
     secrets: inherit
 
   cargo-full:
     name: Cargo full
+    needs: classify
+    if: ${{ needs.classify.outputs.run_cargo_full == 'true' }}
     uses: ./.github/workflows/rust-ci-full.yml
+    with:
+      decision_id: ${{ needs.classify.outputs.decision_id }}
+      decision_artifact: ${{ needs.classify.outputs.artifact_name }}
     secrets: inherit
 
   codespell:
     name: Codespell
+    needs: classify
+    if: ${{ needs.classify.outputs.run_codespell == 'true' }}
     uses: ./.github/workflows/codespell.yml
+    with:
+      decision_id: ${{ needs.classify.outputs.decision_id }}
+      decision_artifact: ${{ needs.classify.outputs.artifact_name }}
     secrets: inherit
 
   repo-checks:
     name: repo-checks
+    needs: classify
+    if: ${{ needs.classify.outputs.run_repo_checks == 'true' }}
     uses: ./.github/workflows/repo-checks.yml
+    with:
+      decision_id: ${{ needs.classify.outputs.decision_id }}
+      decision_artifact: ${{ needs.classify.outputs.artifact_name }}
     secrets: inherit
 
   rust-ci:
     name: rust-ci
+    needs: classify
+    if: ${{ needs.classify.outputs.run_rust_ci == 'true' }}
     uses: ./.github/workflows/rust-ci.yml
+    with:
+      decision_id: ${{ needs.classify.outputs.decision_id }}
+      decision_artifact: ${{ needs.classify.outputs.artifact_name }}
     secrets: inherit
 
   sdk:
     name: sdk
+    needs: classify
+    if: ${{ needs.classify.outputs.run_sdk == 'true' }}
     uses: ./.github/workflows/sdk.yml
+    with:
+      decision_id: ${{ needs.classify.outputs.decision_id }}
+      decision_artifact: ${{ needs.classify.outputs.artifact_name }}
     secrets: inherit
 
   required:
@@ -51,6 +140,7 @@ jobs:
     # required check can appear successful instead of reporting the failure.
     if: ${{ always() }}
     needs:
+      - classify
       - blob-size-policy
       - cargo-deny
       - cargo-full
@@ -76,4 +166,12 @@ jobs:
       - name: Require successful dependencies
         env:
           NEEDS: ${{ toJSON(needs) }}
+          DECISION_ID: ${{ needs.classify.outputs.decision_id }}
+          RUN_BLOB_SIZE_POLICY: ${{ needs.classify.outputs.run_blob_size_policy }}
+          RUN_CARGO_DENY: ${{ needs.classify.outputs.run_cargo_deny }}
+          RUN_CARGO_FULL: ${{ needs.classify.outputs.run_cargo_full }}
+          RUN_CODESPELL: ${{ needs.classify.outputs.run_codespell }}
+          RUN_REPO_CHECKS: ${{ needs.classify.outputs.run_repo_checks }}
+          RUN_RUST_CI: ${{ needs.classify.outputs.run_rust_ci }}
+          RUN_SDK: ${{ needs.classify.outputs.run_sdk }}
         run: python3 .github/scripts/check_ci_results.py

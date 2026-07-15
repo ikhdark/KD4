@@ -704,4 +704,150 @@ mod tests {
         assert_eq!(linear.history_version(), u64::MAX);
         assert_eq!(linear.history_version(), legacy.history_version());
     }
+
+    #[test]
+    fn linear_compaction_request_body_matches_legacy_and_wire_golden() {
+        let large = "tool output ".repeat(512);
+        let items = vec![
+            ResponseItem::FunctionCall {
+                id: Some("function-call-item".to_string()),
+                name: "function_tool".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: "function-call".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::CustomToolCall {
+                id: Some("custom-call-item".to_string()),
+                status: None,
+                call_id: "custom-call".to_string(),
+                name: "custom_tool".to_string(),
+                namespace: None,
+                input: "input".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::ToolSearchCall {
+                id: Some("search-call-item".to_string()),
+                call_id: Some("search-call".to_string()),
+                status: Some("completed".to_string()),
+                execution: "server".to_string(),
+                arguments: json!({ "query": "tool" }),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::CustomToolCallOutput {
+                id: Some("custom-output".to_string()),
+                call_id: "custom-call".to_string(),
+                name: Some("custom_tool".to_string()),
+                output: text_output(&large),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::ToolSearchOutput {
+                id: Some("search-output".to_string()),
+                call_id: Some("search-call".to_string()),
+                status: "completed".to_string(),
+                execution: "server".to_string(),
+                tools: vec![json!({ "name": "tool", "description": large })],
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: Some("function-output".to_string()),
+                call_id: "function-call".to_string(),
+                output: text_output(&large),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ];
+        let mut linear = ContextManager::new();
+        linear.replace(items.clone());
+        let mut legacy = ContextManager::new();
+        legacy.replace(items);
+        let base_instructions = BaseInstructions {
+            text: "base instructions".to_string(),
+        };
+
+        let linear_result = trim_function_call_history_to_fit_context_window_with_costs(
+            &mut linear,
+            0,
+            &base_instructions,
+            proven_rewrite_costs,
+        );
+        let legacy_result = trim_function_call_history_to_fit_context_window_legacy(
+            &mut legacy,
+            0,
+            &base_instructions,
+        );
+        assert_eq!(linear_result, legacy_result);
+
+        let request_body = |history: ContextManager| {
+            let input = history.for_prompt(&[codex_protocol::openai_models::InputModality::Text]);
+            serde_json::to_value(codex_api::CompactionInput {
+                model: "test-model",
+                input: &input,
+                instructions: &base_instructions.text,
+                tools: None,
+                parallel_tool_calls: false,
+                reasoning: None,
+                service_tier: None,
+                prompt_cache_key: None,
+                text: None,
+            })
+            .expect("serialize compaction request")
+        };
+        let linear_body = request_body(linear);
+        let legacy_body = request_body(legacy);
+
+        assert_eq!(linear_body, legacy_body);
+        assert_eq!(
+            linear_body,
+            json!({
+                "model": "test-model",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "id": "function-call-item",
+                        "name": "function_tool",
+                        "arguments": "{}",
+                        "call_id": "function-call"
+                    },
+                    {
+                        "type": "custom_tool_call",
+                        "id": "custom-call-item",
+                        "call_id": "custom-call",
+                        "name": "custom_tool",
+                        "input": "input"
+                    },
+                    {
+                        "type": "tool_search_call",
+                        "id": "search-call-item",
+                        "call_id": "search-call",
+                        "status": "completed",
+                        "execution": "server",
+                        "arguments": { "query": "tool" }
+                    },
+                    {
+                        "type": "custom_tool_call_output",
+                        "id": "custom-output",
+                        "call_id": "custom-call",
+                        "name": "custom_tool",
+                        "output": CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE
+                    },
+                    {
+                        "type": "tool_search_output",
+                        "id": "search-output",
+                        "call_id": "search-call",
+                        "status": "completed",
+                        "execution": "server",
+                        "tools": []
+                    },
+                    {
+                        "type": "function_call_output",
+                        "id": "function-output",
+                        "call_id": "function-call",
+                        "output": CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE
+                    }
+                ],
+                "instructions": "base instructions",
+                "parallel_tool_calls": false
+            })
+        );
+    }
 }

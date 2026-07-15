@@ -75,7 +75,7 @@ pub(crate) fn create_verify_local_tool(options: VerifyLocalToolOptions) -> ToolS
     ToolSpec::Function(ResponsesApiTool {
         name: VERIFY_LOCAL_TOOL_NAME.to_string(),
         description:
-            "Run bounded repo-local validation through scripts/verify_local.py using the normal command approval, sandbox, hook, and cancellation path. The verifier may write repo-local validation logs/cache under .codex/verify-local and ordinary build/test artifacts allowed by the active sandbox. CODEX_HOME and CODEX_SQLITE_HOME are isolated per call. Broad workspace or explicitly mutating verifier flags remain human CLI-only."
+            "Plan and finalize bounded repo-local validation in Rust, then execute each planned command through the normal command approval, sandbox, hook, and cancellation path. The verifier may write repo-local validation logs/cache under .codex/verify-local and ordinary build/test artifacts allowed by the active sandbox. CODEX_HOME and CODEX_SQLITE_HOME are isolated per call. Broad workspace or explicitly mutating verifier flags remain human CLI-only."
                 .to_string(),
         strict: true,
         defer_loading: None,

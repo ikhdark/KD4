@@ -521,10 +521,42 @@ fn trimmed_reason(reason: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
+    use serde::de::DeserializeOwned;
     use serde_json::json;
 
+    use crate::schema::PermissionRequestCommandOutputWire;
+    use crate::schema::PostCompactCommandOutputWire;
+    use crate::schema::PostToolUseCommandOutputWire;
+    use crate::schema::PreCompactCommandOutputWire;
+    use crate::schema::PreToolUseCommandOutputWire;
+    use crate::schema::SessionStartCommandOutputWire;
+    use crate::schema::StopCommandOutputWire;
+    use crate::schema::SubagentStartCommandOutputWire;
+    use crate::schema::SubagentStopCommandOutputWire;
+    use crate::schema::UserPromptSubmitCommandOutputWire;
+
+    use super::parse_json;
     use super::parse_permission_request;
     use super::parse_session_start;
+
+    fn legacy_parse_accepts<T: DeserializeOwned>(stdout: &str) -> bool {
+        let trimmed = stdout.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            return false;
+        };
+        value.is_object() && serde_json::from_value::<T>(value).is_ok()
+    }
+
+    fn assert_direct_parse_matches_legacy<T: DeserializeOwned>(stdout: &str) {
+        assert_eq!(
+            parse_json::<T>(stdout).is_some(),
+            legacy_parse_accepts::<T>(stdout),
+            "stdout: {stdout}"
+        );
+    }
 
     #[test]
     fn direct_hook_output_deserialization_preserves_legacy_acceptance() {
@@ -541,6 +573,39 @@ mod tests {
         assert!(parse_session_start(r#"{"unknownField":true}"#).is_none());
         assert!(parse_session_start(r#"{"hookSpecificOutput":{}}"#).is_none());
         assert!(parse_session_start(r#"{"continue":"yes"}"#).is_none());
+    }
+
+    #[test]
+    fn every_hook_output_wire_preserves_legacy_failure_acceptance() {
+        for stdout in [
+            "{",
+            "[]",
+            r#"{"unknownField":true}"#,
+            r#"{"hookSpecificOutput":{}}"#,
+            r#"{"continue":"yes"}"#,
+        ] {
+            assert_direct_parse_matches_legacy::<SessionStartCommandOutputWire>(stdout);
+            assert_direct_parse_matches_legacy::<SubagentStartCommandOutputWire>(stdout);
+            assert_direct_parse_matches_legacy::<PreToolUseCommandOutputWire>(stdout);
+            assert_direct_parse_matches_legacy::<PermissionRequestCommandOutputWire>(stdout);
+            assert_direct_parse_matches_legacy::<PostToolUseCommandOutputWire>(stdout);
+            assert_direct_parse_matches_legacy::<PreCompactCommandOutputWire>(stdout);
+            assert_direct_parse_matches_legacy::<PostCompactCommandOutputWire>(stdout);
+            assert_direct_parse_matches_legacy::<UserPromptSubmitCommandOutputWire>(stdout);
+            assert_direct_parse_matches_legacy::<StopCommandOutputWire>(stdout);
+            assert_direct_parse_matches_legacy::<SubagentStopCommandOutputWire>(stdout);
+        }
+    }
+
+    #[test]
+    fn direct_hook_output_deserialization_uses_legacy_duplicate_field_fallback() {
+        let stdout = r#"{"continue":false,"continue":true}"#;
+
+        assert!(serde_json::from_str::<SessionStartCommandOutputWire>(stdout).is_err());
+        assert!(legacy_parse_accepts::<SessionStartCommandOutputWire>(stdout));
+
+        let parsed = parse_session_start(stdout).expect("legacy Value path accepts duplicate fields");
+        assert!(parsed.universal.continue_processing);
     }
 
     #[test]

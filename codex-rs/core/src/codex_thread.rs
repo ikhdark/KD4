@@ -671,7 +671,7 @@ impl CodexThread {
         server: &str,
         uri: &str,
     ) -> anyhow::Result<serde_json::Value> {
-        Ok(serde_json::to_value(
+        Ok(codex_mcp::resource_read_result_to_value(
             self.read_mcp_resource_typed(server, uri).await?,
         )?)
     }

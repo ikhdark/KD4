@@ -475,6 +475,45 @@ mod tests {
     }
 
     #[test]
+    fn invalid_json_shapes_preserve_final_failure_diagnostic() {
+        for stdout in [
+            "[]",
+            r#"{"unknownField":true}"#,
+            r#"{"hookSpecificOutput":{}}"#,
+            r#"{"continue":"yes"}"#,
+        ] {
+            let parsed = parse_completed(
+                &handler(),
+                run_result(Some(0), stdout, ""),
+                /*turn_id*/ None,
+            );
+
+            assert_eq!(
+                parsed.data,
+                SessionStartHandlerData {
+                    should_stop: false,
+                    stop_reason: None,
+                    additional_contexts_for_model: Vec::new(),
+                },
+                "stdout: {stdout}"
+            );
+            assert_eq!(
+                parsed.completed.run.status,
+                HookRunStatus::Failed,
+                "stdout: {stdout}"
+            );
+            assert_eq!(
+                parsed.completed.run.entries,
+                vec![HookOutputEntry {
+                    kind: HookOutputEntryKind::Error,
+                    text: "hook returned invalid session start JSON output".to_string(),
+                }],
+                "stdout: {stdout}"
+            );
+        }
+    }
+
+    #[test]
     fn subagent_start_plain_stdout_becomes_model_context() {
         let parsed = parse_completed(
             &handler_for(HookEventName::SubagentStart),

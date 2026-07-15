@@ -8,10 +8,7 @@ use crate::model::PlanMode;
 use crate::model::Verdict;
 use std::collections::HashSet;
 
-pub fn finalize_plan(
-    plan: PlanEnvelopeV2,
-    results: Vec<CommandResultV2>,
-) -> FinalizedVerification {
+pub fn finalize_plan(plan: PlanEnvelopeV2, results: Vec<CommandResultV2>) -> FinalizedVerification {
     if plan.mode == PlanMode::Plan {
         let verdict = plan.verdict.unwrap_or(Verdict::Planned);
         return finish(plan, Vec::new(), verdict, false, None);
@@ -20,13 +17,7 @@ pub fn finalize_plan(
         return finish(plan, Vec::new(), verdict, false, None);
     }
     if plan.commands.is_empty() {
-        return finish(
-            plan,
-            Vec::new(),
-            Verdict::VerifiedNoProof,
-            false,
-            None,
-        );
+        return finish(plan, Vec::new(), Verdict::VerifiedNoProof, false, None);
     }
 
     if results.len() != plan.commands.len() {
@@ -70,13 +61,7 @@ pub fn finalize_plan(
     let cache_eligible = finalized
         .iter()
         .all(|result| result.raw.log_state == LogState::Complete);
-    finish(
-        plan,
-        finalized,
-        Verdict::Verified,
-        cache_eligible,
-        None,
-    )
+    finish(plan, finalized, Verdict::Verified, cache_eligible, None)
 }
 
 fn classify_command_result(result: &CommandResultV2) -> Verdict {
@@ -89,12 +74,14 @@ fn classify_command_result(result: &CommandResultV2) -> Verdict {
     if result.timed_out || result.cancelled {
         return Verdict::Inconclusive;
     }
-    if result.log_state == LogState::IncompleteAfterTermination || result.runner_error.is_some() {
+    if result.log_state == LogState::IncompleteAfterTermination {
         return Verdict::ToolingError;
     }
     match result.launch_error {
         Some(LaunchErrorKind::CommandNotFound) => Verdict::Failed,
+        Some(LaunchErrorKind::UnsupportedPath) => Verdict::Inconclusive,
         Some(LaunchErrorKind::PermissionDenied | LaunchErrorKind::Other) => Verdict::ToolingError,
+        None if result.runner_error.is_some() => Verdict::ToolingError,
         None => match result.exit_code {
             Some(0) => Verdict::Verified,
             Some(_) => Verdict::Failed,

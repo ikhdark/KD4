@@ -363,6 +363,7 @@ pub struct InMemoryThreadStoreCalls {
     pub create_thread: usize,
     pub resume_thread: usize,
     pub append_items: usize,
+    pub append_persisted_items: usize,
     pub persist_thread: usize,
     pub flush_thread: usize,
     pub shutdown_thread: usize,
@@ -505,6 +506,7 @@ impl InMemoryThreadStore {
         thread_id: ThreadId,
         items: &[RolloutItem],
     ) -> ThreadStoreResult<()> {
+        self.state.lock().await.calls.append_persisted_items += 1;
         if items.is_empty() {
             return Ok(());
         }

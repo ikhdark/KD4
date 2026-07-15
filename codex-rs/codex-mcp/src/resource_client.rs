@@ -105,12 +105,7 @@ impl McpResourceClient {
             .load_full()
             .read_resource(server, ReadResourceRequestParams::new(uri.to_string()))
             .await?;
-        let contents = result
-            .contents
-            .into_iter()
-            .map(resource_content_from_rmcp)
-            .collect::<Result<Vec<_>>>()?;
-        Ok(McpResourceReadResult { contents })
+        resource_read_result_from_rmcp(result)
     }
 }
 
@@ -158,4 +153,81 @@ pub fn resource_read_result_from_rmcp(
         .map(resource_content_from_rmcp)
         .collect::<Result<Vec<_>>>()?;
     Ok(McpResourceReadResult { contents })
+}
+
+/// Serializes the typed resource result for the retained `Value` compatibility API.
+pub fn resource_read_result_to_value(
+    result: McpResourceReadResult,
+) -> std::result::Result<serde_json::Value, serde_json::Error> {
+    serde_json::to_value(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_protocol::mcp::ResourceContent;
+    use pretty_assertions::assert_eq;
+    use rmcp::model::Meta;
+    use rmcp::model::ReadResourceResult;
+    use rmcp::model::ResourceContents;
+    use serde_json::json;
+
+    use super::McpResourceReadResult;
+    use super::resource_read_result_from_rmcp;
+    use super::resource_read_result_to_value;
+
+    #[test]
+    fn typed_resource_read_preserves_legacy_value_wrapper_shape() {
+        let text_meta = Meta(serde_json::Map::from_iter([
+            ("nested".to_string(), json!({ "kind": "text" })),
+            ("count".to_string(), json!(1)),
+        ]));
+        let blob_meta = Meta(serde_json::Map::from_iter([
+            ("nested".to_string(), json!({ "kind": "blob" })),
+            ("count".to_string(), json!(2)),
+        ]));
+        let rmcp_result = ReadResourceResult::new(vec![
+            ResourceContents::TextResourceContents {
+                uri: "file:///text".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                text: "hello".to_string(),
+                meta: Some(text_meta),
+            },
+            ResourceContents::BlobResourceContents {
+                uri: "file:///blob".to_string(),
+                mime_type: None,
+                blob: "aGVsbG8=".to_string(),
+                meta: Some(blob_meta),
+            },
+        ]);
+        let legacy_value = serde_json::to_value(&rmcp_result).unwrap();
+
+        let typed = resource_read_result_from_rmcp(rmcp_result).unwrap();
+
+        assert_eq!(
+            typed,
+            McpResourceReadResult {
+                contents: vec![
+                    ResourceContent::Text {
+                        uri: "file:///text".to_string(),
+                        mime_type: Some("text/plain".to_string()),
+                        text: "hello".to_string(),
+                        meta: Some(json!({
+                            "nested": { "kind": "text" },
+                            "count": 1
+                        })),
+                    },
+                    ResourceContent::Blob {
+                        uri: "file:///blob".to_string(),
+                        mime_type: None,
+                        blob: "aGVsbG8=".to_string(),
+                        meta: Some(json!({
+                            "nested": { "kind": "blob" },
+                            "count": 2
+                        })),
+                    },
+                ],
+            }
+        );
+        assert_eq!(resource_read_result_to_value(typed).unwrap(), legacy_value);
+    }
 }

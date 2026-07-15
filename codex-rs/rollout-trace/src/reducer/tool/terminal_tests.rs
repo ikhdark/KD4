@@ -24,6 +24,45 @@ use crate::replay_bundle;
 use crate::writer::TraceWriter;
 
 #[test]
+fn malformed_write_stdin_response_preserves_legacy_diagnostic() {
+    let error = super::parse_terminal_response_payload_legacy_compatible(
+        json!({}),
+        &TerminalOperationKind::WriteStdin,
+        "raw_payload:test",
+    )
+    .err()
+    .expect("malformed response must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "parse write_stdin terminal response raw_payload:test as protocol payload \
+         (missing field `stdout`) or dispatch payload"
+    );
+    assert_eq!(
+        format!("{error:#}"),
+        "parse write_stdin terminal response raw_payload:test as protocol payload \
+         (missing field `stdout`) or dispatch payload: missing field `type`"
+    );
+}
+
+#[test]
+fn missing_write_stdin_arguments_preserve_legacy_context() {
+    let payload: super::DispatchedToolTraceRequestPayload = serde_json::from_value(json!({
+        "tool_name": "write_stdin",
+        "payload": { "type": "function" }
+    }))
+    .expect("typed dispatch envelope");
+    let error = super::parse_dispatch_terminal_request(payload)
+        .err()
+        .expect("missing arguments must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "write_stdin dispatch payload omitted function arguments"
+    );
+}
+
+#[test]
 fn exec_tool_reduces_to_terminal_operation_and_session() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;
@@ -280,6 +319,27 @@ fn write_stdin_operation_reuses_existing_terminal_session() -> anyhow::Result<()
             runtime_payload: stdin_payload,
         },
     )?;
+    let stdin_end_payload = writer.write_json_payload(
+        RawPayloadKind::ToolRuntimeEvent,
+        &json!({
+            "call_id": "tool-stdin",
+            "process_id": "pty-1",
+            "turn_id": "turn-1",
+            "stdout": "hi\n",
+            "stderr": "",
+            "exit_code": 0,
+            "formatted_output": "hi\n",
+            "status": "completed"
+        }),
+    )?;
+    let stdin_runtime_end = writer.append_with_context(
+        trace_context("turn-1"),
+        RawTraceEventPayload::ToolCallRuntimeEnded {
+            tool_call_id: "tool-stdin".to_string(),
+            status: ExecutionStatus::Completed,
+            runtime_payload: stdin_end_payload,
+        },
+    )?;
 
     let rollout = replay_bundle(temp.path())?;
     let startup_operation_id = "terminal_operation:1".to_string();
@@ -299,18 +359,25 @@ fn write_stdin_operation_reuses_existing_terminal_session() -> anyhow::Result<()
             execution: ExecutionWindow {
                 started_at_unix_ms: stdin_runtime_start.wall_time_unix_ms,
                 started_seq: stdin_runtime_start.seq,
-                ended_at_unix_ms: None,
-                ended_seq: None,
-                status: ExecutionStatus::Running,
+                ended_at_unix_ms: Some(stdin_runtime_end.wall_time_unix_ms),
+                ended_seq: Some(stdin_runtime_end.seq),
+                status: ExecutionStatus::Completed,
             },
             request: TerminalRequest::WriteStdin {
                 stdin: "echo hi\n".to_string(),
                 yield_time_ms: None,
                 max_output_tokens: None,
             },
-            result: None,
+            result: Some(TerminalResult {
+                exit_code: Some(0),
+                stdout: "hi\n".to_string(),
+                stderr: String::new(),
+                formatted_output: Some("hi\n".to_string()),
+                original_token_count: None,
+                chunk_id: None,
+            }),
             model_observations: Vec::new(),
-            raw_payload_ids: vec!["raw_payload:2".to_string()],
+            raw_payload_ids: vec!["raw_payload:2".to_string(), "raw_payload:3".to_string()],
         },
     );
 

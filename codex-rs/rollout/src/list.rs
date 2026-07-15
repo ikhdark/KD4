@@ -97,6 +97,7 @@ pub type ConversationsPage = ThreadsPage;
 #[derive(Default)]
 struct HeadTailSummary {
     saw_session_meta: bool,
+    first_summary_head_item: Option<SummaryHeadItemKind>,
     session_meta_line: Option<SessionMetaLine>,
     thread_id: Option<ThreadId>,
     first_user_message: Option<String>,
@@ -114,6 +115,12 @@ struct HeadTailSummary {
     cli_version: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SummaryHeadItemKind {
+    SessionMeta,
+    ResponseItem,
 }
 
 /// Hard cap to bound worst‑case work per request.
@@ -879,15 +886,30 @@ pub async fn read_thread_item_from_rollout(path: PathBuf) -> Option<ThreadItem> 
 pub async fn read_thread_item_and_session_meta_from_rollout(
     path: PathBuf,
 ) -> io::Result<(Option<ThreadItem>, SessionMetaLine)> {
-    let summary = read_head_summary(&path, HEAD_RECORD_LIMIT).await?;
-    let session_meta = summary.session_meta_line.clone().ok_or_else(|| {
-        io::Error::other(format!(
-            "rollout at {} does not start with session metadata",
-            path.display()
-        ))
-    })?;
-    let item = thread_item_from_summary(path, summary, /*updated_at*/ None);
-    Ok((item, session_meta))
+    let summary = match read_head_summary(&path, HEAD_RECORD_LIMIT).await {
+        Ok(summary) => summary,
+        Err(_) => {
+            let session_meta = read_session_meta_line(&path).await?;
+            return Ok((None, session_meta));
+        }
+    };
+
+    match summary.first_summary_head_item {
+        Some(SummaryHeadItemKind::SessionMeta) => {
+            let session_meta = summary.session_meta_line.clone().ok_or_else(|| {
+                rollout_does_not_start_with_session_metadata_error(path.as_path())
+            })?;
+            let item = thread_item_from_summary(path, summary, /*updated_at*/ None);
+            Ok((item, session_meta))
+        }
+        Some(SummaryHeadItemKind::ResponseItem) => Err(
+            rollout_does_not_start_with_session_metadata_error(path.as_path()),
+        ),
+        None => {
+            let session_meta = read_session_meta_line(&path).await?;
+            Ok((None, session_meta))
+        }
+    }
 }
 
 /// Collects immediate subdirectories of `parent`, parses their (string) names with `parse`,
@@ -1167,6 +1189,9 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
 
         match rollout_line.item {
             RolloutItem::SessionMeta(session_meta_line) => {
+                summary
+                    .first_summary_head_item
+                    .get_or_insert(SummaryHeadItemKind::SessionMeta);
                 if !summary.saw_session_meta {
                     summary.source = Some(session_meta_line.meta.source.clone());
                     summary.history_mode = session_meta_line.meta.history_mode;
@@ -1195,6 +1220,9 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                 }
             }
             RolloutItem::ResponseItem(_) | RolloutItem::InterAgentCommunication(_) => {
+                summary
+                    .first_summary_head_item
+                    .get_or_insert(SummaryHeadItemKind::ResponseItem);
                 summary
                     .created_at
                     .get_or_insert_with(|| rollout_line.timestamp.clone());
@@ -1331,11 +1359,17 @@ pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> 
     };
     match first {
         SummaryHeadItem::SessionMeta(session_meta) => Ok(session_meta),
-        SummaryHeadItem::ResponseItem(_) => Err(io::Error::other(format!(
-            "rollout at {} does not start with session metadata",
-            path.display()
-        ))),
+        SummaryHeadItem::ResponseItem(_) => {
+            Err(rollout_does_not_start_with_session_metadata_error(path))
+        }
     }
+}
+
+fn rollout_does_not_start_with_session_metadata_error(path: &Path) -> io::Error {
+    io::Error::other(format!(
+        "rollout at {} does not start with session metadata",
+        path.display()
+    ))
 }
 
 async fn file_modified_time(path: &Path) -> io::Result<Option<OffsetDateTime>> {

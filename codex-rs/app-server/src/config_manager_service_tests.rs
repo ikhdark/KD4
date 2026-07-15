@@ -34,24 +34,46 @@ fn direct_config_projection_matches_legacy_json_bridge() {
     let writable_root =
         AbsolutePathBuf::try_from(temp.path().to_path_buf()).expect("tempdir path is absolute");
     let mut config = ConfigToml {
+        model: Some("gpt-test".to_string()),
+        review_model: Some("gpt-review".to_string()),
+        model_provider: Some("test-provider".to_string()),
+        model_context_window: Some(131_072),
+        model_auto_compact_token_limit: Some(96_000),
+        model_auto_compact_token_limit_scope: Some(
+            codex_protocol::config_types::AutoCompactTokenLimitScope::BodyAfterPrefix,
+        ),
+        approval_policy: Some(codex_protocol::protocol::AskForApproval::OnRequest),
+        approvals_reviewer: Some(codex_config::types::ApprovalsReviewer::AutoReview),
+        allow_login_shell: Some(false),
+        sandbox_mode: Some(codex_protocol::config_types::SandboxMode::WorkspaceWrite),
         sandbox_workspace_write: Some(codex_config::types::SandboxWorkspaceWrite {
             writable_roots: vec![writable_root],
             network_access: true,
             exclude_tmpdir_env_var: true,
             exclude_slash_tmp: true,
         }),
+        instructions: Some("system instructions".to_string()),
+        developer_instructions: Some("developer instructions".to_string()),
+        compact_prompt: Some("compact prompt".to_string()),
         forced_chatgpt_workspace_id: Some(
             codex_config::config_toml::ForcedChatgptWorkspaceIds::Multiple(vec![
                 "workspace-a".to_string(),
                 "workspace-b".to_string(),
             ]),
         ),
+        forced_login_method: Some(codex_protocol::config_types::ForcedLoginMethod::Api),
+        web_search: Some(codex_protocol::config_types::WebSearchMode::Indexed),
         tools: Some(codex_config::config_toml::ToolsToml {
             web_search: None,
             experimental_request_user_input: Some(
                 codex_config::config_toml::ExperimentalRequestUserInput { enabled: false },
             ),
         }),
+        model_reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::High),
+        plan_mode_reasoning_effort: Some(codex_protocol::openai_models::ReasoningEffort::Low),
+        model_reasoning_summary: Some(codex_protocol::config_types::ReasoningSummary::Detailed),
+        model_verbosity: Some(codex_protocol::config_types::Verbosity::High),
+        service_tier: Some("priority".to_string()),
         analytics: Some(codex_config::types::AnalyticsConfigToml {
             enabled: Some(false),
         }),
@@ -93,6 +115,54 @@ fn direct_config_projection_matches_legacy_json_bridge() {
     });
 
     assert_direct_projection_matches_legacy(config);
+
+    let mut remaining_branches = ConfigToml {
+        forced_chatgpt_workspace_id: Some(
+            codex_config::config_toml::ForcedChatgptWorkspaceIds::Single(
+                "workspace-single".to_string(),
+            ),
+        ),
+        tools: Some(codex_config::config_toml::ToolsToml {
+            web_search: Some(codex_protocol::config_types::WebSearchToolConfig {
+                context_size: Some(codex_protocol::config_types::WebSearchContextSize::Low),
+                allowed_domains: Some(vec!["example.test".to_string()]),
+                location: None,
+            }),
+            experimental_request_user_input: None,
+        }),
+        ..ConfigToml::default()
+    };
+    remaining_branches.apps = Some(codex_config::types::AppsConfigToml {
+        default: Some(codex_config::types::AppsDefaultConfig {
+            enabled: true,
+            approvals_reviewer: Some(codex_config::types::ApprovalsReviewer::User),
+            destructive_enabled: true,
+            open_world_enabled: false,
+            default_tools_approval_mode: Some(codex_config::AppToolApproval::Auto),
+        }),
+        apps: std::collections::HashMap::from([(
+            "remaining".to_string(),
+            codex_config::types::AppConfig {
+                enabled: true,
+                approvals_reviewer: Some(codex_config::types::ApprovalsReviewer::AutoReview),
+                destructive_enabled: None,
+                open_world_enabled: None,
+                default_tools_approval_mode: Some(codex_config::AppToolApproval::Auto),
+                default_tools_enabled: None,
+                tools: Some(codex_config::types::AppToolsConfig {
+                    tools: std::collections::HashMap::from([(
+                        "remaining/run".to_string(),
+                        codex_config::types::AppToolConfig {
+                            enabled: None,
+                            approval_mode: Some(codex_config::AppToolApproval::Auto),
+                        },
+                    )]),
+                }),
+            },
+        )]),
+    });
+
+    assert_direct_projection_matches_legacy(remaining_branches);
 }
 
 #[test]

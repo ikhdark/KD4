@@ -1,6 +1,16 @@
 name: rust-ci-full
 on:
   workflow_call:
+    inputs:
+      decision_id:
+        required: true
+        type: string
+      decision_artifact:
+        required: true
+        type: string
+    outputs:
+      consumed_decision_id:
+        value: ${{ jobs.results.outputs.consumed_decision_id }}
   push:
     branches:
       # Main pushes enter through blocking-ci. Keep this opt-in branch trigger
@@ -9,10 +19,44 @@ on:
   workflow_dispatch:
 
 jobs:
+  decision:
+    name: Verify CI decision
+    runs-on: ubuntu-24.04
+    outputs:
+      consumed_decision_id: ${{ steps.consume.outputs.consumed_decision_id || steps.standalone.outputs.consumed_decision_id }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Download CI decision artifact
+        if: ${{ inputs.decision_id != '' }}
+        uses: actions/download-artifact@3e5dc01d7e34b41b6e553c8b10eea3727caf440f # v8.0.0
+        with:
+          name: ${{ inputs.decision_artifact }}
+          path: .ci-decision
+      - name: Verify CI decision artifact
+        if: ${{ inputs.decision_id != '' }}
+        id: consume
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/verify_ci_decision.py \
+            --artifact .ci-decision/ci-decision.json \
+            --decision-id '${{ inputs.decision_id }}' \
+            --workflow cargo-full
+      - name: Standalone workflow decision
+        if: ${{ inputs.decision_id == '' }}
+        id: standalone
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'consumed_decision_id=standalone' >> "$GITHUB_OUTPUT"
+
   # --- CI that doesn't need specific targets ---------------------------------
   general:
     name: Format / etc
     runs-on: ubuntu-24.04
+    needs: decision
     defaults:
       run:
         working-directory: codex-rs
@@ -32,6 +76,7 @@ jobs:
   cargo_shear:
     name: cargo shear
     runs-on: ubuntu-24.04
+    needs: decision
     defaults:
       run:
         working-directory: codex-rs
@@ -50,6 +95,7 @@ jobs:
   argument_comment_lint_package:
     name: Argument comment lint package
     runs-on: ubuntu-24.04
+    needs: decision
     env:
       CARGO_DYLINT_VERSION: 5.0.0
       DYLINT_LINK_VERSION: 5.0.0
@@ -92,6 +138,7 @@ jobs:
   argument_comment_lint_prebuilt:
     name: Argument comment lint - ${{ matrix.name }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
+    needs: decision
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -117,6 +164,7 @@ jobs:
   lint_build:
     name: Lint/Build — ${{ matrix.runner }} - ${{ matrix.target }}${{ matrix.profile == 'release' && ' (release)' || '' }}
     runs-on: ${{ matrix.runs_on || matrix.runner }}
+    needs: decision
     timeout-minutes: 30
     defaults:
       run:
@@ -424,6 +472,7 @@ jobs:
 
   tests_macos_aarch64:
     name: Tests — macos-15-xlarge - aarch64-apple-darwin
+    needs: decision
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
       runner: macos-15-xlarge
@@ -435,6 +484,7 @@ jobs:
 
   tests_linux_x64_remote:
     name: Tests — ubuntu-24.04 - x86_64-unknown-linux-gnu (remote)
+    needs: decision
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
       runner: ubuntu-24.04
@@ -449,6 +499,7 @@ jobs:
 
   tests_linux_arm64:
     name: Tests — ubuntu-24.04-arm - aarch64-unknown-linux-gnu
+    needs: decision
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
       runner: ubuntu-24.04-arm
@@ -462,6 +513,7 @@ jobs:
 
   tests_windows_x64:
     name: Tests — windows-x64 - x86_64-pc-windows-msvc
+    needs: decision
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
       runner: windows-x64
@@ -475,6 +527,7 @@ jobs:
 
   tests_windows_arm64:
     name: Tests — windows-arm64 - aarch64-pc-windows-msvc
+    needs: decision
     uses: ./.github/workflows/rust-ci-full-nextest-platform.yml
     with:
       runner: windows-arm64
@@ -496,6 +549,7 @@ jobs:
     needs:
       [
         general,
+        decision,
         cargo_shear,
         argument_comment_lint_package,
         argument_comment_lint_prebuilt,
@@ -508,10 +562,13 @@ jobs:
       ]
     if: always()
     runs-on: ubuntu-24.04
+    outputs:
+      consumed_decision_id: ${{ needs.decision.outputs.consumed_decision_id }}
     steps:
       - name: Summarize
         shell: bash
         run: |
+          [[ '${{ needs.decision.result }}' == 'success' ]] || { echo 'decision verification failed'; exit 1; }
           echo "argpkg : ${{ needs.argument_comment_lint_package.result }}"
           echo "arglint: ${{ needs.argument_comment_lint_prebuilt.result }}"
           echo "general: ${{ needs.general.result }}"

@@ -151,6 +151,16 @@ impl<T: Clone> Iterator for CloneForAllButLast<T> {
 
 impl<T: Clone> ExactSizeIterator for CloneForAllButLast<T> {}
 
+fn snapshot_fanout<'a, T: Clone + 'a>(
+    connection_ids: &'a [ConnectionId],
+    value: T,
+) -> impl ExactSizeIterator<Item = (ConnectionId, T)> + 'a {
+    connection_ids
+        .iter()
+        .copied()
+        .zip(CloneForAllButLast::new(value, connection_ids.len()))
+}
+
 /// Sends messages to the client and manages request callbacks.
 pub(crate) struct OutgoingMessageSender {
     next_server_request_id: AtomicI64,
@@ -217,10 +227,7 @@ impl ThreadScopedOutgoingMessageSender {
         let ServerNotification::TurnCompleted(completed) = &notification else {
             if !target_connection_ids.is_empty() {
                 self.outgoing
-                    .send_snapshot_notification_to_connections(
-                        &target_connection_ids,
-                        notification,
-                    )
+                    .send_snapshot_notification_to_connections(&target_connection_ids, notification)
                     .await;
             }
             return;
@@ -279,7 +286,10 @@ impl ThreadScopedOutgoingMessageSender {
     }
 
     fn accepted_connection_ids(&self, notification: &ServerNotification) -> Vec<ConnectionId> {
-        let is_raw = matches!(notification, ServerNotification::RawResponseItemCompleted(_));
+        let is_raw = matches!(
+            notification,
+            ServerNotification::RawResponseItemCompleted(_)
+        );
         let is_experimental = notification.experimental_reason().is_some();
         let method = notification.to_string();
         self.recipients
@@ -811,9 +821,7 @@ impl OutgoingMessageSender {
             "app-server snapshot event: {notification}"
         );
         let outgoing_message = OutgoingMessage::AppServerNotification(notification);
-        for (connection_id, message) in connection_ids.iter().copied().zip(
-            CloneForAllButLast::new(outgoing_message, connection_ids.len()),
-        ) {
+        for (connection_id, message) in snapshot_fanout(connection_ids, outgoing_message) {
             if let Err(err) = self
                 .sender
                 .send(OutgoingEnvelope::ToSnapshotAcceptedConnection {
@@ -850,10 +858,7 @@ impl OutgoingMessageSender {
         let mut receipts = Vec::with_capacity(target_connection_ids.len());
         let target_count = target_connection_ids.len();
 
-        for (connection_id, message) in target_connection_ids
-            .into_iter()
-            .zip(CloneForAllButLast::new(outgoing_message, target_count))
-        {
+        for (connection_id, message) in snapshot_fanout(&target_connection_ids, outgoing_message) {
             let (write_complete_tx, write_complete_rx) = oneshot::channel();
             let send_result = self
                 .sender
@@ -1327,6 +1332,113 @@ mod tests {
                 if connection_id == raw_connection
         ));
         assert!(rx.try_recv().is_err());
+        outgoing.shutdown_delivery_tasks().await;
+    }
+
+    #[tokio::test]
+    async fn mixed_filters_run_before_ordered_n_minus_one_snapshot_cloning() {
+        struct CountedClone(Arc<AtomicUsize>);
+
+        impl Clone for CountedClone {
+            fn clone(&self) -> Self {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Self(Arc::clone(&self.0))
+            }
+        }
+
+        let manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let accepted_first = ConnectionId(1);
+        let raw_disabled = ConnectionId(2);
+        let method_opted_out = ConnectionId(3);
+        let accepted_second = ConnectionId(4);
+        let accepted_last = ConnectionId(5);
+        for connection_id in [accepted_first, raw_disabled, accepted_second, accepted_last] {
+            manager
+                .connection_initialized(connection_id, ConnectionCapabilities::default())
+                .await;
+        }
+        manager
+            .connection_initialized(
+                method_opted_out,
+                ConnectionCapabilities {
+                    request_attestation: false,
+                    delivery_filter: ResolvedDeliveryFilter::new(
+                        false,
+                        HashSet::from(["rawResponseItem/completed".to_string()]),
+                    ),
+                },
+            )
+            .await;
+        for (connection_id, raw_events_enabled) in [
+            (accepted_first, true),
+            (raw_disabled, false),
+            (method_opted_out, true),
+            (accepted_second, true),
+            (accepted_last, true),
+        ] {
+            manager
+                .try_ensure_connection_subscribed(thread_id, connection_id, raw_events_enabled)
+                .await
+                .expect("subscribe connection");
+        }
+
+        let (tx, mut rx) = mpsc::channel(8);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let snapshot = manager.recipient_snapshot(thread_id).await;
+        let expected_order = snapshot
+            .connection_ids()
+            .iter()
+            .copied()
+            .filter(|connection_id| {
+                matches!(
+                    *connection_id,
+                    id if id == accepted_first || id == accepted_second || id == accepted_last
+                )
+            })
+            .collect::<Vec<_>>();
+        let scoped = ThreadScopedOutgoingMessageSender::from_snapshot(
+            Arc::clone(&outgoing),
+            snapshot,
+            thread_id,
+        );
+        let notification =
+            ServerNotification::RawResponseItemCompleted(RawResponseItemCompletedNotification {
+                thread_id: thread_id.to_string(),
+                turn_id: "turn-1".to_string(),
+                item: ResponseItem::Message {
+                    id: None,
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: "done".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            });
+        let accepted = scoped.accepted_connection_ids(&notification);
+        assert_eq!(accepted, expected_order);
+
+        let clones = Arc::new(AtomicUsize::new(0));
+        let cloned_for = snapshot_fanout(&accepted, CountedClone(Arc::clone(&clones)))
+            .map(|(connection_id, _)| connection_id)
+            .collect::<Vec<_>>();
+        assert_eq!(cloned_for, accepted);
+        assert_eq!(clones.load(Ordering::SeqCst), accepted.len() - 1);
+
+        scoped.send_server_notification(notification).await;
+        let mut delivered = Vec::new();
+        while let Ok(envelope) = rx.try_recv() {
+            let OutgoingEnvelope::ToSnapshotAcceptedConnection { connection_id, .. } = envelope
+            else {
+                panic!("snapshot fanout must use frozen accepted-recipient envelopes");
+            };
+            delivered.push(connection_id);
+        }
+        assert_eq!(delivered, accepted);
         outgoing.shutdown_delivery_tasks().await;
     }
 
@@ -1899,6 +2011,44 @@ mod tests {
     #[test]
     fn turn_delivery_aggregation_preserves_origin_and_broadcast_semantics() {
         let thread_id = ThreadId::new();
+        let empty = aggregate_turn_delivery(
+            thread_id,
+            "turn-empty".to_string(),
+            Some(ConnectionId(3)),
+            Vec::new(),
+        );
+        assert_eq!(empty.target_count, 0);
+        assert_eq!(empty.success_count, 0);
+        assert_eq!(empty.failure_count, 0);
+        assert_eq!(empty.timeout_count, 0);
+        assert!(!empty.origin_target_present);
+        assert_eq!(
+            empty.origin_delivery_status,
+            TurnDeliveryStatus::NotTargeted
+        );
+        assert_eq!(empty.first_successful_elapsed_ms, None);
+        assert_eq!(empty.last_successful_elapsed_ms, None);
+
+        let single = aggregate_turn_delivery(
+            thread_id,
+            "turn-single".to_string(),
+            Some(ConnectionId(3)),
+            vec![TurnDeliveryOutcome {
+                connection_id: ConnectionId(3),
+                kind: TurnDeliveryOutcomeKind::Success,
+                successful_elapsed_ms: Some(5),
+                post_core_delivery_latency_ms: Some(9),
+            }],
+        );
+        assert_eq!(single.target_count, 1);
+        assert_eq!(single.success_count, 1);
+        assert_eq!(single.failure_count, 0);
+        assert!(single.origin_target_present);
+        assert_eq!(single.origin_delivery_status, TurnDeliveryStatus::Success);
+        assert_eq!(single.origin_successful_elapsed_ms, Some(5));
+        assert_eq!(single.first_successful_elapsed_ms, Some(5));
+        assert_eq!(single.last_successful_elapsed_ms, Some(5));
+
         let fact = aggregate_turn_delivery(
             thread_id,
             "turn-1".to_string(),

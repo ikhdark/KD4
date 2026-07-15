@@ -83,6 +83,66 @@ fn changed_agent_status_is_consumed_once() {
 }
 
 #[tokio::test]
+async fn consumed_running_status_waits_for_a_later_update() {
+    let (status_tx, status_rx) = watch::channel(AgentStatus::PendingInit);
+    let mut item = ActiveJobItem {
+        item_id: "item-running".to_string(),
+        started_at: Instant::now(),
+        status_rx: Some(status_rx),
+    };
+
+    status_tx
+        .send(AgentStatus::Running)
+        .expect("status receiver should remain open");
+    assert_eq!(take_changed_status(&mut item), Some(AgentStatus::Running));
+
+    let thread_id = ThreadId::new();
+    let active_items = HashMap::from([(thread_id, item)]);
+    let wait = wait_for_status_change(&active_items);
+    tokio::pin!(wait);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), &mut wait)
+            .await
+            .is_err(),
+        "a consumed Running status must not remain spuriously ready"
+    );
+
+    status_tx
+        .send(AgentStatus::Completed(Some("done".to_string())))
+        .expect("status receiver should remain open");
+    tokio::time::timeout(STATUS_POLL_INTERVAL, &mut wait)
+        .await
+        .expect("a later status update should wake the waiter");
+}
+
+#[tokio::test]
+async fn unchanged_live_status_uses_bounded_polling_heartbeat() {
+    let (_status_tx, status_rx) = watch::channel(AgentStatus::Running);
+    let thread_id = ThreadId::new();
+    let active_items = HashMap::from([(
+        thread_id,
+        ActiveJobItem {
+            item_id: "item-live".to_string(),
+            started_at: Instant::now(),
+            status_rx: Some(status_rx),
+        },
+    )]);
+    let started = Instant::now();
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        wait_for_status_change(&active_items),
+    )
+    .await
+    .expect("unchanged live watch should emit a bounded heartbeat");
+
+    let elapsed = started.elapsed();
+    assert!(elapsed >= STATUS_POLL_INTERVAL);
+    assert!(elapsed < Duration::from_secs(1));
+}
+
+#[tokio::test]
 async fn closed_status_receiver_uses_bounded_polling_fallback() {
     let (status_tx, status_rx) = watch::channel(AgentStatus::Running);
     drop(status_tx);

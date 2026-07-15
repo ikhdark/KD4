@@ -2,6 +2,25 @@ use super::*;
 use crate::function_tool::FunctionCallError;
 use serde_json::json;
 
+#[test]
+fn automatic_planning_calls_the_rust_library_without_a_planning_subprocess() {
+    let source = include_str!("verify_local.rs");
+    let start = source
+        .find("pub(crate) async fn run_automatic_verify_local_plan")
+        .expect("automatic planner");
+    let end = source[start..]
+        .find("\nfn parse_verify_local_arguments")
+        .map(|offset| start + offset)
+        .expect("next function");
+    let automatic = &source[start..end];
+    assert!(automatic.contains("plan_verification("));
+    assert!(automatic.contains("finalize_plan("));
+    assert!(!automatic.contains("handle_call("));
+    assert!(!automatic.contains("ToolInvocation"));
+    assert!(!automatic.contains("verify-local"));
+    assert!(!automatic.contains("Command::"));
+}
+
 fn base_args() -> serde_json::Value {
     json!({
         "mode": "fast",

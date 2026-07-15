@@ -585,11 +585,6 @@ fi
             .map(|event| (event.run.display_order, &event.run.entries))
             .collect::<Vec<_>>();
         if !hook_failures.is_empty() {
-            std::fs::write(
-                std::env::temp_dir().join("codex-hook-concurrency-failure.txt"),
-                format!("{hook_failures:#?}"),
-            )
-            .expect("write hook failure diagnostics");
             panic!("hook execution failed: {hook_failures:?}");
         }
         assert_eq!(
@@ -834,29 +829,43 @@ fi
 
     #[test]
     fn invalid_json_like_stdout_fails_instead_of_becoming_noop() {
-        let parsed = parse_completed(
-            &handler(),
-            run_result(Some(0), "{\"decision\":\n", ""),
-            Some("turn-1".to_string()),
-        );
+        for stdout in [
+            "{\"decision\":\n",
+            "[]",
+            r#"{"unknownField":true}"#,
+            r#"{"hookSpecificOutput":{}}"#,
+            r#"{"continue":"yes"}"#,
+        ] {
+            let parsed = parse_completed(
+                &handler(),
+                run_result(Some(0), stdout, ""),
+                Some("turn-1".to_string()),
+            );
 
-        assert_eq!(
-            parsed.data,
-            PreToolUseHandlerData {
-                should_block: false,
-                block_reason: None,
-                additional_contexts_for_model: Vec::new(),
-                updated_input: None,
-            }
-        );
-        assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
-        assert_eq!(
-            parsed.completed.run.entries,
-            vec![HookOutputEntry {
-                kind: HookOutputEntryKind::Error,
-                text: "hook returned invalid pre-tool-use JSON output".to_string(),
-            }]
-        );
+            assert_eq!(
+                parsed.data,
+                PreToolUseHandlerData {
+                    should_block: false,
+                    block_reason: None,
+                    additional_contexts_for_model: Vec::new(),
+                    updated_input: None,
+                },
+                "stdout: {stdout}"
+            );
+            assert_eq!(
+                parsed.completed.run.status,
+                HookRunStatus::Failed,
+                "stdout: {stdout}"
+            );
+            assert_eq!(
+                parsed.completed.run.entries,
+                vec![HookOutputEntry {
+                    kind: HookOutputEntryKind::Error,
+                    text: "hook returned invalid pre-tool-use JSON output".to_string(),
+                }],
+                "stdout: {stdout}"
+            );
+        }
     }
 
     #[test]

@@ -77,3 +77,112 @@ fn identity_mismatch_is_a_tooling_error() {
     assert_eq!(finalized.verdict, Verdict::ToolingError);
     assert!(finalized.finalization_error.is_some());
 }
+
+#[test]
+fn nonzero_exit_is_failed() {
+    let mut result = result();
+    result.exit_code = Some(9);
+    assert_eq!(finalize_plan(plan(), vec![result]).verdict, Verdict::Failed);
+}
+
+#[test]
+fn cancellation_is_inconclusive() {
+    let mut result = result();
+    result.exit_code = None;
+    result.cancelled = true;
+    assert_eq!(
+        finalize_plan(plan(), vec![result]).verdict,
+        Verdict::Inconclusive
+    );
+}
+
+#[test]
+fn runner_and_log_failures_are_tooling_errors() {
+    let mut runner = result();
+    runner.runner_error = Some("transport".to_string());
+    assert_eq!(
+        finalize_plan(plan(), vec![runner]).verdict,
+        Verdict::ToolingError
+    );
+    for state in [
+        LogState::IoFailure,
+        LogState::FramingFailure,
+        LogState::IntegrityFailure,
+    ] {
+        let mut failed = result();
+        failed.log_state = state;
+        assert_eq!(
+            finalize_plan(plan(), vec![failed]).verdict,
+            Verdict::ToolingError
+        );
+    }
+}
+
+#[test]
+fn command_not_found_is_failed_but_other_launch_errors_are_tooling_errors() {
+    let mut missing = result();
+    missing.exit_code = None;
+    missing.runner_error = None;
+    missing.launch_error = Some(LaunchErrorKind::CommandNotFound);
+    assert_eq!(
+        finalize_plan(plan(), vec![missing]).verdict,
+        Verdict::Failed
+    );
+    let mut denied = result();
+    denied.exit_code = None;
+    denied.runner_error = None;
+    denied.launch_error = Some(LaunchErrorKind::PermissionDenied);
+    assert_eq!(
+        finalize_plan(plan(), vec![denied]).verdict,
+        Verdict::ToolingError
+    );
+}
+
+#[test]
+fn missing_extra_duplicate_and_reordered_results_fail_closed() {
+    assert_eq!(
+        finalize_plan(plan(), Vec::new()).verdict,
+        Verdict::ToolingError
+    );
+    let mut two = plan();
+    let mut second_command = two.commands[0].clone();
+    second_command.id = "owner:second".to_string();
+    two.commands.push(second_command);
+    assert_eq!(
+        finalize_plan(two.clone(), vec![result()]).verdict,
+        Verdict::ToolingError
+    );
+    assert_eq!(
+        finalize_plan(two.clone(), vec![result(), result()]).verdict,
+        Verdict::ToolingError
+    );
+    let mut first = result();
+    let mut second = result();
+    first.command_id = "owner:second".to_string();
+    first.command_ordinal = 1;
+    second.command_ordinal = 0;
+    assert_eq!(
+        finalize_plan(two, vec![first, second]).verdict,
+        Verdict::ToolingError
+    );
+    assert_eq!(
+        finalize_plan(plan(), vec![result(), result()]).verdict,
+        Verdict::ToolingError
+    );
+}
+
+#[test]
+fn preexecution_verdict_and_exit_code_are_rust_owned() {
+    for (verdict, exit_code) in [
+        (Verdict::VerifiedNoProof, 0),
+        (Verdict::NeedsScope, 3),
+        (Verdict::ToolingError, 4),
+        (Verdict::NeedsRegen, 5),
+    ] {
+        let mut preplanned = plan();
+        preplanned.verdict = Some(verdict);
+        let finalized = finalize_plan(preplanned, Vec::new());
+        assert_eq!(finalized.verdict, verdict);
+        assert_eq!(finalized.exit_code, exit_code);
+    }
+}

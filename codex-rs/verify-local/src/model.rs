@@ -5,6 +5,8 @@ use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
 use serde::ser::SerializeStruct;
+use std::ffi::OsString;
+use std::path::Path;
 use std::path::PathBuf;
 
 pub const VERIFY_LOCAL_JSON_PRODUCER: &str = "kd4.verify_local";
@@ -43,6 +45,59 @@ impl RawPath {
         self.as_utf8()
             .map(str::to_owned)
             .unwrap_or_else(|| format!("<raw:{}>", self.bytes_base64()))
+    }
+
+    pub fn validate_repository_relative(&self) -> Result<(), String> {
+        if self.bytes.is_empty() {
+            return Err("repository path is empty".to_string());
+        }
+        if self.bytes.contains(&0) {
+            return Err("repository path contains NUL".to_string());
+        }
+        if self.bytes.starts_with(b"/")
+            || self.bytes.starts_with(b"\\")
+            || self.bytes.get(1) == Some(&b':')
+        {
+            return Err("repository path must be relative".to_string());
+        }
+        if self
+            .bytes
+            .split(|byte| *byte == b'/')
+            .any(|part| part == b".." || part.is_empty())
+        {
+            return Err("repository path contains an invalid component".to_string());
+        }
+        #[cfg(windows)]
+        if self.as_utf8().is_none() {
+            return Err("non-UTF-8 paths are inconclusive on Windows".to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    pub fn to_os_string(&self) -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(self.bytes.clone())
+    }
+
+    #[cfg(windows)]
+    pub fn to_os_string(&self) -> Result<OsString, String> {
+        self.as_utf8()
+            .map(OsString::from)
+            .ok_or_else(|| "non-UTF-8 paths are inconclusive on Windows".to_string())
+    }
+
+    #[cfg(unix)]
+    pub fn from_path(path: &Path) -> Self {
+        use std::os::unix::ffi::OsStrExt;
+        Self::new(path.as_os_str().as_bytes())
+    }
+
+    #[cfg(windows)]
+    pub fn from_path(path: &Path) -> Result<Self, String> {
+        path.to_str()
+            .map(Self::from_utf8)
+            .ok_or_else(|| "Windows path is not valid Unicode".to_string())
     }
 }
 
@@ -278,6 +333,7 @@ pub enum LogState {
 pub enum LaunchErrorKind {
     CommandNotFound,
     PermissionDenied,
+    UnsupportedPath,
     Other,
 }
 
@@ -303,13 +359,13 @@ pub struct CommandResultV2 {
     pub baseline: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FinalizedCommandResult {
     pub raw: CommandResultV2,
     pub status: Verdict,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FinalizedVerification {
     pub plan: PlanEnvelopeV2,
     pub results: Vec<FinalizedCommandResult>,
@@ -334,6 +390,23 @@ pub struct PlanRequest {
     pub baseline: bool,
     pub no_cache: bool,
     pub cache_readonly: bool,
+    pub retry_flakes: bool,
+    pub scope_start: Option<String>,
+    pub scope_add: Vec<RawPath>,
+    pub scope_reset: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum SnapshotSource {
+    #[default]
+    Worktree,
+    ExplicitPaths,
+    CommitDiff {
+        base: String,
+        head: String,
+        merge_base: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -341,10 +414,16 @@ pub struct SnapshotRecord {
     pub status: String,
     pub path: RawPath,
     pub original_path: Option<RawPath>,
+    pub staged: bool,
+    pub unstaged: bool,
+    pub submodule_state: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RepositorySnapshot {
+    #[serde(skip)]
+    pub repository_root: Option<PathBuf>,
+    pub source: SnapshotSource,
     pub records: Vec<SnapshotRecord>,
     pub complete: bool,
     pub fallback_reasons: Vec<String>,

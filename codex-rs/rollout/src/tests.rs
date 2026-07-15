@@ -28,10 +28,12 @@ use crate::list::get_threads;
 use crate::list::read_head_for_summary;
 use crate::rollout_date_parts;
 use anyhow::Result;
+use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
@@ -54,6 +56,24 @@ fn provider_vec(providers: &[&str]) -> Vec<String> {
 
 fn thread_id_from_uuid(uuid: Uuid) -> ThreadId {
     ThreadId::from_string(&uuid.to_string()).expect("valid thread id")
+}
+
+fn session_meta_json(ts: &str, uuid: Uuid) -> serde_json::Value {
+    serde_json::json!({
+        "timestamp": ts,
+        "type": "session_meta",
+        "payload": {
+            "session_id": uuid,
+            "id": uuid,
+            "timestamp": ts,
+            "cwd": ".",
+            "originator": "test_originator",
+            "cli_version": "test_version",
+            "base_instructions": null,
+            "source": "vscode",
+            "model_provider": TEST_PROVIDER,
+        }
+    })
 }
 
 async fn insert_state_db_thread(
@@ -162,6 +182,134 @@ async fn read_thread_item_from_rollout_rejects_unknown_canonical_history_mode() 
     .unwrap();
 
     assert_eq!(crate::list::read_thread_item_from_rollout(path).await, None);
+}
+
+#[tokio::test]
+async fn combined_rollout_scan_falls_back_to_metadata_after_ignored_head_records() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("metadata-after-ignored-records.jsonl");
+    let uuid = Uuid::from_u128(305);
+    let ts = "2025-01-03T12-00-00";
+    let ignored_event = serde_json::json!({
+        "timestamp": ts,
+        "type": "event_msg",
+        "payload": {
+            "type": "user_message",
+            "message": "ignored before metadata",
+            "kind": "plain"
+        }
+    });
+    let mut lines = vec![ignored_event.to_string(); 11];
+    lines.push(session_meta_json(ts, uuid).to_string());
+    fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+    let (item, session_meta) = crate::list::read_thread_item_and_session_meta_from_rollout(path)
+        .await
+        .expect("metadata-only fallback should remain readable");
+
+    assert_eq!(item, None);
+    assert_eq!(session_meta.meta.id, thread_id_from_uuid(uuid));
+}
+
+#[tokio::test]
+async fn combined_rollout_scan_rejects_response_before_session_metadata() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("response-before-metadata.jsonl");
+    let uuid = Uuid::from_u128(306);
+    let ts = "2025-01-03T12-00-00";
+    let response = RolloutLine {
+        timestamp: ts.to_string(),
+        item: RolloutItem::ResponseItem(ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "response before metadata".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }),
+    };
+    fs::write(
+        &path,
+        format!(
+            "{}\n{}\n",
+            serde_json::to_string(&response).unwrap(),
+            session_meta_json(ts, uuid)
+        ),
+    )
+    .unwrap();
+
+    let error = crate::list::read_thread_item_and_session_meta_from_rollout(path.clone())
+        .await
+        .expect_err("response before metadata must remain invalid");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "rollout at {} does not start with session metadata",
+            path.display()
+        )
+    );
+}
+
+#[tokio::test]
+async fn typed_head_wrapper_matches_legacy_value_shapes() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("typed-head-wrapper.jsonl");
+    let uuid = Uuid::from_u128(307);
+    let ts = "2025-01-03T12-00-00";
+    let meta_value = session_meta_json(ts, uuid);
+    let meta_line: RolloutLine =
+        serde_json::from_value(meta_value.clone()).expect("valid session metadata line");
+    let RolloutItem::SessionMeta(expected_meta) = meta_line.item else {
+        panic!("expected session metadata");
+    };
+    let response = ResponseItem::Message {
+        id: None,
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "direct response".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let response_line = RolloutLine {
+        timestamp: ts.to_string(),
+        item: RolloutItem::ResponseItem(response.clone()),
+    };
+    let communication = InterAgentCommunication::new(
+        AgentPath::root(),
+        AgentPath::try_from("/root/worker").expect("valid recipient path"),
+        Vec::new(),
+        "delegated update".to_string(),
+        true,
+    );
+    let communication_line = RolloutLine {
+        timestamp: ts.to_string(),
+        item: RolloutItem::InterAgentCommunication(communication.clone()),
+    };
+    fs::write(
+        &path,
+        format!(
+            "{}\n{}\n{}\n",
+            meta_value,
+            serde_json::to_string(&response_line).unwrap(),
+            serde_json::to_string(&communication_line).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let actual = read_head_for_summary(&path)
+        .await
+        .expect("typed head compatibility wrapper");
+    let expected = vec![
+        serde_json::to_value(expected_meta).unwrap(),
+        serde_json::to_value(response).unwrap(),
+        serde_json::to_value(communication.to_model_input_item()).unwrap(),
+    ];
+
+    assert_eq!(actual, expected);
 }
 
 #[tokio::test]
