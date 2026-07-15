@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HookCompletedEvent;
@@ -14,6 +15,7 @@ use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
+use crate::engine::dispatcher::HookMatchContext;
 use crate::engine::output_parser;
 use crate::schema::NullableString;
 use crate::schema::SessionStartCommandInput;
@@ -46,6 +48,19 @@ pub struct SessionStartRequest {
     pub model: String,
     pub permission_mode: String,
     pub target: StartHookTarget,
+}
+
+impl SessionStartRequest {
+    pub(crate) fn match_context(&self) -> HookMatchContext<'_> {
+        match &self.target {
+            StartHookTarget::SessionStart { source } => HookMatchContext::SessionStart {
+                source: source.as_str(),
+            },
+            StartHookTarget::SubagentStart { agent_type, .. } => {
+                HookMatchContext::SubagentStart { agent_type }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +131,15 @@ pub(crate) async fn run(
         request.target.event_name(),
         Some(request.target.matcher_input()),
     );
+    run_prepared(matched, shell, request, turn_id).await
+}
+
+pub(crate) async fn run_prepared(
+    matched: Vec<Arc<ConfiguredHandler>>,
+    shell: &CommandShell,
+    request: SessionStartRequest,
+    turn_id: Option<String>,
+) -> SessionStartOutcome {
     if matched.is_empty() {
         return SessionStartOutcome {
             hook_events: Vec::new(),

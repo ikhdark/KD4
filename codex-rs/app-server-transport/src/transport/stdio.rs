@@ -1,13 +1,15 @@
 use super::CHANNEL_CAPACITY;
 use super::ConnectionOrigin;
 use super::TransportEvent;
-use super::forward_incoming_message;
+use super::forward_parsed_incoming_message;
 use super::next_connection_id;
+use super::parse_incoming_message;
 use super::serialize_outgoing_message;
 use crate::outgoing_message::QueuedOutgoingMessage;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCRequest;
+use serde::Deserialize;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use tokio::io;
@@ -49,16 +51,19 @@ pub async fn start_stdio_connection(
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
-                    if let Some(client_name) = stdio_initialize_client_name(&line)
+                    let Some(message) = parse_incoming_message(&line) else {
+                        continue;
+                    };
+                    if let Some(client_name) = stdio_initialize_client_name(&message)
                         && let Some(initialize_client_name_tx) = initialize_client_name_tx.take()
                     {
                         let _ = initialize_client_name_tx.send(client_name);
                     }
-                    if !forward_incoming_message(
+                    if !forward_parsed_incoming_message(
                         &transport_event_tx_for_reader,
                         &writer_tx_for_reader,
                         connection_id,
-                        &line,
+                        message,
                     )
                     .await
                     {
@@ -106,14 +111,57 @@ pub async fn start_stdio_connection(
     Ok(())
 }
 
-fn stdio_initialize_client_name(line: &str) -> Option<String> {
-    let message = serde_json::from_str::<JSONRPCMessage>(line).ok()?;
+fn stdio_initialize_client_name(message: &JSONRPCMessage) -> Option<String> {
     let JSONRPCMessage::Request(JSONRPCRequest { method, params, .. }) = message else {
         return None;
     };
     if method != "initialize" {
         return None;
     }
-    let params = serde_json::from_value::<InitializeParams>(params?).ok()?;
+    let params = InitializeParams::deserialize(params.as_ref()?).ok()?;
     Some(params.client_info.name)
+}
+
+#[cfg(test)]
+mod tests {
+    use codex_app_server_protocol::JSONRPCMessage;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    use super::stdio_initialize_client_name;
+
+    #[test]
+    fn initialize_client_name_is_read_from_the_borrowed_message() {
+        let message: JSONRPCMessage = serde_json::from_value(json!({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {
+                    "name": "test-client",
+                    "version": "1.0.0"
+                },
+                "capabilities": {},
+                "unknownNestedField": { "preserved": true }
+            }
+        }))
+        .expect("initialize request should deserialize");
+        let before = message.clone();
+
+        assert_eq!(
+            stdio_initialize_client_name(&message),
+            Some("test-client".to_string())
+        );
+        assert_eq!(message, before);
+    }
+
+    #[test]
+    fn non_initialize_messages_do_not_produce_a_client_name() {
+        let message: JSONRPCMessage = serde_json::from_value(json!({
+            "method": "initialized",
+            "params": { "unknownNestedField": true }
+        }))
+        .expect("notification should deserialize");
+
+        assert_eq!(stdio_initialize_client_name(&message), None);
+    }
 }

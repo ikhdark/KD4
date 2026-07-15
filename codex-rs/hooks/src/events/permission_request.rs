@@ -14,12 +14,14 @@
 //! 4. Fold the decisions conservatively: any deny wins, otherwise the last
 //!    allow wins, otherwise there is no hook verdict.
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use super::common;
 use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
+use crate::engine::dispatcher::HookMatchContext;
 use crate::engine::output_parser;
 use crate::schema::PermissionRequestCommandInput;
 use crate::schema::SubagentCommandInputFields;
@@ -45,6 +47,15 @@ pub struct PermissionRequestRequest {
     pub matcher_aliases: Vec<String>,
     pub run_id_suffix: String,
     pub tool_input: Value,
+}
+
+impl PermissionRequestRequest {
+    pub(crate) fn match_context(&self) -> HookMatchContext<'_> {
+        HookMatchContext::PermissionRequest {
+            canonical_tool_name: &self.tool_name,
+            matcher_aliases: &self.matcher_aliases,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +106,14 @@ pub(crate) async fn run(
         HookEventName::PermissionRequest,
         &matcher_inputs,
     );
+    run_prepared(matched, shell, request).await
+}
+
+pub(crate) async fn run_prepared(
+    matched: Vec<Arc<ConfiguredHandler>>,
+    shell: &CommandShell,
+    request: PermissionRequestRequest,
+) -> PermissionRequestOutcome {
     if matched.is_empty() {
         return PermissionRequestOutcome {
             hook_events: Vec::new(),

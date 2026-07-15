@@ -323,9 +323,9 @@ pub(crate) async fn handle_output_item_done(
     let mut output = OutputItemResult::default();
     let plan_mode = ctx.turn_context.collaboration_mode.mode == ModeKind::Plan;
 
-    match ToolRouter::build_tool_call(item.clone()) {
+    match ToolRouter::preflight_tool_call(&item) {
         // The model emitted a tool call; log it, persist the item immediately, and queue the tool execution.
-        Ok(Some(call)) => {
+        Ok(Some(preflight)) => {
             ctx.sess
                 .input_queue
                 .accept_mailbox_delivery_for_current_turn(
@@ -334,17 +334,20 @@ pub(crate) async fn handle_output_item_done(
                 )
                 .await;
 
-            let payload_preview = call.payload.log_payload().into_owned();
-            tracing::info!(
-                thread_id = %ctx.sess.thread_id,
-                "ToolCall: {} {}",
-                call.tool_name,
-                payload_preview
-            );
+            {
+                let payload_preview = preflight.log_payload(&item);
+                tracing::info!(
+                    thread_id = %ctx.sess.thread_id,
+                    "ToolCall: {} {}",
+                    preflight.tool_name(),
+                    payload_preview
+                );
+            }
 
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
 
+            let call = preflight.into_tool_call(item);
             let cancellation_token = ctx.cancellation_token.child_token();
             let tool_future: InFlightFuture<'static> = Box::pin(
                 ctx.tool_runtime

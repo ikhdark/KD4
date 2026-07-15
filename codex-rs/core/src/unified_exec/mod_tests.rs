@@ -203,6 +203,7 @@ async fn exec_command_with_tty(
         hook_command: Some(cmd.to_string()),
         raw_output_artifact: None,
         repair_notice: None,
+        analysis: Default::default(),
     })
 }
 

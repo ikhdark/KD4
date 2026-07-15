@@ -26,6 +26,7 @@ use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -311,7 +312,17 @@ impl ToolOutput for AbortedToolOutput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Default)]
+pub(crate) struct ExecCommandOutputAnalysis {
+    decoded_output: OnceLock<String>,
+    model_output_max_tokens: OnceLock<usize>,
+    hook_output: OnceLock<String>,
+    model_output: OnceLock<String>,
+    response_text: OnceLock<String>,
+    preview: OnceLock<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ExecCommandToolOutput {
     pub event_call_id: String,
     pub chunk_id: String,
@@ -326,11 +337,29 @@ pub struct ExecCommandToolOutput {
     pub hook_command: Option<String>,
     pub raw_output_artifact: Option<RawOutputArtifact>,
     pub repair_notice: Option<String>,
+    pub(crate) analysis: Arc<ExecCommandOutputAnalysis>,
+}
+
+impl PartialEq for ExecCommandToolOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.event_call_id == other.event_call_id
+            && self.chunk_id == other.chunk_id
+            && self.wall_time == other.wall_time
+            && self.raw_output == other.raw_output
+            && self.truncation_policy == other.truncation_policy
+            && self.max_output_tokens == other.max_output_tokens
+            && self.process_id == other.process_id
+            && self.exit_code == other.exit_code
+            && self.original_token_count == other.original_token_count
+            && self.hook_command == other.hook_command
+            && self.raw_output_artifact == other.raw_output_artifact
+            && self.repair_notice == other.repair_notice
+    }
 }
 
 impl ToolOutput for ExecCommandToolOutput {
     fn log_preview(&self) -> String {
-        telemetry_preview(&self.response_text())
+        self.preview().to_string()
     }
 
     fn success_for_logging(&self) -> bool {
@@ -342,7 +371,7 @@ impl ToolOutput for ExecCommandToolOutput {
             call_id,
             payload,
             vec![FunctionCallOutputContentItem::InputText {
-                text: self.response_text(),
+                text: self.response_text().to_string(),
             }],
             Some(true),
         )
@@ -367,9 +396,7 @@ impl ToolOutput for ExecCommandToolOutput {
             return None;
         }
 
-        Some(JsonValue::String(
-            self.truncated_output(self.model_output_max_tokens()),
-        ))
+        Some(JsonValue::String(self.hook_output().to_string()))
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
@@ -426,7 +453,7 @@ impl ToolOutput for ExecCommandToolOutput {
             raw_output_artifact_bytes,
             raw_output_artifact_error,
             repair: self.repair_notice.clone(),
-            output: self.model_output(self.model_output_max_tokens()),
+            output: self.model_output().to_string(),
         };
 
         serde_json::to_value(result).unwrap_or_else(|err| {
@@ -436,77 +463,105 @@ impl ToolOutput for ExecCommandToolOutput {
 }
 
 impl ExecCommandToolOutput {
+    fn decoded_output(&self) -> &str {
+        self.analysis
+            .decoded_output
+            .get_or_init(|| String::from_utf8_lossy(&self.raw_output).into_owned())
+    }
+
     fn model_output_max_tokens(&self) -> usize {
-        let raw = String::from_utf8_lossy(&self.raw_output);
-        let class = if self.process_id.is_some() || self.exit_code != Some(0) {
-            OutputBudgetClass::FailureOrTimeout
-        } else {
-            OutputBudgetClass::Success
-        };
-        resolve_adaptive_max_tokens(
-            self.max_output_tokens,
-            class,
-            self.hook_command.as_deref(),
-            raw.as_ref(),
-        )
-        .min(self.truncation_policy.token_budget())
+        *self.analysis.model_output_max_tokens.get_or_init(|| {
+            let class = if self.process_id.is_some() || self.exit_code != Some(0) {
+                OutputBudgetClass::FailureOrTimeout
+            } else {
+                OutputBudgetClass::Success
+            };
+            resolve_adaptive_max_tokens(
+                self.max_output_tokens,
+                class,
+                self.hook_command.as_deref(),
+                self.decoded_output(),
+            )
+            .min(self.truncation_policy.token_budget())
+        })
     }
 
     pub(crate) fn truncated_output(&self, max_tokens: usize) -> String {
-        let text = String::from_utf8_lossy(&self.raw_output).to_string();
-        formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens))
+        formatted_truncate_text(self.decoded_output(), TruncationPolicy::Tokens(max_tokens))
     }
 
-    fn model_output(&self, max_tokens: usize) -> String {
-        let raw = String::from_utf8_lossy(&self.raw_output);
-        let summarized = summarize_shell_output_for_model(
-            raw.as_ref(),
-            self.exit_code.unwrap_or_default(),
-            /*timed_out*/ self.process_id.is_some(),
-            ShellOutputSummaryOptions {
-                enabled: true,
-                turn_cost_guard: false,
-                command_text: self.hook_command.as_deref(),
-            },
-        );
-        let content = summarized.as_deref().unwrap_or(raw.as_ref());
-        formatted_truncate_text(content, TruncationPolicy::Tokens(max_tokens))
+    fn hook_output(&self) -> &str {
+        self.analysis.hook_output.get_or_init(|| {
+            formatted_truncate_text(
+                self.decoded_output(),
+                TruncationPolicy::Tokens(self.model_output_max_tokens()),
+            )
+        })
     }
 
-    fn response_text(&self) -> String {
-        let mut sections = Vec::new();
+    fn model_output(&self) -> &str {
+        self.analysis.model_output.get_or_init(|| {
+            let raw = self.decoded_output();
+            let summarized = summarize_shell_output_for_model(
+                raw,
+                self.exit_code.unwrap_or_default(),
+                /*timed_out*/ self.process_id.is_some(),
+                ShellOutputSummaryOptions {
+                    enabled: true,
+                    turn_cost_guard: false,
+                    command_text: self.hook_command.as_deref(),
+                },
+            );
+            let content = summarized.as_deref().unwrap_or(raw);
+            formatted_truncate_text(
+                content,
+                TruncationPolicy::Tokens(self.model_output_max_tokens()),
+            )
+        })
+    }
 
-        if !self.chunk_id.is_empty() {
-            sections.push(format!("Chunk ID: {}", self.chunk_id));
-        }
+    fn response_text(&self) -> &str {
+        self.analysis.response_text.get_or_init(|| {
+            let mut sections = Vec::new();
 
-        let wall_time_seconds = self.wall_time.as_secs_f64();
-        sections.push(format!("Wall time: {wall_time_seconds:.4} seconds"));
+            if !self.chunk_id.is_empty() {
+                sections.push(format!("Chunk ID: {}", self.chunk_id));
+            }
 
-        if let Some(exit_code) = self.exit_code {
-            sections.push(format!("Process exited with code {exit_code}"));
-        }
+            let wall_time_seconds = self.wall_time.as_secs_f64();
+            sections.push(format!("Wall time: {wall_time_seconds:.4} seconds"));
 
-        if let Some(process_id) = &self.process_id {
-            sections.push(format!("Process running with session ID {process_id}"));
-        }
+            if let Some(exit_code) = self.exit_code {
+                sections.push(format!("Process exited with code {exit_code}"));
+            }
 
-        if let Some(original_token_count) = self.original_token_count {
-            sections.push(format!("Original token count: {original_token_count}"));
-        }
+            if let Some(process_id) = &self.process_id {
+                sections.push(format!("Process running with session ID {process_id}"));
+            }
 
-        if let Some(repair_notice) = &self.repair_notice {
-            sections.push(repair_notice.clone());
-        }
+            if let Some(original_token_count) = self.original_token_count {
+                sections.push(format!("Original token count: {original_token_count}"));
+            }
 
-        if let Some(raw_output_artifact) = &self.raw_output_artifact {
-            sections.push(raw_output_artifact.render_for_model());
-        }
+            if let Some(repair_notice) = &self.repair_notice {
+                sections.push(repair_notice.clone());
+            }
 
-        sections.push("Output:".to_string());
-        sections.push(self.model_output(self.model_output_max_tokens()));
+            if let Some(raw_output_artifact) = &self.raw_output_artifact {
+                sections.push(raw_output_artifact.render_for_model());
+            }
 
-        sections.join("\n")
+            sections.push("Output:".to_string());
+            sections.push(self.model_output().to_string());
+
+            sections.join("\n")
+        })
+    }
+
+    fn preview(&self) -> &str {
+        self.analysis
+            .preview
+            .get_or_init(|| telemetry_preview(self.response_text()))
     }
 }
 

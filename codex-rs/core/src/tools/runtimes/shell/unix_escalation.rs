@@ -14,6 +14,7 @@ use crate::sandboxing::ExecOptions;
 use crate::sandboxing::ExecRequest;
 use crate::sandboxing::SandboxPermissions;
 use crate::shell::ShellType;
+use crate::tools::hook_names::HookToolName;
 use crate::tools::runtimes::build_sandbox_command;
 use crate::tools::runtimes::exec_env_for_sandbox_permissions;
 use crate::tools::runtimes::prepend_zsh_fork_bin_to_path;
@@ -30,6 +31,7 @@ use codex_execpolicy::MatchOptions;
 use codex_execpolicy::Policy;
 use codex_execpolicy::RuleMatch;
 use codex_features::Feature;
+use codex_hooks::HookMatchContext;
 use codex_hooks::PermissionRequestDecision;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::error::CodexErr;
@@ -459,19 +461,32 @@ impl CoreShellActionProvider {
         Ok(stopwatch
             .pause_for(async move {
                 // 1) Run PermissionRequest hooks
-                let permission_request = PermissionRequestPayload::bash(
-                    codex_shell_command::parse_command::shlex_join(&command),
-                    /*description*/ None,
-                );
                 let effective_approval_id = approval_id.clone().unwrap_or_else(|| call_id.clone());
-                match run_permission_request_hooks(
-                    &session,
-                    &turn,
-                    &effective_approval_id,
-                    permission_request,
-                )
-                .await
-                {
+                let hook_tool_name = HookToolName::bash();
+                let permission_plan =
+                    session
+                        .hooks()
+                        .prepare(HookMatchContext::PermissionRequest {
+                            canonical_tool_name: hook_tool_name.name(),
+                            matcher_aliases: hook_tool_name.matcher_aliases(),
+                        });
+                let permission_request_decision = if permission_plan.is_empty() {
+                    None
+                } else {
+                    let permission_request = PermissionRequestPayload::bash(
+                        codex_shell_command::parse_command::shlex_join(&command),
+                        /*description*/ None,
+                    );
+                    run_permission_request_hooks(
+                        &session,
+                        &turn,
+                        permission_plan,
+                        &effective_approval_id,
+                        permission_request,
+                    )
+                    .await
+                };
+                match permission_request_decision {
                     Some(PermissionRequestDecision::Allow) => {
                         return PromptDecision {
                             decision: ReviewDecision::Approved,

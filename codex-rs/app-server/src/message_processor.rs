@@ -45,6 +45,7 @@ use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 use crate::skills_watcher::SkillsWatcher;
 use crate::thread_state::ConnectionCapabilities;
+use crate::thread_state::ResolvedDeliveryFilter;
 use crate::thread_state::ThreadStateManager;
 use crate::transport::AppServerTransport;
 use crate::transport::RemoteControlHandle;
@@ -648,12 +649,18 @@ impl MessageProcessor {
         &self,
         connection_id: ConnectionId,
         request_attestation: bool,
+        experimental_api_enabled: bool,
+        opted_out_notification_methods: HashSet<String>,
     ) {
         self.thread_processor
             .connection_initialized(
                 connection_id,
                 ConnectionCapabilities {
                     request_attestation,
+                    delivery_filter: ResolvedDeliveryFilter::new(
+                        experimental_api_enabled,
+                        opted_out_notification_methods,
+                    ),
                 },
             )
             .await;
@@ -769,6 +776,10 @@ impl MessageProcessor {
                         connection_id,
                         ConnectionCapabilities {
                             request_attestation: session.request_attestation(),
+                            delivery_filter: ResolvedDeliveryFilter::new(
+                                session.experimental_api_enabled(),
+                                session.opted_out_notification_methods(),
+                            ),
                         },
                     )
                     .await;

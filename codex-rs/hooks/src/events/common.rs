@@ -54,7 +54,7 @@ pub(crate) fn flatten_additional_contexts<'a>(
 }
 
 pub(crate) fn serialization_failure_hook_events(
-    handlers: Vec<ConfiguredHandler>,
+    handlers: Vec<Arc<ConfiguredHandler>>,
     turn_id: Option<String>,
     error_message: String,
 ) -> Vec<HookCompletedEvent> {
@@ -78,7 +78,7 @@ pub(crate) fn serialization_failure_hook_events(
 }
 
 pub(crate) fn serialization_failure_hook_events_for_tool_use(
-    handlers: Vec<ConfiguredHandler>,
+    handlers: Vec<Arc<ConfiguredHandler>>,
     turn_id: Option<String>,
     error_message: String,
     tool_use_id: &str,
@@ -119,28 +119,59 @@ pub(crate) fn matcher_pattern_for_event(
     }
 }
 
-pub(crate) fn validate_matcher_pattern(matcher: &str) -> Result<(), regex::Error> {
-    if is_match_all_matcher(matcher) || is_exact_matcher(matcher) {
-        return Ok(());
+#[derive(Debug, Clone)]
+pub(crate) enum CompiledMatcher {
+    MatchAll,
+    Exact(Box<[String]>),
+    Regex(regex::Regex),
+}
+
+impl PartialEq for CompiledMatcher {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::MatchAll, Self::MatchAll) => true,
+            (Self::Exact(left), Self::Exact(right)) => left == right,
+            (Self::Regex(left), Self::Regex(right)) => left.as_str() == right.as_str(),
+            _ => false,
+        }
     }
-    regex::Regex::new(matcher).map(|_| ())
+}
+
+impl Eq for CompiledMatcher {}
+
+impl CompiledMatcher {
+    pub(crate) fn matches_optional(&self, input: Option<&str>) -> bool {
+        match self {
+            Self::MatchAll => true,
+            Self::Exact(candidates) => input
+                .map(|input| candidates.iter().any(|candidate| candidate == input))
+                .unwrap_or(false),
+            Self::Regex(regex) => input.map(|input| regex.is_match(input)).unwrap_or(false),
+        }
+    }
+}
+
+pub(crate) fn compile_matcher_pattern(
+    matcher: Option<&str>,
+) -> Result<CompiledMatcher, regex::Error> {
+    match matcher {
+        None => Ok(CompiledMatcher::MatchAll),
+        Some(matcher) if is_match_all_matcher(matcher) => Ok(CompiledMatcher::MatchAll),
+        Some(matcher) if is_exact_matcher(matcher) => Ok(CompiledMatcher::Exact(
+            matcher.split('|').map(str::to_owned).collect(),
+        )),
+        Some(matcher) => regex::Regex::new(matcher).map(CompiledMatcher::Regex),
+    }
+}
+
+pub(crate) fn validate_matcher_pattern(matcher: &str) -> Result<(), regex::Error> {
+    compile_matcher_pattern(Some(matcher)).map(drop)
 }
 
 pub(crate) fn matches_matcher(matcher: Option<&str>, input: Option<&str>) -> bool {
-    match matcher {
-        None => true,
-        Some(matcher) if is_match_all_matcher(matcher) => true,
-        Some(matcher) if is_exact_matcher(matcher) => input
-            .map(|input| matcher.split('|').any(|candidate| candidate == input))
-            .unwrap_or(false),
-        Some(matcher) => input
-            .and_then(|input| {
-                regex::Regex::new(matcher)
-                    .ok()
-                    .map(|regex| regex.is_match(input))
-            })
-            .unwrap_or(false),
-    }
+    compile_matcher_pattern(matcher)
+        .map(|compiled| compiled.matches_optional(input))
+        .unwrap_or(false)
 }
 
 pub(crate) fn matcher_inputs<'a>(
@@ -288,3 +319,4 @@ mod tests {
         );
     }
 }
+use std::sync::Arc;

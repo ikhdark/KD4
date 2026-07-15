@@ -6,12 +6,12 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutPersistenceTelemetry;
+use codex_rollout::is_persisted_rollout_item;
 use codex_rollout::measure_and_filter_rollout_items;
 use codex_rollout::persisted_rollout_items;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use crate::AppendThreadItemsParams;
 use crate::CreateThreadParams;
 use crate::LoadThreadHistoryParams;
 use crate::LocalThreadStore;
@@ -161,24 +161,55 @@ impl LiveThread {
         } else {
             (persisted_rollout_items(raw_items, self.history_mode), None)
         };
+        if items.is_empty() {
+            if let Some(measurement) = measurement.as_ref() {
+                self.persistence_telemetry
+                    .record_batch(raw_items, measurement);
+            }
+            return Ok(());
+        }
         self.thread_store
-            .append_items(AppendThreadItemsParams {
-                thread_id: self.thread_id,
-                items: raw_items.to_vec(),
-            })
+            .append_persisted_items(self.thread_id, items.as_slice())
             .await?;
         if let Some(measurement) = measurement.as_ref() {
             self.persistence_telemetry
                 .record_batch(raw_items, measurement);
         }
-        if items.is_empty() {
+        self.observe_appended_items(items.as_slice()).await
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub async fn append_item(&self, item: &RolloutItem) -> ThreadStoreResult<()> {
+        let persisted = is_persisted_rollout_item(item, self.history_mode);
+        let measurement = if self.persistence_telemetry.is_enabled() {
+            let (_, measurement) =
+                measure_and_filter_rollout_items(std::slice::from_ref(item), self.history_mode);
+            Some(measurement)
+        } else {
+            None
+        };
+        if persisted {
+            self.thread_store
+                .append_persisted_items(self.thread_id, std::slice::from_ref(item))
+                .await?;
+        }
+        if let Some(measurement) = measurement.as_ref() {
+            self.persistence_telemetry
+                .record_batch(std::slice::from_ref(item), measurement);
+        }
+        if !persisted {
             return Ok(());
         }
+        self.observe_appended_items(std::slice::from_ref(item))
+            .await
+    }
+
+    async fn observe_appended_items(&self, items: &[RolloutItem]) -> ThreadStoreResult<()> {
         let update = self
             .metadata_sync
             .lock()
             .await
-            .observe_appended_items(items.as_slice());
+            .observe_appended_items(items);
         if let Some(update) = update {
             self.thread_store
                 .update_thread_metadata(UpdateThreadMetadataParams {

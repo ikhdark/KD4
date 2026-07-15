@@ -1,4 +1,5 @@
 use codex_protocol::ThreadId;
+use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use std::any::Any;
 use std::future::Future;
@@ -53,6 +54,23 @@ pub trait ThreadStore: Any + Send + Sync {
     /// Implementations should apply the shared rollout persistence policy before writing durable
     /// replay history and before updating any implementation-owned projections.
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()>;
+
+    /// Appends items that have already passed the shared rollout persistence policy.
+    ///
+    /// The default keeps third-party stores compatible by delegating to the raw append API.
+    fn append_persisted_items<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        items: &'a [RolloutItem],
+    ) -> ThreadStoreFuture<'a, ()> {
+        Box::pin(async move {
+            self.append_items(AppendThreadItemsParams {
+                thread_id,
+                items: items.to_vec(),
+            })
+            .await
+        })
+    }
 
     /// Materializes the thread if persistence is lazy, then persists all queued items.
     fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;

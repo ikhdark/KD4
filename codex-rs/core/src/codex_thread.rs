@@ -671,6 +671,16 @@ impl CodexThread {
         server: &str,
         uri: &str,
     ) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(
+            self.read_mcp_resource_typed(server, uri).await?,
+        )?)
+    }
+
+    pub async fn read_mcp_resource_typed(
+        &self,
+        server: &str,
+        uri: &str,
+    ) -> anyhow::Result<codex_mcp::McpResourceReadResult> {
         let result = self
             .current_mcp_runtime()
             .await
@@ -678,7 +688,7 @@ impl CodexThread {
             .read_resource(server, ReadResourceRequestParams::new(uri))
             .await?;
 
-        Ok(serde_json::to_value(result)?)
+        codex_mcp::resource_read_result_from_rmcp(result)
     }
 
     pub async fn call_mcp_tool(

@@ -265,10 +265,10 @@ async fn paginated_turn_context_assigns_missing_response_item_ids_without_featur
     turn_context.history_mode = ThreadHistoryMode::Paginated;
     let response_item = user_message("hello");
 
-    let items = session.prepare_conversation_items_for_history(
-        &turn_context,
-        std::slice::from_ref(&response_item),
-    );
+    let items = session
+        .prepare_conversation_items_for_history(&turn_context, std::slice::from_ref(&response_item))
+        .await
+        .expect("image preparation");
 
     assert!(
         items[0]

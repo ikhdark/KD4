@@ -36,7 +36,8 @@ use crate::current_time::TimeProvider;
 use crate::default_skill_metadata_budget;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::exec_policy::ExecPolicyManager;
-use crate::image_preparation::prepare_response_items;
+use crate::image_preparation::prepare_response_items_owned;
+use crate::image_preparation::response_items_need_preparation;
 use crate::parse_turn_item;
 use crate::realtime_conversation::RealtimeConversationManager;
 use crate::session::step_context::StepContext;
@@ -1336,7 +1337,10 @@ impl Session {
         state.clear_connector_selection();
     }
 
-    async fn record_initial_history(&self, conversation_history: InitialHistory) {
+    async fn record_initial_history(
+        &self,
+        conversation_history: InitialHistory,
+    ) -> anyhow::Result<()> {
         let is_subagent = {
             let state = self.state.lock().await;
             state
@@ -1361,7 +1365,7 @@ impl Session {
                 let rollout_items = resumed_history.history;
                 let previous_turn_settings = self
                     .apply_rollout_reconstruction(&turn_context, &rollout_items)
-                    .await;
+                    .await?;
 
                 // If resuming, warn when the last recorded model differs from the current one.
                 let curr: &str = turn_context.model_info.slug.as_str();
@@ -1406,7 +1410,7 @@ impl Session {
                     }
                 }
                 self.apply_rollout_reconstruction(&turn_context, &rollout_items)
-                    .await;
+                    .await?;
 
                 // Seed usage info from the recorded rollout so UIs can show token counts
                 // immediately on resume/fork.
@@ -1429,6 +1433,7 @@ impl Session {
                 }
             }
         }
+        Ok(())
     }
 
     #[instrument(
@@ -1443,9 +1448,9 @@ impl Session {
         &self,
         turn_context: &TurnContext,
         rollout_items: &[RolloutItem],
-    ) -> Option<PreviousTurnSettings> {
+    ) -> anyhow::Result<Option<PreviousTurnSettings>> {
         let rollout_reconstruction::RolloutReconstruction {
-            mut history,
+            history,
             previous_turn_settings,
             reference_context_item,
             world_state_baseline,
@@ -1460,7 +1465,7 @@ impl Session {
         // installing it, so legacy images are processed once for this resume or fork and
         // will be processed again if the rollout is reconstructed in a future session.
         // This meets image resizing requirements without modifying persisted rollouts.
-        prepare_response_items(&mut history);
+        let history = prepare_response_items_owned(history).await?;
         {
             let mut state = self.state.lock().await;
             state.replace_history(history, reference_context_item);
@@ -1493,7 +1498,7 @@ impl Session {
             self.set_auto_compact_window_estimated_prefill_for_scope(turn_context, prefix_tokens)
                 .await;
         }
-        previous_turn_settings
+        Ok(previous_turn_settings)
     }
 
     async fn set_auto_compact_window_estimated_prefill_for_scope(
@@ -1999,8 +2004,8 @@ impl Session {
     async fn send_event_raw_with_persistence(&self, event: Event, persist: bool) {
         // Persist the event into rollout storage; the store applies its persistence policy.
         if persist {
-            let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
-            self.persist_rollout_items(&rollout_items).await;
+            let rollout_item = RolloutItem::EventMsg(event.msg.clone());
+            self.persist_rollout_item(&rollout_item).await;
         }
         self.services
             .rollout_thread_trace
@@ -2812,21 +2817,24 @@ impl Session {
 
     /// Records conversation items: append to history, persist to rollout, and
     /// notify clients observing raw response items.
-    pub(crate) fn prepare_conversation_items_for_history<'a>(
+    pub(crate) async fn prepare_conversation_items_for_history<'a>(
         &self,
         turn_context: &TurnContext,
         items: &'a [ResponseItem],
-    ) -> Cow<'a, [ResponseItem]> {
-        let mut items = Cow::Borrowed(items);
-        prepare_response_items(items.to_mut());
+    ) -> Result<Cow<'a, [ResponseItem]>, tokio::task::JoinError> {
+        let mut items = if response_items_need_preparation(items) {
+            Cow::Owned(prepare_response_items_owned(items.to_vec()).await?)
+        } else {
+            Cow::Borrowed(items)
+        };
         // Most response items get their passthrough turn ID at the durable history boundary.
         for item in items.to_mut() {
             item.set_turn_id_if_missing(&turn_context.sub_id);
         }
         if turn_context.item_ids_enabled() {
-            Self::assign_missing_response_item_ids(items)
+            Ok(Self::assign_missing_response_item_ids(items))
         } else {
-            items
+            Ok(items)
         }
     }
 
@@ -2878,7 +2886,12 @@ impl Session {
         turn_context: &TurnContext,
         items: &[ResponseItem],
     ) {
-        let items = self.prepare_conversation_items_for_history(turn_context, items);
+        let Ok(items) = self
+            .prepare_conversation_items_for_history(turn_context, items)
+            .await
+        else {
+            return;
+        };
         let items = items.as_ref();
         {
             let mut state = self.state.lock().await;
@@ -2984,10 +2997,15 @@ impl Session {
     ) {
         communication.set_turn_id_if_missing(&turn_context.sub_id);
         let response_item = communication.to_model_input_item();
-        let items = self.prepare_conversation_items_for_history(
-            turn_context,
-            std::slice::from_ref(&response_item),
-        );
+        let Ok(items) = self
+            .prepare_conversation_items_for_history(
+                turn_context,
+                std::slice::from_ref(&response_item),
+            )
+            .await
+        else {
+            return;
+        };
         let items = items.as_ref();
         let response_item = items[0].clone();
         {
@@ -3556,6 +3574,15 @@ impl Session {
             && let Err(e) = live_thread.append_items(items).await
         {
             error!("failed to record rollout items: {e:#}");
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub(crate) async fn persist_rollout_item(&self, item: &RolloutItem) {
+        if let Some(live_thread) = self.live_thread()
+            && let Err(e) = live_thread.append_item(item).await
+        {
+            error!("failed to record rollout item: {e:#}");
         }
     }
 

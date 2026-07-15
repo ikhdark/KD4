@@ -208,6 +208,7 @@ async fn scan_rollout_matches(
     let mut matches = HashMap::new();
     let mut dirs = vec![root.to_path_buf()];
     let json_search_term = case_insensitive_literal_regex(json_search_term)?;
+    let content_search_term = case_insensitive_literal_regex(search_term)?;
 
     while let Some(dir) = dirs.pop() {
         let mut entries = match tokio::fs::read_dir(dir).await {
@@ -239,9 +240,13 @@ async fn scan_rollout_matches(
                 }
                 continue;
             }
-            if rollout_contains(rollout_file.path(), &json_search_term).await? {
-                let snippet =
-                    first_rollout_content_match_snippet(rollout_file.path(), search_term).await?;
+            let (matched, snippet) = scan_rollout_content_match(
+                rollout_file.path(),
+                &json_search_term,
+                &content_search_term,
+            )
+            .await?;
+            if matched {
                 matches.insert(rollout_file.into_path(), snippet);
             }
         }
@@ -250,31 +255,34 @@ async fn scan_rollout_matches(
     Ok(matches)
 }
 
-async fn rollout_contains(path: &Path, search_term: &Regex) -> io::Result<bool> {
+async fn scan_rollout_content_match(
+    path: &Path,
+    json_search_term: &Regex,
+    content_search_term: &Regex,
+) -> io::Result<(bool, Option<String>)> {
     let mut lines = compression::open_rollout_line_reader(path).await?;
+    let mut matched = false;
     while let Some(line) = lines.next_line().await? {
-        if search_term.is_match(line.as_str()) {
-            return Ok(true);
+        if !json_search_term.is_match(line.as_str()) {
+            continue;
+        }
+        matched = true;
+        if let Some(snippet) = content_match_snippet(line.as_str(), content_search_term) {
+            return Ok((true, Some(snippet)));
         }
     }
-    Ok(false)
+    Ok((matched, None))
 }
 
 pub async fn first_rollout_content_match_snippet(
     path: &Path,
     search_term: &str,
 ) -> io::Result<Option<String>> {
-    let mut lines = compression::open_rollout_line_reader(path).await?;
     let json_search_term = case_insensitive_literal_regex(json_escaped_search_term(search_term)?)?;
     let search_term = case_insensitive_literal_regex(search_term)?;
-    while let Some(line) = lines.next_line().await? {
-        if json_search_term.is_match(line.as_str())
-            && let Some(snippet) = content_match_snippet(line.as_str(), &search_term)
-        {
-            return Ok(Some(snippet));
-        }
-    }
-    Ok(None)
+    scan_rollout_content_match(path, &json_search_term, &search_term)
+        .await
+        .map(|(_, snippet)| snippet)
 }
 
 async fn scan_compressed_rollout_matches(

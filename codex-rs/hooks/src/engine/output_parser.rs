@@ -340,14 +340,19 @@ where
     T: for<'de> serde::Deserialize<'de>,
 {
     let trimmed = stdout.trim();
-    if trimmed.is_empty() {
+    if !trimmed.starts_with('{') {
         return None;
     }
-    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
-    if !value.is_object() {
-        return None;
+    match serde_json::from_str(trimmed) {
+        Ok(value) => Some(value),
+        Err(_) => {
+            // Preserve the legacy Value -> target acceptance path for direct-deserialization
+            // edge cases while keeping the successful path single-decode.
+            let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+            value.is_object().then_some(())?;
+            serde_json::from_value(value).ok()
+        }
     }
-    serde_json::from_value(value).ok()
 }
 
 pub(crate) fn looks_like_json(stdout: &str) -> bool {
@@ -519,6 +524,24 @@ mod tests {
     use serde_json::json;
 
     use super::parse_permission_request;
+    use super::parse_session_start;
+
+    #[test]
+    fn direct_hook_output_deserialization_preserves_legacy_acceptance() {
+        let valid =
+            parse_session_start(r#"{"continue":true}"#).expect("valid object should deserialize");
+        assert!(valid.universal.continue_processing);
+
+        let missing_optional_fields =
+            parse_session_start("{}").expect("defaulted fields should remain optional");
+        assert!(missing_optional_fields.universal.continue_processing);
+
+        assert!(parse_session_start("[]").is_none());
+        assert!(parse_session_start("{").is_none());
+        assert!(parse_session_start(r#"{"unknownField":true}"#).is_none());
+        assert!(parse_session_start(r#"{"hookSpecificOutput":{}}"#).is_none());
+        assert!(parse_session_start(r#"{"continue":"yes"}"#).is_none());
+    }
 
     #[test]
     fn permission_request_rejects_reserved_updated_input_field() {

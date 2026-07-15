@@ -10,7 +10,6 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::SubAgentActivityEvent;
 use codex_protocol::protocol::SubAgentActivityKind;
 use serde::Deserialize;
-use serde_json::Value;
 
 use super::super::TraceReducer;
 use crate::model::ConversationItem;
@@ -62,6 +61,23 @@ struct AgentMessageInvocationArgs {
     message: String,
 }
 
+#[derive(Deserialize)]
+struct AgentInvocationEnvelope {
+    payload: AgentInvocationPayload,
+}
+
+#[derive(Deserialize)]
+struct AgentInvocationPayload {
+    arguments: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AgentRuntimeEndPayload<T> {
+    Legacy(SubAgentActivityEvent),
+    Current(T),
+}
+
 /// Builds the stable edge id for the spawn relationship between two threads.
 pub(in crate::reducer) fn spawn_edge_id(parent_thread_id: &str, child_thread_id: &str) -> String {
     format!("edge:spawn:{parent_thread_id}:{child_thread_id}")
@@ -84,7 +100,7 @@ impl TraceReducer {
         match kind {
             ToolCallKind::AssignAgentTask => {
                 let payload: CollabAgentInteractionBeginEvent =
-                    serde_json::from_value(self.read_payload_json(runtime_payload)?)?;
+                    self.read_payload(runtime_payload)?;
                 self.queue_message_agent_interaction(
                     tool_call_id,
                     InteractionEdgeKind::AssignAgentTask,
@@ -95,7 +111,7 @@ impl TraceReducer {
             }
             ToolCallKind::SendMessage => {
                 let payload: CollabAgentInteractionBeginEvent =
-                    serde_json::from_value(self.read_payload_json(runtime_payload)?)?;
+                    self.read_payload(runtime_payload)?;
                 self.queue_message_agent_interaction(
                     tool_call_id,
                     InteractionEdgeKind::SendMessage,
@@ -105,8 +121,7 @@ impl TraceReducer {
                 )
             }
             ToolCallKind::CloseAgent => {
-                let payload: CollabCloseBeginEvent =
-                    serde_json::from_value(self.read_payload_json(runtime_payload)?)?;
+                let payload: CollabCloseBeginEvent = self.read_payload(runtime_payload)?;
                 self.upsert_close_agent_interaction(
                     tool_call_id,
                     payload.receiver_thread_id.to_string(),
@@ -133,44 +148,75 @@ impl TraceReducer {
         runtime_payload: &RawPayloadRef,
     ) -> Result<()> {
         let kind = self.rollout.tool_calls[tool_call_id].kind.clone();
-        let runtime_payload_json = self.read_payload_json(runtime_payload)?;
-        if runtime_payload_json.get("agent_thread_id").is_some() {
-            let payload: SubAgentActivityEvent = serde_json::from_value(runtime_payload_json)?;
-            return self.end_sub_agent_activity(wall_time_unix_ms, tool_call_id, &kind, &payload);
-        }
         match kind {
             ToolCallKind::SpawnAgent => {
-                let payload: CollabAgentSpawnEndEvent =
-                    serde_json::from_value(runtime_payload_json)?;
-                self.end_spawn_agent_interaction(wall_time_unix_ms, tool_call_id, &payload)
+                match self.read_payload::<AgentRuntimeEndPayload<CollabAgentSpawnEndEvent>>(
+                    runtime_payload,
+                )? {
+                    AgentRuntimeEndPayload::Legacy(payload) => self.end_sub_agent_activity(
+                        wall_time_unix_ms,
+                        tool_call_id,
+                        &kind,
+                        &payload,
+                    ),
+                    AgentRuntimeEndPayload::Current(payload) => {
+                        self.end_spawn_agent_interaction(wall_time_unix_ms, tool_call_id, &payload)
+                    }
+                }
             }
             ToolCallKind::AssignAgentTask => {
-                let payload: CollabAgentInteractionEndEvent =
-                    serde_json::from_value(runtime_payload_json)?;
-                self.end_message_agent_interaction(
-                    wall_time_unix_ms,
-                    tool_call_id,
-                    InteractionEdgeKind::AssignAgentTask,
-                    &payload,
-                )
+                match self.read_payload::<AgentRuntimeEndPayload<CollabAgentInteractionEndEvent>>(
+                    runtime_payload,
+                )? {
+                    AgentRuntimeEndPayload::Legacy(payload) => self.end_sub_agent_activity(
+                        wall_time_unix_ms,
+                        tool_call_id,
+                        &kind,
+                        &payload,
+                    ),
+                    AgentRuntimeEndPayload::Current(payload) => self.end_message_agent_interaction(
+                        wall_time_unix_ms,
+                        tool_call_id,
+                        InteractionEdgeKind::AssignAgentTask,
+                        &payload,
+                    ),
+                }
             }
             ToolCallKind::SendMessage => {
-                let payload: CollabAgentInteractionEndEvent =
-                    serde_json::from_value(runtime_payload_json)?;
-                self.end_message_agent_interaction(
-                    wall_time_unix_ms,
-                    tool_call_id,
-                    InteractionEdgeKind::SendMessage,
-                    &payload,
-                )
+                match self.read_payload::<AgentRuntimeEndPayload<CollabAgentInteractionEndEvent>>(
+                    runtime_payload,
+                )? {
+                    AgentRuntimeEndPayload::Legacy(payload) => self.end_sub_agent_activity(
+                        wall_time_unix_ms,
+                        tool_call_id,
+                        &kind,
+                        &payload,
+                    ),
+                    AgentRuntimeEndPayload::Current(payload) => self.end_message_agent_interaction(
+                        wall_time_unix_ms,
+                        tool_call_id,
+                        InteractionEdgeKind::SendMessage,
+                        &payload,
+                    ),
+                }
             }
             ToolCallKind::CloseAgent => {
-                let payload: CollabCloseEndEvent = serde_json::from_value(runtime_payload_json)?;
-                self.upsert_close_agent_interaction(
-                    tool_call_id,
-                    payload.receiver_thread_id.to_string(),
-                    Some(wall_time_unix_ms),
-                )
+                match self
+                    .read_payload::<AgentRuntimeEndPayload<CollabCloseEndEvent>>(runtime_payload)?
+                {
+                    AgentRuntimeEndPayload::Legacy(payload) => self.end_sub_agent_activity(
+                        wall_time_unix_ms,
+                        tool_call_id,
+                        &kind,
+                        &payload,
+                    ),
+                    AgentRuntimeEndPayload::Current(payload) => self
+                        .upsert_close_agent_interaction(
+                            tool_call_id,
+                            payload.receiver_thread_id.to_string(),
+                            Some(wall_time_unix_ms),
+                        ),
+                }
             }
             ToolCallKind::ExecCommand
             | ToolCallKind::WriteStdin
@@ -179,7 +225,14 @@ impl TraceReducer {
             | ToolCallKind::Web
             | ToolCallKind::ImageGeneration
             | ToolCallKind::WaitAgent
-            | ToolCallKind::Other { .. } => Ok(()),
+            | ToolCallKind::Other { .. } => {
+                let runtime_payload_json = self.read_payload_json(runtime_payload)?;
+                if runtime_payload_json.get("agent_thread_id").is_none() {
+                    return Ok(());
+                }
+                let payload: SubAgentActivityEvent = serde_json::from_value(runtime_payload_json)?;
+                self.end_sub_agent_activity(wall_time_unix_ms, tool_call_id, &kind, &payload)
+            }
         }
     }
 
@@ -293,14 +346,10 @@ impl TraceReducer {
                     "agent activity tool call {tool_call_id} referenced missing invocation payload {invocation_payload_id}"
                 )
             })?;
-        let invocation = self.read_payload_json(invocation_payload)?;
-        let arguments = invocation
-            .get("payload")
-            .and_then(|payload| payload.get("arguments"))
-            .and_then(Value::as_str)
-            .with_context(|| {
-                format!("agent activity tool call {tool_call_id} missing function arguments")
-            })?;
+        let invocation: AgentInvocationEnvelope = self.read_payload(invocation_payload)?;
+        let arguments = invocation.payload.arguments.as_deref().with_context(|| {
+            format!("agent activity tool call {tool_call_id} missing function arguments")
+        })?;
         let args: AgentMessageInvocationArgs = serde_json::from_str(arguments)
             .with_context(|| format!("parse agent activity tool call {tool_call_id} arguments"))?;
         Ok(args.message)

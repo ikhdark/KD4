@@ -1,4 +1,5 @@
 use super::*;
+use crate::config_manager_service::api_config_from_config_toml;
 use anyhow::Result;
 use codex_app_server_protocol::AppConfig;
 use codex_app_server_protocol::AppToolApproval;
@@ -11,6 +12,88 @@ use codex_config::test_support::CloudConfigBundleFixture;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 use tempfile::tempdir;
+
+fn assert_direct_projection_matches_legacy(config: ConfigToml) {
+    let legacy: ApiConfig = serde_json::from_value(
+        serde_json::to_value(&config).expect("serialize legacy ConfigToml projection"),
+    )
+    .expect("deserialize legacy ApiConfig projection");
+    let direct = api_config_from_config_toml(config).expect("project ConfigToml directly");
+
+    assert_eq!(
+        serde_json::to_value(direct).expect("serialize direct projection"),
+        serde_json::to_value(legacy).expect("serialize legacy projection"),
+    );
+}
+
+#[test]
+fn direct_config_projection_matches_legacy_json_bridge() {
+    assert_direct_projection_matches_legacy(ConfigToml::default());
+
+    let temp = tempdir().expect("tempdir");
+    let writable_root =
+        AbsolutePathBuf::try_from(temp.path().to_path_buf()).expect("tempdir path is absolute");
+    let mut config = ConfigToml {
+        sandbox_workspace_write: Some(codex_config::types::SandboxWorkspaceWrite {
+            writable_roots: vec![writable_root],
+            network_access: true,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+        }),
+        forced_chatgpt_workspace_id: Some(
+            codex_config::config_toml::ForcedChatgptWorkspaceIds::Multiple(vec![
+                "workspace-a".to_string(),
+                "workspace-b".to_string(),
+            ]),
+        ),
+        tools: Some(codex_config::config_toml::ToolsToml {
+            web_search: None,
+            experimental_request_user_input: Some(
+                codex_config::config_toml::ExperimentalRequestUserInput { enabled: false },
+            ),
+        }),
+        analytics: Some(codex_config::types::AnalyticsConfigToml {
+            enabled: Some(false),
+        }),
+        notify: Some(vec!["notify-command".to_string()]),
+        desktop: Some(std::collections::HashMap::from([(
+            "theme".to_string(),
+            serde_json::json!("dark"),
+        )])),
+        ..ConfigToml::default()
+    };
+    config.apps = Some(codex_config::types::AppsConfigToml {
+        default: Some(codex_config::types::AppsDefaultConfig {
+            enabled: false,
+            approvals_reviewer: None,
+            destructive_enabled: false,
+            open_world_enabled: true,
+            default_tools_approval_mode: Some(codex_config::AppToolApproval::Prompt),
+        }),
+        apps: std::collections::HashMap::from([(
+            "example".to_string(),
+            codex_config::types::AppConfig {
+                enabled: true,
+                approvals_reviewer: None,
+                destructive_enabled: Some(true),
+                open_world_enabled: Some(false),
+                default_tools_approval_mode: Some(codex_config::AppToolApproval::Writes),
+                default_tools_enabled: Some(false),
+                tools: Some(codex_config::types::AppToolsConfig {
+                    tools: std::collections::HashMap::from([(
+                        "example/run".to_string(),
+                        codex_config::types::AppToolConfig {
+                            enabled: Some(true),
+                            approval_mode: Some(codex_config::AppToolApproval::Approve),
+                        },
+                    )]),
+                }),
+            },
+        )]),
+    });
+
+    assert_direct_projection_matches_legacy(config);
+}
 
 #[test]
 fn toml_value_to_item_handles_nested_config_tables() {

@@ -21,7 +21,7 @@ pub struct McpResourcePage {
 }
 
 /// Contents returned after reading one MCP resource.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct McpResourceReadResult {
     /// Text or blob content returned for the requested resource.
     pub contents: Vec<ResourceContent>,
@@ -119,8 +119,43 @@ fn resource_from_rmcp(resource: rmcp::model::Resource) -> Result<Resource> {
     Resource::from_mcp_value(value).context("failed to convert MCP resource")
 }
 
-fn resource_content_from_rmcp(content: rmcp::model::ResourceContents) -> Result<ResourceContent> {
-    let value =
-        serde_json::to_value(content).context("failed to serialize MCP resource content")?;
-    serde_json::from_value(value).context("failed to convert MCP resource content")
+pub fn resource_content_from_rmcp(
+    content: rmcp::model::ResourceContents,
+) -> Result<ResourceContent> {
+    Ok(match content {
+        rmcp::model::ResourceContents::TextResourceContents {
+            uri,
+            mime_type,
+            text,
+            meta,
+        } => ResourceContent::Text {
+            uri,
+            mime_type,
+            text,
+            meta: meta.map(|meta| serde_json::Value::Object(meta.0)),
+        },
+        rmcp::model::ResourceContents::BlobResourceContents {
+            uri,
+            mime_type,
+            blob,
+            meta,
+        } => ResourceContent::Blob {
+            uri,
+            mime_type,
+            blob,
+            meta: meta.map(|meta| serde_json::Value::Object(meta.0)),
+        },
+    })
+}
+
+/// Converts an rmcp read result into the canonical Codex resource result without JSON bridging.
+pub fn resource_read_result_from_rmcp(
+    result: rmcp::model::ReadResourceResult,
+) -> Result<McpResourceReadResult> {
+    let contents = result
+        .contents
+        .into_iter()
+        .map(resource_content_from_rmcp)
+        .collect::<Result<Vec<_>>>()?;
+    Ok(McpResourceReadResult { contents })
 }

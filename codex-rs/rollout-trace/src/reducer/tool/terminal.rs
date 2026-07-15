@@ -53,7 +53,7 @@ impl TraceReducer {
             return Ok(None);
         };
 
-        let payload = self.read_payload_json(invocation_payload)?;
+        let payload: DispatchedToolTraceRequestPayload = self.read_payload(invocation_payload)?;
         let request = parse_dispatch_terminal_request(payload).with_context(|| {
             format!(
                 "parse terminal invocation payload {} as dispatch payload",
@@ -85,9 +85,8 @@ impl TraceReducer {
             return Ok(None);
         };
 
-        let payload = self.read_payload_json(runtime_payload)?;
         let payload: ExecCommandBeginPayload =
-            serde_json::from_value(payload).with_context(|| {
+            self.read_payload(runtime_payload).with_context(|| {
                 format!(
                     "parse terminal runtime start payload {}",
                     runtime_payload.raw_payload_id
@@ -172,12 +171,37 @@ impl TraceReducer {
         };
         let response = response_payload
             .map(|payload| {
-                let value = self.read_payload_json(payload)?;
-                let response = parse_terminal_response_payload(
-                    value,
-                    &operation_kind,
-                    &payload.raw_payload_id,
-                )?;
+                let response = match operation_kind {
+                    TerminalOperationKind::ExecCommand => {
+                        let payload: ExecCommandEndPayload = self
+                            .read_payload(payload)
+                            .with_context(|| {
+                                format!(
+                                    "parse exec terminal response {}",
+                                    payload.raw_payload_id
+                                )
+                            })?;
+                        parse_protocol_terminal_response(payload)
+                    }
+                    TerminalOperationKind::WriteStdin => {
+                        let payload: WriteStdinResponsePayload = self
+                            .read_payload(payload)
+                            .with_context(|| {
+                                format!(
+                                    "parse write_stdin terminal response {} as protocol or dispatch payload",
+                                    payload.raw_payload_id
+                                )
+                            })?;
+                        match payload {
+                            WriteStdinResponsePayload::Protocol(payload) => {
+                                parse_protocol_terminal_response(payload)
+                            }
+                            WriteStdinResponsePayload::Dispatch(payload) => {
+                                parse_dispatch_terminal_response(payload)
+                            }
+                        }
+                    }
+                };
                 Ok::<_, anyhow::Error>((payload.raw_payload_id.clone(), response))
             })
             .transpose()?;
@@ -387,8 +411,9 @@ fn parse_protocol_terminal_request(
     }
 }
 
-fn parse_dispatch_terminal_request(value: JsonValue) -> Result<ParsedTerminalRequest> {
-    let payload: DispatchedToolTraceRequestPayload = serde_json::from_value(value)?;
+fn parse_dispatch_terminal_request(
+    payload: DispatchedToolTraceRequestPayload,
+) -> Result<ParsedTerminalRequest> {
     if payload.tool_name != "write_stdin" {
         bail!(
             "dispatch terminal request is for {}, not write_stdin",
@@ -420,31 +445,6 @@ fn parse_dispatch_terminal_request(value: JsonValue) -> Result<ParsedTerminalReq
     })
 }
 
-fn parse_terminal_response_payload(
-    value: JsonValue,
-    operation_kind: &TerminalOperationKind,
-    raw_payload_id: &str,
-) -> Result<ParsedTerminalResponse> {
-    match operation_kind {
-        TerminalOperationKind::ExecCommand => {
-            let payload = serde_json::from_value::<ExecCommandEndPayload>(value)
-                .with_context(|| format!("parse exec terminal response {raw_payload_id}"))?;
-            Ok(parse_protocol_terminal_response(payload))
-        }
-        TerminalOperationKind::WriteStdin => {
-            match serde_json::from_value::<ExecCommandEndPayload>(value.clone()) {
-                Ok(payload) => Ok(parse_protocol_terminal_response(payload)),
-                Err(protocol_err) => parse_dispatch_terminal_response(value).with_context(|| {
-                    format!(
-                        "parse write_stdin terminal response {raw_payload_id} as protocol payload \
-                         ({protocol_err}) or dispatch payload"
-                    )
-                }),
-            }
-        }
-    }
-}
-
 fn parse_protocol_terminal_response(payload: ExecCommandEndPayload) -> ParsedTerminalResponse {
     ParsedTerminalResponse {
         terminal_id: payload.process_id,
@@ -459,8 +459,9 @@ fn parse_protocol_terminal_response(payload: ExecCommandEndPayload) -> ParsedTer
     }
 }
 
-fn parse_dispatch_terminal_response(value: JsonValue) -> Result<ParsedTerminalResponse> {
-    let payload: DispatchedToolTraceResponsePayload = serde_json::from_value(value)?;
+fn parse_dispatch_terminal_response(
+    payload: DispatchedToolTraceResponsePayload,
+) -> ParsedTerminalResponse {
     let result = match payload {
         DispatchedToolTraceResponsePayload::DirectResponse { response_item } => {
             let output = response_item
@@ -492,10 +493,10 @@ fn parse_dispatch_terminal_response(value: JsonValue) -> Result<ParsedTerminalRe
             chunk_id: None,
         },
     };
-    Ok(ParsedTerminalResponse {
+    ParsedTerminalResponse {
         terminal_id: None,
         result,
-    })
+    }
 }
 
 fn parse_code_mode_exec_result(value: JsonValue) -> TerminalResult {
@@ -561,6 +562,13 @@ struct ExecCommandEndPayload {
     stderr: String,
     exit_code: i32,
     formatted_output: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WriteStdinResponsePayload {
+    Protocol(ExecCommandEndPayload),
+    Dispatch(DispatchedToolTraceResponsePayload),
 }
 
 #[derive(Deserialize)]

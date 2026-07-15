@@ -5,6 +5,9 @@ use super::LastResponse;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
+use super::RequestSchemaCacheKey;
+use super::RequestSchemaCacheValue;
+use super::RequestSchemaSerializationCache;
 use super::UnauthorizedRecoveryExecution;
 use super::X_CODEX_INSTALLATION_ID_HEADER;
 use super::X_CODEX_PARENT_THREAD_ID_HEADER;
@@ -17,6 +20,8 @@ use crate::GenerateAttestationFuture;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
+use crate::tools::ToolWireMode;
+use crate::tools::ToolWireValue;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
@@ -63,6 +68,7 @@ use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Barrier;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -227,15 +233,15 @@ fn request_schema_serialization_cache_is_keyed_by_model_visible_schema() {
     };
 
     client
-        .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
+        .request_schema_components(&prompt, None, ToolWireMode::Responses)
         .expect("first serialization should succeed");
     client
-        .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
+        .request_schema_components(&prompt, None, ToolWireMode::Responses)
         .expect("cached serialization should succeed");
     let mut changed = prompt;
     changed.output_schema = Some(json!({"type": "array"}));
     client
-        .request_schema_components(&changed, None, /*use_responses_lite*/ false)
+        .request_schema_components(&changed, None, ToolWireMode::Responses)
         .expect("changed schema should serialize independently");
 
     let cache = client
@@ -246,6 +252,43 @@ fn request_schema_serialization_cache_is_keyed_by_model_visible_schema() {
     assert_eq!(cache.hits, 1);
     assert_eq!(cache.misses, 2);
     assert_eq!(cache.entries.len(), 2);
+}
+
+#[test]
+fn request_schema_serialization_cache_runs_one_same_key_factory() {
+    let cache = Arc::new(RequestSchemaSerializationCache::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let start = Arc::new(Barrier::new(9));
+    let key = RequestSchemaCacheKey([7; 32]);
+    let mut threads = Vec::new();
+
+    for _ in 0..8 {
+        let cache = Arc::clone(&cache);
+        let calls = Arc::clone(&calls);
+        let start = Arc::clone(&start);
+        threads.push(std::thread::spawn(move || {
+            start.wait();
+            cache.get_or_insert_with(key, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(50));
+                RequestSchemaCacheValue {
+                    tools: ToolWireValue::TopLevel(Arc::<[serde_json::Value]>::from([])),
+                    text: None,
+                }
+            })
+        }));
+    }
+    start.wait();
+
+    for thread in threads {
+        thread.join().expect("request-schema worker");
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let state = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(state.entries.len(), 1);
+    assert!(state.flights.is_empty());
 }
 
 #[tokio::test]

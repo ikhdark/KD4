@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use codex_protocol::ThreadId;
 use codex_protocol::items::HookPromptFragment;
@@ -15,6 +16,7 @@ use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
+use crate::engine::dispatcher::HookMatchContext;
 use crate::engine::output_parser;
 use crate::schema::NullableString;
 use crate::schema::StopCommandInput;
@@ -31,6 +33,17 @@ pub struct StopRequest {
     pub stop_hook_active: bool,
     pub last_assistant_message: Option<String>,
     pub target: StopHookTarget,
+}
+
+impl StopRequest {
+    pub(crate) fn match_context(&self) -> HookMatchContext<'_> {
+        match &self.target {
+            StopHookTarget::Stop => HookMatchContext::Stop,
+            StopHookTarget::SubagentStop { agent_type, .. } => {
+                HookMatchContext::SubagentStop { agent_type }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +115,14 @@ pub(crate) async fn run(
         request.target.event_name(),
         request.target.matcher_input(),
     );
+    run_prepared(matched, shell, request).await
+}
+
+pub(crate) async fn run_prepared(
+    matched: Vec<Arc<ConfiguredHandler>>,
+    shell: &CommandShell,
+    request: StopRequest,
+) -> StopOutcome {
     if matched.is_empty() {
         return StopOutcome {
             hook_events: Vec::new(),

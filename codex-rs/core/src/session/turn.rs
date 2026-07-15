@@ -74,6 +74,7 @@ use crate::tools::router::extension_tool_executors;
 use crate::tools::spec_plan::search_tool_enabled;
 use crate::tools::spec_plan::tool_suggest_enabled;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use crate::turn_timing::ModelStreamTimingGuard;
 use crate::turn_timing::TurnLocalPhase;
 use crate::turn_timing::TurnTimingGuard;
 use crate::turn_timing::record_turn_ttft_metric;
@@ -345,8 +346,14 @@ pub(crate) async fn run_turn(
                         turn_context.as_ref(),
                     )
                     .await;
-                    let estimated_token_count =
-                        sess.get_estimated_token_count(turn_context.as_ref()).await;
+                    let estimated_token_count = if tracing::enabled!(
+                        target: "codex_core::session::turn",
+                        tracing::Level::TRACE
+                    ) {
+                        sess.get_estimated_token_count(turn_context.as_ref()).await
+                    } else {
+                        None
+                    };
                     (has_pending_input, token_status, estimated_token_count)
                 }
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
@@ -1123,12 +1130,18 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
         serde_json::to_vec(connectors),
         serde_json::to_vec(injection_items),
         serde_json::to_vec(user_input),
-        serde_json::to_vec(&router.model_visible_specs()),
-        serde_json::to_vec(history_items),
     ]
     .into_iter()
     .flatten()
     {
+        hasher.update(serialized);
+        hasher.update([0xff]);
+    }
+    if let Ok(serialized) = router.model_visible_schema_bundle().planning_digest_bytes() {
+        hasher.update(serialized);
+        hasher.update([0xff]);
+    }
+    if let Ok(serialized) = serde_json::to_vec(history_items) {
         hasher.update(serialized);
         hasher.update([0xff]);
     }
@@ -1584,7 +1597,7 @@ pub(crate) fn build_prompt(
 ) -> Prompt {
     Prompt {
         input,
-        tools: router.model_visible_specs(),
+        tools: Arc::clone(router.model_visible_schema_bundle()),
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
         output_schema: turn_context.final_output_json_schema.clone(),
@@ -2531,29 +2544,15 @@ async fn try_run_sampling_request(
         !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
+    let mut stream_timing = ModelStreamTimingGuard::new(Some(&turn_context.turn_timing_state));
     let outcome: CodexResult<SamplingRequestResult> = loop {
-        let handle_responses = trace_span!(
-            parent: &receiving_span,
-            "handle_responses",
-            otel.name = field::Empty,
-            tool_name = field::Empty,
-            from = field::Empty,
-            codex.request.reasoning_effort = %reasoning_effort,
-            gen_ai.usage.input_tokens = field::Empty,
-            gen_ai.usage.cache_read.input_tokens = field::Empty,
-            gen_ai.usage.output_tokens = field::Empty,
-            codex.usage.reasoning_output_tokens = field::Empty,
-            codex.usage.total_tokens = field::Empty,
-        );
-
-        let model_stream_wait_timing_guard =
-            turn_context.turn_timing_state.begin_model_stream_wait();
+        stream_timing.begin_wait();
         let stream_event = stream
             .next()
-            .instrument(trace_span!(parent: &handle_responses, "receiving"))
+            .instrument(trace_span!(parent: &receiving_span, "receiving"))
             .or_cancel(&cancellation_token)
             .await;
-        drop(model_stream_wait_timing_guard);
+        stream_timing.begin_processing();
         let event = match stream_event {
             Ok(event) => event,
             Err(codex_async_utils::CancelErr::Cancelled) => break Err(CodexErr::TurnAborted),
@@ -2570,9 +2569,29 @@ async fn try_run_sampling_request(
             }
         };
 
-        let _model_stream_processing_timing_guard = turn_context
-            .turn_timing_state
-            .begin_model_stream_processing();
+        let handle_responses = if matches!(
+            &event,
+            ResponseEvent::OutputTextDelta(_)
+                | ResponseEvent::ReasoningSummaryDelta { .. }
+                | ResponseEvent::ReasoningContentDelta { .. }
+        ) {
+            tracing::Span::none()
+        } else {
+            trace_span!(
+                parent: &receiving_span,
+                "handle_responses",
+                otel.name = field::Empty,
+                tool_name = field::Empty,
+                from = field::Empty,
+                codex.request.reasoning_effort = %reasoning_effort,
+                gen_ai.usage.input_tokens = field::Empty,
+                gen_ai.usage.cache_read.input_tokens = field::Empty,
+                gen_ai.usage.output_tokens = field::Empty,
+                codex.usage.reasoning_output_tokens = field::Empty,
+                codex.usage.total_tokens = field::Empty,
+            )
+        };
+
         sess.services
             .session_telemetry
             .record_responses(&handle_responses, &event);

@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Condvar;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
@@ -89,7 +90,6 @@ use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout_trace::CompactionTraceContext;
 use codex_rollout_trace::InferenceTraceAttempt;
 use codex_rollout_trace::InferenceTraceContext;
-use codex_tools::create_tools_json_for_responses_api;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
 use futures::StreamExt;
@@ -120,6 +120,8 @@ use crate::client_common::ResponseStream;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
+use crate::tools::ToolWireMode;
+use crate::tools::ToolWireValue;
 use crate::turn_timing::TurnLocalPhase;
 use crate::turn_timing::TurnTimingState;
 use crate::util::emit_feedback_auth_recovery_tags;
@@ -219,7 +221,7 @@ struct ModelClientState {
     disable_websockets: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
-    request_schema_cache: StdMutex<RequestSchemaSerializationCache>,
+    request_schema_cache: RequestSchemaSerializationCache,
 }
 
 const REQUEST_SCHEMA_CACHE_CAPACITY: usize = 8;
@@ -229,18 +231,140 @@ struct RequestSchemaCacheKey([u8; 32]);
 
 #[derive(Debug, Clone)]
 struct RequestSchemaCacheValue {
-    tools: Vec<serde_json::Value>,
+    tools: ToolWireValue,
     text: Option<TextControls>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ResponsesRequestKind {
+    Streaming,
+    Compact,
+}
+
+impl ResponsesRequestKind {
+    fn tool_wire_mode(self, use_responses_lite: bool) -> ToolWireMode {
+        if use_responses_lite {
+            ToolWireMode::ResponsesLite
+        } else {
+            match self {
+                Self::Streaming => ToolWireMode::Responses,
+                Self::Compact => ToolWireMode::Compact,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct RequestSchemaSerializationCache {
+    state: StdMutex<RequestSchemaCacheState>,
+}
+
+#[derive(Debug, Default)]
+struct RequestSchemaCacheState {
     entries: VecDeque<(RequestSchemaCacheKey, RequestSchemaCacheValue)>,
+    flights: Vec<(RequestSchemaCacheKey, Arc<RequestSchemaFlight>)>,
     hits: u64,
     misses: u64,
 }
 
+#[derive(Debug, Default)]
+struct RequestSchemaFlight {
+    completed: StdMutex<bool>,
+    wake: Condvar,
+}
+
+impl RequestSchemaFlight {
+    fn wait(&self) {
+        let wait = || {
+            let mut completed = self
+                .completed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !*completed {
+                completed = self
+                    .wake
+                    .wait(completed)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        };
+        if matches!(
+            tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
+            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
+        ) {
+            tokio::task::block_in_place(wait);
+        } else {
+            wait();
+        }
+    }
+
+    fn complete(&self) {
+        let mut completed = self
+            .completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*completed {
+            *completed = true;
+            self.wake.notify_all();
+        }
+    }
+}
+
+struct RequestSchemaFlightLeader<'a> {
+    cache: &'a RequestSchemaSerializationCache,
+    key: RequestSchemaCacheKey,
+    flight: Arc<RequestSchemaFlight>,
+    active: bool,
+}
+
 impl RequestSchemaSerializationCache {
+    fn get_or_insert_with(
+        &self,
+        key: RequestSchemaCacheKey,
+        factory: impl FnOnce() -> RequestSchemaCacheValue,
+    ) -> RequestSchemaCacheValue {
+        let mut factory = Some(factory);
+        loop {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(value) = state.get(key) {
+                trace!("request schema serialization cache hit");
+                return value;
+            }
+            state.record_miss();
+            if let Some(flight) = state
+                .flights
+                .iter()
+                .find(|(candidate, _)| *candidate == key)
+                .map(|(_, flight)| Arc::clone(flight))
+            {
+                drop(state);
+                flight.wait();
+                continue;
+            }
+
+            let flight = Arc::new(RequestSchemaFlight::default());
+            state.flights.push((key, Arc::clone(&flight)));
+            drop(state);
+            let leader = RequestSchemaFlightLeader {
+                cache: self,
+                key,
+                flight,
+                active: true,
+            };
+            let value = factory.take().expect("request-schema factory runs once")();
+            return leader.commit(value);
+        }
+    }
+
+    #[cfg(test)]
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, RequestSchemaCacheState>> {
+        self.state.lock()
+    }
+}
+
+impl RequestSchemaCacheState {
     fn get(&mut self, key: RequestSchemaCacheKey) -> Option<RequestSchemaCacheValue> {
         let index = self
             .entries
@@ -262,6 +386,58 @@ impl RequestSchemaSerializationCache {
             self.entries.pop_front();
         }
         self.entries.push_back((key, value));
+    }
+}
+
+impl RequestSchemaFlightLeader<'_> {
+    fn commit(mut self, value: RequestSchemaCacheValue) -> RequestSchemaCacheValue {
+        let completion = RequestSchemaFlightCompletion(Arc::clone(&self.flight));
+        let mut state = self
+            .cache
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.remove_flight(&mut state);
+        self.active = false;
+        state.insert(self.key, value.clone());
+        drop(state);
+        drop(completion);
+        value
+    }
+
+    fn remove_flight(&self, state: &mut RequestSchemaCacheState) {
+        if let Some(index) = state
+            .flights
+            .iter()
+            .position(|(_, flight)| Arc::ptr_eq(flight, &self.flight))
+        {
+            state.flights.swap_remove(index);
+        }
+    }
+}
+
+impl Drop for RequestSchemaFlightLeader<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self
+            .cache
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.remove_flight(&mut state);
+        self.active = false;
+        drop(state);
+        self.flight.complete();
+    }
+}
+
+struct RequestSchemaFlightCompletion(Arc<RequestSchemaFlight>);
+
+impl Drop for RequestSchemaFlightCompletion {
+    fn drop(&mut self) {
+        self.0.complete();
     }
 }
 
@@ -407,16 +583,72 @@ struct WebsocketSession {
     connection_reused: StdMutex<bool>,
 }
 
+#[derive(serde::Serialize)]
+struct BorrowedResponsesRequestProperties<'a> {
+    model: &'a String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    instructions: &'a String,
+    input: &'a [ResponseItem],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a Vec<serde_json::Value>>,
+    tool_choice: &'a String,
+    parallel_tool_calls: bool,
+    reasoning: Option<&'a Reasoning>,
+    store: bool,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<&'a StreamOptions>,
+    include: &'a Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    service_tier: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a TextControls>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_metadata: Option<&'a HashMap<String, String>>,
+}
+
 fn responses_request_properties_fingerprint(
     request: &ResponsesApiRequest,
 ) -> serde_json::Result<[u8; 32]> {
     // Keep this aligned with `responses_request_properties_match`: input is
     // compared through the normalized prefix chain, while delivery-only stream
     // options and client metadata do not affect previous_response_id reuse.
-    let mut properties = request.clone();
-    properties.input.clear();
-    properties.stream_options = None;
-    properties.client_metadata = None;
+    let ResponsesApiRequest {
+        model,
+        instructions,
+        input: _,
+        tools,
+        tool_choice,
+        parallel_tool_calls,
+        reasoning,
+        store,
+        stream,
+        stream_options: _,
+        include,
+        service_tier,
+        prompt_cache_key,
+        text,
+        client_metadata: _,
+    } = request;
+    let properties = BorrowedResponsesRequestProperties {
+        model,
+        instructions,
+        input: &[],
+        tools: tools.as_ref(),
+        tool_choice,
+        parallel_tool_calls: *parallel_tool_calls,
+        reasoning: reasoning.as_ref(),
+        store: *store,
+        stream: *stream,
+        stream_options: None,
+        include,
+        service_tier: service_tier.as_ref(),
+        prompt_cache_key: prompt_cache_key.as_ref(),
+        text: text.as_ref(),
+        client_metadata: None,
+    };
     let serialized = serde_json::to_vec(&properties)?;
     let mut hasher = Sha256::new();
     hasher.update(WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN);
@@ -577,7 +809,7 @@ impl ModelClient {
                 disable_websockets: AtomicBool::new(false),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
-                request_schema_cache: StdMutex::new(RequestSchemaSerializationCache::default()),
+                request_schema_cache: RequestSchemaSerializationCache::default(),
             }),
             agent_identity_policy,
             prompt_cache_key_override: None,
@@ -689,6 +921,7 @@ impl ModelClient {
             &client_setup.api_provider,
             prompt,
             model_info,
+            ResponsesRequestKind::Compact,
             settings.effort,
             settings.summary,
             settings.service_tier,
@@ -951,12 +1184,13 @@ impl ModelClient {
     }
 
     fn request_schema_cache_key(
+        tool_product_fingerprint: [u8; 32],
         prompt: &Prompt,
         verbosity: Option<VerbosityConfig>,
         use_responses_lite: bool,
     ) -> serde_json::Result<RequestSchemaCacheKey> {
         let serialized = serde_json::to_vec(&(
-            prompt.tools.as_slice(),
+            tool_product_fingerprint,
             &prompt.output_schema,
             prompt.output_schema_strict,
             format!("{verbosity:?}"),
@@ -973,11 +1207,13 @@ impl ModelClient {
         &self,
         prompt: &Prompt,
         verbosity: Option<VerbosityConfig>,
-        use_responses_lite: bool,
+        mode: ToolWireMode,
     ) -> Result<RequestSchemaCacheValue> {
+        let product = prompt.tools.wire_product(mode)?;
+        let use_responses_lite = matches!(mode, ToolWireMode::ResponsesLite);
         if !crate::latency_switches::stage3_persistence_history_enabled() {
             return Ok(RequestSchemaCacheValue {
-                tools: create_tools_json_for_responses_api(&prompt.tools)?,
+                tools: product.value(),
                 text: create_text_param_for_request(
                     verbosity,
                     &prompt.output_schema,
@@ -985,39 +1221,23 @@ impl ModelClient {
                 ),
             });
         }
-        let key = Self::request_schema_cache_key(prompt, verbosity, use_responses_lite)?;
-        {
-            let mut cache = self
-                .state
+        let key = Self::request_schema_cache_key(
+            product.fingerprint(),
+            prompt,
+            verbosity,
+            use_responses_lite,
+        )?;
+        let value =
+            self.state
                 .request_schema_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(value) = cache.get(key) {
-                trace!("request schema serialization cache hit");
-                return Ok(value);
-            }
-            cache.record_miss();
-        }
-
-        let value = RequestSchemaCacheValue {
-            tools: create_tools_json_for_responses_api(&prompt.tools)?,
-            text: create_text_param_for_request(
-                verbosity,
-                &prompt.output_schema,
-                prompt.output_schema_strict,
-            ),
-        };
-        let mut cache = self
-            .state
-            .request_schema_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(value) = cache.get(key) {
-            // Another request populated the same immutable entry while this
-            // request serialized outside the lock.
-            return Ok(value);
-        }
-        cache.insert(key, value.clone());
+                .get_or_insert_with(key, || RequestSchemaCacheValue {
+                    tools: product.value(),
+                    text: create_text_param_for_request(
+                        verbosity,
+                        &prompt.output_schema,
+                        prompt.output_schema_strict,
+                    ),
+                });
         Ok(value)
     }
 
@@ -1027,6 +1247,7 @@ impl ModelClient {
         provider: &codex_api::Provider,
         prompt: &Prompt,
         model_info: &ModelInfo,
+        request_kind: ResponsesRequestKind,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
@@ -1050,29 +1271,32 @@ impl ModelClient {
             }
             None
         };
-        let RequestSchemaCacheValue { tools, text } =
-            self.request_schema_components(prompt, verbosity, model_info.use_responses_lite)?;
-        let (instructions, tools) = if model_info.use_responses_lite {
-            let mut prefix = vec![ResponseItem::AdditionalTools {
-                id: None,
-                role: "developer".to_string(),
-                tools,
-            }];
-            if !prompt.base_instructions.text.is_empty() {
-                prefix.push(ResponseItem::Message {
-                    id: None,
-                    role: "developer".to_string(),
-                    content: vec![ContentItem::InputText {
-                        text: prompt.base_instructions.text.clone(),
-                    }],
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: None,
-                });
+        let RequestSchemaCacheValue { tools, text } = self.request_schema_components(
+            prompt,
+            verbosity,
+            request_kind.tool_wire_mode(model_info.use_responses_lite),
+        )?;
+        let (instructions, tools) = match tools {
+            ToolWireValue::AdditionalTools(additional_tools) => {
+                let mut prefix = vec![additional_tools.as_ref().clone()];
+                if !prompt.base_instructions.text.is_empty() {
+                    prefix.push(ResponseItem::Message {
+                        id: None,
+                        role: "developer".to_string(),
+                        content: vec![ContentItem::InputText {
+                            text: prompt.base_instructions.text.clone(),
+                        }],
+                        phase: None,
+                        internal_chat_message_metadata_passthrough: None,
+                    });
+                }
+                input.splice(0..0, prefix);
+                (String::new(), None)
             }
-            input.splice(0..0, prefix);
-            (String::new(), None)
-        } else {
-            (prompt.base_instructions.text.clone(), Some(tools))
+            ToolWireValue::TopLevel(tools) => (
+                prompt.base_instructions.text.clone(),
+                Some(tools.as_ref().to_vec()),
+            ),
         };
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled && is_openai)
             .then_some(StreamOptions {
@@ -1798,6 +2022,7 @@ impl ModelClientSession {
                 &client_setup.api_provider,
                 prompt,
                 model_info,
+                ResponsesRequestKind::Streaming,
                 effort.clone(),
                 summary,
                 service_tier.clone(),
@@ -1916,6 +2141,7 @@ impl ModelClientSession {
                 &client_setup.api_provider,
                 prompt,
                 model_info,
+                ResponsesRequestKind::Streaming,
                 effort.clone(),
                 summary,
                 service_tier.clone(),

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use tracing::info;
 use tracing::warn;
 
-#[derive(Debug, Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct CodeEnvironment {
     id: String,
     #[serde(default)]
@@ -85,19 +85,29 @@ pub async fn autodetect_environment_id(
         .to_string();
     let body = res.text().await.unwrap_or_default();
     crate::append_error_log(format!("env: status={status} content-type={ct}"));
-    match serde_json::from_str::<serde_json::Value>(&body) {
-        Ok(v) => {
-            let pretty = serde_json::to_string_pretty(&v).unwrap_or(body.clone());
-            crate::append_error_log(format!("env: /environments JSON (pretty):\n{pretty}"));
-        }
-        Err(_) => crate::append_error_log(format!("env: /environments (raw):\n{body}")),
-    }
     if !status.is_success() {
+        match serde_json::from_str::<serde_json::Value>(&body) {
+            Ok(value) => {
+                let pretty = serde_json::to_string_pretty(&value).unwrap_or(body.clone());
+                crate::append_error_log(format!("env: /environments JSON (pretty):\n{pretty}"));
+            }
+            Err(_) => crate::append_error_log(format!("env: /environments (raw):\n{body}")),
+        }
         anyhow::bail!("GET {list_url} failed: {status}; content-type={ct}; body={body}");
     }
-    let all_envs: Vec<CodeEnvironment> = serde_json::from_str(&body).map_err(|e| {
-        anyhow::anyhow!("Decode error for {list_url}: {e}; content-type={ct}; body={body}")
-    })?;
+    let all_envs: Vec<CodeEnvironment> = match serde_json::from_str(&body) {
+        Ok(all_envs) => {
+            let pretty = serde_json::to_string_pretty(&all_envs).unwrap_or(body.clone());
+            crate::append_error_log(format!("env: /environments JSON (pretty):\n{pretty}"));
+            all_envs
+        }
+        Err(error) => {
+            crate::append_error_log(format!("env: /environments (raw):\n{body}"));
+            return Err(anyhow::anyhow!(
+                "Decode error for {list_url}: {error}; content-type={ct}; body={body}"
+            ));
+        }
+    };
     if let Some(env) = pick_environment_row(&all_envs, desired_label.as_deref()) {
         return Ok(AutodetectSelection {
             id: env.id.clone(),

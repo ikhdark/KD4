@@ -689,6 +689,7 @@ impl UnifiedExecProcessManager {
             hook_command: Some(request.hook_command.clone()),
             raw_output_artifact: process.raw_output_artifact().await,
             repair_notice: None,
+            analysis: Default::default(),
         };
 
         Ok(response)
@@ -843,6 +844,7 @@ impl UnifiedExecProcessManager {
             hook_command: Some(hook_command),
             raw_output_artifact: process.raw_output_artifact().await,
             repair_notice: None,
+            analysis: Default::default(),
         };
 
         Ok(response)

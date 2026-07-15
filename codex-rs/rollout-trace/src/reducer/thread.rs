@@ -208,8 +208,7 @@ impl TraceReducer {
         &self,
         metadata_payload: &RawPayloadRef,
     ) -> Result<ThreadStartedMetadata> {
-        let value = self.read_payload_json(metadata_payload)?;
-        serde_json::from_value(value)
+        self.read_payload(metadata_payload)
             .with_context(|| format!("parse thread metadata {}", metadata_payload.raw_payload_id))
     }
 }

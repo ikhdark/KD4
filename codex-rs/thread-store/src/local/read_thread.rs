@@ -9,7 +9,7 @@ use codex_rollout::find_archived_thread_path_by_id_str;
 use codex_rollout::find_thread_name_by_id;
 use codex_rollout::find_thread_path_by_id_str;
 use codex_rollout::read_session_meta_line;
-use codex_rollout::read_thread_item_from_rollout;
+use codex_rollout::read_thread_item_and_session_meta_from_rollout;
 use codex_state::ThreadMetadata;
 
 use super::LocalThreadStore;
@@ -259,10 +259,17 @@ async fn read_thread_from_rollout_path(
     store: &LocalThreadStore,
     path: std::path::PathBuf,
 ) -> ThreadStoreResult<StoredThread> {
-    let Some(item) = read_thread_item_from_rollout(path.clone()).await else {
-        return stored_thread_from_session_meta(store, path).await;
-    };
+    let (item, meta_line) = read_thread_item_and_session_meta_from_rollout(path.clone())
+        .await
+        .map_err(|err| ThreadStoreError::Internal {
+            message: format!("failed to read session metadata {}: {err}", path.display()),
+        })?;
     let archived = rollout_path_is_archived(store.config.codex_home.as_path(), path.as_path());
+    let Some(item) = item else {
+        return Ok(stored_thread_from_meta_line(
+            store, meta_line, path, archived,
+        ));
+    };
     let mut thread = stored_thread_from_rollout_item(
         item,
         archived,
@@ -272,7 +279,6 @@ async fn read_thread_from_rollout_path(
         message: format!("failed to read thread id from {}", path.display()),
     })?;
     thread.rollout_path = Some(codex_rollout::plain_rollout_path(path.as_path()));
-    let meta_line = read_required_session_meta_line(path.as_path()).await?;
     thread.forked_from_id = meta_line.meta.forked_from_id;
     thread.parent_thread_id = meta_line.meta.parent_thread_id;
     thread.history_mode = meta_line.meta.history_mode;
@@ -393,17 +399,6 @@ async fn stored_thread_from_sqlite_metadata(
         first_user_message: metadata.first_user_message,
         history: None,
     })
-}
-
-async fn stored_thread_from_session_meta(
-    store: &LocalThreadStore,
-    path: std::path::PathBuf,
-) -> ThreadStoreResult<StoredThread> {
-    let meta_line = read_required_session_meta_line(path.as_path()).await?;
-    let archived = rollout_path_is_archived(store.config.codex_home.as_path(), path.as_path());
-    Ok(stored_thread_from_meta_line(
-        store, meta_line, path, archived,
-    ))
 }
 
 async fn read_required_session_meta_line(

@@ -136,13 +136,16 @@ async fn send_message_to_connection(
     connection_id: ConnectionId,
     message: OutgoingMessage,
     write_complete_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    apply_notification_filter: bool,
 ) -> bool {
     let Some(connection_state) = connections.get(&connection_id) else {
         warn!("dropping message for disconnected connection: {connection_id:?}");
         return false;
     };
     let message = filter_outgoing_message_for_connection(connection_state, message);
-    if should_skip_notification_for_connection(connection_state, &message) {
+    if apply_notification_filter
+        && should_skip_notification_for_connection(connection_state, &message)
+    {
         return false;
     }
 
@@ -206,8 +209,28 @@ pub(crate) async fn route_outgoing_envelope(
             write_complete_tx,
         } => {
             let _ =
-                send_message_to_connection(connections, connection_id, message, write_complete_tx)
-                    .await;
+                send_message_to_connection(
+                    connections,
+                    connection_id,
+                    message,
+                    write_complete_tx,
+                    /*apply_notification_filter*/ true,
+                )
+                .await;
+        }
+        OutgoingEnvelope::ToSnapshotAcceptedConnection {
+            connection_id,
+            message,
+            write_complete_tx,
+        } => {
+            let _ = send_message_to_connection(
+                connections,
+                connection_id,
+                message,
+                write_complete_tx,
+                /*apply_notification_filter*/ false,
+            )
+            .await;
         }
         OutgoingEnvelope::Broadcast { message } => {
             let target_connections: Vec<ConnectionId> = connections
@@ -229,6 +252,7 @@ pub(crate) async fn route_outgoing_envelope(
                     connection_id,
                     message.clone(),
                     /*write_complete_tx*/ None,
+                    /*apply_notification_filter*/ true,
                 )
                 .await;
             }

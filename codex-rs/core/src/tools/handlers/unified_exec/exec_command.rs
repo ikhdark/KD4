@@ -444,6 +444,7 @@ impl ExecCommandHandler {
                     hook_command: None,
                     raw_output_artifact: Some(raw_output_artifact),
                     repair_notice,
+                    analysis: Default::default(),
                 }));
             }
             Ok(None) => {}
@@ -571,6 +572,7 @@ impl ExecCommandHandler {
                     hook_command: Some(hook_command),
                     raw_output_artifact: Some(finalized_artifact),
                     repair_notice,
+                    analysis: Default::default(),
                 }))
             }
             Err(err) => {
@@ -615,6 +617,14 @@ impl CoreToolRuntime for ExecCommandHandler {
 
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
+    }
+
+    fn pre_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
+        matches!(&invocation.payload, ToolPayload::Function { .. }).then(HookToolName::bash)
+    }
+
+    fn post_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
+        matches!(&invocation.payload, ToolPayload::Function { .. }).then(HookToolName::bash)
     }
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {

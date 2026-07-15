@@ -31,6 +31,11 @@ use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookTrustStatus;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use self::dispatcher::HandlerIndex;
+use self::dispatcher::HookMatchContext;
+use self::dispatcher::PreparedHookPlan;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CommandShell {
@@ -98,7 +103,8 @@ pub struct HookListEntry {
 
 #[derive(Clone)]
 pub(crate) struct ClaudeHooksEngine {
-    handlers: Vec<ConfiguredHandler>,
+    handlers: Vec<Arc<ConfiguredHandler>>,
+    handler_index: HandlerIndex,
     warnings: Vec<String>,
     shell: CommandShell,
     output_spiller: HookOutputSpiller,
@@ -116,6 +122,7 @@ impl ClaudeHooksEngine {
         if !enabled {
             return Self {
                 handlers: Vec::new(),
+                handler_index: HandlerIndex::empty(),
                 warnings: Vec::new(),
                 shell,
                 output_spiller: HookOutputSpiller::new(),
@@ -129,8 +136,15 @@ impl ClaudeHooksEngine {
             plugin_hook_load_warnings,
             bypass_hook_trust,
         );
+        let handlers = discovered
+            .handlers
+            .into_iter()
+            .map(Arc::new)
+            .collect::<Vec<_>>();
+        let handler_index = HandlerIndex::new(&handlers);
         Self {
-            handlers: discovered.handlers,
+            handlers,
+            handler_index,
             warnings: discovered.warnings,
             shell,
             output_spiller: HookOutputSpiller::new(),
@@ -141,29 +155,36 @@ impl ClaudeHooksEngine {
         &self.warnings
     }
 
+    pub(crate) fn prepare(&self, context: HookMatchContext<'_>) -> PreparedHookPlan {
+        self.handler_index.prepare(context)
+    }
+
     pub(crate) fn preview_session_start(
         &self,
         request: &SessionStartRequest,
     ) -> Vec<HookRunSummary> {
-        crate::events::session_start::preview(&self.handlers, request)
+        self.prepare(request.match_context()).preview()
     }
 
     pub(crate) fn preview_pre_tool_use(&self, request: &PreToolUseRequest) -> Vec<HookRunSummary> {
-        crate::events::pre_tool_use::preview(&self.handlers, request)
+        self.prepare(request.match_context())
+            .preview_for_tool_use(&request.tool_use_id)
     }
 
     pub(crate) fn preview_permission_request(
         &self,
         request: &PermissionRequestRequest,
     ) -> Vec<HookRunSummary> {
-        crate::events::permission_request::preview(&self.handlers, request)
+        self.prepare(request.match_context())
+            .preview_for_tool_use(&request.run_id_suffix)
     }
 
     pub(crate) fn preview_post_tool_use(
         &self,
         request: &PostToolUseRequest,
     ) -> Vec<HookRunSummary> {
-        crate::events::post_tool_use::preview(&self.handlers, request)
+        self.prepare(request.match_context())
+            .preview_for_tool_use(&request.tool_use_id)
     }
 
     pub(crate) async fn run_session_start(
@@ -171,9 +192,25 @@ impl ClaudeHooksEngine {
         request: SessionStartRequest,
         turn_id: Option<String>,
     ) -> SessionStartOutcome {
+        let plan = self.prepare(request.match_context());
+        self.run_session_start_with_plan(plan, request, turn_id)
+            .await
+    }
+
+    pub(crate) async fn run_session_start_with_plan(
+        &self,
+        plan: PreparedHookPlan,
+        request: SessionStartRequest,
+        turn_id: Option<String>,
+    ) -> SessionStartOutcome {
         let session_id = request.session_id;
-        let mut outcome =
-            crate::events::session_start::run(&self.handlers, &self.shell, request, turn_id).await;
+        let mut outcome = crate::events::session_start::run_prepared(
+            plan.into_handlers(),
+            &self.shell,
+            request,
+            turn_id,
+        )
+        .await;
         outcome.additional_contexts = self
             .maybe_spill_texts(session_id, outcome.additional_contexts)
             .await;
@@ -181,9 +218,19 @@ impl ClaudeHooksEngine {
     }
 
     pub(crate) async fn run_pre_tool_use(&self, request: PreToolUseRequest) -> PreToolUseOutcome {
+        let plan = self.prepare(request.match_context());
+        self.run_pre_tool_use_with_plan(plan, request).await
+    }
+
+    pub(crate) async fn run_pre_tool_use_with_plan(
+        &self,
+        plan: PreparedHookPlan,
+        request: PreToolUseRequest,
+    ) -> PreToolUseOutcome {
         let session_id = request.session_id;
         let mut outcome =
-            crate::events::pre_tool_use::run(&self.handlers, &self.shell, request).await;
+            crate::events::pre_tool_use::run_prepared(plan.into_handlers(), &self.shell, request)
+                .await;
         outcome.additional_contexts = self
             .maybe_spill_texts(session_id, outcome.additional_contexts)
             .await;
@@ -194,16 +241,36 @@ impl ClaudeHooksEngine {
         &self,
         request: PermissionRequestRequest,
     ) -> PermissionRequestOutcome {
-        crate::events::permission_request::run(&self.handlers, &self.shell, request).await
+        let plan = self.prepare(request.match_context());
+        self.run_permission_request_with_plan(plan, request).await
+    }
+
+    pub(crate) async fn run_permission_request_with_plan(
+        &self,
+        plan: PreparedHookPlan,
+        request: PermissionRequestRequest,
+    ) -> PermissionRequestOutcome {
+        crate::events::permission_request::run_prepared(plan.into_handlers(), &self.shell, request)
+            .await
     }
 
     pub(crate) async fn run_post_tool_use(
         &self,
         request: PostToolUseRequest,
     ) -> PostToolUseOutcome {
+        let plan = self.prepare(request.match_context());
+        self.run_post_tool_use_with_plan(plan, request).await
+    }
+
+    pub(crate) async fn run_post_tool_use_with_plan(
+        &self,
+        plan: PreparedHookPlan,
+        request: PostToolUseRequest,
+    ) -> PostToolUseOutcome {
         let session_id = request.session_id;
         let mut outcome =
-            crate::events::post_tool_use::run(&self.handlers, &self.shell, request).await;
+            crate::events::post_tool_use::run_prepared(plan.into_handlers(), &self.shell, request)
+                .await;
         outcome.additional_contexts = self
             .maybe_spill_texts(session_id, outcome.additional_contexts)
             .await;
@@ -214,38 +281,69 @@ impl ClaudeHooksEngine {
     }
 
     pub(crate) fn preview_pre_compact(&self, request: &PreCompactRequest) -> Vec<HookRunSummary> {
-        crate::events::compact::preview_pre(&self.handlers, request)
+        self.prepare(request.match_context()).preview()
     }
 
     pub(crate) async fn run_pre_compact(&self, request: PreCompactRequest) -> PreCompactOutcome {
-        crate::events::compact::run_pre(&self.handlers, &self.shell, request).await
+        let plan = self.prepare(request.match_context());
+        self.run_pre_compact_with_plan(plan, request).await
+    }
+
+    pub(crate) async fn run_pre_compact_with_plan(
+        &self,
+        plan: PreparedHookPlan,
+        request: PreCompactRequest,
+    ) -> PreCompactOutcome {
+        crate::events::compact::run_prepared(plan.into_handlers(), &self.shell, request).await
     }
 
     pub(crate) fn preview_post_compact(&self, request: &PostCompactRequest) -> Vec<HookRunSummary> {
-        crate::events::compact::preview_post(&self.handlers, request)
+        self.prepare(request.match_context()).preview()
     }
 
     pub(crate) async fn run_post_compact(
         &self,
         request: PostCompactRequest,
     ) -> StatelessHookOutcome {
-        crate::events::compact::run_post(&self.handlers, &self.shell, request).await
+        let plan = self.prepare(request.match_context());
+        self.run_post_compact_with_plan(plan, request).await
+    }
+
+    pub(crate) async fn run_post_compact_with_plan(
+        &self,
+        plan: PreparedHookPlan,
+        request: PostCompactRequest,
+    ) -> StatelessHookOutcome {
+        crate::events::compact::run_post_prepared(plan.into_handlers(), &self.shell, request).await
     }
 
     pub(crate) fn preview_user_prompt_submit(
         &self,
         request: &UserPromptSubmitRequest,
     ) -> Vec<HookRunSummary> {
-        crate::events::user_prompt_submit::preview(&self.handlers, request)
+        self.prepare(request.match_context()).preview()
     }
 
     pub(crate) async fn run_user_prompt_submit(
         &self,
         request: UserPromptSubmitRequest,
     ) -> UserPromptSubmitOutcome {
+        let plan = self.prepare(request.match_context());
+        self.run_user_prompt_submit_with_plan(plan, request).await
+    }
+
+    pub(crate) async fn run_user_prompt_submit_with_plan(
+        &self,
+        plan: PreparedHookPlan,
+        request: UserPromptSubmitRequest,
+    ) -> UserPromptSubmitOutcome {
         let session_id = request.session_id;
-        let mut outcome =
-            crate::events::user_prompt_submit::run(&self.handlers, &self.shell, request).await;
+        let mut outcome = crate::events::user_prompt_submit::run_prepared(
+            plan.into_handlers(),
+            &self.shell,
+            request,
+        )
+        .await;
         outcome.additional_contexts = self
             .maybe_spill_texts(session_id, outcome.additional_contexts)
             .await;
@@ -253,12 +351,22 @@ impl ClaudeHooksEngine {
     }
 
     pub(crate) fn preview_stop(&self, request: &StopRequest) -> Vec<HookRunSummary> {
-        crate::events::stop::preview(&self.handlers, request)
+        self.prepare(request.match_context()).preview()
     }
 
     pub(crate) async fn run_stop(&self, request: StopRequest) -> StopOutcome {
+        let plan = self.prepare(request.match_context());
+        self.run_stop_with_plan(plan, request).await
+    }
+
+    pub(crate) async fn run_stop_with_plan(
+        &self,
+        plan: PreparedHookPlan,
+        request: StopRequest,
+    ) -> StopOutcome {
         let session_id = request.session_id;
-        let mut outcome = crate::events::stop::run(&self.handlers, &self.shell, request).await;
+        let mut outcome =
+            crate::events::stop::run_prepared(plan.into_handlers(), &self.shell, request).await;
         outcome.continuation_fragments = self
             .maybe_spill_prompt_fragments(session_id, outcome.continuation_fragments)
             .await;

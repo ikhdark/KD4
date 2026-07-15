@@ -211,6 +211,10 @@ impl Approvable<ApplyPatchRequest> for ApplyPatchRuntime {
         Some(req.exec_approval_requirement.clone())
     }
 
+    fn permission_request_hook_name(&self, _req: &ApplyPatchRequest) -> Option<HookToolName> {
+        Some(HookToolName::apply_patch())
+    }
+
     fn permission_request_payload(
         &self,
         req: &ApplyPatchRequest,

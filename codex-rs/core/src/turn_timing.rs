@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -22,6 +24,9 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
 const TIMING_SCHEMA_VERSION: u16 = 1;
+const MODEL_OUTPUT_SETTLED: u8 = 1 << 0;
+const VISIBLE_OUTPUT_SETTLED: u8 = 1 << 1;
+const AGENT_MESSAGE_SETTLED: u8 = 1 << 2;
 
 pub(crate) async fn record_turn_ttft_metric(turn_context: &TurnContext, event: &ResponseEvent) {
     let Some(duration) = turn_context
@@ -88,6 +93,7 @@ impl TurnClock for SystemTurnClock {
 pub(crate) struct TurnTimingState {
     clock: Arc<dyn TurnClock>,
     state: StdMutex<TurnTimingStateInner>,
+    milestone_mask: AtomicU8,
 }
 
 impl Default for TurnTimingState {
@@ -497,11 +503,62 @@ pub(crate) struct TurnTimingGuard {
     active: bool,
 }
 
+/// Owns the wait/processing timing transition for one response stream request.
+///
+/// Dropping or explicitly finishing this guard closes the currently active phase exactly once.
+#[must_use]
+pub(crate) struct ModelStreamTimingGuard {
+    timing: Option<Arc<TurnTimingState>>,
+    active: Option<TurnTimingGuard>,
+    finalized: bool,
+}
+
+impl ModelStreamTimingGuard {
+    pub(crate) fn new(timing: Option<&Arc<TurnTimingState>>) -> Self {
+        Self {
+            timing: timing.cloned(),
+            active: None,
+            finalized: false,
+        }
+    }
+
+    pub(crate) fn begin_wait(&mut self) {
+        self.transition(GuardKind::ModelStreamWait);
+    }
+
+    pub(crate) fn begin_processing(&mut self) {
+        self.transition(GuardKind::ModelStreamProcessing);
+    }
+
+    pub(crate) fn finish(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.active.take();
+        self.finalized = true;
+    }
+
+    fn transition(&mut self, kind: GuardKind) {
+        if self.finalized {
+            return;
+        }
+        self.active.take();
+        self.active = self.timing.as_ref().map(|timing| timing.begin_guard(kind));
+    }
+}
+
+impl Drop for ModelStreamTimingGuard {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 impl TurnTimingState {
     fn new(clock: Arc<dyn TurnClock>) -> Self {
         Self {
             clock,
             state: StdMutex::new(TurnTimingStateInner::default()),
+            milestone_mask: AtomicU8::new(0),
         }
     }
 
@@ -512,7 +569,9 @@ impl TurnTimingState {
 
     pub(crate) fn mark_turn_started(&self) -> i64 {
         let sample = self.clock.sample();
-        self.state().start(sample);
+        let mut state = self.state();
+        state.start(sample);
+        self.milestone_mask.store(0, Ordering::Release);
         sample.time.wall_unix_ms
     }
 
@@ -562,10 +621,12 @@ impl TurnTimingState {
         self.begin_guard(GuardKind::ModelRequestWait)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn begin_model_stream_wait(self: &Arc<Self>) -> TurnTimingGuard {
         self.begin_guard(GuardKind::ModelStreamWait)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn begin_model_stream_processing(self: &Arc<Self>) -> TurnTimingGuard {
         self.begin_guard(GuardKind::ModelStreamProcessing)
     }
@@ -614,6 +675,12 @@ impl TurnTimingState {
         if !records_model_output && !records_visible_output {
             return None;
         }
+        let settled = self.milestone_mask.load(Ordering::Acquire);
+        let needs_model = records_model_output && settled & MODEL_OUTPUT_SETTLED == 0;
+        let needs_visible = records_visible_output && settled & VISIBLE_OUTPUT_SETTLED == 0;
+        if !needs_model && !needs_visible {
+            return None;
+        }
         let sample = self.clock.sample();
         let mut state = self.state();
         state.advance(sample.time.monotonic_ns);
@@ -621,25 +688,48 @@ impl TurnTimingState {
         if records_model_output && state.milestones.first_model_output_ns.is_none() {
             state.milestones.first_model_output_ns = Some(elapsed_ns);
         }
-        if !records_visible_output || state.milestones.first_visible_output_ns.is_some() {
-            return None;
+        let visible_duration =
+            if records_visible_output && state.milestones.first_visible_output_ns.is_none() {
+                state.milestones.first_visible_output_ns = Some(elapsed_ns);
+                Some(duration_from_nanos(elapsed_ns))
+            } else {
+                None
+            };
+        let mut publish = 0;
+        if records_model_output && state.milestones.first_model_output_ns.is_some() {
+            publish |= MODEL_OUTPUT_SETTLED;
         }
-        state.milestones.first_visible_output_ns = Some(elapsed_ns);
-        Some(duration_from_nanos(elapsed_ns))
+        if records_visible_output && state.milestones.first_visible_output_ns.is_some() {
+            publish |= VISIBLE_OUTPUT_SETTLED;
+        }
+        drop(state);
+        if publish != 0 {
+            self.milestone_mask.fetch_or(publish, Ordering::Release);
+        }
+        visible_duration
     }
 
     pub(crate) fn record_ttfm_for_turn_item(&self, item: &TurnItem) -> Option<Duration> {
         if !matches!(item, TurnItem::AgentMessage(_)) {
             return None;
         }
+        if self.milestone_mask.load(Ordering::Acquire) & AGENT_MESSAGE_SETTLED != 0 {
+            return None;
+        }
         let sample = self.clock.sample();
         let mut state = self.state();
         state.advance(sample.time.monotonic_ns);
         if state.milestones.first_agent_message_ns.is_some() {
+            drop(state);
+            self.milestone_mask
+                .fetch_or(AGENT_MESSAGE_SETTLED, Ordering::Release);
             return None;
         }
         let elapsed_ns = state.elapsed_since_start(sample.time.monotonic_ns)?;
         state.milestones.first_agent_message_ns = Some(elapsed_ns);
+        drop(state);
+        self.milestone_mask
+            .fetch_or(AGENT_MESSAGE_SETTLED, Ordering::Release);
         Some(duration_from_nanos(elapsed_ns))
     }
 

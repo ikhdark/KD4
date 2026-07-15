@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HookCompletedEvent;
@@ -14,6 +15,7 @@ use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
+use crate::engine::dispatcher::HookMatchContext;
 use crate::engine::output_parser;
 use crate::schema::PostCompactCommandInput;
 use crate::schema::PreCompactCommandInput;
@@ -39,6 +41,22 @@ pub struct PostCompactRequest {
     pub transcript_path: Option<PathBuf>,
     pub model: String,
     pub trigger: String,
+}
+
+impl PreCompactRequest {
+    pub(crate) fn match_context(&self) -> HookMatchContext<'_> {
+        HookMatchContext::PreCompact {
+            trigger: &self.trigger,
+        }
+    }
+}
+
+impl PostCompactRequest {
+    pub(crate) fn match_context(&self) -> HookMatchContext<'_> {
+        HookMatchContext::PostCompact {
+            trigger: &self.trigger,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -79,6 +97,14 @@ pub(crate) async fn run_pre(
         HookEventName::PreCompact,
         Some(request.trigger.as_str()),
     );
+    run_prepared(matched, shell, request).await
+}
+
+pub(crate) async fn run_prepared(
+    matched: Vec<Arc<ConfiguredHandler>>,
+    shell: &CommandShell,
+    request: PreCompactRequest,
+) -> PreCompactOutcome {
     if matched.is_empty() {
         return PreCompactOutcome {
             hook_events: Vec::new(),
@@ -161,6 +187,14 @@ pub(crate) async fn run_post(
         HookEventName::PostCompact,
         Some(request.trigger.as_str()),
     );
+    run_post_prepared(matched, shell, request).await
+}
+
+pub(crate) async fn run_post_prepared(
+    matched: Vec<Arc<ConfiguredHandler>>,
+    shell: &CommandShell,
+    request: PostCompactRequest,
+) -> StatelessHookOutcome {
     if matched.is_empty() {
         return StatelessHookOutcome {
             hook_events: Vec::new(),

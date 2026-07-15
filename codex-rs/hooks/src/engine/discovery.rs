@@ -25,8 +25,8 @@ use serde::Serialize;
 use super::ConfiguredHandler;
 use super::HookListEntry;
 use crate::config_rules::hook_states_from_stack;
+use crate::events::common::compile_matcher_pattern;
 use crate::events::common::matcher_pattern_for_event;
-use crate::events::common::validate_matcher_pattern;
 use codex_protocol::protocol::HookHandlerType;
 use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookTrustStatus;
@@ -449,9 +449,8 @@ fn append_matcher_groups(
 ) {
     for (group_index, group) in groups.into_iter().enumerate() {
         let matcher = matcher_pattern_for_event(event_name, group.matcher.as_deref());
-        if let Some(matcher) = matcher
-            && let Err(err) = validate_matcher_pattern(matcher)
-        {
+        if let Err(err) = compile_matcher_pattern(matcher) {
+            let matcher = matcher.expect("only explicit matchers can fail compilation");
             warnings.push(format!(
                 "invalid matcher {matcher:?} in {}: {err}",
                 source.path.display()

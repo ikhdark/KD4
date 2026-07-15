@@ -7,8 +7,8 @@
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use crate::tools::registry::ToolOutputProjection;
 use codex_rollout_trace::ExecutionStatus;
 use codex_rollout_trace::ToolDispatchInvocation;
 use codex_rollout_trace::ToolDispatchPayload;
@@ -31,22 +31,13 @@ impl ToolDispatchTrace {
         Self { context }
     }
 
-    pub(crate) fn record_completed(
-        &self,
-        invocation: &ToolInvocation,
-        call_id: &str,
-        payload: &ToolPayload,
-        result: &dyn ToolOutput,
-    ) {
+    pub(crate) fn record_completed(&self, success: bool, projection: &ToolOutputProjection) {
         if !self.context.is_enabled() {
             return;
         }
 
-        let Some(result_payload) = tool_dispatch_result(invocation, call_id, payload, result)
-        else {
-            return;
-        };
-        let status = if result.success_for_logging() {
+        let result_payload = tool_dispatch_result(projection);
+        let status = if success {
             ExecutionStatus::Completed
         } else {
             ExecutionStatus::Failed
@@ -84,19 +75,14 @@ fn tool_dispatch_invocation(invocation: &ToolInvocation) -> Option<ToolDispatchI
     })
 }
 
-fn tool_dispatch_result(
-    invocation: &ToolInvocation,
-    call_id: &str,
-    payload: &ToolPayload,
-    result: &dyn ToolOutput,
-) -> Option<ToolDispatchResult> {
-    match invocation.source {
-        ToolCallSource::Direct => Some(ToolDispatchResult::DirectResponse {
-            response_item: result.to_response_item(call_id, payload),
-        }),
-        ToolCallSource::CodeMode { .. } => Some(ToolDispatchResult::CodeModeResponse {
-            value: result.code_mode_result(payload),
-        }),
+fn tool_dispatch_result(projection: &ToolOutputProjection) -> ToolDispatchResult {
+    match projection {
+        ToolOutputProjection::Direct(response_item) => ToolDispatchResult::DirectResponse {
+            response_item: response_item.clone(),
+        },
+        ToolOutputProjection::CodeMode(value) => ToolDispatchResult::CodeModeResponse {
+            value: value.clone(),
+        },
     }
 }
 

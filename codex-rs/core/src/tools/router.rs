@@ -8,6 +8,7 @@ use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
+use crate::tools::schema_bundle::ToolSchemaBundle;
 use crate::tools::spec_plan::build_tool_router;
 use codex_mcp::ToolInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -18,6 +19,8 @@ use codex_tools::ToolCall as ExtensionToolCall;
 use codex_tools::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use serde::Deserialize;
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio_util::sync::CancellationToken;
@@ -32,9 +35,88 @@ pub struct ToolCall {
     pub payload: ToolPayload,
 }
 
+pub(crate) enum ToolCallPreflight {
+    Function {
+        tool_name: ToolName,
+    },
+    ToolSearch {
+        tool_name: ToolName,
+        arguments: SearchToolCallParams,
+    },
+    Custom {
+        tool_name: ToolName,
+    },
+}
+
+impl ToolCallPreflight {
+    pub(crate) fn tool_name(&self) -> &ToolName {
+        match self {
+            Self::Function { tool_name }
+            | Self::ToolSearch { tool_name, .. }
+            | Self::Custom { tool_name } => tool_name,
+        }
+    }
+
+    pub(crate) fn log_payload<'a>(&'a self, item: &'a ResponseItem) -> Cow<'a, str> {
+        match (self, item) {
+            (Self::Function { .. }, ResponseItem::FunctionCall { arguments, .. }) => {
+                Cow::Borrowed(arguments)
+            }
+            (Self::ToolSearch { arguments, .. }, ResponseItem::ToolSearchCall { .. }) => {
+                Cow::Borrowed(&arguments.query)
+            }
+            (Self::Custom { .. }, ResponseItem::CustomToolCall { input, .. }) => {
+                Cow::Borrowed(input)
+            }
+            _ => unreachable!("tool preflight must be consumed with its source item"),
+        }
+    }
+
+    pub(crate) fn into_tool_call(self, item: ResponseItem) -> ToolCall {
+        match (self, item) {
+            (
+                Self::Function { tool_name },
+                ResponseItem::FunctionCall {
+                    arguments, call_id, ..
+                },
+            ) => ToolCall {
+                tool_name,
+                call_id,
+                payload: ToolPayload::Function { arguments },
+            },
+            (
+                Self::ToolSearch {
+                    tool_name,
+                    arguments,
+                },
+                ResponseItem::ToolSearchCall {
+                    call_id: Some(call_id),
+                    execution,
+                    ..
+                },
+            ) => {
+                debug_assert_eq!(execution, "client");
+                ToolCall {
+                    tool_name,
+                    call_id,
+                    payload: ToolPayload::ToolSearch { arguments },
+                }
+            }
+            (Self::Custom { tool_name }, ResponseItem::CustomToolCall { input, call_id, .. }) => {
+                ToolCall {
+                    tool_name,
+                    call_id,
+                    payload: ToolPayload::Custom { input },
+                }
+            }
+            _ => unreachable!("tool preflight must be consumed with its source item"),
+        }
+    }
+}
+
 pub struct ToolRouter {
     registry: ToolRegistry,
-    model_visible_specs: Vec<ToolSpec>,
+    model_visible_schema_bundle: Arc<ToolSchemaBundle>,
 }
 
 pub(crate) struct ToolRouterParams<'a> {
@@ -69,12 +151,17 @@ impl ToolRouter {
     pub(crate) fn from_parts(registry: ToolRegistry, model_visible_specs: Vec<ToolSpec>) -> Self {
         Self {
             registry,
-            model_visible_specs,
+            model_visible_schema_bundle: Arc::new(ToolSchemaBundle::new(model_visible_specs)),
         }
     }
 
+    #[allow(dead_code)]
     pub fn model_visible_specs(&self) -> Vec<ToolSpec> {
-        self.model_visible_specs.clone()
+        self.model_visible_schema_bundle.canonical().to_vec()
+    }
+
+    pub(crate) fn model_visible_schema_bundle(&self) -> &Arc<ToolSchemaBundle> {
+        &self.model_visible_schema_bundle
     }
 
     #[cfg(test)]
@@ -110,51 +197,44 @@ impl ToolRouter {
     }
 
     #[instrument(level = "trace", skip_all, err)]
+    #[allow(dead_code)]
     pub fn build_tool_call(item: ResponseItem) -> Result<Option<ToolCall>, FunctionCallError> {
+        let Some(preflight) = Self::preflight_tool_call(&item)? else {
+            return Ok(None);
+        };
+        Ok(Some(preflight.into_tool_call(item)))
+    }
+
+    pub(crate) fn preflight_tool_call(
+        item: &ResponseItem,
+    ) -> Result<Option<ToolCallPreflight>, FunctionCallError> {
         match item {
             ResponseItem::FunctionCall {
-                name,
-                namespace,
-                arguments,
-                call_id,
-                ..
-            } => {
-                let tool_name = ToolName::new(namespace, name);
-                Ok(Some(ToolCall {
-                    tool_name,
-                    call_id,
-                    payload: ToolPayload::Function { arguments },
-                }))
-            }
+                name, namespace, ..
+            } => Ok(Some(ToolCallPreflight::Function {
+                tool_name: ToolName::new(namespace.clone(), name.clone()),
+            })),
             ResponseItem::ToolSearchCall {
-                call_id: Some(call_id),
+                call_id: Some(_),
                 execution,
                 arguments,
                 ..
             } if execution == "client" => {
-                let arguments: SearchToolCallParams =
-                    serde_json::from_value(arguments).map_err(|err| {
-                        FunctionCallError::RespondToModel(format!(
-                            "failed to parse tool_search arguments: {err}"
-                        ))
-                    })?;
-                Ok(Some(ToolCall {
+                let arguments = SearchToolCallParams::deserialize(arguments).map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "failed to parse tool_search arguments: {err}"
+                    ))
+                })?;
+                Ok(Some(ToolCallPreflight::ToolSearch {
                     tool_name: ToolName::plain("tool_search"),
-                    call_id,
-                    payload: ToolPayload::ToolSearch { arguments },
+                    arguments,
                 }))
             }
             ResponseItem::ToolSearchCall { .. } => Ok(None),
             ResponseItem::CustomToolCall {
-                name,
-                namespace,
-                input,
-                call_id,
-                ..
-            } => Ok(Some(ToolCall {
-                tool_name: ToolName::new(namespace, name),
-                call_id,
-                payload: ToolPayload::Custom { input },
+                name, namespace, ..
+            } => Ok(Some(ToolCallPreflight::Custom {
+                tool_name: ToolName::new(namespace.clone(), name.clone()),
             })),
             _ => Ok(None),
         }

@@ -500,6 +500,24 @@ impl InMemoryThreadStore {
         Ok(())
     }
 
+    async fn append_persisted_items(
+        &self,
+        thread_id: ThreadId,
+        items: &[RolloutItem],
+    ) -> ThreadStoreResult<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let mut state = self.state.lock().await;
+        state.calls.append_items += 1;
+        state
+            .histories
+            .entry(thread_id)
+            .or_default()
+            .extend_from_slice(items);
+        Ok(())
+    }
+
     async fn load_history(
         &self,
         params: LoadThreadHistoryParams,
@@ -622,6 +640,16 @@ impl ThreadStore for InMemoryThreadStore {
 
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()> {
         Box::pin(InMemoryThreadStore::append_items(self, params))
+    }
+
+    fn append_persisted_items<'a>(
+        &'a self,
+        thread_id: ThreadId,
+        items: &'a [RolloutItem],
+    ) -> ThreadStoreFuture<'a, ()> {
+        Box::pin(InMemoryThreadStore::append_persisted_items(
+            self, thread_id, items,
+        ))
     }
 
     fn persist_thread(&self, _thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {

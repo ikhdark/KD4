@@ -23,6 +23,7 @@ use crate::state_db;
 use codex_file_search as file_search;
 use codex_protocol::ThreadId;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMetaLine;
@@ -96,6 +97,7 @@ pub type ConversationsPage = ThreadsPage;
 #[derive(Default)]
 struct HeadTailSummary {
     saw_session_meta: bool,
+    session_meta_line: Option<SessionMetaLine>,
     thread_id: Option<ThreadId>,
     first_user_message: Option<String>,
     preview: Option<String>,
@@ -801,6 +803,14 @@ async fn build_thread_item(
     {
         return None;
     }
+    thread_item_from_summary(path, summary, updated_at)
+}
+
+fn thread_item_from_summary(
+    path: PathBuf,
+    summary: HeadTailSummary,
+    updated_at: Option<String>,
+) -> Option<ThreadItem> {
     // Apply filters: must have session meta and a discoverable preview.
     if summary.saw_session_meta && summary.preview.is_some() {
         let HeadTailSummary {
@@ -863,6 +873,21 @@ pub async fn read_thread_item_from_rollout(path: PathBuf) -> Option<ThreadItem> 
         /*updated_at*/ None,
     )
     .await
+}
+
+/// Reads the canonical session metadata and optional preview summary in one head scan.
+pub async fn read_thread_item_and_session_meta_from_rollout(
+    path: PathBuf,
+) -> io::Result<(Option<ThreadItem>, SessionMetaLine)> {
+    let summary = read_head_summary(&path, HEAD_RECORD_LIMIT).await?;
+    let session_meta = summary.session_meta_line.clone().ok_or_else(|| {
+        io::Error::other(format!(
+            "rollout at {} does not start with session metadata",
+            path.display()
+        ))
+    })?;
+    let item = thread_item_from_summary(path, summary, /*updated_at*/ None);
+    Ok((item, session_meta))
 }
 
 /// Collects immediate subdirectories of `parent`, parses their (string) names with `parse`,
@@ -1163,8 +1188,9 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
                         .git
                         .as_ref()
                         .and_then(|git| git.repository_url.clone());
-                    summary.cli_version = Some(session_meta_line.meta.cli_version);
+                    summary.cli_version = Some(session_meta_line.meta.cli_version.clone());
                     summary.created_at = Some(session_meta_line.meta.timestamp.clone());
+                    summary.session_meta_line = Some(session_meta_line);
                     summary.saw_session_meta = true;
                 }
             }
@@ -1218,6 +1244,28 @@ async fn read_head_summary(path: &Path, head_limit: usize) -> io::Result<HeadTai
 /// Read up to `HEAD_RECORD_LIMIT` records from the start of the rollout file at `path`.
 /// This should be enough to produce a summary including the session meta line.
 pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Value>> {
+    Ok(read_typed_head_for_summary(path)
+        .await?
+        .into_iter()
+        .filter_map(SummaryHeadItem::into_value)
+        .collect())
+}
+
+enum SummaryHeadItem {
+    SessionMeta(SessionMetaLine),
+    ResponseItem(ResponseItem),
+}
+
+impl SummaryHeadItem {
+    fn into_value(self) -> Option<Value> {
+        match self {
+            Self::SessionMeta(session_meta) => serde_json::to_value(session_meta).ok(),
+            Self::ResponseItem(item) => serde_json::to_value(item).ok(),
+        }
+    }
+}
+
+async fn read_typed_head_for_summary(path: &Path) -> io::Result<Vec<SummaryHeadItem>> {
     let mut lines = compression::open_rollout_line_reader(path).await?;
     let mut head = Vec::new();
 
@@ -1232,19 +1280,15 @@ pub async fn read_head_for_summary(path: &Path) -> io::Result<Vec<serde_json::Va
         if let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(trimmed) {
             match rollout_line.item {
                 RolloutItem::SessionMeta(session_meta_line) => {
-                    if let Ok(value) = serde_json::to_value(session_meta_line) {
-                        head.push(value);
-                    }
+                    head.push(SummaryHeadItem::SessionMeta(session_meta_line));
                 }
                 RolloutItem::ResponseItem(item) => {
-                    if let Ok(value) = serde_json::to_value(item) {
-                        head.push(value);
-                    }
+                    head.push(SummaryHeadItem::ResponseItem(item));
                 }
                 RolloutItem::InterAgentCommunication(communication) => {
-                    if let Ok(value) = serde_json::to_value(communication.to_model_input_item()) {
-                        head.push(value);
-                    }
+                    head.push(SummaryHeadItem::ResponseItem(
+                        communication.to_model_input_item(),
+                    ));
                 }
                 RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
@@ -1278,19 +1322,20 @@ fn event_msg_preview(event: &EventMsg) -> Option<String> {
 /// Read the SessionMetaLine from the head of a rollout file for reuse by
 /// callers that need the session metadata (e.g. to derive a cwd for config).
 pub async fn read_session_meta_line(path: &Path) -> io::Result<SessionMetaLine> {
-    let head = read_head_for_summary(path).await?;
-    let Some(first) = head.first() else {
+    let head = read_typed_head_for_summary(path).await?;
+    let Some(first) = head.into_iter().next() else {
         return Err(io::Error::other(format!(
             "rollout at {} is empty",
             path.display()
         )));
     };
-    serde_json::from_value::<SessionMetaLine>(first.clone()).map_err(|_| {
-        io::Error::other(format!(
+    match first {
+        SummaryHeadItem::SessionMeta(session_meta) => Ok(session_meta),
+        SummaryHeadItem::ResponseItem(_) => Err(io::Error::other(format!(
             "rollout at {} does not start with session metadata",
             path.display()
-        ))
-    })
+        ))),
+    }
 }
 
 async fn file_modified_time(path: &Path) -> io::Result<Option<OffsetDateTime>> {
