@@ -90,6 +90,7 @@ members = [
     "tui",
     "tools",
     "v8-poc",
+    "verify-local",
     "websocket-client",
     "utils/absolute-path",
     "utils/path-uri",
@@ -238,6 +239,7 @@ codex-thread-store = { path = "thread-store" }
 codex-tools = { path = "tools" }
 codex-tui = { path = "tui" }
 codex-uds = { path = "uds" }
+codex-verify-local = { path = "verify-local" }
 codex-utils-absolute-path = { path = "utils/absolute-path" }
 codex-utils-approval-presets = { path = "utils/approval-presets" }
 codex-utils-cache = { path = "utils/cache" }

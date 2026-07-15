@@ -17,6 +17,7 @@ use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::TurnItem;
 use codex_protocol::memory_citation::MemoryCitation;
 use codex_protocol::models::ContentItem;
+use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::LocalShellExecAction;
@@ -305,6 +306,147 @@ async fn handle_output_item_done_returns_contributed_last_agent_message() {
         output.last_agent_message.as_deref(),
         Some("contributed assistant text")
     );
+}
+
+#[tokio::test]
+async fn malformed_tool_search_persists_original_before_synthetic_response() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let router = Arc::new(ToolRouter::from_context(
+        step_context.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            mcp_tools: None,
+            deferred_mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: turn_context.dynamic_tools.as_slice(),
+        },
+        &Default::default(),
+    ));
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let tool_runtime = ToolCallRuntime::new(router, Arc::clone(&session), step_context, tracker);
+    let item = ResponseItem::ToolSearchCall {
+        id: Some("malformed-search-item".to_string()),
+        call_id: Some("malformed-search-call".to_string()),
+        status: Some("completed".to_string()),
+        execution: "client".to_string(),
+        arguments: serde_json::json!({"query": 7}),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut expected_item = item.clone();
+    expected_item.set_turn_id_if_missing(&turn_context.sub_id);
+    let expected_message = match ToolRouter::preflight_tool_call(&item) {
+        Err(crate::function_tool::FunctionCallError::RespondToModel(message)) => message,
+        _ => panic!("malformed tool search should request a synthetic response"),
+    };
+    let mut expected_response = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: String::new(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text(expected_message.clone()),
+            ..Default::default()
+        },
+        internal_chat_message_metadata_passthrough: None,
+    };
+    expected_response.set_turn_id_if_missing(&turn_context.sub_id);
+    let mut ctx = HandleOutputCtx {
+        sess: Arc::clone(&session),
+        turn_context: Arc::clone(&turn_context),
+        turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
+        tool_runtime,
+        cancellation_token: CancellationToken::new(),
+    };
+
+    let output = handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None)
+        .await
+        .expect("malformed tool search should produce a synthetic response");
+
+    assert!(output.needs_follow_up);
+    assert!(output.tool_future.is_none());
+    let history = session.clone_history().await;
+    let [persisted_item, synthetic_response] = history.raw_items() else {
+        panic!("expected original call followed by its synthetic response");
+    };
+    assert_eq!(persisted_item, &expected_item);
+    assert_eq!(synthetic_response, &expected_response);
+    let ResponseItem::FunctionCallOutput {
+        call_id, output, ..
+    } = synthetic_response
+    else {
+        panic!("expected a synthetic function-call output");
+    };
+    assert_eq!(call_id, "");
+    let FunctionCallOutputBody::Text(message) = &output.body else {
+        panic!("expected a text error response");
+    };
+    assert_eq!(message, &expected_message);
+}
+
+#[tokio::test]
+async fn function_and_custom_calls_persist_original_items_before_dispatch() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let router = Arc::new(ToolRouter::from_context(
+        step_context.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            mcp_tools: None,
+            deferred_mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: turn_context.dynamic_tools.as_slice(),
+        },
+        &Default::default(),
+    ));
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let tool_runtime = ToolCallRuntime::new(router, Arc::clone(&session), step_context, tracker);
+    let items = vec![
+        ResponseItem::FunctionCall {
+            id: Some("function-item".to_string()),
+            name: "unknown_function".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "function-call".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::CustomToolCall {
+            id: Some("custom-item".to_string()),
+            status: Some("completed".to_string()),
+            call_id: "custom-call".to_string(),
+            name: "unknown_custom".to_string(),
+            namespace: None,
+            input: "payload".to_string(),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+    let expected_items = items
+        .iter()
+        .cloned()
+        .map(|mut item| {
+            item.set_turn_id_if_missing(&turn_context.sub_id);
+            item
+        })
+        .collect::<Vec<_>>();
+    let mut ctx = HandleOutputCtx {
+        sess: Arc::clone(&session),
+        turn_context: Arc::clone(&turn_context),
+        turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
+        tool_runtime,
+        cancellation_token: CancellationToken::new(),
+    };
+
+    for item in items {
+        let output = handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None)
+            .await
+            .expect("tool call should be queued after persistence");
+        assert!(output.needs_follow_up);
+        assert!(output.tool_future.is_some());
+    }
+
+    assert_eq!(session.clone_history().await.raw_items(), expected_items);
 }
 
 #[tokio::test]

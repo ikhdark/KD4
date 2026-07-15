@@ -20,6 +20,7 @@ use crate::GenerateAttestationFuture;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
+use crate::tools::ToolSchemaBundle;
 use crate::tools::ToolWireMode;
 use crate::tools::ToolWireValue;
 use codex_api::AgentIdentityTelemetry;
@@ -64,6 +65,8 @@ use codex_rollout_trace::replay_bundle;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
 use serde_json::json;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -224,6 +227,107 @@ fn websocket_incremental_history_invalidates_without_dropping_transport_contract
     assert!(session.websocket_session.next_history_generation > generation_before);
 }
 
+fn legacy_responses_request_properties_fingerprint(
+    request: &ResponsesApiRequest,
+) -> serde_json::Result<[u8; 32]> {
+    let mut properties = request.clone();
+    properties.input.clear();
+    properties.stream_options = None;
+    properties.client_metadata = None;
+    let serialized = serde_json::to_vec(&properties)?;
+    let mut hasher = Sha256::new();
+    hasher.update(super::WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN);
+    hasher.update(super::WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION.to_be_bytes());
+    hasher.update((serialized.len() as u64).to_be_bytes());
+    hasher.update(serialized);
+    Ok(hasher.finalize().into())
+}
+
+#[test]
+fn borrowed_request_properties_fingerprint_matches_clone_and_clear_for_every_field() {
+    let mut request = history_test_request(vec![history_test_item("input", Some("turn-a"))]);
+    request.model = "model-a".to_string();
+    request.instructions = "instructions-a".to_string();
+    request.tools = Some(vec![json!({"type": "function", "name": "tool-a"})]);
+    request.tool_choice = "required".to_string();
+    request.parallel_tool_calls = false;
+    request.reasoning = Some(codex_api::Reasoning {
+        effort: None,
+        summary: None,
+        context: Some(codex_api::ReasoningContext::AllTurns),
+    });
+    request.store = false;
+    request.stream = false;
+    request.stream_options = Some(codex_api::StreamOptions {
+        reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
+    });
+    request.include = vec!["reasoning.encrypted_content".to_string()];
+    request.service_tier = Some("priority".to_string());
+    request.prompt_cache_key = Some("cache-key".to_string());
+    request.text = Some(codex_api::TextControls::default());
+    request.client_metadata = Some(std::collections::HashMap::from([(
+        "client".to_string(),
+        "metadata".to_string(),
+    )]));
+
+    let mut cases = vec![request.clone()];
+    let mut changed = request.clone();
+    changed.model = "model-b".to_string();
+    cases.push(changed);
+    let mut changed = request.clone();
+    changed.instructions = "instructions-b".to_string();
+    cases.push(changed);
+    let mut changed = request.clone();
+    changed.tools = Some(vec![json!({"type": "function", "name": "tool-b"})]);
+    cases.push(changed);
+    let mut changed = request.clone();
+    changed.tool_choice = "auto".to_string();
+    cases.push(changed);
+    let mut changed = request.clone();
+    changed.parallel_tool_calls = true;
+    cases.push(changed);
+    let mut changed = request.clone();
+    changed.reasoning = None;
+    cases.push(changed);
+    let mut changed = request.clone();
+    changed.store = true;
+    cases.push(changed);
+    let mut changed = request.clone();
+    changed.stream = true;
+    cases.push(changed);
+    let mut changed = request.clone();
+    changed.include.clear();
+    cases.push(changed);
+    let mut changed = request.clone();
+    changed.service_tier = None;
+    cases.push(changed);
+    let mut changed = request.clone();
+    changed.prompt_cache_key = None;
+    cases.push(changed);
+    let mut changed = request.clone();
+    changed.text = None;
+    cases.push(changed);
+    let mut changed = request.clone();
+    changed.input.push(history_test_item("ignored input", None));
+    cases.push(changed);
+    let mut changed = request.clone();
+    changed.stream_options = None;
+    cases.push(changed);
+    let mut changed = request;
+    changed.client_metadata = None;
+    cases.push(changed);
+
+    for (index, request) in cases.iter().enumerate() {
+        assert_eq!(
+            super::responses_request_properties_fingerprint(request)
+                .expect("borrowed fingerprint should serialize"),
+            legacy_responses_request_properties_fingerprint(request)
+                .expect("legacy fingerprint should serialize"),
+            "request case {index}"
+        );
+    }
+}
+
 #[test]
 fn request_schema_serialization_cache_is_keyed_by_model_visible_schema() {
     let client = test_model_client(SessionSource::Cli);
@@ -289,6 +393,54 @@ fn request_schema_serialization_cache_runs_one_same_key_factory() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(state.entries.len(), 1);
     assert!(state.flights.is_empty());
+}
+
+#[test]
+fn provider_schema_serialization_failure_stays_at_request_boundary_and_retries() {
+    for mode in [
+        ToolWireMode::Responses,
+        ToolWireMode::Compact,
+        ToolWireMode::ResponsesLite,
+    ] {
+        let client = test_model_client(SessionSource::Cli);
+        let tools = Arc::new(ToolSchemaBundle::new(Vec::new()));
+        tools.fail_next_wire_serialization(mode);
+        let prompt = Prompt {
+            tools: Arc::clone(&tools),
+            ..Prompt::default()
+        };
+
+        let error = client
+            .request_schema_components(&prompt, None, mode)
+            .expect_err("the injected provider-boundary serialization should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("injected tool-schema serialization failure")
+        );
+        {
+            let cache = client
+                .state
+                .request_schema_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(cache.misses, 0);
+            assert!(cache.entries.is_empty());
+            assert!(cache.flights.is_empty());
+        }
+
+        client
+            .request_schema_components(&prompt, None, mode)
+            .expect("a later request should retry and cache a successful product");
+        let cache = client
+            .state
+            .request_schema_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(cache.misses, 1);
+        assert_eq!(cache.entries.len(), 1);
+        assert!(cache.flights.is_empty());
+    }
 }
 
 #[tokio::test]

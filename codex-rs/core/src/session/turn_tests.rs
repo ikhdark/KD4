@@ -4,6 +4,8 @@ use codex_extension_api::TurnItemContributor;
 use codex_protocol::items::AgentMessageContent;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 struct RewriteAgentMessageContributor;
 
@@ -35,6 +37,67 @@ fn assistant_output_text(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+#[test]
+fn planning_schema_serialization_failure_adds_no_bytes_or_delimiter() {
+    let mut failed = Sha256::new();
+    failed.update(b"prefix");
+    let expected_failed = failed.clone().finalize();
+    let error = serde_json::Error::io(std::io::Error::other(
+        "injected planning serialization failure",
+    ));
+
+    assert!(!append_planning_schema_digest(&mut failed, Err(error)));
+    assert_eq!(failed.finalize(), expected_failed);
+
+    let mut successful = Sha256::new();
+    successful.update(b"prefix");
+    assert!(append_planning_schema_digest(
+        &mut successful,
+        Ok(b"serialized tools")
+    ));
+    let mut expected_successful = Sha256::new();
+    expected_successful.update(b"prefix");
+    expected_successful.update(b"serialized tools");
+    expected_successful.update([0xff]);
+    assert_eq!(successful.finalize(), expected_successful.finalize());
+}
+
+#[tokio::test]
+async fn trace_disabled_full_history_estimate_performs_zero_scans() {
+    let items = [1_i64, 2, 3, 4];
+    let scans = AtomicUsize::new(0);
+
+    let disabled = maybe_estimate_history_for_trace(false, || async {
+        Some(
+            items
+                .iter()
+                .map(|item| {
+                    scans.fetch_add(1, Ordering::SeqCst);
+                    item
+                })
+                .sum(),
+        )
+    })
+    .await;
+    assert_eq!(disabled, None);
+    assert_eq!(scans.load(Ordering::SeqCst), 0);
+
+    let enabled = maybe_estimate_history_for_trace(true, || async {
+        Some(
+            items
+                .iter()
+                .map(|item| {
+                    scans.fetch_add(1, Ordering::SeqCst);
+                    item
+                })
+                .sum(),
+        )
+    })
+    .await;
+    assert_eq!(enabled, Some(10));
+    assert_eq!(scans.load(Ordering::SeqCst), items.len());
 }
 
 #[tokio::test]

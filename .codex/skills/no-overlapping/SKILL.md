@@ -1,85 +1,99 @@
 ---
 name: no-overlapping
-description: [TODO: Complete and informative explanation of what the skill does and when to use it. Include WHEN to use this skill - specific scenarios, file types, or tasks that trigger it.]
+description: Analyze KD4 implementation phases, audit items, plans, trackers, dirty worktrees, branches, and owner paths to determine which work does not overlap and can run safely in parallel. Use when the user asks which phases, items, tasks, Codex threads, branches, or worktrees can run at once; whether workstreams conflict; how to split concurrent implementation; what another task has completed; or to create, update, or reconcile a phase/item tracker with ownership, dependencies, proof state, and parallel-ready or blocked classifications. Inspect the actual source, worktree, and shared tracker before deciding. Do not use for generic harness creation, ordinary implementation, or planning without a concurrency or conflict question.
 ---
 
 # No Overlapping
 
-## Overview
+Build evidence-backed parallel work maps for KD4 without weakening implementation,
+validation, or dirty-worktree policy.
 
-[TODO: 1-2 sentences explaining what this skill enables]
+## Required Reading
 
-## Structuring This Skill
+1. Read the root `AGENTS.md` and `.codex/AGENTS.md`.
+2. Read the user-provided report, plan, or phase list and the current canonical
+   tracker, if one exists.
+3. Read the closest owner `AGENTS.md` only for areas needed to classify overlap.
+4. When creating or updating `.codex/harness` state, also read
+   `.codex/harness/README.md` and `.codex/harness/workflow.md`.
 
-[TODO: Choose the structure that best fits this skill's purpose. Common patterns:
+## Ground The Current State
 
-**1. Workflow-Based** (best for sequential processes)
-- Works well when there are clear step-by-step procedures
-- Example: DOCX skill with "Workflow Decision Tree" -> "Reading" -> "Creating" -> "Editing"
-- Structure: ## Overview -> ## Workflow Decision Tree -> ## Step 1 -> ## Step 2...
+1. Reload the canonical tracker immediately before analysis. Other Codex tasks
+   may have updated it since the last turn.
+2. Inspect focused repository evidence with `git status --short`, changed-path
+   or diff summaries, and recent task evidence when relevant.
+3. Treat dirty paths as evidence of active ownership, not proof of completion.
+4. Preserve unrelated changes and do not modify product code during a read-only
+   overlap analysis.
+5. Distinguish user-reported completion, implemented code, and verified work.
 
-**2. Task-Based** (best for tool collections)
-- Works well when the skill offers different operations/capabilities
-- Example: PDF skill with "Quick Start" -> "Merge PDFs" -> "Split PDFs" -> "Extract Text"
-- Structure: ## Overview -> ## Quick Start -> ## Task Category 1 -> ## Task Category 2...
+## Map Work Ownership
 
-**3. Reference/Guidelines** (best for standards or specifications)
-- Works well for brand guidelines, coding standards, or requirements
-- Example: Brand styling with "Brand Guidelines" -> "Colors" -> "Typography" -> "Features"
-- Structure: ## Overview -> ## Guidelines -> ## Specifications -> ## Usage...
+For every candidate phase or item, record the smallest useful set of:
 
-**4. Capabilities-Based** (best for integrated systems)
-- Works well when the skill provides multiple interrelated features
-- Example: Product Management with "Core Capabilities" -> numbered capability list
-- Structure: ## Overview -> ## Core Capabilities -> ### 1. Feature -> ### 2. Feature...
+- stable phase/item ID and short objective;
+- primary owner files or subsystem;
+- shared types, protocols, registries, generated artifacts, or configuration;
+- ordering dependencies and replaced or competing runtime paths;
+- focused tests, generators, or validation resources that could collide.
 
-Patterns can be mixed and matched as needed. Most skills combine patterns (e.g., start with task-based, add workflow for complex operations).
+Do not declare work independent merely because its named files differ. Shared
+interfaces, schemas, state machines, generated outputs, validation baselines,
+and downstream dependencies also count as overlap.
 
-Delete this entire "Structuring This Skill" section when done - it's just guidance.]
+## Classify Concurrency
 
-## [TODO: Replace with the first main section based on chosen structure]
+Use these classifications:
 
-[TODO: Add content here. See examples in existing skills:
-- Code samples for technical skills
-- Decision trees for complex workflows
-- Concrete examples with realistic user requests
-- References to scripts/templates/references as needed]
+- `parallel_ready`: no shared write owner, contract, generated artifact,
+  validation resource, or unfinished dependency was found.
+- `coordinate`: work can proceed only with an explicit file/owner split and a
+  named integration order.
+- `blocked`: an unfinished dependency or competing owner makes concurrent work
+  unsafe.
+- `unknown`: current evidence is insufficient; inspect further or ask the
+  active implementer.
 
-## Resources (optional)
+Prefer item-level classifications when any part of a phase overlaps. Call an
+entire phase parallel-ready only when every included item qualifies.
 
-Create only the resource directories this skill actually needs. Delete this section if no resources are required.
+## Report Or Update The Tracker
 
-### scripts/
-Executable code (Python/Bash/etc.) that can be run directly to perform specific operations.
+- For a read-only question, report the safe workstreams, blocked work, and exact
+  overlap reasons without editing files.
+- Create or mutate tracker state only when the user asks to create, update,
+  reconcile, or maintain it.
+- When a canonical tracker exists, keep one writer responsible for status
+  changes and preserve its existing status vocabulary.
+- Never promote dirty or compiling code to `verified`; require the audit item's
+  stated proof or the nearest sufficient owner validation.
+- A phase is complete only when every item is verified or intentionally skipped
+  with a reason. Keep user-confirmed completion visibly distinct when receipts
+  are unavailable.
+- Record which item IDs a parallel task owns before implementation begins.
 
-**Examples from other skills:**
-- PDF skill: `fill_fillable_fields.py`, `extract_form_field_info.py` - utilities for PDF manipulation
-- DOCX skill: `document.py`, `utilities.py` - Python modules for document processing
+## Concurrent Implementation Guardrails
 
-**Appropriate for:** Python scripts, shell scripts, or any executable code that performs automation, data processing, or specific operations.
+- Refresh the tracker and focused dirty-path map immediately before assigning
+  new work.
+- Give each task a bounded set of item IDs, owner paths, and evidence targets.
+- Do not start a downstream timing, protocol, schema, persistence, or generated
+  artifact item until its upstream owner is stable and proven.
+- Reconcile shared tracker updates after another task reports progress.
+- Do not create tasks, branches, worktrees, commits, or subagents unless the
+  user explicitly requests them.
+- Do not implement the candidate work merely because it is parallel-ready; the
+  user's overlap question authorizes analysis, not implementation.
 
-**Note:** Scripts may be executed without loading into context, but can still be read by Codex for patching or environment adjustments.
+## Output
 
-### references/
-Documentation and reference material intended to be loaded into context to inform Codex's process and thinking.
+Lead with the actionable split:
 
-**Examples from other skills:**
-- Product management: `communication.md`, `context_building.md` - detailed workflow guides
-- BigQuery: API reference documentation and query examples
-- Finance: Schema documentation, company policies
+1. work that can start now beside the active item or phase;
+2. work that must wait or requires coordination;
+3. the tracker/worktree evidence supporting the classification;
+4. any status uncertainty that prevents a stronger claim.
 
-**Appropriate for:** In-depth documentation, API references, database schemas, comprehensive guides, or any detailed information that Codex should reference while working.
-
-### assets/
-Files not intended to be loaded into context, but rather used within the output Codex produces.
-
-**Examples from other skills:**
-- Brand styling: PowerPoint template files (.pptx), logo files
-- Frontend builder: HTML/React boilerplate project directories
-- Typography: Font files (.ttf, .woff2)
-
-**Appropriate for:** Templates, boilerplate code, document templates, images, icons, fonts, or any files meant to be copied or used in the final output.
-
----
-
-**Not every skill requires all three types of resources.**
+Keep simple answers compact. Use a table only when comparing several candidate
+items or owners materially improves clarity.

@@ -670,21 +670,29 @@ impl TurnTimingState {
         &self,
         event: &ResponseEvent,
     ) -> Option<Duration> {
+        let (visible_duration, publish) = self.commit_response_event_milestones(event);
+        self.publish_milestones(publish);
+        visible_duration
+    }
+
+    fn commit_response_event_milestones(&self, event: &ResponseEvent) -> (Option<Duration>, u8) {
         let records_model_output = response_event_records_model_output(event);
         let records_visible_output = response_event_records_visible_output(event);
         if !records_model_output && !records_visible_output {
-            return None;
+            return (None, 0);
         }
         let settled = self.milestone_mask.load(Ordering::Acquire);
         let needs_model = records_model_output && settled & MODEL_OUTPUT_SETTLED == 0;
         let needs_visible = records_visible_output && settled & VISIBLE_OUTPUT_SETTLED == 0;
         if !needs_model && !needs_visible {
-            return None;
+            return (None, 0);
         }
         let sample = self.clock.sample();
         let mut state = self.state();
         state.advance(sample.time.monotonic_ns);
-        let elapsed_ns = state.elapsed_since_start(sample.time.monotonic_ns)?;
+        let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns) else {
+            return (None, 0);
+        };
         if records_model_output && state.milestones.first_model_output_ns.is_none() {
             state.milestones.first_model_output_ns = Some(elapsed_ns);
         }
@@ -696,41 +704,45 @@ impl TurnTimingState {
                 None
             };
         let mut publish = 0;
-        if records_model_output && state.milestones.first_model_output_ns.is_some() {
+        if needs_model && state.milestones.first_model_output_ns.is_some() {
             publish |= MODEL_OUTPUT_SETTLED;
         }
-        if records_visible_output && state.milestones.first_visible_output_ns.is_some() {
+        if needs_visible && state.milestones.first_visible_output_ns.is_some() {
             publish |= VISIBLE_OUTPUT_SETTLED;
         }
-        drop(state);
-        if publish != 0 {
-            self.milestone_mask.fetch_or(publish, Ordering::Release);
-        }
-        visible_duration
+        (visible_duration, publish)
     }
 
     pub(crate) fn record_ttfm_for_turn_item(&self, item: &TurnItem) -> Option<Duration> {
+        let (duration, publish) = self.commit_agent_message_milestone(item);
+        self.publish_milestones(publish);
+        duration
+    }
+
+    fn commit_agent_message_milestone(&self, item: &TurnItem) -> (Option<Duration>, u8) {
         if !matches!(item, TurnItem::AgentMessage(_)) {
-            return None;
+            return (None, 0);
         }
         if self.milestone_mask.load(Ordering::Acquire) & AGENT_MESSAGE_SETTLED != 0 {
-            return None;
+            return (None, 0);
         }
         let sample = self.clock.sample();
         let mut state = self.state();
         state.advance(sample.time.monotonic_ns);
         if state.milestones.first_agent_message_ns.is_some() {
-            drop(state);
-            self.milestone_mask
-                .fetch_or(AGENT_MESSAGE_SETTLED, Ordering::Release);
-            return None;
+            return (None, AGENT_MESSAGE_SETTLED);
         }
-        let elapsed_ns = state.elapsed_since_start(sample.time.monotonic_ns)?;
+        let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns) else {
+            return (None, 0);
+        };
         state.milestones.first_agent_message_ns = Some(elapsed_ns);
-        drop(state);
-        self.milestone_mask
-            .fetch_or(AGENT_MESSAGE_SETTLED, Ordering::Release);
-        Some(duration_from_nanos(elapsed_ns))
+        (Some(duration_from_nanos(elapsed_ns)), AGENT_MESSAGE_SETTLED)
+    }
+
+    fn publish_milestones(&self, publish: u8) {
+        if publish != 0 {
+            self.milestone_mask.fetch_or(publish, Ordering::Release);
+        }
     }
 
     fn begin_guard(self: &Arc<Self>, kind: GuardKind) -> TurnTimingGuard {

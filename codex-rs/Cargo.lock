@@ -2695,6 +2695,7 @@ dependencies = [
  "codex-utils-pty",
  "codex-utils-stream-parser",
  "codex-utils-string",
+ "codex-verify-local",
  "codex-web-search-extension",
  "codex-windows-sandbox",
  "core_test_support",
@@ -4475,6 +4476,21 @@ version = "0.0.0"
 dependencies = [
  "pretty_assertions",
  "v8",
+]
+
+[[package]]
+name = "codex-verify-local"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "indexmap 2.14.0",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

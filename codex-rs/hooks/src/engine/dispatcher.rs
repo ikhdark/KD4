@@ -395,6 +395,8 @@ pub(crate) fn hook_source_label(source: codex_protocol::protocol::HookSource) ->
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookSource;
     use codex_utils_absolute_path::test_support::PathBufExt;
@@ -402,6 +404,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::ConfiguredHandler;
+    use super::HandlerIndex;
+    use super::HookMatchContext;
     use super::select_handlers;
     use super::select_handlers_for_matcher_inputs;
 
@@ -422,6 +426,181 @@ mod tests {
             display_order,
             env: std::collections::HashMap::new(),
         }
+    }
+
+    fn selected_orders(index: &HandlerIndex, context: HookMatchContext<'_>) -> Vec<i64> {
+        index
+            .prepare(context)
+            .into_handlers()
+            .into_iter()
+            .map(|handler| handler.display_order)
+            .collect()
+    }
+
+    #[test]
+    fn prepared_hook_plan_matches_all_contexts_aliases_once_and_preserves_order() {
+        let handlers = vec![
+            Arc::new(make_handler(
+                HookEventName::PreToolUse,
+                Some("apply_patch|Write"),
+                "pre combined",
+                30,
+            )),
+            Arc::new(make_handler(
+                HookEventName::PermissionRequest,
+                Some("^Edit$"),
+                "permission alias",
+                40,
+            )),
+            Arc::new(make_handler(
+                HookEventName::PostToolUse,
+                Some("^Write$"),
+                "post alias",
+                50,
+            )),
+            Arc::new(make_handler(
+                HookEventName::SessionStart,
+                Some("^resume$"),
+                "session",
+                60,
+            )),
+            Arc::new(make_handler(
+                HookEventName::SubagentStart,
+                Some("^explorer$"),
+                "subagent start",
+                70,
+            )),
+            Arc::new(make_handler(
+                HookEventName::SubagentStop,
+                Some("^explorer$"),
+                "subagent stop",
+                80,
+            )),
+            Arc::new(make_handler(
+                HookEventName::PreCompact,
+                Some("^auto$"),
+                "pre compact",
+                90,
+            )),
+            Arc::new(make_handler(
+                HookEventName::PostCompact,
+                Some("^manual$"),
+                "post compact",
+                100,
+            )),
+            Arc::new(make_handler(
+                HookEventName::UserPromptSubmit,
+                Some("^never$"),
+                "prompt unconditional",
+                110,
+            )),
+            Arc::new(make_handler(
+                HookEventName::Stop,
+                Some("^never$"),
+                "stop unconditional",
+                120,
+            )),
+            Arc::new(make_handler(
+                HookEventName::PreToolUse,
+                Some("^Write$"),
+                "pre alias",
+                10,
+            )),
+            Arc::new(make_handler(
+                HookEventName::PreToolUse,
+                Some("^Bash$"),
+                "pre mismatch",
+                20,
+            )),
+        ];
+        let index = HandlerIndex::new(&handlers);
+        let aliases = vec!["Write".to_string(), "Edit".to_string()];
+
+        assert_eq!(
+            selected_orders(
+                &index,
+                HookMatchContext::PreToolUse {
+                    canonical_tool_name: "apply_patch",
+                    matcher_aliases: &aliases,
+                }
+            ),
+            vec![30, 10]
+        );
+        assert_eq!(
+            selected_orders(
+                &index,
+                HookMatchContext::PermissionRequest {
+                    canonical_tool_name: "apply_patch",
+                    matcher_aliases: &aliases,
+                }
+            ),
+            vec![40]
+        );
+        assert_eq!(
+            selected_orders(
+                &index,
+                HookMatchContext::PostToolUse {
+                    canonical_tool_name: "apply_patch",
+                    matcher_aliases: &aliases,
+                }
+            ),
+            vec![50]
+        );
+        assert_eq!(
+            selected_orders(&index, HookMatchContext::SessionStart { source: "resume" }),
+            vec![60]
+        );
+        assert_eq!(
+            selected_orders(
+                &index,
+                HookMatchContext::SubagentStart {
+                    agent_type: "explorer",
+                }
+            ),
+            vec![70]
+        );
+        assert_eq!(
+            selected_orders(
+                &index,
+                HookMatchContext::SubagentStop {
+                    agent_type: "explorer",
+                }
+            ),
+            vec![80]
+        );
+        assert_eq!(
+            selected_orders(&index, HookMatchContext::PreCompact { trigger: "auto" }),
+            vec![90]
+        );
+        assert_eq!(
+            selected_orders(&index, HookMatchContext::PostCompact { trigger: "manual" }),
+            vec![100]
+        );
+        assert_eq!(
+            selected_orders(&index, HookMatchContext::UserPromptSubmit),
+            vec![110]
+        );
+        assert_eq!(selected_orders(&index, HookMatchContext::Stop), vec![120]);
+    }
+
+    #[test]
+    fn prepared_hook_plan_no_match_is_empty() {
+        let handlers = vec![Arc::new(make_handler(
+            HookEventName::PreToolUse,
+            Some("^Bash$"),
+            "mismatch",
+            0,
+        ))];
+        let index = HandlerIndex::new(&handlers);
+        let aliases = vec!["Write".to_string(), "Edit".to_string()];
+
+        let plan = index.prepare(HookMatchContext::PreToolUse {
+            canonical_tool_name: "apply_patch",
+            matcher_aliases: &aliases,
+        });
+
+        assert_eq!(plan.event_name(), HookEventName::PreToolUse);
+        assert!(plan.is_empty());
     }
 
     #[test]

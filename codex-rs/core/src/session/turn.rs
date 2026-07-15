@@ -346,14 +346,14 @@ pub(crate) async fn run_turn(
                         turn_context.as_ref(),
                     )
                     .await;
-                    let estimated_token_count = if tracing::enabled!(
-                        target: "codex_core::session::turn",
-                        tracing::Level::TRACE
-                    ) {
-                        sess.get_estimated_token_count(turn_context.as_ref()).await
-                    } else {
-                        None
-                    };
+                    let estimated_token_count = maybe_estimate_history_for_trace(
+                        tracing::enabled!(
+                            target: "codex_core::session::turn",
+                            tracing::Level::TRACE
+                        ),
+                        || sess.get_estimated_token_count(turn_context.as_ref()),
+                    )
+                    .await;
                     (has_pending_input, token_status, estimated_token_count)
                 }
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
@@ -1137,15 +1137,28 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
         hasher.update(serialized);
         hasher.update([0xff]);
     }
-    if let Ok(serialized) = router.model_visible_schema_bundle().planning_digest_bytes() {
-        hasher.update(serialized);
-        hasher.update([0xff]);
-    }
+    append_planning_schema_digest(
+        &mut hasher,
+        router.model_visible_schema_bundle().planning_digest_bytes(),
+    );
     if let Ok(serialized) = serde_json::to_vec(history_items) {
         hasher.update(serialized);
         hasher.update([0xff]);
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn append_planning_schema_digest(
+    hasher: &mut Sha256,
+    serialized: serde_json::Result<&[u8]>,
+) -> bool {
+    if let Ok(serialized) = serialized {
+        hasher.update(serialized);
+        hasher.update([0xff]);
+        true
+    } else {
+        false
+    }
 }
 
 fn estimate_pending_tokens(user_input: &[UserInput], injection_items: &[ResponseItem]) -> i64 {
@@ -3008,6 +3021,7 @@ async fn try_run_sampling_request(
             }
         }
     };
+    stream_timing.finish();
     drop(sampling_timing_guard);
 
     flush_assistant_text_segments_all(
@@ -3071,6 +3085,14 @@ async fn try_run_sampling_request(
     }
 
     outcome
+}
+
+async fn maybe_estimate_history_for_trace<F, Fut>(enabled: bool, estimate: F) -> Option<i64>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<i64>>,
+{
+    if enabled { estimate().await } else { None }
 }
 
 pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<String> {

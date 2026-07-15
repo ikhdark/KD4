@@ -1,0 +1,29 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "codex-verify-local"
+version.workspace = true
+
+[lib]
+name = "codex_verify_local"
+path = "src/lib.rs"
+
+[[bin]]
+name = "codex-verify-local"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+indexmap = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

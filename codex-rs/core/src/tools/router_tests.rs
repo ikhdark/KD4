@@ -208,6 +208,120 @@ async fn build_custom_tool_call_uses_namespace_for_registry_name() -> anyhow::Re
     Ok(())
 }
 
+#[test]
+fn tool_call_preflight_preserves_borrowed_logs_and_consumed_calls() {
+    let cases = vec![
+        (
+            ResponseItem::FunctionCall {
+                id: Some("function-item".to_string()),
+                name: "create_event".to_string(),
+                namespace: Some("calendar".to_string()),
+                arguments: r#"{"title":"review"}"#.to_string(),
+                call_id: "function-call".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            r#"{"title":"review"}"#,
+            ToolCall {
+                tool_name: ToolName::namespaced("calendar", "create_event"),
+                call_id: "function-call".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: r#"{"title":"review"}"#.to_string(),
+                },
+            },
+        ),
+        (
+            ResponseItem::ToolSearchCall {
+                id: Some("search-item".to_string()),
+                call_id: Some("search-call".to_string()),
+                status: Some("completed".to_string()),
+                execution: "client".to_string(),
+                arguments: json!({"query": "calendar", "limit": 2}),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            "calendar",
+            ToolCall {
+                tool_name: ToolName::plain("tool_search"),
+                call_id: "search-call".to_string(),
+                payload: ToolPayload::ToolSearch {
+                    arguments: codex_protocol::models::SearchToolCallParams {
+                        query: "calendar".to_string(),
+                        limit: Some(2),
+                    },
+                },
+            },
+        ),
+        (
+            ResponseItem::CustomToolCall {
+                id: Some("custom-item".to_string()),
+                status: Some("completed".to_string()),
+                call_id: "custom-call".to_string(),
+                name: "exec".to_string(),
+                namespace: Some("python".to_string()),
+                input: "print('hello')".to_string(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            "print('hello')",
+            ToolCall {
+                tool_name: ToolName::namespaced("python", "exec"),
+                call_id: "custom-call".to_string(),
+                payload: ToolPayload::Custom {
+                    input: "print('hello')".to_string(),
+                },
+            },
+        ),
+    ];
+
+    for (item, expected_log, expected_call) in cases {
+        let preflight = ToolRouter::preflight_tool_call(&item)
+            .expect("preflight should parse")
+            .expect("item should be a client tool call");
+        let log_payload = preflight.log_payload(&item);
+        assert!(matches!(log_payload, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(log_payload, expected_log);
+        assert_eq!(preflight.into_tool_call(item.clone()), expected_call);
+        assert_eq!(
+            ToolRouter::build_tool_call(item).expect("compatibility wrapper should parse"),
+            Some(expected_call)
+        );
+    }
+
+    assert!(
+        ToolRouter::preflight_tool_call(&ResponseItem::Other)
+            .expect("non-tool items are accepted")
+            .is_none()
+    );
+    assert!(
+        ToolRouter::preflight_tool_call(&ResponseItem::ToolSearchCall {
+            id: None,
+            call_id: Some("server-search".to_string()),
+            status: None,
+            execution: "server".to_string(),
+            arguments: json!({"query": "calendar"}),
+            internal_chat_message_metadata_passthrough: None,
+        })
+        .expect("server tool search is not a client call")
+        .is_none()
+    );
+
+    let malformed = ToolRouter::preflight_tool_call(&ResponseItem::ToolSearchCall {
+        id: None,
+        call_id: Some("malformed-search".to_string()),
+        status: None,
+        execution: "client".to_string(),
+        arguments: json!({"query": 7}),
+        internal_chat_message_metadata_passthrough: None,
+    });
+    let error = match malformed {
+        Err(error) => error,
+        Ok(_) => panic!("malformed tool-search arguments must fail"),
+    };
+    assert!(
+        error
+            .to_string()
+            .starts_with("failed to parse tool_search arguments:")
+    );
+}
+
 #[tokio::test]
 async fn mcp_parallel_support_uses_handler_data() -> anyhow::Result<()> {
     let (_, turn) = make_session_and_context().await;

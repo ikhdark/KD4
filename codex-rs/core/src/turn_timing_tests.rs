@@ -1,5 +1,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use codex_analytics::TurnProfile;
@@ -10,12 +12,16 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use pretty_assertions::assert_eq;
 
+use super::AGENT_MESSAGE_SETTLED;
 use super::ClockSample;
 use super::InteractiveWaitKind;
+use super::MODEL_OUTPUT_SETTLED;
+use super::ModelStreamTimingGuard;
 use super::TimeSample;
 use super::TurnClock;
 use super::TurnLocalPhase;
 use super::TurnTimingState;
+use super::VISIBLE_OUTPUT_SETTLED;
 use super::response_item_records_model_output;
 use super::response_item_records_visible_output;
 use crate::ResponseEvent;
@@ -25,6 +31,7 @@ const NS_PER_MS: u128 = 1_000_000;
 #[derive(Debug)]
 struct FakeClock {
     sample: Mutex<TimeSample>,
+    samples: AtomicUsize,
 }
 
 impl FakeClock {
@@ -34,6 +41,7 @@ impl FakeClock {
                 monotonic_ns,
                 wall_unix_ms,
             }),
+            samples: AtomicUsize::new(0),
         }
     }
 
@@ -49,10 +57,15 @@ impl FakeClock {
         sample.monotonic_ns = monotonic_ms.saturating_mul(NS_PER_MS);
         sample.wall_unix_ms = i64::try_from(monotonic_ms).unwrap_or(i64::MAX);
     }
+
+    fn sample_count(&self) -> usize {
+        self.samples.load(Ordering::SeqCst)
+    }
 }
 
 impl TurnClock for FakeClock {
     fn sample(&self) -> ClockSample {
+        self.samples.fetch_add(1, Ordering::SeqCst);
         ClockSample {
             time: *self.sample.lock().expect("fake clock lock"),
         }
@@ -63,6 +76,185 @@ fn timing() -> (Arc<FakeClock>, Arc<TurnTimingState>) {
     let clock = Arc::new(FakeClock::new(0, 0));
     let state = Arc::new(TurnTimingState::with_clock(clock.clone()));
     (clock, state)
+}
+
+fn agent_message(id: &str) -> TurnItem {
+    TurnItem::AgentMessage(AgentMessageItem {
+        id: id.to_string(),
+        content: Vec::new(),
+        phase: None,
+        memory_citation: None,
+    })
+}
+
+#[test]
+fn model_stream_timing_guard_closes_once_for_all_exit_styles() {
+    for exit_style in ["success", "error", "eof", "cancellation"] {
+        let (clock, state) = timing();
+        state.mark_turn_started();
+        let mut guard = ModelStreamTimingGuard::new(Some(&state));
+        guard.begin_wait();
+        clock.set_ms(5);
+        guard.begin_processing();
+        clock.set_ms(12);
+
+        if exit_style == "success" {
+            guard.finish();
+            guard.finish();
+        }
+        drop(guard);
+        clock.set_ms(50);
+
+        let profile = state.complete_snapshot().profile;
+        assert_eq!(
+            profile.unions.model_stream_wait_ns,
+            5 * NS_PER_MS,
+            "{exit_style}"
+        );
+        assert_eq!(
+            profile.unions.model_stream_processing_ns,
+            7 * NS_PER_MS,
+            "{exit_style}"
+        );
+        assert_eq!(profile.counters.invalid_transition_count, 0, "{exit_style}");
+    }
+}
+
+#[test]
+fn milestone_bits_publish_only_after_timestamps_are_committed() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+
+    clock.set_ms(5);
+    let (model_duration, model_bits) =
+        state.commit_response_event_milestones(&ResponseEvent::ToolCallInputDelta {
+            item_id: "tool-item".to_string(),
+            call_id: Some("tool-call".to_string()),
+            delta: "{}".to_string(),
+        });
+    assert_eq!(model_duration, None);
+    assert_eq!(model_bits, MODEL_OUTPUT_SETTLED);
+    assert_eq!(state.milestone_mask.load(Ordering::Acquire), 0);
+    assert_eq!(
+        state.state().milestones.first_model_output_ns,
+        Some(5 * NS_PER_MS)
+    );
+    state.publish_milestones(model_bits);
+    assert_eq!(
+        state.milestone_mask.load(Ordering::Acquire),
+        MODEL_OUTPUT_SETTLED
+    );
+
+    clock.set_ms(10);
+    let (visible_duration, visible_bits) = state
+        .commit_response_event_milestones(&ResponseEvent::OutputTextDelta("visible".to_string()));
+    assert_eq!(visible_duration, Some(Duration::from_millis(10)));
+    assert_eq!(visible_bits, VISIBLE_OUTPUT_SETTLED);
+    assert_eq!(
+        state.milestone_mask.load(Ordering::Acquire),
+        MODEL_OUTPUT_SETTLED
+    );
+    assert_eq!(
+        state.state().milestones.first_visible_output_ns,
+        Some(10 * NS_PER_MS)
+    );
+    state.publish_milestones(visible_bits);
+
+    clock.set_ms(15);
+    let (agent_duration, agent_bits) =
+        state.commit_agent_message_milestone(&agent_message("agent-1"));
+    assert_eq!(agent_duration, Some(Duration::from_millis(15)));
+    assert_eq!(agent_bits, AGENT_MESSAGE_SETTLED);
+    assert_eq!(
+        state.milestone_mask.load(Ordering::Acquire),
+        MODEL_OUTPUT_SETTLED | VISIBLE_OUTPUT_SETTLED
+    );
+    assert_eq!(
+        state.state().milestones.first_agent_message_ns,
+        Some(15 * NS_PER_MS)
+    );
+    state.publish_milestones(agent_bits);
+    assert_eq!(
+        state.milestone_mask.load(Ordering::Acquire),
+        MODEL_OUTPUT_SETTLED | VISIBLE_OUTPUT_SETTLED | AGENT_MESSAGE_SETTLED
+    );
+}
+
+#[test]
+fn existing_milestones_are_published_by_following_recorders() {
+    let (clock, model_state) = timing();
+    model_state.mark_turn_started();
+    clock.set_ms(5);
+    let model_event = ResponseEvent::ToolCallInputDelta {
+        item_id: "tool-item".to_string(),
+        call_id: Some("tool-call".to_string()),
+        delta: "{}".to_string(),
+    };
+    let (_, model_bits) = model_state.commit_response_event_milestones(&model_event);
+    assert_eq!(model_bits, MODEL_OUTPUT_SETTLED);
+    assert_eq!(
+        model_state.record_response_event_milestones(&model_event),
+        None
+    );
+    assert_ne!(
+        model_state.milestone_mask.load(Ordering::Acquire) & MODEL_OUTPUT_SETTLED,
+        0
+    );
+
+    let (clock, visible_state) = timing();
+    visible_state.mark_turn_started();
+    clock.set_ms(5);
+    let visible_event = ResponseEvent::OutputTextDelta("visible".to_string());
+    let (_, visible_bits) = visible_state.commit_response_event_milestones(&visible_event);
+    assert_eq!(visible_bits, MODEL_OUTPUT_SETTLED | VISIBLE_OUTPUT_SETTLED);
+    assert_eq!(
+        visible_state.record_response_event_milestones(&visible_event),
+        None
+    );
+    assert_eq!(
+        visible_state.milestone_mask.load(Ordering::Acquire)
+            & (MODEL_OUTPUT_SETTLED | VISIBLE_OUTPUT_SETTLED),
+        MODEL_OUTPUT_SETTLED | VISIBLE_OUTPUT_SETTLED
+    );
+
+    let (clock, agent_state) = timing();
+    agent_state.mark_turn_started();
+    clock.set_ms(5);
+    let item = agent_message("agent-1");
+    let (_, agent_bits) = agent_state.commit_agent_message_milestone(&item);
+    assert_eq!(agent_bits, AGENT_MESSAGE_SETTLED);
+    assert_eq!(agent_state.record_ttfm_for_turn_item(&item), None);
+    assert_ne!(
+        agent_state.milestone_mask.load(Ordering::Acquire) & AGENT_MESSAGE_SETTLED,
+        0
+    );
+}
+
+#[test]
+fn settled_milestones_skip_repeated_clock_sampling() {
+    let (clock, state) = timing();
+    state.mark_turn_started();
+    assert_eq!(clock.sample_count(), 1);
+
+    clock.set_ms(5);
+    let visible_event = ResponseEvent::OutputTextDelta("visible".to_string());
+    assert_eq!(
+        state.record_response_event_milestones(&visible_event),
+        Some(Duration::from_millis(5))
+    );
+    assert_eq!(clock.sample_count(), 2);
+    assert_eq!(state.record_response_event_milestones(&visible_event), None);
+    assert_eq!(clock.sample_count(), 2);
+
+    clock.set_ms(10);
+    let item = agent_message("agent-1");
+    assert_eq!(
+        state.record_ttfm_for_turn_item(&item),
+        Some(Duration::from_millis(10))
+    );
+    assert_eq!(clock.sample_count(), 3);
+    assert_eq!(state.record_ttfm_for_turn_item(&item), None);
+    assert_eq!(clock.sample_count(), 3);
 }
 
 #[test]
