@@ -12,6 +12,8 @@ use codex_apply_patch::AppliedPatchChange;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::AppliedPatchFileChange;
 
+use crate::task_evidence::MutationObservation;
+
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 const DEV_NULL: &str = "/dev/null";
 const REGULAR_FILE_MODE: &str = "100644";
@@ -187,34 +189,42 @@ impl TurnDiffTracker {
         environment_id: &str,
         cwd: Option<&Path>,
     ) {
-        let possible_mutation = looks_like_mutating_command(command);
-        self.record_exec_command_end_at_with_mutation(
+        let observation = if looks_like_mutating_command(command) {
+            MutationObservation::Unknown
+        } else {
+            MutationObservation::Unchanged
+        };
+        self.record_exec_command_end_at_with_observation(
             command,
             exit_code,
             timed_out,
             environment_id,
             cwd,
-            possible_mutation,
+            observation,
         );
     }
 
-    pub(crate) fn record_exec_command_end_at_with_mutation(
+    pub(crate) fn record_exec_command_end_at_with_observation(
         &mut self,
         command: &[String],
         exit_code: i32,
         timed_out: bool,
         environment_id: &str,
         cwd: Option<&Path>,
-        possible_mutation: bool,
+        observation: MutationObservation,
     ) {
         let was_post_mutation = self.has_unvalidated_mutation();
         let is_validation = is_validation_command(command);
         let format_only = is_format_only_command(command);
         let broad_filter = is_broad_validation_filter_command(command);
+        let observed_or_unknown_mutation = matches!(
+            observation,
+            MutationObservation::Changed | MutationObservation::Unknown
+        );
 
-        // A command can write before failing or timing out, so known mutators
-        // always invalidate exact diff/freshness state.
-        if possible_mutation {
+        // Unknown observations remain conservative, while a complete unchanged
+        // fingerprint must not invent a mutation from command syntax alone.
+        if observed_or_unknown_mutation {
             self.record_unknown_mutation();
         }
 
@@ -227,7 +237,7 @@ impl TurnDiffTracker {
                 ValidationFreshnessStatus::TimedOut
             } else if is_validation && exit_code == 0 && broad_filter {
                 ValidationFreshnessStatus::AdvisoryBroadFilter
-            } else if is_validation && exit_code == 0 && possible_mutation {
+            } else if is_validation && exit_code == 0 && observed_or_unknown_mutation {
                 ValidationFreshnessStatus::StaleAfterLastMutation
             } else if is_validation {
                 ValidationFreshnessStatus::FailedAfterLastMutation
@@ -236,7 +246,12 @@ impl TurnDiffTracker {
             };
         }
 
-        if is_validation && exit_code == 0 && !timed_out && !broad_filter && !possible_mutation {
+        if is_validation
+            && exit_code == 0
+            && !timed_out
+            && !broad_filter
+            && observation == MutationObservation::Unchanged
+        {
             self.has_successful_validation = true;
             match validation_coverage(command, cwd) {
                 ValidationCoverage::All => {

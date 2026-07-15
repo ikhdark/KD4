@@ -618,16 +618,18 @@ impl ToolRegistry {
             }
         }
 
-        let post_tool_use_plan = tool.post_tool_use_hook_name(&invocation).and_then(|tool_name| {
-            let plan = invocation
-                .session
-                .hooks()
-                .prepare(HookMatchContext::PostToolUse {
-                    canonical_tool_name: tool_name.name(),
-                    matcher_aliases: tool_name.matcher_aliases(),
-                });
-            (!plan.is_empty()).then_some(plan)
-        });
+        let post_tool_use_plan = tool
+            .post_tool_use_hook_name(&invocation)
+            .and_then(|tool_name| {
+                let plan = invocation
+                    .session
+                    .hooks()
+                    .prepare(HookMatchContext::PostToolUse {
+                        canonical_tool_name: tool_name.name(),
+                        matcher_aliases: tool_name.matcher_aliases(),
+                    });
+                (!plan.is_empty()).then_some(plan)
+            });
 
         let response_cell = tokio::sync::Mutex::new(None);
         let invocation_for_tool = invocation.clone();

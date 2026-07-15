@@ -814,7 +814,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn clear_prevents_a_stale_flight_commit() {
-        let cache = assert_global_mutation_prevents_stale_flight_commit(|cache| cache.clear()).await;
+        let cache =
+            assert_global_mutation_prevents_stale_flight_commit(|cache| cache.clear()).await;
         assert_eq!(cache.get(&"other"), None);
     }
 

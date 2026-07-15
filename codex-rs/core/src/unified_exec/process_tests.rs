@@ -25,12 +25,23 @@ struct MockExecProcess {
     process_id: ProcessId,
     write_response: WriteResponse,
     read_responses: Mutex<VecDeque<ReadResponse>>,
+    read_calls: Mutex<Vec<(Option<u64>, Option<usize>, Option<usize>, Option<u64>)>>,
     terminate_error: Option<String>,
     wake_tx: watch::Sender<u64>,
 }
 
 impl MockExecProcess {
-    async fn read(&self) -> Result<ReadResponse, ExecServerError> {
+    async fn read_with_limits(
+        &self,
+        after_seq: Option<u64>,
+        max_bytes: Option<usize>,
+        max_chunks: Option<usize>,
+        wait_ms: Option<u64>,
+    ) -> Result<ReadResponse, ExecServerError> {
+        self.read_calls
+            .lock()
+            .await
+            .push((after_seq, max_bytes, max_chunks, wait_ms));
         Ok(self
             .read_responses
             .lock()
@@ -39,6 +50,8 @@ impl MockExecProcess {
             .unwrap_or(ReadResponse {
                 chunks: Vec::new(),
                 output_gaps: Vec::new(),
+                earliest_retained_seq: Some(1),
+                complete: Some(true),
                 next_seq: 1,
                 exited: false,
                 exit_code: None,
@@ -71,11 +84,25 @@ impl ExecProcess for MockExecProcess {
 
     fn read(
         &self,
-        _after_seq: Option<u64>,
-        _max_bytes: Option<usize>,
-        _wait_ms: Option<u64>,
+        after_seq: Option<u64>,
+        max_bytes: Option<usize>,
+        wait_ms: Option<u64>,
     ) -> ExecProcessFuture<'_, ReadResponse> {
-        Box::pin(MockExecProcess::read(self))
+        Box::pin(MockExecProcess::read_with_limits(
+            self, after_seq, max_bytes, None, wait_ms,
+        ))
+    }
+
+    fn read_with_limits(
+        &self,
+        after_seq: Option<u64>,
+        max_bytes: Option<usize>,
+        max_chunks: Option<usize>,
+        wait_ms: Option<u64>,
+    ) -> ExecProcessFuture<'_, ReadResponse> {
+        Box::pin(MockExecProcess::read_with_limits(
+            self, after_seq, max_bytes, max_chunks, wait_ms,
+        ))
     }
 
     fn write(&self, _chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
@@ -103,6 +130,7 @@ async fn remote_process(
                 status: write_status,
             },
             read_responses: Mutex::new(VecDeque::new()),
+            read_calls: Mutex::new(Vec::new()),
             terminate_error,
             wake_tx,
         }),
@@ -127,6 +155,8 @@ async fn tail_only_recovery_gap_is_observed_from_the_wake_channel() {
                 first_missing_seq: 1,
                 last_missing_seq: 2,
             }],
+            earliest_retained_seq: Some(3),
+            complete: Some(true),
             next_seq: 3,
             exited: false,
             exit_code: None,
@@ -134,6 +164,7 @@ async fn tail_only_recovery_gap_is_observed_from_the_wake_channel() {
             failure: None,
             sandbox_denied: false,
         }])),
+        read_calls: Mutex::new(Vec::new()),
         terminate_error: None,
         wake_tx,
     });
@@ -164,6 +195,104 @@ async fn tail_only_recovery_gap_is_observed_from_the_wake_channel() {
     })
     .await
     .expect("tail-only recovery gap should become durable evidence");
+}
+
+#[tokio::test]
+async fn recovery_pages_use_explicit_completeness_and_preserve_whole_stream_bytes() {
+    let (wake_tx, _wake_rx) = watch::channel(0);
+    let first = vec![b'a'; 60 * 1024];
+    let second = [vec![0_u8, 0xff, b'Z'], vec![b'b'; 8 * 1024]].concat();
+    let expected = [first.clone(), second.clone()].concat();
+    let mock = Arc::new(MockExecProcess {
+        process_id: "paged-process".to_string().into(),
+        write_response: WriteResponse {
+            status: WriteStatus::Accepted,
+        },
+        read_responses: Mutex::new(VecDeque::from([
+            ReadResponse {
+                chunks: vec![codex_exec_server::ProcessOutputChunk {
+                    seq: 1,
+                    stream: codex_exec_server::ExecOutputStream::Stdout,
+                    chunk: first.into(),
+                }],
+                output_gaps: Vec::new(),
+                earliest_retained_seq: Some(1),
+                complete: Some(false),
+                next_seq: 2,
+                exited: false,
+                exit_code: None,
+                closed: false,
+                failure: None,
+                sandbox_denied: false,
+            },
+            ReadResponse {
+                chunks: vec![codex_exec_server::ProcessOutputChunk {
+                    seq: 2,
+                    stream: codex_exec_server::ExecOutputStream::Stdout,
+                    chunk: second.into(),
+                }],
+                output_gaps: Vec::new(),
+                earliest_retained_seq: Some(1),
+                complete: Some(true),
+                next_seq: 3,
+                exited: false,
+                exit_code: None,
+                closed: false,
+                failure: None,
+                sandbox_denied: false,
+            },
+        ])),
+        read_calls: Mutex::new(Vec::new()),
+        terminate_error: None,
+        wake_tx,
+    });
+    let process = UnifiedExecProcess::from_exec_server_started(
+        StartedExecProcess {
+            process: Arc::clone(&mock) as Arc<dyn ExecProcess>,
+        },
+        None,
+    )
+    .await
+    .expect("remote process should start");
+
+    mock.wake_tx.send(2).expect("wake recovery reader");
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let rendered = process
+                .output_handles()
+                .output_buffer
+                .lock()
+                .await
+                .render_bytes();
+            if rendered.len() >= expected.len() {
+                assert_eq!(rendered, expected);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("paged recovery should complete");
+
+    let expected_page_max_bytes = 64 * 1024;
+    let expected_page_max_chunks = 128;
+    assert_eq!(
+        *mock.read_calls.lock().await,
+        vec![
+            (
+                Some(0),
+                Some(expected_page_max_bytes),
+                Some(expected_page_max_chunks),
+                Some(0),
+            ),
+            (
+                Some(1),
+                Some(expected_page_max_bytes),
+                Some(expected_page_max_chunks),
+                Some(0),
+            ),
+        ]
+    );
 }
 
 #[tokio::test]

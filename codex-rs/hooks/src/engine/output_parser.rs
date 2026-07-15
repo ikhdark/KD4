@@ -602,9 +602,12 @@ mod tests {
         let stdout = r#"{"continue":false,"continue":true}"#;
 
         assert!(serde_json::from_str::<SessionStartCommandOutputWire>(stdout).is_err());
-        assert!(legacy_parse_accepts::<SessionStartCommandOutputWire>(stdout));
+        assert!(legacy_parse_accepts::<SessionStartCommandOutputWire>(
+            stdout
+        ));
 
-        let parsed = parse_session_start(stdout).expect("legacy Value path accepts duplicate fields");
+        let parsed =
+            parse_session_start(stdout).expect("legacy Value path accepts duplicate fields");
         assert!(parsed.universal.continue_processing);
     }
 

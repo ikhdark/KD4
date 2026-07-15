@@ -508,13 +508,11 @@ impl CoreToolRuntime for ApplyPatchHandler {
     }
 
     fn pre_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
-        matches!(&invocation.payload, ToolPayload::Custom { .. })
-            .then(HookToolName::apply_patch)
+        matches!(&invocation.payload, ToolPayload::Custom { .. }).then(HookToolName::apply_patch)
     }
 
     fn post_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
-        matches!(&invocation.payload, ToolPayload::Custom { .. })
-            .then(HookToolName::apply_patch)
+        matches!(&invocation.payload, ToolPayload::Custom { .. }).then(HookToolName::apply_patch)
     }
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {

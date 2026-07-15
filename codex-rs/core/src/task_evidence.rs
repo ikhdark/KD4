@@ -831,12 +831,8 @@ impl TaskEvidenceLedger {
                 } else {
                     MutationCoverage::Incomplete
                 };
-                if matches!(
-                    observation,
-                    MutationObservation::Changed | MutationObservation::Unknown
-                ) {
+                if observation == MutationObservation::Changed {
                     invalidate_for_mutation(document);
-                    let epoch = document.evidence_epoch;
                     if let Some(active_step_id) = document.active_step_id.clone()
                         && let Some(step) = document
                             .plan
@@ -848,20 +844,21 @@ impl TaskEvidenceLedger {
                     {
                         step.status = StepStatus::Implemented;
                     }
-                    if observation == MutationObservation::Unknown {
-                        upsert_risk(
-                            document,
-                            EvidenceRisk {
-                                id: format!("unknown-command-mutation-{epoch}"),
-                                description: "command mutation coverage was incomplete; validation evidence was conservatively invalidated"
-                                    .to_string(),
-                                source: "command".to_string(),
-                                blocking: false,
-                                resolved: false,
-                                epoch,
-                            },
-                        );
-                    }
+                }
+                if observation == MutationObservation::Unknown {
+                    let epoch = document.evidence_epoch;
+                    upsert_risk(
+                        document,
+                        EvidenceRisk {
+                            id: format!("unknown-command-mutation-{epoch}"),
+                            description: "command mutation coverage was incomplete; observed-change evidence remains unresolved"
+                                .to_string(),
+                            source: "command".to_string(),
+                            blocking: false,
+                            resolved: false,
+                            epoch,
+                        },
+                    );
                 }
                 let receipt_id = next_receipt_id(
                     "command",
@@ -897,7 +894,7 @@ impl TaskEvidenceLedger {
             })
             .await
         else {
-            return None;
+            return Some(candidate_observation);
         };
         self.persist_document(&snapshot).await;
         Some(observation)
@@ -1160,18 +1157,23 @@ impl TaskEvidenceLedger {
     pub(crate) async fn take_automatic_verify_plan_request(&self) -> Option<Vec<String>> {
         let (changed_paths, snapshot) = self
             .update_document(|document| {
-                let has_mutation = !document.edit_receipts.is_empty()
-                    || document
-                        .command_receipts
-                        .iter()
-                        .any(|receipt| receipt.possible_mutation);
+                let epoch = document.evidence_epoch;
+                let has_mutation = document
+                    .edit_receipts
+                    .iter()
+                    .any(|receipt| receipt.epoch == epoch)
+                    || document.command_receipts.iter().any(|receipt| {
+                        receipt.epoch == epoch
+                            && receipt.observation == Some(MutationObservation::Changed)
+                    });
                 if !has_mutation
-                    || document.verify_plan_epoch == Some(document.evidence_epoch)
-                    || document.automatic_plan_attempt_epoch == Some(document.evidence_epoch)
+                    || document.verify_plan_epoch == Some(epoch)
+                    || document.validation_epoch == Some(epoch)
+                    || document.automatic_plan_attempt_epoch == Some(epoch)
                 {
                     return None;
                 }
-                document.automatic_plan_attempt_epoch = Some(document.evidence_epoch);
+                document.automatic_plan_attempt_epoch = Some(epoch);
                 document.updated_at = timestamp();
                 Some(document.latest_file_hashes.keys().cloned().collect())
             })
@@ -2705,7 +2707,9 @@ fn derive_completion_gate(
             unresolved_steps.join(", ")
         ));
     }
-    if document.verify_plan_epoch != Some(document.evidence_epoch) {
+    if document.verify_plan_epoch != Some(document.evidence_epoch)
+        && document.validation_epoch != Some(document.evidence_epoch)
+    {
         partial.push("verify_local planning is missing or stale".to_string());
     }
     if document.validation_epoch != Some(document.evidence_epoch) {
@@ -2833,7 +2837,7 @@ fn task_is_tracked(document: &TaskEvidenceDocument) -> bool {
             .any(|receipt| match receipt.observation {
                 Some(MutationObservation::Changed | MutationObservation::Unknown) => true,
                 Some(MutationObservation::Unchanged) => false,
-                None => receipt.possible_mutation,
+                None => false,
             })
         || document
             .risks

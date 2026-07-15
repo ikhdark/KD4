@@ -3,7 +3,7 @@
 //! `ChatComposer` publishes every change of the `@token` as
 //! `AppEvent::StartFileSearch(query)`. This manager owns a single
 //! `codex-file-search` session for the current search root, updates the query
-//! on every keystroke, and drops the session when the query becomes empty.
+//! on every keystroke, and retains the completed walk across empty queries.
 
 use codex_file_search as file_search;
 use std::path::PathBuf;
@@ -60,7 +60,9 @@ impl FileSearchManager {
         st.latest_query.push_str(&query);
 
         if query.is_empty() {
-            st.session.take();
+            if let Some(session) = st.session.as_ref() {
+                session.update_query("");
+            }
             return;
         }
 
@@ -130,4 +132,46 @@ impl file_search::SessionReporter for TuiSessionReporter {
     }
 
     fn on_complete(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn empty_query_retains_session_and_reuses_the_walk() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        fs::write(temp.path().join("alpha.txt"), "alpha").expect("file");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let manager = FileSearchManager::new(temp.path().to_path_buf(), AppEventSender::new(tx));
+
+        manager.on_user_query("alpha".to_string());
+        manager.on_user_query(String::new());
+        {
+            #[expect(clippy::unwrap_used)]
+            let state = manager.state.lock().unwrap();
+            assert!(state.session.is_some());
+        }
+        manager.on_user_query("beta".to_string());
+
+        let usage = (0..100)
+            .find_map(|_| {
+                #[expect(clippy::unwrap_used)]
+                let state = manager.state.lock().unwrap();
+                let usage = state.session.as_ref()?.usage_snapshot();
+                drop(state);
+                if usage.walker_runs == 1 {
+                    Some(usage)
+                } else {
+                    thread::sleep(Duration::from_millis(10));
+                    None
+                }
+            })
+            .expect("walker started");
+        assert_eq!(usage.query_updates, 3);
+        assert_eq!(usage.walker_runs, 1);
+    }
 }

@@ -194,6 +194,12 @@ pub struct ReadResponse {
     pub chunks: Vec<ProcessOutputChunk>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_gaps: Vec<OutputGap>,
+    /// First output sequence still replayable, or `next_seq` when none is retained.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub earliest_retained_seq: Option<u64>,
+    /// Whether this page reached the retained-output snapshot boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
     pub next_seq: u64,
     pub exited: bool,
     pub exit_code: Option<i32>,
@@ -753,6 +759,8 @@ mod tests {
         let decoded: ReadResponse =
             serde_json::from_value(old_response).expect("new client decodes old response");
         assert!(decoded.output_gaps.is_empty());
+        assert_eq!(decoded.earliest_retained_seq, None);
+        assert_eq!(decoded.complete, None);
 
         let new_response = ReadResponse {
             chunks: Vec::new(),
@@ -766,6 +774,8 @@ mod tests {
                     last_missing_seq: 9,
                 },
             ],
+            earliest_retained_seq: Some(5),
+            complete: Some(true),
             next_seq: 10,
             exited: false,
             exit_code: None,
@@ -780,11 +790,14 @@ mod tests {
             closed: bool,
         }
         let old_client: OldReadResponse = serde_json::from_value(
-            serde_json::to_value(new_response).expect("serialize new response"),
+            serde_json::to_value(&new_response).expect("serialize new response"),
         )
-        .expect("old client ignores outputGaps");
+        .expect("old client ignores new recovery fields");
         assert_eq!(old_client.next_seq, 10);
         assert!(!old_client.closed);
+        let encoded = serde_json::to_value(new_response).expect("serialize recovery contract");
+        assert_eq!(encoded["earliestRetainedSeq"], 5);
+        assert_eq!(encoded["complete"], true);
 
         let old_request = serde_json::json!({
             "processId": "proc-old",
@@ -832,6 +845,8 @@ mod tests {
         let response = ReadResponse {
             chunks: Vec::new(),
             output_gaps: Vec::new(),
+            earliest_retained_seq: None,
+            complete: None,
             next_seq: 1,
             exited: false,
             exit_code: None,
@@ -841,6 +856,8 @@ mod tests {
         };
         let serialized = serde_json::to_value(response).expect("serialize read response");
         assert!(serialized.get("outputGaps").is_none());
+        assert!(serialized.get("earliestRetainedSeq").is_none());
+        assert!(serialized.get("complete").is_none());
 
         let mut with_unknown = serialized;
         with_unknown["futureField"] = serde_json::json!({"ignored": true});

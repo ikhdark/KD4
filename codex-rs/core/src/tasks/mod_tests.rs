@@ -2,11 +2,13 @@ use super::TASK_COMPACT_METRIC;
 use super::emit_compact_metric;
 use super::emit_turn_memory_metric;
 use super::emit_turn_network_proxy_metric;
+use super::emit_turn_tool_call_metric;
 use codex_otel::MetricsClient;
 use codex_otel::MetricsConfig;
 use codex_otel::SessionTelemetry;
 use codex_otel::TURN_MEMORY_METRIC;
 use codex_otel::TURN_NETWORK_PROXY_METRIC;
+use codex_otel::TURN_TOOL_CALL_METRIC;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use opentelemetry::KeyValue;
@@ -73,6 +75,45 @@ fn metric_point(resource_metrics: &ResourceMetrics, name: &str) -> (BTreeMap<Str
         },
         _ => panic!("unexpected counter data type"),
     }
+}
+
+fn f64_histogram_point(
+    resource_metrics: &ResourceMetrics,
+    name: &str,
+) -> (BTreeMap<String, String>, u64, f64) {
+    let metric = find_metric(resource_metrics, name);
+    match metric.data() {
+        AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
+            let points = histogram.data_points().collect::<Vec<_>>();
+            assert_eq!(points.len(), 1);
+            let point = points[0];
+            (
+                attributes_to_map(point.attributes()),
+                point.count(),
+                point.sum(),
+            )
+        }
+        _ => panic!("unexpected f64 histogram data type"),
+    }
+}
+
+#[test]
+fn emit_turn_tool_call_metric_records_authoritative_count() {
+    let session_telemetry = test_session_telemetry();
+
+    emit_turn_tool_call_metric(&session_telemetry, 7, ("tmp_mem_enabled", "true"));
+
+    let snapshot = session_telemetry
+        .snapshot_metrics()
+        .expect("runtime metrics snapshot");
+    let (attrs, count, sum) = f64_histogram_point(&snapshot, TURN_TOOL_CALL_METRIC);
+
+    assert_eq!(count, 1);
+    assert_eq!(sum, 7.0);
+    assert_eq!(
+        attrs,
+        BTreeMap::from([("tmp_mem_enabled".to_string(), "true".to_string())])
+    );
 }
 
 #[test]

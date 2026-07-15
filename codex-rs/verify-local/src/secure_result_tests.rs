@@ -69,3 +69,54 @@ fn identity_mismatch_is_rejected_by_exact_parser_path() {
     actual.command_id = "other".to_string();
     assert!(verify_result_identity(&expected, &actual).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn preexisting_symlink_temporary_is_rejected_without_following_it() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let result = result();
+    let dir = create_invocation_dir(temp.path(), &result.invocation_id, &result.runner_nonce)
+        .expect("private dir");
+    let target = temp.path().join("target");
+    fs::write(&target, b"unchanged").expect("target");
+    let temporary = dir.join(format!(
+        "{}.tmp",
+        result_filename(
+            result.command_ordinal,
+            &result.command_id,
+            &result.invocation_id,
+            &result.runner_nonce,
+        )
+    ));
+    symlink(&target, &temporary).expect("symlink");
+
+    assert!(write_result_file(&dir, &result).is_err());
+    assert_eq!(fs::read(&target).expect("target bytes"), b"unchanged");
+}
+
+#[test]
+fn published_result_is_regular_and_identity_stable_on_reopen() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let result = result();
+    let dir = create_invocation_dir(temp.path(), &result.invocation_id, &result.runner_nonce)
+        .expect("private dir");
+    write_result_file(&dir, &result).expect("write result");
+    let path = dir.join(result_filename(
+        result.command_ordinal,
+        &result.command_id,
+        &result.invocation_id,
+        &result.runner_nonce,
+    ));
+    let first = open_existing_private_file(&path).expect("first open");
+    let second = open_existing_private_file(&path).expect("second open");
+    assert_eq!(
+        file_identity(&first).expect("first identity"),
+        file_identity(&second).expect("second identity")
+    );
+    assert_eq!(
+        read_result_file(&path).expect("strict read").command_id,
+        result.command_id
+    );
+}

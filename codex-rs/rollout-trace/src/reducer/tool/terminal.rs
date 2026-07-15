@@ -97,13 +97,18 @@ impl TraceReducer {
             return Ok(None);
         };
 
-        let payload: ExecCommandBeginPayload =
-            self.read_payload(runtime_payload).with_context(|| {
-                format!(
-                    "parse terminal runtime start payload {}",
-                    runtime_payload.raw_payload_id
-                )
-            })?;
+        let payload: ExecCommandBeginPayload = match self.read_payload(runtime_payload) {
+            Ok(payload) => payload,
+            Err(_) => {
+                let value = self.read_payload_json(runtime_payload)?;
+                serde_json::from_value(value).with_context(|| {
+                    format!(
+                        "parse terminal runtime start payload {}",
+                        runtime_payload.raw_payload_id
+                    )
+                })?
+            }
+        };
         let request = parse_protocol_terminal_request(payload, &operation_kind);
         self.insert_terminal_operation(TerminalOperationStart {
             seq,

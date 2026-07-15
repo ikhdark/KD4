@@ -547,12 +547,24 @@ fn exec_command_tool_output_clones_share_cached_analysis() {
     let code_mode = output.code_mode_result(&payload);
 
     assert!(std::sync::Arc::ptr_eq(&output.analysis, &cloned.analysis));
-    assert_eq!(output.decoded_output().as_ptr(), cloned.decoded_output().as_ptr());
+    assert_eq!(
+        output.decoded_output().as_ptr(),
+        cloned.decoded_output().as_ptr()
+    );
     assert_eq!(output.hook_output().as_ptr(), cloned.hook_output().as_ptr());
-    assert_eq!(output.model_output().as_ptr(), cloned.model_output().as_ptr());
-    assert_eq!(output.response_text().as_ptr(), cloned.response_text().as_ptr());
+    assert_eq!(
+        output.model_output().as_ptr(),
+        cloned.model_output().as_ptr()
+    );
+    assert_eq!(
+        output.response_text().as_ptr(),
+        cloned.response_text().as_ptr()
+    );
     assert_eq!(output.preview().as_ptr(), cloned.preview().as_ptr());
-    assert_eq!(hook_response, cloned.post_tool_use_response("call-cache", &payload));
+    assert_eq!(
+        hook_response,
+        cloned.post_tool_use_response("call-cache", &payload)
+    );
     assert_eq!(preview, cloned.log_preview());
     assert_eq!(response, cloned.to_response_item("call-cache", &payload));
     assert_eq!(code_mode, cloned.code_mode_result(&payload));

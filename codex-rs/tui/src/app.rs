@@ -1302,6 +1302,7 @@ See the Codex keymap documentation for supported actions and examples."
                     // Allow widgets to process any pending timers before rendering.
                     self.chat_widget.pre_draw_tick();
                     let rendered_area = self.render_chat_widget_frame(tui)?;
+                    self.chat_widget.on_terminal_frame_rendered();
                     if self.chat_widget.ambient_pet_image_enabled() {
                         let terminal_size = tui.terminal.size()?;
                         let ambient_pet_area = Rect::new(

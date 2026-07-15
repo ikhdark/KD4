@@ -109,6 +109,7 @@ impl ChatWidget {
     }
 
     pub(super) fn on_agent_message_delta(&mut self, delta: String) {
+        self.note_active_first_assistant_output(!delta.is_empty());
         self.handle_streaming_delta(delta);
     }
 

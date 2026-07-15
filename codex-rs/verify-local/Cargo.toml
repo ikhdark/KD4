@@ -31,5 +31,16 @@ toml = { workspace = true }
 walkdir = { workspace = true }
 tempfile = { workspace = true }
 
+[target.'cfg(windows)'.dependencies.windows-sys]
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+]
+version = "0.52"
+
 [dev-dependencies]
 pretty_assertions = { workspace = true }

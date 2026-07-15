@@ -122,6 +122,7 @@ mod tests {
     use tracing::field::Visit;
     use tracing::span::Attributes;
     use tracing::span::Record;
+    use tracing::subscriber::Interest;
 
     #[derive(Clone, Default)]
     struct EventCollector {
@@ -131,6 +132,10 @@ mod tests {
     impl Subscriber for EventCollector {
         fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
             true
+        }
+
+        fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+            Interest::always()
         }
 
         fn new_span(&self, _span: &Attributes<'_>) -> Id {
@@ -250,6 +255,8 @@ mod tests {
             assert!(value.chars().count() <= DIAGNOSTIC_PREVIEW_CHARS);
             assert!(!value.chars().any(|ch| matches!(ch, '\n' | '\r' | '\t')));
         }
+        assert!(event["error"].ends_with('…'));
+        assert!(event["preview"].ends_with('…'));
         assert!(!event["error"].contains("ERROR_TAIL"));
         assert!(!event["preview"].contains("INPUT_TAIL"));
     }

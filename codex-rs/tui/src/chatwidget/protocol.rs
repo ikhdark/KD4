@@ -61,6 +61,18 @@ impl ChatWidget {
                 self.turn_lifecycle.last_turn_id = Some(notification.turn.id);
                 self.last_non_retry_error = None;
                 if !matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages)) {
+                    if let Some(correlation_id) = self.first_terminal_frame.on_turn_started() {
+                        tracing::debug!(
+                            target: "codex_tui::latency",
+                            correlation_id,
+                            turn_id = self
+                                .turn_lifecycle
+                                .last_turn_id
+                                .as_deref()
+                                .unwrap_or_default(),
+                            "submitted turn started for terminal-frame correlation"
+                        );
+                    }
                     self.on_task_started();
                 }
             }
@@ -247,6 +259,9 @@ impl ChatWidget {
         notification: TurnCompletedNotification,
         replay_kind: Option<ReplayKind>,
     ) {
+        if self.turn_lifecycle.last_turn_id.as_deref() == Some(notification.turn.id.as_str()) {
+            self.first_terminal_frame.on_turn_completed();
+        }
         // User-message dedupe only suppresses the app-server echo of a prompt
         // this TUI already rendered locally. Once that turn ends, another
         // client can submit the same text and it still needs its own user cell.

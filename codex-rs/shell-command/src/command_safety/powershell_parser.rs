@@ -2,6 +2,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -321,11 +322,33 @@ async fn route_request(
 
 async fn run_actor(
     executable: PathBuf,
-    mut requests: tokio_mpsc::Receiver<ActorRequest>,
+    requests: tokio_mpsc::Receiver<ActorRequest>,
     state: Arc<AtomicU8>,
     generation: Arc<AtomicU64>,
 ) {
-    let mut parser: Option<PowershellParserProcess> = None;
+    run_actor_with_factory(
+        executable,
+        requests,
+        state,
+        generation,
+        PARSER_REAP_TIMEOUT,
+        PowershellParserProcess::spawn,
+    )
+    .await;
+}
+
+async fn run_actor_with_factory<P, F>(
+    executable: PathBuf,
+    mut requests: tokio_mpsc::Receiver<ActorRequest>,
+    state: Arc<AtomicU8>,
+    generation: Arc<AtomicU64>,
+    reap_timeout: Duration,
+    mut spawn: F,
+) where
+    P: ParserProcess,
+    F: FnMut(&PathBuf) -> std::io::Result<P> + Send,
+{
+    let mut parser: Option<P> = None;
     loop {
         let request = match tokio::time::timeout(ACTOR_IDLE_TTL, requests.recv()).await {
             Ok(Some(request)) => request,
@@ -335,7 +358,7 @@ async fn run_actor(
                 while let Ok(request) = requests.try_recv() {
                     send_outcome(request.response, PowershellParseOutcome::Failed);
                 }
-                quarantine_and_reap(&state, &generation, &mut parser).await;
+                quarantine_and_reap(&state, &generation, &mut parser, reap_timeout).await;
                 state.store(ActorState::Stopped as u8, Ordering::Release);
                 return;
             }
@@ -347,19 +370,33 @@ async fn run_actor(
             continue;
         }
 
-        let outcome =
-            process_request(&executable, &state, &generation, &mut parser, &request).await;
+        let outcome = process_request(
+            &executable,
+            &state,
+            &generation,
+            &mut parser,
+            &request,
+            reap_timeout,
+            &mut spawn,
+        )
+        .await;
         send_outcome(request.response, outcome);
     }
 }
 
-async fn process_request(
+async fn process_request<P, F>(
     executable: &PathBuf,
     state: &Arc<AtomicU8>,
     generation: &Arc<AtomicU64>,
-    parser: &mut Option<PowershellParserProcess>,
+    parser: &mut Option<P>,
     request: &ActorRequest,
-) -> PowershellParseOutcome {
+    reap_timeout: Duration,
+    spawn: &mut F,
+) -> PowershellParseOutcome
+where
+    P: ParserProcess,
+    F: FnMut(&PathBuf) -> std::io::Result<P> + Send,
+{
     for attempt in 0..=1 {
         let remaining = request.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -367,10 +404,10 @@ async fn process_request(
         }
 
         if parser.is_none() {
-            match PowershellParserProcess::spawn(executable) {
+            match spawn(executable) {
                 Ok(process) => *parser = Some(process),
                 Err(_) => {
-                    quarantine_and_reap(state, generation, parser).await;
+                    quarantine_and_reap(state, generation, parser, reap_timeout).await;
                     if attempt == 1 || Instant::now() >= request.deadline {
                         state.store(ActorState::Active as u8, Ordering::Release);
                         return PowershellParseOutcome::Failed;
@@ -381,7 +418,7 @@ async fn process_request(
             }
         }
         if Instant::now() >= request.deadline {
-            quarantine_and_reap(state, generation, parser).await;
+            quarantine_and_reap(state, generation, parser, reap_timeout).await;
             state.store(ActorState::Active as u8, Ordering::Release);
             return PowershellParseOutcome::Failed;
         }
@@ -399,12 +436,12 @@ async fn process_request(
         match parse_result {
             Ok(Ok(outcome)) if Instant::now() < request.deadline => return outcome,
             Ok(Ok(_)) => {
-                quarantine_and_reap(state, generation, parser).await;
+                quarantine_and_reap(state, generation, parser, reap_timeout).await;
                 state.store(ActorState::Active as u8, Ordering::Release);
                 return PowershellParseOutcome::Failed;
             }
             Ok(Err(_)) | Err(_) => {
-                quarantine_and_reap(state, generation, parser).await;
+                quarantine_and_reap(state, generation, parser, reap_timeout).await;
                 if attempt == 1 || Instant::now() >= request.deadline {
                     state.store(ActorState::Active as u8, Ordering::Release);
                     return PowershellParseOutcome::Failed;
@@ -417,14 +454,15 @@ async fn process_request(
     PowershellParseOutcome::Failed
 }
 
-async fn quarantine_and_reap(
+async fn quarantine_and_reap<P: ParserProcess>(
     state: &Arc<AtomicU8>,
     generation: &Arc<AtomicU64>,
-    parser: &mut Option<PowershellParserProcess>,
+    parser: &mut Option<P>,
+    reap_timeout: Duration,
 ) {
     state.store(ActorState::Quarantined as u8, Ordering::Release);
     if let Some(process) = parser.take() {
-        process.terminate_and_reap().await;
+        let _ = tokio::time::timeout(reap_timeout, process.terminate_and_reap()).await;
     }
     generation.fetch_add(1, Ordering::AcqRel);
 }
@@ -469,6 +507,16 @@ struct PowershellParserProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+trait ParserProcess: Send {
+    fn parse<'a>(
+        &'a mut self,
+        request_id: u64,
+        encoded_payload: &'a str,
+    ) -> impl Future<Output = std::io::Result<PowershellParseOutcome>> + Send + 'a;
+
+    fn terminate_and_reap(self) -> impl Future<Output = ()> + Send;
 }
 
 impl PowershellParserProcess {
@@ -560,7 +608,21 @@ impl PowershellParserProcess {
         drop(self.stdin);
         drop(self.stdout);
         let _ = self.child.start_kill();
-        let _ = tokio::time::timeout(PARSER_REAP_TIMEOUT, self.child.wait()).await;
+        let _ = self.child.wait().await;
+    }
+}
+
+impl ParserProcess for PowershellParserProcess {
+    fn parse<'a>(
+        &'a mut self,
+        request_id: u64,
+        encoded_payload: &'a str,
+    ) -> impl Future<Output = std::io::Result<PowershellParseOutcome>> + Send + 'a {
+        PowershellParserProcess::parse(self, request_id, encoded_payload)
+    }
+
+    fn terminate_and_reap(self) -> impl Future<Output = ()> + Send {
+        PowershellParserProcess::terminate_and_reap(self)
     }
 }
 
@@ -621,36 +683,48 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::sync::atomic::AtomicBool;
 
-    struct BatchScripts {
-        root: PathBuf,
+    #[derive(Clone, Copy)]
+    enum FakeParseBehavior {
+        Hang,
+        Unsupported,
     }
 
-    impl BatchScripts {
-        fn new(label: &str) -> Self {
-            let unique = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "codex-powershell-parser-{label}-{}-{unique}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&root).expect("create parser test directory");
-            Self { root }
-        }
-
-        fn write(&self, name: &str, body: &str) -> PathBuf {
-            let path = self.root.join(name);
-            std::fs::write(&path, body).expect("write parser test batch file");
-            path
-        }
+    #[derive(Clone, Copy)]
+    enum FakeReapBehavior {
+        Hang,
+        Complete,
     }
 
-    impl Drop for BatchScripts {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.root);
-        }
+    struct FakeParserProcess {
+        parse_behavior: FakeParseBehavior,
+        reap_behavior: FakeReapBehavior,
+        reap_attempts: Arc<AtomicU64>,
     }
 
-    fn healthy_batch_script() -> &'static str {
-        "@echo off\r\nset /p line=\r\nfor /f \"tokens=2 delims=:,\" %%A in (\"%line%\") do set id=%%A\r\necho {\"id\":%id%,\"status\":\"unsupported\",\"commands\":null}\r\n"
+    impl ParserProcess for FakeParserProcess {
+        fn parse<'a>(
+            &'a mut self,
+            _request_id: u64,
+            _encoded_payload: &'a str,
+        ) -> impl Future<Output = std::io::Result<PowershellParseOutcome>> + Send + 'a {
+            async move {
+                match self.parse_behavior {
+                    FakeParseBehavior::Hang => {
+                        std::future::pending::<std::io::Result<PowershellParseOutcome>>().await
+                    }
+                    FakeParseBehavior::Unsupported => Ok(PowershellParseOutcome::Unsupported),
+                }
+            }
+        }
+
+        fn terminate_and_reap(self) -> impl Future<Output = ()> + Send {
+            async move {
+                self.reap_attempts.fetch_add(1, Ordering::Relaxed);
+                if matches!(self.reap_behavior, FakeReapBehavior::Hang) {
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
     }
 
     async fn receive_outcome(
@@ -663,28 +737,21 @@ mod tests {
             .expect("parser actor should respond within the test bound")
     }
 
-    async fn stop_test_actors(pool: &Arc<Mutex<ParserPool>>) {
-        let states = {
-            let mut pool = pool.lock().await;
-            let states = pool
-                .actors
-                .values()
-                .map(|handle| Arc::clone(&handle.state))
-                .collect::<Vec<_>>();
-            pool.actors.clear();
-            states
-        };
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while states
-            .iter()
-            .any(|state| state.load(Ordering::Acquire) != ActorState::Stopped as u8)
-        {
-            assert!(
-                Instant::now() < deadline,
-                "parser actors should stop after their routing handles are dropped"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+    fn actor_request(
+        generation: u64,
+        deadline: Instant,
+    ) -> (ActorRequest, mpsc::Receiver<PowershellParseOutcome>) {
+        let (response, response_rx) = mpsc::channel();
+        (
+            ActorRequest {
+                generation,
+                request_id: NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed),
+                encoded_payload: String::new(),
+                deadline,
+                response,
+            },
+            response_rx,
+        )
     }
 
     fn parse(script: &str) -> Option<PowershellParseOutcome> {
@@ -722,38 +789,61 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn hung_parser_preserves_heartbeat_and_other_executable_progress() {
-        let scripts = BatchScripts::new("concurrency");
-        let hung = scripts.write(
-            "hung.cmd",
-            "@echo off\r\nset /p request=\r\nset /p wait=\r\n",
-        );
-        let healthy = scripts.write("healthy.cmd", healthy_batch_script());
-        let pool = Arc::new(Mutex::new(ParserPool::default()));
-        let (hung_tx, hung_rx) = mpsc::channel();
-        let (healthy_tx, healthy_rx) = mpsc::channel();
-
-        route_request(
-            Arc::clone(&pool),
-            ExecutableIdentity {
-                key: "test-hung".to_string(),
-                launch_path: hung,
-            },
-            String::new(),
-            Instant::now() + Duration::from_secs(3),
-            hung_tx,
-        )
-        .await;
-        route_request(
-            Arc::clone(&pool),
-            ExecutableIdentity {
-                key: "test-healthy".to_string(),
-                launch_path: healthy,
-            },
-            String::new(),
-            Instant::now() + Duration::from_secs(2),
-            healthy_tx,
-        )
-        .await;
+        let reap_timeout = Duration::from_millis(25);
+        let hung_reaps = Arc::new(AtomicU64::new(0));
+        let healthy_reaps = Arc::new(AtomicU64::new(0));
+        let hung_state = Arc::new(AtomicU8::new(ActorState::Active as u8));
+        let healthy_state = Arc::new(AtomicU8::new(ActorState::Active as u8));
+        let hung_generation = Arc::new(AtomicU64::new(0));
+        let healthy_generation = Arc::new(AtomicU64::new(0));
+        let (hung_tx, hung_rx) = tokio_mpsc::channel(1);
+        let (healthy_tx, healthy_rx) = tokio_mpsc::channel(1);
+        let hung_actor = {
+            let reap_attempts = Arc::clone(&hung_reaps);
+            tokio::spawn(run_actor_with_factory(
+                PathBuf::from("hung-parser"),
+                hung_rx,
+                Arc::clone(&hung_state),
+                Arc::clone(&hung_generation),
+                reap_timeout,
+                move |_| {
+                    Ok(FakeParserProcess {
+                        parse_behavior: FakeParseBehavior::Hang,
+                        reap_behavior: FakeReapBehavior::Hang,
+                        reap_attempts: Arc::clone(&reap_attempts),
+                    })
+                },
+            ))
+        };
+        let healthy_actor = {
+            let reap_attempts = Arc::clone(&healthy_reaps);
+            tokio::spawn(run_actor_with_factory(
+                PathBuf::from("healthy-parser"),
+                healthy_rx,
+                Arc::clone(&healthy_state),
+                Arc::clone(&healthy_generation),
+                reap_timeout,
+                move |_| {
+                    Ok(FakeParserProcess {
+                        parse_behavior: FakeParseBehavior::Unsupported,
+                        reap_behavior: FakeReapBehavior::Complete,
+                        reap_attempts: Arc::clone(&reap_attempts),
+                    })
+                },
+            ))
+        };
+        let (hung_request, hung_response) =
+            actor_request(0, Instant::now() + Duration::from_millis(150));
+        let (healthy_request, healthy_response) =
+            actor_request(0, Instant::now() + Duration::from_secs(1));
+        hung_tx
+            .send(hung_request)
+            .await
+            .expect("hung actor should accept request");
+        healthy_tx
+            .send(healthy_request)
+            .await
+            .expect("healthy actor should accept request");
 
         let heartbeat_ticks = Arc::new(AtomicU64::new(0));
         let heartbeat_stop = Arc::new(AtomicBool::new(false));
@@ -767,18 +857,18 @@ mod tests {
                 }
             })
         };
-        let hung_wait = tokio::spawn(receive_outcome(hung_rx, Duration::from_secs(5)));
-        let healthy_wait = tokio::spawn(receive_outcome(healthy_rx, Duration::from_secs(2)));
+        let hung_wait = tokio::spawn(receive_outcome(hung_response, Duration::from_secs(1)));
+        let healthy_wait = tokio::spawn(receive_outcome(healthy_response, Duration::from_secs(1)));
 
-        tokio::time::sleep(Duration::from_millis(60)).await;
-        assert!(heartbeat_ticks.load(Ordering::Relaxed) >= 3);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(heartbeat_ticks.load(Ordering::Relaxed) >= 2);
         assert!(
             !hung_wait.is_finished(),
             "hung parser must remain isolated rather than fail the actor immediately"
         );
 
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), healthy_wait)
+            tokio::time::timeout(Duration::from_secs(1), healthy_wait)
                 .await
                 .expect("healthy executable should progress while its peer is hung")
                 .expect("healthy response task should not panic"),
@@ -789,79 +879,106 @@ mod tests {
             "healthy executable should complete before the hung request deadline"
         );
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), hung_wait)
+            tokio::time::timeout(Duration::from_secs(1), hung_wait)
                 .await
                 .expect("hung request should be deadline bounded")
                 .expect("hung response task should not panic"),
             PowershellParseOutcome::Failed
         );
+        assert_eq!(hung_reaps.load(Ordering::Relaxed), 1);
+        assert_eq!(hung_generation.load(Ordering::Acquire), 1);
 
         heartbeat_stop.store(true, Ordering::Release);
         heartbeat.await.expect("heartbeat task should stop");
-        stop_test_actors(&pool).await;
+        drop(hung_tx);
+        drop(healthy_tx);
+        tokio::time::timeout(Duration::from_secs(1), hung_actor)
+            .await
+            .expect("hung actor should stop after its queue closes")
+            .expect("hung actor task should not panic");
+        tokio::time::timeout(Duration::from_secs(1), healthy_actor)
+            .await
+            .expect("healthy actor should stop after its queue closes")
+            .expect("healthy actor task should not panic");
+        assert_eq!(
+            hung_state.load(Ordering::Acquire),
+            ActorState::Stopped as u8
+        );
+        assert_eq!(
+            healthy_state.load(Ordering::Acquire),
+            ActorState::Stopped as u8
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn timed_out_parser_restarts_for_a_later_request() {
-        let scripts = BatchScripts::new("restart");
-        let marker = scripts.root.join("started.marker");
-        let restart = scripts.write(
-            "restart.cmd",
-            &format!(
-                "@echo off\r\nif exist \"{}\" goto healthy\r\ntype nul > \"{}\"\r\nset /p request=\r\nset /p wait=\r\nexit /b\r\n:healthy\r\n{}",
-                marker.display(),
-                marker.display(),
-                healthy_batch_script()
-            ),
-        );
-        let pool = Arc::new(Mutex::new(ParserPool::default()));
-        let identity = ExecutableIdentity {
-            key: "test-restart".to_string(),
-            launch_path: restart,
+        let reap_timeout = Duration::from_millis(25);
+        let spawn_count = Arc::new(AtomicU64::new(0));
+        let reap_attempts = Arc::new(AtomicU64::new(0));
+        let state = Arc::new(AtomicU8::new(ActorState::Active as u8));
+        let generation = Arc::new(AtomicU64::new(0));
+        let (request_tx, request_rx) = tokio_mpsc::channel(1);
+        let actor = {
+            let spawn_count = Arc::clone(&spawn_count);
+            let reap_attempts = Arc::clone(&reap_attempts);
+            tokio::spawn(run_actor_with_factory(
+                PathBuf::from("restartable-parser"),
+                request_rx,
+                Arc::clone(&state),
+                Arc::clone(&generation),
+                reap_timeout,
+                move |_| {
+                    let launch = spawn_count.fetch_add(1, Ordering::Relaxed);
+                    Ok(FakeParserProcess {
+                        parse_behavior: if launch == 0 {
+                            FakeParseBehavior::Hang
+                        } else {
+                            FakeParseBehavior::Unsupported
+                        },
+                        reap_behavior: if launch == 0 {
+                            FakeReapBehavior::Hang
+                        } else {
+                            FakeReapBehavior::Complete
+                        },
+                        reap_attempts: Arc::clone(&reap_attempts),
+                    })
+                },
+            ))
         };
-        let (first_tx, first_rx) = mpsc::channel();
-
-        route_request(
-            Arc::clone(&pool),
-            identity.clone(),
-            String::new(),
-            Instant::now() + Duration::from_millis(200),
-            first_tx,
-        )
-        .await;
+        let (first_request, first_response) =
+            actor_request(0, Instant::now() + Duration::from_millis(100));
+        request_tx
+            .send(first_request)
+            .await
+            .expect("actor should accept the first request");
         assert_eq!(
-            receive_outcome(first_rx, Duration::from_secs(2)).await,
+            receive_outcome(first_response, Duration::from_secs(1)).await,
             PowershellParseOutcome::Failed
         );
-        assert!(
-            marker.exists(),
-            "first parser launch should create its marker"
-        );
-        {
-            let pool = pool.lock().await;
-            let handle = pool
-                .actors
-                .get(&identity.key)
-                .expect("timed-out actor should remain restartable");
-            assert_eq!(handle.state(), ActorState::Active);
-            assert!(handle.generation.load(Ordering::Acquire) >= 1);
-        }
+        assert_eq!(state.load(Ordering::Acquire), ActorState::Active as u8);
+        assert_eq!(generation.load(Ordering::Acquire), 1);
+        assert_eq!(spawn_count.load(Ordering::Relaxed), 1);
+        assert_eq!(reap_attempts.load(Ordering::Relaxed), 1);
 
-        let (second_tx, second_rx) = mpsc::channel();
-        route_request(
-            Arc::clone(&pool),
-            identity,
-            String::new(),
-            Instant::now() + Duration::from_secs(2),
-            second_tx,
-        )
-        .await;
+        let (second_request, second_response) =
+            actor_request(1, Instant::now() + Duration::from_secs(1));
+        request_tx
+            .send(second_request)
+            .await
+            .expect("actor should accept a later request");
         assert_eq!(
-            receive_outcome(second_rx, Duration::from_secs(2)).await,
+            receive_outcome(second_response, Duration::from_secs(1)).await,
             PowershellParseOutcome::Unsupported
         );
+        assert_eq!(spawn_count.load(Ordering::Relaxed), 2);
 
-        stop_test_actors(&pool).await;
+        drop(request_tx);
+        tokio::time::timeout(Duration::from_secs(1), actor)
+            .await
+            .expect("restartable actor should stop after its queue closes")
+            .expect("restartable actor task should not panic");
+        assert_eq!(state.load(Ordering::Acquire), ActorState::Stopped as u8);
+        assert_eq!(reap_attempts.load(Ordering::Relaxed), 2);
     }
 
     #[test]

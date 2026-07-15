@@ -147,6 +147,19 @@ impl TraceReducer {
             .with_context(|| format!("parse payload {}", payload.raw_payload_id))
     }
 
+    fn read_payload_with_legacy_value_errors<T: DeserializeOwned>(
+        &self,
+        payload: &RawPayloadRef,
+    ) -> Result<T> {
+        match self.read_payload(payload) {
+            Ok(payload) => Ok(payload),
+            Err(_) => {
+                let value = self.read_payload_json(payload)?;
+                Ok(serde_json::from_value(value)?)
+            }
+        }
+    }
+
     fn read_payload_json(&self, payload: &RawPayloadRef) -> Result<Value> {
         self.read_payload(payload)
     }

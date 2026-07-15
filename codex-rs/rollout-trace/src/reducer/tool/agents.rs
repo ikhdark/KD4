@@ -178,7 +178,7 @@ impl TraceReducer {
         match kind {
             ToolCallKind::AssignAgentTask => {
                 let payload: CollabAgentInteractionBeginEvent =
-                    self.read_payload(runtime_payload)?;
+                    self.read_payload_with_legacy_value_errors(runtime_payload)?;
                 self.queue_message_agent_interaction(
                     tool_call_id,
                     InteractionEdgeKind::AssignAgentTask,
@@ -189,7 +189,7 @@ impl TraceReducer {
             }
             ToolCallKind::SendMessage => {
                 let payload: CollabAgentInteractionBeginEvent =
-                    self.read_payload(runtime_payload)?;
+                    self.read_payload_with_legacy_value_errors(runtime_payload)?;
                 self.queue_message_agent_interaction(
                     tool_call_id,
                     InteractionEdgeKind::SendMessage,
@@ -199,7 +199,8 @@ impl TraceReducer {
                 )
             }
             ToolCallKind::CloseAgent => {
-                let payload: CollabCloseBeginEvent = self.read_payload(runtime_payload)?;
+                let payload: CollabCloseBeginEvent =
+                    self.read_payload_with_legacy_value_errors(runtime_payload)?;
                 self.upsert_close_agent_interaction(
                     tool_call_id,
                     payload.receiver_thread_id.to_string(),

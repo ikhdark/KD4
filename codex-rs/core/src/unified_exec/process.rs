@@ -670,7 +670,8 @@ impl UnifiedExecProcess {
                 {
                     let recovery_was_required = event_delivery_lost
                         || event_seq.is_some_and(|seq| seq > last_seq.saturating_add(1));
-                    let mut saw_gap_metadata = false;
+                    let mut received_recovery_page = false;
+                    let mut all_recovery_pages_explicit = true;
                     let mut incomplete_reason: Option<String> = None;
                     let mut terminal_exited = false;
                     let mut terminal_exit_code = None;
@@ -698,6 +699,8 @@ impl UnifiedExecProcess {
                         let ExecReadResponse {
                             chunks,
                             output_gaps,
+                            earliest_retained_seq,
+                            complete,
                             next_seq,
                             exited,
                             exit_code,
@@ -719,7 +722,25 @@ impl UnifiedExecProcess {
                         terminal_failure = terminal_failure.or(failure);
                         terminal_sandbox_denied |= sandbox_denied;
 
-                        saw_gap_metadata |= !output_gaps.is_empty();
+                        received_recovery_page = true;
+                        all_recovery_pages_explicit &=
+                            earliest_retained_seq.is_some() && complete.is_some();
+                        if let Some(earliest_retained_seq) = earliest_retained_seq
+                            && (earliest_retained_seq == 0
+                                || earliest_retained_seq > next_seq
+                                || chunks
+                                    .first()
+                                    .is_some_and(|chunk| earliest_retained_seq > chunk.seq)
+                                || output_gaps
+                                    .iter()
+                                    .any(|gap| gap.last_missing_seq >= earliest_retained_seq))
+                        {
+                            incomplete_reason = Some(
+                                "recovery returned an invalid earliest-retained boundary"
+                                    .to_string(),
+                            );
+                            break;
+                        }
                         for gap in output_gaps {
                             if !merge_recovery_gap(&mut recovery_gaps, gap, &recovered_sequences) {
                                 incomplete_reason =
@@ -811,8 +832,13 @@ impl UnifiedExecProcess {
                         }
 
                         let page_was_limited = local_page_limit_reached
-                            || page_chunk_count >= RECOVERY_PAGE_MAX_CHUNKS
-                            || page_bytes >= RECOVERY_PAGE_MAX_BYTES;
+                            || match complete {
+                                Some(complete) => !complete,
+                                None => {
+                                    page_chunk_count >= RECOVERY_PAGE_MAX_CHUNKS
+                                        || page_bytes >= RECOVERY_PAGE_MAX_BYTES
+                                }
+                            };
                         if page_chunk_count == 0
                             && last_seq <= page_start_seq
                             && next_seq <= page_start_seq.saturating_add(1)
@@ -858,9 +884,11 @@ impl UnifiedExecProcess {
                         }
                     }
 
-                    if recovery_was_required && !saw_gap_metadata {
+                    if recovery_was_required
+                        && (!received_recovery_page || !all_recovery_pages_explicit)
+                    {
                         incomplete_reason.get_or_insert_with(|| {
-                            "peer supplied no recovery gap metadata".to_string()
+                            "peer supplied no explicit recovery completeness contract".to_string()
                         });
                     }
                     if terminal_closed && !terminal_exited && terminal_failure.is_none() {

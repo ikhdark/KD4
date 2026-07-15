@@ -380,6 +380,36 @@ fn failed_or_timed_out_mutators_still_create_unknown_mutation_state() {
 }
 
 #[test]
+fn observed_noop_overrides_syntactic_mutator_classification() {
+    let command = [
+        "pwsh".to_string(),
+        "-Command".to_string(),
+        "Set-Content -LiteralPath a.txt -Value unchanged; exit 1".to_string(),
+    ];
+    let mut tracker = TurnDiffTracker::new();
+
+    tracker.record_exec_command_end_at_with_observation(
+        &command,
+        1,
+        false,
+        "",
+        None,
+        MutationObservation::Unchanged,
+    );
+    assert!(!tracker.has_unvalidated_mutation());
+
+    tracker.record_exec_command_end_at_with_observation(
+        &command,
+        1,
+        false,
+        "",
+        None,
+        MutationObservation::Changed,
+    );
+    assert!(tracker.has_unvalidated_mutation());
+}
+
+#[test]
 fn just_fix_is_a_mutation_and_cannot_validate_its_own_edits() {
     let mut tracker = TurnDiffTracker::new();
     tracker.record_unknown_mutation();

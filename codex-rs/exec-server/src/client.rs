@@ -1066,6 +1066,8 @@ impl SessionState {
         ReadResponse {
             chunks: Vec::new(),
             output_gaps: Vec::new(),
+            earliest_retained_seq: Some(next_seq),
+            complete: Some(true),
             next_seq,
             exited: true,
             exit_code: None,
@@ -2238,6 +2240,8 @@ mod tests {
                     result: serde_json::to_value(ReadResponse {
                         chunks: Vec::new(),
                         output_gaps: Vec::new(),
+                        earliest_retained_seq: Some(1),
+                        complete: Some(true),
                         next_seq: 1,
                         exited: false,
                         exit_code: None,

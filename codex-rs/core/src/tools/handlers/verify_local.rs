@@ -20,13 +20,17 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
 use codex_protocol::exec_output::ExecToolCallOutput;
+use codex_tools::ToolName;
+use codex_tools::ToolSpec;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
+use codex_verify_local::CommandResultV2;
+use codex_verify_local::LaunchErrorKind;
+use codex_verify_local::LogState;
 use codex_verify_local::PlanMode;
 use codex_verify_local::PlanRequest;
 use codex_verify_local::RawPath;
 use codex_verify_local::RepositorySnapshot;
-use codex_verify_local::CommandResultV2;
-use codex_verify_local::LaunchErrorKind;
-use codex_verify_local::LogState;
 use codex_verify_local::SnapshotRecord;
 use codex_verify_local::SnapshotSource;
 use codex_verify_local::finalize_plan;
@@ -34,10 +38,6 @@ use codex_verify_local::plan_verification;
 use codex_verify_local::random_hex_128;
 use codex_verify_local::render_human;
 use codex_verify_local::serialize_legacy_v1;
-use codex_tools::ToolName;
-use codex_tools::ToolSpec;
-use codex_utils_absolute_path::AbsolutePathBuf;
-use codex_utils_path_uri::PathUri;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -275,11 +275,12 @@ impl VerifyLocalHandler {
                     facts.push(unsupported_path_result(&plan, command, ordinal, nonce));
                     continue;
                 };
-                let cwd = AbsolutePathBuf::from_absolute_path(repo_root.clone()).map_err(|err| {
-                    FunctionCallError::RespondToModel(format!(
-                        "invalid verify_local repo root: {err}"
-                    ))
-                })?;
+                let cwd =
+                    AbsolutePathBuf::from_absolute_path(repo_root.clone()).map_err(|err| {
+                        FunctionCallError::RespondToModel(format!(
+                            "invalid verify_local repo root: {err}"
+                        ))
+                    })?;
                 let hook_command = codex_shell_command::parse_command::shlex_join(&argv);
                 let exec_params = ExecParams {
                     command: argv.clone(),
@@ -458,7 +459,9 @@ fn unsupported_path_result(
     nonce: String,
 ) -> CommandResultV2 {
     CommandResultV2 {
-        runner_error: Some("command contains a path that Core cannot represent losslessly".to_string()),
+        runner_error: Some(
+            "command contains a path that Core cannot represent losslessly".to_string(),
+        ),
         launch_error: Some(LaunchErrorKind::UnsupportedPath),
         ..base_command_result(plan, command, ordinal, nonce)
     }
@@ -505,11 +508,12 @@ pub(crate) async fn run_automatic_verify_local_plan(
 ) -> Result<String, FunctionCallError> {
     let _ = (session, tracker, cancellation_token);
     let scope_current = changed.is_empty();
-    let environment = resolve_tool_environment(&step_context.environments, None)?.ok_or_else(|| {
-        FunctionCallError::RespondToModel(
-            "automatic verify_local planning requires a selected local environment".to_string(),
-        )
-    })?;
+    let environment =
+        resolve_tool_environment(&step_context.environments, None)?.ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "automatic verify_local planning requires a selected local environment".to_string(),
+            )
+        })?;
     if environment.environment.is_remote() {
         return Err(FunctionCallError::RespondToModel(
             "automatic verify_local planning is available only locally".to_string(),
@@ -520,7 +524,10 @@ pub(crate) async fn run_automatic_verify_local_plan(
             "automatic verify_local planning could not locate the repository root".to_string(),
         )
     })?;
-    let changed_paths = changed.into_iter().map(RawPath::from_utf8).collect::<Vec<_>>();
+    let changed_paths = changed
+        .into_iter()
+        .map(RawPath::from_utf8)
+        .collect::<Vec<_>>();
     let snapshot = RepositorySnapshot {
         repository_root: Some(repo_root),
         source: SnapshotSource::ExplicitPaths,

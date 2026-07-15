@@ -608,19 +608,17 @@ async fn emit_exec_end(
             possible_mutation,
         )
         .await;
-    let tracker_mutation = mutation_observation.map_or(possible_mutation, |observation| {
-        matches!(
-            observation,
-            crate::task_evidence::MutationObservation::Changed
-                | crate::task_evidence::MutationObservation::Unknown
-        )
+    let tracker_observation = mutation_observation.unwrap_or(if possible_mutation {
+        crate::task_evidence::MutationObservation::Unknown
+    } else {
+        crate::task_evidence::MutationObservation::Unchanged
     });
     if let Some(tracker) = ctx.turn_diff_tracker {
         let native_cwd = exec_input.cwd.to_abs_path().ok();
         tracker
             .lock()
             .await
-            .record_exec_command_end_at_with_mutation(
+            .record_exec_command_end_at_with_observation(
                 exec_input.command,
                 exec_result.exit_code,
                 exec_result.timed_out,
@@ -628,7 +626,7 @@ async fn emit_exec_end(
                 native_cwd
                     .as_ref()
                     .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
-                tracker_mutation,
+                tracker_observation,
             );
     }
 

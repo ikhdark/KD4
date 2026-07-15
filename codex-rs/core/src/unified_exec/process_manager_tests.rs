@@ -200,6 +200,71 @@ async fn capacity_omission_is_reported_once_per_drain_and_preserved_for_finaliza
 }
 
 #[tokio::test]
+async fn many_small_drains_share_one_response_cap_and_report_exact_omission() {
+    const CHUNK_BYTES: usize = 4 * 1024;
+    const CHUNK_COUNT: usize = 300;
+    let total_input = CHUNK_BYTES * CHUNK_COUNT;
+    let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(
+        UNIFIED_EXEC_OUTPUT_MAX_BYTES,
+    )));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let cancellation_token = CancellationToken::new();
+    let producer = {
+        let output_buffer = Arc::clone(&output_buffer);
+        let output_notify = Arc::clone(&output_notify);
+        let output_closed = Arc::clone(&output_closed);
+        let output_closed_notify = Arc::clone(&output_closed_notify);
+        tokio::spawn(async move {
+            for _ in 0..CHUNK_COUNT {
+                output_buffer
+                    .lock()
+                    .await
+                    .push_chunk(vec![b'x'; CHUNK_BYTES]);
+                output_notify.notify_waiters();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        if output_buffer.lock().await.retained_bytes() == 0 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("collector should drain each source chunk");
+            }
+            output_closed.store(true, Ordering::Release);
+            output_closed_notify.notify_waiters();
+        })
+    };
+
+    let collected = UnifiedExecProcessManager::collect_output_until_deadline(
+        &output_buffer,
+        &output_notify,
+        &output_closed,
+        &output_closed_notify,
+        &cancellation_token,
+        /*pause_state*/ None,
+        Instant::now() + Duration::from_secs(5),
+        CollectionMode::UntilDeadline,
+    )
+    .await;
+    producer.await.expect("producer should finish");
+
+    assert!(collected.len() <= UNIFIED_EXEC_OUTPUT_MAX_BYTES);
+    let rendered = String::from_utf8_lossy(&collected);
+    assert_eq!(rendered.matches("[output truncated:").count(), 1);
+    let reported_omitted = rendered
+        .split_once("[output truncated: ")
+        .and_then(|(_, suffix)| suffix.split_whitespace().next())
+        .and_then(|value| value.parse::<usize>().ok())
+        .expect("truncation marker should report omitted bytes");
+    let retained_source = collected.iter().filter(|byte| **byte == b'x').count();
+    assert_eq!(retained_source + reported_omitted, total_input);
+}
+
+#[tokio::test]
 async fn output_closure_without_output_returns_immediately() {
     let output_buffer = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::new(32)));
     let output_notify = Arc::new(Notify::new());

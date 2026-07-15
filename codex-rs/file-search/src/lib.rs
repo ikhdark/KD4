@@ -22,9 +22,11 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::process::Command;
 
 #[cfg(test)]
@@ -98,6 +100,75 @@ pub struct FileSearchSnapshot {
     pub walk_complete: bool,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+pub struct FileSearchUsageSnapshot {
+    pub one_shot_runs: u64,
+    pub interactive_sessions: u64,
+    pub query_updates: u64,
+    pub walker_runs: u64,
+    pub walker_entries: u64,
+    pub snapshots_emitted: u64,
+    pub walker_duration_ns: u64,
+    pub matcher_duration_ns: u64,
+}
+
+struct UsageCounters {
+    one_shot_runs: AtomicU64,
+    interactive_sessions: AtomicU64,
+    query_updates: AtomicU64,
+    walker_runs: AtomicU64,
+    walker_entries: AtomicU64,
+    snapshots_emitted: AtomicU64,
+    walker_duration_ns: AtomicU64,
+    matcher_duration_ns: AtomicU64,
+}
+
+impl UsageCounters {
+    const fn new() -> Self {
+        Self {
+            one_shot_runs: AtomicU64::new(0),
+            interactive_sessions: AtomicU64::new(0),
+            query_updates: AtomicU64::new(0),
+            walker_runs: AtomicU64::new(0),
+            walker_entries: AtomicU64::new(0),
+            snapshots_emitted: AtomicU64::new(0),
+            walker_duration_ns: AtomicU64::new(0),
+            matcher_duration_ns: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> FileSearchUsageSnapshot {
+        FileSearchUsageSnapshot {
+            one_shot_runs: self.one_shot_runs.load(Ordering::Relaxed),
+            interactive_sessions: self.interactive_sessions.load(Ordering::Relaxed),
+            query_updates: self.query_updates.load(Ordering::Relaxed),
+            walker_runs: self.walker_runs.load(Ordering::Relaxed),
+            walker_entries: self.walker_entries.load(Ordering::Relaxed),
+            snapshots_emitted: self.snapshots_emitted.load(Ordering::Relaxed),
+            walker_duration_ns: self.walker_duration_ns.load(Ordering::Relaxed),
+            matcher_duration_ns: self.matcher_duration_ns.load(Ordering::Relaxed),
+        }
+    }
+
+    fn add_walker_entries(&self, count: u64) {
+        self.walker_entries.fetch_add(count, Ordering::Relaxed);
+    }
+
+    fn add_duration(counter: &AtomicU64, elapsed: Duration) {
+        let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            Some(current.saturating_add(nanos))
+        });
+    }
+}
+
+static FILE_SEARCH_USAGE: UsageCounters = UsageCounters::new();
+
+/// Returns process-lifetime, content-free fuzzy-search usage measurements.
+pub fn file_search_usage_snapshot() -> FileSearchUsageSnapshot {
+    FILE_SEARCH_USAGE.snapshot()
+}
+
 #[derive(Debug, Clone)]
 pub struct FileSearchOptions {
     pub limit: NonZero<usize>,
@@ -136,6 +207,12 @@ pub trait SessionReporter: Send + Sync + 'static {
     fn on_complete(&self);
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SessionKind {
+    OneShot,
+    Interactive,
+}
+
 pub struct FileSearchSession {
     inner: Arc<SessionInner>,
 }
@@ -143,15 +220,42 @@ pub struct FileSearchSession {
 impl FileSearchSession {
     /// Update the query. This should be cheap relative to re-walking.
     pub fn update_query(&self, pattern_text: &str) {
-        let _ = self
+        if self
             .inner
             .work_tx
-            .send(WorkSignal::QueryUpdated(pattern_text.to_string()));
+            .send(WorkSignal::QueryUpdated(pattern_text.to_string()))
+            .is_ok()
+        {
+            self.inner
+                .metrics
+                .query_updates
+                .fetch_add(1, Ordering::Relaxed);
+            FILE_SEARCH_USAGE
+                .query_updates
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn usage_snapshot(&self) -> FileSearchUsageSnapshot {
+        self.inner.metrics.snapshot()
     }
 }
 
 impl Drop for FileSearchSession {
     fn drop(&mut self) {
+        let usage = self.usage_snapshot();
+        tracing::debug!(
+            target: "codex_file_search::usage",
+            one_shot_runs = usage.one_shot_runs,
+            interactive_sessions = usage.interactive_sessions,
+            query_updates = usage.query_updates,
+            walker_runs = usage.walker_runs,
+            walker_entries = usage.walker_entries,
+            snapshots_emitted = usage.snapshots_emitted,
+            walker_duration_ns = usage.walker_duration_ns,
+            matcher_duration_ns = usage.matcher_duration_ns,
+            "file search session usage"
+        );
         self.inner.shutdown.store(true, Ordering::Relaxed);
         let _ = self.inner.work_tx.send(WorkSignal::Shutdown);
     }
@@ -162,6 +266,22 @@ pub fn create_session(
     options: FileSearchOptions,
     reporter: Arc<dyn SessionReporter>,
     cancel_flag: Option<Arc<AtomicBool>>,
+) -> anyhow::Result<FileSearchSession> {
+    create_session_with_kind(
+        search_directories,
+        options,
+        reporter,
+        cancel_flag,
+        SessionKind::Interactive,
+    )
+}
+
+fn create_session_with_kind(
+    search_directories: Vec<PathBuf>,
+    options: FileSearchOptions,
+    reporter: Arc<dyn SessionReporter>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    session_kind: SessionKind,
 ) -> anyhow::Result<FileSearchSession> {
     let FileSearchOptions {
         limit,
@@ -190,6 +310,29 @@ pub fn create_session(
     let injector = nucleo.injector();
 
     let cancelled = cancel_flag.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+    let metrics = Arc::new(UsageCounters::new());
+    let mode = match session_kind {
+        SessionKind::OneShot => {
+            metrics.one_shot_runs.fetch_add(1, Ordering::Relaxed);
+            FILE_SEARCH_USAGE
+                .one_shot_runs
+                .fetch_add(1, Ordering::Relaxed);
+            "one_shot"
+        }
+        SessionKind::Interactive => {
+            metrics.interactive_sessions.fetch_add(1, Ordering::Relaxed);
+            FILE_SEARCH_USAGE
+                .interactive_sessions
+                .fetch_add(1, Ordering::Relaxed);
+            "interactive"
+        }
+    };
+    tracing::debug!(
+        target: "codex_file_search::usage",
+        mode,
+        roots = search_directories.len(),
+        "file search session started"
+    );
 
     let inner = Arc::new(SessionInner {
         search_directories,
@@ -199,6 +342,7 @@ pub fn create_session(
         respect_gitignore,
         cancelled,
         shutdown: Arc::new(AtomicBool::new(false)),
+        metrics,
         reporter,
         work_tx,
     });
@@ -297,7 +441,13 @@ pub fn run(
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<FileSearchResults> {
     let reporter = Arc::new(RunReporter::default());
-    let session = create_session(roots, options, reporter.clone(), cancel_flag)?;
+    let session = create_session_with_kind(
+        roots,
+        options,
+        reporter.clone(),
+        cancel_flag,
+        SessionKind::OneShot,
+    )?;
 
     session.update_query(pattern_text);
 
@@ -352,6 +502,7 @@ struct SessionInner {
     respect_gitignore: bool,
     cancelled: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
+    metrics: Arc<UsageCounters>,
     reporter: Arc<dyn SessionReporter>,
     work_tx: Sender<WorkSignal>,
 }
@@ -361,6 +512,42 @@ enum WorkSignal {
     NucleoNotify,
     WalkComplete,
     Shutdown,
+}
+
+struct WalkerEntryBatch {
+    pending: u64,
+    session: Arc<UsageCounters>,
+}
+
+impl WalkerEntryBatch {
+    fn new(session: Arc<UsageCounters>) -> Self {
+        Self {
+            pending: 0,
+            session,
+        }
+    }
+
+    fn observe(&mut self) {
+        self.pending += 1;
+        if self.pending >= 1024 {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.pending == 0 {
+            return;
+        }
+        self.session.add_walker_entries(self.pending);
+        FILE_SEARCH_USAGE.add_walker_entries(self.pending);
+        self.pending = 0;
+    }
+}
+
+impl Drop for WalkerEntryBatch {
+    fn drop(&mut self) {
+        self.flush();
+    }
 }
 
 fn build_override_matcher(
@@ -415,7 +602,13 @@ fn walker_worker(
     override_matcher: Option<ignore::overrides::Override>,
     injector: Injector<Arc<str>>,
 ) {
+    let started = Instant::now();
+    inner.metrics.walker_runs.fetch_add(1, Ordering::Relaxed);
+    FILE_SEARCH_USAGE
+        .walker_runs
+        .fetch_add(1, Ordering::Relaxed);
     let Some(first_root) = inner.search_directories.first() else {
+        record_walker_finished(&inner, started.elapsed());
         let _ = inner.work_tx.send(WorkSignal::WalkComplete);
         return;
     };
@@ -446,10 +639,12 @@ fn walker_worker(
     }
 
     let walker = walk_builder.build_parallel();
+    let metrics = inner.metrics.clone();
 
     walker.run(|| {
         const CHECK_INTERVAL: usize = 1024;
         let mut n = 0;
+        let mut usage = WalkerEntryBatch::new(metrics.clone());
         let search_directories = inner.search_directories.clone();
         let injector = injector.clone();
         let cancelled = inner.cancelled.clone();
@@ -460,6 +655,7 @@ fn walker_worker(
                 Ok(entry) => entry,
                 Err(_) => return ignore::WalkState::Continue,
             };
+            usage.observe();
             let path = entry.path();
             let Some(full_path) = path.to_str() else {
                 return ignore::WalkState::Continue;
@@ -479,7 +675,23 @@ fn walker_worker(
             ignore::WalkState::Continue
         })
     });
+    record_walker_finished(&inner, started.elapsed());
     let _ = inner.work_tx.send(WorkSignal::WalkComplete);
+}
+
+fn record_walker_finished(inner: &SessionInner, elapsed: Duration) {
+    UsageCounters::add_duration(&inner.metrics.walker_duration_ns, elapsed);
+    UsageCounters::add_duration(&FILE_SEARCH_USAGE.walker_duration_ns, elapsed);
+    let usage = inner.metrics.snapshot();
+    tracing::debug!(
+        target: "codex_file_search::usage",
+        walker_runs = usage.walker_runs,
+        walker_entries = usage.walker_entries,
+        walker_duration_ns = usage.walker_duration_ns,
+        cancelled = inner.cancelled.load(Ordering::Relaxed),
+        shutdown = inner.shutdown.load(Ordering::Relaxed),
+        "file search walk finished"
+    );
 }
 
 fn matcher_worker(
@@ -538,6 +750,7 @@ fn matcher_worker(
             }
             recv(next_notify) -> _ => {
                 will_notify = false;
+                let matcher_started = Instant::now();
                 let status = nucleo.tick(TICK_TIMEOUT_MS);
                 if status.changed {
                     let snapshot = nucleo.snapshot();
@@ -583,8 +796,24 @@ fn matcher_worker(
                         scanned_file_count: snapshot.item_count() as usize,
                         walk_complete,
                     };
+                    inner
+                        .metrics
+                        .snapshots_emitted
+                        .fetch_add(1, Ordering::Relaxed);
+                    FILE_SEARCH_USAGE
+                        .snapshots_emitted
+                        .fetch_add(1, Ordering::Relaxed);
                     inner.reporter.on_update(&snapshot);
                 }
+                let matcher_elapsed = matcher_started.elapsed();
+                UsageCounters::add_duration(
+                    &inner.metrics.matcher_duration_ns,
+                    matcher_elapsed,
+                );
+                UsageCounters::add_duration(
+                    &FILE_SEARCH_USAGE.matcher_duration_ns,
+                    matcher_elapsed,
+                );
                 if !status.running && walk_complete {
                     inner.reporter.on_complete();
                 }
@@ -869,6 +1098,12 @@ mod tests {
                 .iter()
                 .any(|file_match| file_match.path.to_string_lossy().contains("beta.txt"))
         );
+        let usage = session.usage_snapshot();
+        assert_eq!(usage.interactive_sessions, 1);
+        assert_eq!(usage.query_updates, 2);
+        assert_eq!(usage.walker_runs, 1);
+        assert!(usage.walker_entries >= 2);
+        assert!(usage.snapshots_emitted >= 2);
     }
 
     #[test]
@@ -961,6 +1196,7 @@ mod tests {
 
     #[test]
     fn run_returns_matches_for_query() {
+        let usage_before = file_search_usage_snapshot();
         let dir = create_temp_tree(/*file_count*/ 40);
         let options = FileSearchOptions {
             limit: NonZero::new(20).unwrap(),
@@ -978,6 +1214,8 @@ mod tests {
         .expect("run ok");
 
         assert!(!results.matches.is_empty());
+        let usage_after = file_search_usage_snapshot();
+        assert!(usage_after.one_shot_runs >= usage_before.one_shot_runs.saturating_add(1));
         assert!(results.total_match_count >= results.matches.len());
         assert!(
             results

@@ -208,15 +208,14 @@ pub(crate) async fn route_outgoing_envelope(
             message,
             write_complete_tx,
         } => {
-            let _ =
-                send_message_to_connection(
-                    connections,
-                    connection_id,
-                    message,
-                    write_complete_tx,
-                    /*apply_notification_filter*/ true,
-                )
-                .await;
+            let _ = send_message_to_connection(
+                connections,
+                connection_id,
+                message,
+                write_complete_tx,
+                /*apply_notification_filter*/ true,
+            )
+            .await;
         }
         OutgoingEnvelope::ToSnapshotAcceptedConnection {
             connection_id,

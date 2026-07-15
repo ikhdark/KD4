@@ -143,6 +143,8 @@ fn recovery_handles_dense_tail_output_and_newer_notification() {
             .recover_events(ReadResponse {
                 chunks,
                 output_gaps: Vec::new(),
+                earliest_retained_seq: Some(2),
+                complete: Some(true),
                 next_seq: last_seq + 1,
                 exited: true,
                 exit_code: Some(17),
@@ -179,6 +181,8 @@ fn recovery_rejects_output_at_closed_sequence() {
                 chunk: b"output".to_vec().into(),
             }],
             output_gaps: Vec::new(),
+            earliest_retained_seq: Some(1),
+            complete: Some(true),
             next_seq: 2,
             exited: false,
             exit_code: None,
@@ -208,6 +212,8 @@ async fn recovery_surfaces_tail_only_output_gap_through_wake() {
                     first_missing_seq: 1,
                     last_missing_seq: 2,
                 }],
+                earliest_retained_seq: Some(3),
+                complete: Some(true),
                 next_seq: 3,
                 exited: false,
                 exit_code: None,
@@ -249,6 +255,8 @@ async fn recovery_gap_precedes_retained_output() {
                 first_missing_seq: 1,
                 last_missing_seq: 2,
             }],
+            earliest_retained_seq: Some(3),
+            complete: Some(true),
             next_seq: 4,
             exited: false,
             exit_code: None,
@@ -285,6 +293,8 @@ async fn recovery_gap_splits_around_pending_live_output() {
                 first_missing_seq: 1,
                 last_missing_seq: 3,
             }],
+            earliest_retained_seq: Some(4),
+            complete: Some(true),
             next_seq: 4,
             exited: false,
             exit_code: None,
@@ -329,6 +339,8 @@ fn recovery_rejects_gap_overlapping_returned_output() {
                 first_missing_seq: 1,
                 last_missing_seq: 2,
             }],
+            earliest_retained_seq: Some(2),
+            complete: Some(true),
             next_seq: 3,
             exited: false,
             exit_code: None,
@@ -362,6 +374,8 @@ async fn recovery_adds_sandbox_denial_to_pending_exit_event() {
                 chunk: b"sandbox denied".to_vec().into(),
             }],
             output_gaps: Vec::new(),
+            earliest_retained_seq: Some(1),
+            complete: Some(true),
             next_seq: 3,
             exited: true,
             exit_code: Some(1),
@@ -384,4 +398,26 @@ async fn recovery_adds_sandbox_denial_to_pending_exit_event() {
             sandbox_denied: Some(true),
         })
     );
+}
+
+#[test]
+fn recovery_rejects_explicit_incomplete_page() {
+    let state = SessionState::new(/*recoverable*/ true);
+
+    let error = state
+        .recover_events(ReadResponse {
+            chunks: Vec::new(),
+            output_gaps: Vec::new(),
+            earliest_retained_seq: Some(1),
+            complete: Some(false),
+            next_seq: 1,
+            exited: false,
+            exit_code: None,
+            closed: false,
+            failure: None,
+            sandbox_denied: false,
+        })
+        .expect_err("one-shot recovery must reject an incomplete page");
+
+    assert!(error.to_string().contains("incomplete read page"));
 }

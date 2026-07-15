@@ -2641,10 +2641,9 @@ impl ThreadRequestProcessor {
             self.thread_watch_manager.upsert_thread(loaded_thread).await;
             if let Some(parent_thread_id) = config_snapshot.parent_thread_id {
                 parent_recipient_snapshot = Some(
-                    self
-                    .thread_state_manager
-                    .recipient_snapshot(parent_thread_id)
-                    .await
+                    self.thread_state_manager
+                        .recipient_snapshot(parent_thread_id)
+                        .await,
                 );
             }
         }

@@ -141,6 +141,18 @@ fn emit_turn_network_proxy_metric(
     );
 }
 
+fn emit_turn_tool_call_metric(
+    session_telemetry: &SessionTelemetry,
+    tool_call_count: u32,
+    tmp_mem: (&str, &str),
+) {
+    session_telemetry.histogram(
+        TURN_TOOL_CALL_METRIC,
+        i64::from(tool_call_count),
+        &[tmp_mem],
+    );
+}
+
 fn emit_turn_memory_metric(
     session_telemetry: &SessionTelemetry,
     feature_enabled: bool,
@@ -795,14 +807,11 @@ impl Session {
             }
         }
 
-        let (turn_had_memory_citation, turn_tool_calls, token_usage_at_turn_start) = {
+        let (turn_had_memory_citation, token_usage_at_turn_start) = {
             let ts = finalization.turn_state.lock().await;
-            (
-                ts.has_memory_citation,
-                ts.tool_calls,
-                ts.token_usage_at_turn_start.clone(),
-            )
+            (ts.has_memory_citation, ts.token_usage_at_turn_start.clone())
         };
+        let turn_tool_calls = turn_context.turn_timing_state.tool_call_count();
         // Emit token usage metrics.
         {
             // TODO(jif): drop this
@@ -834,11 +843,7 @@ impl Session {
                 network_proxy_active,
                 tmp_mem,
             );
-            self.services.session_telemetry.histogram(
-                TURN_TOOL_CALL_METRIC,
-                i64::try_from(turn_tool_calls).unwrap_or(i64::MAX),
-                &[tmp_mem],
-            );
+            emit_turn_tool_call_metric(&self.services.session_telemetry, turn_tool_calls, tmp_mem);
             let total_token_usage = self.total_token_usage().await.unwrap_or_default();
             let turn_token_usage = TokenUsage {
                 input_tokens: (total_token_usage.input_tokens

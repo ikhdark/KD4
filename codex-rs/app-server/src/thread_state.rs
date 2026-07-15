@@ -588,8 +588,9 @@ impl ThreadStateManager {
     ) {
         let mut state = self.state.lock().await;
         let previous = state.live_connections.get(&connection_id);
-        let filter_changed = previous
-            .is_none_or(|previous| previous.capabilities.delivery_filter != capabilities.delivery_filter);
+        let filter_changed = previous.is_none_or(|previous| {
+            previous.capabilities.delivery_filter != capabilities.delivery_filter
+        });
         let filter_revision = previous.map_or(0, |previous| {
             previous
                 .filter_revision
@@ -785,9 +786,7 @@ impl ThreadStateManager {
             }
             if let Some(thread_entry) = state.threads.get_mut(&thread_id) {
                 thread_entry.connection_ids.remove(&connection_id);
-                thread_entry
-                    .raw_event_connection_ids
-                    .remove(&connection_id);
+                thread_entry.raw_event_connection_ids.remove(&connection_id);
                 thread_entry
                     .recipient_filter_revisions
                     .remove(&connection_id);
@@ -816,10 +815,8 @@ impl ThreadStateManager {
         experimental_raw_events: bool,
     ) -> Option<Arc<Mutex<ThreadState>>> {
         let mut state = self.state.lock().await;
-        let connection_filter_revision = state
-            .live_connections
-            .get(&connection_id)?
-            .filter_revision;
+        let connection_filter_revision =
+            state.live_connections.get(&connection_id)?.filter_revision;
         state
             .thread_ids_by_connection
             .entry(connection_id)
@@ -827,12 +824,10 @@ impl ThreadStateManager {
             .insert(thread_id);
         let thread_entry = state.threads.entry(thread_id).or_default();
         let membership_changed = thread_entry.connection_ids.insert(connection_id);
-        thread_entry.initialize_recipient_filter_revision(
-            connection_id,
-            connection_filter_revision,
-        );
-        let raw_filter_changed = experimental_raw_events
-            && thread_entry.raw_event_connection_ids.insert(connection_id);
+        thread_entry
+            .initialize_recipient_filter_revision(connection_id, connection_filter_revision);
+        let raw_filter_changed =
+            experimental_raw_events && thread_entry.raw_event_connection_ids.insert(connection_id);
         if raw_filter_changed && !membership_changed {
             thread_entry.bump_recipient_filter_revision(connection_id);
         }
@@ -864,10 +859,8 @@ impl ThreadStateManager {
             .insert(thread_id);
         let thread_entry = state.threads.entry(thread_id).or_default();
         let membership_changed = thread_entry.connection_ids.insert(connection_id);
-        thread_entry.initialize_recipient_filter_revision(
-            connection_id,
-            connection_filter_revision,
-        );
+        thread_entry
+            .initialize_recipient_filter_revision(connection_id, connection_filter_revision);
         thread_entry.update_has_connections();
         if membership_changed {
             state.rebuild_recipient_snapshot(thread_id);
@@ -886,9 +879,7 @@ impl ThreadStateManager {
             for thread_id in &thread_ids {
                 if let Some(thread_entry) = state.threads.get_mut(thread_id) {
                     thread_entry.connection_ids.remove(&connection_id);
-                    thread_entry
-                        .raw_event_connection_ids
-                        .remove(&connection_id);
+                    thread_entry.raw_event_connection_ids.remove(&connection_id);
                     thread_entry
                         .recipient_filter_revisions
                         .remove(&connection_id);
@@ -940,10 +931,8 @@ mod recipient_snapshot_tests {
         let manager = ThreadStateManager::new();
         let thread_id = ThreadId::new();
         let connection_id = ConnectionId(1);
-        let initial_filter = ResolvedDeliveryFilter::new(
-            false,
-            HashSet::from(["thread/ignored".to_string()]),
-        );
+        let initial_filter =
+            ResolvedDeliveryFilter::new(false, HashSet::from(["thread/ignored".to_string()]));
         manager
             .connection_initialized(
                 connection_id,

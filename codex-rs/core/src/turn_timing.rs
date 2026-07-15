@@ -608,6 +608,10 @@ impl TurnTimingState {
         state.counters.tool_call_count = state.counters.tool_call_count.saturating_add(1);
     }
 
+    pub(crate) fn tool_call_count(&self) -> u32 {
+        self.state().counters.tool_call_count
+    }
+
     pub(crate) fn begin_tool_blocking(self: &Arc<Self>) -> TurnTimingGuard {
         self.begin_guard(GuardKind::LegacyToolBlocking)
     }

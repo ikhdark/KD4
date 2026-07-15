@@ -284,18 +284,16 @@ fn owned_preparation_keeps_the_async_executor_responsive() {
             .recv_timeout(Duration::from_secs(1))
             .expect("blocking worker started");
 
-        let preparation = tokio::spawn(prepare_response_items_owned(vec![
-            ResponseItem::Message {
-                id: None,
-                role: "user".to_string(),
-                content: vec![ContentItem::InputImage {
-                    image_url: "https://example.com/remote.png".to_string(),
-                    detail: Some(ImageDetail::High),
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            },
-        ]));
+        let preparation = tokio::spawn(prepare_response_items_owned(vec![ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image_url: "https://example.com/remote.png".to_string(),
+                detail: Some(ImageDetail::High),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        }]));
         tokio::task::yield_now().await;
         assert!(
             !preparation.is_finished(),

@@ -355,6 +355,77 @@ async fn exec_full_buffer_capture_keeps_io_drain_timeout_when_descendant_holds_p
 }
 
 #[tokio::test]
+async fn exec_shell_tool_drains_both_streams_under_one_deadline_with_partial_output() -> Result<()>
+{
+    #[cfg(windows)]
+    let command = vec![
+        "powershell.exe".to_string(),
+        "-NonInteractive".to_string(),
+        "-NoLogo".to_string(),
+        "-Command".to_string(),
+        "[Console]::Out.Write('STDOUT_PARTIAL'); [Console]::Error.Write('STDERR_PARTIAL'); $child = Join-Path $PSHOME 'powershell.exe'; Start-Process -FilePath $child -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Milliseconds 4000') -NoNewWindow"
+            .to_string(),
+    ];
+    #[cfg(not(windows))]
+    let command = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "printf STDOUT_PARTIAL; printf STDERR_PARTIAL >&2; sleep 4 &".to_string(),
+    ];
+    let started = tokio::time::Instant::now();
+
+    let output = tokio::time::timeout(
+        Duration::from_millis(IO_DRAIN_TIMEOUT_MS * 3),
+        exec(
+            ExecParams {
+                command,
+                cwd: codex_utils_absolute_path::AbsolutePathBuf::current_dir()?,
+                expiration: 1.into(),
+                capture_policy: ExecCapturePolicy::ShellTool,
+                env: std::env::vars().collect(),
+                network: None,
+                network_environment_id: None,
+                sandbox_permissions: SandboxPermissions::UseDefault,
+                windows_sandbox_level: WindowsSandboxLevel::Disabled,
+                windows_sandbox_private_desktop: false,
+                justification: None,
+                arg0: None,
+            },
+            NetworkSandboxPolicy::Enabled,
+            /*stdout_stream*/ None,
+            /*after_spawn*/ None,
+        ),
+    )
+    .await
+    .expect("shell-tool exec should return once the shared drain deadline fires")?;
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(IO_DRAIN_TIMEOUT_MS.saturating_sub(500)),
+        "descriptor-holding descendant should exercise the drain deadline: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(IO_DRAIN_TIMEOUT_MS * 2),
+        "stdout and stderr must share one drain deadline: {elapsed:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout.text);
+    let stderr = String::from_utf8_lossy(&output.stderr.text);
+    let aggregated_output = String::from_utf8_lossy(&output.aggregated_output.text);
+    assert!(stdout.contains("STDOUT_PARTIAL"));
+    assert!(stderr.contains("STDERR_PARTIAL"));
+    assert!(aggregated_output.contains("STDOUT_PARTIAL"));
+    assert!(aggregated_output.contains("STDERR_PARTIAL"));
+    assert_eq!(
+        aggregated_output
+            .matches("stdout/stderr drain timed out")
+            .count(),
+        1
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn process_exec_tool_call_preserves_full_buffer_capture_policy() -> Result<()> {
     let byte_count = EXEC_OUTPUT_MAX_BYTES.saturating_add(128 * 1024);
     #[cfg(windows)]

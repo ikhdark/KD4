@@ -230,6 +230,8 @@ impl BlockingTerminateExecProcess {
         Ok(ReadResponse {
             chunks: Vec::new(),
             output_gaps: Vec::new(),
+            earliest_retained_seq: Some(1),
+            complete: Some(true),
             next_seq: 1,
             exited: false,
             exit_code: None,

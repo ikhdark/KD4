@@ -134,10 +134,8 @@ fn execute_command(
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    configure_process_tree(&mut process);
-
-    let mut child = match process.spawn() {
-        Ok(child) => child,
+    let (mut child, process_tree) = match spawn_process_tree(&mut process) {
+        Ok(spawned) => spawned,
         Err(error) => {
             result.duration_ns = nanos_u64(started.elapsed().as_nanos());
             result.runner_error = Some(error.to_string());
@@ -169,7 +167,7 @@ fn execute_command(
         while let Ok(frame) = frame_rx.try_recv() {
             if let Err(error) = collector.write_frame(&frame) {
                 logging_fault = Some(error);
-                terminate_process_tree(&mut child);
+                terminate_process_tree(&mut child, &process_tree);
                 break;
             }
         }
@@ -183,8 +181,7 @@ fn execute_command(
             }
             Ok(None) if started.elapsed() >= timeout => {
                 result.timed_out = true;
-                terminate_process_tree(&mut child);
-                let _ = wait_for_exit(&mut child, GRACEFUL_TERMINATION);
+                terminate_process_tree(&mut child, &process_tree);
                 result.log_state = LogState::IncompleteAfterTermination;
                 break;
             }
@@ -192,7 +189,7 @@ fn execute_command(
                 Ok(frame) => {
                     if let Err(error) = collector.write_frame(&frame) {
                         logging_fault = Some(error);
-                        terminate_process_tree(&mut child);
+                        terminate_process_tree(&mut child, &process_tree);
                         break;
                     }
                 }
@@ -201,7 +198,7 @@ fn execute_command(
             },
             Err(error) => {
                 result.runner_error = Some(error.to_string());
-                terminate_process_tree(&mut child);
+                terminate_process_tree(&mut child, &process_tree);
                 break;
             }
         }
@@ -512,15 +509,121 @@ fn configure_process_tree(command: &mut Command) {
 #[cfg(windows)]
 fn configure_process_tree(command: &mut Command) {
     use std::os::windows::process::CommandExt;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+    use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
+
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED);
 }
 
 #[cfg(not(any(unix, windows)))]
 fn configure_process_tree(_command: &mut Command) {}
 
+#[cfg(not(windows))]
+struct ProcessTree;
+
+#[cfg(windows)]
+struct ProcessTree {
+    job: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        if self.job != 0 {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.job);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_process_tree(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
+    configure_process_tree(command);
+    command.spawn().map(|child| (child, ProcessTree))
+}
+
+#[cfg(windows)]
+fn spawn_process_tree(command: &mut Command) -> std::io::Result<(Child, ProcessTree)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+    use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+    use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
+    use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
+
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let process_tree = ProcessTree { job };
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    let configured = unsafe {
+        SetInformationJobObject(
+            process_tree.job,
+            JobObjectExtendedLimitInformation,
+            &limits as *const _ as *const std::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if configured == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    configure_process_tree(command);
+    let mut child = command.spawn()?;
+    let process_handle = child.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    if unsafe { AssignProcessToJobObject(process_tree.job, process_handle) } == 0 {
+        let error = std::io::Error::last_os_error();
+        abort_suspended_process(&mut child, &process_tree);
+        return Err(error);
+    }
+
+    let mut is_member = 0;
+    if unsafe { IsProcessInJob(process_handle, process_tree.job, &mut is_member) } == 0 {
+        let error = std::io::Error::last_os_error();
+        abort_suspended_process(&mut child, &process_tree);
+        return Err(error);
+    }
+    if is_member == 0 {
+        abort_suspended_process(&mut child, &process_tree);
+        return Err(std::io::Error::other(
+            "spawned verifier command is not a member of its Job Object",
+        ));
+    }
+
+    let resume_status = unsafe { NtResumeProcess(process_handle) };
+    if resume_status < 0 {
+        abort_suspended_process(&mut child, &process_tree);
+        return Err(std::io::Error::other(format!(
+            "NtResumeProcess failed with NTSTATUS 0x{:08x}",
+            resume_status as u32
+        )));
+    }
+
+    Ok((child, process_tree))
+}
+
+#[cfg(windows)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    fn NtResumeProcess(process_handle: windows_sys::Win32::Foundation::HANDLE) -> i32;
+}
+
+#[cfg(windows)]
+fn abort_suspended_process(child: &mut Child, process_tree: &ProcessTree) {
+    unsafe {
+        windows_sys::Win32::System::JobObjects::TerminateJobObject(process_tree.job, 1);
+    }
+    let _ = child.kill();
+    let _ = wait_for_exit(child, POST_TERMINATION_DRAIN);
+}
+
 #[cfg(unix)]
-fn terminate_process_tree(child: &mut Child) {
+fn terminate_process_tree(child: &mut Child, _process_tree: &ProcessTree) {
     let pid = child.id() as i32;
     unsafe {
         libc::kill(-pid, libc::SIGTERM);
@@ -531,19 +634,31 @@ fn terminate_process_tree(child: &mut Child) {
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
-    let _ = child.wait();
+    let _ = wait_for_exit(child, POST_TERMINATION_DRAIN);
 }
 
 #[cfg(windows)]
-fn terminate_process_tree(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
+fn terminate_process_tree(child: &mut Child, process_tree: &ProcessTree) {
+    use windows_sys::Win32::System::Console::CTRL_BREAK_EVENT;
+    use windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent;
+    use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+    unsafe {
+        GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id());
+    }
+    if wait_for_exit(child, GRACEFUL_TERMINATION) {
+        return;
+    }
+    unsafe {
+        TerminateJobObject(process_tree.job, 1);
+    }
+    let _ = wait_for_exit(child, POST_TERMINATION_DRAIN);
 }
 
 #[cfg(not(any(unix, windows)))]
-fn terminate_process_tree(child: &mut Child) {
+fn terminate_process_tree(child: &mut Child, _process_tree: &ProcessTree) {
     let _ = child.kill();
-    let _ = child.wait();
+    let _ = wait_for_exit(child, POST_TERMINATION_DRAIN);
 }
 
 pub fn random_hex_128() -> Result<String, String> {

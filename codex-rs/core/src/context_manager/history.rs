@@ -527,9 +527,7 @@ fn estimate_encrypted_function_output_length(encoded_len: usize) -> usize {
     encoded_len.saturating_mul(9).div_ceil(16)
 }
 
-pub(crate) fn estimate_base_instruction_token_count(
-    base_instructions: &BaseInstructions,
-) -> i64 {
+pub(crate) fn estimate_base_instruction_token_count(base_instructions: &BaseInstructions) -> i64 {
     i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX)
 }
 

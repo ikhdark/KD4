@@ -146,6 +146,25 @@ fn repo_uri(repo: &Path) -> PathUri {
     PathUri::from_host_native_path(repo).expect("repository URI")
 }
 
+async fn record_observed_command_change(ledger: &TaskEvidenceLedger, repo: &Path, call_id: &str) {
+    initialize_git_repo(repo).await;
+    tokio::fs::write(repo.join("observed.txt"), "before")
+        .await
+        .expect("seed observed file");
+    let cwd = repo_uri(repo);
+    let command = trusted_exact_write_command("observed.txt");
+    ledger.record_command_intent(call_id, &command, &cwd).await;
+    tokio::fs::write(repo.join("observed.txt"), "after")
+        .await
+        .expect("change observed file");
+    assert_eq!(
+        ledger
+            .record_command(call_id, &command, &cwd, 0, false, 1, true)
+            .await,
+        Some(MutationObservation::Changed)
+    );
+}
+
 fn plan_item(id: &str, status: StepStatus) -> PlanItemArg {
     PlanItemArg {
         id: Some(id.to_string()),
@@ -706,6 +725,69 @@ async fn complete_coverage_noop_is_unchanged_without_advancing_the_epoch() {
     let receipt = document.command_receipts.last().expect("command receipt");
     assert_eq!(receipt.coverage, Some(MutationCoverage::Complete));
     assert_eq!(receipt.observation, observation);
+    drop(guard);
+    assert_eq!(ledger.take_automatic_verify_plan_request().await, None);
+}
+
+#[tokio::test]
+async fn failed_complete_coverage_noop_does_not_advance_or_plan() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    initialize_git_repo(&repo).await;
+    let cwd = repo_uri(&repo);
+    let command = trusted_noop_command();
+
+    ledger
+        .record_command_intent("failed-noop", &command, &cwd)
+        .await;
+    assert_eq!(
+        ledger
+            .record_command("failed-noop", &command, &cwd, 1, false, 1, true)
+            .await,
+        Some(MutationObservation::Unchanged)
+    );
+    assert_eq!(
+        ledger
+            .document
+            .lock()
+            .await
+            .as_ref()
+            .expect("document")
+            .evidence_epoch,
+        0
+    );
+    assert_eq!(ledger.take_automatic_verify_plan_request().await, None);
+}
+
+#[tokio::test]
+async fn identical_content_write_does_not_advance_or_plan() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    initialize_git_repo(&repo).await;
+    tokio::fs::write(repo.join("same.txt"), "same")
+        .await
+        .expect("seed unchanged file");
+    let cwd = repo_uri(&repo);
+    let command = trusted_exact_write_command("same.txt");
+
+    ledger
+        .record_command_intent("same-write", &command, &cwd)
+        .await;
+    assert_eq!(
+        ledger
+            .record_command("same-write", &command, &cwd, 0, false, 1, true)
+            .await,
+        Some(MutationObservation::Unchanged)
+    );
+    assert_eq!(
+        ledger
+            .document
+            .lock()
+            .await
+            .as_ref()
+            .expect("document")
+            .evidence_epoch,
+        0
+    );
+    assert_eq!(ledger.take_automatic_verify_plan_request().await, None);
 }
 
 #[tokio::test]
@@ -726,7 +808,7 @@ async fn git_failure_keeps_complete_syntax_observation_unknown() {
 }
 
 #[tokio::test]
-async fn incomplete_coverage_noop_is_unknown_and_advances_the_epoch() {
+async fn incomplete_coverage_noop_is_unknown_without_advancing_the_epoch() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     initialize_git_repo(&repo).await;
     let cwd = repo_uri(&repo);
@@ -742,13 +824,19 @@ async fn incomplete_coverage_noop_is_unknown_and_advances_the_epoch() {
     assert_eq!(observation, Some(MutationObservation::Unknown));
     let guard = ledger.document.lock().await;
     let document = guard.as_ref().expect("document");
-    assert_eq!(document.evidence_epoch, 1);
+    assert_eq!(document.evidence_epoch, 0);
     assert_eq!(
         document
             .command_receipts
             .last()
             .and_then(|receipt| receipt.coverage),
         Some(MutationCoverage::Incomplete)
+    );
+    assert!(
+        document
+            .risks
+            .iter()
+            .any(|risk| risk.source == "command" && !risk.resolved)
     );
 }
 
@@ -782,6 +870,10 @@ async fn complete_coverage_detects_existing_untracked_content_changes_even_on_fa
             .expect("document")
             .evidence_epoch,
         1
+    );
+    assert_eq!(
+        ledger.take_automatic_verify_plan_request().await,
+        Some(Vec::new())
     );
 }
 
@@ -1383,6 +1475,90 @@ async fn final_pass_supersedes_fast_failure_and_late_plan_is_suppressed() {
             .iter()
             .filter(|risk| risk.source == "verify_local")
             .all(|risk| risk.resolved)
+    );
+}
+
+#[tokio::test]
+async fn successful_fast_or_final_validation_suppresses_automatic_planning() {
+    for mode in ["fast", "final"] {
+        let (_temp, repo, ledger) = ledger_fixture().await;
+        record_observed_command_change(&ledger, &repo, mode).await;
+        let validation_start = ledger
+            .begin_verify_local_validation()
+            .await
+            .expect("validation start");
+
+        assert!(
+            ledger
+                .record_verify_local(
+                    mode,
+                    Some("VERIFIED"),
+                    true,
+                    true,
+                    true,
+                    Some(&validation_start),
+                    &[],
+                    &[],
+                    Some(&serde_json::json!({"verdict": "VERIFIED"})),
+                )
+                .await
+        );
+        assert_eq!(ledger.take_automatic_verify_plan_request().await, None);
+        let gate = ledger.completion_gate().await.expect("completion gate");
+        assert!(
+            gate.reasons
+                .iter()
+                .all(|reason| reason != "verify_local planning is missing or stale")
+        );
+    }
+}
+
+#[tokio::test]
+async fn stronger_final_failure_restores_automatic_planning_after_fast_success() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    record_observed_command_change(&ledger, &repo, "stronger-failure").await;
+    let fast_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("fast validation start");
+    assert!(
+        ledger
+            .record_verify_local(
+                "fast",
+                Some("VERIFIED"),
+                true,
+                true,
+                true,
+                Some(&fast_start),
+                &[],
+                &[],
+                Some(&serde_json::json!({"verdict": "VERIFIED"})),
+            )
+            .await
+    );
+    let final_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("final validation start");
+    assert!(
+        !ledger
+            .record_verify_local(
+                "final",
+                Some("FAILED"),
+                false,
+                false,
+                true,
+                Some(&final_start),
+                &[],
+                &[],
+                Some(&serde_json::json!({"verdict": "FAILED"})),
+            )
+            .await
+    );
+
+    assert_eq!(
+        ledger.take_automatic_verify_plan_request().await,
+        Some(Vec::new())
     );
 }
 

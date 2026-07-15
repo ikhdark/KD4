@@ -67,7 +67,12 @@ fn execute_plan_writes_framed_log_and_strict_result_file() {
     assert_eq!(results.len(), 1);
     let result = &results[0];
     assert_eq!(result.exit_code, Some(0));
-    assert_eq!(result.log_state, LogState::Complete);
+    assert_eq!(
+        result.log_state,
+        LogState::Complete,
+        "runner error: {:?}",
+        result.runner_error
+    );
     let log_path = result.log_path.as_ref().expect("log path");
     let log = fs::read_to_string(log_path).expect("log");
     assert!(log.contains("\"seq\":0"));
@@ -105,5 +110,52 @@ fn timeout_marks_incomplete_after_termination_without_success() {
     let result = &results[0];
     assert!(result.timed_out);
     assert_eq!(result.exit_code, None);
-    assert_eq!(result.log_state, LogState::IncompleteAfterTermination);
+    assert_eq!(
+        result.log_state,
+        LogState::IncompleteAfterTermination,
+        "runner error: {:?}",
+        result.runner_error
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_timeout_terminates_descendants_in_the_job() {
+    use std::thread;
+    use std::time::Duration;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    fs::write(
+        temp.path().join("spawn-descendant.cmd"),
+        "@echo off\r\nstart \"\" /b cmd.exe /d /s /c \"ping -n 3 127.0.0.1 ^>nul ^& echo escaped^>escaped.txt\"\r\nping -n 10 127.0.0.1 >nul\r\n",
+    )
+    .expect("script");
+    let mut plan = plan_for_shell("spawn-descendant.cmd", 500);
+    plan.commands[0].cwd = RawPath::from_utf8(temp.path().to_string_lossy().into_owned());
+
+    let result = execute_plan(&plan, temp.path()).remove(0);
+    assert!(result.timed_out);
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        !temp.path().join("escaped.txt").exists(),
+        "a descendant escaped the verifier Job Object"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_process_tree_requires_suspended_verified_job_membership() {
+    let source = include_str!("runner.rs");
+    for required in [
+        "CREATE_SUSPENDED",
+        "AssignProcessToJobObject",
+        "IsProcessInJob",
+        "NtResumeProcess",
+        "TerminateJobObject",
+        "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE",
+    ] {
+        assert!(source.contains(required), "missing {required}");
+    }
+    assert!(!source.contains("JOB_OBJECT_LIMIT_BREAKAWAY_OK"));
+    assert!(!source.contains("JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK"));
 }

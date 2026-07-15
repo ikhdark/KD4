@@ -56,6 +56,8 @@ impl SessionState {
         let ReadResponse {
             chunks,
             output_gaps,
+            earliest_retained_seq: _,
+            complete,
             next_seq,
             exited,
             exit_code,
@@ -67,6 +69,11 @@ impl SessionState {
             return Err(ExecServerError::Protocol(format!(
                 "process failed while recovering: {message}"
             )));
+        }
+        if complete == Some(false) {
+            return Err(ExecServerError::Protocol(
+                "process recovery returned an incomplete read page".to_string(),
+            ));
         }
 
         let target_seq = next_seq.saturating_sub(1);

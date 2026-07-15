@@ -684,8 +684,7 @@ async fn drain_to_completed(
         .await;
     drop(model_request_timing_guard);
     let mut stream = stream_result?;
-    let mut stream_timing =
-        ModelStreamTimingGuard::new(Some(&turn_context.turn_timing_state));
+    let mut stream_timing = ModelStreamTimingGuard::new(Some(&turn_context.turn_timing_state));
     loop {
         stream_timing.begin_wait();
         let maybe_event = stream.next().await;

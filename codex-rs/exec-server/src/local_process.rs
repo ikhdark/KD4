@@ -409,6 +409,10 @@ impl LocalProcess {
                 let mut total_bytes: usize = 0;
                 let mut next_seq = process.next_seq;
                 let mut limited = false;
+                let earliest_retained_seq = process
+                    .output
+                    .front()
+                    .map_or(process.next_seq, |chunk| chunk.seq);
                 for retained in process.output.iter().filter(|chunk| chunk.seq > after_seq) {
                     if chunks.len() >= max_chunks {
                         next_seq = retained.seq;
@@ -445,6 +449,8 @@ impl LocalProcess {
                     ReadResponse {
                         chunks,
                         output_gaps,
+                        earliest_retained_seq: Some(earliest_retained_seq),
+                        complete: Some(!limited),
                         next_seq,
                         exited: process.exit_code.is_some(),
                         exit_code: process.exit_code,
@@ -460,6 +466,7 @@ impl LocalProcess {
                 response.exited && after_seq < response.next_seq.saturating_sub(1);
             if !response.chunks.is_empty()
                 || !response.output_gaps.is_empty()
+                || response.complete == Some(false)
                 || response.closed
                 || has_new_terminal_event
                 || tokio::time::Instant::now() >= deadline
@@ -1228,6 +1235,8 @@ mod tests {
             ReadResponse {
                 chunks: Vec::new(),
                 output_gaps: Vec::new(),
+                earliest_retained_seq: Some(2),
+                complete: Some(true),
                 next_seq: 2,
                 exited: true,
                 exit_code: Some(0),
@@ -1309,6 +1318,29 @@ mod tests {
             vec![1, 2]
         );
         assert_eq!(response.next_seq, 3);
+        assert_eq!(response.earliest_retained_seq, Some(1));
+        assert_eq!(response.complete, Some(false));
+
+        let final_page = backend
+            .exec_read(ReadParams {
+                process_id: process.process_id.clone(),
+                after_seq: response.next_seq.checked_sub(1),
+                max_bytes: None,
+                max_chunks: Some(2),
+                wait_ms: Some(0),
+            })
+            .await
+            .expect("read final page");
+        assert_eq!(
+            final_page
+                .chunks
+                .iter()
+                .map(|chunk| chunk.seq)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+        assert_eq!(final_page.next_seq, 4);
+        assert_eq!(final_page.complete, Some(true));
         backend.shutdown().await;
     }
 
@@ -1324,19 +1356,66 @@ mod tests {
             .expect("send stdout");
         wait_for_retained_output_count(&backend, &process.process_id, 1).await;
 
-        let response = backend
-            .exec_read(ReadParams {
+        let response = timeout(
+            Duration::from_millis(100),
+            backend.exec_read(ReadParams {
                 process_id: process.process_id.clone(),
                 after_seq: None,
                 max_bytes: Some(4),
                 max_chunks: None,
-                wait_ms: Some(0),
-            })
-            .await
-            .expect("read process");
+                wait_ms: Some(1_000),
+            }),
+        )
+        .await
+        .expect("limited empty page should not long-poll")
+        .expect("read process");
 
         assert!(response.chunks.is_empty());
         assert_eq!(response.next_seq, 1);
+        assert_eq!(response.earliest_retained_seq, Some(1));
+        assert_eq!(response.complete, Some(false));
+        backend.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn read_reports_exact_gap_after_forced_retention_eviction() {
+        let backend = LocalProcess::default();
+        let process = spawn_test_process(&backend, "proc-retention-gap").await;
+        let retained = vec![b'c'; 600 * 1024];
+
+        for chunk in [
+            vec![b'a'; 600 * 1024],
+            vec![b'b'; 600 * 1024],
+            retained.clone(),
+        ] {
+            process.stdout_tx.send(chunk).await.expect("send stdout");
+        }
+        wait_for_process_next_seq(&backend, &process.process_id, 4).await;
+
+        let response = backend
+            .exec_read(ReadParams {
+                process_id: process.process_id.clone(),
+                after_seq: None,
+                max_bytes: None,
+                max_chunks: None,
+                wait_ms: Some(0),
+            })
+            .await
+            .expect("read retained output");
+
+        assert_eq!(
+            response.output_gaps,
+            vec![OutputGap {
+                first_missing_seq: 1,
+                last_missing_seq: 2,
+            }]
+        );
+        assert_eq!(response.earliest_retained_seq, Some(3));
+        assert_eq!(response.complete, Some(true));
+        assert_eq!(response.next_seq, 4);
+        assert_eq!(response.chunks.len(), 1);
+        assert_eq!(response.chunks[0].seq, 3);
+        assert_eq!(response.chunks[0].chunk.0, retained);
         backend.shutdown().await;
     }
 
@@ -1527,6 +1606,32 @@ mod tests {
         })
         .await
         .expect("output should be retained");
+    }
+
+    async fn wait_for_process_next_seq(
+        backend: &LocalProcess,
+        process_id: &ProcessId,
+        expected: u64,
+    ) {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let next_seq = {
+                    let processes = backend.inner.processes.lock().await;
+                    let ProcessEntry::Running(process) =
+                        processes.get(process_id).expect("test process")
+                    else {
+                        panic!("test process should be running");
+                    };
+                    process.next_seq
+                };
+                if next_seq >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("process sequence should advance");
     }
 
     fn dummy_session() -> ExecCommandSession {

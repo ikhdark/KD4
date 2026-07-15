@@ -84,9 +84,8 @@ pub(crate) fn response_items_need_preparation(items: &[ResponseItem]) -> bool {
             ContentItem::InputText { .. } | ContentItem::OutputText { .. } => false,
         }),
         ResponseItem::FunctionCallOutput { output, .. }
-        | ResponseItem::CustomToolCallOutput { output, .. } => output
-            .content_items()
-            .is_some_and(|content| {
+        | ResponseItem::CustomToolCallOutput { output, .. } => {
+            output.content_items().is_some_and(|content| {
                 content.iter().any(|item| match item {
                     FunctionCallOutputContentItem::InputImage { image_url, .. } => {
                         is_remote_image_url(image_url) || is_data_url(image_url)
@@ -94,7 +93,8 @@ pub(crate) fn response_items_need_preparation(items: &[ResponseItem]) -> bool {
                     FunctionCallOutputContentItem::InputText { .. }
                     | FunctionCallOutputContentItem::EncryptedContent { .. } => false,
                 })
-            }),
+            })
+        }
         _ => false,
     })
 }

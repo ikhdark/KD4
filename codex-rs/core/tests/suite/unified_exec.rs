@@ -2879,6 +2879,128 @@ async fn unified_exec_timeout_and_followup_poll() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unified_exec_empty_poll_wakes_on_delayed_output_after_quiet_start() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+    skip_if_sandbox!(Ok(()));
+
+    let server = start_mock_server().await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::UnifiedExec)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_auto_env(&server).await?;
+
+    #[cfg(windows)]
+    let command =
+        "Write-Output READY; Start-Sleep -Seconds 3; Write-Output WAKE; Start-Sleep -Seconds 6";
+    #[cfg(not(windows))]
+    let command = "printf 'READY\\n'; sleep 3; printf 'WAKE\\n'; sleep 6";
+
+    let first_call_id = "uexec-quiet-ready";
+    let first_args = serde_json::json!({
+        "cmd": command,
+        "yield_time_ms": 10_000,
+        "tty": false,
+    });
+
+    let poll_call_id = "uexec-empty-poll-wake";
+    let poll_args = serde_json::json!({
+        "chars": "",
+        "session_id": 1000,
+        "yield_time_ms": 10_000,
+    });
+
+    let responses = vec![
+        sse(vec![
+            ev_response_created("resp-1"),
+            ev_function_call(
+                first_call_id,
+                "exec_command",
+                &serde_json::to_string(&first_args)?,
+            ),
+            ev_completed("resp-1"),
+        ]),
+        sse(vec![
+            ev_response_created("resp-2"),
+            ev_function_call(
+                poll_call_id,
+                "write_stdin",
+                &serde_json::to_string(&poll_args)?,
+            ),
+            ev_completed("resp-2"),
+        ]),
+        sse(vec![
+            ev_assistant_message("msg-1", "done"),
+            ev_completed("resp-3"),
+        ]),
+    ];
+    let request_log = mount_sse_sequence(&server, responses).await;
+
+    submit_unified_exec_turn(&test, "check quiet wake", PermissionProfile::Disabled).await?;
+
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let bodies = request_log
+        .requests()
+        .into_iter()
+        .map(|request| request.body_json())
+        .collect::<Vec<_>>();
+    let outputs = collect_tool_outputs(&bodies)?;
+
+    let first_output = outputs
+        .get(first_call_id)
+        .expect("missing initial quiet-period output");
+    assert!(
+        first_output.output.contains("READY"),
+        "expected initial output to include READY, got {:?}",
+        first_output.output
+    );
+    assert!(
+        !first_output.output.contains("WAKE"),
+        "initial quiet-period response should not wait for delayed output, got {:?}",
+        first_output.output
+    );
+    assert_eq!(first_output.exit_code, None);
+    let process_id = first_output
+        .process_id
+        .as_deref()
+        .expect("initial response should keep the live process id");
+    assert!(
+        first_output.wall_time_seconds < 2.0,
+        "quiet-period response should return well before delayed output, wall time was {}",
+        first_output.wall_time_seconds
+    );
+
+    let poll_output = outputs
+        .get(poll_call_id)
+        .expect("missing empty-poll output");
+    assert!(
+        poll_output.output.contains("WAKE"),
+        "expected empty poll to wake on delayed output, got {:?}",
+        poll_output.output
+    );
+    assert_eq!(poll_output.exit_code, None);
+    assert_eq!(
+        poll_output.process_id.as_deref(),
+        Some(process_id),
+        "empty poll should preserve the live process id"
+    );
+    assert!(
+        (1.0..5.5).contains(&poll_output.wall_time_seconds),
+        "empty poll should wait for delayed output but not the full yield timeout, wall time was {}",
+        poll_output.wall_time_seconds
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 // Skipped on arm because the ctor logic to handle arg0 doesn't work on ARM
 #[cfg(not(target_arch = "arm"))]
 async fn unified_exec_formats_large_output_summary() -> Result<()> {
