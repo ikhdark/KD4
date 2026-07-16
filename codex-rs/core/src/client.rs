@@ -2238,11 +2238,16 @@ impl ModelClientSession {
                         "websocket connection is unavailable".to_string(),
                     ))
                 })?;
+            let timing_turn_id = session_telemetry
+                .timing_correlation_enabled()
+                .then(|| responses_metadata.turn_id.clone())
+                .flatten();
             let stream_result = websocket_connection
                 .stream_request(
                     ws_request,
                     self.websocket_session.connection_reused(),
                     Some(Arc::clone(&self.turn_state)),
+                    timing_turn_id,
                 )
                 .await
                 .map_err(|err| {
@@ -3023,9 +3028,10 @@ impl WebsocketTelemetry for ApiTelemetry {
         &self,
         result: &std::result::Result<Option<std::result::Result<Message, Error>>, ApiError>,
         duration: Duration,
+        turn_id: Option<&str>,
     ) {
         self.session_telemetry
-            .record_websocket_event(result, duration);
+            .record_websocket_event_for_turn(result, duration, turn_id);
     }
 }
 

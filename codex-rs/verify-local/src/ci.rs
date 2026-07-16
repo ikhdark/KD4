@@ -1,5 +1,5 @@
-use crate::context::PlannerContext;
 use crate::context::CargoGraph;
+use crate::context::PlannerContext;
 use crate::model::RepositorySnapshot;
 use crate::model::SnapshotRecord;
 use crate::model::SnapshotSource;
@@ -94,9 +94,7 @@ impl CiDecisionOutputs {
         }));
         records
             .into_iter()
-            .map(|(name, value)| {
-                format!("{name}={value}\n").encode_utf16().count() * 2
-            })
+            .map(|(name, value)| format!("{name}={value}\n").encode_utf16().count() * 2)
             .sum()
     }
 }
@@ -495,12 +493,18 @@ fn validate_decision_body(body: &CiDecisionBody) -> Result<(), CiDecisionError> 
                 .map_err(CiDecisionError::InvalidContract)?;
         }
     }
-    for oid in [body.base.as_deref(), body.merge_base.as_deref(), body.head.as_deref()]
-        .into_iter()
-        .flatten()
+    for oid in [
+        body.base.as_deref(),
+        body.merge_base.as_deref(),
+        body.head.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
     {
         if !matches!(oid.len(), 40 | 64)
-            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            || !oid
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         {
             return Err(CiDecisionError::InvalidContract(
                 "comparison object ID is not canonical lowercase hex".to_string(),

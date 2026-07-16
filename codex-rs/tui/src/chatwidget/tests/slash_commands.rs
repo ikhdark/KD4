@@ -2,6 +2,7 @@ use super::*;
 use crate::bottom_pane::slash_commands::ServiceTierCommand;
 use pretty_assertions::assert_eq;
 use serial_test::serial;
+use tracing_test::traced_test;
 
 fn force_pet_image_support(chat: &mut ChatWidget) {
     chat.set_pet_image_support_for_tests(crate::pets::PetImageSupport::Supported(
@@ -2026,9 +2027,12 @@ async fn active_goal_without_follow_up_suppresses_agent_turn_complete_notificati
 }
 
 #[tokio::test]
+#[traced_test]
 async fn queued_follow_up_suppresses_agent_turn_complete_notification() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.thread_id = Some(ThreadId::new());
+    chat.submit_user_message(UserMessage::from("Start"));
+    assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. });
     handle_turn_started(&mut chat, "turn-1");
     chat.queue_user_message("Continue".into());
 
@@ -2037,6 +2041,37 @@ async fn queued_follow_up_suppresses_agent_turn_complete_notification() {
     assert_matches!(chat.pending_notification, None);
     assert!(chat.input_queue.queued_user_messages.is_empty());
     assert_matches!(next_submit_op(&mut op_rx), Op::UserTurn { .. });
+
+    handle_turn_started(&mut chat, "turn-2");
+    chat.note_active_first_assistant_output(/*has_content*/ true);
+    complete_assistant_message(
+        &mut chat,
+        "turn-2-message",
+        "Follow-up reply",
+        Some(MessagePhase::FinalAnswer),
+    );
+    chat.on_terminal_frame_rendered();
+    chat.on_terminal_frame_rendered();
+
+    logs_assert(|lines: &[&str]| {
+        let rendered = lines
+            .iter()
+            .filter(|line| line.contains("first terminal frame rendered for submitted turn"))
+            .copied()
+            .collect::<Vec<_>>();
+        if rendered.len() != 2 {
+            return Err(format!(
+                "expected exactly two rendered-turn events, got {rendered:?}"
+            ));
+        }
+        if !rendered.iter().any(|line| line.contains("turn-1")) {
+            return Err(format!("missing turn-1 render event: {rendered:?}"));
+        }
+        if !rendered.iter().any(|line| line.contains("turn-2")) {
+            return Err(format!("missing turn-2 render event: {rendered:?}"));
+        }
+        Ok(())
+    });
 }
 
 #[tokio::test]

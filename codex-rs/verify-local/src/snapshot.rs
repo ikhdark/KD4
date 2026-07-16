@@ -2,9 +2,9 @@ use crate::model::RawPath;
 use crate::model::RepositorySnapshot;
 use crate::model::SnapshotRecord;
 use crate::model::SnapshotSource;
-use std::fs;
 #[cfg(unix)]
 use std::ffi::OsString;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -206,7 +206,10 @@ fn canonical_path(path: &Path) -> Result<PathBuf, SnapshotError> {
 
 fn canonical_git_root(path: &Path) -> Result<PathBuf, SnapshotError> {
     let start = canonical_path(path)?;
-    let output = run_git(&start, &["rev-parse", "--path-format=absolute", "--show-toplevel"])?;
+    let output = run_git(
+        &start,
+        &["rev-parse", "--path-format=absolute", "--show-toplevel"],
+    )?;
     let bytes = single_line(&output, "Git top-level path")?;
     canonical_path(&path_from_git_bytes(bytes)?)
 }
@@ -222,7 +225,10 @@ fn resolve_commit(repository_root: &Path, value: &str) -> Result<String, Snapsho
     )?;
     let resolved_output = std::str::from_utf8(&output)
         .map_err(|_| SnapshotError::InvalidCommitObject(value.to_string()))?;
-    let lines = resolved_output.lines().filter(|line| !line.is_empty()).collect::<Vec<_>>();
+    let lines = resolved_output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
     if lines.len() != 1
         || !(40..=64).contains(&lines[0].len())
         || !lines[0].as_bytes().iter().all(u8::is_ascii_hexdigit)
@@ -245,7 +251,10 @@ fn resolve_merge_base(
 fn parse_single_merge_base(output: &[u8]) -> Result<&str, SnapshotError> {
     let output = std::str::from_utf8(&output)
         .map_err(|_| SnapshotError::Malformed("merge-base output is not ASCII".to_string()))?;
-    let bases = output.lines().filter(|line| !line.is_empty()).collect::<Vec<_>>();
+    let bases = output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
     if bases.len() != 1 {
         return Err(SnapshotError::AmbiguousMergeBase { count: bases.len() });
     }
@@ -256,7 +265,9 @@ fn single_line<'a>(bytes: &'a [u8], label: &str) -> Result<&'a [u8], SnapshotErr
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
     if bytes.is_empty() || bytes.contains(&b'\n') || bytes.contains(&b'\r') || bytes.contains(&0) {
-        return Err(SnapshotError::Malformed(format!("{label} is not exactly one line")));
+        return Err(SnapshotError::Malformed(format!(
+            "{label} is not exactly one line"
+        )));
     }
     Ok(bytes)
 }
@@ -420,7 +431,9 @@ fn record_from_xy(
                 .all(|status| matches!(status, b'.' | b'M' | b'A' | b'D' | b'R' | b'T'))
     };
     if !valid {
-        return Err(SnapshotError::Malformed("unsupported status XY field".to_string()));
+        return Err(SnapshotError::Malformed(
+            "unsupported status XY field".to_string(),
+        ));
     }
     let status = String::from_utf8(xy.to_vec())
         .map_err(|_| SnapshotError::Malformed("non-ASCII status".to_string()))?;
@@ -447,7 +460,9 @@ fn validate_submodule(field: &[u8]) -> Result<(), SnapshotError> {
     if valid {
         Ok(())
     } else {
-        Err(SnapshotError::Malformed("invalid submodule field".to_string()))
+        Err(SnapshotError::Malformed(
+            "invalid submodule field".to_string(),
+        ))
     }
 }
 
@@ -464,7 +479,9 @@ fn validate_modes_and_oids(
     if oids.clone().any(|index| {
         !matches!(parts[index].len(), 40 | 64) || !parts[index].iter().all(u8::is_ascii_hexdigit)
     }) {
-        return Err(SnapshotError::Malformed("invalid Git object ID".to_string()));
+        return Err(SnapshotError::Malformed(
+            "invalid Git object ID".to_string(),
+        ));
     }
     Ok(())
 }
@@ -547,7 +564,9 @@ fn validate_rename_status(status: &[u8]) -> Result<(), SnapshotError> {
         .and_then(|score| score.parse::<u16>().ok())
         .ok_or_else(|| SnapshotError::Malformed("invalid rename score".to_string()))?;
     if score > 100 {
-        return Err(SnapshotError::Malformed("rename score exceeds 100".to_string()));
+        return Err(SnapshotError::Malformed(
+            "rename score exceeds 100".to_string(),
+        ));
     }
     Ok(())
 }

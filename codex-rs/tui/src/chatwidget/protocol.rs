@@ -61,7 +61,13 @@ impl ChatWidget {
                 self.turn_lifecycle.last_turn_id = Some(notification.turn.id);
                 self.last_non_retry_error = None;
                 if !matches!(replay_kind, Some(ReplayKind::ResumeInitialMessages)) {
-                    if let Some(correlation_id) = self.first_terminal_frame.on_turn_started() {
+                    let turn_id = self
+                        .turn_lifecycle
+                        .last_turn_id
+                        .as_deref()
+                        .unwrap_or_default();
+                    if let Some(correlation_id) = self.first_terminal_frame.on_turn_started(turn_id)
+                    {
                         tracing::debug!(
                             target: "codex_tui::latency",
                             correlation_id,
@@ -260,7 +266,8 @@ impl ChatWidget {
         replay_kind: Option<ReplayKind>,
     ) {
         if self.turn_lifecycle.last_turn_id.as_deref() == Some(notification.turn.id.as_str()) {
-            self.first_terminal_frame.on_turn_completed();
+            self.first_terminal_frame
+                .on_turn_completed(notification.turn.id.as_str());
         }
         // User-message dedupe only suppresses the app-server echo of a prompt
         // this TUI already rendered locally. Once that turn ends, another

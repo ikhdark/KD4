@@ -23,6 +23,8 @@ use crate::metrics::STARTUP_PHASE_DURATION_METRIC;
 use crate::metrics::SessionMetricTagValues;
 use crate::metrics::TOOL_CALL_COUNT_METRIC;
 use crate::metrics::TOOL_CALL_DURATION_METRIC;
+use crate::metrics::TUI_SUBMIT_TO_FIRST_TERMINAL_FRAME_DURATION_METRIC;
+use crate::metrics::TURN_TTFM_DURATION_METRIC;
 use crate::metrics::TURN_TTFT_DURATION_METRIC;
 use crate::metrics::WEBSOCKET_EVENT_COUNT_METRIC;
 use crate::metrics::WEBSOCKET_EVENT_DURATION_METRIC;
@@ -160,6 +162,18 @@ impl SessionTelemetry {
         }
     }
 
+    pub fn timing_correlation_enabled(&self) -> bool {
+        self.metrics.is_some()
+            || tracing::enabled!(
+                target: crate::targets::OTEL_LOG_ONLY_TARGET,
+                tracing::Level::INFO
+            )
+            || tracing::enabled!(
+                target: crate::targets::OTEL_TRACE_SAFE_TARGET,
+                tracing::Level::INFO
+            )
+    }
+
     pub fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]) {
         let res: MetricsResult<()> = (|| {
             let Some(metrics) = &self.metrics else {
@@ -231,12 +245,47 @@ impl SessionTelemetry {
     }
 
     /// Records time to first token as both a metric and a production telemetry event.
-    pub fn record_turn_ttft(&self, duration: Duration) {
+    pub fn record_turn_ttft(&self, turn_id: &str, duration: Duration) {
         self.record_duration(TURN_TTFT_DURATION_METRIC, duration, &[]);
         log_and_trace_event!(
             self,
             common: {
                 event.name = "codex.turn_ttft",
+                turn.id = turn_id,
+                duration_ms = %duration.as_millis(),
+            },
+            log: {},
+            trace: {},
+        );
+    }
+
+    pub fn record_turn_ttfm(&self, turn_id: &str, duration: Duration) {
+        self.record_duration(TURN_TTFM_DURATION_METRIC, duration, &[]);
+        log_and_trace_event!(
+            self,
+            common: {
+                event.name = "codex.turn_ttfm",
+                turn.id = turn_id,
+                duration_ms = %duration.as_millis(),
+            },
+            log: {},
+            trace: {},
+        );
+    }
+
+    /// Records the first terminal frame for a TUI turn with the same public
+    /// turn ID used by Core timing events.
+    pub fn record_tui_submit_to_first_terminal_frame(&self, turn_id: &str, duration: Duration) {
+        self.record_duration(
+            TUI_SUBMIT_TO_FIRST_TERMINAL_FRAME_DURATION_METRIC,
+            duration,
+            &[],
+        );
+        log_and_trace_event!(
+            self,
+            common: {
+                event.name = "codex.tui_submit_to_first_terminal_frame",
+                turn.id = turn_id,
                 duration_ms = %duration.as_millis(),
             },
             log: {},
@@ -731,6 +780,23 @@ impl SessionTelemetry {
         >,
         duration: Duration,
     ) {
+        self.record_websocket_event_for_turn(result, duration, /*turn_id*/ None);
+    }
+
+    pub fn record_websocket_event_for_turn(
+        &self,
+        result: &Result<
+            Option<
+                Result<
+                    tokio_tungstenite::tungstenite::Message,
+                    tokio_tungstenite::tungstenite::Error,
+                >,
+            >,
+            ApiError,
+        >,
+        duration: Duration,
+        turn_id: Option<&str>,
+    ) {
         let mut kind = None;
         let mut success = true;
 
@@ -744,7 +810,7 @@ impl SessionTelemetry {
                                 .and_then(|value| value.as_str())
                                 .map(std::string::ToString::to_string);
                             if kind.as_deref() == Some(RESPONSES_WEBSOCKET_TIMING_KIND) {
-                                self.record_responses_websocket_timing_metrics(&value);
+                                self.record_responses_websocket_timing_metrics(&value, turn_id);
                             }
                             if kind.as_deref() == Some("response.failed") {
                                 success = false;
@@ -1133,7 +1199,22 @@ impl SessionTelemetry {
         );
     }
 
-    fn record_responses_websocket_timing_metrics(&self, value: &serde_json::Value) {
+    fn record_responses_websocket_timing_metrics(
+        &self,
+        value: &serde_json::Value,
+        turn_id: Option<&str>,
+    ) {
+        if let Some(turn_id) = turn_id {
+            log_and_trace_event!(
+                self,
+                common: {
+                    event.name = "codex.responses_websocket_timing",
+                    turn.id = turn_id,
+                },
+                log: {},
+                trace: {},
+            );
+        }
         let timing_metrics = value.get(RESPONSES_WEBSOCKET_TIMING_METRICS_FIELD);
 
         let overhead_value =

@@ -140,12 +140,13 @@ mod tests {
     use std::fs;
     use std::thread;
     use std::time::Duration;
+    use std::time::Instant;
 
     #[test]
     fn empty_query_retains_session_and_reuses_the_walk() {
         let temp = tempfile::tempdir().expect("tempdir");
         fs::write(temp.path().join("alpha.txt"), "alpha").expect("file");
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let manager = FileSearchManager::new(temp.path().to_path_buf(), AppEventSender::new(tx));
 
         manager.on_user_query("alpha".to_string());
@@ -157,20 +158,24 @@ mod tests {
         }
         manager.on_user_query("beta".to_string());
 
-        let usage = (0..100)
-            .find_map(|_| {
-                #[expect(clippy::unwrap_used)]
-                let state = manager.state.lock().unwrap();
-                let usage = state.session.as_ref()?.usage_snapshot();
-                drop(state);
-                if usage.walker_runs == 1 {
-                    Some(usage)
-                } else {
-                    thread::sleep(Duration::from_millis(10));
-                    None
+        let deadline = Instant::now() + Duration::from_secs(5);
+        'wait_for_beta: loop {
+            while let Ok(event) = rx.try_recv() {
+                if matches!(event, AppEvent::FileSearchResult { query, .. } if query == "beta") {
+                    break 'wait_for_beta;
                 }
-            })
-            .expect("walker started");
+            }
+            assert!(Instant::now() < deadline, "beta query was not processed");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        #[expect(clippy::unwrap_used)]
+        let state = manager.state.lock().unwrap();
+        let usage = state
+            .session
+            .as_ref()
+            .expect("session retained")
+            .usage_snapshot();
         assert_eq!(usage.query_updates, 3);
         assert_eq!(usage.walker_runs, 1);
     }

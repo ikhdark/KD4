@@ -214,6 +214,7 @@ impl ResponsesWebsocketConnection {
         request: ResponsesWsRequest,
         connection_reused: bool,
         turn_state: Option<Arc<OnceLock<String>>>,
+        turn_id: Option<String>,
     ) -> Result<ResponseStream, ApiError> {
         let (tx_event, rx_event) =
             mpsc::channel::<std::result::Result<ResponseEvent, ApiError>>(1600);
@@ -262,6 +263,7 @@ impl ResponsesWebsocketConnection {
                         telemetry,
                         connection_reused,
                         turn_state.as_deref(),
+                        turn_id.as_deref(),
                     )
                     .await
                 };
@@ -627,6 +629,7 @@ async fn run_websocket_response_stream(
     telemetry: Option<Arc<dyn WebsocketTelemetry>>,
     connection_reused: bool,
     turn_state: Option<&OnceLock<String>>,
+    turn_id: Option<&str>,
 ) -> Result<(), ApiError> {
     let mut last_server_model: Option<String> = None;
     let mut safety_buffering_treatment = SafetyBufferingTreatment::default();
@@ -645,7 +648,7 @@ async fn run_websocket_response_stream(
             .await
             .map_err(|_| ApiError::Stream("idle timeout waiting for websocket".into()));
         if let Some(t) = telemetry.as_ref() {
-            t.on_ws_event(&response, poll_start.elapsed());
+            t.on_ws_event(&response, poll_start.elapsed(), turn_id);
         }
         let message = match response {
             Ok(Some(Ok(msg))) => msg,

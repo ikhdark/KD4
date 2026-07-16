@@ -237,10 +237,7 @@ fn run_ci_scope(args: CiScopeArgs) -> Result<i32, String> {
                     error.to_string(),
                 )
             });
-    let repository_root = snapshot
-        .repository_root
-        .clone()
-        .unwrap_or(repository_root);
+    let repository_root = snapshot.repository_root.clone().unwrap_or(repository_root);
     let mut metadata_request = CargoMetadataRequest::for_repository(&repository_root);
     metadata_request.no_cache = args.no_cache;
     metadata_request.cache_readonly = args.cache_readonly;

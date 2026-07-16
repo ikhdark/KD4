@@ -265,12 +265,13 @@ impl PlannerContext {
                 path: repository_root.to_path_buf(),
                 source,
             })?;
-        let expected_workspace = fs::canonicalize(repository_root.join("codex-rs")).map_err(
-            |source| ContextError::Read {
-                path: repository_root.join("codex-rs"),
-                source,
-            },
-        )?;
+        let expected_workspace =
+            fs::canonicalize(repository_root.join("codex-rs")).map_err(|source| {
+                ContextError::Read {
+                    path: repository_root.join("codex-rs"),
+                    source,
+                }
+            })?;
         let workspace_root = metadata
             .get("workspace_root")
             .and_then(JsonValue::as_str)
@@ -299,13 +300,12 @@ impl PlannerContext {
             let package = package.as_object().ok_or_else(|| {
                 ContextError::Metadata(format!("package {index} is not an object"))
             })?;
-            let id = package.get("id").and_then(JsonValue::as_str).ok_or_else(|| {
-                ContextError::Metadata(format!("package {index} has no id"))
-            })?;
+            let id = package
+                .get("id")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| ContextError::Metadata(format!("package {index} has no id")))?;
             if packages_by_id.insert(id.to_string(), package).is_some() {
-                return Err(ContextError::Metadata(format!(
-                    "duplicate package id {id}"
-                )));
+                return Err(ContextError::Metadata(format!("duplicate package id {id}")));
             }
         }
         let workspace_members = metadata
@@ -329,16 +329,17 @@ impl PlannerContext {
             let package = packages_by_id.get(id).ok_or_else(|| {
                 ContextError::Metadata(format!("workspace member {id} has no package record"))
             })?;
-            let name = package.get("name").and_then(JsonValue::as_str).ok_or_else(|| {
-                ContextError::Metadata(format!("workspace package {id} has no name"))
-            })?;
+            let name = package
+                .get("name")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    ContextError::Metadata(format!("workspace package {id} has no name"))
+                })?;
             let manifest = package
                 .get("manifest_path")
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| {
-                    ContextError::Metadata(format!(
-                        "workspace package {id} has no manifest_path"
-                    ))
+                    ContextError::Metadata(format!("workspace package {id} has no manifest_path"))
                 })
                 .and_then(|path| {
                     fs::canonicalize(path).map_err(|error| {
@@ -391,17 +392,13 @@ impl PlannerContext {
                 })?;
             for (index, dependency) in dependencies.iter().enumerate() {
                 let dependency = dependency.as_object().ok_or_else(|| {
-                    ContextError::Metadata(format!(
-                        "dependency {index} for {id} is not an object"
-                    ))
+                    ContextError::Metadata(format!("dependency {index} for {id} is not an object"))
                 })?;
                 let dependency_name = dependency
                     .get("name")
                     .and_then(JsonValue::as_str)
                     .ok_or_else(|| {
-                        ContextError::Metadata(format!(
-                            "dependency {index} for {id} has no name"
-                        ))
+                        ContextError::Metadata(format!("dependency {index} for {id} has no name"))
                     })?;
                 if workspace_names.contains(dependency_name) {
                     graph

@@ -28,9 +28,7 @@ fn cargo_metadata_graph_drives_globbed_conservative_reverse_closure() {
             fixture
                 .path()
                 .join(format!("codex-rs/crates/{name}/Cargo.toml")),
-            &format!(
-                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
-            ),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"),
         );
         write(
             fixture
@@ -43,8 +41,7 @@ fn cargo_metadata_graph_drives_globbed_conservative_reverse_closure() {
         fixture.path().join("scripts/verify_local_rules.toml"),
         "# fixture rules\n",
     );
-    let workspace_root =
-        fs::canonicalize(fixture.path().join("codex-rs")).expect("workspace root");
+    let workspace_root = fs::canonicalize(fixture.path().join("codex-rs")).expect("workspace root");
     let package = |name: &str, dependencies: serde_json::Value| {
         serde_json::json!({
             "id": format!("workspace#{name}"),

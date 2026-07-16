@@ -4219,6 +4219,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "tracing-test",
  "two-face",
  "unicode-segmentation",
  "unicode-width 0.2.1",

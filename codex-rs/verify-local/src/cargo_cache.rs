@@ -437,7 +437,12 @@ fn discover_workspace(
             return;
         }
     };
-    let members = string_array(inventory, "workspace.members", workspace.get("members"), true);
+    let members = string_array(
+        inventory,
+        "workspace.members",
+        workspace.get("members"),
+        true,
+    );
     let default_members = string_array(
         inventory,
         "workspace.default-members",
@@ -727,7 +732,13 @@ fn inventory_targets(inventory: &mut Inventory, manifest: &Path) {
         }
     };
     if let Some(package) = value.get("package").and_then(toml::Value::as_table) {
-        for key in ["autolib", "autobins", "autoexamples", "autotests", "autobenches"] {
+        for key in [
+            "autolib",
+            "autobins",
+            "autoexamples",
+            "autotests",
+            "autobenches",
+        ] {
             if let Some(setting) = package.get(key) {
                 match setting.as_bool() {
                     Some(setting) => logical(
@@ -754,7 +765,10 @@ fn inventory_targets(inventory: &mut Inventory, manifest: &Path) {
                 (_, Some(_)) => {}
                 _ => incomplete(
                     inventory,
-                    format!("package.build has an invalid type in {}", manifest.display()),
+                    format!(
+                        "package.build has an invalid type in {}",
+                        manifest.display()
+                    ),
                 ),
             }
         }
@@ -769,7 +783,10 @@ fn inventory_targets(inventory: &mut Inventory, manifest: &Path) {
         let Some(targets) = targets.as_array() else {
             incomplete(
                 inventory,
-                format!("{key} target list is not an array in {}", manifest.display()),
+                format!(
+                    "{key} target list is not an array in {}",
+                    manifest.display()
+                ),
             );
             continue;
         };
@@ -789,15 +806,13 @@ fn inventory_targets(inventory: &mut Inventory, manifest: &Path) {
         if directory.is_dir() {
             for entry in WalkDir::new(&directory).follow_links(false).into_iter() {
                 match entry {
-                    Ok(entry) => {
-                        record_file(
-                            inventory,
-                            "cargo-target-candidate",
-                            entry.path(),
-                            false,
-                            ExpectedInputKind::Either,
-                        )
-                    }
+                    Ok(entry) => record_file(
+                        inventory,
+                        "cargo-target-candidate",
+                        entry.path(),
+                        false,
+                        ExpectedInputKind::Either,
+                    ),
                     Err(error) => incomplete(
                         inventory,
                         format!(
@@ -831,7 +846,10 @@ fn inventory_explicit_target(
     let Some(path) = path.as_str() else {
         incomplete(
             inventory,
-            format!("{kind} target path is not a string in {}", manifest.display()),
+            format!(
+                "{kind} target path is not a string in {}",
+                manifest.display()
+            ),
         );
         return;
     };
@@ -1194,7 +1212,10 @@ fn record_git_identity(inventory: &mut Inventory, repository_root: &Path) {
 fn canonical_git_output_path(repository_root: &Path, output: &[u8]) -> Result<PathBuf, String> {
     let output = output.strip_suffix(b"\n").unwrap_or(output);
     let output = output.strip_suffix(b"\r").unwrap_or(output);
-    if output.is_empty() || output.contains(&b'\n') || output.contains(&b'\r') || output.contains(&0)
+    if output.is_empty()
+        || output.contains(&b'\n')
+        || output.contains(&b'\r')
+        || output.contains(&0)
     {
         return Err("expected exactly one path line".to_string());
     }
@@ -1386,10 +1407,7 @@ fn string_array(
     for (index, value) in values.iter().enumerate() {
         match value.as_str() {
             Some(value) => result.push(value.to_string()),
-            None => incomplete(
-                inventory,
-                format!("{label}[{index}] is not a string"),
-            ),
+            None => incomplete(inventory, format!("{label}[{index}] is not a string")),
         }
     }
     result
@@ -1440,14 +1458,20 @@ fn is_relevant_environment_key(key: &OsStr) -> bool {
             || key.starts_with("RUST_")
             || key.starts_with("RUSTC_")
             || key.starts_with("RUSTUP_")
-            || matches!(key, "PATH" | "RUSTC" | "RUSTDOC" | "RUSTFLAGS" | "RUSTDOCFLAGS")
+            || matches!(
+                key,
+                "PATH" | "RUSTC" | "RUSTDOC" | "RUSTFLAGS" | "RUSTDOCFLAGS"
+            )
     })
 }
 
 fn validate_metadata_topology_args(inventory: &mut Inventory, arguments: &[OsString]) {
     for argument in arguments {
         let Some(argument) = argument.to_str() else {
-            incomplete(inventory, "metadata argument is not Unicode and cannot be modeled");
+            incomplete(
+                inventory,
+                "metadata argument is not Unicode and cannot be modeled",
+            );
             continue;
         };
         if matches!(argument, "--manifest-path" | "--config")

@@ -8,7 +8,6 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use codex_analytics::TurnProfile;
-use codex_otel::TURN_TTFM_DURATION_METRIC;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TurnTiming;
@@ -35,7 +34,9 @@ pub(crate) async fn record_turn_ttft_metric(turn_context: &TurnContext, event: &
     else {
         return;
     };
-    turn_context.session_telemetry.record_turn_ttft(duration);
+    turn_context
+        .session_telemetry
+        .record_turn_ttft(&turn_context.sub_id, duration);
 }
 
 pub(crate) async fn record_turn_ttfm_metric(turn_context: &TurnContext, item: &TurnItem) {
@@ -47,7 +48,7 @@ pub(crate) async fn record_turn_ttfm_metric(turn_context: &TurnContext, item: &T
     };
     turn_context
         .session_telemetry
-        .record_duration(TURN_TTFM_DURATION_METRIC, duration, &[]);
+        .record_turn_ttfm(&turn_context.sub_id, duration);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

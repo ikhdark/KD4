@@ -135,7 +135,6 @@ use codex_git_utils::local_git_branches;
 use codex_git_utils::recent_commits;
 use codex_otel::RuntimeMetricsSummary;
 use codex_otel::SessionTelemetry;
-use codex_otel::TUI_SUBMIT_TO_FIRST_TERMINAL_FRAME_DURATION_METRIC;
 use codex_plugin::PluginCapabilitySummary;
 use codex_protocol::ThreadId;
 use codex_protocol::account::PlanType;
@@ -1848,7 +1847,9 @@ impl ChatWidget {
     }
 
     pub(crate) fn prepare_local_op_submission(&mut self, op: &AppCommand) {
-        if matches!(op, AppCommand::UserTurn { .. })
+        if (self.session_telemetry.timing_correlation_enabled()
+            || tracing::enabled!(target: "codex_tui::latency", tracing::Level::DEBUG))
+            && matches!(op, AppCommand::UserTurn { .. })
             && let Some(correlation_id) = self.first_terminal_frame.arm_submission()
         {
             tracing::debug!(
@@ -1877,7 +1878,7 @@ impl ChatWidget {
     pub(crate) fn note_first_assistant_output(&mut self, turn_id: &str, has_content: bool) {
         if has_content
             && self.turn_lifecycle.last_turn_id.as_deref() == Some(turn_id)
-            && let Some(correlation_id) = self.first_terminal_frame.on_first_output()
+            && let Some(correlation_id) = self.first_terminal_frame.on_first_output(turn_id)
         {
             tracing::debug!(
                 target: "codex_tui::latency",
@@ -1892,34 +1893,38 @@ impl ChatWidget {
         if !has_content {
             return;
         }
-        let Some(correlation_id) = self.first_terminal_frame.on_first_output() else {
+        let turn_id = self
+            .turn_lifecycle
+            .last_turn_id
+            .as_deref()
+            .unwrap_or_default();
+        let Some(correlation_id) = self.first_terminal_frame.on_first_output(turn_id) else {
             return;
         };
-        let turn_id = self.turn_lifecycle.last_turn_id.as_deref();
         tracing::debug!(
             target: "codex_tui::latency",
             correlation_id,
-            turn_id = turn_id.unwrap_or_default(),
+            turn_id,
             "first assistant output observed for terminal-frame correlation"
         );
     }
 
     pub(crate) fn on_terminal_frame_rendered(&mut self) {
-        let Some((correlation_id, duration)) = self.first_terminal_frame.take_rendered_duration()
-        else {
-            return;
-        };
-        self.session_telemetry.record_duration(
-            TUI_SUBMIT_TO_FIRST_TERMINAL_FRAME_DURATION_METRIC,
-            duration,
-            &[],
-        );
-        tracing::debug!(
-            target: "codex_tui::latency",
-            correlation_id,
-            duration_ms = duration.as_millis(),
-            "first terminal frame rendered for submitted turn"
-        );
+        let rendered_at = Instant::now();
+        while let Some((correlation_id, turn_id, duration)) = self
+            .first_terminal_frame
+            .take_rendered_duration(rendered_at)
+        {
+            self.session_telemetry
+                .record_tui_submit_to_first_terminal_frame(&turn_id, duration);
+            tracing::debug!(
+                target: "codex_tui::latency",
+                correlation_id,
+                turn_id,
+                duration_ms = duration.as_millis(),
+                "first terminal frame rendered for submitted turn"
+            );
+        }
     }
 
     fn on_list_skills(&mut self, ev: SkillsListResponse) {

@@ -983,10 +983,44 @@ mod tests {
             self.updates.lock().unwrap().clone()
         }
 
-        fn wait_for_updates_at_least(&self, min_len: usize, timeout: Duration) -> bool {
-            self.wait_until(&self.updates, &self.update_cv, timeout, |updates| {
-                updates.len() >= min_len
-            })
+        fn wait_for_query_ranking(
+            &self,
+            query: &str,
+            expected_matches: &[FileMatch],
+            expected_total_match_count: usize,
+            timeout: Duration,
+        ) -> Option<FileSearchSnapshot> {
+            let deadline = Instant::now() + timeout;
+            let mut updates = self.updates.lock().unwrap();
+            loop {
+                if let Some(snapshot) = updates.iter().rev().find(|snapshot| {
+                    snapshot.query == query
+                        && snapshot.walk_complete
+                        && snapshot.matches == expected_matches
+                        && snapshot.total_match_count == expected_total_match_count
+                }) {
+                    return Some(snapshot.clone());
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                let (next_updates, wait_result) =
+                    self.update_cv.wait_timeout(updates, remaining).unwrap();
+                updates = next_updates;
+                if wait_result.timed_out() {
+                    return updates
+                        .iter()
+                        .rev()
+                        .find(|snapshot| {
+                            snapshot.query == query
+                                && snapshot.walk_complete
+                                && snapshot.matches == expected_matches
+                                && snapshot.total_match_count == expected_total_match_count
+                        })
+                        .cloned();
+                }
+            }
         }
 
         fn snapshot(&self) -> FileSearchSnapshot {
@@ -1070,40 +1104,59 @@ mod tests {
     }
 
     #[test]
-    fn session_accepts_query_updates_after_walk_complete() {
+    fn session_alpha_empty_beta_matches_one_shot_with_single_walk() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("alpha.txt"), "alpha").unwrap();
-        fs::write(dir.path().join("beta.txt"), "beta").unwrap();
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        for path in [
+            "alpha.txt",
+            "alphabet.md",
+            "beta.txt",
+            "betamax.md",
+            "gamma.txt",
+            "src/alpha_beta.rs",
+            "src/beta_alpha.rs",
+        ] {
+            fs::write(dir.path().join(path), path).unwrap();
+        }
+        let options = FileSearchOptions {
+            limit: NonZero::new(32).unwrap(),
+            threads: NonZero::new(1).unwrap(),
+            compute_indices: true,
+            ..Default::default()
+        };
+        let roots = vec![dir.path().to_path_buf()];
+        let alpha_baseline = run("alpha", roots.clone(), options.clone(), None).unwrap();
+        let empty_baseline = run("", roots.clone(), options.clone(), None).unwrap();
+        let beta_baseline = run("beta", roots.clone(), options.clone(), None).unwrap();
         let reporter = Arc::new(RecordingReporter::default());
-        let session = create_session(
-            vec![dir.path().to_path_buf()],
-            FileSearchOptions::default(),
-            reporter.clone(),
-            /*cancel_flag*/ None,
-        )
-        .expect("session");
+        let session = create_session(roots, options, reporter.clone(), /*cancel_flag*/ None)
+            .expect("session");
 
-        session.update_query("alpha");
-        assert!(reporter.wait_for_complete(Duration::from_secs(5)));
-        let updates_before = reporter.updates().len();
+        for (query, baseline) in [
+            ("alpha", &alpha_baseline),
+            ("", &empty_baseline),
+            ("beta", &beta_baseline),
+        ] {
+            reporter.clear();
+            session.update_query(query);
+            let snapshot = reporter
+                .wait_for_query_ranking(
+                    query,
+                    &baseline.matches,
+                    baseline.total_match_count,
+                    Duration::from_secs(5),
+                )
+                .unwrap_or_else(|| panic!("missing exact completed ranking for query {query:?}"));
+            assert_eq!(snapshot.matches, baseline.matches);
+            assert_eq!(snapshot.total_match_count, baseline.total_match_count);
+        }
 
-        session.update_query("beta");
-        assert!(reporter.wait_for_updates_at_least(updates_before + 1, Duration::from_secs(5),));
-
-        let updates = reporter.updates();
-        let last_update = updates.last().cloned().expect("update");
-        assert!(
-            last_update
-                .matches
-                .iter()
-                .any(|file_match| file_match.path.to_string_lossy().contains("beta.txt"))
-        );
         let usage = session.usage_snapshot();
         assert_eq!(usage.interactive_sessions, 1);
-        assert_eq!(usage.query_updates, 2);
+        assert_eq!(usage.query_updates, 3);
         assert_eq!(usage.walker_runs, 1);
-        assert!(usage.walker_entries >= 2);
-        assert!(usage.snapshots_emitted >= 2);
+        assert!(usage.walker_entries >= 8);
+        assert!(usage.snapshots_emitted >= 3);
     }
 
     #[test]

@@ -39,6 +39,7 @@ pub trait WebsocketTelemetry: Send + Sync {
         &self,
         result: &Result<Option<Result<Message, Error>>, ApiError>,
         duration: Duration,
+        turn_id: Option<&str>,
     );
 }
 
