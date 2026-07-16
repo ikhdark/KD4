@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from collections.abc import Mapping
 
 
 JOB_ENV = {
@@ -16,6 +18,17 @@ JOB_ENV = {
     "rust-ci": "RUN_RUST_CI",
     "sdk": "RUN_SDK",
 }
+DECISION_ID_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+
+
+def parse_expected_values(environment: Mapping[str, str]) -> dict[str, bool]:
+    expected: dict[str, bool] = {}
+    for job, name in JOB_ENV.items():
+        value = environment.get(name)
+        if value not in {"true", "false"}:
+            raise ValueError(f"{name} must be exactly true or false, got {value!r}")
+        expected[job] = value == "true"
+    return expected
 
 
 def validate(
@@ -24,6 +37,8 @@ def validate(
     expected: dict[str, bool],
 ) -> list[str]:
     failures: list[str] = []
+    if DECISION_ID_RE.fullmatch(decision_id) is None:
+        failures.append(f"invalid decision id: {decision_id!r}")
     classify = needs.get("classify")
     if not isinstance(classify, dict) or classify.get("result") != "success":
         failures.append("classify did not succeed")
@@ -34,6 +49,28 @@ def validate(
             failures.append(
                 f"classify decision mismatch: expected {decision_id}, got {classified_id}"
             )
+        if isinstance(outputs, dict):
+            expected_output_names = {
+                f"run_{job.replace('-', '_')}" for job in expected
+            }
+            actual_output_names = {
+                name for name in outputs if name.startswith("run_")
+            }
+            for extra in sorted(actual_output_names - expected_output_names):
+                failures.append(f"classify exposed unexpected output {extra}")
+            for job, should_run in expected.items():
+                name = f"run_{job.replace('-', '_')}"
+                value = outputs.get(name)
+                if value not in {"true", "false"}:
+                    failures.append(
+                        f"classify output {name} must be true or false, got {value!r}"
+                    )
+                elif (value == "true") != should_run:
+                    failures.append(
+                        f"classify output {name} disagrees with terminal expectation"
+                    )
+        else:
+            failures.append("classify outputs are missing")
 
     for job, should_run in expected.items():
         dependency = needs.get(job)
@@ -60,10 +97,11 @@ def validate(
 def main() -> None:
     needs = json.loads(os.environ["NEEDS"])
     decision_id = os.environ["DECISION_ID"]
-    expected = {
-        job: os.environ[environment].lower() == "true"
-        for job, environment in JOB_ENV.items()
-    }
+    try:
+        expected = parse_expected_values(os.environ)
+    except ValueError as error:
+        print(f"CI terminal decision failed:\n- {error}")
+        raise SystemExit(1) from error
     failures = validate(needs, decision_id, expected)
     if failures:
         print("CI terminal decision failed:")

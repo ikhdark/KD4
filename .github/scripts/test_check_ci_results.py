@@ -21,7 +21,13 @@ def needs(expected: dict[str, bool]) -> dict[str, dict[str, object]]:
     result: dict[str, dict[str, object]] = {
         "classify": {
             "result": "success",
-            "outputs": {"decision_id": DECISION},
+            "outputs": {
+                "decision_id": DECISION,
+                **{
+                    f"run_{job.replace('-', '_')}": str(expected[job]).lower()
+                    for job in JOBS
+                },
+            },
         }
     }
     for job in JOBS:
@@ -72,6 +78,31 @@ class CheckCiResultsTest(unittest.TestCase):
         failures = MODULE.validate(data, DECISION, expected)
         self.assertTrue(any("codespell" in failure for failure in failures))
 
+    def test_empty_decision_and_all_skips_fail_closed(self) -> None:
+        expected = {job: False for job in JOBS}
+        data = needs(expected)
+        data["classify"]["outputs"]["decision_id"] = ""
+        failures = MODULE.validate(data, "", expected)
+        self.assertTrue(any("invalid decision id" in failure for failure in failures))
+
+    def test_invalid_run_values_and_classifier_mismatch_fail(self) -> None:
+        expected = {job: False for job in JOBS}
+        with self.assertRaises(ValueError):
+            MODULE.parse_expected_values(
+                {
+                    environment: ("yes" if index == 0 else "false")
+                    for index, environment in enumerate(MODULE.JOB_ENV.values())
+                }
+            )
+        data = needs(expected)
+        data["classify"]["outputs"]["run_rust_ci"] = "true"
+        data["classify"]["outputs"]["run_sdk"] = ""
+        data["classify"]["outputs"]["run_unexpected"] = "false"
+        failures = MODULE.validate(data, DECISION, expected)
+        self.assertTrue(any("run_rust_ci disagrees" in failure for failure in failures))
+        self.assertTrue(any("run_sdk must be" in failure for failure in failures))
+        self.assertTrue(any("run_unexpected" in failure for failure in failures))
+
     def test_blocking_ci_static_terminal_gate_contract(self) -> None:
         workflow = (REPO / ".github/workflows/blocking-ci.yml").read_text()
         self.assertIn("if: ${{ always() }}", workflow)
@@ -114,6 +145,10 @@ class CheckCiResultsTest(unittest.TestCase):
         self.assertIn("value: ${{ jobs.results.outputs.consumed_decision_id }}", text)
         self.assertIn("consumed_decision_id: ${{ needs.changed.outputs.consumed_decision_id }}", text)
         self.assertIn("needs.changed.result", text)
+        self.assertIn("scoped_packages:", text)
+        self.assertIn("fromJSON(needs.changed.outputs.rust_matrix)", text)
+        self.assertIn('cargo test --locked -p "$PACKAGE"', text)
+        self.assertIn("needs.scoped_packages.result", text)
 
     def test_rust_ci_full_has_aggregate_decision_result(self) -> None:
         text = (REPO / ".github/workflows/rust-ci-full.yml").read_text()

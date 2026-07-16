@@ -3,6 +3,8 @@ use crate::model::RepositorySnapshot;
 use crate::model::SnapshotRecord;
 use crate::model::SnapshotSource;
 use std::fs;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -43,7 +45,7 @@ impl RepositorySnapshot {
         repository_root: &Path,
         paths: impl IntoIterator<Item = RawPath>,
     ) -> Result<Self, SnapshotError> {
-        let repository_root = canonical_root(repository_root)?;
+        let repository_root = canonical_path(repository_root)?;
         let mut records = paths
             .into_iter()
             .map(|path| {
@@ -75,7 +77,7 @@ impl RepositorySnapshot {
     }
 
     pub fn from_worktree(repository_root: &Path) -> Result<Self, SnapshotError> {
-        let repository_root = canonical_root(repository_root)?;
+        let repository_root = canonical_git_root(repository_root)?;
         let output = run_git(
             &repository_root,
             &[
@@ -104,23 +106,13 @@ impl RepositorySnapshot {
         head: &str,
         mode: CommitComparisonMode,
     ) -> Result<Self, SnapshotError> {
-        let repository_root = canonical_root(repository_root)?;
+        let repository_root = canonical_git_root(repository_root)?;
         let base = resolve_commit(&repository_root, base)?;
         let head = resolve_commit(&repository_root, head)?;
         let (comparison_base, merge_base) = match mode {
             CommitComparisonMode::Direct => (base.clone(), None),
             CommitComparisonMode::PullRequestMergeBase => {
-                let output = run_git(&repository_root, &["merge-base", "--all", &base, &head])?;
-                let merge_base_output = String::from_utf8_lossy(&output);
-                let bases = merge_base_output
-                    .lines()
-                    .filter(|line| !line.trim().is_empty())
-                    .map(str::trim)
-                    .collect::<Vec<_>>();
-                if bases.len() != 1 {
-                    return Err(SnapshotError::AmbiguousMergeBase { count: bases.len() });
-                }
-                let resolved = resolve_commit(&repository_root, bases[0])?;
+                let resolved = resolve_merge_base(&repository_root, &base, &head)?;
                 (resolved.clone(), Some(resolved))
             }
         };
@@ -144,9 +136,10 @@ impl RepositorySnapshot {
         Ok(Self {
             repository_root: Some(repository_root),
             source: SnapshotSource::CommitDiff {
-                base,
-                head,
+                base: Some(base),
+                head: Some(head),
                 merge_base,
+                pull_request: mode == CommitComparisonMode::PullRequestMergeBase,
             },
             records,
             complete: true,
@@ -163,13 +156,59 @@ impl RepositorySnapshot {
             fallback_reasons: vec![reason.into()],
         }
     }
+
+    pub fn commit_diff_fallback(
+        repository_root: &Path,
+        base: &str,
+        head: &str,
+        mode: CommitComparisonMode,
+        reason: impl Into<String>,
+    ) -> Self {
+        let repository_root = canonical_git_root(repository_root).ok();
+        let resolved_base = repository_root
+            .as_deref()
+            .and_then(|root| resolve_commit(root, base).ok());
+        let resolved_head = repository_root
+            .as_deref()
+            .and_then(|root| resolve_commit(root, head).ok());
+        let merge_base = match (
+            mode,
+            repository_root.as_deref(),
+            resolved_base.as_deref(),
+            resolved_head.as_deref(),
+        ) {
+            (CommitComparisonMode::PullRequestMergeBase, Some(root), Some(base), Some(head)) => {
+                resolve_merge_base(root, base, head).ok()
+            }
+            _ => None,
+        };
+        Self {
+            repository_root,
+            source: SnapshotSource::CommitDiff {
+                base: resolved_base,
+                head: resolved_head,
+                merge_base,
+                pull_request: mode == CommitComparisonMode::PullRequestMergeBase,
+            },
+            records: Vec::new(),
+            complete: false,
+            fallback_reasons: vec![reason.into()],
+        }
+    }
 }
 
-fn canonical_root(path: &Path) -> Result<PathBuf, SnapshotError> {
+fn canonical_path(path: &Path) -> Result<PathBuf, SnapshotError> {
     fs::canonicalize(path).map_err(|source| SnapshotError::Canonicalize {
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn canonical_git_root(path: &Path) -> Result<PathBuf, SnapshotError> {
+    let start = canonical_path(path)?;
+    let output = run_git(&start, &["rev-parse", "--path-format=absolute", "--show-toplevel"])?;
+    let bytes = single_line(&output, "Git top-level path")?;
+    canonical_path(&path_from_git_bytes(bytes)?)
 }
 
 fn resolve_commit(repository_root: &Path, value: &str) -> Result<String, SnapshotError> {
@@ -181,12 +220,9 @@ fn resolve_commit(repository_root: &Path, value: &str) -> Result<String, Snapsho
         repository_root,
         &["rev-parse", "--verify", "--end-of-options", &expression],
     )?;
-    let resolved_output = String::from_utf8_lossy(&output);
-    let lines = resolved_output
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(str::trim)
-        .collect::<Vec<_>>();
+    let resolved_output = std::str::from_utf8(&output)
+        .map_err(|_| SnapshotError::InvalidCommitObject(value.to_string()))?;
+    let lines = resolved_output.lines().filter(|line| !line.is_empty()).collect::<Vec<_>>();
     if lines.len() != 1
         || !(40..=64).contains(&lines[0].len())
         || !lines[0].as_bytes().iter().all(u8::is_ascii_hexdigit)
@@ -194,6 +230,55 @@ fn resolve_commit(repository_root: &Path, value: &str) -> Result<String, Snapsho
         return Err(SnapshotError::InvalidCommitObject(value.to_string()));
     }
     Ok(lines[0].to_ascii_lowercase())
+}
+
+fn resolve_merge_base(
+    repository_root: &Path,
+    base: &str,
+    head: &str,
+) -> Result<String, SnapshotError> {
+    let output = run_git(repository_root, &["merge-base", "--all", base, head])?;
+    let base = parse_single_merge_base(&output)?;
+    resolve_commit(repository_root, base)
+}
+
+fn parse_single_merge_base(output: &[u8]) -> Result<&str, SnapshotError> {
+    let output = std::str::from_utf8(&output)
+        .map_err(|_| SnapshotError::Malformed("merge-base output is not ASCII".to_string()))?;
+    let bases = output.lines().filter(|line| !line.is_empty()).collect::<Vec<_>>();
+    if bases.len() != 1 {
+        return Err(SnapshotError::AmbiguousMergeBase { count: bases.len() });
+    }
+    Ok(bases[0])
+}
+
+fn single_line<'a>(bytes: &'a [u8], label: &str) -> Result<&'a [u8], SnapshotError> {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    let bytes = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+    if bytes.is_empty() || bytes.contains(&b'\n') || bytes.contains(&b'\r') || bytes.contains(&0) {
+        return Err(SnapshotError::Malformed(format!("{label} is not exactly one line")));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn path_from_git_bytes(bytes: &[u8]) -> Result<PathBuf, SnapshotError> {
+    use std::os::unix::ffi::OsStringExt;
+    Ok(PathBuf::from(OsString::from_vec(bytes.to_vec())))
+}
+
+#[cfg(windows)]
+fn path_from_git_bytes(bytes: &[u8]) -> Result<PathBuf, SnapshotError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| SnapshotError::Malformed("Git top-level path is not UTF-8".to_string()))?;
+    Ok(PathBuf::from(text))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn path_from_git_bytes(bytes: &[u8]) -> Result<PathBuf, SnapshotError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| SnapshotError::Malformed("Git top-level path is not UTF-8".to_string()))?;
+    Ok(PathBuf::from(text))
 }
 
 fn run_git(repository_root: &Path, args: &[&str]) -> Result<Vec<u8>, SnapshotError> {
@@ -206,6 +291,7 @@ fn run_git(repository_root: &Path, args: &[&str]) -> Result<Vec<u8>, SnapshotErr
         .args(["-c", "core.pager=cat"])
         .args(["-c", "diff.external="])
         .args(["-c", "diff.renamelimit=0"])
+        .args(["-c", "status.relativePaths=false"])
         .args(args)
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -250,13 +336,17 @@ fn parse_porcelain_v2(bytes: &[u8]) -> Result<Vec<SnapshotRecord>, SnapshotError
                 records.push(parse_rename(field, original)?);
             }
             Some(b'u') => records.push(parse_unmerged(field)?),
-            Some(b'?') => records.push(simple_record(
+            Some(b'?') if field.starts_with(b"? ") => records.push(simple_record(
                 "?",
                 path_after_prefix(field, 2)?,
                 false,
                 true,
             )?),
-            Some(b'!') => {}
+            Some(b'!') => {
+                return Err(SnapshotError::Malformed(
+                    "ignored record was not requested".to_string(),
+                ));
+            }
             _ => {
                 return Err(SnapshotError::Malformed(format!(
                     "unknown porcelain-v2 record type: {:?}",
@@ -275,7 +365,9 @@ fn parse_ordinary(field: &[u8]) -> Result<SnapshotRecord, SnapshotError> {
             "ordinary status record".to_string(),
         ));
     }
-    record_from_xy(parts[1], parts[2], parts[8], None)
+    validate_submodule(parts[2])?;
+    validate_modes_and_oids(&parts, 3..=5, 6..=7)?;
+    record_from_xy(parts[1], parts[2], parts[8], None, false)
 }
 
 fn parse_rename(field: &[u8], original: &[u8]) -> Result<SnapshotRecord, SnapshotError> {
@@ -291,7 +383,10 @@ fn parse_rename(field: &[u8], original: &[u8]) -> Result<SnapshotRecord, Snapsho
             "type-2 record is not a rename".to_string(),
         ));
     }
-    record_from_xy(parts[1], parts[2], parts[9], Some(original))
+    validate_rename_status(parts[8])?;
+    validate_submodule(parts[2])?;
+    validate_modes_and_oids(&parts, 3..=5, 6..=7)?;
+    record_from_xy(parts[1], parts[2], parts[9], Some(original), false)
 }
 
 fn parse_unmerged(field: &[u8]) -> Result<SnapshotRecord, SnapshotError> {
@@ -301,7 +396,9 @@ fn parse_unmerged(field: &[u8]) -> Result<SnapshotRecord, SnapshotError> {
             "unmerged status record".to_string(),
         ));
     }
-    record_from_xy(parts[1], parts[2], parts[10], None)
+    validate_submodule(parts[2])?;
+    validate_modes_and_oids(&parts, 3..=6, 7..=9)?;
+    record_from_xy(parts[1], parts[2], parts[10], None, true)
 }
 
 fn record_from_xy(
@@ -309,9 +406,21 @@ fn record_from_xy(
     submodule: &[u8],
     path: &[u8],
     original: Option<&[u8]>,
+    unmerged: bool,
 ) -> Result<SnapshotRecord, SnapshotError> {
     if xy.len() != 2 {
         return Err(SnapshotError::Malformed("status XY field".to_string()));
+    }
+    let valid = if unmerged {
+        matches!(xy, b"DD" | b"AU" | b"UD" | b"UA" | b"DU" | b"AA" | b"UU")
+    } else {
+        xy != b".."
+            && xy
+                .iter()
+                .all(|status| matches!(status, b'.' | b'M' | b'A' | b'D' | b'R' | b'T'))
+    };
+    if !valid {
+        return Err(SnapshotError::Malformed("unsupported status XY field".to_string()));
     }
     let status = String::from_utf8(xy.to_vec())
         .map_err(|_| SnapshotError::Malformed("non-ASCII status".to_string()))?;
@@ -326,6 +435,38 @@ fn record_from_xy(
         submodule_state: (submodule != b"N...")
             .then(|| String::from_utf8_lossy(submodule).into_owned()),
     })
+}
+
+fn validate_submodule(field: &[u8]) -> Result<(), SnapshotError> {
+    let valid = field == b"N..."
+        || (field.len() == 4
+            && field[0] == b'S'
+            && matches!(field[1], b'.' | b'C')
+            && matches!(field[2], b'.' | b'M')
+            && matches!(field[3], b'.' | b'U'));
+    if valid {
+        Ok(())
+    } else {
+        Err(SnapshotError::Malformed("invalid submodule field".to_string()))
+    }
+}
+
+fn validate_modes_and_oids(
+    parts: &[&[u8]],
+    modes: std::ops::RangeInclusive<usize>,
+    oids: std::ops::RangeInclusive<usize>,
+) -> Result<(), SnapshotError> {
+    if modes.clone().any(|index| {
+        parts[index].len() != 6 || !parts[index].iter().all(|byte| matches!(byte, b'0'..=b'7'))
+    }) {
+        return Err(SnapshotError::Malformed("invalid Git mode".to_string()));
+    }
+    if oids.clone().any(|index| {
+        !matches!(parts[index].len(), 40 | 64) || !parts[index].iter().all(u8::is_ascii_hexdigit)
+    }) {
+        return Err(SnapshotError::Malformed("invalid Git object ID".to_string()));
+    }
+    Ok(())
 }
 
 fn simple_record(
@@ -355,6 +496,7 @@ fn parse_name_status(bytes: &[u8]) -> Result<Vec<SnapshotRecord>, SnapshotError>
             return Err(SnapshotError::UnsupportedCopy);
         }
         if status.first() == Some(&b'R') {
+            validate_rename_status(status)?;
             let old = fields.get(index).ok_or_else(|| {
                 SnapshotError::Malformed("diff rename is missing old path".to_string())
             })?;
@@ -374,6 +516,12 @@ fn parse_name_status(bytes: &[u8]) -> Result<Vec<SnapshotRecord>, SnapshotError>
             });
             continue;
         }
+        if !matches!(status, b"A" | b"D" | b"M" | b"T") {
+            return Err(SnapshotError::Malformed(format!(
+                "unsupported diff status: {}",
+                String::from_utf8_lossy(status)
+            )));
+        }
         let path = fields
             .get(index)
             .ok_or_else(|| SnapshotError::Malformed("diff status is missing path".to_string()))?;
@@ -387,6 +535,21 @@ fn parse_name_status(bytes: &[u8]) -> Result<Vec<SnapshotRecord>, SnapshotError>
         )?);
     }
     Ok(records)
+}
+
+fn validate_rename_status(status: &[u8]) -> Result<(), SnapshotError> {
+    let score = status
+        .strip_prefix(b"R")
+        .filter(|score| score.len() == 3 && score.iter().all(u8::is_ascii_digit))
+        .ok_or_else(|| SnapshotError::Malformed("invalid rename score".to_string()))?;
+    let score = std::str::from_utf8(score)
+        .ok()
+        .and_then(|score| score.parse::<u16>().ok())
+        .ok_or_else(|| SnapshotError::Malformed("invalid rename score".to_string()))?;
+    if score > 100 {
+        return Err(SnapshotError::Malformed("rename score exceeds 100".to_string()));
+    }
+    Ok(())
 }
 
 fn checked_path(bytes: &[u8]) -> Result<RawPath, SnapshotError> {

@@ -18,7 +18,7 @@ pub(crate) fn create_wait_tool() -> ToolSpec {
         (
             "max_tokens".to_string(),
             JsonSchema::number(Some(
-                "Output token budget for this wait call. Defaults adaptively to 4000 tokens for success, 8000 for failure/timeout, and up to 10000 for high-signal diagnostics.".to_string(),
+                "Output token budget for this wait call. Defaults adaptively to 8000 tokens for success and 10000 for failures, timeouts, and high-signal diagnostics.".to_string(),
             )),
         ),
         (
@@ -76,7 +76,7 @@ mod tests {
                         (
                             "max_tokens".to_string(),
                             JsonSchema::number(Some(
-                                "Output token budget for this wait call. Defaults adaptively to 4000 tokens for success, 8000 for failure/timeout, and up to 10000 for high-signal diagnostics."
+                                "Output token budget for this wait call. Defaults adaptively to 8000 tokens for success and 10000 for failures, timeouts, and high-signal diagnostics."
                                     .to_string(),
                             )),
                         ),

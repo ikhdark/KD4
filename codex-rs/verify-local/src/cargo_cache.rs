@@ -91,6 +91,13 @@ struct InputRecord {
     sha256: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExpectedInputKind {
+    File,
+    Directory,
+    Either,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Inventory {
     logical: BTreeMap<String, Vec<u8>>,
@@ -155,16 +162,18 @@ pub fn load_cargo_metadata(
         let previous = entry
             .previous_manifest_paths
             .iter()
-            .filter_map(NativePathWire::to_path)
-            .collect::<BTreeSet<_>>();
-        let inventory = build_inventory(&request, &previous);
-        let fingerprint = complete_fingerprint(&request, &inventory);
-        if inventory.complete && entry.fingerprint == fingerprint {
-            return Ok(CargoMetadataResult {
-                metadata: entry.metadata,
-                fingerprint: Some(fingerprint),
-                disposition: CargoCacheDisposition::Hit,
-            });
+            .map(NativePathWire::to_path)
+            .collect::<Option<BTreeSet<_>>>();
+        if let Some(previous) = previous {
+            let inventory = build_inventory(&request, &previous);
+            let fingerprint = complete_fingerprint(&request, &inventory);
+            if inventory.complete && entry.fingerprint == fingerprint {
+                return Ok(CargoMetadataResult {
+                    metadata: entry.metadata,
+                    fingerprint: Some(fingerprint),
+                    disposition: CargoCacheDisposition::Hit,
+                });
+            }
         }
     }
 
@@ -172,8 +181,14 @@ pub fn load_cargo_metadata(
     let eligible_before_run = initial.complete && initial.reasons.is_empty();
     let locked = request.workspace_root.join("Cargo.lock").is_file();
     let metadata = run_metadata(&request, locked)?;
-    let previous = metadata_manifest_paths(&metadata);
-    let inventory = build_inventory(&request, &previous);
+    let (previous, metadata_inventory_error) = match metadata_manifest_paths(&metadata) {
+        Ok(previous) => (previous, None),
+        Err(error) => (BTreeSet::new(), Some(error)),
+    };
+    let mut inventory = build_inventory(&request, &previous);
+    if let Some(error) = metadata_inventory_error {
+        incomplete(&mut inventory, error);
+    }
     let fingerprint = complete_fingerprint(&request, &inventory);
     let mut reasons = initial
         .reasons
@@ -245,11 +260,16 @@ fn build_inventory(request: &CargoMetadataRequest, previous: &BTreeSet<PathBuf>)
     );
     logical_path(&mut inventory, "repository-root", &request.repository_root);
     logical_path(&mut inventory, "workspace-root", &request.workspace_root);
+    validate_metadata_topology_args(&mut inventory, &request.extra_args);
 
     for (key, value) in relevant_environment() {
-        logical_os(&mut inventory, &format!("env:{key}"), &value);
+        logical_os(
+            &mut inventory,
+            &format!("env:raw:{}", base64_encode(&native_os_bytes(&key))),
+            &value,
+        );
     }
-    let cargo_home = effective_cargo_home();
+    let cargo_home = effective_cargo_home(&request.workspace_root);
     if let Some(home) = &cargo_home {
         logical_path(&mut inventory, "cargo-home", home);
     } else {
@@ -262,14 +282,26 @@ fn build_inventory(request: &CargoMetadataRequest, previous: &BTreeSet<PathBuf>)
     let cargo_path = resolve_executable(&request.cargo);
     let rustc_path = resolve_executable(&request.rustc);
     match cargo_path {
-        Some(path) => record_file(&mut inventory, "cargo-executable", &path, true),
+        Some(path) => record_file(
+            &mut inventory,
+            "cargo-executable",
+            &path,
+            true,
+            ExpectedInputKind::File,
+        ),
         None => incomplete(
             &mut inventory,
             "selected Cargo executable could not be resolved",
         ),
     }
     match rustc_path {
-        Some(path) => record_file(&mut inventory, "rustc-executable", &path, true),
+        Some(path) => record_file(
+            &mut inventory,
+            "rustc-executable",
+            &path,
+            true,
+            ExpectedInputKind::File,
+        ),
         None => incomplete(
             &mut inventory,
             "selected rustc executable could not be resolved",
@@ -297,12 +329,14 @@ fn build_inventory(request: &CargoMetadataRequest, previous: &BTreeSet<PathBuf>)
             "ancestor-cargo-config",
             &ancestor.join(".cargo/config"),
             false,
+            ExpectedInputKind::File,
         );
         record_file(
             &mut inventory,
             "ancestor-cargo-config-toml",
             &ancestor.join(".cargo/config.toml"),
             false,
+            ExpectedInputKind::File,
         );
     }
     if let Some(cargo_home) = cargo_home {
@@ -311,12 +345,14 @@ fn build_inventory(request: &CargoMetadataRequest, previous: &BTreeSet<PathBuf>)
             "cargo-home-config",
             &cargo_home.join("config"),
             false,
+            ExpectedInputKind::File,
         );
         record_file(
             &mut inventory,
             "cargo-home-config-toml",
             &cargo_home.join("config.toml"),
             false,
+            ExpectedInputKind::File,
         );
     }
     for (label, path) in [
@@ -352,16 +388,29 @@ fn build_inventory(request: &CargoMetadataRequest, previous: &BTreeSet<PathBuf>)
             label,
             "workspace-manifest" | "workspace-lock" | "verifier-rules"
         );
-        record_file(&mut inventory, label, &path, required);
+        record_file(
+            &mut inventory,
+            label,
+            &path,
+            required,
+            ExpectedInputKind::File,
+        );
     }
 
     let root_manifest = request.workspace_root.join("Cargo.toml");
+    inventory.manifests.insert(root_manifest.clone());
     discover_workspace(&mut inventory, request, &root_manifest);
     let mut manifests = inventory.manifests.clone();
     manifests.extend(previous.iter().cloned());
     discover_path_dependencies(&mut inventory, &mut manifests);
     for manifest in manifests {
-        record_file(&mut inventory, "package-manifest", &manifest, true);
+        record_file(
+            &mut inventory,
+            "package-manifest",
+            &manifest,
+            true,
+            ExpectedInputKind::File,
+        );
         inventory.manifests.insert(manifest.clone());
         inventory_targets(&mut inventory, &manifest);
     }
@@ -388,9 +437,19 @@ fn discover_workspace(
             return;
         }
     };
-    let members = string_array(workspace.get("members"));
-    let default_members = string_array(workspace.get("default-members"));
-    let exclude = string_array(workspace.get("exclude"));
+    let members = string_array(inventory, "workspace.members", workspace.get("members"), true);
+    let default_members = string_array(
+        inventory,
+        "workspace.default-members",
+        workspace.get("default-members"),
+        false,
+    );
+    let exclude = string_array(
+        inventory,
+        "workspace.exclude",
+        workspace.get("exclude"),
+        false,
+    );
     for (label, values) in [
         ("workspace.members", &members),
         ("workspace.default-members", &default_members),
@@ -405,12 +464,27 @@ fn discover_workspace(
         inventory.discovery_roots.insert(root.clone());
         record_discovery_tree(inventory, &root);
     }
-    let exclude_matchers = exclude
-        .iter()
-        .filter_map(|pattern| globset::Glob::new(pattern).ok())
-        .map(|glob| glob.compile_matcher())
-        .collect::<Vec<_>>();
-    for member in &members {
+    let mut exclude_matchers = Vec::new();
+    for pattern in &exclude {
+        match globset::Glob::new(pattern) {
+            Ok(glob) => exclude_matchers.push((pattern.as_str(), glob.compile_matcher())),
+            Err(error) => incomplete(
+                inventory,
+                format!("invalid workspace exclude glob {pattern}: {error}"),
+            ),
+        }
+    }
+    let mut default_matchers = Vec::new();
+    for pattern in &default_members {
+        match globset::Glob::new(pattern) {
+            Ok(glob) => default_matchers.push((pattern.as_str(), glob.compile_matcher())),
+            Err(error) => incomplete(
+                inventory,
+                format!("invalid workspace default-member glob {pattern}: {error}"),
+            ),
+        }
+    }
+    for (member_index, member) in members.iter().enumerate() {
         let matcher = match globset::Glob::new(member) {
             Ok(glob) => glob.compile_matcher(),
             Err(error) => {
@@ -423,30 +497,64 @@ fn discover_workspace(
         };
         let root = discovery_root(&request.workspace_root, member);
         if member.contains(['*', '?', '[']) {
-            for entry in WalkDir::new(&root)
-                .follow_links(false)
-                .into_iter()
-                .filter_map(Result::ok)
-                .filter(|entry| entry.file_name() == OsStr::new("Cargo.toml"))
-            {
+            for entry in WalkDir::new(&root).follow_links(false).into_iter() {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        incomplete(
+                            inventory,
+                            format!("workspace candidate discovery failed: {error}"),
+                        );
+                        continue;
+                    }
+                };
+                if entry.file_name() != OsStr::new("Cargo.toml") {
+                    continue;
+                }
                 let Some(parent) = entry.path().parent() else {
+                    incomplete(inventory, "workspace candidate manifest has no parent");
                     continue;
                 };
                 let Ok(relative) = parent.strip_prefix(&request.workspace_root) else {
+                    incomplete(
+                        inventory,
+                        format!(
+                            "workspace candidate is outside the workspace: {}",
+                            parent.display()
+                        ),
+                    );
                     continue;
                 };
-                let relative = relative.to_string_lossy().replace('\\', "/");
+                let Some(relative) = relative.to_str() else {
+                    incomplete(
+                        inventory,
+                        format!("workspace candidate is not Unicode: {}", relative.display()),
+                    );
+                    continue;
+                };
+                let relative = relative.replace('\\', "/");
                 let excluded = exclude_matchers
                     .iter()
-                    .any(|exclude| exclude.is_match(&relative));
+                    .any(|(_, exclude)| exclude.is_match(&relative));
+                let default = default_matchers
+                    .iter()
+                    .filter(|(_, matcher)| matcher.is_match(&relative))
+                    .map(|(pattern, _)| *pattern)
+                    .collect::<Vec<_>>()
+                    .join("\0");
                 logical(
                     inventory,
-                    &format!("workspace-candidate:{relative}"),
+                    &format!("workspace-candidate:{member_index}:{relative}"),
                     if matcher.is_match(&relative) && !excluded {
                         b"included"
                     } else {
                         b"excluded"
                     },
+                );
+                logical(
+                    inventory,
+                    &format!("workspace-candidate-default:{member_index}:{relative}"),
+                    default.as_bytes(),
                 );
                 if matcher.is_match(&relative) && !excluded {
                     inventory.manifests.insert(entry.path().to_path_buf());
@@ -454,14 +562,26 @@ fn discover_workspace(
             }
         } else {
             let manifest = request.workspace_root.join(member).join("Cargo.toml");
-            record_file(inventory, "workspace-member-manifest", &manifest, true);
+            record_file(
+                inventory,
+                "workspace-member-manifest",
+                &manifest,
+                true,
+                ExpectedInputKind::File,
+            );
             inventory.manifests.insert(manifest);
         }
     }
 }
 
 fn record_discovery_tree(inventory: &mut Inventory, root: &Path) {
-    record_file(inventory, "workspace-discovery-root", root, false);
+    record_file(
+        inventory,
+        "workspace-discovery-root",
+        root,
+        false,
+        ExpectedInputKind::Directory,
+    );
     if !root.is_dir() {
         return;
     }
@@ -469,13 +589,20 @@ fn record_discovery_tree(inventory: &mut Inventory, root: &Path) {
         match entry {
             Ok(entry) => {
                 if entry.file_type().is_dir() || entry.file_name() == OsStr::new("Cargo.toml") {
-                    record_file(inventory, "workspace-candidate", entry.path(), false);
+                    record_file(
+                        inventory,
+                        "workspace-candidate",
+                        entry.path(),
+                        false,
+                        ExpectedInputKind::Either,
+                    );
                     if entry.file_type().is_dir() {
                         record_file(
                             inventory,
                             "workspace-candidate-manifest-marker",
                             &entry.path().join("Cargo.toml"),
                             false,
+                            ExpectedInputKind::File,
                         );
                     }
                 }
@@ -538,9 +665,39 @@ fn collect_path_dependency_specs(value: &toml::Value, callback: &mut impl FnMut(
             }
         }
     }
+    if let Some(workspace) = table.get("workspace").and_then(toml::Value::as_table) {
+        for key in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            if let Some(dependencies) = workspace.get(key).and_then(toml::Value::as_table) {
+                collect_paths_from_dependency_table(dependencies, callback);
+            }
+        }
+    }
+    if let Some(patches) = table.get("patch").and_then(toml::Value::as_table) {
+        for source in patches.values().filter_map(toml::Value::as_table) {
+            collect_paths_from_dependency_table(source, callback);
+        }
+    }
+    if let Some(replacements) = table.get("replace").and_then(toml::Value::as_table) {
+        collect_paths_from_dependency_table(replacements, callback);
+    }
     if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
         for target in targets.values() {
             collect_path_dependency_specs(target, callback);
+        }
+    }
+}
+
+fn collect_paths_from_dependency_table(
+    dependencies: &toml::map::Map<String, toml::Value>,
+    callback: &mut impl FnMut(&str),
+) {
+    for spec in dependencies.values() {
+        if let Some(path) = spec
+            .as_table()
+            .and_then(|table| table.get("path"))
+            .and_then(toml::Value::as_str)
+        {
+            callback(path);
         }
     }
 }
@@ -559,25 +716,87 @@ fn inventory_targets(inventory: &mut Inventory, manifest: &Path) {
             "cargo-target-marker",
             &root.join(relative),
             false,
+            ExpectedInputKind::File,
         );
     }
-    let value = read_toml(manifest).ok();
-    if let Some(build) = value
-        .as_ref()
-        .and_then(|value| value.get("package"))
-        .and_then(|value| value.get("build"))
-        .and_then(toml::Value::as_str)
-    {
-        record_file(inventory, "explicit-build-script", &root.join(build), true);
+    let value = match read_toml(manifest) {
+        Ok(value) => value,
+        Err(error) => {
+            incomplete(inventory, error);
+            return;
+        }
+    };
+    if let Some(package) = value.get("package").and_then(toml::Value::as_table) {
+        for key in ["autolib", "autobins", "autoexamples", "autotests", "autobenches"] {
+            if let Some(setting) = package.get(key) {
+                match setting.as_bool() {
+                    Some(setting) => logical(
+                        inventory,
+                        &format!("cargo-target-setting:{}:{key}", manifest.display()),
+                        &[u8::from(setting)],
+                    ),
+                    None => incomplete(
+                        inventory,
+                        format!("{key} is not boolean in {}", manifest.display()),
+                    ),
+                }
+            }
+        }
+        if let Some(build) = package.get("build") {
+            match (build.as_str(), build.as_bool()) {
+                (Some(path), _) => record_file(
+                    inventory,
+                    "explicit-build-script",
+                    &root.join(path),
+                    true,
+                    ExpectedInputKind::File,
+                ),
+                (_, Some(_)) => {}
+                _ => incomplete(
+                    inventory,
+                    format!("package.build has an invalid type in {}", manifest.display()),
+                ),
+            }
+        }
+    }
+    if let Some(lib) = value.get("lib") {
+        inventory_explicit_target(inventory, root, manifest, "lib", lib);
+    }
+    for key in ["bin", "example", "test", "bench"] {
+        let Some(targets) = value.get(key) else {
+            continue;
+        };
+        let Some(targets) = targets.as_array() else {
+            incomplete(
+                inventory,
+                format!("{key} target list is not an array in {}", manifest.display()),
+            );
+            continue;
+        };
+        for target in targets {
+            inventory_explicit_target(inventory, root, manifest, key, target);
+        }
     }
     for directory in ["src/bin", "examples", "tests", "benches"] {
         let directory = root.join(directory);
-        record_file(inventory, "cargo-target-directory", &directory, false);
+        record_file(
+            inventory,
+            "cargo-target-directory",
+            &directory,
+            false,
+            ExpectedInputKind::Directory,
+        );
         if directory.is_dir() {
             for entry in WalkDir::new(&directory).follow_links(false).into_iter() {
                 match entry {
                     Ok(entry) => {
-                        record_file(inventory, "cargo-target-candidate", entry.path(), false)
+                        record_file(
+                            inventory,
+                            "cargo-target-candidate",
+                            entry.path(),
+                            false,
+                            ExpectedInputKind::Either,
+                        )
                     }
                     Err(error) => incomplete(
                         inventory,
@@ -590,6 +809,39 @@ fn inventory_targets(inventory: &mut Inventory, manifest: &Path) {
             }
         }
     }
+}
+
+fn inventory_explicit_target(
+    inventory: &mut Inventory,
+    root: &Path,
+    manifest: &Path,
+    kind: &str,
+    value: &toml::Value,
+) {
+    let Some(table) = value.as_table() else {
+        incomplete(
+            inventory,
+            format!("{kind} target is not a table in {}", manifest.display()),
+        );
+        return;
+    };
+    let Some(path) = table.get("path") else {
+        return;
+    };
+    let Some(path) = path.as_str() else {
+        incomplete(
+            inventory,
+            format!("{kind} target path is not a string in {}", manifest.display()),
+        );
+        return;
+    };
+    record_file(
+        inventory,
+        "explicit-cargo-target",
+        &root.join(path),
+        true,
+        ExpectedInputKind::File,
+    );
 }
 
 fn validate_lockfile(inventory: &mut Inventory, lockfile: &Path) {
@@ -632,7 +884,8 @@ fn validate_lockfile(inventory: &mut Inventory, lockfile: &Path) {
             Some(source) if source.starts_with("git+") => {
                 let revision = source.rsplit_once('#').map(|(_, revision)| revision);
                 if !revision.is_some_and(|revision| {
-                    revision.len() >= 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    matches!(revision.len(), 40 | 64)
+                        && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
                 }) {
                     incomplete(
                         inventory,
@@ -656,6 +909,7 @@ fn run_metadata(request: &CargoMetadataRequest, locked: bool) -> Result<Value, C
     let output = Command::new(&request.cargo)
         .args(&args)
         .current_dir(&request.workspace_root)
+        .env("RUSTC", &request.rustc)
         .output()
         .map_err(|error| CargoCacheError::Metadata(error.to_string()))?;
     if !output.status.success() {
@@ -679,15 +933,29 @@ fn metadata_args(request: &CargoMetadataRequest, locked: bool) -> Vec<OsString> 
     args
 }
 
-fn metadata_manifest_paths(metadata: &Value) -> BTreeSet<PathBuf> {
-    metadata
+fn metadata_manifest_paths(metadata: &Value) -> Result<BTreeSet<PathBuf>, String> {
+    let packages = metadata
         .get("packages")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|package| package.get("manifest_path").and_then(Value::as_str))
-        .map(PathBuf::from)
-        .collect()
+        .ok_or_else(|| "Cargo metadata has no package array".to_string())?;
+    let mut manifests = BTreeSet::new();
+    for (index, package) in packages.iter().enumerate() {
+        let package = package
+            .as_object()
+            .ok_or_else(|| format!("Cargo metadata package {index} is not an object"))?;
+        let manifest = package
+            .get("manifest_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Cargo metadata package {index} has no manifest_path"))?;
+        let manifest = fs::canonicalize(manifest)
+            .map_err(|error| format!("Cargo metadata manifest cannot be canonicalized: {error}"))?;
+        if !manifests.insert(manifest) {
+            return Err(format!(
+                "Cargo metadata repeats manifest_path for package {index}"
+            ));
+        }
+    }
+    Ok(manifests)
 }
 
 fn invocation_seed(request: &CargoMetadataRequest) -> String {
@@ -754,9 +1022,17 @@ impl FingerprintWriter {
     }
 }
 
-fn record_file(inventory: &mut Inventory, label: &str, path: &Path, required: bool) {
+fn record_file(
+    inventory: &mut Inventory,
+    label: &str,
+    path: &Path,
+    required: bool,
+    expected: ExpectedInputKind,
+) {
     let path_bytes = native_path_bytes(path);
-    if inventory.files.contains_key(&path_bytes) {
+    if let Some(existing) = inventory.files.get(&path_bytes) {
+        let existing = existing.clone();
+        validate_input_record(inventory, path, required, expected, &existing);
         return;
     }
     let metadata = fs::symlink_metadata(path);
@@ -822,7 +1098,42 @@ fn record_file(inventory: &mut Inventory, label: &str, path: &Path, required: bo
             ),
         ),
     }
+    validate_input_record(inventory, path, required, expected, &record);
     inventory.files.insert(path_bytes, record);
+}
+
+fn validate_input_record(
+    inventory: &mut Inventory,
+    path: &Path,
+    required: bool,
+    expected: ExpectedInputKind,
+    record: &InputRecord,
+) {
+    if required && !record.present {
+        incomplete(
+            inventory,
+            format!("required fingerprint input is absent: {}", path.display()),
+        );
+        return;
+    }
+    if !record.present {
+        return;
+    }
+    let matches = match expected {
+        ExpectedInputKind::File => record.file_type == "file",
+        ExpectedInputKind::Directory => record.file_type == "directory",
+        ExpectedInputKind::Either => matches!(record.file_type.as_str(), "file" | "directory"),
+    };
+    if !matches {
+        incomplete(
+            inventory,
+            format!(
+                "fingerprint input has the wrong file type (expected {expected:?}, found {}): {}",
+                record.file_type,
+                path.display()
+            ),
+        );
+    }
 }
 
 fn record_command_version(
@@ -861,7 +1172,12 @@ fn record_git_identity(inventory: &mut Inventory, repository_root: &Path) {
             .env("GIT_OPTIONAL_LOCKS", "0")
             .output()
         {
-            Ok(output) if output.status.success() => logical(inventory, label, &output.stdout),
+            Ok(output) if output.status.success() => {
+                match canonical_git_output_path(repository_root, &output.stdout) {
+                    Ok(path) => logical_path(inventory, label, &path),
+                    Err(error) => incomplete(inventory, format!("{label} is invalid: {error}")),
+                }
+            }
             Ok(output) => incomplete(
                 inventory,
                 format!(
@@ -873,6 +1189,43 @@ fn record_git_identity(inventory: &mut Inventory, repository_root: &Path) {
         }
     }
     logical_path(inventory, "worktree-identity", repository_root);
+}
+
+fn canonical_git_output_path(repository_root: &Path, output: &[u8]) -> Result<PathBuf, String> {
+    let output = output.strip_suffix(b"\n").unwrap_or(output);
+    let output = output.strip_suffix(b"\r").unwrap_or(output);
+    if output.is_empty() || output.contains(&b'\n') || output.contains(&b'\r') || output.contains(&0)
+    {
+        return Err("expected exactly one path line".to_string());
+    }
+    let path = git_output_path(output)?;
+    let path = if path.is_absolute() {
+        path
+    } else {
+        repository_root.join(path)
+    };
+    fs::canonicalize(&path)
+        .map_err(|error| format!("failed to canonicalize {}: {error}", path.display()))
+}
+
+#[cfg(unix)]
+fn git_output_path(output: &[u8]) -> Result<PathBuf, String> {
+    use std::os::unix::ffi::OsStringExt;
+    Ok(PathBuf::from(OsString::from_vec(output.to_vec())))
+}
+
+#[cfg(windows)]
+fn git_output_path(output: &[u8]) -> Result<PathBuf, String> {
+    std::str::from_utf8(output)
+        .map(PathBuf::from)
+        .map_err(|_| "Git path output is not UTF-8".to_string())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn git_output_path(output: &[u8]) -> Result<PathBuf, String> {
+    std::str::from_utf8(output)
+        .map(PathBuf::from)
+        .map_err(|_| "Git path output is not UTF-8".to_string())
 }
 
 fn read_candidate_entry(
@@ -1011,14 +1364,35 @@ fn read_toml(path: &Path) -> Result<toml::Value, String> {
     toml::from_str(&text).map_err(|error| format!("failed to parse {}: {error}", path.display()))
 }
 
-fn string_array(value: Option<&toml::Value>) -> Vec<String> {
-    value
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(toml::Value::as_str)
-        .map(str::to_string)
-        .collect()
+fn string_array(
+    inventory: &mut Inventory,
+    label: &str,
+    value: Option<&toml::Value>,
+    required: bool,
+) -> Vec<String> {
+    let Some(value) = value else {
+        logical(inventory, &format!("{label}:present"), b"0");
+        if required {
+            incomplete(inventory, format!("{label} is absent"));
+        }
+        return Vec::new();
+    };
+    logical(inventory, &format!("{label}:present"), b"1");
+    let Some(values) = value.as_array() else {
+        incomplete(inventory, format!("{label} is not an array"));
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        match value.as_str() {
+            Some(value) => result.push(value.to_string()),
+            None => incomplete(
+                inventory,
+                format!("{label}[{index}] is not a string"),
+            ),
+        }
+    }
+    result
 }
 
 fn discovery_root(workspace_root: &Path, pattern: &str) -> PathBuf {
@@ -1029,29 +1403,63 @@ fn discovery_root(workspace_root: &Path, pattern: &str) -> PathBuf {
     workspace_root.join(prefix)
 }
 
-fn relevant_environment() -> BTreeMap<String, OsString> {
-    std::env::vars_os()
-        .filter_map(|(key, value)| {
-            let key_text = key.to_string_lossy();
-            (key_text.starts_with("CARGO_")
-                || key_text.starts_with("RUST_")
-                || matches!(
-                    key_text.as_ref(),
-                    "RUSTFLAGS" | "RUSTDOCFLAGS" | "RUSTUP_TOOLCHAIN" | "RUSTC_WRAPPER"
-                ))
-            .then(|| (key_text.into_owned(), value))
-        })
-        .collect()
+fn relevant_environment() -> Vec<(OsString, OsString)> {
+    let mut values = std::env::vars_os()
+        .filter(|(key, _)| is_relevant_environment_key(key))
+        .collect::<Vec<_>>();
+    values.sort_by(|(left, _), (right, _)| native_os_bytes(left).cmp(&native_os_bytes(right)));
+    values
 }
 
-fn effective_cargo_home() -> Option<PathBuf> {
-    std::env::var_os("CARGO_HOME")
+fn effective_cargo_home(workspace_root: &Path) -> Option<PathBuf> {
+    resolve_cargo_home(
+        workspace_root,
+        std::env::var_os("CARGO_HOME"),
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }),
+    )
+}
+
+fn resolve_cargo_home(
+    workspace_root: &Path,
+    configured: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    let path = configured
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-                .map(PathBuf::from)
-                .map(|home| home.join(".cargo"))
-        })
+        .or_else(|| home.map(PathBuf::from).map(|home| home.join(".cargo")))?;
+    Some(if path.is_absolute() {
+        path
+    } else {
+        workspace_root.join(path)
+    })
+}
+
+fn is_relevant_environment_key(key: &OsStr) -> bool {
+    key.to_str().is_none_or(|key| {
+        key.starts_with("CARGO_")
+            || key.starts_with("RUST_")
+            || key.starts_with("RUSTC_")
+            || key.starts_with("RUSTUP_")
+            || matches!(key, "PATH" | "RUSTC" | "RUSTDOC" | "RUSTFLAGS" | "RUSTDOCFLAGS")
+    })
+}
+
+fn validate_metadata_topology_args(inventory: &mut Inventory, arguments: &[OsString]) {
+    for argument in arguments {
+        let Some(argument) = argument.to_str() else {
+            incomplete(inventory, "metadata argument is not Unicode and cannot be modeled");
+            continue;
+        };
+        if matches!(argument, "--manifest-path" | "--config")
+            || argument.starts_with("--manifest-path=")
+            || argument.starts_with("--config=")
+        {
+            incomplete(
+                inventory,
+                format!("metadata topology argument is not cache-enumerable: {argument}"),
+            );
+        }
+    }
 }
 
 fn resolve_executable(program: &OsStr) -> Option<PathBuf> {

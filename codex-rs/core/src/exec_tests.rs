@@ -27,6 +27,15 @@ fn make_exec_output(
 }
 
 #[test]
+fn default_exec_command_timeout_is_twenty_minutes() {
+    assert_eq!(DEFAULT_EXEC_COMMAND_TIMEOUT_MS, 1_200_000);
+    assert_eq!(
+        ExecExpiration::DefaultTimeout.timeout_ms(),
+        Some(DEFAULT_EXEC_COMMAND_TIMEOUT_MS)
+    );
+}
+
+#[test]
 fn sandbox_detection_requires_keywords() {
     let output = make_exec_output(/*exit_code*/ 1, "", "", "");
     assert!(!is_likely_sandbox_denied(

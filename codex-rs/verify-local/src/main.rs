@@ -1,7 +1,6 @@
 use clap::Parser;
 use clap::Subcommand;
 use clap::ValueEnum;
-use codex_verify_local::CargoCacheDisposition;
 use codex_verify_local::CargoMetadataRequest;
 use codex_verify_local::CommitComparisonMode;
 use codex_verify_local::PlanMode;
@@ -9,7 +8,7 @@ use codex_verify_local::PlanRequest;
 use codex_verify_local::RawPath;
 use codex_verify_local::RepositorySnapshot;
 use codex_verify_local::Verdict;
-use codex_verify_local::build_ci_decision;
+use codex_verify_local::build_ci_decision_from_metadata;
 use codex_verify_local::execute_plan;
 use codex_verify_local::finalize_plan;
 use codex_verify_local::load_cargo_metadata;
@@ -230,31 +229,43 @@ fn run_ci_scope(args: CiScopeArgs) -> Result<i32, String> {
     let mut snapshot =
         RepositorySnapshot::from_commit_diff(&repository_root, &args.base, &args.head, comparison)
             .unwrap_or_else(|error| {
-                RepositorySnapshot::full_fallback(&repository_root, error.to_string())
+                RepositorySnapshot::commit_diff_fallback(
+                    &repository_root,
+                    &args.base,
+                    &args.head,
+                    comparison,
+                    error.to_string(),
+                )
             });
+    let repository_root = snapshot
+        .repository_root
+        .clone()
+        .unwrap_or(repository_root);
     let mut metadata_request = CargoMetadataRequest::for_repository(&repository_root);
     metadata_request.no_cache = args.no_cache;
     metadata_request.cache_readonly = args.cache_readonly;
-    match load_cargo_metadata(&metadata_request) {
-        Ok(result) => {
-            if let CargoCacheDisposition::Bypassed { reasons } = result.disposition {
-                snapshot.complete = false;
-                snapshot.fallback_reasons.extend(
-                    reasons
-                        .into_iter()
-                        .map(|reason| format!("Cargo cache: {reason}")),
-                );
-            }
-        }
+    let metadata = match load_cargo_metadata(&metadata_request) {
+        Ok(result) => Some(result.metadata),
         Err(error) => {
             snapshot.complete = false;
             snapshot
                 .fallback_reasons
                 .push(format!("Cargo metadata fingerprint failed: {error}"));
+            None
         }
+    };
+    let artifact = match metadata.as_ref() {
+        Some(metadata) => {
+            build_ci_decision_from_metadata(&repository_root, snapshot, args.event, metadata)
+        }
+        None => build_ci_decision_from_metadata(
+            &repository_root,
+            snapshot,
+            args.event,
+            &serde_json::Value::Null,
+        ),
     }
-    let artifact = build_ci_decision(&repository_root, snapshot, args.event)
-        .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string())?;
     write_ci_decision_artifact(&artifact, &args.artifact).map_err(|error| error.to_string())?;
     if let Some(output) = args.github_output {
         write_github_outputs(&output, &artifact.outputs)?;

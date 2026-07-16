@@ -67,6 +67,30 @@ jobs:
           echo 'codex=true' >> "$GITHUB_OUTPUT"
           echo 'workflows=true' >> "$GITHUB_OUTPUT"
 
+  scoped_packages:
+    name: Scoped package (${{ matrix.package }})
+    needs: changed
+    if: ${{ needs.changed.outputs.rust_matrix != '[]' }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.changed.outputs.rust_matrix) }}
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+      - name: Test scoped package
+        env:
+          PACKAGE: ${{ matrix.package }}
+        run: cargo test --locked -p "$PACKAGE"
+
   # --- Fast Cargo-native PR checks -------------------------------------------
   general:
     name: Format / etc
@@ -230,6 +254,7 @@ jobs:
     needs:
       [
         changed,
+        scoped_packages,
         general,
         cargo_shear,
         argument_comment_lint_package,
@@ -247,6 +272,7 @@ jobs:
           echo "argpkg : ${{ needs.argument_comment_lint_package.result }}"
           echo "arglint: ${{ needs.argument_comment_lint_prebuilt.result }}"
           echo "general: ${{ needs.general.result }}"
+          echo "scoped : ${{ needs.scoped_packages.result }}"
           echo "shear  : ${{ needs.cargo_shear.result }}"
 
           # If nothing relevant changed (PR touching only root README, etc.),
@@ -258,6 +284,12 @@ jobs:
 
           if [[ "${NEEDS_CHANGED_OUTPUTS_ARGUMENT_COMMENT_LINT_PACKAGE}" == 'true' ]]; then
             [[ '${{ needs.argument_comment_lint_package.result }}' == 'success' ]] || { echo 'argument_comment_lint_package failed'; exit 1; }
+          fi
+
+          if [[ "${NEEDS_CHANGED_OUTPUTS_RUST_MATRIX}" != '[]' ]]; then
+            [[ '${{ needs.scoped_packages.result }}' == 'success' ]] || { echo 'scoped package matrix failed'; exit 1; }
+          else
+            [[ '${{ needs.scoped_packages.result }}' == 'skipped' ]] || { echo 'empty scoped package matrix unexpectedly ran'; exit 1; }
           fi
 
           if [[ "${NEEDS_CHANGED_OUTPUTS_ARGUMENT_COMMENT_LINT}" == 'true' || "${NEEDS_CHANGED_OUTPUTS_WORKFLOWS}" == 'true' ]]; then
@@ -273,3 +305,4 @@ jobs:
           NEEDS_CHANGED_OUTPUTS_CODEX: ${{ needs.changed.outputs.codex }}
           NEEDS_CHANGED_OUTPUTS_WORKFLOWS: ${{ needs.changed.outputs.workflows }}
           NEEDS_CHANGED_OUTPUTS_ARGUMENT_COMMENT_LINT_PACKAGE: ${{ needs.changed.outputs.argument_comment_lint_package }}
+          NEEDS_CHANGED_OUTPUTS_RUST_MATRIX: ${{ needs.changed.outputs.rust_matrix }}

@@ -1,4 +1,5 @@
 use crate::context::PlannerContext;
+use crate::context::CargoGraph;
 use crate::model::RepositorySnapshot;
 use crate::model::SnapshotRecord;
 use crate::model::SnapshotSource;
@@ -28,18 +29,21 @@ const WORKFLOWS: [&str; 7] = [
 ];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkflowDecision {
     pub id: String,
     pub run: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct MatrixPlan {
     pub rust_packages: Vec<String>,
     pub rust_shards: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CiDecisionBody {
     pub schema_version: u64,
     pub event: String,
@@ -75,18 +79,25 @@ impl CiDecisionOutputs {
     }
 
     pub fn utf16_budget_bytes(&self) -> usize {
-        let mut values = vec![
-            self.decision_id.as_str(),
-            self.artifact_name.as_str(),
-            self.rust_matrix_json.as_str(),
-            self.rust_shards_json.as_str(),
+        let mut records = vec![
+            ("decision_id".to_string(), self.decision_id.clone()),
+            ("artifact_name".to_string(), self.artifact_name.clone()),
+            ("full_fallback".to_string(), self.full_fallback.to_string()),
+            ("rust_matrix".to_string(), self.rust_matrix_json.clone()),
+            ("rust_shards".to_string(), self.rust_shards_json.clone()),
         ];
-        values.extend(self.workflows.iter().map(|workflow| workflow.id.as_str()));
-        values
+        records.extend(self.workflows.iter().map(|workflow| {
+            (
+                format!("run_{}", workflow.id.replace('-', "_")),
+                workflow.run.to_string(),
+            )
+        }));
+        records
             .into_iter()
-            .map(|value| value.encode_utf16().count() * 2)
-            .sum::<usize>()
-            + self.workflows.len() * 10
+            .map(|(name, value)| {
+                format!("{name}={value}\n").encode_utf16().count() * 2
+            })
+            .sum()
     }
 }
 
@@ -105,6 +116,8 @@ pub enum CiDecisionError {
     Serialize(#[from] serde_json::Error),
     #[error("decision artifact hash mismatch: expected {expected}, actual {actual}")]
     HashMismatch { expected: String, actual: String },
+    #[error("invalid CI decision contract: {0}")]
+    InvalidContract(String),
     #[error("failed to write decision artifact {path}: {source}")]
     Write {
         path: PathBuf,
@@ -115,8 +128,44 @@ pub enum CiDecisionError {
 
 pub fn build_ci_decision(
     repository_root: &Path,
+    snapshot: RepositorySnapshot,
+    event: impl Into<String>,
+) -> Result<CiDecisionArtifact, CiDecisionError> {
+    let context = PlannerContext::load(repository_root)
+        .map_err(|error| CiDecisionError::Context(error.to_string()))?;
+    build_ci_decision_with_context(&context, snapshot, event.into())
+}
+
+pub fn build_ci_decision_from_metadata(
+    repository_root: &Path,
     mut snapshot: RepositorySnapshot,
     event: impl Into<String>,
+    metadata: &serde_json::Value,
+) -> Result<CiDecisionArtifact, CiDecisionError> {
+    let context = match PlannerContext::from_cargo_metadata(repository_root, metadata) {
+        Ok(context) => context,
+        Err(error) => {
+            snapshot.complete = false;
+            snapshot
+                .fallback_reasons
+                .push(format!("Cargo metadata graph is unusable: {error}"));
+            let repository_root = fs::canonicalize(repository_root)
+                .map_err(|error| CiDecisionError::Context(error.to_string()))?;
+            PlannerContext {
+                workspace_root: repository_root.join("codex-rs"),
+                repository_root,
+                graph: CargoGraph::default(),
+                rules: Vec::new(),
+            }
+        }
+    };
+    build_ci_decision_with_context(&context, snapshot, event.into())
+}
+
+fn build_ci_decision_with_context(
+    context: &PlannerContext,
+    mut snapshot: RepositorySnapshot,
+    event: String,
 ) -> Result<CiDecisionArtifact, CiDecisionError> {
     snapshot.records.sort_by(|left, right| {
         left.status
@@ -137,9 +186,14 @@ pub fn build_ci_decision(
                     )
             })
     });
-    let context = PlannerContext::load(repository_root)
-        .map_err(|error| CiDecisionError::Context(error.to_string()))?;
-    let mut body = classify(&context, snapshot, event.into());
+    let mut body = classify(context, snapshot, event);
+    if body
+        .fallback_reasons
+        .iter()
+        .any(|reason| reason == "Rust package matrix exceeded its bounded output budget")
+    {
+        body = full_suite_replacement(body, "GitHub output budget exceeded");
+    }
     let mut bytes = canonical_body_bytes(&body)?;
     let mut outputs = outputs_for(&body, &bytes)?;
     if matrix_exceeds_budget(&body.matrix) || outputs.utf16_budget_bytes() > 64 * 1024 {
@@ -168,6 +222,7 @@ pub fn verify_ci_decision_artifact(
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let body = CiDecisionBody::deserialize(&mut deserializer)?;
     deserializer.end()?;
+    validate_decision_body(&body)?;
     Ok(body)
 }
 
@@ -175,6 +230,17 @@ pub fn write_ci_decision_artifact(
     artifact: &CiDecisionArtifact,
     destination: &Path,
 ) -> Result<(), CiDecisionError> {
+    if decision_id(&artifact.bytes) != artifact.outputs.decision_id {
+        return Err(CiDecisionError::InvalidContract(
+            "artifact bytes do not match the advertised decision_id".to_string(),
+        ));
+    }
+    let parsed = verify_ci_decision_artifact(&artifact.bytes, &artifact.outputs.decision_id)?;
+    if parsed != artifact.body {
+        return Err(CiDecisionError::InvalidContract(
+            "artifact bytes do not match the in-memory body".to_string(),
+        ));
+    }
     let parent = destination.parent().ok_or_else(|| CiDecisionError::Write {
         path: destination.to_path_buf(),
         source: std::io::Error::new(
@@ -216,15 +282,16 @@ fn classify(
             base,
             head,
             merge_base,
+            pull_request,
         } => (
-            if merge_base.is_some() {
+            if *pull_request {
                 "pull_request_merge_base".to_string()
             } else {
                 "direct_commit_diff".to_string()
             },
-            Some(base.clone()),
+            base.clone(),
             merge_base.clone(),
-            Some(head.clone()),
+            head.clone(),
         ),
         SnapshotSource::Worktree => ("worktree".to_string(), None, None, None),
         SnapshotSource::ExplicitPaths => ("explicit_paths".to_string(), None, None, None),
@@ -377,9 +444,10 @@ fn is_manifest_or_shared_rust(path: &str) -> bool {
 
 fn full_suite_replacement(mut body: CiDecisionBody, reason: &str) -> CiDecisionBody {
     body.full_fallback = true;
-    body.fallback_reasons.push(reason.to_string());
-    body.fallback_reasons.sort();
-    body.fallback_reasons.dedup();
+    body.changes.clear();
+    body.affected_packages.clear();
+    body.reverse_closure.clear();
+    body.fallback_reasons = vec![reason.to_string()];
     for workflow in &mut body.workflows {
         workflow.run = true;
     }
@@ -388,6 +456,67 @@ fn full_suite_replacement(mut body: CiDecisionBody, reason: &str) -> CiDecisionB
         rust_shards: vec!["workspace".to_string()],
     };
     body
+}
+
+fn validate_decision_body(body: &CiDecisionBody) -> Result<(), CiDecisionError> {
+    if body.schema_version != CI_SCHEMA_VERSION {
+        return Err(CiDecisionError::InvalidContract(format!(
+            "unsupported schema version {}",
+            body.schema_version
+        )));
+    }
+    let mut workflow_ids = BTreeSet::new();
+    for workflow in &body.workflows {
+        if !WORKFLOWS.contains(&workflow.id.as_str()) || !workflow_ids.insert(&workflow.id) {
+            return Err(CiDecisionError::InvalidContract(format!(
+                "unknown or duplicate workflow {}",
+                workflow.id
+            )));
+        }
+    }
+    if workflow_ids.len() != WORKFLOWS.len() {
+        return Err(CiDecisionError::InvalidContract(
+            "workflow decision set is incomplete".to_string(),
+        ));
+    }
+    if matrix_exceeds_budget(&body.matrix) {
+        return Err(CiDecisionError::InvalidContract(
+            "matrix exceeds the transport budget".to_string(),
+        ));
+    }
+    for record in &body.changes {
+        record
+            .path
+            .validate_repository_relative()
+            .map_err(CiDecisionError::InvalidContract)?;
+        if let Some(original) = &record.original_path {
+            original
+                .validate_repository_relative()
+                .map_err(CiDecisionError::InvalidContract)?;
+        }
+    }
+    for oid in [body.base.as_deref(), body.merge_base.as_deref(), body.head.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if !matches!(oid.len(), 40 | 64)
+            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(CiDecisionError::InvalidContract(
+                "comparison object ID is not canonical lowercase hex".to_string(),
+            ));
+        }
+    }
+    if body.full_fallback
+        && (!body.workflows.iter().all(|workflow| workflow.run)
+            || !body.matrix.rust_packages.is_empty()
+            || body.matrix.rust_shards != ["workspace"])
+    {
+        return Err(CiDecisionError::InvalidContract(
+            "full fallback does not select the complete suite".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn matrix_exceeds_budget(matrix: &MatrixPlan) -> bool {

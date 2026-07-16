@@ -109,8 +109,13 @@ fn published_result_is_regular_and_identity_stable_on_reopen() {
         &result.invocation_id,
         &result.runner_nonce,
     ));
-    let first = open_existing_private_file(&path).expect("first open");
-    let second = open_existing_private_file(&path).expect("second open");
+    let directory = ResultDirectory::open(&dir).expect("directory handle");
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("name");
+    let first = open_existing_private_file_at(&directory, name).expect("first open");
+    let second = open_existing_private_file_at(&directory, name).expect("second open");
     assert_eq!(
         file_identity(&first).expect("first identity"),
         file_identity(&second).expect("second identity")
@@ -119,4 +124,39 @@ fn published_result_is_regular_and_identity_stable_on_reopen() {
         read_result_file(&path).expect("strict read").command_id,
         result.command_id
     );
+}
+
+#[test]
+fn atomic_publication_never_replaces_an_existing_destination() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let source = temp.path().join("source.tmp");
+    let destination = temp.path().join("destination.json");
+    let directory = ResultDirectory::open(temp.path()).expect("directory handle");
+    let mut source_file =
+        open_new_private_file_at(&directory, "source.tmp").expect("source handle");
+    source_file.write_all(b"new").expect("source bytes");
+    source_file.sync_all().expect("source sync");
+    let mut destination_file =
+        open_new_private_file_at(&directory, "destination.json").expect("destination handle");
+    destination_file
+        .write_all(b"existing")
+        .expect("destination bytes");
+    destination_file.sync_all().expect("destination sync");
+    drop(destination_file);
+
+    assert!(
+        atomic_rename_no_replace_at(&directory, "source.tmp", "destination.json", &source_file,)
+            .is_err()
+    );
+    assert_eq!(
+        fs::read(&destination).expect("destination bytes"),
+        b"existing"
+    );
+    assert_eq!(fs::read(&source).expect("source bytes"), b"new");
+
+    fs::remove_file(&destination).expect("remove destination");
+    atomic_rename_no_replace_at(&directory, "source.tmp", "destination.json", &source_file)
+        .expect("publish");
+    assert!(!source.exists());
+    assert_eq!(fs::read(&destination).expect("published bytes"), b"new");
 }

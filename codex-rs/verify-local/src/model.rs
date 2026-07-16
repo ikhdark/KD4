@@ -403,9 +403,10 @@ pub enum SnapshotSource {
     Worktree,
     ExplicitPaths,
     CommitDiff {
-        base: String,
-        head: String,
+        base: Option<String>,
+        head: Option<String>,
         merge_base: Option<String>,
+        pull_request: bool,
     },
 }
 

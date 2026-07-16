@@ -3,8 +3,8 @@ use super::*;
 #[test]
 fn porcelain_v2_preserves_rename_paths_and_sorts_raw_records() {
     let bytes = b"? z new\npath\0\
-1 M. N... 100644 100644 100644 aaaaaaa bbbbbbb a.rs\0\
-2 R. N... 100644 100644 100644 aaaaaaa bbbbbbb R100 new.rs\0old.rs\0";
+1 M. N... 100644 100644 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb a.rs\0\
+2 R. N... 100644 100644 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb R100 new.rs\0old.rs\0";
     let mut records = parse_porcelain_v2(bytes).expect("parse status");
     sort_records(&mut records);
     assert_eq!(records.len(), 3);
@@ -48,6 +48,39 @@ fn malformed_nul_output_fails_closed() {
     ));
 }
 
+#[test]
+fn conflicts_and_ambiguous_merge_bases_are_fail_closed() {
+    let oid = "a".repeat(40);
+    let conflict = format!(
+        "u UU N... 100644 100644 100644 100644 {oid} {oid} {oid} conflict.rs\0"
+    );
+    let records = parse_porcelain_v2(conflict.as_bytes()).expect("conflict");
+    assert_eq!(records[0].status, "UU");
+    assert!(matches!(
+        parse_single_merge_base(format!("{oid}\n{}\n", "b".repeat(40)).as_bytes()),
+        Err(SnapshotError::AmbiguousMergeBase { count: 2 })
+    ));
+}
+
+#[test]
+fn unknown_statuses_and_invalid_rename_scores_fail_closed() {
+    for bytes in [
+        b"X\0path\0".as_slice(),
+        b"U\0path\0".as_slice(),
+        b"R101\0old\0new\0".as_slice(),
+        b"R1\0old\0new\0".as_slice(),
+    ] {
+        assert!(matches!(
+            parse_name_status(bytes),
+            Err(SnapshotError::Malformed(_))
+        ));
+    }
+    assert!(matches!(
+        parse_porcelain_v2(b"! ignored\0"),
+        Err(SnapshotError::Malformed(_))
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn non_utf8_paths_are_lossless_on_unix() {
@@ -79,6 +112,7 @@ fn explicit_paths_are_deterministic_and_do_not_require_git() {
 fn worktree_and_direct_commit_diff_cover_rename_and_deletion() {
     let temp = tempfile::tempdir().expect("tempdir");
     git(temp.path(), &["init", "-q"]);
+    git(temp.path(), &["config", "core.autocrlf", "false"]);
     git(
         temp.path(),
         &["config", "user.email", "verify@example.test"],
@@ -86,11 +120,17 @@ fn worktree_and_direct_commit_diff_cover_rename_and_deletion() {
     git(temp.path(), &["config", "user.name", "Verifier"]);
     std::fs::write(temp.path().join("old.txt"), "old\n").expect("write old");
     std::fs::write(temp.path().join("delete.txt"), "delete\n").expect("write delete");
+    std::fs::write(temp.path().join("source.txt"), "source\n").expect("write source");
     git(temp.path(), &["add", "."]);
     git(temp.path(), &["commit", "-q", "-m", "base"]);
     let base = git_text(temp.path(), &["rev-parse", "HEAD"]);
     std::fs::rename(temp.path().join("old.txt"), temp.path().join("new.txt")).expect("rename");
     std::fs::remove_file(temp.path().join("delete.txt")).expect("delete");
+    std::fs::copy(
+        temp.path().join("source.txt"),
+        temp.path().join("copy.txt"),
+    )
+    .expect("copy");
     let worktree = RepositorySnapshot::from_worktree(temp.path()).expect("worktree snapshot");
     assert!(
         worktree
@@ -118,6 +158,99 @@ fn worktree_and_direct_commit_diff_cover_rename_and_deletion() {
             .iter()
             .any(|record| record.path.as_utf8() == Some("delete.txt"))
     );
+    assert!(diff.records.iter().any(|record| {
+        record.status == "A" && record.path.as_utf8() == Some("copy.txt")
+    }));
+}
+
+#[test]
+fn worktree_uses_the_canonical_git_top_level_from_a_nested_directory() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git(temp.path(), &["init", "-q"]);
+    git(temp.path(), &["config", "core.autocrlf", "false"]);
+    let nested = temp.path().join("nested/deeper");
+    std::fs::create_dir_all(&nested).expect("nested");
+    std::fs::write(temp.path().join("changed.txt"), "changed\n").expect("write");
+    let snapshot = RepositorySnapshot::from_worktree(&nested).expect("worktree snapshot");
+    assert_eq!(
+        snapshot.repository_root,
+        Some(std::fs::canonicalize(temp.path()).expect("canonical root"))
+    );
+    assert_eq!(snapshot.records[0].path.as_utf8(), Some("changed.txt"));
+}
+
+#[test]
+fn commit_diff_fallback_preserves_mode_and_validated_ids() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git(temp.path(), &["init", "-q"]);
+    git(temp.path(), &["config", "user.email", "verify@example.test"]);
+    git(temp.path(), &["config", "user.name", "Verifier"]);
+    std::fs::write(temp.path().join("base.txt"), "base\n").expect("write");
+    git(temp.path(), &["add", "."]);
+    git(temp.path(), &["commit", "-q", "-m", "base"]);
+    let oid = git_text(temp.path(), &["rev-parse", "HEAD"]);
+    let snapshot = RepositorySnapshot::commit_diff_fallback(
+        temp.path(),
+        &oid,
+        "not-a-commit",
+        CommitComparisonMode::PullRequestMergeBase,
+        "missing shallow history",
+    );
+    assert!(matches!(
+        snapshot.source,
+        SnapshotSource::CommitDiff {
+            base: Some(ref base),
+            head: None,
+            merge_base: None,
+            pull_request: true,
+        } if base == &oid
+    ));
+    assert!(!snapshot.complete);
+}
+
+#[test]
+fn pull_request_snapshot_records_the_validated_merge_base() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    git(temp.path(), &["init", "-q"]);
+    git(temp.path(), &["config", "core.autocrlf", "false"]);
+    git(temp.path(), &["config", "user.email", "verify@example.test"]);
+    git(temp.path(), &["config", "user.name", "Verifier"]);
+    std::fs::write(temp.path().join("base.txt"), "base\n").expect("base");
+    git(temp.path(), &["add", "."]);
+    git(temp.path(), &["commit", "-q", "-m", "base"]);
+    let merge_base = git_text(temp.path(), &["rev-parse", "HEAD"]);
+    let main_branch = git_text(temp.path(), &["branch", "--show-current"]);
+    git(temp.path(), &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(temp.path().join("feature.txt"), "feature\n").expect("feature");
+    git(temp.path(), &["add", "."]);
+    git(temp.path(), &["commit", "-q", "-m", "feature"]);
+    let head = git_text(temp.path(), &["rev-parse", "HEAD"]);
+    git(temp.path(), &["checkout", "-q", &main_branch]);
+    std::fs::write(temp.path().join("main.txt"), "main\n").expect("main");
+    git(temp.path(), &["add", "."]);
+    git(temp.path(), &["commit", "-q", "-m", "main"]);
+    let base = git_text(temp.path(), &["rev-parse", "HEAD"]);
+    let snapshot = RepositorySnapshot::from_commit_diff(
+        temp.path(),
+        &base,
+        &head,
+        CommitComparisonMode::PullRequestMergeBase,
+    )
+    .expect("pull request snapshot");
+    assert!(matches!(
+        snapshot.source,
+        SnapshotSource::CommitDiff {
+            base: Some(ref resolved_base),
+            head: Some(ref resolved_head),
+            merge_base: Some(ref resolved_merge_base),
+            pull_request: true,
+        } if resolved_base == &base
+            && resolved_head == &head
+            && resolved_merge_base == &merge_base
+    ));
+    assert!(snapshot.records.iter().any(|record| {
+        record.status == "A" && record.path.as_utf8() == Some("feature.txt")
+    }));
 }
 
 fn git(cwd: &Path, args: &[&str]) {

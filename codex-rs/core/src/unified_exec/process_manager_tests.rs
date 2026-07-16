@@ -13,7 +13,9 @@ use tokio::time::Duration;
 use tokio::time::Instant;
 
 #[test]
-fn adaptive_output_budget_uses_4k_8k_and_diagnostic_escalation() {
+fn adaptive_output_budget_uses_relaxed_defaults_and_diagnostic_escalation() {
+    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 8_000);
+    assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 10_000);
     assert_eq!(
         resolve_adaptive_max_tokens(None, OutputBudgetClass::Success, Some("echo ok"), "ok"),
         DEFAULT_SUCCESS_OUTPUT_TOKENS

@@ -95,6 +95,123 @@ fn invocation_arguments_and_environment_mode_are_fingerprint_inputs() {
 }
 
 #[test]
+fn malformed_workspace_specs_and_globs_bypass_warm_caching() {
+    let fixture = fixture_repository(true);
+    write(
+        fixture.path().join("codex-rs/Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\", 7]\nexclude = [\"[\"]\nresolver = \"2\"\n",
+    );
+    let inventory = build_inventory(&request(fixture.path()), &BTreeSet::new());
+    assert!(!inventory.complete);
+    assert!(
+        inventory
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("workspace.members[1]"))
+    );
+    assert!(
+        inventory
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("invalid workspace exclude glob"))
+    );
+}
+
+#[test]
+fn optional_discovery_inputs_must_have_the_expected_file_type() {
+    let fixture = fixture_repository(true);
+    std::fs::create_dir_all(fixture.path().join("codex-rs/.cargo/config.toml"))
+        .expect("config directory");
+    let inventory = build_inventory(&request(fixture.path()), &BTreeSet::new());
+    assert!(!inventory.complete);
+    assert!(
+        inventory
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("wrong file type"))
+    );
+}
+
+#[test]
+fn workspace_inherited_paths_and_explicit_targets_are_fingerprint_inputs() {
+    let fixture = fixture_repository(true);
+    write(
+        fixture.path().join("codex-rs/Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n[workspace.dependencies]\next = { path = \"../external/ext\" }\n",
+    );
+    write(
+        fixture.path().join("codex-rs/crates/a/Cargo.toml"),
+        "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\next = { workspace = true }\n[[bin]]\nname = \"tool\"\npath = \"../../../tools/tool.rs\"\n",
+    );
+    write(
+        fixture.path().join("external/ext/Cargo.toml"),
+        "[package]\nname = \"ext\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    write(
+        fixture.path().join("external/ext/src/lib.rs"),
+        "pub fn ext() {}\n",
+    );
+    write(fixture.path().join("tools/tool.rs"), "fn main() {}\n");
+    let request = request(fixture.path());
+    let before = complete_fingerprint(&request, &build_inventory(&request, &BTreeSet::new()));
+    write(
+        fixture.path().join("external/ext/src/lib.rs"),
+        "pub fn ext() { println!(\"changed\"); }\n",
+    );
+    let dependency_changed =
+        complete_fingerprint(&request, &build_inventory(&request, &BTreeSet::new()));
+    assert_ne!(before, dependency_changed);
+    write(
+        fixture.path().join("tools/tool.rs"),
+        "fn main() { println!(\"changed\"); }\n",
+    );
+    let target_changed =
+        complete_fingerprint(&request, &build_inventory(&request, &BTreeSet::new()));
+    assert_ne!(dependency_changed, target_changed);
+}
+
+#[test]
+fn unmodeled_metadata_topology_arguments_bypass_warm_caching() {
+    let fixture = fixture_repository(true);
+    let mut request = request(fixture.path());
+    request.extra_args = vec![
+        OsString::from("--manifest-path"),
+        OsString::from("../other/Cargo.toml"),
+    ];
+    let inventory = build_inventory(&request, &BTreeSet::new());
+    assert!(!inventory.complete);
+    assert!(
+        inventory
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("not cache-enumerable"))
+    );
+}
+
+#[test]
+fn metadata_manifest_inventory_and_environment_inputs_fail_closed() {
+    assert!(metadata_manifest_paths(&serde_json::json!({"packages": [{}]})).is_err());
+    for key in [
+        "CARGO_HOME",
+        "RUSTC",
+        "RUSTC_WORKSPACE_WRAPPER",
+        "RUSTUP_HOME",
+        "RUSTDOC",
+        "PATH",
+    ] {
+        assert!(is_relevant_environment_key(OsStr::new(key)), "{key}");
+    }
+    assert_eq!(
+        resolve_cargo_home(
+            Path::new("C:/workspace"),
+            Some(OsString::from("relative-cargo-home")),
+            None,
+        ),
+        Some(PathBuf::from("C:/workspace").join("relative-cargo-home"))
+    );
+}
+
+#[test]
 fn locked_complete_metadata_gets_a_real_warm_hit() {
     let fixture = fixture_repository(true);
     let request = request(fixture.path());

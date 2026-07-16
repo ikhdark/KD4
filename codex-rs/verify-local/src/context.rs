@@ -1,6 +1,7 @@
 use crate::model::RawPath;
 use globset::Glob;
 use serde::Deserialize;
+use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
@@ -145,6 +146,8 @@ pub enum ContextError {
     MissingPackageName(PathBuf),
     #[error("workspace root does not define workspace.members")]
     MissingWorkspaceMembers,
+    #[error("invalid Cargo metadata graph: {0}")]
+    Metadata(String),
 }
 
 #[derive(Deserialize)]
@@ -243,27 +246,183 @@ impl PlannerContext {
             }
         }
 
-        let rules_path = repository_root.join("scripts/verify_local_rules.toml");
-        let rules = if rules_path.is_file() {
-            let text = fs::read_to_string(&rules_path).map_err(|source| ContextError::Read {
-                path: rules_path.clone(),
-                source,
-            })?;
-            toml::from_str::<RulesFile>(&text)
-                .map_err(|source| ContextError::Parse {
-                    path: rules_path,
-                    source,
-                })?
-                .surface
-        } else {
-            Vec::new()
-        };
+        let rules = load_rules(&repository_root)?;
 
         Ok(Self {
             repository_root,
             workspace_root,
             graph,
             rules,
+        })
+    }
+
+    pub fn from_cargo_metadata(
+        repository_root: &Path,
+        metadata: &JsonValue,
+    ) -> Result<Self, ContextError> {
+        let repository_root =
+            fs::canonicalize(repository_root).map_err(|source| ContextError::Read {
+                path: repository_root.to_path_buf(),
+                source,
+            })?;
+        let expected_workspace = fs::canonicalize(repository_root.join("codex-rs")).map_err(
+            |source| ContextError::Read {
+                path: repository_root.join("codex-rs"),
+                source,
+            },
+        )?;
+        let workspace_root = metadata
+            .get("workspace_root")
+            .and_then(JsonValue::as_str)
+            .ok_or_else(|| ContextError::Metadata("workspace_root is absent".to_string()))
+            .and_then(|path| {
+                fs::canonicalize(path).map_err(|error| {
+                    ContextError::Metadata(format!(
+                        "workspace_root cannot be canonicalized: {error}"
+                    ))
+                })
+            })?;
+        if workspace_root != expected_workspace {
+            return Err(ContextError::Metadata(format!(
+                "workspace_root {} does not match {}",
+                workspace_root.display(),
+                expected_workspace.display()
+            )));
+        }
+
+        let packages = metadata
+            .get("packages")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| ContextError::Metadata("packages is not an array".to_string()))?;
+        let mut packages_by_id = BTreeMap::new();
+        for (index, package) in packages.iter().enumerate() {
+            let package = package.as_object().ok_or_else(|| {
+                ContextError::Metadata(format!("package {index} is not an object"))
+            })?;
+            let id = package.get("id").and_then(JsonValue::as_str).ok_or_else(|| {
+                ContextError::Metadata(format!("package {index} has no id"))
+            })?;
+            if packages_by_id.insert(id.to_string(), package).is_some() {
+                return Err(ContextError::Metadata(format!(
+                    "duplicate package id {id}"
+                )));
+            }
+        }
+        let workspace_members = metadata
+            .get("workspace_members")
+            .and_then(JsonValue::as_array)
+            .ok_or_else(|| {
+                ContextError::Metadata("workspace_members is not an array".to_string())
+            })?;
+        if workspace_members.is_empty() {
+            return Err(ContextError::Metadata(
+                "workspace_members is empty".to_string(),
+            ));
+        }
+
+        let mut graph = CargoGraph::default();
+        let mut member_ids = BTreeMap::new();
+        for (index, member) in workspace_members.iter().enumerate() {
+            let id = member.as_str().ok_or_else(|| {
+                ContextError::Metadata(format!("workspace member {index} is not a string"))
+            })?;
+            let package = packages_by_id.get(id).ok_or_else(|| {
+                ContextError::Metadata(format!("workspace member {id} has no package record"))
+            })?;
+            let name = package.get("name").and_then(JsonValue::as_str).ok_or_else(|| {
+                ContextError::Metadata(format!("workspace package {id} has no name"))
+            })?;
+            let manifest = package
+                .get("manifest_path")
+                .and_then(JsonValue::as_str)
+                .ok_or_else(|| {
+                    ContextError::Metadata(format!(
+                        "workspace package {id} has no manifest_path"
+                    ))
+                })
+                .and_then(|path| {
+                    fs::canonicalize(path).map_err(|error| {
+                        ContextError::Metadata(format!(
+                            "workspace manifest cannot be canonicalized: {error}"
+                        ))
+                    })
+                })?;
+            let root = manifest.parent().ok_or_else(|| {
+                ContextError::Metadata(format!(
+                    "workspace manifest has no parent: {}",
+                    manifest.display()
+                ))
+            })?;
+            if !root.starts_with(&workspace_root) {
+                return Err(ContextError::Metadata(format!(
+                    "workspace package is outside the workspace: {}",
+                    root.display()
+                )));
+            }
+            if graph
+                .packages
+                .insert(
+                    name.to_string(),
+                    PackageInfo {
+                        name: name.to_string(),
+                        root: root.to_path_buf(),
+                        manifest,
+                    },
+                )
+                .is_some()
+            {
+                return Err(ContextError::Metadata(format!(
+                    "duplicate workspace package name {name}"
+                )));
+            }
+            member_ids.insert(id.to_string(), name.to_string());
+        }
+
+        let workspace_names = graph.packages.keys().cloned().collect::<BTreeSet<_>>();
+        for (id, package_name) in &member_ids {
+            let package = packages_by_id[id];
+            let dependencies = package
+                .get("dependencies")
+                .and_then(JsonValue::as_array)
+                .ok_or_else(|| {
+                    ContextError::Metadata(format!(
+                        "workspace package {id} has no dependency array"
+                    ))
+                })?;
+            for (index, dependency) in dependencies.iter().enumerate() {
+                let dependency = dependency.as_object().ok_or_else(|| {
+                    ContextError::Metadata(format!(
+                        "dependency {index} for {id} is not an object"
+                    ))
+                })?;
+                let dependency_name = dependency
+                    .get("name")
+                    .and_then(JsonValue::as_str)
+                    .ok_or_else(|| {
+                        ContextError::Metadata(format!(
+                            "dependency {index} for {id} has no name"
+                        ))
+                    })?;
+                if workspace_names.contains(dependency_name) {
+                    graph
+                        .dependencies
+                        .entry(package_name.clone())
+                        .or_default()
+                        .insert(dependency_name.to_string());
+                    graph
+                        .reverse_dependencies
+                        .entry(dependency_name.to_string())
+                        .or_default()
+                        .insert(package_name.clone());
+                }
+            }
+        }
+
+        Ok(Self {
+            repository_root: repository_root.clone(),
+            workspace_root,
+            graph,
+            rules: load_rules(&repository_root)?,
         })
     }
 
@@ -302,6 +461,23 @@ fn read_toml(path: &Path) -> Result<toml::Value, ContextError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn load_rules(repository_root: &Path) -> Result<Vec<SurfaceRule>, ContextError> {
+    let rules_path = repository_root.join("scripts/verify_local_rules.toml");
+    if !rules_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&rules_path).map_err(|source| ContextError::Read {
+        path: rules_path.clone(),
+        source,
+    })?;
+    Ok(toml::from_str::<RulesFile>(&text)
+        .map_err(|source| ContextError::Parse {
+            path: rules_path,
+            source,
+        })?
+        .surface)
 }
 
 fn collect_dependencies(

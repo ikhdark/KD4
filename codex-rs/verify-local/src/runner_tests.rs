@@ -5,6 +5,13 @@ use crate::model::RawPath;
 use crate::model::RepositorySnapshot;
 use crate::secure_result;
 use std::fs;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::thread;
+use std::time::Duration;
 
 #[test]
 fn operating_system_ids_use_fixed_lowercase_hex() {
@@ -23,11 +30,8 @@ fn operating_system_ids_use_fixed_lowercase_hex() {
 fn planner_generated_invocation_id_executes_through_secure_runner() {
     let repository = tempfile::tempdir().expect("temporary repository");
     let changed = RawPath::from_utf8("codex-rs/verify-local/src/lib.rs");
-    let snapshot = RepositorySnapshot::from_explicit_paths(
-        repository.path(),
-        [changed.clone()],
-    )
-    .expect("explicit snapshot");
+    let snapshot = RepositorySnapshot::from_explicit_paths(repository.path(), [changed.clone()])
+        .expect("explicit snapshot");
     let request = PlanRequest {
         mode: Some(PlanMode::Fast),
         changed: vec![changed],
@@ -123,6 +127,84 @@ fn execute_plan_writes_framed_log_and_strict_result_file() {
         .collect::<Vec<_>>();
     assert_eq!(result_files.len(), 1);
     assert!(!result_files[0].contains("owner:test/command"));
+}
+
+#[test]
+fn mixed_32_mib_output_stays_framed_and_diagnostic_is_bounded() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let payload = vec![b'x'; 16 * 1024 * 1024];
+    fs::write(temp.path().join("payload.bin"), &payload).expect("payload");
+    let script = if cfg!(windows) {
+        "type payload.bin & type payload.bin 1>&2"
+    } else {
+        "cat payload.bin; cat payload.bin >&2"
+    };
+    let mut plan = plan_for_shell(script, 30_000);
+    plan.commands[0].cwd = RawPath::from_utf8(temp.path().to_string_lossy().into_owned());
+
+    let result = execute_plan(&plan, temp.path()).remove(0);
+    assert_eq!(result.exit_code, Some(0));
+    assert_eq!(
+        result.log_state,
+        LogState::Complete,
+        "{:?}",
+        result.runner_error
+    );
+    assert!(result.diagnostic.len() <= 64 * 1024 + 64);
+
+    let file = fs::File::open(result.log_path.expect("log path")).expect("log");
+    let mut expected_seq = 0_u64;
+    let mut previous_time = 0_u64;
+    let mut total_payload = 0_usize;
+    let mut streams = std::collections::HashSet::new();
+    for line in BufReader::new(file).split(b'\n') {
+        let line = line.expect("frame line");
+        if line.is_empty() {
+            continue;
+        }
+        let frame: OwnedLogFrame = serde_json::from_slice(&line).expect("frame json");
+        assert_eq!(frame.seq, expected_seq);
+        assert!(frame.monotonic_ns >= previous_time);
+        let decoded = BASE64_STANDARD
+            .decode(frame.bytes_base64.as_bytes())
+            .expect("payload base64");
+        assert!(decoded.len() <= MAX_FRAME_PAYLOAD);
+        total_payload += decoded.len();
+        streams.insert(frame.stream);
+        expected_seq += 1;
+        previous_time = frame.monotonic_ns;
+    }
+    assert_eq!(total_payload, 32 * 1024 * 1024);
+    assert_eq!(streams.len(), 2);
+}
+
+#[test]
+fn cancellation_is_reported_as_fact_and_finalized_as_inconclusive() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut plan = plan_for_shell(
+        if cfg!(windows) {
+            "ping -n 30 127.0.0.1 >NUL"
+        } else {
+            "sleep 30"
+        },
+        60_000,
+    );
+    plan.commands[0].cwd = RawPath::from_utf8(temp.path().to_string_lossy().into_owned());
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let trigger = Arc::clone(&cancellation);
+    let canceller = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        trigger.store(true, Ordering::Release);
+    });
+
+    let results = execute_plan_with_cancellation(&plan, temp.path(), &cancellation);
+    canceller.join().expect("canceller");
+    assert!(results[0].cancelled);
+    assert!(!results[0].timed_out);
+    assert_eq!(results[0].log_state, LogState::IncompleteAfterTermination);
+    let finalized = crate::finalize::finalize_plan(plan, results);
+    assert_eq!(finalized.verdict, crate::model::Verdict::Inconclusive);
+    assert!(!finalized.cache_eligible);
 }
 
 #[test]

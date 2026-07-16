@@ -21,6 +21,7 @@ pub use ci::CiDecisionOutputs;
 pub use ci::MatrixPlan;
 pub use ci::WorkflowDecision;
 pub use ci::build_ci_decision;
+pub use ci::build_ci_decision_from_metadata;
 pub use ci::decision_id;
 pub use ci::verify_ci_decision_artifact;
 pub use ci::write_ci_decision_artifact;

@@ -17,9 +17,31 @@ SPEC.loader.exec_module(MODULE)
 
 class VerifyCiDecisionTest(unittest.TestCase):
     def artifact(self, directory: Path, run: bool = True) -> tuple[Path, str]:
+        workflows = [
+            {"id": workflow, "run": run if workflow == "rust-ci" else False}
+            for workflow in [
+                "blob-size-policy",
+                "cargo-deny",
+                "cargo-full",
+                "codespell",
+                "repo-checks",
+                "rust-ci",
+                "sdk",
+            ]
+        ]
         body = {
             "schema_version": 1,
-            "workflows": [{"id": "rust-ci", "run": run}],
+            "event": "pull_request",
+            "comparison_mode": "explicit_paths",
+            "base": None,
+            "merge_base": None,
+            "head": None,
+            "changes": [],
+            "full_fallback": False,
+            "fallback_reasons": [],
+            "workflows": workflows,
+            "affected_packages": ["a"],
+            "reverse_closure": ["a"],
             "matrix": {"rust_packages": ["a"], "rust_shards": ["rust-000"]},
         }
         payload = json.dumps(body, indent=2).encode() + b"\n"
@@ -42,13 +64,36 @@ class VerifyCiDecisionTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 MODULE.consume(path, decision_id, "rust-ci")
             with self.assertRaises(SystemExit):
-                MODULE.consume(path, decision_id, "sdk")
+                MODULE.consume(path, decision_id, "unknown")
 
     def test_rejects_artifact_body_containing_decision_id(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             path, _ = self.artifact(Path(temp))
             body = json.loads(path.read_bytes())
             body["decision_id"] = "forbidden"
+            payload = json.dumps(body).encode()
+            path.write_bytes(payload)
+            decision_id = "sha256:" + hashlib.sha256(payload).hexdigest()
+            with self.assertRaises(SystemExit):
+                MODULE.consume(path, decision_id, "rust-ci")
+
+    def test_rejects_duplicate_workflows_and_invalid_matrix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path, _ = self.artifact(Path(temp))
+            body = json.loads(path.read_bytes())
+            body["workflows"].append({"id": "rust-ci", "run": True})
+            body["matrix"]["rust_packages"] = [7]
+            payload = json.dumps(body).encode()
+            path.write_bytes(payload)
+            decision_id = "sha256:" + hashlib.sha256(payload).hexdigest()
+            with self.assertRaises(SystemExit):
+                MODULE.consume(path, decision_id, "rust-ci")
+
+    def test_rejects_invalid_fallback_invariants(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path, _ = self.artifact(Path(temp))
+            body = json.loads(path.read_bytes())
+            body["full_fallback"] = True
             payload = json.dumps(body).encode()
             path.write_bytes(payload)
             decision_id = "sha256:" + hashlib.sha256(payload).hexdigest()

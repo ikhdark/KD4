@@ -17,6 +17,92 @@ fn rust_change_uses_conservative_reverse_workspace_closure() {
 }
 
 #[test]
+fn cargo_metadata_graph_drives_globbed_conservative_reverse_closure() {
+    let fixture = tempfile::tempdir().expect("tempdir");
+    write(
+        fixture.path().join("codex-rs/Cargo.toml"),
+        "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"2\"\n",
+    );
+    for name in ["a", "b", "c"] {
+        write(
+            fixture
+                .path()
+                .join(format!("codex-rs/crates/{name}/Cargo.toml")),
+            &format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+            ),
+        );
+        write(
+            fixture
+                .path()
+                .join(format!("codex-rs/crates/{name}/src/lib.rs")),
+            "pub fn owner() {}\n",
+        );
+    }
+    write(
+        fixture.path().join("scripts/verify_local_rules.toml"),
+        "# fixture rules\n",
+    );
+    let workspace_root =
+        fs::canonicalize(fixture.path().join("codex-rs")).expect("workspace root");
+    let package = |name: &str, dependencies: serde_json::Value| {
+        serde_json::json!({
+            "id": format!("workspace#{name}"),
+            "name": name,
+            "manifest_path": fs::canonicalize(
+                fixture.path().join(format!("codex-rs/crates/{name}/Cargo.toml"))
+            ).expect("manifest"),
+            "dependencies": dependencies,
+        })
+    };
+    let metadata = serde_json::json!({
+        "workspace_root": workspace_root,
+        "workspace_members": ["workspace#a", "workspace#b", "workspace#c"],
+        "packages": [
+            package("a", serde_json::json!([])),
+            package("b", serde_json::json!([
+                {"name": "a", "kind": null, "optional": true, "rename": "alias_a", "target": "cfg(unix)"},
+                {"name": "a", "kind": "build", "optional": false},
+                {"name": "a", "kind": "dev", "optional": false}
+            ])),
+            package("c", serde_json::json!([
+                {"name": "b", "kind": null, "optional": false}
+            ]))
+        ]
+    });
+    let snapshot = RepositorySnapshot::from_explicit_paths(
+        fixture.path(),
+        [RawPath::from_utf8("codex-rs/crates/a/src/lib.rs")],
+    )
+    .expect("snapshot");
+    let artifact =
+        build_ci_decision_from_metadata(fixture.path(), snapshot, "pull_request", &metadata)
+            .expect("decision");
+    assert!(!artifact.body.full_fallback);
+    assert_eq!(artifact.body.reverse_closure, vec!["a", "b", "c"]);
+}
+
+#[test]
+fn malformed_metadata_graph_activates_full_fallback() {
+    let fixture = fixture_repository(false);
+    let artifact = build_ci_decision_from_metadata(
+        fixture.path(),
+        snapshot(fixture.path(), ["codex-rs/a/src/lib.rs"]),
+        "pull_request",
+        &serde_json::json!({}),
+    )
+    .expect("fallback decision");
+    assert!(artifact.body.full_fallback);
+    assert!(
+        artifact
+            .body
+            .fallback_reasons
+            .iter()
+            .any(|reason| reason.contains("metadata graph"))
+    );
+}
+
+#[test]
 fn sdk_docs_and_mixed_changes_select_expected_fixed_workflows() {
     let fixture = fixture_repository(false);
     let sdk = decision(fixture.path(), ["sdk/python/openai/__init__.py"]);
@@ -139,18 +225,50 @@ fn consumer_hashes_exact_bytes_before_parsing_and_mutation_fails() {
 #[test]
 fn output_budget_fallback_builds_and_hashes_a_new_small_body() {
     let fixture = fixture_repository(false);
-    let mut body = decision(fixture.path(), ["codex-rs/a/src/lib.rs"]).body;
-    body.matrix.rust_packages = (0..129)
-        .map(|index| format!("package-{index:03}"))
-        .collect();
-    body.matrix.rust_shards = (0..33).map(|index| format!("shard-{index:03}")).collect();
-    let original = canonical_body_bytes(&body).expect("original");
-    let replacement = full_suite_replacement(body, "GitHub output budget exceeded");
-    let replaced = canonical_body_bytes(&replacement).expect("replacement");
-    assert_ne!(decision_id(&original), decision_id(&replaced));
-    assert!(replacement.full_fallback);
-    assert_eq!(replacement.matrix.rust_shards, vec!["workspace"]);
-    assert!(replacement.matrix.rust_packages.is_empty());
+    let mut context = PlannerContext::load(fixture.path()).expect("context");
+    context
+        .graph
+        .reverse_dependencies
+        .entry("a".to_string())
+        .or_default()
+        .extend((0..129).map(|index| format!("package-{index:03}")));
+    let artifact = build_ci_decision_with_context(
+        &context,
+        snapshot(fixture.path(), ["codex-rs/a/src/lib.rs"]),
+        "pull_request".to_string(),
+    )
+    .expect("bounded decision");
+    assert!(artifact.body.full_fallback);
+    assert_eq!(artifact.body.matrix.rust_shards, vec!["workspace"]);
+    assert!(artifact.body.matrix.rust_packages.is_empty());
+    assert!(artifact.body.changes.is_empty());
+    assert!(artifact.body.affected_packages.is_empty());
+    assert!(artifact.body.reverse_closure.is_empty());
+    assert_eq!(
+        artifact.body.fallback_reasons,
+        vec!["GitHub output budget exceeded"]
+    );
+    assert_eq!(decision_id(&artifact.bytes), artifact.outputs.decision_id);
+}
+
+#[test]
+fn strict_consumer_and_writer_reject_contract_or_identity_mutation() {
+    let fixture = fixture_repository(false);
+    let artifact = decision(fixture.path(), ["docs/readme.md"]);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&artifact.bytes).expect("decision json");
+    value
+        .as_object_mut()
+        .expect("body")
+        .insert("decision_id".to_string(), serde_json::json!("forbidden"));
+    let mut bytes = serde_json::to_vec_pretty(&value).expect("mutated bytes");
+    bytes.push(b'\n');
+    assert!(verify_ci_decision_artifact(&bytes, &decision_id(&bytes)).is_err());
+
+    let mut inconsistent = artifact.clone();
+    inconsistent.outputs.decision_id = "sha256:".to_string() + &"0".repeat(64);
+    let temp = tempfile::tempdir().expect("tempdir");
+    assert!(write_ci_decision_artifact(&inconsistent, &temp.path().join("decision.json")).is_err());
 }
 
 #[test]

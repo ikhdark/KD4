@@ -61,7 +61,7 @@ use codex_utils_path_uri::PathUri;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
 use codex_utils_pty::process_group::kill_child_process_group;
 
-pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
+pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 
 // Hardcode these since it does not seem worth including the libc crate just
 // for these.
