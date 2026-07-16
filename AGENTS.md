@@ -42,10 +42,12 @@ exceptions outside that block.
 - Known top-level instruction scopes include `.codex/AGENTS.md`,
   `codex-rs/AGENTS.md`, and `scripts/AGENTS.md`; further nested files apply
   only where present.
-- `.codex/AGENTS.md` and `.codex/README.md` own workspace policy and routing.
-  `.codex/config.toml` owns optional repo-local runtime configuration,
-  `.codex/environments` owns worktree setup/state, and `.codex/skills` owns
-  fork-local skills and validation workflows.
+- `.codex/AGENTS.md` owns workspace source/state policy, and
+  `.codex/README.md` owns workspace routing. `.codex/config.toml` owns optional
+  repo-local runtime configuration, `.codex/environments` owns worktree
+  setup/state, and `.codex/skills` owns fork-local skills. The
+  `.codex/skills/kd4-harness` skill owns the optional durable task-context
+  contract; `.codex/harness/runs` contains ignored local task state only.
 - [`SOURCEMAP.md`](SOURCEMAP.md) owns the high-level directory map, runtime
   entrypoints, Rust-domain routing, build/package/publish paths, generated
   contracts, and cross-cutting change routes.

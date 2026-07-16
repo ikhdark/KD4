@@ -186,3 +186,27 @@ fn preexecution_verdict_and_exit_code_are_rust_owned() {
         assert_eq!(finalized.exit_code, exit_code);
     }
 }
+
+#[test]
+fn nonexecuting_plans_reject_supplied_results() {
+    let mut plan_mode = plan();
+    plan_mode.mode = PlanMode::Plan;
+
+    let mut preexecution_verdict = plan();
+    preexecution_verdict.verdict = Some(Verdict::NeedsScope);
+
+    let mut no_commands = plan();
+    no_commands.commands.clear();
+
+    for plan in [plan_mode, preexecution_verdict, no_commands] {
+        let finalized = finalize_plan(plan, vec![result()]);
+        assert_eq!(finalized.verdict, Verdict::ToolingError);
+        assert_eq!(finalized.exit_code, 4);
+        assert!(!finalized.cache_eligible);
+        assert_eq!(finalized.results.len(), 1);
+        assert_eq!(
+            finalized.finalization_error.as_deref(),
+            Some("execution results were supplied for a non-executing plan")
+        );
+    }
+}

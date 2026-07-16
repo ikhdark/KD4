@@ -9,8 +9,6 @@ use crate::secure_result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use serde::Serialize;
-use sha2::Digest;
-use sha2::Sha256;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
@@ -33,29 +31,33 @@ const GRACEFUL_TERMINATION: Duration = Duration::from_secs(5);
 const POST_TERMINATION_DRAIN: Duration = Duration::from_secs(2);
 
 pub fn execute_plan(plan: &PlanEnvelopeV2, repository_root: &Path) -> Vec<CommandResultV2> {
-    let invocation_nonce = secure_result::random_hex_128().unwrap_or_else(|error| {
-        let digest = Sha256::digest(error.as_bytes());
-        digest[..16]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
-    });
-    let result_dir = secure_result::create_invocation_dir(
+    let invocation_nonce = match secure_result::random_hex_128() {
+        Ok(nonce) => nonce,
+        Err(error) => {
+            return setup_failure_results(
+                plan,
+                format!("operating-system cryptographic RNG failed: {error}"),
+            );
+        }
+    };
+    let result_dir = match secure_result::create_invocation_dir(
         repository_root,
         &plan.invocation_id,
         &invocation_nonce,
-    );
+    ) {
+        Ok(result_dir) => result_dir,
+        Err(error) => {
+            return setup_failure_results(
+                plan,
+                format!("failed to allocate private result directory: {error}"),
+            );
+        }
+    };
     plan.commands
         .iter()
         .enumerate()
         .map(|(ordinal, command)| {
-            execute_command(
-                plan,
-                command,
-                ordinal,
-                repository_root,
-                result_dir.as_ref().ok().map(PathBuf::as_path),
-            )
+            execute_command(plan, command, ordinal, repository_root, &result_dir)
         })
         .collect()
 }
@@ -65,21 +67,20 @@ fn execute_command(
     command: &CommandSpecV2,
     ordinal: usize,
     repository_root: &Path,
-    result_dir: Option<&Path>,
+    result_dir: &Path,
 ) -> CommandResultV2 {
-    let nonce = secure_result::random_hex_128().unwrap_or_else(|error| {
-        let digest = Sha256::digest(error.as_bytes());
-        digest[..16]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
-    });
+    let nonce = match secure_result::random_hex_128() {
+        Ok(nonce) => nonce,
+        Err(error) => {
+            return setup_failure_result(
+                plan,
+                command,
+                ordinal,
+                format!("operating-system cryptographic RNG failed: {error}"),
+            );
+        }
+    };
     let mut result = base_result(plan, command, ordinal, nonce);
-    if result_dir.is_none() {
-        result.runner_error = Some("failed to allocate private result directory".to_string());
-        result.log_state = LogState::IntegrityFailure;
-        return result;
-    }
     let (program, arguments) = match command.args.split_first() {
         Some((program, arguments)) => (program, arguments),
         None => {
@@ -229,12 +230,7 @@ fn execute_command(
     persist_result(result_dir, result)
 }
 
-fn persist_result(result_dir: Option<&Path>, mut result: CommandResultV2) -> CommandResultV2 {
-    let Some(result_dir) = result_dir else {
-        result.log_state = LogState::IntegrityFailure;
-        result.runner_error = Some("missing private result directory".to_string());
-        return result;
-    };
+fn persist_result(result_dir: &Path, mut result: CommandResultV2) -> CommandResultV2 {
     match secure_result::write_result_file(result_dir, &result) {
         Ok(parsed) => parsed,
         Err(error) => {
@@ -243,6 +239,26 @@ fn persist_result(result_dir: Option<&Path>, mut result: CommandResultV2) -> Com
             result
         }
     }
+}
+
+fn setup_failure_results(plan: &PlanEnvelopeV2, error: String) -> Vec<CommandResultV2> {
+    plan.commands
+        .iter()
+        .enumerate()
+        .map(|(ordinal, command)| setup_failure_result(plan, command, ordinal, error.clone()))
+        .collect()
+}
+
+fn setup_failure_result(
+    plan: &PlanEnvelopeV2,
+    command: &CommandSpecV2,
+    ordinal: usize,
+    error: String,
+) -> CommandResultV2 {
+    let mut result = base_result(plan, command, ordinal, String::new());
+    result.runner_error = Some(error);
+    result.log_state = LogState::IntegrityFailure;
+    result
 }
 
 fn base_result(

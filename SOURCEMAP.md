@@ -37,8 +37,8 @@ entrypoint to generated, package, SDK, or desktop-visible outputs.
 3. Use the ownership tables when the change spans packages or languages.
 4. Identify contract and generated-output owners before editing schemas,
    lockfiles, package artifacts, or publish/install paths.
-5. Return to the applicable `AGENTS.md` for the exact validation and completion
-   gate.
+5. Return to the applicable `AGENTS.md` for the exact validation and final
+   reporting rules.
 
 For a clear crate-local or script-local task, skip this map and use the closest
 owner documentation directly.
@@ -60,7 +60,7 @@ owner documentation directly.
 
 | Path | Owns |
 | --- | --- |
-| `.codex/` | Repo-local Codex policy, environments, harness artifacts, skills, and generated local workflow state |
+| `.codex/` | Repo-local Codex policy and routing, worktree environment setup, fork-local skills, and ignored task, verification, and runtime state |
 | `.github/` | CI, release, repository checks, issue templates, and automation |
 | `codex-cli/` | npm-facing `@openai/codex` wrapper, native binary discovery, and package staging inputs |
 | `codex-rs/` | Primary Rust workspace and nearly all CLI, runtime, app-server, TUI, tool, protocol, state, plugin, and sandbox behavior |
@@ -150,7 +150,7 @@ general KD4 hook framework up front.
 | Repository-wide editing policy | `AGENTS.md` |
 | Rust workspace policy and crate routing | `codex-rs/AGENTS.md` |
 | Script ownership and validation | `scripts/AGENTS.md`, then `scripts/README.md` |
-| Repo-local Codex setup and harness | `.codex/AGENTS.md`, `.codex/README.md` |
+| Repo-local Codex setup and durable task context | `.codex/AGENTS.md`, `.codex/README.md`, `.codex/skills/kd4-harness/SKILL.md` |
 | Installation and local build | `docs/install.md` |
 | Configuration | `docs/config.md`, `docs/example-config.md` |
 | Authentication | `docs/authentication.md` |
@@ -175,6 +175,7 @@ when the task needs cross-cutting context.
 | Model/provider behavior | `model-provider*`, `models-manager`, backend/client crates -> `core` request path -> diagnostics/tests |
 | Prompt or model-visible context | `prompts`, `core` prompt owners, `context-fragments` -> scoped prompt/core policy -> snapshots/tests |
 | Plugin, skill, MCP, or extension behavior | `plugin`, `core-plugins`, `core-skills`, `skills`, `mcp-server`, `connectors`, `ext/*` -> registry/dispatch callers |
+| Repo-local Codex policy, skill, or durable task context | `.codex/AGENTS.md` -> `.codex/README.md` -> targeted `.codex/skills` owner; `.codex/harness/runs` remains ignored local state |
 | Stored thread/session behavior | `state`, `thread-store`, `rollout*`, `message-history`, `memories/*` -> app-server/TUI consumers |
 | npm packaging or install behavior | `codex-cli` -> `scripts/stage_npm_packages.py`/`scripts/codex_package` -> installer/release workflow |
 | SDK/API surface | app-server protocol/schema -> `sdk/typescript` and/or `sdk/python` -> generated artifacts and focused SDK tests |

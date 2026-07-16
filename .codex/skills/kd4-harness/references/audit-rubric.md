@@ -1,47 +1,41 @@
-# Audit Rubric Reference
+# Harness Audit Reference
 
-Use this reference when the user asks to audit, score, harden, or optimize the
-KD4 harness.
+Use this reference when auditing, scoring, hardening, or optimizing the KD4
+harness skill or its durable task artifacts.
+
+## Evidence Pass
+
+Inspect the current skill contract, bundled references, UI metadata, `.codex`
+source/state policy, and any targeted run artifact. Check repository policy only
+where the harness routes to it. Do not treat ignored logs or old run state as
+current policy.
 
 ## Categories
 
-Tool Coverage:
-Required local tools, commands, skills, and templates exist for the accepted
-workflow. Score low when the workflow depends on unstated external tools.
+- Trigger precision: frontmatter activates for durable workflow work without
+  becoming the default implementation skill.
+- Reference integrity: every required path exists, every bundled reference is
+  directly routed, and deleted templates or docs are not required.
+- Context efficiency: instructions use progressive disclosure and do not copy
+  root or `.codex` policy.
+- Source/state boundary: reviewable skill source stays separate from ignored
+  runs, logs, screenshots, caches, and runtime evidence.
+- Artifact usability: each artifact has a distinct purpose, minimal fields, and
+  a concrete continuation or proof value.
+- Validation alignment: recorded checks are the nearest sufficient proof and
+  final claims do not exceed them.
+- Authority and safety: dirty work, approval, sandbox, execution, publish,
+  generated-output, and subagent boundaries remain owned by active policy.
+- Runtime clarity: desktop-visible work preserves publish, restart, process,
+  and visible-proof state when relevant.
 
-Context Efficiency:
-Instructions are concise, progressively disclosed, and not duplicated across
-root `AGENTS.md`, `.codex/AGENTS.md`, skills, and templates.
+## Findings
 
-Quality Gates:
-The harness points to the nearest sufficient validation for docs, scripts, Rust
-crates, schemas, publish paths, and desktop-visible work.
+Lead with evidence-backed findings ordered by impact. For each finding, name the
+affected file or artifact, explain the practical failure mode, and propose the
+smallest corrective action. Score categories only when the user asks for a
+score.
 
-Memory And State:
-Durable decisions are preserved in reviewable files when useful, while logs,
-run state, screenshots, and generated artifacts stay local by default.
-
-Eval Coverage:
-Important harness changes have capability or regression criteria. Prefer
-command and rule graders over model or manual graders when possible.
-
-Security Guardrails:
-Secrets, credentials, approval, sandbox, patch, test-gating, publish, and
-execution-safety surfaces are protected from unrelated edits.
-
-Cost And Scope Control:
-Subagents, broad scans, large file reads, and broad validation are used only
-when they materially improve the outcome.
-
-Git And Review Integration:
-Dirty worktree state is respected, unrelated changes are ignored, and final
-answers name only actions that actually happened.
-
-Desktop Runtime Proof:
-Desktop-visible claims include publish and restart evidence, process path or
-hash, and user-visible runtime proof when relevant.
-
-## Output
-
-Use `.codex/harness/templates/HARNESS_AUDIT.md`. Findings should lead with
-evidence and top actions, not generic advice.
+Create `HARNESS_AUDIT.md` only when the audit must survive the current task. Use
+the sections `Scope`, `Findings`, `Top actions`, `Validation`, and `Decision`;
+otherwise report the audit directly.

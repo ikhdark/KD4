@@ -1,40 +1,55 @@
-# Context Management Reference
+# Context And Handoff Reference
 
 Use this reference when a task is long, interrupted, phase-based, or likely to
 hit context pressure.
 
-## Modes
+## Load Current Context
 
-Research:
-Gather evidence and return findings. Do not edit unless the user asks for
-implementation.
+Load authoritative context in this order and stop when the task is grounded:
 
-Plan:
-Distill evidence into `PLAN.md`, including non-goals and validation intent.
+1. The latest user objective and constraints.
+2. Root and nearest scoped instructions not already present in active context.
+3. The targeted run artifact or handoff, if one exists.
+4. The current owner source and nearest test or validation route.
+5. `SOURCEMAP.md` only for ambiguous ownership, cross-cutting work, or a
+   runtime-to-install trace.
+6. A specific generated receipt only when the claim depends on it.
 
-Implement:
-Edit the focused owner path and record only useful decisions in `IMPLEMENT.md`.
+Do not reload all harness references, all run files, or `.codex/verify-local`
+logs merely because they exist. Treat the current worktree as source of truth
+when a handoff and source disagree.
 
-Review:
-Use severity-ranked findings and `QA_CHECKLIST.md` when risk is non-trivial.
+## Refresh Durable Context
 
-Finish:
-Match final claims to validation evidence. Write `HANDOFF.md` when the next
-turn needs durable continuation context.
+After a material decision or phase boundary, preserve only information needed
+to resume safely:
 
-## Compaction Points
+- objective and non-goals;
+- user constraints and task-relevant dirty changes;
+- current owner paths and intended runtime path;
+- decisions and rejected approaches with reasons;
+- completed work and focused validation receipts;
+- exact next action;
+- blockers, unresolved questions, and remaining risk.
 
-Good compaction points:
+Do not preserve raw logs, full transcripts, speculative branches, redundant
+policy text, or stale status. Verify drift-prone facts before carrying them into
+a new handoff.
 
-- after research, before planning or implementation;
-- after plan acceptance, before focused edits;
-- after a failed approach has been documented;
-- before switching to an unrelated task;
-- before ending a long task that will resume later.
+## Handoff Shape
 
-Bad compaction points:
+Write `HANDOFF.md` with these sections when continuation state is required:
 
-- in the middle of an edit;
-- while recent line-level context is still needed;
-- before a failure reason has been recorded;
-- before saving the next concrete step.
+1. Objective
+2. Current state
+3. Decisions and rejected approaches
+4. Touched files and ownership notes
+5. Proven evidence and skipped checks
+6. Next concrete action
+7. Blockers and remaining risk
+
+## Compaction Boundaries
+
+Compact after research, an accepted plan, a completed edit, a documented failed
+approach, or before a task switch. Do not compact mid-edit, before preserving a
+failure reason, or while recent line-level context is still required.

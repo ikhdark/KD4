@@ -32,13 +32,15 @@ class VerifyLocalCompatibilityTest(unittest.TestCase):
             "--changed=scripts/verify_local.py",
             f"--repository-root={REPO_ROOT}",
         ]
+        env = os.environ.copy()
+        env["CODEX_VERIFY_LOCAL_PYTHON"] = sys.executable
         direct = subprocess.run(
             [str(binary), *arguments],
             cwd=REPO_ROOT,
+            env=env,
             capture_output=True,
             check=False,
         )
-        env = os.environ.copy()
         env["CODEX_VERIFY_LOCAL_BIN"] = str(binary)
         wrapped = subprocess.run(
             [sys.executable, str(WRAPPER), *arguments],

@@ -9,6 +9,15 @@ use crate::model::Verdict;
 use std::collections::HashSet;
 
 pub fn finalize_plan(plan: PlanEnvelopeV2, results: Vec<CommandResultV2>) -> FinalizedVerification {
+    if !results.is_empty()
+        && (plan.mode == PlanMode::Plan || plan.verdict.is_some() || plan.commands.is_empty())
+    {
+        return tooling_error(
+            plan,
+            results,
+            "execution results were supplied for a non-executing plan",
+        );
+    }
     if plan.mode == PlanMode::Plan {
         let verdict = plan.verdict.unwrap_or(Verdict::Planned);
         return finish(plan, Vec::new(), verdict, false, None);

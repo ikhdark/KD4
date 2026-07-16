@@ -1,49 +1,40 @@
 # Evals Reference
 
-Use this reference when a harness change needs explicit success criteria,
-regression criteria, or repeatable grading.
+Use this reference when harness behavior needs explicit capability or
+regression criteria that must survive the current turn.
 
-## When To Create An Eval
+## Decide Whether To Persist An Eval
 
-Create an eval artifact for:
+Create `EVAL.md` when the user requests an eval, the workflow change is complex
+or repeatable, a known failure can recur, or later work needs durable acceptance
+criteria. Skip the artifact when deterministic validation and a focused
+read-back are sufficient.
 
-- changes to harness workflow policy;
-- new or changed skills;
-- automation scripts or generators;
-- desktop-visible workflows;
-- bug fixes where the failing behavior can recur.
+For a skill change, always run structural validation. Forward-test only when
+active instructions permit subagents and realistic behavior cannot be covered
+deterministically.
 
-Skip eval artifacts for tiny documentation edits when `git diff --check` and a
-focused read-back are enough.
+## Eval Shape
 
-## Eval Types
+Record:
 
-Capability eval:
-Proves the new behavior can happen.
+- capability or regression objective;
+- baseline or failure being protected;
+- exact success criteria;
+- grader and expected result;
+- attempt evidence and result;
+- remaining risk.
 
-Regression eval:
-Proves an existing workflow still behaves the same.
+## Grader Order
 
-Release-critical eval:
-Requires repeated passing evidence, such as `pass^3`, for safety-sensitive or
-desktop-visible paths.
+Prefer the strongest practical grader in this order:
 
-Manual-review eval:
-Captures a human decision when deterministic checks cannot judge the outcome.
+1. Command grader: focused validator, test, build, schema check, or dry-run.
+2. Rule grader: exact path, link, regex, schema, or structured-data assertion.
+3. Manual grader: named human judgment for ambiguous behavior.
+4. Model grader: open-ended judgment with a written rubric when deterministic
+   checks cannot decide.
 
-## Graders
-
-Prefer in this order:
-
-1. Command grader: focused test, build, script check, schema check, or dry-run.
-2. Rule grader: exact file, regex, schema, or JSON assertion.
-3. Manual grader: named reviewer judgment for ambiguous outcomes.
-4. Model grader: open-ended judgment with a written rubric.
-
-## Metrics
-
-- `pass@1`: first attempt succeeds.
-- `pass@3`: at least one of three controlled attempts succeeds.
-- `pass^3`: three controlled attempts all succeed.
-
-Use `pass^3` only where repeatability matters enough to justify the cost.
+Use `pass@1` for a first-attempt capability result, `pass@3` for at least one of
+three controlled successes, and `pass^3` only when three consecutive successes
+are worth the cost. Do not inflate repeat counts for documentation-only changes.

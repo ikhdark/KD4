@@ -12,6 +12,7 @@ use crate::model::ScopeV2;
 use crate::model::SkippedDecision;
 use crate::model::SnapshotSource;
 use crate::model::Verdict;
+use crate::secure_result;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
@@ -28,7 +29,18 @@ const SCHEMA_TIMEOUT_MS: u64 = 10 * 60 * 1_000;
 
 pub fn plan_verification(request: PlanRequest, snapshot: RepositorySnapshot) -> PlanEnvelopeV2 {
     let mode = request.mode.unwrap_or(PlanMode::Plan);
-    let invocation_id = invocation_id(&request, &snapshot);
+    let invocation_id = match secure_result::random_hex_128() {
+        Ok(invocation_id) => invocation_id,
+        Err(error) => {
+            let mut plan = PlanEnvelopeV2::new(mode, String::new());
+            plan.verdict = Some(Verdict::ToolingError);
+            plan.skipped.push(SkippedDecision {
+                item: "verification invocation".to_string(),
+                reason: format!("operating-system cryptographic RNG failed: {error}"),
+            });
+            return plan;
+        }
+    };
     let mut plan = PlanEnvelopeV2::new(mode, invocation_id);
     plan.enabled_expansions = enabled_expansions(&request);
     if !snapshot.complete {
@@ -775,22 +787,6 @@ fn scope_id(paths: &[RawPath]) -> String {
 fn path_id(path: &RawPath) -> String {
     let digest = Sha256::digest(path.as_bytes());
     format!("{:x}", digest)[..12].to_string()
-}
-
-fn invocation_id(request: &PlanRequest, snapshot: &RepositorySnapshot) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(request.mode.unwrap_or(PlanMode::Plan).as_str().as_bytes());
-    for record in &snapshot.records {
-        hasher.update(record.status.as_bytes());
-        hasher.update([0]);
-        hasher.update(record.path.as_bytes());
-        hasher.update([0xff]);
-        if let Some(original) = &record.original_path {
-            hasher.update(original.as_bytes());
-        }
-        hasher.update([0xfe]);
-    }
-    format!("{:x}", hasher.finalize())
 }
 
 fn scope_state_path(repository_root: &Path) -> std::path::PathBuf {

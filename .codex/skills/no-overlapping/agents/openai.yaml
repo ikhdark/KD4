@@ -1,4 +1,0 @@
-interface:
-  display_name: "No Overlapping"
-  short_description: "Find safe parallel KD4 implementation work"
-  default_prompt: "Use $no-overlapping to map phase and item ownership, identify work that can run safely in parallel, and update the shared tracker with conflicts, dependencies, and proof state."

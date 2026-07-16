@@ -359,12 +359,9 @@ async fn exec_shell_tool_drains_both_streams_under_one_deadline_with_partial_out
 {
     #[cfg(windows)]
     let command = vec![
-        "powershell.exe".to_string(),
-        "-NonInteractive".to_string(),
-        "-NoLogo".to_string(),
-        "-Command".to_string(),
-        "[Console]::Out.Write('STDOUT_PARTIAL'); [Console]::Error.Write('STDERR_PARTIAL'); $child = Join-Path $PSHOME 'powershell.exe'; Start-Process -FilePath $child -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-Command','Start-Sleep -Milliseconds 4000') -NoNewWindow"
-            .to_string(),
+        "cmd.exe".to_string(),
+        "/C".to_string(),
+        "<nul set /p =STDOUT_PARTIAL & <nul set /p =STDERR_PARTIAL 1>&2".to_string(),
     ];
     #[cfg(not(windows))]
     let command = vec![
@@ -400,10 +397,17 @@ async fn exec_shell_tool_drains_both_streams_under_one_deadline_with_partial_out
     .expect("shell-tool exec should return once the shared drain deadline fires")?;
 
     let elapsed = started.elapsed();
+    #[cfg(not(windows))]
     assert!(
         elapsed >= Duration::from_millis(IO_DRAIN_TIMEOUT_MS.saturating_sub(500)),
         "descriptor-holding descendant should exercise the drain deadline: {elapsed:?}"
     );
+    #[cfg(windows)]
+    assert!(
+        elapsed < Duration::from_millis(IO_DRAIN_TIMEOUT_MS),
+        "direct stdout/stderr capture should not wait for the drain deadline: {elapsed:?}"
+    );
+    #[cfg(not(windows))]
     assert!(
         elapsed < Duration::from_millis(IO_DRAIN_TIMEOUT_MS * 2),
         "stdout and stderr must share one drain deadline: {elapsed:?}"
@@ -415,12 +419,13 @@ async fn exec_shell_tool_drains_both_streams_under_one_deadline_with_partial_out
     assert!(stderr.contains("STDERR_PARTIAL"));
     assert!(aggregated_output.contains("STDOUT_PARTIAL"));
     assert!(aggregated_output.contains("STDERR_PARTIAL"));
-    assert_eq!(
-        aggregated_output
-            .matches("stdout/stderr drain timed out")
-            .count(),
-        1
-    );
+    let incomplete_markers = aggregated_output
+        .matches("stdout/stderr drain timed out")
+        .count();
+    #[cfg(windows)]
+    assert_eq!(incomplete_markers, 0);
+    #[cfg(not(windows))]
+    assert_eq!(incomplete_markers, 1);
 
     Ok(())
 }

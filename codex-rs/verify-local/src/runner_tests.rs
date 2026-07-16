@@ -1,6 +1,8 @@
 use super::*;
 use crate::model::PlanMode;
+use crate::model::PlanRequest;
 use crate::model::RawPath;
+use crate::model::RepositorySnapshot;
 use crate::secure_result;
 use std::fs;
 
@@ -15,6 +17,35 @@ fn operating_system_ids_use_fixed_lowercase_hex() {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     );
     assert_ne!(first, second);
+}
+
+#[test]
+fn planner_generated_invocation_id_executes_through_secure_runner() {
+    let repository = tempfile::tempdir().expect("temporary repository");
+    let changed = RawPath::from_utf8("codex-rs/verify-local/src/lib.rs");
+    let snapshot = RepositorySnapshot::from_explicit_paths(
+        repository.path(),
+        [changed.clone()],
+    )
+    .expect("explicit snapshot");
+    let request = PlanRequest {
+        mode: Some(PlanMode::Fast),
+        changed: vec![changed],
+        ..PlanRequest::default()
+    };
+    let mut plan = crate::planner::plan_verification(request, snapshot);
+    assert_eq!(plan.invocation_id.len(), 32);
+    assert!(
+        plan.invocation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    );
+    plan.verdict = None;
+    plan.commands = plan_for_shell("echo planner-runner", 5_000).commands;
+
+    let results = execute_plan(&plan, repository.path());
+    let finalized = crate::finalize::finalize_plan(plan, results);
+    assert_eq!(finalized.verdict, crate::model::Verdict::Verified);
 }
 
 #[test]
