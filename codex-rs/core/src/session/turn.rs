@@ -93,7 +93,6 @@ use codex_core_skills::injection::PlannedSkillInjections;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
-use codex_git_utils::get_git_repo_root_with_fs;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ServiceTier;
@@ -207,7 +206,7 @@ pub(crate) async fn run_turn(
     // Only now may normal turn persistence begin.
     let (mut world_state, display_roots) = tokio::join!(
         sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
-        turn_diff_display_roots(turn_context.as_ref()),
+        turn_diff_display_roots(sess.as_ref(), turn_context.as_ref()),
     );
 
     if run_pending_session_start_hooks(&sess, &turn_context).await {
@@ -539,22 +538,15 @@ pub(crate) async fn run_turn(
 }
 
 #[instrument(level = "trace", skip_all)]
-async fn turn_diff_display_roots(turn_context: &TurnContext) -> Vec<(String, PathBuf)> {
-    let mut display_roots = Vec::new();
-    for turn_environment in &turn_context.environments.turn_environments {
-        // TODO(anp): Migrate git-root discovery and diff display roots to PathUri so foreign
-        // environment roots can participate without host-native conversion.
-        let Ok(cwd) = turn_environment.cwd().to_abs_path() else {
-            continue;
-        };
-        let root =
-            get_git_repo_root_with_fs(turn_environment.environment.get_filesystem().as_ref(), &cwd)
-                .await
-                .unwrap_or(cwd)
-                .into_path_buf();
-        display_roots.push((turn_environment.environment_id.clone(), root));
-    }
-    display_roots
+async fn turn_diff_display_roots(
+    sess: &Session,
+    turn_context: &TurnContext,
+) -> Vec<(String, PathBuf)> {
+    sess.services
+        .turn_environments
+        .git_workspace_snapshot(&turn_context.environments)
+        .await
+        .display_roots()
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -1662,8 +1654,7 @@ async fn run_sampling_request(
     let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
         &sess,
         Arc::clone(&step_context),
-        Arc::clone(&router),
-        Arc::clone(&turn_diff_tracker),
+        tool_runtime.clone(),
     );
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;

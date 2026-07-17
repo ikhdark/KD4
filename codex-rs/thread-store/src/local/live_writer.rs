@@ -103,6 +103,17 @@ pub(super) async fn resume_thread(
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to resume local thread recorder: {err}"),
         })?;
+    let state_db = store.state_db().await;
+    codex_rollout::state_db::reconcile_rollout(
+        state_db.as_deref(),
+        recorder.rollout_path(),
+        config.model_provider_id.as_str(),
+        /*builder*/ None,
+        &[],
+        /*archived_only*/ None,
+        /*new_thread_memory_mode*/ None,
+    )
+    .await;
     store
         .insert_live_recorder(params.thread_id, recorder, history_mode)
         .await
@@ -178,6 +189,20 @@ pub(super) async fn shutdown_thread(
     let rollout_path = recorder.rollout_path().to_path_buf();
     recorder.shutdown().await.map_err(thread_store_io_error)?;
     sync_materialized_rollout_path(store, thread_id).await?;
+    if codex_rollout::existing_rollout_path(rollout_path.as_path())
+        .await
+        .is_none()
+        && let Some(state_db) = store.state_db().await
+    {
+        state_db
+            .delete_thread(thread_id)
+            .await
+            .map_err(|err| ThreadStoreError::Internal {
+                message: format!(
+                    "failed to remove unmaterialized thread metadata for {thread_id}: {err}"
+                ),
+            })?;
+    }
     if let Some(metrics) = codex_otel::global()
         && let Ok(metadata) = tokio::fs::metadata(rollout_path).await
     {
@@ -239,6 +264,16 @@ async fn sync_materialized_rollout_path(
                     message: format!("failed to read thread metadata for {thread_id}: {err}"),
                 })?
         else {
+            codex_rollout::state_db::reconcile_rollout(
+                Some(state_db.as_ref()),
+                rollout_path.as_path(),
+                store.config.default_model_provider_id.as_str(),
+                /*builder*/ None,
+                &[],
+                /*archived_only*/ Some(false),
+                /*new_thread_memory_mode*/ None,
+            )
+            .await;
             return Ok(());
         };
         if metadata.rollout_path != rollout_path {

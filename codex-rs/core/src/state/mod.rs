@@ -1,5 +1,6 @@
 mod additional_context;
 mod auto_compact_window;
+mod mcp_projection;
 mod service;
 mod session;
 mod turn;
@@ -7,6 +8,8 @@ mod turn;
 pub(crate) use additional_context::AdditionalContextStore;
 pub(crate) use auto_compact_window::AutoCompactWindowIds;
 pub(crate) use auto_compact_window::AutoCompactWindowSnapshot;
+pub(crate) use mcp_projection::McpProjectionCoordinator;
+pub(crate) use mcp_projection::McpProjectionTicket;
 pub(crate) use service::SessionServices;
 pub(crate) use session::SessionState;
 pub(crate) use turn::ActiveTurn;

@@ -180,6 +180,7 @@ impl fmt::Display for SkillParseError {
 
 impl Error for SkillParseError {}
 
+#[derive(Clone)]
 pub struct SkillRoot {
     pub path: AbsolutePathBuf,
     pub scope: SkillScope,

@@ -342,14 +342,8 @@ fn push_chunk_preserves_prefix_and_suffix() {
 
     let first = snapshot.first().expect("expected at least one chunk");
     assert_eq!(first.first(), Some(&b'a'));
-    assert!(snapshot.iter().any(|chunk| chunk.as_slice() == b"b"));
-    assert_eq!(
-        snapshot
-            .last()
-            .expect("expected at least one chunk")
-            .as_slice(),
-        b"c"
-    );
+    assert!(snapshot.len() <= 2);
+    assert!(snapshot.concat().ends_with(b"bc"));
 }
 
 #[test]

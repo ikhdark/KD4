@@ -846,18 +846,6 @@ impl Session {
                 slug: Some(session_model),
             };
             config.features.emit_metrics(&session_telemetry);
-            session_telemetry.counter(
-                THREAD_STARTED_METRIC,
-                /*inc*/ 1,
-                &[(
-                    "is_git",
-                    if get_git_repo_root(session_configuration.cwd()).is_some() {
-                        "true"
-                    } else {
-                        "false"
-                    },
-                )],
-            );
 
             session_telemetry.conversation_starts(
                 config.model_provider.name.as_str(),
@@ -914,6 +902,22 @@ impl Session {
             ));
             turn_environments.update_selections(session_configuration.environment_selections());
             let resolved_environments = turn_environments.snapshot().await;
+            let git_telemetry = session_telemetry.clone();
+            let git_telemetry_environments = Arc::clone(&turn_environments);
+            let git_telemetry_snapshot = resolved_environments.clone();
+            let git_telemetry_fallback_cwd = session_configuration.cwd().clone();
+            drop(tokio::spawn(async move {
+                let is_git = git_telemetry_environments
+                    .git_workspace_snapshot(&git_telemetry_snapshot)
+                    .await
+                    .primary_is_git()
+                    .unwrap_or_else(|| get_git_repo_root(&git_telemetry_fallback_cwd).is_some());
+                git_telemetry.counter(
+                    THREAD_STARTED_METRIC,
+                    /*inc*/ 1,
+                    &[("is_git", if is_git { "true" } else { "false" })],
+                );
+            }));
             let agents_md_manager = Arc::new(AgentsMdManager::new(user_instructions));
             agents_md_manager
                 .refresh(config.as_ref(), &resolved_environments)
@@ -1080,8 +1084,8 @@ impl Session {
                 mcp_connection_manager,
                 mcp_runtime: arc_swap::ArcSwapOption::empty(),
                 planning_generation: std::sync::atomic::AtomicU64::new(0),
-                mcp_projection_lock: Mutex::new(()),
-                mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
+                mcp_projection: crate::state::McpProjectionCoordinator::new(),
+                mcp_startup_cancellation_token: std::sync::Mutex::new(CancellationToken::new()),
                 unified_exec_manager,
                 command_execution:
                     crate::tools::command_execution::CommandExecutionLedger::default(),
@@ -1226,7 +1230,11 @@ impl Session {
             }
 
             let mcp_startup_cancellation_token = {
-                let mut cancel_guard = sess.services.mcp_startup_cancellation_token.lock().await;
+                let mut cancel_guard = sess
+                    .services
+                    .mcp_startup_cancellation_token
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 cancel_guard.cancel();
                 let cancel_token = CancellationToken::new();
                 *cancel_guard = cancel_token.clone();

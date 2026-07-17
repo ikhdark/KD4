@@ -1,9 +1,9 @@
 use crate::unified_exec::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 const OUTPUT_EVIDENCE_MARKER_MAX_BYTES: usize = 256;
+const MAX_RETAINED_CHUNKS: usize = 2;
 
 #[derive(Debug, Default)]
 pub(crate) struct OutputRecoveryEvidence {
@@ -21,11 +21,8 @@ pub(crate) type SharedOutputRecoveryEvidence = Arc<Mutex<OutputRecoveryEvidence>
 pub(crate) struct HeadTailBuffer {
     max_bytes: usize,
     head_budget: usize,
-    tail_budget: usize,
-    head: VecDeque<Vec<u8>>,
-    tail: VecDeque<Vec<u8>>,
-    head_bytes: usize,
-    tail_bytes: usize,
+    head: Vec<u8>,
+    tail: CircularByteBuffer,
     omitted_bytes: usize,
     unreported_omitted_bytes: usize,
     lagged_chunks: u64,
@@ -58,11 +55,8 @@ impl HeadTailBuffer {
         Self {
             max_bytes,
             head_budget,
-            tail_budget,
-            head: VecDeque::new(),
-            tail: VecDeque::new(),
-            head_bytes: 0,
-            tail_bytes: 0,
+            head: Vec::with_capacity(head_budget),
+            tail: CircularByteBuffer::new(tail_budget),
             omitted_bytes: 0,
             unreported_omitted_bytes: 0,
             lagged_chunks: 0,
@@ -111,7 +105,7 @@ impl HeadTailBuffer {
     #[allow(dead_code)]
     /// Total bytes currently retained by the buffer (head + tail).
     pub(crate) fn retained_bytes(&self) -> usize {
-        self.head_bytes.saturating_add(self.tail_bytes)
+        self.head.len().saturating_add(self.tail.len())
     }
 
     // Used for tests.
@@ -158,25 +152,17 @@ impl HeadTailBuffer {
         }
 
         // Fill the head budget first, then keep a capped tail.
-        if self.head_bytes < self.head_budget {
-            let remaining_head = self.head_budget.saturating_sub(self.head_bytes);
-            if chunk.len() <= remaining_head {
-                self.head_bytes = self.head_bytes.saturating_add(chunk.len());
-                self.head.push_back(chunk);
-                return;
-            }
-
-            // Split the chunk: part goes to head, remainder goes to tail.
-            let (head_part, tail_part) = chunk.split_at(remaining_head);
-            if !head_part.is_empty() {
-                self.head_bytes = self.head_bytes.saturating_add(head_part.len());
-                self.head.push_back(head_part.to_vec());
-            }
-            self.push_to_tail(tail_part.to_vec());
-            return;
+        let mut remaining = chunk.as_slice();
+        if self.head.len() < self.head_budget {
+            let head_len = remaining
+                .len()
+                .min(self.head_budget.saturating_sub(self.head.len()));
+            self.head.extend_from_slice(&remaining[..head_len]);
+            remaining = &remaining[head_len..];
         }
 
-        self.push_to_tail(chunk);
+        let omitted = self.tail.push(remaining);
+        self.record_omitted_bytes(omitted);
     }
 
     /// Snapshot the retained output as a list of chunks.
@@ -184,9 +170,13 @@ impl HeadTailBuffer {
     /// The returned chunks are ordered as: head chunks first, then tail chunks.
     /// Omitted bytes are not represented in the snapshot.
     pub(crate) fn snapshot_chunks(&self) -> Vec<Vec<u8>> {
-        let mut out = Vec::new();
-        out.extend(self.head.iter().cloned());
-        out.extend(self.tail.iter().cloned());
+        let mut out = Vec::with_capacity(MAX_RETAINED_CHUNKS);
+        if !self.head.is_empty() {
+            out.push(self.head.clone());
+        }
+        if !self.tail.is_empty() {
+            out.push(self.tail.to_bytes());
+        }
         out
     }
 
@@ -196,12 +186,8 @@ impl HeadTailBuffer {
     /// Omitted bytes are not represented in the returned value.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.retained_bytes());
-        for chunk in self.head.iter() {
-            out.extend_from_slice(chunk);
-        }
-        for chunk in self.tail.iter() {
-            out.extend_from_slice(chunk);
-        }
+        out.extend_from_slice(&self.head);
+        self.tail.extend_into(&mut out);
         out
     }
 
@@ -254,66 +240,112 @@ impl HeadTailBuffer {
     /// omission/lag accounting are preserved until the caller explicitly
     /// consumes their pending counts.
     pub(crate) fn drain_chunks(&mut self) -> Vec<Vec<u8>> {
-        let mut out: Vec<Vec<u8>> = self.head.drain(..).collect();
-        out.extend(self.tail.drain(..));
-        self.head_bytes = 0;
-        self.tail_bytes = 0;
+        let mut out = Vec::with_capacity(MAX_RETAINED_CHUNKS);
+        if !self.head.is_empty() {
+            out.push(self.head.clone());
+            self.head.clear();
+        }
+        if !self.tail.is_empty() {
+            out.push(self.tail.take_bytes());
+        }
         out
-    }
-
-    fn push_to_tail(&mut self, chunk: Vec<u8>) {
-        if self.tail_budget == 0 {
-            self.record_omitted_bytes(chunk.len());
-            return;
-        }
-
-        if chunk.len() >= self.tail_budget {
-            // This single chunk is larger than the whole tail budget. Keep only the last
-            // tail_budget bytes and drop everything else.
-            let start = chunk.len().saturating_sub(self.tail_budget);
-            let kept = chunk[start..].to_vec();
-            let dropped = chunk.len().saturating_sub(kept.len());
-            self.record_omitted_bytes(self.tail_bytes.saturating_add(dropped));
-            self.tail.clear();
-            self.tail_bytes = kept.len();
-            self.tail.push_back(kept);
-            return;
-        }
-
-        self.tail_bytes = self.tail_bytes.saturating_add(chunk.len());
-        self.tail.push_back(chunk);
-        self.trim_tail_to_budget();
-    }
-
-    fn trim_tail_to_budget(&mut self) {
-        let mut excess = self.tail_bytes.saturating_sub(self.tail_budget);
-        while excess > 0 {
-            let (omitted, done) = match self.tail.front_mut() {
-                Some(front) if excess >= front.len() => {
-                    let front_len = front.len();
-                    excess -= front_len;
-                    self.tail_bytes = self.tail_bytes.saturating_sub(front_len);
-                    self.tail.pop_front();
-                    (front_len, false)
-                }
-                Some(front) => {
-                    let omitted = excess;
-                    front.drain(..excess);
-                    self.tail_bytes = self.tail_bytes.saturating_sub(excess);
-                    (omitted, true)
-                }
-                None => break,
-            };
-            self.record_omitted_bytes(omitted);
-            if done {
-                break;
-            }
-        }
     }
 
     fn record_omitted_bytes(&mut self, omitted: usize) {
         self.omitted_bytes = self.omitted_bytes.saturating_add(omitted);
         self.unreported_omitted_bytes = self.unreported_omitted_bytes.saturating_add(omitted);
+    }
+}
+
+/// Fixed-capacity suffix storage. Once full, new bytes overwrite the oldest
+/// bytes in place, so both memory use and append work are bounded by bytes
+/// rather than by the number of incoming chunks.
+#[derive(Debug)]
+struct CircularByteBuffer {
+    bytes: Vec<u8>,
+    start: usize,
+    capacity: usize,
+}
+
+impl CircularByteBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(capacity),
+            start: 0,
+            capacity,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Append bytes and return the number of previously or newly supplied
+    /// bytes that no longer fit in the retained suffix.
+    fn push(&mut self, input: &[u8]) -> usize {
+        if input.is_empty() {
+            return 0;
+        }
+        if self.capacity == 0 {
+            return input.len();
+        }
+        if input.len() >= self.capacity {
+            let omitted = self
+                .bytes
+                .len()
+                .saturating_add(input.len().saturating_sub(self.capacity));
+            self.bytes.clear();
+            self.bytes
+                .extend_from_slice(&input[input.len() - self.capacity..]);
+            self.start = 0;
+            return omitted;
+        }
+
+        let fill_len = input
+            .len()
+            .min(self.capacity.saturating_sub(self.bytes.len()));
+        self.bytes.extend_from_slice(&input[..fill_len]);
+        let overwrite = &input[fill_len..];
+        if overwrite.is_empty() {
+            return 0;
+        }
+
+        debug_assert_eq!(self.bytes.len(), self.capacity);
+        let first_len = overwrite.len().min(self.capacity - self.start);
+        self.bytes[self.start..self.start + first_len]
+            .copy_from_slice(&overwrite[..first_len]);
+        let second_len = overwrite.len().saturating_sub(first_len);
+        if second_len > 0 {
+            self.bytes[..second_len].copy_from_slice(&overwrite[first_len..]);
+        }
+        self.start = (self.start + overwrite.len()) % self.capacity;
+        overwrite.len()
+    }
+
+    fn extend_into(&self, output: &mut Vec<u8>) {
+        if self.bytes.len() < self.capacity || self.start == 0 {
+            output.extend_from_slice(&self.bytes);
+            return;
+        }
+        output.extend_from_slice(&self.bytes[self.start..]);
+        output.extend_from_slice(&self.bytes[..self.start]);
+    }
+
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut output = Vec::with_capacity(self.bytes.len());
+        self.extend_into(&mut output);
+        output
+    }
+
+    fn take_bytes(&mut self) -> Vec<u8> {
+        let output = self.to_bytes();
+        self.bytes.clear();
+        self.start = 0;
+        output
     }
 }
 

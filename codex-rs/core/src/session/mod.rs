@@ -194,6 +194,7 @@ use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::types::McpServerConfig;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_model_provider_info::OPENAI_PROVIDER_ID;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 #[cfg(test)]
@@ -474,6 +475,73 @@ pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
+async fn resolve_initial_model(
+    config: &Config,
+    allow_provider_model_fallback: bool,
+    models_manager: &SharedModelsManager,
+    refresh_strategy: RefreshStrategy,
+) -> (String, ModelInfo) {
+    if matches!(refresh_strategy, RefreshStrategy::OnlineIfUncached)
+        && !allow_provider_model_fallback
+        && config.model_provider_id == OPENAI_PROVIDER_ID
+        && let Some(requested_model) = config.model.as_ref()
+    {
+        // Load fresh cached metadata without network access, then require an exact catalog
+        // match. Prefix/suffix metadata inference is not sufficient here because it can hide
+        // unknown or provider-mismatched model IDs that still need online validation.
+        let available_models = models_manager
+            .list_models(RefreshStrategy::Offline, config.http_client_factory())
+            .await;
+        if available_models
+            .iter()
+            .any(|available_model| available_model.model == requested_model.as_str())
+        {
+            let model_info = models_manager
+                .get_model_info(requested_model, &config.to_models_manager_config())
+                .await;
+            // Preserve the root-session refresh request, but do not put it on the critical path
+            // when bundled or cached metadata can fully initialize the explicit model.
+            let models_manager = Arc::clone(models_manager);
+            let http_client_factory = config.http_client_factory();
+            tokio::spawn(async move {
+                let _ = models_manager
+                    .list_models(RefreshStrategy::OnlineIfUncached, http_client_factory)
+                    .await;
+            });
+            return (requested_model.clone(), model_info);
+        }
+    }
+
+    if config.model.is_none() || !matches!(refresh_strategy, RefreshStrategy::Offline) {
+        let _ = models_manager
+            .list_models(refresh_strategy, config.http_client_factory())
+            .await;
+    }
+    let model = models_manager
+        .get_default_model(
+            &config.model,
+            allow_provider_model_fallback,
+            refresh_strategy,
+            config.http_client_factory(),
+        )
+        .await;
+    if allow_provider_model_fallback
+        && let Some(requested_model) = config.model.as_ref()
+        && model != *requested_model
+    {
+        info!(
+            model_provider = %config.model_provider_id,
+            requested_model,
+            fallback_model = %model,
+            "replaced unavailable requested model with provider default"
+        );
+    }
+    let model_info = models_manager
+        .get_model_info(model.as_str(), &config.to_models_manager_config())
+        .await;
+    (model, model_info)
+}
+
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
     pub(crate) async fn spawn(args: CodexSpawnArgs) -> CodexResult<CodexSpawnOk> {
@@ -566,47 +634,22 @@ impl Codex {
 
         let config = Arc::new(config);
         let refresh_strategy = if session_source.is_non_root_agent() {
-            codex_models_manager::manager::RefreshStrategy::Offline
+            RefreshStrategy::Offline
         } else {
-            codex_models_manager::manager::RefreshStrategy::OnlineIfUncached
+            RefreshStrategy::OnlineIfUncached
         };
-        if config.model.is_none()
-            || !matches!(
-                refresh_strategy,
-                codex_models_manager::manager::RefreshStrategy::Offline
-            )
-        {
-            let _ = models_manager
-                .list_models(refresh_strategy, config.http_client_factory())
-                .await;
-        }
-        let model = models_manager
-            .get_default_model(
-                &config.model,
-                allow_provider_model_fallback,
-                refresh_strategy,
-                config.http_client_factory(),
-            )
-            .await;
-        if allow_provider_model_fallback
-            && let Some(requested_model) = config.model.as_ref()
-            && model != *requested_model
-        {
-            info!(
-                model_provider = %config.model_provider_id,
-                requested_model,
-                fallback_model = %model,
-                "replaced unavailable requested model with provider default"
-            );
-        }
+        let (model, model_info) = resolve_initial_model(
+            config.as_ref(),
+            allow_provider_model_fallback,
+            &models_manager,
+            refresh_strategy,
+        )
+        .await;
 
         // Resolve base instructions for the session. Priority order:
         // 1. config.base_instructions override
         // 2. conversation history => session_meta.base_instructions
         // 3. base_instructions for current model
-        let model_info = models_manager
-            .get_model_info(model.as_str(), &config.to_models_manager_config())
-            .await;
         let multi_agent_version =
             resolve_multi_agent_version(&conversation_history, inherited_multi_agent_version);
         let history_mode = conversation_history.get_history_mode(
@@ -4154,6 +4197,10 @@ async fn build_hooks_for_config(
 #[cfg(test)]
 #[path = "elicitation_holders_tests.rs"]
 mod elicitation_holders_tests;
+
+#[cfg(test)]
+#[path = "model_catalog_refresh_tests.rs"]
+mod model_catalog_refresh_tests;
 
 #[cfg(test)]
 pub(crate) mod tests;

@@ -3,10 +3,12 @@ use crate::CreateThreadParams;
 use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
 use crate::error::reject_paginated_history_mode;
+use chrono::Utc;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::RolloutRecorderParams;
+use codex_state::ThreadMetadataBuilder;
 
 pub(super) async fn create_thread(
     store: &LocalThreadStore,
@@ -27,7 +29,16 @@ pub(super) async fn create_thread(
         model_provider_id: params.metadata.model_provider.clone(),
         generate_memories: matches!(params.metadata.memory_mode, ThreadMemoryMode::Enabled),
     };
-    RolloutRecorder::new(
+    let created_at = Utc::now();
+    let source = params.source.clone();
+    let thread_source = params.thread_source.clone();
+    let history_mode = params.history_mode;
+    let model_provider = params.metadata.model_provider.clone();
+    let memory_mode = match params.metadata.memory_mode {
+        ThreadMemoryMode::Enabled => "enabled",
+        ThreadMemoryMode::Disabled => "disabled",
+    };
+    let recorder = RolloutRecorder::new(
         &config,
         RolloutRecorderParams::new(
             params.thread_id,
@@ -48,5 +59,30 @@ pub(super) async fn create_thread(
     .await
     .map_err(|err| ThreadStoreError::Internal {
         message: format!("failed to initialize local thread recorder: {err}"),
-    })
+    })?;
+
+    let mut builder = ThreadMetadataBuilder::new(
+        params.thread_id,
+        recorder.rollout_path().to_path_buf(),
+        created_at,
+        source.clone(),
+    );
+    builder.updated_at = Some(created_at);
+    builder.history_mode = history_mode;
+    builder.thread_source = thread_source;
+    builder.agent_nickname = source.get_nickname();
+    builder.agent_role = source.get_agent_role();
+    builder.agent_path = source.get_agent_path().map(Into::into);
+    builder.model_provider = Some(model_provider.clone());
+    builder.cwd = config.cwd.clone();
+    builder.cli_version = Some(env!("CARGO_PKG_VERSION").to_string());
+    let state_db = store.state_db().await;
+    codex_rollout::state_db::index_current_thread(
+        state_db.as_deref(),
+        &builder,
+        model_provider.as_str(),
+        memory_mode,
+    )
+    .await;
+    Ok(recorder)
 }

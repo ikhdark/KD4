@@ -228,6 +228,168 @@ async fn skills_for_config_reuses_cache_for_same_effective_config() {
     assert_eq!(outcome2.skills, outcome1.skills);
 }
 
+#[test]
+fn skills_cache_uses_keyed_singleflight() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let key_a = ConfigSkillsCacheKey {
+        roots: vec![(
+            codex_home.path().join("a").abs(),
+            0,
+            None,
+            None,
+        )],
+        skill_config_rules: SkillConfigRules::default(),
+    };
+    let key_b = ConfigSkillsCacheKey {
+        roots: vec![(
+            codex_home.path().join("b").abs(),
+            0,
+            None,
+            None,
+        )],
+        skill_config_rules: SkillConfigRules::default(),
+    };
+
+    let (generation_a, flight_a1) = skills_service.skills_cache_flight(&key_a);
+    let (_, flight_a2) = skills_service.skills_cache_flight(&key_a);
+    let (_, flight_b) = skills_service.skills_cache_flight(&key_b);
+
+    assert!(Arc::ptr_eq(&flight_a1, &flight_a2));
+    assert!(!Arc::ptr_eq(&flight_a1, &flight_b));
+
+    skills_service.invalidate_paths(&[codex_home.path().join("a")]);
+    assert!(!skills_service.publish_skills_cache_flight(
+        generation_a,
+        &key_a,
+        &flight_a1,
+        HostSkillsSnapshot::new(Arc::new(SkillLoadOutcome::default())),
+    ));
+
+    let cancellation_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let (_, canceled) = cancellation_service.skills_cache_flight(&key_a);
+    drop(canceled);
+    let (_, _active) = cancellation_service.skills_cache_flight(&key_b);
+    assert_eq!(
+        cancellation_service
+            .cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flights
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn skills_cache_invalidates_only_entries_overlapping_changed_paths() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let config_layer_stack = config_stack(&codex_home, "");
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let skill_a_path = write_plugin_skill(
+        &codex_home,
+        "test",
+        "plugin-a",
+        "skill-a",
+        "skill-a",
+        "before-a",
+    );
+    let skill_b_path = write_plugin_skill(
+        &codex_home,
+        "test",
+        "plugin-b",
+        "skill-b",
+        "skill-b",
+        "before-b",
+    );
+    let root_a = plugin_skill_root_for_skill_path(&skill_a_path, "plugin-a@test", "test:plugin-a");
+    let root_b = plugin_skill_root_for_skill_path(&skill_b_path, "plugin-b@test", "test:plugin-b");
+
+    let outcome_a = skills_for_config_with_stack(
+        &skills_service,
+        &cwd,
+        &config_layer_stack,
+        std::slice::from_ref(&root_a),
+    )
+    .await;
+    let outcome_b = skills_for_config_with_stack(
+        &skills_service,
+        &cwd,
+        &config_layer_stack,
+        std::slice::from_ref(&root_b),
+    )
+    .await;
+    assert_eq!(
+        outcome_a
+            .skills
+            .iter()
+            .find(|skill| skill.name == "test:plugin-a:skill-a")
+            .map(|skill| skill.description.as_str()),
+        Some("before-a")
+    );
+    assert_eq!(
+        outcome_b
+            .skills
+            .iter()
+            .find(|skill| skill.name == "test:plugin-b:skill-b")
+            .map(|skill| skill.description.as_str()),
+        Some("before-b")
+    );
+
+    fs::write(
+        &skill_a_path,
+        "---\nname: skill-a\ndescription: after-a\n---\n\n# Body\n",
+    )
+    .expect("update skill a");
+    fs::write(
+        &skill_b_path,
+        "---\nname: skill-b\ndescription: after-b\n---\n\n# Body\n",
+    )
+    .expect("update skill b");
+    skills_service.invalidate_paths(std::slice::from_ref(&skill_a_path));
+
+    let reloaded_a = skills_for_config_with_stack(
+        &skills_service,
+        &cwd,
+        &config_layer_stack,
+        std::slice::from_ref(&root_a),
+    )
+    .await;
+    let cached_b = skills_for_config_with_stack(
+        &skills_service,
+        &cwd,
+        &config_layer_stack,
+        std::slice::from_ref(&root_b),
+    )
+    .await;
+    assert_eq!(
+        reloaded_a
+            .skills
+            .iter()
+            .find(|skill| skill.name == "test:plugin-a:skill-a")
+            .map(|skill| skill.description.as_str()),
+        Some("after-a")
+    );
+    assert_eq!(
+        cached_b
+            .skills
+            .iter()
+            .find(|skill| skill.name == "test:plugin-b:skill-b")
+            .map(|skill| skill.description.as_str()),
+        Some("before-b")
+    );
+}
+
 #[tokio::test]
 async fn set_extra_roots_replaces_runtime_roots_and_clears_cache() {
     let codex_home = tempfile::tempdir().expect("tempdir");

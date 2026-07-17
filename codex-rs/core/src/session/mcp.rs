@@ -106,10 +106,6 @@ impl Session {
         codex_mcp::configured_mcp_servers(&self.runtime_mcp_config(config).await)
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "MCP runtime comparison and publication must remain serialized"
-    )]
     pub(crate) async fn mcp_runtime_for_step(
         self: &Arc<Self>,
         turn_context: &TurnContext,
@@ -123,11 +119,7 @@ impl Session {
             return current;
         }
 
-        let _guard = self.services.mcp_projection_lock.lock().await;
-        let current = self.services.latest_mcp_runtime();
-        if current.available_environment_ids() == available_environment_ids {
-            return current;
-        }
+        let ticket = self.services.mcp_projection.begin();
         let mcp_projection = self
             .services
             .mcp_manager
@@ -139,39 +131,52 @@ impl Session {
                 &available_environment_ids,
             )
             .await;
-        let mcp_config = &mcp_projection.config;
-        let changed_environment_is_used_by_mcp = mcp_config
-            .mcp_server_catalog
-            .configured_servers()
-            .values()
-            .any(|server| {
-                let was_available = current
-                    .available_environment_ids()
-                    .contains(&server.environment_id);
-                let is_available = available_environment_ids.contains(&server.environment_id);
-                server.enabled && was_available != is_available
-            });
-        if !changed_environment_is_used_by_mcp
-            && current
-                .config()
+
+        // Recheck the immutable input fingerprint under the short publication guard. Projection
+        // work above may be slow, but it never excludes an unchanged or newer projection.
+        if let Some(_guard) = self.services.mcp_projection.lock_if_current(ticket).await {
+            let current = self.services.latest_mcp_runtime();
+            if current.available_environment_ids() == available_environment_ids {
+                return current;
+            }
+            let mcp_config = &mcp_projection.config;
+            let changed_environment_is_used_by_mcp = mcp_config
                 .mcp_server_catalog
-                .has_same_servers(&mcp_config.mcp_server_catalog)
-            && current.config().connector_snapshot == mcp_config.connector_snapshot
-        {
-            // Availability is only an input to the MCP projection. When that input changes but
-            // the projected servers and connectors do not, advance the input key without
-            // replacing the live manager and restarting its processes.
-            let runtime = Arc::new(McpRuntimeSnapshot::new(
-                Arc::new(current.config().clone()),
-                mcp_projection.plugins_available,
-                current.manager_arc(),
-                current.runtime_context().clone(),
-                available_environment_ids,
-            ));
-            self.services.mcp_runtime.store(Some(Arc::clone(&runtime)));
-            return runtime;
+                .configured_servers()
+                .values()
+                .any(|server| {
+                    let was_available = current
+                        .available_environment_ids()
+                        .contains(&server.environment_id);
+                    let is_available = available_environment_ids.contains(&server.environment_id);
+                    server.enabled && was_available != is_available
+                });
+            if !changed_environment_is_used_by_mcp
+                && current
+                    .config()
+                    .mcp_server_catalog
+                    .has_same_servers(&mcp_config.mcp_server_catalog)
+                && current.config().connector_snapshot == mcp_config.connector_snapshot
+            {
+                // Availability is only an input to the MCP projection. When that input changes but
+                // the projected servers and connectors do not, advance the input key without
+                // replacing the live manager and restarting its processes.
+                let runtime = Arc::new(McpRuntimeSnapshot::new(
+                    Arc::new(current.config().clone()),
+                    mcp_projection.plugins_available,
+                    current.manager_arc(),
+                    current.runtime_context().clone(),
+                    available_environment_ids,
+                ));
+                self.services
+                    .publish_mcp_runtime_snapshot(Arc::clone(&runtime));
+                return runtime;
+            }
+        } else {
+            return self.services.latest_mcp_runtime();
         }
         self.refresh_mcp_servers_inner(
+            ticket,
             turn_context,
             mcp_projection,
             environments,
@@ -325,6 +330,7 @@ impl Session {
 
     async fn refresh_mcp_servers_inner(
         &self,
+        ticket: crate::state::McpProjectionTicket,
         turn_context: &TurnContext,
         mcp_projection: McpRuntimeProjection,
         environments: &TurnEnvironmentSnapshot,
@@ -359,14 +365,9 @@ impl Session {
             &mcp_runtime_context,
         )
         .await;
-        let mcp_startup_cancellation_token = {
-            let mut guard = self.services.mcp_startup_cancellation_token.lock().await;
-            // The previous runtime owns the old token and may still be serving an in-flight step.
-            // Its manager cancels that token when the last runtime handle is dropped.
-            let cancellation_token = CancellationToken::new();
-            *guard = cancellation_token.clone();
-            cancellation_token
-        };
+        // Candidate construction owns a fresh token privately. A stale candidate must not replace
+        // the token associated with the published runtime.
+        let mcp_startup_cancellation_token = CancellationToken::new();
         let current_runtime = self.services.latest_mcp_runtime();
         let codex_apps_auth_manager =
             codex_mcp::host_owned_codex_apps_enabled(&mcp_config, auth.as_ref())
@@ -379,7 +380,7 @@ impl Session {
             &turn_context.approval_policy,
             turn_context.sub_id.clone(),
             self.get_tx_event(),
-            mcp_startup_cancellation_token,
+            mcp_startup_cancellation_token.clone(),
             turn_context.permission_profile(),
             mcp_runtime_context.clone(),
             mcp_config.codex_home.clone(),
@@ -398,8 +399,23 @@ impl Session {
             current_runtime.manager().elicitation_router(),
         )
         .await;
-        refreshed_manager
-            .set_elicitations_auto_deny(current_runtime.manager().elicitations_auto_deny());
+        let Some(_guard) = self.services.mcp_projection.lock_if_current(ticket).await else {
+            return self.services.latest_mcp_runtime();
+        };
+        let current_runtime = self.services.latest_mcp_runtime();
+        refreshed_manager.set_elicitations_auto_deny(
+            current_runtime.manager().elicitations_auto_deny(),
+        );
+        {
+            let mut startup_token = self
+                .services
+                .mcp_startup_cancellation_token
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The previous runtime owns the old token and may still be serving an in-flight step.
+            // Its manager cancels that token when the last runtime handle is dropped.
+            *startup_token = mcp_startup_cancellation_token;
+        }
         self.services.publish_mcp_runtime(
             mcp_config,
             plugins_available,
@@ -409,10 +425,6 @@ impl Session {
         )
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "MCP runtime refresh and publication must remain serialized"
-    )]
     pub(crate) async fn refresh_mcp_servers_if_requested(
         &self,
         turn_context: &TurnContext,
@@ -469,7 +481,7 @@ impl Session {
             return;
         }
 
-        let _guard = self.services.mcp_projection_lock.lock().await;
+        let ticket = self.services.mcp_projection.begin();
         let available_environment_ids = self
             .services
             .latest_mcp_runtime()
@@ -491,6 +503,7 @@ impl Session {
             .mcp_server_catalog
             .with_materialized_servers(mcp_servers);
         self.refresh_mcp_servers_inner(
+            ticket,
             turn_context,
             mcp_projection,
             &turn_context.environments,
@@ -528,17 +541,13 @@ impl Session {
         Ok(())
     }
 
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "MCP runtime refresh and publication must remain serialized"
-    )]
     pub(crate) async fn refresh_mcp_servers_now(
         &self,
         turn_context: &TurnContext,
         refresh_config: &Config,
         elicitation_reviewer: Option<ElicitationReviewerHandle>,
     ) {
-        let _guard = self.services.mcp_projection_lock.lock().await;
+        let ticket = self.services.mcp_projection.begin();
         let available_environment_ids = self
             .services
             .latest_mcp_runtime()
@@ -556,6 +565,7 @@ impl Session {
             )
             .await;
         self.refresh_mcp_servers_inner(
+            ticket,
             turn_context,
             mcp_projection,
             &turn_context.environments,
@@ -584,7 +594,7 @@ impl Session {
         self.services
             .mcp_startup_cancellation_token
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -592,7 +602,7 @@ impl Session {
         self.services
             .mcp_startup_cancellation_token
             .lock()
-            .await
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cancel();
     }
 }

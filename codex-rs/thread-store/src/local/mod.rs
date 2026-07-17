@@ -408,9 +408,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_append_items_does_not_update_sqlite_metadata() {
-        // This pins the ThreadStore contract: raw appends are history-only. Callers that need
-        // metadata updates must use LiveThread or call update_thread_metadata explicitly.
+    async fn create_thread_indexes_sqlite_while_raw_appends_remain_history_only() {
+        // Current-thread discovery is direct and does not depend on historical backfill. Raw
+        // appends remain history-only; LiveThread still owns append-derived metadata updates.
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
@@ -426,6 +426,17 @@ mod tests {
             .create_thread(create_thread_params(thread_id))
             .await
             .expect("create live thread");
+        let rollout_path = store
+            .live_rollout_path(thread_id)
+            .await
+            .expect("live rollout path");
+        let created = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("sqlite metadata read")
+            .expect("current thread should be indexed directly");
+        assert_eq!(created.rollout_path, rollout_path);
+        assert_eq!(created.model_provider, "test-provider");
         store
             .append_items(AppendThreadItemsParams {
                 thread_id,
@@ -435,13 +446,12 @@ mod tests {
             .expect("append raw item");
         store.flush_thread(thread_id).await.expect("flush thread");
 
-        assert_eq!(
-            runtime
-                .get_thread(thread_id)
-                .await
-                .expect("sqlite metadata read"),
-            None
-        );
+        let after_raw_append = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("sqlite metadata read")
+            .expect("current thread metadata");
+        assert_eq!(after_raw_append.preview, None);
     }
 
     #[tokio::test]
@@ -888,7 +898,19 @@ mod tests {
             .await
             .expect("shutdown initial writer");
 
-        let resumed_store = LocalThreadStore::new(config, /*state_db*/ None);
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        assert_eq!(
+            codex_rollout::state_db::readiness(runtime.as_ref())
+                .await
+                .expect("state db readiness"),
+            codex_rollout::state_db::StateDbReadiness::WriteReady
+        );
+        let resumed_store = LocalThreadStore::new(config, Some(runtime.clone()));
         resumed_store
             .resume_thread(ResumeThreadParams {
                 thread_id,
@@ -899,6 +921,12 @@ mod tests {
             })
             .await
             .expect("resume live thread");
+        let resumed_metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("sqlite metadata read")
+            .expect("resumed thread should be indexed directly");
+        assert_eq!(resumed_metadata.rollout_path, rollout_path);
         resumed_store
             .append_items(AppendThreadItemsParams {
                 thread_id,

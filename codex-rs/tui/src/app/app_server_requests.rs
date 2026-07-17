@@ -67,7 +67,7 @@ pub(crate) enum ResolvedAppServerRequest {
     },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct PendingAppServerRequests {
     exec_approvals: HashMap<String, AppServerRequestId>,
     file_change_approvals: HashMap<String, AppServerRequestId>,
@@ -174,6 +174,20 @@ impl PendingAppServerRequests {
                 })
             }
         }
+    }
+
+    pub(super) fn resolution<T>(
+        &self,
+        op: T,
+    ) -> Result<Option<AppServerRequestResolution>, String>
+    where
+        T: Into<AppCommand>,
+    {
+        // Resolution construction is intentionally non-destructive. The TUI
+        // commits the removal only after the bounded client queue accepts the
+        // reply, so a saturated or closed transport cannot orphan an approval.
+        let mut snapshot = self.clone();
+        snapshot.take_resolution(op)
     }
 
     pub(super) fn take_resolution<T>(
@@ -401,7 +415,7 @@ impl PendingAppServerRequests {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PendingUserInputRequest {
     item_id: String,
     request_id: AppServerRequestId,

@@ -84,7 +84,7 @@ fn append_repair_terminates_nonempty_rollout_tail() -> std::io::Result<()> {
 }
 
 #[tokio::test]
-async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
+async fn state_db_init_backfills_existing_rollouts_in_background() -> anyhow::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let uuid = Uuid::new_v4();
     let thread_id = ThreadId::from_string(&uuid.to_string())?;
@@ -150,15 +150,30 @@ async fn state_db_init_backfills_before_returning() -> anyhow::Result<()> {
         .await
         .expect("state db should initialize");
 
-    let metadata = runtime
-        .get_thread(thread_id)
-        .await?
-        .expect("thread should be backfilled before init returns");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let metadata = loop {
+        if let Some(metadata) = runtime.get_thread(thread_id).await? {
+            break metadata;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "background backfill did not index existing rollout"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    };
     assert_eq!(metadata.rollout_path, rollout_path);
-    assert_eq!(
-        runtime.get_backfill_state().await?.status,
-        codex_state::BackfillStatus::Complete
-    );
+    loop {
+        if crate::state_db::readiness(runtime.as_ref()).await?
+            == crate::state_db::StateDbReadiness::HistoricalIndexComplete
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "background backfill did not mark the historical index complete"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 
     Ok(())
 }

@@ -19,6 +19,7 @@ use crate::guardian::GuardianRejection;
 use crate::guardian::GuardianRejectionCircuitBreaker;
 use crate::mcp::McpManager;
 use crate::session::McpRuntimeSnapshot;
+use super::mcp_projection::McpProjectionCoordinator;
 use crate::task_evidence::TaskEvidenceLedger;
 use crate::tools::code_mode::CodeModeService;
 use crate::tools::command_execution::CommandExecutionLedger;
@@ -59,9 +60,9 @@ pub(crate) struct SessionServices {
     /// Aggregate generation for model-visible planning state. Every invalidating
     /// publication must advance this value before a pending turn may replan.
     pub(crate) planning_generation: AtomicU64,
-    /// Serializes environment-driven runtime rebuilds.
-    pub(crate) mcp_projection_lock: Mutex<()>,
-    pub(crate) mcp_startup_cancellation_token: Mutex<CancellationToken>,
+    /// Keeps candidate construction off-lock and admits only the newest runtime publication.
+    pub(crate) mcp_projection: McpProjectionCoordinator,
+    pub(crate) mcp_startup_cancellation_token: std::sync::Mutex<CancellationToken>,
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
     pub(crate) command_execution: CommandExecutionLedger,
     pub(crate) task_evidence: TaskEvidenceLedger,
@@ -155,6 +156,11 @@ impl SessionServices {
         self.mcp_runtime.store(Some(Arc::clone(&runtime)));
         self.bump_planning_generation();
         runtime
+    }
+
+    pub(crate) fn publish_mcp_runtime_snapshot(&self, runtime: Arc<McpRuntimeSnapshot>) {
+        self.mcp_runtime.store(Some(runtime));
+        self.bump_planning_generation();
     }
 
     pub(crate) fn planning_generation(&self) -> u64 {

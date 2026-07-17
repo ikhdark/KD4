@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Seek;
@@ -8,18 +11,22 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::LazyLock;
-use std::sync::Mutex;
+use std::sync::Weak;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionMetaLine;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::io::AsyncBufReadExt;
+use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 const SESSION_INDEX_FILE: &str = "session_index.jsonl";
 const READ_CHUNK_SIZE: usize = 8192;
-static SESSION_INDEX_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+type SessionIndexLock = RwLock<()>;
+static SESSION_INDEX_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<SessionIndexLock>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionIndexEntry {
@@ -55,19 +62,29 @@ pub async fn append_session_index_entry(
     codex_home: &Path,
     entry: &SessionIndexEntry,
 ) -> std::io::Result<()> {
-    let _guard = SESSION_INDEX_LOCK
-        .lock()
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
-    let path = session_index_path(codex_home);
-    let mut file = std::fs::OpenOptions::new()
+    let path = canonical_session_index_path(codex_home).await?;
+    let guard = session_index_lock(&path).await.write_owned().await;
+    let entry = entry.clone();
+    run_blocking_io(move || {
+        let _guard = guard;
+        append_session_index_entry_blocking(&path, &entry)
+    })
+    .await
+}
+
+fn append_session_index_entry_blocking(
+    path: &Path,
+    entry: &SessionIndexEntry,
+) -> std::io::Result<()> {
+    let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&path)?;
+        .open(path)?;
     let mut line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
     line.push('\n');
     file.write_all(line.as_bytes())?;
     file.flush()?;
-    Ok(())
+    file.sync_data()
 }
 
 /// Remove all recorded names for a thread from the session index.
@@ -75,11 +92,20 @@ pub async fn remove_thread_name_entries(
     codex_home: &Path,
     thread_id: ThreadId,
 ) -> std::io::Result<()> {
-    let _guard = SESSION_INDEX_LOCK
-        .lock()
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
-    let path = session_index_path(codex_home);
-    let contents = match std::fs::read_to_string(&path) {
+    let path = canonical_session_index_path(codex_home).await?;
+    let guard = session_index_lock(&path).await.write_owned().await;
+    run_blocking_io(move || {
+        let _guard = guard;
+        remove_thread_name_entries_blocking(&path, thread_id)
+    })
+    .await
+}
+
+fn remove_thread_name_entries_blocking(
+    path: &Path,
+    thread_id: ThreadId,
+) -> std::io::Result<()> {
+    let contents = match std::fs::read_to_string(path) {
         Ok(contents) => contents,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
@@ -100,8 +126,22 @@ pub async fn remove_thread_name_entries(
         return Ok(());
     }
     let temp_path = path.with_extension("jsonl.tmp");
-    std::fs::write(&temp_path, remaining)?;
-    std::fs::rename(temp_path, path)
+    let mut temp_file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temp_path)?;
+    temp_file.write_all(remaining.as_bytes())?;
+    temp_file.flush()?;
+    temp_file.sync_all()?;
+    drop(temp_file);
+    std::fs::rename(temp_path, path)?;
+    #[cfg(unix)]
+    File::open(path.parent().ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidInput, "session index path has no parent")
+    })?)?
+    .sync_all()?;
+    Ok(())
 }
 
 /// Find the latest thread name for a thread id, if any.
@@ -109,14 +149,17 @@ pub async fn find_thread_name_by_id(
     codex_home: &Path,
     thread_id: &ThreadId,
 ) -> std::io::Result<Option<String>> {
-    let path = session_index_path(codex_home);
-    if !path.exists() {
-        return Ok(None);
-    }
+    let path = canonical_session_index_path(codex_home).await?;
+    let guard = session_index_lock(&path).await.read_owned().await;
     let id = *thread_id;
-    let entry = tokio::task::spawn_blocking(move || scan_index_from_end_by_id(&path, &id))
-        .await
-        .map_err(std::io::Error::other)??;
+    let entry = run_blocking_io(move || {
+        let _guard = guard;
+        match scan_index_from_end_by_id(&path, &id) {
+            Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+            result => result,
+        }
+    })
+    .await?;
     Ok(entry.map(|entry| entry.thread_name))
 }
 
@@ -125,31 +168,17 @@ pub async fn find_thread_names_by_ids(
     codex_home: &Path,
     thread_ids: &HashSet<ThreadId>,
 ) -> std::io::Result<HashMap<ThreadId, String>> {
-    let path = session_index_path(codex_home);
-    if thread_ids.is_empty() || !path.exists() {
+    if thread_ids.is_empty() {
         return Ok(HashMap::new());
     }
-
-    let file = tokio::fs::File::open(&path).await?;
-    let reader = tokio::io::BufReader::new(file);
-    let mut lines = reader.lines();
-    let mut names = HashMap::with_capacity(thread_ids.len());
-
-    while let Some(line) = lines.next_line().await? {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(trimmed) else {
-            continue;
-        };
-        let name = entry.thread_name.trim();
-        if !name.is_empty() && thread_ids.contains(&entry.id) {
-            names.insert(entry.id, name.to_string());
-        }
-    }
-
-    Ok(names)
+    let path = canonical_session_index_path(codex_home).await?;
+    let guard = session_index_lock(&path).await.read_owned().await;
+    let thread_ids = thread_ids.clone();
+    run_blocking_io(move || {
+        let _guard = guard;
+        find_thread_names_by_ids_blocking(&path, &thread_ids)
+    })
+    .await
 }
 
 /// Locate a recorded thread rollout and read its session metadata by thread name.
@@ -162,16 +191,16 @@ pub async fn find_thread_meta_by_name_str(
     if name.trim().is_empty() {
         return Ok(None);
     }
-    let path = session_index_path(codex_home);
-    if !path.exists() {
-        return Ok(None);
-    }
+    let path = canonical_session_index_path(codex_home).await?;
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     let name = name.to_string();
     // Stream matching ids newest-first instead of stopping at the first name hit: the newest entry
     // may point at a thread whose rollout was never materialized.
-    let scan =
-        tokio::task::spawn_blocking(move || stream_thread_ids_from_end_by_name(&path, &name, tx));
+    let guard = session_index_lock(&path).await.read_owned().await;
+    let scan = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        stream_thread_ids_from_end_by_name(&path, &name, tx)
+    });
 
     while let Some(thread_id) = rx.recv().await {
         // Keep walking until a matching id resolves to a loadable rollout so an unsaved or partial
@@ -198,6 +227,76 @@ fn session_index_path(codex_home: &Path) -> PathBuf {
     codex_home.join(SESSION_INDEX_FILE)
 }
 
+async fn canonical_session_index_path(codex_home: &Path) -> std::io::Result<PathBuf> {
+    let path = session_index_path(codex_home);
+    run_blocking_io(move || canonicalize_session_index_path(&path)).await
+}
+
+fn canonicalize_session_index_path(path: &Path) -> std::io::Result<PathBuf> {
+    match std::fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| {
+                std::io::Error::new(ErrorKind::InvalidInput, "session index path has no parent")
+            })?;
+            let file_name = path.file_name().ok_or_else(|| {
+                std::io::Error::new(ErrorKind::InvalidInput, "session index path has no file name")
+            })?;
+            Ok(std::fs::canonicalize(parent)?.join(file_name))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn session_index_lock(path: &Path) -> Arc<SessionIndexLock> {
+    let mut locks = SESSION_INDEX_LOCKS.lock().await;
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+
+    let lock = Arc::new(RwLock::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+async fn run_blocking_io<T, F>(operation: F) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> std::io::Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(operation)
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+fn find_thread_names_by_ids_blocking(
+    path: &Path,
+    thread_ids: &HashSet<ThreadId>,
+) -> std::io::Result<HashMap<ThreadId, String>> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(err) => return Err(err),
+    };
+    let mut names = HashMap::with_capacity(thread_ids.len());
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<SessionIndexEntry>(trimmed) else {
+            continue;
+        };
+        let name = entry.thread_name.trim();
+        if !name.is_empty() && thread_ids.contains(&entry.id) {
+            names.insert(entry.id, name.to_string());
+        }
+    }
+    Ok(names)
+}
+
 fn scan_index_from_end_by_id(
     path: &Path,
     thread_id: &ThreadId,
@@ -211,7 +310,7 @@ fn stream_thread_ids_from_end_by_name(
     tx: tokio::sync::mpsc::Sender<ThreadId>,
 ) -> std::io::Result<()> {
     let mut seen = HashSet::new();
-    scan_index_from_end_for_each(path, |entry| {
+    match scan_index_from_end_for_each(path, |entry| {
         // The first row seen for an id is its latest name. Ignore older rows for that id so a
         // historical name cannot be treated as the current one after the thread is renamed.
         if seen.insert(entry.id) && entry.thread_name == name && tx.blocking_send(entry.id).is_err()
@@ -219,8 +318,11 @@ fn stream_thread_ids_from_end_by_name(
             return Ok(Some(entry.clone()));
         }
         Ok(None)
-    })?;
-    Ok(())
+    }) {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
 }
 
 fn scan_index_from_end<F>(

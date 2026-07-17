@@ -7,6 +7,8 @@ use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
+use crate::tools::registry::ToolCallAdmission;
+use crate::tools::registry::ToolConflictKey;
 use crate::tools::registry::ToolExecutor;
 use crate::unified_exec::WriteStdinRequest;
 use codex_protocol::protocol::EventMsg;
@@ -130,6 +132,20 @@ impl WriteStdinHandler {
 }
 
 impl CoreToolRuntime for WriteStdinHandler {
+    fn tool_call_admission(&self, payload: &ToolPayload) -> ToolCallAdmission {
+        let ToolPayload::Function { arguments } = payload else {
+            return ToolCallAdmission::Serialize(Vec::new());
+        };
+        serde_json::from_str::<WriteStdinArgs>(arguments).map_or_else(
+            |_| ToolCallAdmission::Serialize(Vec::new()),
+            |args| {
+                ToolCallAdmission::serialize(ToolConflictKey::Process(
+                    args.session_id.to_string(),
+                ))
+            },
+        )
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

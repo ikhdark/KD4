@@ -3,6 +3,7 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
+use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
@@ -686,30 +687,38 @@ async fn emit_patch_end(
         .await;
 
     if let Some(tracker) = ctx.turn_diff_tracker {
-        let (should_emit_turn_diff, unified_diff) = {
-            let mut guard = tracker.lock().await;
-            let had_unified_diff = guard.has_unified_diff();
-            let tracker_changed = match tracker_update {
-                TurnDiffTrackerUpdate::Track {
-                    environment_id,
-                    delta,
-                } => {
-                    guard.track_delta(environment_id.as_deref().unwrap_or_default(), delta);
-                    true
-                }
-                TurnDiffTrackerUpdate::Invalidate => {
-                    guard.record_unknown_mutation();
-                    true
-                }
-                TurnDiffTrackerUpdate::None => false,
-            };
-            let unified_diff = guard.get_unified_diff();
-            (
-                tracker_changed && (had_unified_diff || unified_diff.is_some()),
-                unified_diff.unwrap_or_default(),
-            )
+        let completed_update = match tracker_update {
+            TurnDiffTrackerUpdate::Track {
+                environment_id,
+                delta,
+            } => {
+                TurnDiffTracker::track_delta_async(
+                    std::sync::Arc::clone(tracker),
+                    environment_id.unwrap_or_default(),
+                    delta.clone(),
+                )
+                .await
+            }
+            TurnDiffTrackerUpdate::Invalidate => {
+                let mut guard = tracker.lock().await;
+                let had_unified_diff = guard.has_unified_diff();
+                guard.record_unknown_mutation();
+                Some(crate::turn_diff_tracker::CompletedTurnDiffUpdate {
+                    had_unified_diff,
+                    unified_diff: None,
+                })
+            }
+            TurnDiffTrackerUpdate::None => None,
         };
-        if should_emit_turn_diff {
+
+        if let Some(completed_update) = completed_update
+            && (completed_update.had_unified_diff || completed_update.unified_diff.is_some())
+        {
+            let unified_diff = completed_update
+                .unified_diff
+                .as_deref()
+                .unwrap_or_default()
+                .to_owned();
             ctx.session
                 .send_event(ctx.turn, EventMsg::TurnDiff(TurnDiffEvent { unified_diff }))
                 .await;

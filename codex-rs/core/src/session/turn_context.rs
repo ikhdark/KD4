@@ -691,6 +691,11 @@ impl Session {
         multi_agent_runtime: TurnMultiAgentRuntime,
     ) -> Arc<TurnContext> {
         let turn_environments = self.services.turn_environments.snapshot().await;
+        let git_workspace_snapshot = self
+            .services
+            .turn_environments
+            .git_workspace_snapshot(&turn_environments)
+            .await;
         let primary_turn_environment = turn_environments.primary().cloned();
         // TODO(anp): Migrate per-turn config and legacy TurnContext cwd consumers to PathUri so
         // a foreign primary environment does not fall back to the session's host cwd.
@@ -777,6 +782,9 @@ impl Session {
             sub_id,
             skills_snapshot,
         );
+        turn_context
+            .turn_metadata_state
+            .set_git_workspace_source(git_workspace_snapshot.primary_local_metadata_source());
         turn_context.realtime_active = self.conversation.running_state().await.is_some();
 
         if let Some(final_schema) = final_output_json_schema {

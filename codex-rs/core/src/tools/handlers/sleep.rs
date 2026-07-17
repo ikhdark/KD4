@@ -67,6 +67,10 @@ impl ToolExecutor<ToolInvocation> for SleepHandler {
         create_sleep_tool()
     }
 
+    fn supports_parallel_tool_calls(&self) -> bool {
+        true
+    }
+
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(async move {
             let ToolInvocation {

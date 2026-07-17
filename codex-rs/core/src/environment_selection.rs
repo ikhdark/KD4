@@ -15,6 +15,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
 
+use crate::git_workspace::GitWorkspaceCache;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
 use crate::shell_snapshot::ShellSnapshot;
@@ -69,7 +70,13 @@ pub(crate) struct ThreadEnvironments {
     local_shell: Shell,
     shell_snapshot: ShellSnapshot,
     non_blocking_snapshots: bool,
-    environments: ArcSwap<Vec<SelectedTurnEnvironment>>,
+    environments: ArcSwap<SelectedTurnEnvironments>,
+    git_workspace_cache: Arc<GitWorkspaceCache>,
+}
+
+struct SelectedTurnEnvironments {
+    generation: u64,
+    environments: Vec<SelectedTurnEnvironment>,
 }
 
 impl ThreadEnvironments {
@@ -99,7 +106,11 @@ impl ThreadEnvironments {
             local_shell,
             shell_snapshot,
             non_blocking_snapshots,
-            environments: ArcSwap::from_pointee(environments),
+            environments: ArcSwap::from_pointee(SelectedTurnEnvironments {
+                generation: current.generation,
+                environments,
+            }),
+            git_workspace_cache: GitWorkspaceCache::new(),
         }
     }
 
@@ -107,11 +118,13 @@ impl ThreadEnvironments {
         let previous = self.environments.load();
         let mut seen_environment_ids = HashSet::with_capacity(environments.len());
         let mut next = Vec::with_capacity(environments.len());
+        let mut replaced_resolution = false;
         for selected_environment in environments {
             if !seen_environment_ids.insert(selected_environment.environment_id.as_str()) {
                 continue;
             }
             if let Some(environment) = previous
+                .environments
                 .iter()
                 .find(|environment| environment.selection == *selected_environment)
                 && !matches!(environment.resolution.clone().now_or_never(), Some(Err(_)))
@@ -134,12 +147,25 @@ impl ThreadEnvironments {
             .remote_handle();
             drop(tokio::spawn(resolution_task));
             let resolution = resolution.boxed().shared();
+            replaced_resolution = true;
             next.push(SelectedTurnEnvironment {
                 selection: selected_environment.clone(),
                 resolution,
             });
         }
-        self.environments.store(Arc::new(next));
+        let unchanged = !replaced_resolution
+            && previous.environments.len() == next.len()
+            && previous
+                .environments
+                .iter()
+                .zip(&next)
+                .all(|(previous, next)| previous.selection == next.selection);
+        if !unchanged {
+            self.environments.store(Arc::new(SelectedTurnEnvironments {
+                generation: previous.generation.saturating_add(1),
+                environments: next,
+            }));
+        }
     }
 
     fn resolve_environment(
@@ -190,9 +216,9 @@ impl ThreadEnvironments {
 
     pub(crate) async fn snapshot(&self) -> TurnEnvironmentSnapshot {
         let current = self.environments.load_full();
-        let mut turn_environments = Vec::with_capacity(current.len());
+        let mut turn_environments = Vec::with_capacity(current.environments.len());
         let mut starting = Vec::new();
-        for environment in current.iter() {
+        for environment in &current.environments {
             let resolved = if self.non_blocking_snapshots {
                 environment.resolution.clone().now_or_never()
             } else {
@@ -211,6 +237,7 @@ impl ThreadEnvironments {
             }
         }
         TurnEnvironmentSnapshot {
+            generation: current.generation,
             turn_environments,
             starting,
         }
@@ -219,10 +246,18 @@ impl ThreadEnvironments {
     pub(crate) fn environment_manager(&self) -> Arc<EnvironmentManager> {
         Arc::clone(&self.environment_manager)
     }
+
+    pub(crate) async fn git_workspace_snapshot(
+        &self,
+        environments: &TurnEnvironmentSnapshot,
+    ) -> crate::git_workspace::GitWorkspaceSnapshot {
+        self.git_workspace_cache.snapshot(environments).await
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TurnEnvironmentSnapshot {
+    pub(crate) generation: u64,
     pub(crate) turn_environments: Vec<TurnEnvironment>,
     pub(crate) starting: Vec<StartingTurnEnvironment>,
 }
@@ -715,7 +750,9 @@ url = "ws://127.0.0.1:8765"
             /*non_blocking_snapshots*/ true,
         );
         environments.update_selections(std::slice::from_ref(&selection));
-        let failed_resolution = environments.environments.load()[0].resolution.clone();
+        let failed_resolution = environments.environments.load().environments[0]
+            .resolution
+            .clone();
         assert!(failed_resolution.clone().await.is_err());
 
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -837,6 +874,7 @@ url = "ws://127.0.0.1:8765"
             crate::shell::default_user_shell(),
             ShellSnapshot::disabled(),
             TurnEnvironmentSnapshot {
+                generation: 0,
                 turn_environments: vec![inherited],
                 starting: Vec::new(),
             },
@@ -874,6 +912,7 @@ url = "ws://127.0.0.1:8765"
                 .expect("remote environment"),
         );
         let remote = TurnEnvironmentSnapshot {
+            generation: 0,
             turn_environments: vec![TurnEnvironment::new(
                 REMOTE_ENVIRONMENT_ID.to_string(),
                 remote_environment.clone(),
@@ -883,6 +922,7 @@ url = "ws://127.0.0.1:8765"
             starting: Vec::new(),
         };
         let multiple = TurnEnvironmentSnapshot {
+            generation: 0,
             turn_environments: vec![
                 local.primary().expect("local environment").clone(),
                 TurnEnvironment::new(

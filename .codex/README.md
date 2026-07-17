@@ -9,6 +9,7 @@ default.
 | Need | Authoritative file |
 | --- | --- |
 | Edit anything under `.codex` | [`AGENTS.md`](AGENTS.md) |
+| Configure KD4 subagent roles, limits, and reasoning | [`config.toml`](config.toml) and [`agents/`](agents/) |
 | Prepare ignored files for a Codex worktree | [`environments/README.md`](environments/README.md) |
 | Preserve task context, evidence, an eval, audit, or handoff | [`skills/kd4-harness/SKILL.md`](skills/kd4-harness/SKILL.md) |
 | Implement or change KD4 repository behavior | [`../AGENTS.md`](../AGENTS.md) |
@@ -21,11 +22,12 @@ load. Routine work does not need a run directory.
 
 ## Source And State Boundary
 
-Durable policy, environment source, and fork-local skills are reviewable source.
+Durable policy, agent roles, environment source, and fork-local skills are
+reviewable source.
 Generated runs, verification output, app backups, patched-app trees, and Wiring
 Guard sessions are local state; the exact boundary is owned by
 [`AGENTS.md`](AGENTS.md).
 
-Project-local runtime configuration may be added as `.codex/config.toml` only
-when this checkout needs an explicit setting. Its absence is intentional and is
-not a missing setup step.
+Project-local runtime configuration lives in `.codex/config.toml`. Project
+subagent definitions live in `.codex/agents/` and inherit the parent model and
+permission mode unless their agent file overrides a supported setting.

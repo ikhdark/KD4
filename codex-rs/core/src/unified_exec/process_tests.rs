@@ -1,6 +1,12 @@
 use super::process::UnifiedExecProcess;
 use super::process::merge_recovery_gap;
 use super::process::recovery_incomplete_detail;
+use super::head_tail_buffer::HeadTailBuffer;
+use super::process::OutputHandles;
+use crate::tools::command_output_artifact::RawOutputArtifact;
+use crate::tools::command_output_artifact::RawOutputArtifactWritePositions;
+use crate::tools::command_output_artifact::RawOutputArtifactWriteQueue;
+use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::unified_exec::UnifiedExecError;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEventReceiver;
@@ -17,9 +23,16 @@ use pretty_assertions::assert_eq;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::sync::Notify;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 struct MockExecProcess {
     process_id: ProcessId,
@@ -359,6 +372,104 @@ async fn remote_terminate_confirmed_updates_state_on_success_only() {
         .expect("terminate should succeed");
 
     assert!(process.has_exited());
+}
+
+#[tokio::test]
+async fn slow_artifact_writer_does_not_delay_local_output_drain() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let artifact = create_raw_output_artifact(temp.path(), "thread", b"").await;
+    let RawOutputArtifact::Stored { path, .. } = &artifact else {
+        panic!("expected stored artifact");
+    };
+    let path = path.clone();
+    let artifact_state = Arc::new(Mutex::new(artifact));
+    let io_gate = Arc::new(Semaphore::new(0));
+    let artifact_queue = RawOutputArtifactWriteQueue::spawn_with_io_gate(
+        Some(Arc::clone(&artifact_state)),
+        Arc::clone(&io_gate),
+    )
+    .expect("artifact queue");
+    let artifact_observer = artifact_queue.observer();
+
+    let output_buffer = Arc::new(Mutex::new(HeadTailBuffer::new(64 * 1024)));
+    let output_notify = Arc::new(Notify::new());
+    let output_closed = Arc::new(AtomicBool::new(false));
+    let output_closed_notify = Arc::new(Notify::new());
+    let output_handles = OutputHandles {
+        output_buffer: Arc::clone(&output_buffer),
+        output_notify,
+        output_closed: Arc::clone(&output_closed),
+        output_closed_notify: Arc::clone(&output_closed_notify),
+        cancellation_token: CancellationToken::new(),
+        recovery_evidence: Arc::new(std::sync::Mutex::new(Default::default())),
+    };
+    let (output_tx, mut output_rx) = broadcast::channel(64);
+    let (stdout_tx, stdout_rx) = mpsc::channel(1);
+    let (stderr_tx, stderr_rx) = mpsc::channel(1);
+    drop(stderr_tx);
+    let output_task = UnifiedExecProcess::spawn_local_output_task_with_artifact_queue(
+        stdout_rx,
+        stderr_rx,
+        output_handles,
+        output_tx,
+        Some(artifact_queue),
+    );
+
+    stdout_tx.send(b"first\n".to_vec()).await.expect("send first");
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), output_rx.recv())
+            .await
+            .expect("first published output should not wait for artifact I/O")
+            .expect("published output"),
+        b"first\n"
+    );
+
+    let mut expected = b"first\n".to_vec();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        for index in 0..32 {
+            let chunk = format!("chunk-{index:02}\n").into_bytes();
+            expected.extend_from_slice(&chunk);
+            stdout_tx.send(chunk).await.expect("send chunk");
+        }
+        drop(stdout_tx);
+        loop {
+            let notified = output_closed_notify.notified();
+            if output_closed.load(Ordering::Acquire) {
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .expect("process output should drain while artifact I/O is blocked");
+
+    assert_eq!(output_buffer.lock().await.to_bytes(), expected);
+    assert_eq!(
+        artifact_observer.positions(),
+        RawOutputArtifactWritePositions {
+            observed: expected.len() as u64,
+            queued: expected.len() as u64,
+            committed: 0,
+            finalized: 0,
+        }
+    );
+
+    io_gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), output_task)
+        .await
+        .expect("artifact writer should finalize")
+        .expect("output task should complete");
+    artifact_observer.wait_until_done().await;
+    assert_eq!(
+        artifact_observer.positions(),
+        RawOutputArtifactWritePositions {
+            observed: expected.len() as u64,
+            queued: expected.len() as u64,
+            committed: expected.len() as u64,
+            finalized: expected.len() as u64,
+        }
+    );
+    assert_eq!(tokio::fs::read(path).await.expect("read artifact"), expected);
 }
 
 #[test]

@@ -5480,8 +5480,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         mcp_connection_manager: Arc::new(arc_swap::ArcSwap::from(mcp_runtime.manager_arc())),
         mcp_runtime: arc_swap::ArcSwapOption::from(Some(mcp_runtime)),
         planning_generation: std::sync::atomic::AtomicU64::new(1),
-        mcp_projection_lock: Mutex::new(()),
-        mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
+        mcp_projection: crate::state::McpProjectionCoordinator::new(),
+        mcp_startup_cancellation_token: std::sync::Mutex::new(CancellationToken::new()),
         unified_exec_manager: UnifiedExecProcessManager::new(
             config.background_terminal_max_timeout,
         ),
@@ -7619,8 +7619,8 @@ where
         mcp_connection_manager: Arc::new(arc_swap::ArcSwap::from(mcp_runtime.manager_arc())),
         mcp_runtime: arc_swap::ArcSwapOption::from(Some(mcp_runtime)),
         planning_generation: std::sync::atomic::AtomicU64::new(1),
-        mcp_projection_lock: Mutex::new(()),
-        mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
+        mcp_projection: crate::state::McpProjectionCoordinator::new(),
+        mcp_startup_cancellation_token: std::sync::Mutex::new(CancellationToken::new()),
         unified_exec_manager: UnifiedExecProcessManager::new(
             config.background_terminal_max_timeout,
         ),

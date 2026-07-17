@@ -2,6 +2,16 @@ use super::*;
 use crate::session::step_context::StepContext;
 use pretty_assertions::assert_eq;
 
+fn shared_function_call(call_id: &str) -> SharedToolCall {
+    SharedToolCall::new(crate::tools::router::ToolCall {
+        tool_name: codex_tools::ToolName::plain("test_tool"),
+        call_id: call_id.to_string(),
+        payload: ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
+    })
+}
+
 struct TestHandler {
     tool_name: codex_tools::ToolName,
 }
@@ -378,10 +388,7 @@ async fn write_stdin_does_not_expose_default_pre_tool_use_payload() {
 #[test]
 fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
     let mut result = AnyToolResult {
-        call_id: "call-1".to_string(),
-        payload: ToolPayload::Function {
-            arguments: "{}".to_string(),
-        },
+        call: shared_function_call("call-1"),
         result: Box::new(PostToolUseFeedbackOutput {
             original: Box::new(codex_tools::JsonToolOutput::new(
                 serde_json::json!({ "typed": true }),
@@ -406,10 +413,7 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
     );
 
     let mut result = AnyToolResult {
-        call_id: "call-1".to_string(),
-        payload: ToolPayload::Function {
-            arguments: "{}".to_string(),
-        },
+        call: shared_function_call("call-1"),
         result: Box::new(PostToolUseFeedbackOutput {
             original: Box::new(codex_tools::JsonToolOutput::new(
                 serde_json::json!({ "typed": true }),
@@ -465,10 +469,7 @@ fn projected_tool_results_are_consumed_without_reprojection() {
     let direct_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let code_mode_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut direct = AnyToolResult {
-        call_id: "direct-call".to_string(),
-        payload: ToolPayload::Function {
-            arguments: "{}".to_string(),
-        },
+        call: shared_function_call("direct-call"),
         result: Box::new(ProjectionCountingOutput {
             direct_calls: Arc::clone(&direct_calls),
             code_mode_calls: Arc::clone(&code_mode_calls),
@@ -489,10 +490,7 @@ fn projected_tool_results_are_consumed_without_reprojection() {
     );
 
     let mut code_mode = AnyToolResult {
-        call_id: "code-call".to_string(),
-        payload: ToolPayload::Function {
-            arguments: "{}".to_string(),
-        },
+        call: shared_function_call("code-call"),
         result: Box::new(ProjectionCountingOutput {
             direct_calls: Arc::clone(&direct_calls),
             code_mode_calls: Arc::clone(&code_mode_calls),

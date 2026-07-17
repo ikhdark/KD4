@@ -16,6 +16,7 @@ Durable files include, when present:
 
 - `.codex/.gitignore`
 - `.codex/AGENTS.md`
+- `.codex/agents/**`
 - `.codex/config.toml`
 - `.codex/environments/README.md`
 - `.codex/environments/setup.py`

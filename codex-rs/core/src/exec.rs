@@ -19,7 +19,9 @@ use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
+use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::sandboxing::ExecOptions;
@@ -298,6 +300,44 @@ pub struct StdoutStream {
     pub sub_id: String,
     pub call_id: String,
     pub tx_event: Sender<Event>,
+}
+
+struct OutputEventDelivery {
+    tx: Option<mpsc::UnboundedSender<Event>>,
+    task: JoinHandle<()>,
+}
+
+impl OutputEventDelivery {
+    fn spawn(tx_event: Sender<Event>) -> Self {
+        // `read_output` already caps each call at
+        // `MAX_EXEC_OUTPUT_DELTAS_PER_CALL`, so this staging queue is bounded
+        // by that producer-side limit without making pipe draining wait for a
+        // saturated presentation channel.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                let _ = tx_event.send(event).await;
+            }
+        });
+        Self { tx: Some(tx), task }
+    }
+
+    fn enqueue(&self, event: Event) -> bool {
+        self.tx
+            .as_ref()
+            .is_some_and(|tx| tx.send(event).is_ok())
+    }
+
+    async fn finish(mut self) -> io::Result<()> {
+        self.tx.take();
+        (&mut self.task).await.map_err(io::Error::other)
+    }
+}
+
+impl Drop for OutputEventDelivery {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1185,6 +1225,9 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
     };
     let mut tmp = [0u8; READ_CHUNK_SIZE];
     let mut emitted_deltas: usize = 0;
+    let event_delivery = stream
+        .as_ref()
+        .map(|stream| OutputEventDelivery::spawn(stream.tx_event.clone()));
 
     loop {
         let n = reader.read(&mut tmp).await?;
@@ -1192,10 +1235,15 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
             break;
         }
 
+        let chunk = tmp[..n].to_vec();
+        retained_output.lock().await.push_chunk(chunk.clone());
+        if let Some(full_output) = full_output.as_mut() {
+            full_output.write_all(&chunk).await?;
+        }
+
         if let Some(stream) = &stream
             && emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
         {
-            let chunk = tmp[..n].to_vec();
             let msg = EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
                 call_id: stream.call_id.clone(),
                 stream: if is_stderr {
@@ -1209,16 +1257,18 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
                 id: stream.sub_id.clone(),
                 msg,
             };
-            #[allow(clippy::let_unit_value)]
-            let _ = stream.tx_event.send(event).await;
-            emitted_deltas += 1;
-        }
-
-        retained_output.lock().await.push_chunk(tmp[..n].to_vec());
-        if let Some(full_output) = full_output.as_mut() {
-            full_output.write_all(&tmp[..n]).await?;
+            if event_delivery
+                .as_ref()
+                .is_some_and(|event_delivery| event_delivery.enqueue(event))
+            {
+                emitted_deltas += 1;
+            }
         }
         // Continue reading to EOF to avoid back-pressure
+    }
+
+    if let Some(event_delivery) = event_delivery {
+        event_delivery.finish().await?;
     }
 
     let Some(mut full_output) = full_output else {

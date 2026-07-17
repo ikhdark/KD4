@@ -1,12 +1,17 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
+use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
+use tokio::sync::OwnedMutexGuard;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
 use tokio::task::JoinError;
-use tokio_util::either::Either;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
@@ -23,9 +28,12 @@ use crate::tools::context::ToolPayload;
 use crate::tools::lifecycle::notify_tool_aborted;
 use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
+use crate::tools::registry::ToolCallAdmission;
+use crate::tools::registry::ToolConflictKey;
 use crate::tools::router::ToolCall;
 use crate::tools::router::ToolCallSource;
 use crate::tools::router::ToolRouter;
+use crate::tools::router::SharedToolCall;
 use codex_protocol::error::CodexErr;
 use codex_protocol::models::ResponseInputItem;
 
@@ -38,6 +46,91 @@ struct ToolCallTimingGuard {
     tool_name: codex_tools::ToolName,
 }
 
+pub(crate) const MAX_IN_FLIGHT_TOOL_CALLS: usize = 32;
+
+struct ToolAdmissionController {
+    capacity: Arc<Semaphore>,
+    conflict_locks: StdMutex<HashMap<ToolConflictKey, Weak<Mutex<()>>>>,
+}
+
+struct ToolAdmissionGuard {
+    _capacity: OwnedSemaphorePermit,
+    _conflicts: Vec<OwnedMutexGuard<()>>,
+}
+
+impl ToolAdmissionController {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: Arc::new(Semaphore::new(capacity)),
+            conflict_locks: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    async fn admit(
+        &self,
+        admission: ToolCallAdmission,
+        call: &ToolCall,
+        source: &ToolCallSource,
+    ) -> ToolAdmissionGuard {
+        let ToolCallAdmission::Serialize(mut keys) = admission else {
+            let capacity = Arc::clone(&self.capacity)
+                .acquire_owned()
+                .await
+                .expect("tool admission capacity is never closed");
+            return ToolAdmissionGuard {
+                _capacity: capacity,
+                _conflicts: Vec::new(),
+            };
+        };
+
+        if let ToolCallSource::CodeMode { cell_id, .. } = source {
+            keys.push(ToolConflictKey::CodeCell(cell_id.clone()));
+        }
+        if keys.is_empty() {
+            keys.push(ToolConflictKey::Tool(call.tool_name.clone()));
+        }
+        keys.sort();
+        keys.dedup();
+
+        let locks = {
+            let mut conflict_locks = self
+                .conflict_locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            conflict_locks.retain(|_, lock| lock.strong_count() > 0);
+            keys.into_iter()
+                .map(|key| match conflict_locks.entry(key) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => entry
+                        .get()
+                        .upgrade()
+                        .unwrap_or_else(|| {
+                            let lock = Arc::new(Mutex::new(()));
+                            entry.insert(Arc::downgrade(&lock));
+                            lock
+                        }),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let lock = Arc::new(Mutex::new(()));
+                        entry.insert(Arc::downgrade(&lock));
+                        lock
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut conflicts = Vec::with_capacity(locks.len());
+        for lock in locks {
+            conflicts.push(lock.lock_owned().await);
+        }
+        let capacity = Arc::clone(&self.capacity)
+            .acquire_owned()
+            .await
+            .expect("tool admission capacity is never closed");
+        ToolAdmissionGuard {
+            _capacity: capacity,
+            _conflicts: conflicts,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ToolCallRuntime {
     router: Arc<ToolRouter>,
@@ -45,7 +138,7 @@ pub(crate) struct ToolCallRuntime {
     // Tool calls may run later, so retain the step whose tool list advertised them.
     step_context: Arc<StepContext>,
     tracker: SharedTurnDiffTracker,
-    parallel_execution: Arc<RwLock<()>>,
+    admission: Arc<ToolAdmissionController>,
 }
 
 impl ToolCallRuntime {
@@ -60,7 +153,7 @@ impl ToolCallRuntime {
             session,
             step_context,
             tracker,
-            parallel_execution: Arc::new(RwLock::new(())),
+            admission: Arc::new(ToolAdmissionController::new(MAX_IN_FLIGHT_TOOL_CALLS)),
         }
     }
 
@@ -77,14 +170,18 @@ impl ToolCallRuntime {
         call: ToolCall,
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<ResponseInputItem, CodexErr>> {
+        let call = SharedToolCall::new(call);
         let error_call = call.clone();
-        let future =
-            self.handle_tool_call_with_source(call, ToolCallSource::Direct, cancellation_token);
+        let future = self.handle_shared_tool_call_with_source(
+            call,
+            ToolCallSource::Direct,
+            cancellation_token,
+        );
         async move {
             match future.await {
                 Ok(response) => Ok(response.into_response()),
                 Err(FunctionCallError::Fatal(message)) => Err(CodexErr::Fatal(message)),
-                Err(other) => Ok(Self::failure_response(error_call, other)),
+                Err(other) => Ok(Self::failure_response(&error_call, other)),
             }
         }
         .in_current_span()
@@ -97,15 +194,29 @@ impl ToolCallRuntime {
         source: ToolCallSource,
         cancellation_token: CancellationToken,
     ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
-        let supports_parallel = self.router.tool_supports_parallel(&call);
+        self.handle_shared_tool_call_with_source(
+            SharedToolCall::new(call),
+            source,
+            cancellation_token,
+        )
+    }
+
+    fn handle_shared_tool_call_with_source(
+        self,
+        call: SharedToolCall,
+        source: ToolCallSource,
+        cancellation_token: CancellationToken,
+    ) -> impl std::future::Future<Output = Result<AnyToolResult, FunctionCallError>> {
+        let resolved = self.router.resolve_tool_call(&call);
+        let admission = resolved.admission.clone();
         let router = Arc::clone(&self.router);
         let session = Arc::clone(&self.session);
         let step_context = Arc::clone(&self.step_context);
         let turn = Arc::clone(&step_context.turn);
         let tracker = Arc::clone(&self.tracker);
-        let lock = Arc::clone(&self.parallel_execution);
+        let admission_controller = Arc::clone(&self.admission);
         let invocation_cancellation_token = cancellation_token.clone();
-        let wait_for_runtime_cancellation = self.router.tool_waits_for_runtime_cancellation(&call);
+        let wait_for_runtime_cancellation = resolved.waits_for_runtime_cancellation;
         let started = Instant::now();
         let tool_call_timing_guard =
             ToolCallTimingGuard::capture(started, &session.thread_id, &turn.sub_id, &call, &source);
@@ -134,28 +245,41 @@ impl ToolCallRuntime {
             let turn_tool_execution_guard = turn.turn_timing_state.begin_tool_execution();
             let _tool_call_timing_guard = tool_call_timing_guard;
             let _turn_tool_execution_guard = turn_tool_execution_guard;
+            let admission_guard = tokio::select! {
+                guard = admission_controller.admit(admission, &call, &source) => guard,
+                _ = cancellation_token.cancelled() => {
+                    let secs = started.elapsed().as_secs_f32().max(0.1);
+                    abort_dispatch_span.record("aborted", true);
+                    let response = Self::aborted_response(&call, secs);
+                    notify_tool_aborted(
+                        abort_session.as_ref(),
+                        abort_turn.as_ref(),
+                        call.call_id.as_str(),
+                        &call.tool_name,
+                        abort_source,
+                    )
+                    .await;
+                    return Ok(response);
+                }
+            };
+            // Bounded admission is complete before the dispatch task is spawned.
             let mut dispatch_handle: AbortOnDropHandle<
                 Result<AnyToolResult, FunctionCallError>,
             > = AbortOnDropHandle::new(tokio::spawn(async move {
-                let _guard = if supports_parallel {
-                    Either::Left(lock.read().await)
-                } else {
-                    Either::Right(lock.write().await)
-                };
-                // Admission through the parallel-execution gate marks the end
-                // of dispatch waiting and the start of handler execution.
+                let _admission_guard = admission_guard;
                 if let Some(execution_started_at) = execution_started_at {
                     let _ = execution_started_at.set(Instant::now());
                 }
 
                 router
-                    .dispatch_tool_call_with_terminal_outcome(
+                    .dispatch_resolved_tool_call_with_terminal_outcome(
                         session,
                         step_context,
                         invocation_cancellation_token,
                         tracker,
                         dispatch_call,
                         source,
+                        resolved,
                         dispatch_terminal_outcome_reached,
                     )
                     .instrument(dispatch_span.clone())
@@ -211,17 +335,17 @@ impl ToolCallRuntime {
         FunctionCallError::Fatal(format!("tool task failed to receive: {err:?}"))
     }
 
-    fn failure_response(call: ToolCall, err: FunctionCallError) -> ResponseInputItem {
+    fn failure_response(call: &SharedToolCall, err: FunctionCallError) -> ResponseInputItem {
         let message = err.to_string();
-        match call.payload {
+        match &call.payload {
             ToolPayload::ToolSearch { .. } => ResponseInputItem::ToolSearchOutput {
-                call_id: call.call_id,
+                call_id: call.call_id.clone(),
                 status: "completed".to_string(),
                 execution: "client".to_string(),
                 tools: Vec::new(),
             },
             ToolPayload::Custom { .. } => ResponseInputItem::CustomToolCallOutput {
-                call_id: call.call_id,
+                call_id: call.call_id.clone(),
                 name: None,
                 output: codex_protocol::models::FunctionCallOutputPayload {
                     body: codex_protocol::models::FunctionCallOutputBody::Text(message),
@@ -229,7 +353,7 @@ impl ToolCallRuntime {
                 },
             },
             _ => ResponseInputItem::FunctionCallOutput {
-                call_id: call.call_id,
+                call_id: call.call_id.clone(),
                 output: codex_protocol::models::FunctionCallOutputPayload {
                     body: codex_protocol::models::FunctionCallOutputBody::Text(message),
                     success: Some(false),
@@ -238,10 +362,9 @@ impl ToolCallRuntime {
         }
     }
 
-    fn aborted_response(call: &ToolCall, secs: f32) -> AnyToolResult {
+    fn aborted_response(call: &SharedToolCall, secs: f32) -> AnyToolResult {
         AnyToolResult {
-            call_id: call.call_id.clone(),
-            payload: call.payload.clone(),
+            call: call.clone(),
             result: Box::new(AbortedToolOutput {
                 message: Self::abort_message(call, secs),
             }),
@@ -249,7 +372,7 @@ impl ToolCallRuntime {
         }
     }
 
-    fn abort_message(call: &ToolCall, secs: f32) -> String {
+    fn abort_message(call: &SharedToolCall, secs: f32) -> String {
         if call.tool_name.namespace.is_none()
             && matches!(
                 call.tool_name.name.as_str(),
@@ -412,6 +535,82 @@ mod tests {
         turn_context.turn_timing_state.tool_call_count()
     }
 
+    fn test_call(tool_name: &str, call_id: &str) -> ToolCall {
+        ToolCall {
+            tool_name: codex_tools::ToolName::plain(tool_name),
+            call_id: call_id.to_string(),
+            payload: ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_is_bounded_and_conflict_aware() {
+        let call = test_call("mutating_tool", "call-1");
+        let bounded = ToolAdmissionController::new(1);
+        let capacity = bounded
+            .admit(ToolCallAdmission::Concurrent, &call, &ToolCallSource::Direct)
+            .await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                bounded.admit(ToolCallAdmission::Concurrent, &call, &ToolCallSource::Direct),
+            )
+            .await
+            .is_err()
+        );
+        drop(capacity);
+
+        let keyed = ToolAdmissionController::new(4);
+        let agent_a = ToolCallAdmission::serialize(ToolConflictKey::Agent("agent-a".into()));
+        let held = keyed.admit(agent_a.clone(), &call, &ToolCallSource::Direct).await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                keyed.admit(agent_a, &call, &ToolCallSource::Direct),
+            )
+            .await
+            .is_err()
+        );
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            keyed.admit(
+                ToolCallAdmission::serialize(ToolConflictKey::Agent("agent-b".into())),
+                &call,
+                &ToolCallSource::Direct,
+            ),
+        )
+        .await
+        .expect("different conflict keys should be admitted independently");
+        drop(held);
+
+        let source = ToolCallSource::CodeMode {
+            cell_id: "cell-1".into(),
+            runtime_tool_call_id: "runtime-call-1".into(),
+        };
+        let held = keyed
+            .admit(
+                ToolCallAdmission::serialize(ToolConflictKey::Agent("agent-a".into())),
+                &call,
+                &source,
+            )
+            .await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(25),
+                keyed.admit(
+                    ToolCallAdmission::serialize(ToolConflictKey::Process("7".into())),
+                    &call,
+                    &source,
+                ),
+            )
+            .await
+            .is_err()
+        );
+        drop(held);
+    }
+
     #[tokio::test]
     async fn accepted_tool_calls_are_counted_once_at_the_common_envelope() -> anyhow::Result<()> {
         let (session, turn_context) = crate::session::tests::make_session_and_context().await;
@@ -421,6 +620,8 @@ mod tests {
         let tool_name = codex_tools::ToolName::plain("test_tool");
         let handler = Arc::new(ImmediateHandler {
             tool_name: tool_name.clone(),
+            admission_calls: None,
+            cancellation_metadata_calls: None,
         }) as Arc<dyn CoreToolRuntime>;
         let failing_tool_name = codex_tools::ToolName::plain("failing_tool");
         let failing_handler = Arc::new(FailingHandler {
@@ -505,6 +706,8 @@ mod tests {
         let tool_name = codex_tools::ToolName::plain("test_tool");
         let handler = Arc::new(ImmediateHandler {
             tool_name: tool_name.clone(),
+            admission_calls: None,
+            cancellation_metadata_calls: None,
         }) as Arc<dyn CoreToolRuntime>;
         let step_context = StepContext::for_test(Arc::clone(&turn_context));
         let router = Arc::new(ToolRouter::from_parts(
@@ -514,17 +717,10 @@ mod tests {
         let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
         let runtime = ToolCallRuntime::new(router, Arc::clone(&session), step_context, tracker);
         let initial_count = accepted_tool_call_count(turn_context.as_ref());
-        let execution_gate = Arc::clone(&runtime.parallel_execution);
-        let execution_gate_guard = execution_gate
-            .try_write_owned()
-            .expect("execution gate should be available before dispatch starts");
-        let (release_execution_gate_tx, release_execution_gate_rx) = std::sync::mpsc::channel();
-        let execution_gate_task = tokio::task::spawn_blocking(move || {
-            let _execution_gate_guard = execution_gate_guard;
-            release_execution_gate_rx
-                .recv()
-                .expect("test should release the execution gate");
-        });
+        let admission_capacity_guard = Arc::clone(&runtime.admission.capacity)
+            .acquire_many_owned(MAX_IN_FLIGHT_TOOL_CALLS as u32)
+            .await
+            .expect("admission capacity is never closed");
 
         let buffer: &'static std::sync::Mutex<Vec<u8>> =
             Box::leak(Box::new(std::sync::Mutex::new(Vec::new())));
@@ -621,18 +817,132 @@ mod tests {
             dispatch_duration_ms, total_duration_ms,
             "tool cancelled before admission should attribute all elapsed time to dispatch: {timing_event}"
         );
-        release_execution_gate_tx
-            .send(())
-            .expect("execution gate task should remain available");
-        execution_gate_task
-            .await
-            .expect("execution gate task should join");
+        drop(admission_capacity_guard);
 
+        Ok(())
+    }
+
+    #[test]
+    fn large_arguments_stay_in_one_shared_call_allocation() {
+        let arguments = "x".repeat(2 * 1024 * 1024);
+        let call = SharedToolCall::new(ToolCall {
+            tool_name: codex_tools::ToolName::plain("large_tool"),
+            call_id: "large-call".to_string(),
+            payload: ToolPayload::Function { arguments },
+        });
+        let dispatch = call.clone();
+        let cancellation = call.clone();
+
+        assert!(call.shares_allocation_with(&dispatch));
+        assert!(call.shares_allocation_with(&cancellation));
+        assert_eq!(call.payload.log_payload().len(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn failure_response_shapes_remain_exact() {
+        let failure = || FunctionCallError::RespondToModel("expected failure".to_string());
+        let function_call = SharedToolCall::new(ToolCall {
+            tool_name: codex_tools::ToolName::plain("function_tool"),
+            call_id: "function-call".to_string(),
+            payload: ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+        });
+        assert_eq!(
+            ToolCallRuntime::failure_response(&function_call, failure()),
+            ResponseInputItem::FunctionCallOutput {
+                call_id: "function-call".to_string(),
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text("expected failure".to_string()),
+                    success: Some(false),
+                },
+            }
+        );
+
+        let custom_call = SharedToolCall::new(ToolCall {
+            tool_name: codex_tools::ToolName::plain("custom_tool"),
+            call_id: "custom-call".to_string(),
+            payload: ToolPayload::Custom {
+                input: "large input".repeat(1024),
+            },
+        });
+        assert_eq!(
+            ToolCallRuntime::failure_response(&custom_call, failure()),
+            ResponseInputItem::CustomToolCallOutput {
+                call_id: "custom-call".to_string(),
+                name: None,
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text("expected failure".to_string()),
+                    success: Some(false),
+                },
+            }
+        );
+
+        let search_call = SharedToolCall::new(ToolCall {
+            tool_name: codex_tools::ToolName::plain("tool_search"),
+            call_id: "search-call".to_string(),
+            payload: ToolPayload::ToolSearch {
+                arguments: codex_protocol::models::SearchToolCallParams {
+                    query: "query".to_string(),
+                    limit: Some(10),
+                },
+            },
+        });
+        assert_eq!(
+            ToolCallRuntime::failure_response(&search_call, failure()),
+            ResponseInputItem::ToolSearchOutput {
+                call_id: "search-call".to_string(),
+                status: "completed".to_string(),
+                execution: "client".to_string(),
+                tools: Vec::new(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_and_execution_metadata_are_resolved_once() -> anyhow::Result<()> {
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        *session.active_turn.lock().await = Some(crate::state::ActiveTurn::default());
+        let turn_context = Arc::new(turn_context);
+        let tool_name = codex_tools::ToolName::plain("resolved_once_tool");
+        let admission_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancellation_metadata_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = Arc::new(ImmediateHandler {
+            tool_name: tool_name.clone(),
+            admission_calls: Some(Arc::clone(&admission_calls)),
+            cancellation_metadata_calls: Some(Arc::clone(&cancellation_metadata_calls)),
+        }) as Arc<dyn CoreToolRuntime>;
+        let step_context = StepContext::for_test(Arc::clone(&turn_context));
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools([handler]),
+            Vec::new(),
+        ));
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let runtime = ToolCallRuntime::new(router, session, step_context, tracker);
+
+        runtime
+            .handle_tool_call(
+                ToolCall {
+                    tool_name,
+                    call_id: "resolved-once-call".to_string(),
+                    payload: ToolPayload::Function {
+                        arguments: "x".repeat(1024 * 1024),
+                    },
+                },
+                CancellationToken::new(),
+            )
+            .await?;
+
+        assert_eq!(admission_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(cancellation_metadata_calls.load(Ordering::Relaxed), 1);
         Ok(())
     }
 
     struct ImmediateHandler {
         tool_name: codex_tools::ToolName,
+        admission_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
+        cancellation_metadata_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
     }
 
     impl ToolExecutor<ToolInvocation> for ImmediateHandler {
@@ -665,7 +975,21 @@ mod tests {
         }
     }
 
-    impl CoreToolRuntime for ImmediateHandler {}
+    impl CoreToolRuntime for ImmediateHandler {
+        fn tool_call_admission(&self, _payload: &ToolPayload) -> ToolCallAdmission {
+            if let Some(calls) = &self.admission_calls {
+                calls.fetch_add(1, Ordering::Relaxed);
+            }
+            ToolCallAdmission::Concurrent
+        }
+
+        fn waits_for_runtime_cancellation(&self) -> bool {
+            if let Some(calls) = &self.cancellation_metadata_calls {
+                calls.fetch_add(1, Ordering::Relaxed);
+            }
+            false
+        }
+    }
 
     struct FailingHandler {
         tool_name: codex_tools::ToolName,
@@ -835,6 +1159,8 @@ mod tests {
         let tool_name = codex_tools::ToolName::plain("test_tool");
         let handler = Arc::new(ImmediateHandler {
             tool_name: tool_name.clone(),
+            admission_calls: None,
+            cancellation_metadata_calls: None,
         }) as Arc<dyn CoreToolRuntime>;
         let step_context = StepContext::for_test(Arc::clone(&turn_context));
         let router = Arc::new(ToolRouter::from_parts(
@@ -939,9 +1265,11 @@ mod tests {
             .await
             .expect("timed out waiting for tool response")
             .expect("tool response task should join")?;
-        let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+        let ResponseInputItem::FunctionCallOutput { call_id, output } = response else {
             anyhow::bail!("cancelled tool should return function output");
         };
+        assert_eq!(call_id, "call-1");
+        assert_eq!(output.success, None);
         let FunctionCallOutputBody::Text(text) = output.body else {
             anyhow::bail!("cancelled tool output should be text");
         };

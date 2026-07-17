@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command as ProcessCommand;
+use std::sync::Arc;
 use std::time::Duration;
 
 use codex_utils_path::normalize_for_path_comparison;
@@ -21,8 +22,9 @@ const REGULAR_FILE_MODE: &str = "100644";
 // content-exact diff without stalling tool completion.
 const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 
+#[derive(Clone)]
 struct TrackedContent {
-    content: String,
+    content: Arc<str>,
     mode: Option<String>,
     revision: u64,
 }
@@ -42,7 +44,7 @@ impl TrackedPath {
     }
 }
 
-#[derive(Eq, Hash, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 struct DiffCacheKey {
     left_path: TrackedPath,
     left_revision: Option<u64>,
@@ -93,6 +95,7 @@ impl ValidationFreshnessStatus {
 
 /// Tracks the net text diff for the current turn from committed apply_patch
 /// mutations, without rereading the workspace filesystem.
+#[derive(Clone)]
 pub struct TurnDiffTracker {
     valid: bool,
     display_roots_by_environment: HashMap<String, PathBuf>,
@@ -100,15 +103,19 @@ pub struct TurnDiffTracker {
     current_by_path: HashMap<TrackedPath, TrackedContent>,
     origin_by_current_path: HashMap<TrackedPath, TrackedPath>,
     next_revision: u64,
+    render_revision: u64,
     mutation_revision: u64,
-    rendered_diffs: HashMap<DiffCacheKey, Option<String>>,
-    unified_diff: Option<String>,
+    rendered_diffs: HashMap<DiffCacheKey, Option<Arc<str>>>,
+    unified_diff: Option<Arc<str>>,
+    update_gate: Arc<tokio::sync::Mutex<()>>,
     unvalidated_paths: HashSet<TrackedPath>,
     unvalidated_unknown_mutation: bool,
     has_successful_validation: bool,
     last_post_mutation_validation_status: ValidationFreshnessStatus,
     #[cfg(test)]
     rendered_diff_count: std::cell::Cell<usize>,
+    #[cfg(test)]
+    render_pause: Option<Arc<TestRenderPause>>,
 }
 
 impl Default for TurnDiffTracker {
@@ -120,17 +127,34 @@ impl Default for TurnDiffTracker {
             current_by_path: HashMap::new(),
             origin_by_current_path: HashMap::new(),
             next_revision: 0,
+            render_revision: 0,
             mutation_revision: 0,
             rendered_diffs: HashMap::new(),
             unified_diff: None,
+            update_gate: Arc::new(tokio::sync::Mutex::new(())),
             unvalidated_paths: HashSet::new(),
             unvalidated_unknown_mutation: false,
             has_successful_validation: false,
             last_post_mutation_validation_status: ValidationFreshnessStatus::None,
             #[cfg(test)]
             rendered_diff_count: std::cell::Cell::new(0),
+            #[cfg(test)]
+            render_pause: None,
         }
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct CompletedTurnDiffUpdate {
+    pub(crate) had_unified_diff: bool,
+    pub(crate) unified_diff: Option<Arc<str>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct TestRenderPause {
+    started: std::sync::atomic::AtomicBool,
+    released: std::sync::atomic::AtomicBool,
 }
 
 impl TurnDiffTracker {
@@ -149,27 +173,97 @@ impl TurnDiffTracker {
         tracker
     }
 
+    #[cfg(test)]
     pub fn track_delta(&mut self, environment_id: &str, delta: &AppliedPatchDelta) {
-        if !delta.is_empty() {
-            self.record_mutation(paths_touched_by_delta(environment_id, delta));
+        let resolved_modes = self.resolve_file_modes(environment_id, delta);
+        if self.apply_delta(environment_id, delta, &resolved_modes) {
+            self.refresh_unified_diff();
         }
+    }
 
-        if !self.valid {
-            return;
-        }
+    pub(crate) async fn track_delta_async(
+        tracker: Arc<tokio::sync::Mutex<Self>>,
+        environment_id: String,
+        delta: AppliedPatchDelta,
+    ) -> Option<CompletedTurnDiffUpdate> {
+        let update_gate = {
+            let tracker = tracker.lock().await;
+            Arc::clone(&tracker.update_gate)
+        };
+        let update_guard = update_gate.lock_owned().await;
+        let worker = tokio::spawn(async move {
+            let _update_guard = update_guard;
+            let display_roots_by_environment = {
+                let tracker = tracker.lock().await;
+                tracker.display_roots_by_environment.clone()
+            };
+            let mode_environment_id = environment_id.clone();
+            let mode_delta = delta.clone();
+            let resolved_modes = tokio::task::spawn_blocking(move || {
+                resolve_file_modes(
+                    &display_roots_by_environment,
+                    &mode_environment_id,
+                    &mode_delta,
+                )
+            })
+            .await
+            .unwrap_or_default();
 
-        if !delta.is_exact() {
-            self.invalidate();
-            return;
-        }
+            let (render_revision, mut render_snapshot, had_unified_diff) = {
+                let mut tracker = tracker.lock().await;
+                let had_unified_diff = tracker.has_unified_diff();
+                if !tracker.apply_delta(&environment_id, &delta, &resolved_modes) {
+                    return Some(CompletedTurnDiffUpdate {
+                        had_unified_diff,
+                        unified_diff: tracker.unified_diff.clone(),
+                    });
+                }
+                (
+                    tracker.render_revision,
+                    tracker.clone(),
+                    had_unified_diff,
+                )
+            };
 
-        for change in delta.changes() {
-            self.apply_change(environment_id, change);
-        }
-        self.refresh_unified_diff();
+            let render_snapshot = tokio::task::spawn_blocking(move || {
+                render_snapshot.refresh_unified_diff();
+                render_snapshot
+            })
+            .await;
+
+            let Ok(render_snapshot) = render_snapshot else {
+                let mut tracker = tracker.lock().await;
+                if tracker.render_revision != render_revision {
+                    return None;
+                }
+                tracker.invalidate();
+                return Some(CompletedTurnDiffUpdate {
+                    had_unified_diff,
+                    unified_diff: None,
+                });
+            };
+
+            let mut tracker = tracker.lock().await;
+            if tracker.render_revision != render_revision {
+                return None;
+            }
+            tracker.rendered_diffs = render_snapshot.rendered_diffs;
+            tracker.unified_diff = render_snapshot.unified_diff;
+            #[cfg(test)]
+            tracker
+                .rendered_diff_count
+                .set(render_snapshot.rendered_diff_count.get());
+            Some(CompletedTurnDiffUpdate {
+                had_unified_diff,
+                unified_diff: tracker.unified_diff.clone(),
+            })
+        });
+
+        worker.await.ok().flatten()
     }
 
     pub fn invalidate(&mut self) {
+        self.render_revision = self.render_revision.saturating_add(1);
         self.valid = false;
         self.rendered_diffs.clear();
         self.unified_diff = None;
@@ -367,11 +461,46 @@ impl TurnDiffTracker {
     }
 
     pub fn get_unified_diff(&self) -> Option<String> {
-        self.unified_diff.clone()
+        self.unified_diff.as_deref().map(str::to_owned)
     }
 
     pub(crate) fn has_unified_diff(&self) -> bool {
         self.unified_diff.is_some()
+    }
+
+    #[cfg(test)]
+    fn resolve_file_modes(
+        &self,
+        environment_id: &str,
+        delta: &AppliedPatchDelta,
+    ) -> HashMap<TrackedPath, Option<&'static str>> {
+        resolve_file_modes(&self.display_roots_by_environment, environment_id, delta)
+    }
+
+    fn apply_delta(
+        &mut self,
+        environment_id: &str,
+        delta: &AppliedPatchDelta,
+        resolved_modes: &HashMap<TrackedPath, Option<&'static str>>,
+    ) -> bool {
+        if !delta.is_empty() {
+            self.record_mutation(paths_touched_by_delta(environment_id, delta));
+        }
+
+        if !self.valid {
+            return false;
+        }
+
+        if !delta.is_exact() {
+            self.invalidate();
+            return false;
+        }
+
+        self.render_revision = self.render_revision.saturating_add(1);
+        for change in delta.changes() {
+            self.apply_change(environment_id, change, resolved_modes);
+        }
+        true
     }
 
     fn record_mutation(&mut self, paths: HashSet<TrackedPath>) {
@@ -389,6 +518,16 @@ impl TurnDiffTracker {
     }
 
     fn refresh_unified_diff(&mut self) {
+        #[cfg(test)]
+        if let Some(pause) = self.render_pause.as_ref() {
+            pause
+                .started
+                .store(true, std::sync::atomic::Ordering::Release);
+            while !pause.released.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+        }
+
         let rename_pairs = self.rename_pairs();
         let paired_destinations = rename_pairs.values().cloned().collect::<HashSet<_>>();
         let mut handled = HashSet::new();
@@ -430,6 +569,7 @@ impl TurnDiffTracker {
             };
             let rendered = previous_diffs.remove(&key).unwrap_or_else(|| {
                 self.render_diff(left_path, left_content, right_path, right_content)
+                    .map(Arc::<str>::from)
             });
 
             if let Some(diff) = rendered.as_deref() {
@@ -442,17 +582,29 @@ impl TurnDiffTracker {
         }
 
         self.rendered_diffs = rendered_diffs;
-        self.unified_diff = (!aggregated.is_empty()).then_some(aggregated);
+        self.unified_diff = (!aggregated.is_empty()).then(|| Arc::<str>::from(aggregated));
     }
 
-    fn apply_change(&mut self, environment_id: &str, change: &AppliedPatchChange) {
+    fn apply_change(
+        &mut self,
+        environment_id: &str,
+        change: &AppliedPatchChange,
+        resolved_modes: &HashMap<TrackedPath, Option<&'static str>>,
+    ) {
         let source_path = TrackedPath::new(environment_id, change.path.as_path());
         match &change.change {
             AppliedPatchFileChange::Add {
                 content,
                 overwritten_content,
-            } => self.apply_add(source_path, content, overwritten_content.as_deref()),
-            AppliedPatchFileChange::Delete { content } => self.apply_delete(source_path, content),
+            } => self.apply_add(
+                source_path,
+                content,
+                overwritten_content.as_deref(),
+                resolved_modes,
+            ),
+            AppliedPatchFileChange::Delete { content } => {
+                self.apply_delete(source_path, content, resolved_modes)
+            }
             AppliedPatchFileChange::Update {
                 move_path,
                 old_content,
@@ -468,30 +620,43 @@ impl TurnDiffTracker {
                     old_content,
                     overwritten_move_content.as_deref(),
                     new_content,
+                    resolved_modes,
                 )
             }
         }
     }
 
-    fn apply_add(&mut self, path: TrackedPath, content: &str, overwritten_content: Option<&str>) {
+    fn apply_add(
+        &mut self,
+        path: TrackedPath,
+        content: &str,
+        overwritten_content: Option<&str>,
+        resolved_modes: &HashMap<TrackedPath, Option<&'static str>>,
+    ) {
         self.origin_by_current_path.remove(&path);
         if !self.current_by_path.contains_key(&path)
             && !self.baseline_by_path.contains_key(&path)
             && let Some(overwritten_content) = overwritten_content
         {
-            let overwritten_content = self.tracked_content(&path, overwritten_content);
+            let overwritten_content =
+                self.tracked_content_with_mode(&path, overwritten_content, resolved_modes);
             self.baseline_by_path
                 .insert(path.clone(), overwritten_content);
         }
-        let content = self.tracked_content(&path, content);
+        let content = self.tracked_content_with_mode(&path, content, resolved_modes);
         self.current_by_path.insert(path, content);
     }
 
-    fn apply_delete(&mut self, path: TrackedPath, content: &str) {
+    fn apply_delete(
+        &mut self,
+        path: TrackedPath,
+        content: &str,
+        resolved_modes: &HashMap<TrackedPath, Option<&'static str>>,
+    ) {
         if self.current_by_path.remove(&path).is_none()
             && !self.baseline_by_path.contains_key(&path)
         {
-            let content = self.tracked_content(&path, content);
+            let content = self.tracked_content_with_mode(&path, content, resolved_modes);
             self.baseline_by_path.insert(path.clone(), content);
         }
         self.origin_by_current_path.remove(&path);
@@ -504,11 +669,13 @@ impl TurnDiffTracker {
         old_content: &str,
         overwritten_move_content: Option<&str>,
         new_content: &str,
+        resolved_modes: &HashMap<TrackedPath, Option<&'static str>>,
     ) {
         if !self.current_by_path.contains_key(&source_path)
             && !self.baseline_by_path.contains_key(&source_path)
         {
-            let old_content = self.tracked_content(&source_path, old_content);
+            let old_content =
+                self.tracked_content_with_mode(&source_path, old_content, resolved_modes);
             self.baseline_by_path
                 .insert(source_path.clone(), old_content);
         }
@@ -519,8 +686,11 @@ impl TurnDiffTracker {
                     && !self.baseline_by_path.contains_key(&dest_path)
                     && let Some(overwritten_move_content) = overwritten_move_content
                 {
-                    let overwritten_move_content =
-                        self.tracked_content(&dest_path, overwritten_move_content);
+                    let overwritten_move_content = self.tracked_content_with_mode(
+                        &dest_path,
+                        overwritten_move_content,
+                        resolved_modes,
+                    );
                     self.baseline_by_path
                         .insert(dest_path.clone(), overwritten_move_content);
                 }
@@ -529,7 +699,8 @@ impl TurnDiffTracker {
                     .remove(&source_path)
                     .unwrap_or_else(|| source_path.clone());
                 self.current_by_path.remove(&source_path);
-                let new_content = self.tracked_content(&dest_path, new_content);
+                let new_content =
+                    self.tracked_content_with_mode(&dest_path, new_content, resolved_modes);
                 self.current_by_path.insert(dest_path.clone(), new_content);
                 self.origin_by_current_path.remove(&dest_path);
                 if dest_path != origin {
@@ -537,13 +708,19 @@ impl TurnDiffTracker {
                 }
             }
             None => {
-                let new_content = self.tracked_content(&source_path, new_content);
+                let new_content =
+                    self.tracked_content_with_mode(&source_path, new_content, resolved_modes);
                 self.current_by_path.insert(source_path, new_content);
             }
         }
     }
 
-    fn tracked_content(&mut self, path: &TrackedPath, content: &str) -> TrackedContent {
+    fn tracked_content_with_mode(
+        &mut self,
+        path: &TrackedPath,
+        content: &str,
+        resolved_modes: &HashMap<TrackedPath, Option<&'static str>>,
+    ) -> TrackedContent {
         let mode = self
             .current_by_path
             .get(path)
@@ -553,14 +730,26 @@ impl TurnDiffTracker {
                     .get(path)
                     .and_then(|tracked| tracked.mode.clone())
             })
-            .or_else(|| self.file_mode(path).map(str::to_owned));
+            .or_else(|| {
+                resolved_modes
+                    .get(path)
+                    .copied()
+                    .flatten()
+                    .map(str::to_owned)
+            });
         let revision = self.next_revision;
         self.next_revision += 1;
         TrackedContent {
-            content: content.to_string(),
+            content: Arc::<str>::from(content),
             mode,
             revision,
         }
+    }
+
+    #[cfg(test)]
+    fn tracked_content(&mut self, path: &TrackedPath, content: &str) -> TrackedContent {
+        let resolved_modes = HashMap::from([(path.clone(), self.file_mode(path))]);
+        self.tracked_content_with_mode(path, content, &resolved_modes)
     }
 
     fn rename_pairs(&self) -> HashMap<TrackedPath, TrackedPath> {
@@ -588,8 +777,8 @@ impl TurnDiffTracker {
         right_path: &TrackedPath,
         right_content: Option<&TrackedContent>,
     ) -> Option<String> {
-        let left_text = left_content.map(|content| content.content.as_str());
-        let right_text = right_content.map(|content| content.content.as_str());
+        let left_text = left_content.map(|content| content.content.as_ref());
+        let right_text = right_content.map(|content| content.content.as_ref());
         if left_text == right_text {
             return None;
         }
@@ -613,14 +802,12 @@ impl TurnDiffTracker {
             (None, Some(_)) => {
                 let mode = right_content
                     .and_then(|content| content.mode.as_deref())
-                    .or_else(|| self.file_mode(right_path))
                     .unwrap_or(REGULAR_FILE_MODE);
                 diff.push_str(&format!("new file mode {mode}\n"));
             }
             (Some(_), None) => {
                 let mode = left_content
                     .and_then(|content| content.mode.as_deref())
-                    .or_else(|| self.file_mode(left_path))
                     .unwrap_or(REGULAR_FILE_MODE);
                 diff.push_str(&format!("deleted file mode {mode}\n"));
             }
@@ -653,52 +840,9 @@ impl TurnDiffTracker {
         Some(diff)
     }
 
+    #[cfg(test)]
     fn file_mode(&self, path: &TrackedPath) -> Option<&'static str> {
-        let filesystem_path = if path.path.is_absolute() {
-            path.path.clone()
-        } else {
-            self.display_roots_by_environment
-                .get(&path.environment_id)
-                .map_or_else(|| path.path.clone(), |root| root.join(&path.path))
-        };
-        if let Ok(metadata) = std::fs::symlink_metadata(&filesystem_path) {
-            if metadata.file_type().is_symlink() {
-                return Some("120000");
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if metadata.permissions().mode() & 0o111 != 0 {
-                    return Some("100755");
-                }
-            }
-            return Some(REGULAR_FILE_MODE);
-        }
-
-        let root = self
-            .display_roots_by_environment
-            .get(&path.environment_id)?;
-        let relative_path = filesystem_path.strip_prefix(root).ok()?;
-        let output = ProcessCommand::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["ls-files", "--stage", "--"])
-            .arg(relative_path)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        match String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .next()?
-        {
-            "100644" => Some(REGULAR_FILE_MODE),
-            "100755" => Some("100755"),
-            "120000" => Some("120000"),
-            "160000" => Some("160000"),
-            _ => None,
-        }
+        file_mode(&self.display_roots_by_environment, path)
     }
 
     #[cfg(test)]
@@ -718,6 +862,69 @@ impl TurnDiffTracker {
         } else {
             display
         }
+    }
+}
+
+fn resolve_file_modes(
+    display_roots_by_environment: &HashMap<String, PathBuf>,
+    environment_id: &str,
+    delta: &AppliedPatchDelta,
+) -> HashMap<TrackedPath, Option<&'static str>> {
+    paths_touched_by_delta(environment_id, delta)
+        .into_iter()
+        .map(|path| {
+            let mode = file_mode(display_roots_by_environment, &path);
+            (path, mode)
+        })
+        .collect()
+}
+
+fn file_mode(
+    display_roots_by_environment: &HashMap<String, PathBuf>,
+    path: &TrackedPath,
+) -> Option<&'static str> {
+    let filesystem_path = if path.path.is_absolute() {
+        path.path.clone()
+    } else {
+        display_roots_by_environment
+            .get(&path.environment_id)
+            .map_or_else(|| path.path.clone(), |root| root.join(&path.path))
+    };
+    if let Ok(metadata) = std::fs::symlink_metadata(&filesystem_path) {
+        if metadata.file_type().is_symlink() {
+            return Some("120000");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 != 0 {
+                return Some("100755");
+            }
+        }
+        return Some(REGULAR_FILE_MODE);
+    }
+
+    let root = display_roots_by_environment.get(&path.environment_id)?;
+    let relative_path = filesystem_path.strip_prefix(root).ok()?;
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--stage", "--"])
+        .arg(relative_path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    match String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()?
+    {
+        "100644" => Some(REGULAR_FILE_MODE),
+        "100755" => Some("100755"),
+        "120000" => Some("120000"),
+        "160000" => Some("160000"),
+        _ => None,
     }
 }
 

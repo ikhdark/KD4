@@ -141,10 +141,10 @@ impl SkillsWatcher {
                     _ = shutdown_token.cancelled() => break,
                     event = rx.recv() => event,
                 };
-                if event.is_none() {
+                let Some(event) = event else {
                     break;
-                }
-                skills_service.clear_cache();
+                };
+                skills_service.invalidate_paths(&event.paths);
                 outgoing
                     .send_server_notification(ServerNotification::SkillsChanged(
                         SkillsChangedNotification {},

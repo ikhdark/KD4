@@ -97,6 +97,39 @@ fn fills_head_then_tail_across_multiple_chunks() {
 }
 
 #[test]
+fn one_byte_chunks_use_bounded_storage_and_preserve_exact_head_and_tail() {
+    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 1_024);
+
+    for index in 0..100_000_u32 {
+        buf.push_chunk(vec![(index % 251) as u8]);
+    }
+
+    let retained = buf.to_bytes();
+    let expected_head = (0..512_u32)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let expected_tail = (100_000_u32 - 512..100_000_u32)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    assert_eq!(buf.retained_bytes(), 1_024);
+    assert_eq!(buf.omitted_bytes(), 100_000 - 1_024);
+    assert_eq!(&retained[..512], expected_head);
+    assert_eq!(&retained[512..], expected_tail);
+    assert!(buf.snapshot_chunks().len() <= super::MAX_RETAINED_CHUNKS);
+}
+
+#[test]
+fn circular_tail_wraps_across_both_storage_segments() {
+    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 10);
+    buf.push_chunk(b"0123456789".to_vec());
+    buf.push_chunk(b"abc".to_vec());
+    buf.push_chunk(b"defg".to_vec());
+
+    assert_eq!(buf.to_bytes(), b"01234cdefg".to_vec());
+    assert_eq!(buf.omitted_bytes(), 7);
+}
+
+#[test]
 fn rendered_marker_reserves_its_actual_length_and_preserves_head_and_tail() {
     let mut buf = HeadTailBuffer::new(/*max_bytes*/ 100);
     buf.push_chunk([vec![b'H'; 100], vec![b'T'; 100]].concat());

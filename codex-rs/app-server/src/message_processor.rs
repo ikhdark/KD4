@@ -7,6 +7,8 @@ use std::sync::atomic::AtomicBool;
 use crate::attestation::app_server_attestation_provider;
 use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
+use crate::connection_rpc_gate::RpcAdmissionError;
+use crate::connection_rpc_gate::rpc_overloaded_error;
 use crate::current_time::app_server_time_provider;
 use crate::error_code::invalid_request;
 use crate::extensions::ThreadExtensionDependencies;
@@ -41,6 +43,7 @@ use crate::request_processors::ThreadRequestProcessor;
 use crate::request_processors::TurnRequestProcessor;
 use crate::request_processors::WindowsSandboxRequestProcessor;
 use crate::request_serialization::QueuedInitializedRequest;
+use crate::request_serialization::RequestEnqueueResult;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 use crate::skills_watcher::SkillsWatcher;
@@ -827,7 +830,7 @@ impl MessageProcessor {
         let rpc_gate = Arc::clone(&session.rpc_gate);
         let processor = Arc::clone(self);
         let span = request_context.span();
-        let request = QueuedInitializedRequest::new(
+        let request = match QueuedInitializedRequest::try_new(
             rpc_gate,
             async move {
                 let processor_for_request = Arc::clone(&processor);
@@ -846,13 +849,22 @@ impl MessageProcessor {
                 }
             }
             .instrument(span),
-        );
+        ) {
+            Ok(request) => request,
+            Err(RpcAdmissionError::Closed) => return Ok(()),
+            Err(RpcAdmissionError::Overloaded) => return Err(rpc_overloaded_error()),
+        };
 
         if let Some(scope) = serialization_scope {
             let (key, access) = RequestSerializationQueueKey::from_scope(connection_id, scope);
-            self.request_serialization_queues
+            if self
+                .request_serialization_queues
                 .enqueue(key, access, request)
-                .await;
+                .await
+                == RequestEnqueueResult::Overloaded
+            {
+                return Err(rpc_overloaded_error());
+            }
         } else {
             tokio::spawn(async move {
                 request.run().await;

@@ -4,9 +4,20 @@ use codex_core::ThreadManager;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::Op;
+use futures::StreamExt;
+use futures::stream;
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use tracing::warn;
+
+const MCP_REFRESH_CONCURRENCY: usize = 8;
+
+struct PlannedRefresh {
+    thread_id: ThreadId,
+    thread: Arc<CodexThread>,
+    config: McpServerRefreshConfig,
+}
 
 pub(crate) async fn queue_strict_refresh(
     thread_manager: &Arc<ThreadManager>,
@@ -15,18 +26,8 @@ pub(crate) async fn queue_strict_refresh(
     config_manager
         .load_latest_config(/*fallback_cwd*/ None)
         .await?;
-    let mut refreshes = Vec::new();
-    for thread_id in thread_manager.list_thread_ids().await {
-        let thread = thread_manager
-            .get_thread(thread_id)
-            .await
-            .map_err(|err| io::Error::other(format!("failed to load thread {thread_id}: {err}")))?;
-        let config = build_refresh_config(thread.as_ref(), config_manager).await?;
-        refreshes.push((thread_id, thread, config));
-    }
-    for (thread_id, thread, config) in refreshes {
-        queue_refresh(thread_id, thread, config).await?;
-    }
+    let refreshes = collect_strict_results(plan_refreshes(thread_manager, config_manager).await)?;
+    collect_strict_results(queue_planned_refreshes(refreshes).await)?;
     Ok(())
 }
 
@@ -34,25 +35,108 @@ pub(crate) async fn queue_best_effort_refresh(
     thread_manager: &Arc<ThreadManager>,
     config_manager: &ConfigManager,
 ) {
-    for thread_id in thread_manager.list_thread_ids().await {
-        let thread = match thread_manager.get_thread(thread_id).await {
-            Ok(thread) => thread,
-            Err(err) => {
-                warn!("failed to load thread {thread_id} for MCP refresh: {err}");
-                continue;
-            }
-        };
-        let config = match build_refresh_config(thread.as_ref(), config_manager).await {
-            Ok(config) => config,
-            Err(err) => {
-                warn!("failed to build MCP refresh config for thread {thread_id}: {err}");
-                continue;
-            }
-        };
-        if let Err(err) = queue_refresh(thread_id, thread, config).await {
+    let planned = plan_refreshes(thread_manager, config_manager).await;
+    let mut refreshes = Vec::with_capacity(planned.len());
+    for (thread_id, result) in planned {
+        match result {
+            Ok(refresh) => refreshes.push(refresh),
+            Err(err) => warn!("failed to plan MCP refresh for thread {thread_id}: {err}"),
+        }
+    }
+    for (_thread_id, result) in queue_planned_refreshes(refreshes).await {
+        if let Err(err) = result {
             warn!("{err}");
         }
     }
+}
+
+async fn plan_refreshes(
+    thread_manager: &Arc<ThreadManager>,
+    config_manager: &ConfigManager,
+) -> Vec<(ThreadId, io::Result<PlannedRefresh>)> {
+    let mut thread_ids = thread_manager.list_thread_ids().await;
+    thread_ids.sort_by_key(|thread_id| thread_id.to_string());
+    let jobs = thread_ids.into_iter().map(|thread_id| async move {
+        let result = async {
+            let thread = thread_manager.get_thread(thread_id).await.map_err(|err| {
+                io::Error::other(format!("failed to load thread {thread_id}: {err}"))
+            })?;
+            let config = build_refresh_config(thread.as_ref(), config_manager).await?;
+            Ok(PlannedRefresh {
+                thread_id,
+                thread,
+                config,
+            })
+        }
+        .await;
+        (thread_id, result)
+    });
+    let mut planned = collect_bounded(jobs).await;
+    planned.sort_by_key(|(thread_id, _)| thread_id.to_string());
+    planned
+}
+
+fn group_identical_refreshes<T>(
+    refreshes: Vec<(McpServerRefreshConfig, T)>,
+) -> Vec<(McpServerRefreshConfig, Vec<T>)> {
+    let mut groups: Vec<(McpServerRefreshConfig, Vec<T>)> = Vec::new();
+    for (config, refresh) in refreshes {
+        if let Some(group) = groups.iter_mut().find_map(|(group_config, group)| {
+            (&*group_config == &config).then_some(group)
+        }) {
+            group.push(refresh);
+        } else {
+            groups.push((config, vec![refresh]));
+        }
+    }
+    groups
+}
+
+async fn queue_planned_refreshes(
+    refreshes: Vec<PlannedRefresh>,
+) -> Vec<(ThreadId, io::Result<()>)> {
+    let mut submissions = Vec::with_capacity(refreshes.len());
+    let keyed_refreshes = refreshes
+        .into_iter()
+        .map(|refresh| {
+            (
+                refresh.config,
+                (refresh.thread_id, refresh.thread),
+            )
+        })
+        .collect();
+    for (config, threads) in group_identical_refreshes(keyed_refreshes) {
+        for (thread_id, thread) in threads {
+            submissions.push((thread_id, thread, config.clone()));
+        }
+    }
+    let jobs = submissions
+        .into_iter()
+        .map(|(thread_id, thread, config)| async move {
+            let result = queue_refresh(thread_id, thread, config).await;
+            (thread_id, result)
+        });
+    let mut results = collect_bounded(jobs).await;
+    results.sort_by_key(|(thread_id, _)| thread_id.to_string());
+    results
+}
+
+async fn collect_bounded<I, F, T>(jobs: I) -> Vec<T>
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = T>,
+{
+    stream::iter(jobs)
+        .buffer_unordered(MCP_REFRESH_CONCURRENCY)
+        .collect()
+        .await
+}
+
+fn collect_strict_results<T>(
+    mut results: Vec<(ThreadId, io::Result<T>)>,
+) -> io::Result<Vec<T>> {
+    results.sort_by_key(|(thread_id, _)| thread_id.to_string());
+    results.into_iter().map(|(_thread_id, result)| result).collect()
 }
 
 async fn build_refresh_config(
@@ -120,7 +204,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+    use std::str::FromStr;
     use tempfile::TempDir;
+    use tokio::sync::Notify;
 
     #[tokio::test]
     async fn strict_refresh_reports_thread_planning_failures() -> anyhow::Result<()> {
@@ -175,6 +261,85 @@ mod tests {
         );
         assert_eq!(backend, AuthKeyringBackendKind::Secrets);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn refresh_fanout_is_bounded_without_serializing_blocked_work() {
+        let job_count = MCP_REFRESH_CONCURRENCY * 3;
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let release_blocked = Arc::new(Notify::new());
+
+        let jobs = (0..job_count).map(|job| {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            let completed = Arc::clone(&completed);
+            let release_blocked = Arc::clone(&release_blocked);
+            async move {
+                let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now_active, Ordering::SeqCst);
+                if job == 0 {
+                    release_blocked.notified().await;
+                } else {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+        let fanout = tokio::spawn(collect_bounded(jobs));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while completed.load(Ordering::SeqCst) != job_count - 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("one blocked refresh must not delay independent refresh work");
+        assert!(peak.load(Ordering::SeqCst) > 1);
+        assert!(peak.load(Ordering::SeqCst) <= MCP_REFRESH_CONCURRENCY);
+
+        release_blocked.notify_one();
+        fanout.await.expect("bounded refresh fanout should finish");
+    }
+
+    #[test]
+    fn strict_refresh_errors_are_reported_in_thread_order() {
+        let first = ThreadId::from_str("11111111-1111-4111-8111-111111111111")
+            .expect("valid first thread ID");
+        let second = ThreadId::from_str("22222222-2222-4222-8222-222222222222")
+            .expect("valid second thread ID");
+
+        let err = collect_strict_results::<()>(vec![
+            (second, Err(io::Error::other("second error"))),
+            (first, Err(io::Error::other("first error"))),
+        ])
+        .expect_err("strict refresh should report an error");
+
+        assert_eq!(err.to_string(), "first error");
+    }
+
+    #[test]
+    fn identical_refresh_keys_share_one_deterministic_group() {
+        let config_a = McpServerRefreshConfig {
+            mcp_servers: serde_json::json!({"docs": {"command": "docs"}}),
+            mcp_oauth_credentials_store_mode: serde_json::json!("auto"),
+            auth_keyring_backend_kind: serde_json::json!("direct"),
+        };
+        let config_b = McpServerRefreshConfig {
+            mcp_servers: serde_json::json!({"other": {"command": "other"}}),
+            ..config_a.clone()
+        };
+
+        let groups = group_identical_refreshes(vec![
+            (config_a.clone(), "first"),
+            (config_b.clone(), "second"),
+            (config_a.clone(), "third"),
+        ]);
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], (config_a, vec!["first", "third"]));
+        assert_eq!(groups[1], (config_b, vec!["second"]));
     }
 
     async fn refresh_test_state() -> anyhow::Result<(

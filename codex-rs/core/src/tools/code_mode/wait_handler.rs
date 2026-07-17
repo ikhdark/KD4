@@ -9,6 +9,8 @@ use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
+use crate::tools::registry::ToolCallAdmission;
+use crate::tools::registry::ToolConflictKey;
 use crate::tools::registry::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -135,6 +137,22 @@ impl CodeModeWaitHandler {
 }
 
 impl CoreToolRuntime for CodeModeWaitHandler {
+    fn tool_call_admission(&self, payload: &ToolPayload) -> ToolCallAdmission {
+        let ToolPayload::Function { arguments } = payload else {
+            return ToolCallAdmission::Serialize(Vec::new());
+        };
+        parse_arguments::<ExecWaitArgs>(arguments).map_or_else(
+            |_| ToolCallAdmission::Serialize(Vec::new()),
+            |args| {
+                if args.terminate {
+                    ToolCallAdmission::serialize(ToolConflictKey::CodeCell(args.cell_id))
+                } else {
+                    ToolCallAdmission::Concurrent
+                }
+            },
+        )
+    }
+
     fn pre_tool_use_hook_name(&self, _invocation: &ToolInvocation) -> Option<HookToolName> {
         None
     }

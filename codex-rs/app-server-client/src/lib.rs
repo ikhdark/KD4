@@ -43,6 +43,7 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result as JsonRpcResult;
 use codex_app_server_protocol::ServerNotification;
+use codex_app_server_protocol::ServerNotificationDeliveryClass;
 use codex_app_server_protocol::ServerRequest;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
@@ -134,41 +135,13 @@ impl From<InProcessServerEvent> for AppServerEvent {
 }
 
 fn event_requires_delivery(event: &InProcessServerEvent) -> bool {
-    // These transcript and terminal events must remain lossless. Dropping
-    // streamed assistant text or the authoritative completed item can leave
-    // the TUI with permanently corrupted markdown, while dropping completion
-    // notifications can leave surfaces waiting forever.
     match event {
         InProcessServerEvent::ServerNotification(notification) => {
-            server_notification_requires_delivery(notification)
+            notification.delivery_class() != ServerNotificationDeliveryClass::BestEffort
         }
-        _ => false,
+        InProcessServerEvent::ServerRequest(_) => true,
+        InProcessServerEvent::Lagged { .. } => false,
     }
-}
-
-/// Returns `true` for notifications that must survive backpressure.
-///
-/// Transcript events (`AgentMessageDelta`, `PlanDelta`, reasoning deltas) and
-/// the authoritative `ItemCompleted` / `TurnCompleted` form the lossless tier
-/// of the event stream. Dropping any of these corrupts the visible assistant
-/// output or leaves surfaces waiting for a completion signal that already
-/// fired. Everything else (`CommandExecutionOutputDelta`, progress, etc.) is
-/// best-effort and may be dropped with only cosmetic impact.
-///
-/// Both the in-process and remote transports delegate to this function so the
-/// classification stays in sync.
-pub(crate) fn server_notification_requires_delivery(notification: &ServerNotification) -> bool {
-    matches!(
-        notification,
-        ServerNotification::TurnCompleted(_)
-            | ServerNotification::ThreadSettingsUpdated(_)
-            | ServerNotification::ItemCompleted(_)
-            | ServerNotification::ExternalAgentConfigImportCompleted(_)
-            | ServerNotification::AgentMessageDelta(_)
-            | ServerNotification::PlanDelta(_)
-            | ServerNotification::ReasoningSummaryTextDelta(_)
-            | ServerNotification::ReasoningTextDelta(_)
-    )
 }
 
 /// Outcome of attempting to forward a single event to the consumer channel.
@@ -506,7 +479,7 @@ impl InProcessAppServerClient {
                                 notification,
                                 response_tx,
                             }) => {
-                                let result = request_sender.notify(notification);
+                                let result = request_sender.notify(notification).await;
                                 let _ = response_tx.send(result);
                             }
                             Some(ClientCommand::ResolveServerRequest {
@@ -514,8 +487,9 @@ impl InProcessAppServerClient {
                                 result,
                                 response_tx,
                             }) => {
-                                let send_result =
-                                    request_sender.respond_to_server_request(request_id, result);
+                                let send_result = request_sender
+                                    .respond_to_server_request(request_id, result)
+                                    .await;
                                 let _ = response_tx.send(send_result);
                             }
                             Some(ClientCommand::RejectServerRequest {
@@ -523,7 +497,9 @@ impl InProcessAppServerClient {
                                 error,
                                 response_tx,
                             }) => {
-                                let send_result = request_sender.fail_server_request(request_id, error);
+                                let send_result = request_sender
+                                    .fail_server_request(request_id, error)
+                                    .await;
                                 let _ = response_tx.send(send_result);
                             }
                             Some(ClientCommand::Shutdown { response_tx }) => {
@@ -552,7 +528,7 @@ impl InProcessAppServerClient {
                                     message: "chatgpt auth token refresh is not supported for in-process app-server clients".to_string(),
                                     data: None,
                                 },
-                            );
+                            ).await;
                             if let Err(err) = send_result {
                                 warn!(
                                     "failed to reject unsupported chatgpt auth token refresh request: {err}"
@@ -566,15 +542,20 @@ impl InProcessAppServerClient {
                             &mut skipped_events,
                             event,
                             |request| {
-                                let _ = request_sender.fail_server_request(
-                                    request.id().clone(),
-                                    JSONRPCErrorError {
-                                        code: -32001,
-                                        message: "in-process app-server event queue is full"
-                                            .to_string(),
-                                        data: None,
-                                    },
-                                );
+                                let request_sender = request_sender.clone();
+                                tokio::spawn(async move {
+                                    let _ = request_sender
+                                        .fail_server_request(
+                                            request.id().clone(),
+                                            JSONRPCErrorError {
+                                                code: -32001,
+                                                message: "in-process app-server event queue is full"
+                                                    .to_string(),
+                                                data: None,
+                                            },
+                                        )
+                                        .await;
+                                });
                             },
                         )
                         .await

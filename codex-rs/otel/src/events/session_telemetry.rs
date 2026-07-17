@@ -1089,7 +1089,7 @@ impl SessionTelemetry {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn log_tool_result_with_tags<F, Fut, E>(
+    pub async fn log_tool_result_with_tags<T, F, Fut, E>(
         &self,
         tool_name: &str,
         call_id: &str,
@@ -1097,10 +1097,10 @@ impl SessionTelemetry {
         extra_tags: &[(&str, &str)],
         extra_trace_fields: &[(&str, &str)],
         f: F,
-    ) -> Result<(String, bool), E>
+    ) -> Result<T, E>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<(String, bool), E>>,
+        Fut: Future<Output = Result<(T, String, bool), E>>,
         E: std::fmt::Display,
     {
         let start = Instant::now();
@@ -1108,7 +1108,7 @@ impl SessionTelemetry {
         let duration = start.elapsed();
 
         let (output, success) = match &result {
-            Ok((preview, success)) => (Cow::Borrowed(preview.as_str()), *success),
+            Ok((_, preview, success)) => (Cow::Borrowed(preview.as_str()), *success),
             Err(error) => (Cow::Owned(error.to_string()), false),
         };
 
@@ -1123,7 +1123,7 @@ impl SessionTelemetry {
             extra_trace_fields,
         );
 
-        result
+        result.map(|(value, _, _)| value)
     }
 
     pub fn log_tool_failed(&self, tool_name: &str, error: &str) {

@@ -118,7 +118,24 @@ pub(super) async fn list_rollout_threads(
     sort_key: codex_rollout::ThreadSortKey,
     sort_direction: codex_rollout::SortDirection,
 ) -> ThreadStoreResult<codex_rollout::ThreadsPage> {
+    let historical_index_complete = match state_db.as_deref() {
+        Some(runtime) => match codex_rollout::state_db::readiness(runtime).await {
+            Ok(codex_rollout::state_db::StateDbReadiness::HistoricalIndexComplete) => true,
+            Ok(codex_rollout::state_db::StateDbReadiness::WriteReady) => false,
+            Err(err) => {
+                tracing::warn!("failed to read state DB readiness before thread listing: {err}");
+                false
+            }
+        },
+        None => false,
+    };
     if let Some(relation_filter) = params.relation_filter {
+        if state_db.is_some() && !historical_index_complete {
+            return Err(ThreadStoreError::Internal {
+                message: "historical thread index is partial; relationship-filtered listing is unavailable until background backfill completes"
+                    .to_string(),
+            });
+        }
         let relation_filter = match relation_filter {
             ThreadRelationFilter::DirectChildrenOf(parent_thread_id) => {
                 codex_state::ThreadRelationFilter::DirectChildrenOf(parent_thread_id)
@@ -148,7 +165,13 @@ pub(super) async fn list_rollout_threads(
         return Ok(page.into());
     }
 
-    let page = if params.use_state_db_only && params.archived {
+    let use_state_db_only = params.use_state_db_only && historical_index_complete;
+    if params.use_state_db_only && !use_state_db_only {
+        tracing::debug!(
+            "historical thread index is partial; using rollout scan for complete thread listing"
+        );
+    }
+    let page = if use_state_db_only && params.archived {
         RolloutRecorder::list_archived_threads_from_state_db(
             state_db,
             config,
@@ -163,7 +186,7 @@ pub(super) async fn list_rollout_threads(
             params.search_term.as_deref(),
         )
         .await
-    } else if params.use_state_db_only {
+    } else if use_state_db_only {
         RolloutRecorder::list_threads_from_state_db(
             state_db,
             config,
@@ -267,6 +290,61 @@ mod tests {
 
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].model_provider, "test-provider");
+    }
+
+    #[tokio::test]
+    async fn state_db_only_listing_scans_rollouts_while_historical_index_is_partial() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let uuid = Uuid::from_u128(104);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        write_session_file(home.path(), "2025-01-03T12-30-00", uuid)
+            .expect("session file");
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        assert_eq!(
+            codex_rollout::state_db::readiness(runtime.as_ref())
+                .await
+                .expect("state DB readiness"),
+            codex_rollout::state_db::StateDbReadiness::WriteReady
+        );
+        let store = LocalThreadStore::new(config, Some(runtime.clone()));
+
+        let page = store
+            .list_threads(ListThreadsParams {
+                page_size: 10,
+                cursor: None,
+                sort_key: ThreadSortKey::CreatedAt,
+                sort_direction: SortDirection::Desc,
+                allowed_sources: Vec::new(),
+                model_providers: None,
+                cwd_filters: None,
+                archived: false,
+                search_term: None,
+                relation_filter: None,
+                use_state_db_only: true,
+            })
+            .await
+            .expect("partial-index thread listing");
+
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|thread| thread.thread_id)
+                .collect::<Vec<_>>(),
+            vec![thread_id]
+        );
+        assert!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .expect("read repaired metadata")
+                .is_some()
+        );
     }
 
     #[tokio::test]

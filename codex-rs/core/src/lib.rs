@@ -46,6 +46,7 @@ mod environment_selection;
 pub mod exec;
 pub mod exec_env;
 mod exec_policy;
+mod git_workspace;
 #[cfg(test)]
 mod git_info_tests;
 mod guardian;

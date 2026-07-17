@@ -151,10 +151,19 @@ fn apply_commit_tick_plan(
     plan_stream_controller: Option<&mut PlanStreamController>,
 ) -> CommitTickOutput {
     let mut output = CommitTickOutput::default();
+    let mut remaining_batch_budget = match drain_plan {
+        DrainPlan::Single => None,
+        DrainPlan::Batch(max_lines) => Some(max_lines),
+    };
 
     if let Some(controller) = stream_controller {
         output.has_controller = true;
-        let (cell, is_idle) = drain_stream_controller(controller, drain_plan);
+        let controller_plan = controller_drain_plan(
+            drain_plan,
+            &mut remaining_batch_budget,
+            controller.queued_lines(),
+        );
+        let (cell, is_idle) = drain_stream_controller(controller, controller_plan);
         if let Some(cell) = cell {
             output.cells.push(cell);
         }
@@ -162,7 +171,12 @@ fn apply_commit_tick_plan(
     }
     if let Some(controller) = plan_stream_controller {
         output.has_controller = true;
-        let (cell, is_idle) = drain_plan_stream_controller(controller, drain_plan);
+        let controller_plan = controller_drain_plan(
+            drain_plan,
+            &mut remaining_batch_budget,
+            controller.queued_lines(),
+        );
+        let (cell, is_idle) = drain_plan_stream_controller(controller, controller_plan);
         if let Some(cell) = cell {
             output.cells.push(cell);
         }
@@ -172,11 +186,27 @@ fn apply_commit_tick_plan(
     output
 }
 
+/// Allocate one controller's share of a combined catch-up batch allowance.
+fn controller_drain_plan(
+    drain_plan: DrainPlan,
+    remaining_batch_budget: &mut Option<usize>,
+    queued_lines: usize,
+) -> DrainPlan {
+    let DrainPlan::Batch(_) = drain_plan else {
+        return DrainPlan::Single;
+    };
+    let remaining = remaining_batch_budget
+        .as_mut()
+        .expect("batch drain plan must carry a remaining budget");
+    let allowance = (*remaining).min(queued_lines);
+    *remaining -= allowance;
+    DrainPlan::Batch(allowance)
+}
+
 /// Applies one drain step to the main stream controller.
 ///
-/// [`DrainPlan::Single`] maps to one-line drain; [`DrainPlan::Batch`] maps to
-/// multi-line drain (including instant catch-up when policy requests the full
-/// queued backlog).
+/// [`DrainPlan::Single`] maps to one-line drain; [`DrainPlan::Batch`] maps to a
+/// frame-budgeted multi-line drain.
 fn drain_stream_controller(
     controller: &mut StreamController,
     drain_plan: DrainPlan,
@@ -210,5 +240,33 @@ fn max_duration(lhs: Option<Duration>, rhs: Option<Duration>) -> Option<Duration
         (Some(left), None) => Some(left),
         (None, Some(right)) => Some(right),
         (None, None) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::history_cell::HistoryRenderMode;
+
+    #[test]
+    fn catch_up_batch_budget_is_shared_across_controllers() {
+        let cwd = std::env::temp_dir();
+        let mut stream = StreamController::new(None, &cwd, HistoryRenderMode::Raw);
+        let mut plan = PlanStreamController::new(None, &cwd, HistoryRenderMode::Raw);
+        let source = (0..80)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        assert!(stream.push(&source));
+        assert!(plan.push(&source));
+        let queued_before = stream.queued_lines() + plan.queued_lines();
+
+        let _ = apply_commit_tick_plan(
+            DrainPlan::Batch(64),
+            Some(&mut stream),
+            Some(&mut plan),
+        );
+
+        let queued_after = stream.queued_lines() + plan.queued_lines();
+        assert_eq!(queued_before - queued_after, 64);
     }
 }

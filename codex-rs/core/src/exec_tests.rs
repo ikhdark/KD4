@@ -130,6 +130,74 @@ async fn read_output_limits_retained_bytes_for_shell_capture() {
     );
 }
 
+#[tokio::test]
+async fn read_output_drains_and_retains_before_saturated_event_delivery() {
+    let (mut writer, reader) = tokio::io::duplex(64);
+    let expected = vec![b'x'; 64 * 1024];
+    let expected_for_writer = expected.clone();
+    let writer_task = tokio::spawn(async move {
+        writer
+            .write_all(&expected_for_writer)
+            .await
+            .expect("write all output");
+    });
+
+    let retained_output = Arc::new(TokioMutex::new(HeadTailBuffer::new(EXEC_OUTPUT_MAX_BYTES)));
+    let (tx_event, rx_event) = async_channel::bounded(1);
+    tx_event
+        .send(Event {
+            id: "occupied".to_string(),
+            msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+                call_id: "occupied".to_string(),
+                stream: ExecOutputStream::Stdout,
+                chunk: b"occupied".to_vec(),
+            }),
+        })
+        .await
+        .expect("fill event channel");
+    let stream = StdoutStream {
+        sub_id: "turn".to_string(),
+        call_id: "call".to_string(),
+        tx_event,
+    };
+    let task = tokio::spawn(read_output(
+        reader,
+        Some(stream),
+        /*is_stderr*/ false,
+        Arc::clone(&retained_output),
+        /*retain_full_output*/ false,
+    ));
+
+    tokio::time::timeout(Duration::from_secs(1), writer_task)
+        .await
+        .expect("pipe should drain while client delivery is saturated")
+        .expect("writer task");
+    assert_eq!(
+        retained_output.lock().await.to_bytes(),
+        expected
+    );
+    assert!(!task.is_finished());
+
+    let occupied = rx_event.recv().await.expect("occupied event");
+    assert_eq!(occupied.id, "occupied");
+    let delivery_drain = tokio::spawn(async move {
+        let mut delivered = Vec::new();
+        while let Ok(event) = rx_event.recv().await {
+            if let EventMsg::ExecCommandOutputDelta(event) = event.msg {
+                delivered.extend_from_slice(&event.chunk);
+            }
+        }
+        delivered
+    });
+    let full_output = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("reader should finish after delivery resumes")
+        .expect("reader task")
+        .expect("read output");
+    assert_eq!(full_output, None);
+    assert_eq!(delivery_drain.await.expect("delivery drain"), expected);
+}
+
 #[test]
 fn aggregate_output_prefers_stderr_on_contention() {
     let stdout = StreamOutput {

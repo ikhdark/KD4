@@ -1,62 +1,282 @@
+use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
-use tokio::sync::Mutex;
+use codex_app_server_protocol::JSONRPCErrorError;
 use tokio_util::task::TaskTracker;
+
+use crate::error_code::OVERLOADED_ERROR_CODE;
+
+const GLOBAL_RPC_ADMISSION_LIMIT: usize = 1024;
+const PER_CONNECTION_RPC_ADMISSION_LIMIT: usize = 256;
+const RPC_OVERLOADED_MESSAGE: &str = "app-server RPC admission limit exceeded";
+
+static GLOBAL_RPC_ADMISSION: OnceLock<Arc<GlobalRpcAdmission>> = OnceLock::new();
+
+#[derive(Debug)]
+struct GlobalRpcAdmission {
+    limit: usize,
+    admitted: AtomicUsize,
+}
+
+impl GlobalRpcAdmission {
+    fn new(limit: usize) -> Self {
+        assert!(limit > 0, "global RPC admission limit must be positive");
+        Self {
+            limit,
+            admitted: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_acquire(&self) -> bool {
+        self.admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                (admitted < self.limit).then_some(admitted + 1)
+            })
+            .is_ok()
+    }
+
+    fn release(&self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let released = self
+            .admitted
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
+                admitted.checked_sub(count)
+            })
+            .is_ok();
+        debug_assert!(released, "released more RPC admissions than held");
+    }
+
+    #[cfg(test)]
+    fn admitted_count(&self) -> usize {
+        self.admitted.load(Ordering::Acquire)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdmissionStage {
+    Queued,
+    Running,
+}
+
+#[derive(Debug)]
+struct ConnectionRpcGateState {
+    accepting: bool,
+    next_admission_id: u64,
+    admissions: HashMap<u64, AdmissionStage>,
+}
+
+#[derive(Debug)]
+struct ConnectionRpcGateInner {
+    state: Mutex<ConnectionRpcGateState>,
+    tasks: TaskTracker,
+    global: Arc<GlobalRpcAdmission>,
+    per_connection_limit: usize,
+}
 
 /// Per-connection gate for initialized RPC handler execution.
 ///
-/// Closing the gate prevents queued handlers from starting while allowing
-/// handlers that already acquired a token to finish.
+/// Admission is reserved before handlers are queued or spawned. Closing the
+/// gate revokes queued reservations while allowing running handlers to finish.
 #[derive(Debug)]
 pub(crate) struct ConnectionRpcGate {
-    accepting: Mutex<bool>,
-    tasks: TaskTracker,
+    inner: Arc<ConnectionRpcGateInner>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RpcAdmissionError {
+    Closed,
+    Overloaded,
+}
+
+#[derive(Debug)]
+pub(crate) struct RpcAdmissionPermit {
+    inner: Arc<ConnectionRpcGateInner>,
+    admission_id: u64,
 }
 
 impl ConnectionRpcGate {
     pub(crate) fn new() -> Self {
-        let accepting = true;
+        let global = Arc::clone(
+            GLOBAL_RPC_ADMISSION
+                .get_or_init(|| Arc::new(GlobalRpcAdmission::new(GLOBAL_RPC_ADMISSION_LIMIT))),
+        );
+        Self::with_global(global, PER_CONNECTION_RPC_ADMISSION_LIMIT)
+    }
+
+    fn with_global(global: Arc<GlobalRpcAdmission>, per_connection_limit: usize) -> Self {
+        assert!(
+            per_connection_limit > 0,
+            "per-connection RPC admission limit must be positive"
+        );
         Self {
-            accepting: Mutex::new(accepting),
-            tasks: TaskTracker::new(),
+            inner: Arc::new(ConnectionRpcGateInner {
+                state: Mutex::new(ConnectionRpcGateState {
+                    accepting: true,
+                    next_admission_id: 0,
+                    admissions: HashMap::new(),
+                }),
+                tasks: TaskTracker::new(),
+                global,
+                per_connection_limit,
+            }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_limits(global_limit: usize, per_connection_limit: usize) -> Self {
+        Self::with_global(
+            Arc::new(GlobalRpcAdmission::new(global_limit)),
+            per_connection_limit,
+        )
+    }
+
+    pub(crate) fn try_admit(&self) -> Result<RpcAdmissionPermit, RpcAdmissionError> {
+        let mut state = self.inner.state.lock().unwrap_or_else(|err| err.into_inner());
+        if !state.accepting {
+            return Err(RpcAdmissionError::Closed);
+        }
+        if state.admissions.len() >= self.inner.per_connection_limit
+            || !self.inner.global.try_acquire()
+        {
+            return Err(RpcAdmissionError::Overloaded);
+        }
+
+        let admission_id = loop {
+            let candidate = state.next_admission_id;
+            state.next_admission_id = state.next_admission_id.wrapping_add(1);
+            if !state.admissions.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+        state
+            .admissions
+            .insert(admission_id, AdmissionStage::Queued);
+        Ok(RpcAdmissionPermit {
+            inner: Arc::clone(&self.inner),
+            admission_id,
+        })
     }
 
     pub(crate) async fn run<F>(&self, future: F)
     where
         F: Future<Output = ()>,
     {
+        if let Ok(permit) = self.try_admit() {
+            permit.run(future).await;
+        }
+    }
+
+    pub(crate) async fn close(&self) {
+        let revoked_count = {
+            let mut state = self.inner.state.lock().unwrap_or_else(|err| err.into_inner());
+            state.accepting = false;
+            let before = state.admissions.len();
+            state
+                .admissions
+                .retain(|_, stage| *stage == AdmissionStage::Running);
+            self.inner.tasks.close();
+            before - state.admissions.len()
+        };
+        self.inner.global.release(revoked_count);
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.close().await;
+        self.inner.tasks.wait().await;
+    }
+
+    #[cfg(test)]
+    async fn is_accepting(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .accepting
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inflight_count(&self) -> usize {
+        self.inner.tasks.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admitted_count(&self) -> usize {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .admissions
+            .len()
+    }
+
+    #[cfg(test)]
+    fn global_admitted_count(&self) -> usize {
+        self.inner.global.admitted_count()
+    }
+}
+
+impl RpcAdmissionPermit {
+    pub(crate) async fn run<F>(self, future: F)
+    where
+        F: Future<Output = ()>,
+    {
         let token = {
-            let accepting = self.accepting.lock().await;
-            if !*accepting {
+            let mut state = self.inner.state.lock().unwrap_or_else(|err| err.into_inner());
+            if !state.accepting {
                 return;
             }
-            self.tasks.token()
+            let Some(stage) = state.admissions.get_mut(&self.admission_id) else {
+                return;
+            };
+            if *stage != AdmissionStage::Queued {
+                return;
+            }
+            *stage = AdmissionStage::Running;
+            self.inner.tasks.token()
         };
 
         future.await;
         drop(token);
     }
 
-    pub(crate) async fn close(&self) {
-        let mut accepting = self.accepting.lock().await;
-        *accepting = false;
-        self.tasks.close();
+    pub(crate) fn is_active(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .admissions
+            .contains_key(&self.admission_id)
     }
+}
 
-    pub(crate) async fn shutdown(&self) {
-        self.close().await;
-        self.tasks.wait().await;
+impl Drop for RpcAdmissionPermit {
+    fn drop(&mut self) {
+        let released = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .admissions
+            .remove(&self.admission_id)
+            .is_some();
+        if released {
+            self.inner.global.release(1);
+        }
     }
+}
 
-    #[cfg(test)]
-    async fn is_accepting(&self) -> bool {
-        *self.accepting.lock().await
-    }
-
-    #[cfg(test)]
-    fn inflight_count(&self) -> usize {
-        self.tasks.len()
+pub(crate) fn rpc_overloaded_error() -> JSONRPCErrorError {
+    JSONRPCErrorError {
+        code: OVERLOADED_ERROR_CODE,
+        message: RPC_OVERLOADED_MESSAGE.to_string(),
+        data: None,
     }
 }
 
@@ -234,5 +454,71 @@ mod tests {
             .expect("handler body should still be waiting");
         run_task.await.expect("run task should complete");
         assert_eq!(gate.inflight_count(), 0);
+    }
+
+    #[test]
+    fn global_and_per_connection_admission_are_bounded() {
+        let global = Arc::new(GlobalRpcAdmission::new(/*limit*/ 2));
+        let first_gate = ConnectionRpcGate::with_global(Arc::clone(&global), /*limit*/ 1);
+        let second_gate = ConnectionRpcGate::with_global(Arc::clone(&global), /*limit*/ 1);
+        let third_gate = ConnectionRpcGate::with_global(global, /*limit*/ 1);
+
+        let first_permit = first_gate.try_admit().expect("first request should fit");
+        assert_eq!(
+            first_gate.try_admit().expect_err("connection should be full"),
+            RpcAdmissionError::Overloaded
+        );
+        let second_permit = second_gate
+            .try_admit()
+            .expect("second global request should fit");
+        assert_eq!(
+            third_gate.try_admit().expect_err("global gate should be full"),
+            RpcAdmissionError::Overloaded
+        );
+        assert_eq!(first_gate.admitted_count(), 1);
+        assert_eq!(second_gate.admitted_count(), 1);
+        assert_eq!(third_gate.global_admitted_count(), 2);
+
+        drop(first_permit);
+        let third_permit = third_gate
+            .try_admit()
+            .expect("released global slot should be reusable");
+        assert_eq!(third_gate.global_admitted_count(), 2);
+
+        drop(second_permit);
+        drop(third_permit);
+        assert_eq!(third_gate.global_admitted_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn close_revokes_queued_admission_without_polling_future() {
+        let gate = ConnectionRpcGate::with_limits(/*global_limit*/ 2, /*per_connection_limit*/ 2);
+        let permit = gate.try_admit().expect("request should be admitted");
+        let polled = Arc::new(AtomicBool::new(/*v*/ false));
+        let polled_clone = Arc::clone(&polled);
+
+        gate.close().await;
+        assert!(!permit.is_active());
+        assert_eq!(gate.admitted_count(), 0);
+        assert_eq!(gate.global_admitted_count(), 0);
+
+        permit
+            .run(async move {
+                polled_clone.store(/*val*/ true, Ordering::Release);
+            })
+            .await;
+        assert!(!polled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn overload_response_is_stable() {
+        assert_eq!(
+            rpc_overloaded_error(),
+            JSONRPCErrorError {
+                code: OVERLOADED_ERROR_CODE,
+                message: RPC_OVERLOADED_MESSAGE.to_string(),
+                data: None,
+            }
+        );
     }
 }

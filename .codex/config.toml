@@ -1,0 +1,22 @@
+[agents]
+max_depth = 1
+
+[features.multi_agent_v2]
+enabled = true
+max_concurrent_threads_per_session = 4
+
+[agents.kd4_explorer]
+description = "Read-only KD4 source, ownership, and dependency investigator."
+config_file = "./agents/kd4_explorer.toml"
+
+[agents.kd4_worker]
+description = "Implements one bounded, owner-isolated KD4 item or lane."
+config_file = "./agents/kd4_worker.toml"
+
+[agents.kd4_verifier]
+description = "Reviews and validates KD4 changes with focused KDS evidence."
+config_file = "./agents/kd4_verifier.toml"
+
+[agents.kd4_integrator]
+description = "Coordinates cross-cutting KD4 contracts and final integration."
+config_file = "./agents/kd4_integrator.toml"

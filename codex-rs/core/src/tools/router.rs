@@ -6,6 +6,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::registry::AnyToolResult;
+use crate::tools::registry::ResolvedTool;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::schema_bundle::ToolSchemaBundle;
@@ -21,6 +22,7 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde::Deserialize;
 use std::borrow::Cow;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio_util::sync::CancellationToken;
@@ -33,6 +35,31 @@ pub struct ToolCall {
     pub tool_name: ToolName,
     pub call_id: String,
     pub payload: ToolPayload,
+}
+
+/// Immutable call data shared by admission, dispatch, cancellation, telemetry,
+/// and response projection. Cloning this envelope never clones a potentially
+/// large tool payload.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct SharedToolCall(Arc<ToolCall>);
+
+impl SharedToolCall {
+    pub(crate) fn new(call: ToolCall) -> Self {
+        Self(Arc::new(call))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_allocation_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Deref for SharedToolCall {
+    type Target = ToolCall;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref()
+    }
 }
 
 pub(crate) enum ToolCallPreflight {
@@ -190,10 +217,8 @@ impl ToolRouter {
             .unwrap_or(false)
     }
 
-    pub fn tool_waits_for_runtime_cancellation(&self, call: &ToolCall) -> bool {
-        self.registry
-            .waits_for_runtime_cancellation(&call.tool_name)
-            .unwrap_or(false)
+    pub(crate) fn resolve_tool_call(&self, call: &SharedToolCall) -> ResolvedTool {
+        self.registry.resolve_tool(&call.tool_name, &call.payload)
     }
 
     #[instrument(level = "trace", skip_all, err)]
@@ -251,6 +276,8 @@ impl ToolRouter {
         call: ToolCall,
         source: ToolCallSource,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        let call = SharedToolCall::new(call);
+        let resolved = self.resolve_tool_call(&call);
         self.dispatch_tool_call_with_code_mode_result_inner(
             session,
             step_context,
@@ -258,6 +285,7 @@ impl ToolRouter {
             tracker,
             call,
             source,
+            resolved,
             /*terminal_outcome_reached*/ None,
         )
         .await
@@ -265,14 +293,15 @@ impl ToolRouter {
 
     #[instrument(level = "trace", skip_all, err)]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn dispatch_tool_call_with_terminal_outcome(
+    pub(crate) async fn dispatch_resolved_tool_call_with_terminal_outcome(
         &self,
         session: Arc<Session>,
         step_context: Arc<StepContext>,
         cancellation_token: CancellationToken,
         tracker: SharedTurnDiffTracker,
-        call: ToolCall,
+        call: SharedToolCall,
         source: ToolCallSource,
+        resolved: ResolvedTool,
         terminal_outcome_reached: Arc<AtomicBool>,
     ) -> Result<AnyToolResult, FunctionCallError> {
         self.dispatch_tool_call_with_code_mode_result_inner(
@@ -282,6 +311,7 @@ impl ToolRouter {
             tracker,
             call,
             source,
+            resolved,
             Some(terminal_outcome_reached),
         )
         .await
@@ -294,16 +324,11 @@ impl ToolRouter {
         step_context: Arc<StepContext>,
         cancellation_token: CancellationToken,
         tracker: SharedTurnDiffTracker,
-        call: ToolCall,
+        call: SharedToolCall,
         source: ToolCallSource,
+        resolved: ResolvedTool,
         terminal_outcome_reached: Option<Arc<AtomicBool>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
-        let ToolCall {
-            tool_name,
-            call_id,
-            payload,
-        } = call;
-
         // Keep the legacy ToolInvocation.turn field tied to the same request state until handlers migrate.
         let turn = Arc::clone(&step_context.turn);
         let invocation = ToolInvocation {
@@ -312,14 +337,19 @@ impl ToolRouter {
             step_context,
             cancellation_token,
             tracker,
-            call_id,
-            tool_name,
+            call_id: call.call_id.clone(),
+            tool_name: call.tool_name.clone(),
             source,
-            payload,
+            payload: call.payload.clone(),
         };
 
         self.registry
-            .dispatch_any_with_terminal_outcome(invocation, terminal_outcome_reached)
+            .dispatch_resolved_with_terminal_outcome(
+                resolved,
+                call,
+                invocation,
+                terminal_outcome_reached,
+            )
             .await
     }
 }

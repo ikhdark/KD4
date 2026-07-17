@@ -3,8 +3,8 @@
 //! This policy preserves the baseline user experience while adapting to bursty
 //! stream input. In [`ChunkingMode::Smooth`], one queued line is drained per
 //! baseline commit tick. When queue pressure rises, it switches to
-//! [`ChunkingMode::CatchUp`] and drains queued backlog immediately so display
-//! lag converges as quickly as possible.
+//! [`ChunkingMode::CatchUp`] and drains bounded batches so display lag converges
+//! without letting one large backlog consume an entire render frame.
 //!
 //! The policy is source-agnostic: it depends only on queue depth and queue
 //! age from [`QueueSnapshot`]. It does not branch on source identity or explicit
@@ -15,7 +15,7 @@
 //! Think of this as a two-gear system:
 //!
 //! - [`ChunkingMode::Smooth`]: steady baseline display pacing.
-//! - [`ChunkingMode::CatchUp`]: full queue draining while backlog exists.
+//! - [`ChunkingMode::CatchUp`]: frame-budgeted batch draining while backlog exists.
 //!
 //! The transition logic intentionally uses hysteresis:
 //!
@@ -33,14 +33,14 @@
 //! 1. If queue is empty, reset to [`ChunkingMode::Smooth`].
 //! 2. If currently smooth, call [`AdaptiveChunkingPolicy::maybe_enter_catch_up`].
 //! 3. If currently catch-up, call [`AdaptiveChunkingPolicy::maybe_exit_catch_up`].
-//! 4. Build [`DrainPlan`] (`Single` for smooth, `Batch(queued_lines)` for catch-up).
+//! 4. Build [`DrainPlan`] (`Single` for smooth, bounded `Batch` for catch-up).
 //!
 //! # Concrete examples
 //!
 //! With current defaults:
 //!
 //! - `Smooth` drains one line per commit tick.
-//! - `CatchUp` drains all currently queued lines in a tick.
+//! - `CatchUp` drains at most [`CATCH_UP_MAX_LINES_PER_TICK`] queued lines in a tick.
 //!
 //! # Tuning guide (in code terms)
 //!
@@ -114,6 +114,12 @@ const SEVERE_QUEUE_DEPTH_LINES: usize = 64;
 
 /// Oldest-line age cutoff that marks backlog as severe for faster convergence.
 const SEVERE_OLDEST_AGE: Duration = Duration::from_millis(300);
+
+/// Maximum combined queue rows a catch-up tick may move into history.
+///
+/// `commit_tick` shares this allowance across active controllers, keeping catch-up work bounded
+/// even when a large response arrives in one transport burst.
+const CATCH_UP_MAX_LINES_PER_TICK: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ChunkingMode {
@@ -199,7 +205,11 @@ impl AdaptiveChunkingPolicy {
 
         let drain_plan = match self.mode {
             ChunkingMode::Smooth => DrainPlan::Single,
-            ChunkingMode::CatchUp => DrainPlan::Batch(snapshot.queued_lines.max(1)),
+            ChunkingMode::CatchUp => DrainPlan::Batch(
+                snapshot
+                    .queued_lines
+                    .clamp(1, CATCH_UP_MAX_LINES_PER_TICK),
+            ),
         };
 
         ChunkingDecision {
@@ -353,12 +363,12 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_batch_drains_current_backlog() {
+    fn catch_up_batch_respects_per_frame_line_budget() {
         let mut policy = AdaptiveChunkingPolicy::default();
         let now = Instant::now();
         let decision = policy.decide(snapshot(/*queued_lines*/ 512, /*oldest_age_ms*/ 400), now);
         assert_eq!(decision.mode, ChunkingMode::CatchUp);
-        assert_eq!(decision.drain_plan, DrainPlan::Batch(512));
+        assert_eq!(decision.drain_plan, DrainPlan::Batch(64));
     }
 
     #[test]

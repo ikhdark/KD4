@@ -2,8 +2,8 @@
 //!
 //! `MarkdownStreamCollector` buffers incoming token deltas and exposes a commit boundary at each
 //! newline. The stream controllers (`streaming/controller.rs`) call `commit_complete_source()`
-//! after each newline-bearing delta to obtain the completed prefix for re-rendering, leaving the
-//! trailing incomplete line in the buffer for the next delta.
+//! after each newline-bearing delta to obtain the completed prefix for re-rendering, while
+//! `pending_source()` exposes the trailing incomplete line for bounded provisional rendering.
 //!
 //! On finalization, `finalize_and_drain_source()` flushes whatever remains (the last line, which
 //! may lack a trailing newline).
@@ -93,6 +93,15 @@ impl MarkdownStreamCollector {
         let out = self.buffer[self.committed_source_len..commit_end].to_string();
         self.committed_source_len = commit_end;
         Some(out)
+    }
+
+    /// Return the live source suffix that has not crossed a newline commit boundary yet.
+    ///
+    /// Stream controllers may render this suffix provisionally while keeping the committed
+    /// newline-stable prefix canonical. The returned source remains owned by the collector and is
+    /// replaced by subsequent deltas or drained during finalization.
+    pub fn pending_source(&self) -> &str {
+        &self.buffer[self.committed_source_len..]
     }
 
     /// Finalize the stream and return any remaining raw source.
@@ -231,6 +240,18 @@ mod tests {
         c.push_delta("!\n");
         let out2 = c.commit_complete_lines();
         assert_eq!(out2.len(), 1, "one completed line after newline");
+    }
+
+    #[tokio::test]
+    async fn pending_source_stays_separate_from_newline_stable_prefix() {
+        let mut c = super::MarkdownStreamCollector::new(/*width*/ None, &super::test_cwd());
+        c.push_delta("Hello");
+        assert_eq!(c.pending_source(), "Hello");
+
+        c.push_delta("!\nnext");
+        assert_eq!(c.commit_complete_source().as_deref(), Some("Hello!\n"));
+        assert_eq!(c.pending_source(), "next");
+        assert_eq!(c.finalize_and_drain_source(), "next\n");
     }
 
     #[tokio::test]

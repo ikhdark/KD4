@@ -10,9 +10,12 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use tempfile::tempdir;
+use tokio::sync::Mutex;
 
 fn git_blob_sha1_hex(data: &str) -> String {
     format!("{:x}", git_blob_sha1_hex_bytes(data.as_bytes()))
@@ -58,6 +61,16 @@ fn verify_local_proof_command() -> Vec<String> {
         "--fast".into(),
         "--json".into(),
     ]
+}
+
+async fn wait_for_render_pause(pause: &TestRenderPause) {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !pause.started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("turn diff render should start");
 }
 
 trait TestTurnDiffTrackerExt {
@@ -1157,6 +1170,78 @@ async fn repeated_updates_only_rerender_the_touched_path() {
     }
 
     assert_eq!(tracker.rendered_diff_count(), 42);
+}
+
+#[tokio::test]
+async fn async_render_releases_tracker_mutex_and_discards_stale_result() {
+    let dir = tempdir().expect("tempdir");
+    let delta = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: a.txt\n+one\n*** End Patch",
+    )
+    .await;
+    let pause = Arc::new(TestRenderPause::default());
+    let tracker = Arc::new(Mutex::new(tracker_with_root(dir.path())));
+    tracker.lock().await.render_pause = Some(Arc::clone(&pause));
+
+    let update = tokio::spawn(TurnDiffTracker::track_delta_async(
+        Arc::clone(&tracker),
+        String::new(),
+        delta,
+    ));
+    wait_for_render_pause(&pause).await;
+
+    let mut guard = tokio::time::timeout(Duration::from_millis(100), tracker.lock())
+        .await
+        .expect("diff rendering must not hold the tracker mutex");
+    guard.record_unknown_mutation();
+    drop(guard);
+    pause.released.store(true, Ordering::Release);
+
+    assert!(update.await.expect("update task").is_none());
+    assert_eq!(tracker.lock().await.get_unified_diff(), None);
+}
+
+#[tokio::test]
+async fn cancelled_waiter_does_not_cancel_final_diff_publish() {
+    let dir = tempdir().expect("tempdir");
+    let delta = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Add File: a.txt\n+one\n*** End Patch",
+    )
+    .await;
+    let pause = Arc::new(TestRenderPause::default());
+    let tracker = Arc::new(Mutex::new(tracker_with_root(dir.path())));
+    tracker.lock().await.render_pause = Some(Arc::clone(&pause));
+
+    let update = tokio::spawn(TurnDiffTracker::track_delta_async(
+        Arc::clone(&tracker),
+        String::new(),
+        delta,
+    ));
+    wait_for_render_pause(&pause).await;
+    update.abort();
+    assert!(update.await.expect_err("waiter should be cancelled").is_cancelled());
+    pause.released.store(true, Ordering::Release);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if tracker.lock().await.get_unified_diff().is_some() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached render worker should publish the final diff");
+    assert!(
+        tracker
+            .lock()
+            .await
+            .get_unified_diff()
+            .expect("final diff")
+            .contains("+one")
+    );
 }
 
 #[test]

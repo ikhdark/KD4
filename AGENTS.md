@@ -1,6 +1,6 @@
 # Repository policy
 
-Shared policy revision: `2026-07-13`.
+Shared policy revision: `2026-07-16`.
 
 ## Synchronization contract
 
@@ -250,9 +250,12 @@ risk section when there is no unresolved risk.
 
 ## Tool use
 
-- Use `rg` or `rg --files` for normal text and file discovery. Use `fd`,
-  `ast-grep`, `jq`, `yq`, or another purpose-built tool only when it materially
-  simplifies the task.
+- Use `search_source` and `read_file_span` when available for bounded,
+  citation-friendly repository source lookup and targeted span reads. Use `rg`
+  or `rg --files` for regular-expression searches, exhaustive or closure
+  searches, file discovery, and advanced filtering. Use `fd`, `ast-grep`,
+  `jq`, `yq`, or another purpose-built tool only when it materially simplifies
+  the task.
 - Prefer repository-owned recipes such as `just`, configured formatters,
   generators, and focused test commands over improvised equivalents.
 - Use `apply_patch` for manual edits. Use an owning formatter or generator for

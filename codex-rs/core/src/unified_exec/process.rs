@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::exec::is_likely_sandbox_denied;
 use crate::tools::command_output_artifact::RawOutputArtifact;
-use crate::tools::command_output_artifact::RawOutputArtifactWriter;
+use crate::tools::command_output_artifact::RawOutputArtifactWriteQueue;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEvent;
 use codex_exec_server::OutputGap;
@@ -601,8 +601,7 @@ impl UnifiedExecProcess {
         let mut events = process.subscribe_events();
         let mut wake_rx = process.subscribe_wake();
         tokio::spawn(async move {
-            let mut artifact_writer =
-                RawOutputArtifactWriter::open(raw_output_artifact.as_ref()).await;
+            let artifact_queue = RawOutputArtifactWriteQueue::spawn(raw_output_artifact.clone());
             let mut last_seq: u64 = 0;
             let mut recovery_gaps = Vec::new();
             let mut recovered_sequences = BTreeSet::new();
@@ -814,16 +813,14 @@ impl UnifiedExecProcess {
                             page_chunk_count = page_chunk_count.saturating_add(1);
                             page_bytes = page_bytes.saturating_add(chunk_len);
                             let bytes = chunk.chunk.into_inner();
-                            if let Some(writer) = artifact_writer.as_mut() {
-                                writer
-                                    .write_chunk(raw_output_artifact.as_ref(), &bytes)
-                                    .await;
-                            }
-                            let mut guard = output_buffer.lock().await;
-                            guard.push_chunk(bytes.clone());
-                            drop(guard);
-                            let _ = output_tx.send(bytes);
-                            output_notify.notify_waiters();
+                            publish_output_chunk(
+                                &output_buffer,
+                                &output_tx,
+                                &output_notify,
+                                artifact_queue.as_ref(),
+                                bytes,
+                            )
+                            .await;
                         }
                         last_seq = advance_through_declared_gaps(last_seq, &recovery_gaps);
 
@@ -941,16 +938,14 @@ impl UnifiedExecProcess {
                         recovered_sequences.insert(chunk.seq);
                         last_seq = chunk.seq;
                         let bytes = chunk.chunk.into_inner();
-                        if let Some(writer) = artifact_writer.as_mut() {
-                            writer
-                                .write_chunk(raw_output_artifact.as_ref(), &bytes)
-                                .await;
-                        }
-                        let mut guard = output_buffer.lock().await;
-                        guard.push_chunk(bytes.clone());
-                        drop(guard);
-                        let _ = output_tx.send(bytes);
-                        output_notify.notify_waiters();
+                        publish_output_chunk(
+                            &output_buffer,
+                            &output_tx,
+                            &output_notify,
+                            artifact_queue.as_ref(),
+                            bytes,
+                        )
+                        .await;
                     }
                     ExecProcessEvent::Exited {
                         seq,
@@ -986,24 +981,39 @@ impl UnifiedExecProcess {
                     }
                 }
             }
-            if let Some(writer) = artifact_writer.as_mut() {
+            if let Some(artifact_queue) = artifact_queue {
                 if !recovery_gaps.is_empty() || !recovery_reasons.is_empty() {
                     let marker = recovery_incomplete_marker(&recovery_gaps, &recovery_reasons);
-                    writer
-                        .write_chunk(raw_output_artifact.as_ref(), &marker)
-                        .await;
+                    artifact_queue.enqueue(&marker);
                 }
-                writer.finish(raw_output_artifact.as_ref()).await;
+                artifact_queue.finish().await;
             }
         })
     }
 
     fn spawn_local_output_task(
+        stdout_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        stderr_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        output_handles: OutputHandles,
+        output_tx: broadcast::Sender<Vec<u8>>,
+        raw_output_artifact: Option<Arc<Mutex<RawOutputArtifact>>>,
+    ) -> JoinHandle<()> {
+        let artifact_queue = RawOutputArtifactWriteQueue::spawn(raw_output_artifact);
+        Self::spawn_local_output_task_with_artifact_queue(
+            stdout_rx,
+            stderr_rx,
+            output_handles,
+            output_tx,
+            artifact_queue,
+        )
+    }
+
+    pub(super) fn spawn_local_output_task_with_artifact_queue(
         mut stdout_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         mut stderr_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
-        raw_output_artifact: Option<Arc<Mutex<RawOutputArtifact>>>,
+        artifact_queue: Option<RawOutputArtifactWriteQueue>,
     ) -> JoinHandle<()> {
         let OutputHandles {
             output_buffer,
@@ -1014,8 +1024,6 @@ impl UnifiedExecProcess {
             recovery_evidence: _,
         } = output_handles;
         tokio::spawn(async move {
-            let mut artifact_writer =
-                RawOutputArtifactWriter::open(raw_output_artifact.as_ref()).await;
             let mut stdout_open = true;
             let mut stderr_open = true;
             loop {
@@ -1037,22 +1045,20 @@ impl UnifiedExecProcess {
                     else => break,
                 };
                 if let Some(chunk) = chunk {
-                    if let Some(writer) = artifact_writer.as_mut() {
-                        writer
-                            .write_chunk(raw_output_artifact.as_ref(), &chunk)
-                            .await;
-                    }
-                    let mut guard = output_buffer.lock().await;
-                    guard.push_chunk(chunk.clone());
-                    drop(guard);
-                    let _ = output_tx.send(chunk);
-                    output_notify.notify_waiters();
+                    publish_output_chunk(
+                        &output_buffer,
+                        &output_tx,
+                        &output_notify,
+                        artifact_queue.as_ref(),
+                        chunk,
+                    )
+                    .await;
                 }
             }
             output_closed.store(true, Ordering::Release);
             output_closed_notify.notify_waiters();
-            if let Some(writer) = artifact_writer.as_mut() {
-                writer.finish(raw_output_artifact.as_ref()).await;
+            if let Some(artifact_queue) = artifact_queue {
+                artifact_queue.finish().await;
             }
         })
     }
@@ -1061,6 +1067,23 @@ impl UnifiedExecProcess {
         let state = self.state_rx.borrow().clone();
         let _ = self.state_tx.send_replace(state.exited(exit_code));
         self.cancellation_token.cancel();
+    }
+}
+
+async fn publish_output_chunk(
+    output_buffer: &OutputBuffer,
+    output_tx: &broadcast::Sender<Vec<u8>>,
+    output_notify: &Notify,
+    artifact_queue: Option<&RawOutputArtifactWriteQueue>,
+    chunk: Vec<u8>,
+) {
+    let mut guard = output_buffer.lock().await;
+    guard.push_chunk(chunk.clone());
+    drop(guard);
+    let _ = output_tx.send(chunk.clone());
+    output_notify.notify_waiters();
+    if let Some(artifact_queue) = artifact_queue {
+        artifact_queue.enqueue(&chunk);
     }
 }
 
