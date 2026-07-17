@@ -260,7 +260,8 @@ pub(super) async fn run_exec_like_with_exit_code(
         turn_environment.environment_id.clone(),
     );
     let event_tracker = track_validation_freshness.then_some(&tracker);
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
+    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
+        .with_task_evidence(track_validation_freshness);
     emitter.begin(event_ctx).await;
 
     let exec_approval_requirement = session
@@ -335,7 +336,8 @@ pub(super) async fn run_exec_like_with_exit_code(
             .record_exit(attempt_key, retry_exit_code)
             .await;
     }
-    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
+    let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker)
+        .with_task_evidence(track_validation_freshness);
     let post_tool_use_response = out
         .as_ref()
         .ok()

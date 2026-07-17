@@ -15,7 +15,7 @@ fn automatic_validation_command(long_running: bool) -> Vec<codex_verify_local::C
     let script = if long_running {
         "Start-Sleep -Seconds 30"
     } else {
-        "exit 0"
+        "Write-Output ok"
     };
     [
         "powershell.exe",
@@ -24,14 +24,18 @@ fn automatic_validation_command(long_running: bool) -> Vec<codex_verify_local::C
         "-Command",
         script,
     ]
-        .into_iter()
-        .map(codex_verify_local::CommandArgV2::text)
-        .collect()
+    .into_iter()
+    .map(codex_verify_local::CommandArgV2::text)
+    .collect()
 }
 
 #[cfg(not(windows))]
 fn automatic_validation_command(long_running: bool) -> Vec<codex_verify_local::CommandArgV2> {
-    let script = if long_running { "sleep 30" } else { "exit 0" };
+    let script = if long_running {
+        "sleep 30"
+    } else {
+        "printf 'ok\\n'"
+    };
     ["sh", "-c", script]
         .into_iter()
         .map(codex_verify_local::CommandArgV2::text)
@@ -76,16 +80,29 @@ fn automatic_validation_plan(
 #[tokio::test]
 async fn automatic_validation_cancels_stale_generation_then_records_one_exact_fast_receipt() {
     const CHANGED_PATH: &str = "codex-rs/core/src/task_evidence.rs";
-    let (session, mut turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
     turn.approval_policy
         .set(AskForApproval::Never)
         .expect("test approval policy");
+    #[allow(deprecated)]
+    let repo_root = find_verify_local_repo_root(&PathUri::from_abs_path(&turn.cwd))
+        .expect("KD4 repository root");
+    let evidence_home = tempfile::tempdir().expect("task evidence home");
+    Arc::make_mut(&mut turn.config).codex_home =
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+            evidence_home.path().to_path_buf(),
+        )
+        .expect("absolute task evidence home");
+    session.services.task_evidence = crate::task_evidence::TaskEvidenceLedger::deferred(
+        evidence_home.path().to_path_buf(),
+        session.thread_id(),
+        &repo_root,
+    )
+    .await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-    #[allow(deprecated)]
-    let repo_root = find_verify_local_repo_root(&turn.cwd).expect("KD4 repository root");
     let ledger = &session.services.task_evidence;
     ledger
         .seed_automatic_validation_mutation_for_test(&[CHANGED_PATH])
@@ -146,27 +163,36 @@ async fn automatic_validation_cancels_stale_generation_then_records_one_exact_fa
         ledger
             .automatic_validation_receipts_for_test(&current_claim_id)
             .await,
-        vec![(
-            "fast".to_string(),
-            vec![CHANGED_PATH.to_string()],
-            true,
-        )]
+        vec![("fast".to_string(), vec![CHANGED_PATH.to_string()], true,)]
     );
 }
 
 #[tokio::test]
 async fn automatic_fast_pass_cannot_override_stronger_final_failure() {
     const CHANGED_PATH: &str = "codex-rs/core/src/task_evidence.rs";
-    let (session, mut turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
     turn.approval_policy
         .set(AskForApproval::Never)
         .expect("test approval policy");
+    #[allow(deprecated)]
+    let repo_root = find_verify_local_repo_root(&PathUri::from_abs_path(&turn.cwd))
+        .expect("KD4 repository root");
+    let evidence_home = tempfile::tempdir().expect("task evidence home");
+    Arc::make_mut(&mut turn.config).codex_home =
+        codex_utils_absolute_path::AbsolutePathBuf::from_absolute_path(
+            evidence_home.path().to_path_buf(),
+        )
+        .expect("absolute task evidence home");
+    session.services.task_evidence = crate::task_evidence::TaskEvidenceLedger::deferred(
+        evidence_home.path().to_path_buf(),
+        session.thread_id(),
+        &repo_root,
+    )
+    .await;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     let step_context = StepContext::for_test(Arc::clone(&turn));
     let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-    #[allow(deprecated)]
-    let repo_root = find_verify_local_repo_root(&turn.cwd).expect("KD4 repository root");
     let ledger = &session.services.task_evidence;
     ledger
         .seed_automatic_validation_mutation_for_test(&[CHANGED_PATH])

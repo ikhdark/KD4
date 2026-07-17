@@ -147,7 +147,10 @@ async fn connected_catalog_authorization_ignores_later_shared_cache_mutation() {
 
     assert!(client.connected_catalog_contains("connected_tool"));
     assert!(!client.connected_catalog_contains("later_cached_tool"));
-    assert_eq!(client.listed_tools()[0].callable_name, "later_cached_tool");
+    assert_eq!(
+        cache_context.current_tools().expect("mutated shared cache")[0].callable_name,
+        "later_cached_tool"
+    );
 }
 
 async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> AsyncManagedClient {
@@ -781,9 +784,13 @@ fn filter_tools_applies_per_server_filters() {
 
 #[test]
 fn codex_apps_env_bearer_token_bypasses_shared_tools_cache() {
+    let server = EffectiveMcpServer::host_owned_codex_apps(crate::codex_apps_mcp_server_config(
+        "https://chatgpt.com",
+        /*apps_mcp_product_sku*/ None,
+        /*originator*/ None,
+    ));
     assert!(!should_share_codex_apps_tools_cache(
-        CODEX_APPS_MCP_SERVER_NAME,
-        /*uses_env_bearer_token*/ true,
+        &server, /*uses_env_bearer_token*/ true,
     ));
 }
 
@@ -1425,6 +1432,7 @@ async fn list_all_tools_adds_server_metadata_to_tools() {
             supports_parallel_tool_calls: true,
             default_tools_approval_mode: None,
             tool_approval_modes: HashMap::new(),
+            host_owned_codex_apps: false,
         },
     );
     manager
@@ -1499,13 +1507,12 @@ fn host_owned_codex_apps_requires_validated_registration_provenance() {
     assert!(manager.is_host_owned_codex_apps_server(CODEX_APPS_MCP_SERVER_NAME));
     assert!(!manager.is_host_owned_codex_apps_server("docs"));
 
-    let user_owned_reserved_name = EffectiveMcpServer::configured(
-        crate::codex_apps_mcp_server_config(
+    let user_owned_reserved_name =
+        EffectiveMcpServer::configured(crate::codex_apps_mcp_server_config(
             "https://chatgpt.com",
             /*apps_mcp_product_sku*/ None,
             /*originator*/ None,
-        ),
-    );
+        ));
     manager.server_metadata.insert(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
         McpServerMetadata::from(&user_owned_reserved_name),
@@ -1535,10 +1542,7 @@ fn cached_catalog_never_defers_a_required_server() {
         /*originator*/ None,
     );
     let optional = EffectiveMcpServer::host_owned_codex_apps(config.clone());
-    assert!(should_defer_server_startup(
-        &optional,
-        Some(&cache_context)
-    ));
+    assert!(should_defer_server_startup(&optional, Some(&cache_context)));
 
     config.required = true;
     let required = EffectiveMcpServer::host_owned_codex_apps(config);
@@ -1577,11 +1581,8 @@ async fn cached_optional_apps_catalog_stays_dormant_until_authoritative_use() {
         oauth_resource: None,
         tools: HashMap::new(),
     };
-    let cache_key = codex_apps_tools_cache_key(
-        /*auth*/ None,
-        CODEX_APPS_MCP_SERVER_NAME,
-        &apps_config,
-    );
+    let cache_key =
+        codex_apps_tools_cache_key(/*auth*/ None, CODEX_APPS_MCP_SERVER_NAME, &apps_config);
     cache
         .context(codex_home.path().to_path_buf(), cache_key)
         .store_current_tools_for_test(vec![create_test_tool(
@@ -1741,10 +1742,7 @@ async fn concurrent_authoritative_uses_join_one_reconnect_after_deferred_failure
         })
     };
     let manager = Arc::new(create_test_manager_with_failed_apps_startup(
-        vec![create_test_tool(
-            CODEX_APPS_MCP_SERVER_NAME,
-            "cached_tool",
-        )],
+        vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "cached_tool")],
         reconnect_factory,
     ));
 

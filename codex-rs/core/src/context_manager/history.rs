@@ -36,6 +36,10 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::LazyLock;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 
 pub(crate) const PROMPT_HISTORY_CANONICAL_POLICY_VERSION: u16 = 1;
 const PROMPT_HISTORY_CANONICAL_HASH_DOMAIN: &[u8] = b"codex.websocket.history.v1";
@@ -124,6 +128,8 @@ pub(crate) struct PromptHistorySnapshot {
     proof_tail: Arc<PromptHistoryProofNode>,
     #[cfg(test)]
     normalization_work: usize,
+    #[cfg(test)]
+    materialization_count: Arc<AtomicUsize>,
 }
 
 impl PromptHistorySnapshot {
@@ -152,6 +158,8 @@ impl PromptHistorySnapshot {
     }
 
     pub(crate) fn materialize(&self) -> Vec<ResponseItem> {
+        #[cfg(test)]
+        self.materialization_count.fetch_add(1, Ordering::Relaxed);
         self.segments
             .materialize_segments()
             .into_iter()
@@ -233,6 +241,11 @@ impl PromptHistorySnapshot {
     #[cfg(test)]
     pub(crate) fn normalization_work(&self) -> usize {
         self.normalization_work
+    }
+
+    #[cfg(test)]
+    pub(crate) fn materialization_count(&self) -> usize {
+        self.materialization_count.load(Ordering::Relaxed)
     }
 }
 
@@ -460,6 +473,8 @@ impl ContextManager {
             proof_tail: Arc::clone(&cache.proof_tail),
             #[cfg(test)]
             normalization_work,
+            #[cfg(test)]
+            materialization_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 

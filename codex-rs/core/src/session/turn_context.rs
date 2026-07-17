@@ -671,6 +671,8 @@ impl Session {
         sub_id: String,
         updates: SessionSettingsUpdate,
     ) -> CodexResult<Arc<TurnContext>> {
+        self.wait_for_startup_discovery(&self.startup_discovery_cancellation)
+            .await?;
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
         let update_result: CodexResult<_> = {
             let mut state = self.state.lock().await;
@@ -805,8 +807,8 @@ impl Session {
                 .original_config_do_not_use
                 .to_models_manager_config(),
         );
-        let available_models = model_catalog
-            .available_models(self.services.models_manager.uses_codex_backend());
+        let available_models =
+            model_catalog.available_models(self.services.models_manager.uses_codex_backend());
         let per_turn_config =
             self.turn_config_snapshot(&session_configuration, cwd.clone(), &model_info);
         self.services

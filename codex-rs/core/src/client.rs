@@ -117,6 +117,7 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::client_common::format_response_input_for_request;
 use crate::context_manager::PromptHistoryCanonicalHash;
 use crate::context_manager::PromptHistoryIncrementalProof;
 use crate::context_manager::PromptHistoryPolicyIdentity;
@@ -658,6 +659,7 @@ fn responses_request_properties_fingerprint(
     request: &ResponsesApiRequest,
     auth_snapshot: &RequestAuthSnapshot,
     history_policy_identity: PromptHistoryPolicyIdentity,
+    use_responses_lite: bool,
 ) -> serde_json::Result<[u8; 32]> {
     // Input is compared through the canonical history proof, while delivery-only
     // stream options and client metadata do not affect previous_response_id reuse.
@@ -696,7 +698,8 @@ fn responses_request_properties_fingerprint(
         client_metadata: None,
     };
     let serialized = serde_json::to_vec(&properties)?;
-    let static_identity = serde_json::to_vec(&(auth_snapshot, history_policy_identity))?;
+    let static_identity =
+        serde_json::to_vec(&(auth_snapshot, history_policy_identity, use_responses_lite))?;
     let mut hasher = Sha256::new();
     hasher.update(WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN);
     hasher.update((static_identity.len() as u64).to_be_bytes());
@@ -1582,10 +1585,6 @@ impl ModelClientSession {
         self.client.capture_request_auth_snapshot().await
     }
 
-    pub(crate) fn request_auth_generation_matches(&self, snapshot: &RequestAuthSnapshot) -> bool {
-        self.client.current_auth_generation() == snapshot.generation
-    }
-
     pub(crate) fn set_turn_timing(&mut self, turn_timing: Arc<TurnTimingState>) {
         self.turn_timing = Some(turn_timing);
     }
@@ -1630,6 +1629,7 @@ impl ModelClientSession {
         request: &ResponsesApiRequest,
         auth_snapshot: &RequestAuthSnapshot,
         history_policy_identity: PromptHistoryPolicyIdentity,
+        use_responses_lite: bool,
         request_prefix: serde_json::Result<CanonicalPrefixHash>,
         mutation_revision: Option<u64>,
         rewrite_revision: Option<u64>,
@@ -1639,6 +1639,7 @@ impl ModelClientSession {
             request,
             auth_snapshot,
             history_policy_identity,
+            use_responses_lite,
         );
         self.websocket_session.next_history_generation = self
             .websocket_session
@@ -1715,6 +1716,7 @@ impl ModelClientSession {
         history: Option<&PromptHistorySnapshot>,
         auth_snapshot: &RequestAuthSnapshot,
         history_policy_identity: PromptHistoryPolicyIdentity,
+        use_responses_lite: bool,
         last_response: &LastResponse,
         allow_empty_delta: bool,
     ) -> Option<IncrementalProof> {
@@ -1724,6 +1726,7 @@ impl ModelClientSession {
             request,
             auth_snapshot,
             history_policy_identity,
+            use_responses_lite,
         )
         .ok()?;
         if current_properties_fingerprint != baseline.request_properties_fingerprint {
@@ -1738,48 +1741,46 @@ impl ModelClientSession {
             return None;
         }
 
-        let (input, current_prefix, mutation_revision, rewrite_revision) =
-            if crate::latency_switches::stage3_persistence_history_enabled()
-                && let Some(history) = history
-                && let (Some(mutation_revision), Some(rewrite_revision)) =
-                    (baseline.mutation_revision, baseline.rewrite_revision)
-                && let Some(PromptHistoryIncrementalProof {
-                    suffix,
-                    current_prefix,
-                    mutation_revision,
-                    rewrite_revision,
-                }) = history.incremental_proof(
-                    mutation_revision,
-                    rewrite_revision,
-                    baseline.request_prefix,
-                    baseline.history_policy_identity,
-                    &last_response.items_added,
-                )
-            {
-                (
-                    suffix,
-                    current_prefix,
-                    Some(mutation_revision),
-                    Some(rewrite_revision),
-                )
-            } else {
-                let mut expected_prefix = baseline.request_prefix;
-                expected_prefix
-                    .extend_items(&last_response.items_added)
-                    .ok()?;
-                let (candidate_prefix, input) =
-                    request.input.split_at_checked(expected_prefix.item_count)?;
-                if CanonicalPrefixHash::from_items(candidate_prefix).ok()? != expected_prefix {
-                    trace!(
-                        history_generation = baseline.generation,
-                        "incremental request failed, normalized prefix digest didn't match"
-                    );
-                    return None;
-                }
-                let mut current_prefix = expected_prefix;
-                current_prefix.extend_items(input).ok()?;
-                (input.to_vec(), current_prefix, None, None)
-            };
+        let (input, current_prefix, mutation_revision, rewrite_revision) = if let Some(history) =
+            history
+            && let (Some(mutation_revision), Some(rewrite_revision)) =
+                (baseline.mutation_revision, baseline.rewrite_revision)
+            && let Some(PromptHistoryIncrementalProof {
+                suffix,
+                current_prefix,
+                mutation_revision,
+                rewrite_revision,
+            }) = history.incremental_proof(
+                mutation_revision,
+                rewrite_revision,
+                baseline.request_prefix,
+                baseline.history_policy_identity,
+                &last_response.items_added,
+            ) {
+            (
+                suffix,
+                current_prefix,
+                Some(mutation_revision),
+                Some(rewrite_revision),
+            )
+        } else {
+            let mut expected_prefix = baseline.request_prefix;
+            expected_prefix
+                .extend_items(&last_response.items_added)
+                .ok()?;
+            let (candidate_prefix, input) =
+                request.input.split_at_checked(expected_prefix.item_count)?;
+            if CanonicalPrefixHash::from_items(candidate_prefix).ok()? != expected_prefix {
+                trace!(
+                    history_generation = baseline.generation,
+                    "incremental request failed, normalized prefix digest didn't match"
+                );
+                return None;
+            }
+            let mut current_prefix = expected_prefix;
+            current_prefix.extend_items(input).ok()?;
+            (input.to_vec(), current_prefix, None, None)
+        };
 
         if !allow_empty_delta && input.is_empty() {
             return None;
@@ -1816,21 +1817,24 @@ impl ModelClientSession {
         history: Option<&PromptHistorySnapshot>,
         auth_snapshot: &RequestAuthSnapshot,
         history_policy_identity: PromptHistoryPolicyIdentity,
+        use_responses_lite: bool,
         last_response: &LastResponse,
     ) -> std::result::Result<(ResponsesWsRequest, bool, IncrementalProof), ResponseCreateWsRequest>
     {
         let previous_response_id_from_untraced_warmup =
             self.websocket_session.last_response_from_untraced_warmup;
-        let Some(proof) = self.get_incremental_proof(
+        let Some(mut proof) = self.get_incremental_proof(
             request,
             history,
             auth_snapshot,
             history_policy_identity,
+            use_responses_lite,
             last_response,
             /*allow_empty_delta*/ true,
         ) else {
             return Err(payload);
         };
+        format_response_input_for_request(&mut proof.input, use_responses_lite);
         if let Some(baseline) = self.websocket_session.last_request_history.as_mut() {
             baseline.previous_response_id = Some(proof.previous_response_id.clone());
         }
@@ -2196,8 +2200,10 @@ impl ModelClientSession {
             } else {
                 session_telemetry_for_request(session_telemetry, &request)
             };
-            let snapshot_input_is_direct =
-                request.input.is_empty() && !model_info.use_responses_lite;
+            // The caller supplies model-visible history exclusively through the frozen
+            // snapshot. Responses Lite may still place stable tool-schema control items in
+            // `request.input`, so the serialized request itself is not necessarily empty.
+            let snapshot_input_is_exclusive = prompt.input.is_empty();
             let mut client_metadata = self
                 .client
                 .build_ws_client_metadata(responses_metadata, model_info.use_responses_lite);
@@ -2262,6 +2268,7 @@ impl ModelClientSession {
                     history,
                     auth_snapshot,
                     history_policy_identity,
+                    model_info.use_responses_lite,
                     last_response,
                 ),
                 None => Err(ws_payload),
@@ -2314,6 +2321,7 @@ impl ModelClientSession {
                             /*history*/ None,
                             auth_snapshot,
                             history_policy_identity,
+                            model_info.use_responses_lite,
                             last_response,
                         ),
                         None => Err(ws_payload),
@@ -2328,10 +2336,7 @@ impl ModelClientSession {
                             Some(proof.previous_response_id),
                         ),
                         Err(ws_payload) => {
-                            let snapshot_identity = history.filter(|history| {
-                                snapshot_input_is_direct
-                                    && request.input.len() == history.canonical_prefix().item_count
-                            });
+                            let snapshot_identity = history.filter(|_| snapshot_input_is_exclusive);
                             (
                                 ResponsesWsRequest::ResponseCreate(ws_payload),
                                 false,
@@ -2371,6 +2376,7 @@ impl ModelClientSession {
                 &request,
                 auth_snapshot,
                 history_policy_identity,
+                model_info.use_responses_lite,
                 request_prefix,
                 mutation_revision,
                 rewrite_revision,

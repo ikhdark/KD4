@@ -833,8 +833,7 @@ impl TaskEvidenceLedger {
                     || document.automatic_plan_attempt_epoch != Some(request.evidence_generation)
                     || document.automatic_plan_attempt_claim_id.as_deref()
                         != Some(request.claim_id.as_str())
-            })
-                || document.evidence_epoch != epoch
+            }) || document.evidence_epoch != epoch
                 || task_evidence_workspace_generation(document) != workspace_generation
                 || task_evidence_spec_generation(document) != spec_generation
             {
@@ -1299,10 +1298,7 @@ impl TaskEvidenceLedger {
                 } else {
                     MutationCoverage::Incomplete
                 };
-                if matches!(
-                    observation,
-                    MutationObservation::Changed | MutationObservation::Unknown
-                ) {
+                if observation == MutationObservation::Changed {
                     invalidate_for_mutation(document);
                 }
                 if observation == MutationObservation::Changed {
@@ -1355,7 +1351,9 @@ impl TaskEvidenceLedger {
                     possible_mutation,
                     observation: Some(observation),
                     coverage: Some(coverage),
-                    changed_paths: if observation == MutationObservation::Changed {
+                    changed_paths: if observation == MutationObservation::Changed
+                        && command_succeeded
+                    {
                         command_changed_paths.clone()
                     } else {
                         Vec::new()
@@ -2155,10 +2153,7 @@ impl TaskEvidenceLedger {
     }
 
     #[cfg(test)]
-    pub(crate) async fn seed_automatic_validation_mutation_for_test(
-        &self,
-        changed_paths: &[&str],
-    ) {
+    pub(crate) async fn seed_automatic_validation_mutation_for_test(&self, changed_paths: &[&str]) {
         self.ensure_initialized().await;
         let Some(repo_root) = self.repo_root.as_ref() else {
             return;
@@ -2180,10 +2175,8 @@ impl TaskEvidenceLedger {
                         .latest_file_hashes
                         .insert(snapshot.path.clone(), snapshot.clone());
                 }
-                let receipt_id = next_receipt_id(
-                    "command",
-                    &mut document.next_command_receipt_sequence,
-                );
+                let receipt_id =
+                    next_receipt_id("command", &mut document.next_command_receipt_sequence);
                 document.command_receipts.push(CommandReceipt {
                     id: receipt_id,
                     recorded_at: timestamp(),
@@ -3389,6 +3382,17 @@ fn promote_steps_with_fresh_evidence(document: &mut TaskEvidenceDocument) {
                 .any(|step| step.id == step_id && step.status == StepStatus::Passed);
         }
     }
+    let active_ids = document
+        .plan
+        .iter()
+        .filter(|step| step.status == StepStatus::InProgress)
+        .map(|step| step.id.clone())
+        .collect::<Vec<_>>();
+    document.active_step_id = if active_ids.len() == 1 {
+        active_ids.into_iter().next()
+    } else {
+        None
+    };
 }
 
 fn step_has_fresh_evidence(document: &TaskEvidenceDocument, index: usize) -> bool {
@@ -3764,10 +3768,7 @@ fn automatic_validation_mutation_pending(document: &TaskEvidenceDocument, epoch:
         })
 }
 
-fn automatic_validation_changed_paths(
-    document: &TaskEvidenceDocument,
-    epoch: u64,
-) -> Vec<String> {
+fn automatic_validation_changed_paths(document: &TaskEvidenceDocument, epoch: u64) -> Vec<String> {
     let mut paths = BTreeSet::new();
     for receipt in document
         .edit_receipts

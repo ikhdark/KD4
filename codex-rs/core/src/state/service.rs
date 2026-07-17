@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
+use super::mcp_projection::McpProjectionCoordinator;
 use crate::SkillsService;
 use crate::agent::AgentControl;
 use crate::agents_md_manager::AgentsMdManager;
@@ -19,7 +20,6 @@ use crate::guardian::GuardianRejection;
 use crate::guardian::GuardianRejectionCircuitBreaker;
 use crate::mcp::McpManager;
 use crate::session::McpRuntimeSnapshot;
-use super::mcp_projection::McpProjectionCoordinator;
 use crate::task_evidence::TaskEvidenceLedger;
 use crate::tools::code_mode::CodeModeService;
 use crate::tools::command_execution::CommandExecutionLedger;
@@ -90,7 +90,7 @@ pub(crate) struct SessionServices {
     pub(crate) mcp_manager: Arc<McpManager>,
     pub(crate) extensions: Arc<ExtensionRegistry<crate::config::Config>>,
     pub(crate) session_extension_data: ExtensionData,
-    pub(crate) thread_extension_data: ExtensionData,
+    pub(crate) thread_extension_data: Arc<ExtensionData>,
     pub(crate) supports_openai_form_elicitation: AtomicBool,
     /// Raw capability selections for this thread. Each model step resolves them against its
     /// current executor environments before using them.

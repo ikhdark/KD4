@@ -5546,7 +5546,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         session_extension_data: codex_extension_api::ExtensionData::new(
             agent_control.session_id().to_string(),
         ),
-        thread_extension_data: codex_extension_api::ExtensionData::new(thread_id.to_string()),
+        thread_extension_data: Arc::new(codex_extension_api::ExtensionData::new(
+            thread_id.to_string(),
+        )),
         selected_capability_roots: Vec::new(),
         mcp_thread_init: codex_extension_api::ExtensionDataInit::default(),
         supports_openai_form_elicitation: std::sync::atomic::AtomicBool::new(false),
@@ -5646,6 +5648,8 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
+        startup_discovery_readiness: super::session::StartupDiscoveryReadiness::completed(),
+        startup_discovery_cancellation: CancellationToken::new(),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
         rollout_compression_scheduled: std::sync::atomic::AtomicBool::new(false),
@@ -7692,7 +7696,9 @@ where
         session_extension_data: codex_extension_api::ExtensionData::new(
             agent_control.session_id().to_string(),
         ),
-        thread_extension_data: codex_extension_api::ExtensionData::new(thread_id.to_string()),
+        thread_extension_data: Arc::new(codex_extension_api::ExtensionData::new(
+            thread_id.to_string(),
+        )),
         selected_capability_roots: Vec::new(),
         mcp_thread_init: codex_extension_api::ExtensionDataInit::default(),
         supports_openai_form_elicitation: std::sync::atomic::AtomicBool::new(false),
@@ -7792,6 +7798,8 @@ where
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
+        startup_discovery_readiness: super::session::StartupDiscoveryReadiness::completed(),
+        startup_discovery_cancellation: CancellationToken::new(),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
         rollout_compression_scheduled: std::sync::atomic::AtomicBool::new(false),

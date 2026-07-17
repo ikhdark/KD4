@@ -36,6 +36,7 @@ pub(crate) struct ToolEventCtx<'a> {
     pub turn: &'a TurnContext,
     pub call_id: &'a str,
     pub turn_diff_tracker: Option<&'a SharedTurnDiffTracker>,
+    pub record_task_evidence: bool,
 }
 
 impl<'a> ToolEventCtx<'a> {
@@ -50,7 +51,13 @@ impl<'a> ToolEventCtx<'a> {
             turn,
             call_id,
             turn_diff_tracker,
+            record_task_evidence: true,
         }
+    }
+
+    pub fn with_task_evidence(mut self, record_task_evidence: bool) -> Self {
+        self.record_task_evidence = record_task_evidence;
+        self
     }
 }
 
@@ -536,11 +543,13 @@ async fn emit_exec_stage(
 ) {
     match stage {
         ToolEventStage::Begin => {
-            ctx.session
-                .services
-                .task_evidence
-                .record_command_intent(ctx.call_id, exec_input.command, exec_input.cwd)
-                .await;
+            if ctx.record_task_evidence {
+                ctx.session
+                    .services
+                    .task_evidence
+                    .record_command_intent(ctx.call_id, exec_input.command, exec_input.cwd)
+                    .await;
+            }
             emit_exec_command_begin(
                 ctx,
                 exec_input.command,
@@ -615,20 +624,23 @@ async fn emit_exec_end(
     })
     .await
     .unwrap_or(true);
-    let mutation_observation = ctx
-        .session
-        .services
-        .task_evidence
-        .record_command(
-            ctx.call_id,
-            exec_input.command,
-            exec_input.cwd,
-            exec_result.exit_code,
-            exec_result.timed_out,
-            u64::try_from(exec_result.duration.as_millis()).unwrap_or(u64::MAX),
-            possible_mutation,
-        )
-        .await;
+    let mutation_observation = if ctx.record_task_evidence {
+        ctx.session
+            .services
+            .task_evidence
+            .record_command(
+                ctx.call_id,
+                exec_input.command,
+                exec_input.cwd,
+                exec_result.exit_code,
+                exec_result.timed_out,
+                u64::try_from(exec_result.duration.as_millis()).unwrap_or(u64::MAX),
+                possible_mutation,
+            )
+            .await
+    } else {
+        Some(crate::task_evidence::MutationObservation::Unchanged)
+    };
     let tracker_observation = mutation_observation.unwrap_or(if possible_mutation {
         crate::task_evidence::MutationObservation::Unknown
     } else {

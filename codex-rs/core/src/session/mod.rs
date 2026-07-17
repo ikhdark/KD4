@@ -867,6 +867,7 @@ impl Codex {
     }
 
     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
+        self.session.startup_discovery_cancellation.cancel();
         let session_loop_termination = self.session_loop_termination.clone();
         match self.submit(Op::Shutdown).await {
             Ok(_) => {}
@@ -1678,8 +1679,11 @@ impl Session {
     }
 
     pub(crate) async fn refresh_runtime_config(&self, next_config: Config) {
-        self.refresh_runtime_config_inner(Arc::new(next_config), /*invalidate_shared_caches*/ true)
-            .await;
+        self.refresh_runtime_config_inner(
+            Arc::new(next_config),
+            /*invalidate_shared_caches*/ true,
+        )
+        .await;
     }
 
     pub(crate) async fn refresh_runtime_config_from_process_reload(

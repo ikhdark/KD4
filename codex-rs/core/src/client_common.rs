@@ -56,10 +56,17 @@ impl Prompt {
         use_responses_lite: bool,
     ) -> Vec<ResponseItem> {
         let mut input = self.input.clone();
-        if use_responses_lite {
-            strip_image_details(&mut input);
-        }
+        format_response_input_for_request(&mut input, use_responses_lite);
         input
+    }
+}
+
+pub(crate) fn format_response_input_for_request(
+    items: &mut [ResponseItem],
+    use_responses_lite: bool,
+) {
+    if use_responses_lite {
+        strip_image_details(items);
     }
 }
 

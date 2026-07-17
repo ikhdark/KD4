@@ -15,8 +15,8 @@ use std::time::Instant;
 
 use anyhow::Context;
 use arc_swap::ArcSwapOption;
-use codex_login::CodexAuth;
 use codex_config::McpServerConfig;
+use codex_login::CodexAuth;
 use codex_protocol::mcp::McpServerInfo;
 use serde::Deserialize;
 use serde::Serialize;
@@ -51,8 +51,8 @@ pub(crate) fn codex_apps_tools_cache_key(
         auth.is_some_and(CodexAuth::is_workspace_account),
     ))
     .expect("Codex Apps auth cache identity should serialize");
-    let server_config = serde_json::to_value(server_config)
-        .expect("Codex Apps server config should serialize");
+    let server_config =
+        serde_json::to_value(server_config).expect("Codex Apps server config should serialize");
     let mut server_identity = server_name.as_bytes().to_vec();
     server_identity.push(0);
     server_identity.extend_from_slice(canonical_json(&server_config).as_bytes());
@@ -82,11 +82,16 @@ fn canonical_json(value: &serde_json::Value) -> String {
         serde_json::Value::Null
         | serde_json::Value::Bool(_)
         | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => serde_json::to_string(value)
-            .expect("primitive JSON cache identity should serialize"),
+        | serde_json::Value::String(_) => {
+            serde_json::to_string(value).expect("primitive JSON cache identity should serialize")
+        }
         serde_json::Value::Array(values) => format!(
             "[{}]",
-            values.iter().map(canonical_json).collect::<Vec<_>>().join(",")
+            values
+                .iter()
+                .map(canonical_json)
+                .collect::<Vec<_>>()
+                .join(",")
         ),
         serde_json::Value::Object(values) => {
             let mut keys = values.keys().collect::<Vec<_>>();
@@ -96,8 +101,7 @@ fn canonical_json(value: &serde_json::Value) -> String {
                 .map(|key| {
                     format!(
                         "{}:{}",
-                        serde_json::to_string(key)
-                            .expect("JSON object key should serialize"),
+                        serde_json::to_string(key).expect("JSON object key should serialize"),
                         canonical_json(&values[key])
                     )
                 })
@@ -274,7 +278,7 @@ impl CodexAppsToolsCacheIdentity {
         // filename hash so non-UTF-8 Unix paths cannot collapse distinct auth
         // keys onto the same disk cache file.
         let identity_json = serde_json::to_string(&self.auth_key).unwrap_or_default();
-        let identity_hash = sha1_hex(&identity_json);
+        let identity_hash = sha1_hex(identity_json.as_bytes());
         self.codex_home
             .join(cache_dir)
             .join(format!("{identity_hash}.json"))
@@ -418,13 +422,6 @@ const CODEX_APPS_TOOLS_CACHE_SCHEMA_VERSION: u8 = 4;
 
 const CODEX_APPS_SERVER_INFO_CACHE_DIR: &str = "cache/codex_apps_server_info";
 const CODEX_APPS_SERVER_INFO_CACHE_SCHEMA_VERSION: u8 = 1;
-
-fn sha1_hex(s: &str) -> String {
-    let mut hasher = Sha1::new();
-    hasher.update(s.as_bytes());
-    let sha1 = hasher.finalize();
-    format!("{sha1:x}")
-}
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex

@@ -96,7 +96,6 @@ use codex_core_skills::injection::PlannedSkillInjections;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
-use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ServiceTier;
@@ -166,6 +165,7 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
+    sess.wait_for_startup_discovery(&cancellation_token).await?;
     let mut preparation_timing_guard = Some(
         turn_context
             .turn_timing_state
@@ -202,7 +202,7 @@ pub(crate) async fn run_turn(
         identity: first_identity,
         step_context: first_step_context,
         first_router,
-        auth_mode: first_auth_mode,
+        auth: first_auth,
         injection_items,
         explicitly_enabled_connectors,
         ..
@@ -260,7 +260,7 @@ pub(crate) async fn run_turn(
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
 
     let mut next_step_context = Some(first_step_context);
-    let mut first_router = Some((first_identity.generation, first_auth_mode, first_router));
+    let mut first_router = Some((first_identity.generation, first_auth, first_router));
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
@@ -605,7 +605,7 @@ struct PendingTurnPlan {
     history_snapshot: PromptHistorySnapshot,
     step_context: Arc<StepContext>,
     first_router: Arc<ToolRouter>,
-    auth_mode: Option<AuthMode>,
+    auth: RequestAuthSnapshot,
     base_instructions: BaseInstructions,
     injection_items: Vec<ResponseItem>,
     explicitly_enabled_connectors: HashSet<String>,
@@ -638,7 +638,7 @@ async fn capture_sampling_request_snapshot(
     turn_context: &Arc<TurnContext>,
     initial_step_context: Arc<StepContext>,
     client_session: &ModelClientSession,
-    preferred_router: &mut Option<(u64, Option<AuthMode>, Arc<ToolRouter>)>,
+    preferred_router: &mut Option<(u64, RequestAuthSnapshot, Arc<ToolRouter>)>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<SamplingRequestSnapshot> {
     let mut step_context = Some(initial_step_context);
@@ -648,22 +648,21 @@ async fn capture_sampling_request_snapshot(
         }
         let generation = sess.services.planning_generation();
         let auth = client_session.capture_request_auth_snapshot().await?;
-        let auth_mode = turn_context
-            .auth_manager
-            .as_deref()
-            .and_then(|auth| auth.auth_mode());
-        let current_step_context = match step_context.take() {
-            Some(step_context) => step_context,
-            None => sess.capture_step_context(Arc::clone(turn_context)).await,
+        let (preferred, preferred_mismatch) = match preferred_router.take() {
+            Some((router_generation, router_auth, router))
+                if crate::latency_switches::stage2_critical_path_enabled()
+                    && router_generation == generation
+                    && router_auth == auth =>
+            {
+                (Some(router), false)
+            }
+            Some(_) => (None, true),
+            None => (None, false),
         };
-        let preferred = preferred_router
-            .take()
-            .filter(|(router_generation, router_auth_mode, _)| {
-                crate::latency_switches::stage2_critical_path_enabled()
-                    && *router_generation == generation
-                    && *router_auth_mode == auth_mode
-            })
-            .map(|(_, _, router)| router);
+        let current_step_context = match (preferred_mismatch, step_context.take()) {
+            (false, Some(step_context)) => step_context,
+            _ => sess.capture_step_context(Arc::clone(turn_context)).await,
+        };
         let (history, router) = match preferred {
             Some(router) => (
                 sess.prompt_history_snapshot(&turn_context.model_info.input_modalities)
@@ -682,16 +681,12 @@ async fn capture_sampling_request_snapshot(
                 (history, router?)
             }
         };
-        let current_auth_mode = turn_context
-            .auth_manager
-            .as_deref()
-            .and_then(|auth| auth.auth_mode());
+        let current_auth = client_session.capture_request_auth_snapshot().await?;
         let base_instructions = sess.get_base_instructions().await;
         let current_base_instructions = sess.get_base_instructions().await;
         if sess.services.planning_generation() == generation
             && sess.history_mutation_revision().await == history.mutation_revision()
-            && current_auth_mode == auth_mode
-            && client_session.request_auth_generation_matches(&auth)
+            && current_auth == auth
             && current_base_instructions.text.as_str() == base_instructions.text.as_str()
         {
             return Ok(SamplingRequestSnapshot {
@@ -714,14 +709,17 @@ async fn build_pure_pending_turn_plan(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
     input: &[TurnInput],
+    client_session: &ModelClientSession,
+    generation: u64,
+    auth: RequestAuthSnapshot,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<PendingTurnPlanBuild> {
     let turn_context = step_context.turn.as_ref();
-    let generation = sess.services.planning_generation();
-    let auth_mode = turn_context
-        .auth_manager
-        .as_deref()
-        .and_then(|auth| auth.auth_mode());
+    if sess.services.planning_generation() != generation
+        || client_session.capture_request_auth_snapshot().await? != auth
+    {
+        return Ok(PendingTurnPlanBuild::Stale);
+    }
     let user_input = input
         .iter()
         .filter_map(|item| match item {
@@ -745,13 +743,10 @@ async fn build_pure_pending_turn_plan(
             sess.get_base_instructions(),
         );
         let first_router = first_router?;
+        let current_auth = client_session.capture_request_auth_snapshot().await?;
         if sess.services.planning_generation() != generation
             || sess.history_mutation_revision().await != history_snapshot.mutation_revision()
-            || turn_context
-                .auth_manager
-                .as_deref()
-                .and_then(|auth| auth.auth_mode())
-                != auth_mode
+            || current_auth != auth
             || sess.get_base_instructions().await.text.as_str() != base_instructions.text.as_str()
         {
             return Ok(PendingTurnPlanBuild::Stale);
@@ -765,6 +760,7 @@ async fn build_pure_pending_turn_plan(
                 plugins: &[],
                 injection_items: &[],
                 user_input: &user_input,
+                auth: &auth,
                 router: first_router.as_ref(),
                 history_snapshot: &history_snapshot,
                 base_instructions: &base_instructions,
@@ -775,7 +771,7 @@ async fn build_pure_pending_turn_plan(
             history_snapshot,
             step_context,
             first_router,
-            auth_mode,
+            auth,
             base_instructions,
             injection_items: Vec::new(),
             explicitly_enabled_connectors: HashSet::new(),
@@ -901,13 +897,10 @@ async fn build_pure_pending_turn_plan(
         sess.get_base_instructions(),
     );
     let first_router = first_router?;
+    let current_auth = client_session.capture_request_auth_snapshot().await?;
     if sess.services.planning_generation() != generation
         || sess.history_mutation_revision().await != history_snapshot.mutation_revision()
-        || turn_context
-            .auth_manager
-            .as_deref()
-            .and_then(|auth| auth.auth_mode())
-            != auth_mode
+        || current_auth != auth
         || sess.get_base_instructions().await.text.as_str() != base_instructions.text.as_str()
     {
         return Ok(PendingTurnPlanBuild::Stale);
@@ -923,6 +916,7 @@ async fn build_pure_pending_turn_plan(
             plugins: &mentioned_plugins,
             injection_items: &injection_items,
             user_input: &user_input,
+            auth: &auth,
             router: first_router.as_ref(),
             history_snapshot: &history_snapshot,
             base_instructions: &base_instructions,
@@ -933,7 +927,7 @@ async fn build_pure_pending_turn_plan(
         history_snapshot,
         step_context,
         first_router,
-        auth_mode,
+        auth,
         base_instructions,
         pending_token_estimate: estimate_pending_tokens(&user_input, &injection_items),
         injection_items,
@@ -979,9 +973,19 @@ async fn stabilize_pending_turn_plan(
             }
         }
 
+        let generation = sess.services.planning_generation();
+        let auth = client_session.capture_request_auth_snapshot().await?;
         let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
-        let plan = match build_pure_pending_turn_plan(sess, step_context, input, cancellation_token)
-            .await?
+        let plan = match build_pure_pending_turn_plan(
+            sess,
+            step_context,
+            input,
+            client_session,
+            generation,
+            auth,
+            cancellation_token,
+        )
+        .await?
         {
             PendingTurnPlanBuild::Stale => {
                 fixed_point
@@ -1188,13 +1192,10 @@ async fn stabilize_pending_turn_plan(
             }
         }
 
+        let current_auth = client_session.capture_request_auth_snapshot().await?;
         if sess.services.planning_generation() != plan.identity.generation
             || sess.history_mutation_revision().await != plan.history_snapshot.mutation_revision()
-            || turn_context
-                .auth_manager
-                .as_deref()
-                .and_then(|auth| auth.auth_mode())
-                != plan.auth_mode
+            || current_auth != plan.auth
             || sess.get_base_instructions().await.text.as_str()
                 != plan.base_instructions.text.as_str()
         {
@@ -1230,6 +1231,7 @@ struct PlanningStateDigestInput<'a> {
     plugins: &'a [PluginCapabilitySummary],
     injection_items: &'a [ResponseItem],
     user_input: &'a [UserInput],
+    auth: &'a RequestAuthSnapshot,
     router: &'a ToolRouter,
     history_snapshot: &'a PromptHistorySnapshot,
     base_instructions: &'a BaseInstructions,
@@ -1243,12 +1245,13 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
         plugins,
         injection_items,
         user_input,
+        auth,
         router,
         history_snapshot,
         base_instructions,
     } = input;
     let mut hasher = Sha256::new();
-    hasher.update(b"codex.immutable-planning-snapshot.v1");
+    hasher.update(b"codex.immutable-planning-snapshot.v2");
     hasher.update(step_context.turn.model_info.slug.as_bytes());
     if let Some(comp_hash) = &step_context.turn.model_info.comp_hash {
         hasher.update([1]);
@@ -1259,15 +1262,7 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
     hasher.update(format!("{:?}", step_context.turn.config.features.get()).as_bytes());
     hasher.update(format!("{:?}", step_context.turn.model_info.input_modalities).as_bytes());
     hasher.update(
-        format!(
-            "{:?}",
-            step_context
-                .turn
-                .auth_manager
-                .as_deref()
-                .and_then(|auth| auth.auth_mode())
-        )
-        .as_bytes(),
+        serde_json::to_vec(auth).expect("request auth snapshot should serialize for planning"),
     );
     hasher.update(step_context.mcp.version().to_be_bytes());
     hasher.update(base_instructions.text.as_bytes());
@@ -1908,11 +1903,7 @@ async fn run_sampling_request(
         retry_result?;
         turn_context.turn_timing_state.record_sampling_retry();
 
-        let auth_mode = turn_context
-            .auth_manager
-            .as_deref()
-            .and_then(|auth| auth.auth_mode());
-        let mut preferred_router = Some((generation, auth_mode, Arc::clone(&router)));
+        let mut preferred_router = Some((generation, auth, Arc::clone(&router)));
         current_snapshot = Some(
             capture_sampling_request_snapshot(
                 &sess,

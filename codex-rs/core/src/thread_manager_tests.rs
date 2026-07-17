@@ -750,6 +750,147 @@ async fn start_thread_seeds_extension_data_for_mcp_and_lifecycle_contributors() 
 }
 
 #[tokio::test]
+async fn thread_start_publishes_configuration_before_discovery_and_gates_first_turn() {
+    struct BlockingMcpContributor {
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl codex_extension_api::McpServerContributor<Config> for BlockingMcpContributor {
+        fn id(&self) -> &'static str {
+            "blocking_startup_discovery_test"
+        }
+
+        fn contribute<'a>(
+            &'a self,
+            _context: codex_extension_api::McpServerContributionContext<'a, Config>,
+        ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::McpServerContribution>>
+        {
+            Box::pin(async move {
+                if let Some(entered) = self
+                    .entered
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = entered.send(());
+                }
+                self.release.notified().await;
+                Vec::new()
+            })
+        }
+    }
+
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config
+        .startup_warnings
+        .push("startup warning before discovery".to_string());
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut extensions = codex_extension_api::ExtensionRegistryBuilder::new();
+    extensions.mcp_server_contributor(Arc::new(BlockingMcpContributor {
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: Arc::clone(&release),
+    }));
+    let manager = Arc::new(ThreadManager::new(
+        &config,
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Arc::new(extensions.build()),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store_from_config(&config, /*state_db*/ None),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    ));
+    let start_manager = Arc::clone(&manager);
+    let start_config = config.clone();
+    let start_task = tokio::spawn(async move {
+        start_manager
+            .start_thread_with_options(StartThreadOptions {
+                config: start_config,
+                allow_provider_model_fallback: false,
+                initial_history: InitialHistory::New,
+                history_mode: None,
+                session_source: None,
+                thread_source: None,
+                dynamic_tools: Vec::new(),
+                metrics_service_name: None,
+                parent_trace: None,
+                environments: Vec::new(),
+                thread_extension_init: Default::default(),
+                supports_openai_form_elicitation: false,
+            })
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), entered_rx)
+        .await
+        .expect("startup discovery should begin")
+        .expect("startup discovery entry signal should be sent");
+    let started = tokio::time::timeout(Duration::from_secs(5), start_task)
+        .await
+        .expect("thread publication must not wait for startup discovery")
+        .expect("thread start task should not panic")
+        .expect("thread should start");
+
+    let warning = tokio::time::timeout(Duration::from_secs(5), started.thread.next_event())
+        .await
+        .expect("startup warning should follow SessionConfigured")
+        .expect("startup warning event");
+    let EventMsg::Warning(warning) = warning.msg else {
+        panic!("expected startup warning after SessionConfigured");
+    };
+    assert_eq!(warning.message, "startup warning before discovery");
+
+    started
+        .thread
+        .submit(Op::UserInput {
+            items: vec![codex_protocol::user_input::UserInput::Text {
+                text: "wait for discovery".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("queue first turn");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), started.thread.next_event())
+            .await
+            .is_err(),
+        "turn construction must remain gated on startup discovery"
+    );
+
+    release.notify_one();
+    let turn_started = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = started.thread.next_event().await.expect("thread event");
+            if matches!(event.msg, EventMsg::TurnStarted(_)) {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("turn should enter its public lifecycle after discovery");
+    assert!(matches!(turn_started.msg, EventMsg::TurnStarted(_)));
+    tokio::time::timeout(Duration::from_secs(5), started.thread.shutdown_and_wait())
+        .await
+        .expect("thread shutdown should finish")
+        .expect("thread shutdown");
+}
+
+#[tokio::test]
 async fn selected_capability_roots_round_trip_through_fork() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;

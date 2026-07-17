@@ -8,6 +8,7 @@ use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
 use crate::startup_timing::StartupTimingState;
 use crate::state::ActiveTurn;
+use anyhow::Context;
 use codex_extension_api::ExtensionDataInit;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_protocol::SessionId;
@@ -48,6 +49,8 @@ pub(crate) struct Session {
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     /// Correlated pre-turn startup phases, frozen at the first model send.
     pub(crate) startup_timing: Arc<StartupTimingState>,
+    pub(super) startup_discovery_readiness: StartupDiscoveryReadiness,
+    pub(super) startup_discovery_cancellation: CancellationToken,
     /// Owns terminal coordinators so request cancellation cannot strand a claimed turn.
     pub(crate) terminal_tasks: tokio_util::task::TaskTracker,
     /// Prevents terminal cleanup from waking queued work after shutdown begins.
@@ -58,6 +61,12 @@ pub(crate) struct Session {
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
     pub(super) next_internal_sub_id: AtomicU64,
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.startup_discovery_cancellation.cancel();
+    }
 }
 
 #[derive(Clone)]
@@ -476,6 +485,43 @@ struct StartupDiscovery<T> {
     task: tokio_util::task::AbortOnDropHandle<T>,
 }
 
+#[derive(Clone)]
+pub(super) struct StartupDiscoveryReadiness {
+    state: watch::Sender<Option<Result<(), Arc<str>>>>,
+}
+
+impl StartupDiscoveryReadiness {
+    fn pending() -> Self {
+        let (state, _receiver) = watch::channel(None);
+        Self { state }
+    }
+
+    #[cfg(test)]
+    pub(super) fn completed() -> Self {
+        let readiness = Self::pending();
+        readiness.complete(Ok(()));
+        readiness
+    }
+
+    fn complete(&self, result: Result<(), String>) {
+        self.state
+            .send_replace(Some(result.map_err(Arc::<str>::from)));
+    }
+
+    async fn wait(&self) -> Result<(), Arc<str>> {
+        let mut receiver = self.state.subscribe();
+        loop {
+            if let Some(result) = receiver.borrow().clone() {
+                return result;
+            }
+            receiver
+                .changed()
+                .await
+                .map_err(|_| Arc::<str>::from("startup discovery readiness channel closed"))?;
+        }
+    }
+}
+
 impl<T: Send + 'static> StartupDiscovery<T> {
     fn spawn(future: impl std::future::Future<Output = T> + Send + 'static) -> Self {
         Self {
@@ -492,6 +538,18 @@ impl Session {
     /// Returns the concrete identity for this thread.
     pub(crate) fn thread_id(&self) -> ThreadId {
         self.thread_id
+    }
+
+    pub(crate) async fn wait_for_startup_discovery(
+        &self,
+        cancellation_token: &CancellationToken,
+    ) -> CodexResult<()> {
+        tokio::select! {
+            _ = cancellation_token.cancelled() => Err(CodexErr::TurnAborted),
+            result = self.startup_discovery_readiness.wait() => result.map_err(|message| {
+                CodexErr::Stream(format!("startup discovery failed: {message}"), None)
+            }),
+        }
     }
 
     /// Returns the identity shared by the root thread and all descendant threads.
@@ -602,10 +660,10 @@ impl Session {
                 }
             };
         let mcp_thread_init = thread_extension_init.clone();
-        let thread_extension_data = codex_extension_api::ExtensionData::new_with_init(
+        let thread_extension_data = Arc::new(codex_extension_api::ExtensionData::new_with_init(
             thread_id.to_string(),
             thread_extension_init,
-        );
+        ));
         // Kick off independent async setup tasks in parallel to reduce startup latency.
         //
         // - initialize thread persistence with new or resumed session info
@@ -720,7 +778,7 @@ impl Session {
                 error!("failed to initialize thread persistence: {e:#}");
                 e
             })?);
-        let session_result: anyhow::Result<Arc<Self>> = async {
+        let session_result: anyhow::Result<(Arc<Self>, tokio::sync::oneshot::Sender<()>)> = async {
             let rollout_path = if let Some(live_thread) = live_thread_init.as_ref() {
                 live_thread.local_rollout_path().await?
             } else {
@@ -1173,6 +1231,8 @@ impl Session {
                 tool_search_handler_cache: Default::default(),
                 turn_environments: Arc::clone(&turn_environments),
             };
+            let startup_discovery_readiness = StartupDiscoveryReadiness::pending();
+            let startup_discovery_cancellation = CancellationToken::new();
             let sess = Arc::new(Session {
                 thread_id,
                 installation_id,
@@ -1188,6 +1248,8 @@ impl Session {
                 conversation: Arc::new(RealtimeConversationManager::new()),
                 active_turn: Mutex::new(None),
                 startup_timing: Arc::clone(&startup_timing),
+                startup_discovery_readiness,
+                startup_discovery_cancellation,
                 terminal_tasks: tokio_util::task::TaskTracker::new(),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 rollout_compression_scheduled: std::sync::atomic::AtomicBool::new(false),
@@ -1238,126 +1300,170 @@ impl Session {
                 sess.send_event_raw(event).await;
             }
 
-            let (
-                plugin_skill_errors,
-                hooks,
-                (mcp_projection, mcp_servers, auth_statuses, tool_plugin_provenance),
-            ) = startup_discovery
-                .wait()
-                .await
-                .context("startup discovery task failed")?;
-            sess.services.session_telemetry.conversation_starts(
-                config.model_provider.name.as_str(),
-                session_configuration.collaboration_mode.reasoning_effort(),
-                config
-                    .model_reasoning_summary
-                    .unwrap_or(ReasoningSummaryConfig::Auto),
-                config.model_context_window,
-                config.model_auto_compact_token_limit,
-                config.permissions.approval_policy.value(),
-                config
-                    .permissions
-                    .legacy_sandbox_policy(session_configuration.cwd().as_path()),
-                mcp_servers.keys().map(String::as_str).collect(),
-            );
-            for err in &plugin_skill_errors {
-                error!(
-                    "failed to load skill {}: {}",
-                    err.path.display(),
-                    err.message
-                );
-            }
-            let hooks = Arc::new(hooks);
-            sess.services.hooks.store(Arc::clone(&hooks));
-            for warning in hooks.startup_warnings() {
-                sess.send_event_raw(Event {
-                    id: INITIAL_SUBMIT_ID.to_owned(),
-                    msg: EventMsg::Warning(WarningEvent {
-                        message: warning.clone(),
-                    }),
-                })
-                .await;
-            }
+            let (startup_publication_tx, startup_publication_rx) = tokio::sync::oneshot::channel();
+            let startup_readiness = sess.startup_discovery_readiness.clone();
+            let startup_cancellation = sess.startup_discovery_cancellation.clone();
+            let weak_sess = Arc::downgrade(&sess);
+            let startup_config = Arc::clone(&config);
+            let startup_session_configuration = session_configuration.clone();
+            let startup_tx_event = tx_event.clone();
+            let startup_mcp_runtime_context = mcp_runtime_context.clone();
+            let startup_auth = auth.cloned();
+            let startup_timing = Arc::clone(&startup_timing);
+            drop(tokio::spawn(async move {
+                let completion = async {
+                    let discovery = tokio::select! {
+                        _ = startup_cancellation.cancelled() => {
+                            return Err(anyhow::anyhow!("startup discovery cancelled"));
+                        }
+                        result = startup_discovery.wait() => {
+                            result.context("startup discovery task failed")?
+                        }
+                    };
+                    tokio::select! {
+                        _ = startup_cancellation.cancelled() => {
+                            return Err(anyhow::anyhow!("startup discovery cancelled"));
+                        }
+                        result = startup_publication_rx => {
+                            result.context("session publication cancelled before startup discovery completed")?;
+                        }
+                    }
+                    let sess = weak_sess
+                        .upgrade()
+                        .context("session closed before startup discovery completed")?;
+                    let (
+                        plugin_skill_errors,
+                        hooks,
+                        (mcp_projection, mcp_servers, auth_statuses, tool_plugin_provenance),
+                    ) = discovery;
+                    sess.services.session_telemetry.conversation_starts(
+                        startup_config.model_provider.name.as_str(),
+                        startup_session_configuration
+                            .collaboration_mode
+                            .reasoning_effort(),
+                        startup_config
+                            .model_reasoning_summary
+                            .unwrap_or(ReasoningSummaryConfig::Auto),
+                        startup_config.model_context_window,
+                        startup_config.model_auto_compact_token_limit,
+                        startup_config.permissions.approval_policy.value(),
+                        startup_config.permissions.legacy_sandbox_policy(
+                            startup_session_configuration.cwd().as_path(),
+                        ),
+                        mcp_servers.keys().map(String::as_str).collect(),
+                    );
+                    for err in &plugin_skill_errors {
+                        error!(
+                            "failed to load skill {}: {}",
+                            err.path.display(),
+                            err.message
+                        );
+                    }
+                    let hooks = Arc::new(hooks);
+                    sess.services.hooks.store(Arc::clone(&hooks));
+                    for warning in hooks.startup_warnings() {
+                        sess.send_event_raw(Event {
+                            id: INITIAL_SUBMIT_ID.to_owned(),
+                            msg: EventMsg::Warning(WarningEvent {
+                                message: warning.clone(),
+                            }),
+                        })
+                        .await;
+                    }
 
-            let mcp_startup_cancellation_token = {
-                let mut cancel_guard = sess
-                    .services
-                    .mcp_startup_cancellation_token
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                cancel_guard.cancel();
-                let cancel_token = CancellationToken::new();
-                *cancel_guard = cancel_token.clone();
-                cancel_token
-            };
-            let codex_apps_auth_manager =
-                codex_mcp::host_owned_codex_apps_enabled(&mcp_projection.config, auth)
+                    let mcp_startup_cancellation_token = {
+                        let mut cancel_guard = sess
+                            .services
+                            .mcp_startup_cancellation_token
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        cancel_guard.cancel();
+                        let cancel_token = CancellationToken::new();
+                        *cancel_guard = cancel_token.clone();
+                        cancel_token
+                    };
+                    let codex_apps_auth_manager = codex_mcp::host_owned_codex_apps_enabled(
+                        &mcp_projection.config,
+                        startup_auth.as_ref(),
+                    )
                     .then(|| Arc::clone(&sess.services.auth_manager));
-            let mcp_connection_manager = McpConnectionManager::new(
-                &mcp_servers,
-                config.mcp_oauth_credentials_store_mode,
-                config.auth_keyring_backend_kind(),
-                auth_statuses,
-                &session_configuration.approval_policy,
-                INITIAL_SUBMIT_ID.to_owned(),
-                tx_event.clone(),
-                mcp_startup_cancellation_token,
-                session_configuration.permission_profile(),
-                mcp_runtime_context.clone(),
-                config.codex_home.to_path_buf(),
-                sess.services.mcp_manager.codex_apps_tools_cache(),
-                config.prefix_mcp_tool_names(),
-                mcp_projection
-                    .config
-                    .client_elicitation_capability
-                    .clone(),
-                sess.services
-                    .supports_openai_form_elicitation
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                tool_plugin_provenance,
-                auth,
-                codex_apps_auth_manager,
-                Some(sess.mcp_elicitation_reviewer()),
-                Some(sess.mcp_elicitation_lifecycle()),
-                codex_mcp::ElicitationRequestRouter::default(),
-            )
-            .instrument(info_span!(
-                "session_init.mcp_manager_init",
-                otel.name = "session_init.mcp_manager_init",
-            ))
-            .await;
-            sess.services
-                .install_mcp_connection_manager(
-                    Arc::new(mcp_projection.config),
-                    mcp_projection.plugins_available,
-                    mcp_runtime_context,
-                    /*available_environment_ids*/ Vec::new(),
-                    mcp_connection_manager,
-                )
-                .await?;
-            sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
-                .await;
-            let session_start_source = match &initial_history {
-                InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
-                InitialHistory::New | InitialHistory::Forked(_) => {
-                    codex_hooks::SessionStartSource::Startup
-                }
-                InitialHistory::Cleared => codex_hooks::SessionStartSource::Clear,
-            };
+                    let mcp_connection_manager = McpConnectionManager::new(
+                        &mcp_servers,
+                        startup_config.mcp_oauth_credentials_store_mode,
+                        startup_config.auth_keyring_backend_kind(),
+                        auth_statuses,
+                        &startup_session_configuration.approval_policy,
+                        INITIAL_SUBMIT_ID.to_owned(),
+                        startup_tx_event,
+                        mcp_startup_cancellation_token,
+                        startup_session_configuration.permission_profile(),
+                        startup_mcp_runtime_context.clone(),
+                        startup_config.codex_home.to_path_buf(),
+                        sess.services.mcp_manager.codex_apps_tools_cache(),
+                        startup_config.prefix_mcp_tool_names(),
+                        mcp_projection
+                            .config
+                            .client_elicitation_capability
+                            .clone(),
+                        sess.services
+                            .supports_openai_form_elicitation
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                        tool_plugin_provenance,
+                        startup_auth.as_ref(),
+                        codex_apps_auth_manager,
+                        Some(sess.mcp_elicitation_reviewer()),
+                        Some(sess.mcp_elicitation_lifecycle()),
+                        codex_mcp::ElicitationRequestRouter::default(),
+                    )
+                    .instrument(info_span!(
+                        "session_init.mcp_manager_init",
+                        otel.name = "session_init.mcp_manager_init",
+                    ))
+                    .await;
+                    sess.services
+                        .install_mcp_connection_manager(
+                            Arc::new(mcp_projection.config),
+                            mcp_projection.plugins_available,
+                            startup_mcp_runtime_context,
+                            /*available_environment_ids*/ Vec::new(),
+                            mcp_connection_manager,
+                        )
+                        .await?;
+                    sess.schedule_startup_prewarm(
+                        startup_session_configuration.base_instructions.clone(),
+                    )
+                    .await;
+                    let session_start_source = match &initial_history {
+                        InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
+                        InitialHistory::New | InitialHistory::Forked(_) => {
+                            codex_hooks::SessionStartSource::Startup
+                        }
+                        InitialHistory::Cleared => codex_hooks::SessionStartSource::Clear,
+                    };
 
-            // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
-            Box::pin(sess.record_initial_history(initial_history)).await?;
-            {
-                let mut state = sess.state.lock().await;
-                state.queue_pending_session_start_source(session_start_source);
-            }
-            startup_timing.finish_session_initialization();
-            Ok(sess)
+                    // Initial history and the session-start hook must be ready before the first
+                    // turn crosses the discovery barrier.
+                    Box::pin(sess.record_initial_history(initial_history)).await?;
+                    {
+                        let mut state = sess.state.lock().await;
+                        state.queue_pending_session_start_source(session_start_source);
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }
+                .await;
+                startup_timing.finish_session_initialization();
+                if let Err(err) = &completion {
+                    error!("startup discovery completion failed: {err:#}");
+                }
+                startup_readiness.complete(completion.map_err(|err| format!("{err:#}")));
+            }));
+            Ok((sess, startup_publication_tx))
         }
         .await;
         match session_result {
-            Ok(sess) => {
+            Ok((sess, startup_publication_tx)) => {
                 live_thread_init.commit();
+                let _ = startup_publication_tx.send(());
                 Ok(sess)
             }
             Err(err) => {

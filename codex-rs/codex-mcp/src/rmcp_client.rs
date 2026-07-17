@@ -25,6 +25,7 @@ use crate::codex_apps_cache::CodexAppsToolsCacheContext;
 use crate::codex_apps_cache::CodexAppsToolsFetchSource;
 use crate::codex_apps_cache::load_startup_cached_codex_apps_server_info;
 use crate::elicitation::ElicitationRequestManager;
+#[cfg(test)]
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::ToolPluginProvenance;
 use crate::runtime::McpRuntimeContext;
@@ -458,7 +459,7 @@ impl AsyncManagedClient {
         client_elicitation_capability: ElicitationCapability,
         supports_openai_form_elicitation: bool,
     ) -> Self {
-        let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
+        let is_codex_apps_mcp_server = server.is_host_owned_codex_apps();
         let reconnect_server_name = server_name.clone();
         let reconnect_tx_event = tx_event.clone();
         let tool_filter = server

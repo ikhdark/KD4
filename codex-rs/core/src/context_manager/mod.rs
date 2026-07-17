@@ -3,7 +3,6 @@ mod normalize;
 pub(crate) mod updates;
 
 pub(crate) use history::ContextManager;
-pub(crate) use history::PROMPT_HISTORY_CANONICAL_POLICY_VERSION;
 pub(crate) use history::PromptHistoryCanonicalHash;
 pub(crate) use history::PromptHistoryIncrementalProof;
 pub(crate) use history::PromptHistoryPolicyIdentity;
