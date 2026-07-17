@@ -19,8 +19,8 @@ use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -62,8 +62,48 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
 use codex_utils_pty::process_group::kill_child_process_group;
+use serde::Serialize;
 
 pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExecCommandOutcome {
+    CompletedSuccess,
+    CompletedFailure,
+    Running,
+    TimedOut,
+    Cancelled,
+    LaunchFailed,
+}
+
+impl ExecCommandOutcome {
+    pub(crate) fn from_process_facts(
+        process_id: Option<i32>,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+        launch_failed: bool,
+    ) -> Self {
+        if launch_failed {
+            Self::LaunchFailed
+        } else if cancelled {
+            Self::Cancelled
+        } else if timed_out {
+            Self::TimedOut
+        } else if process_id.is_some() {
+            Self::Running
+        } else if exit_code == Some(0) {
+            Self::CompletedSuccess
+        } else {
+            Self::CompletedFailure
+        }
+    }
+
+    pub(crate) fn is_success(self) -> bool {
+        matches!(self, Self::CompletedSuccess | Self::Running)
+    }
+}
 
 // Hardcode these since it does not seem worth including the libc crate just
 // for these.
@@ -121,6 +161,9 @@ pub enum ExecCapturePolicy {
     /// Trusted internal helpers can buffer the full child output in memory
     /// without the shell-oriented output cap or exec-expiration behavior.
     FullBuffer,
+    /// Proof-bearing validation keeps exact output while still honoring the
+    /// command's timeout or cancellation contract.
+    Verification,
 }
 
 fn select_process_exec_tool_sandbox_type(
@@ -279,7 +322,7 @@ impl ExecCapturePolicy {
     fn retained_bytes_cap(self) -> Option<usize> {
         match self {
             Self::ShellTool => Some(EXEC_OUTPUT_MAX_BYTES),
-            Self::FullBuffer => None,
+            Self::FullBuffer | Self::Verification => None,
         }
     }
 
@@ -289,7 +332,7 @@ impl ExecCapturePolicy {
 
     fn uses_expiration(self) -> bool {
         match self {
-            Self::ShellTool => true,
+            Self::ShellTool | Self::Verification => true,
             Self::FullBuffer => false,
         }
     }
@@ -323,9 +366,7 @@ impl OutputEventDelivery {
     }
 
     fn enqueue(&self, event: Event) -> bool {
-        self.tx
-            .as_ref()
-            .is_some_and(|tx| tx.send(event).is_ok())
+        self.tx.as_ref().is_some_and(|tx| tx.send(event).is_ok())
     }
 
     async fn finish(mut self) -> io::Result<()> {
@@ -846,12 +887,14 @@ fn finalize_exec_result(
                     raw_output.retained_bytes_cap,
                 );
             }
+            let aggregated_output_bytes = Some(aggregated_output.text.clone());
             let aggregated_output = aggregated_output.from_utf8_lossy();
             let exec_output = ExecToolCallOutput {
                 exit_code,
                 stdout,
                 stderr,
                 aggregated_output,
+                aggregated_output_bytes,
                 duration,
                 timed_out,
             };
@@ -887,6 +930,81 @@ struct RawExecToolCallOutput {
     pub timed_out: bool,
     pub io_drain_incomplete: bool,
     pub retained_bytes_cap: Option<usize>,
+}
+
+#[derive(Debug)]
+enum SequencedOutputStorage {
+    Full(Vec<u8>),
+    Capped(HeadTailBuffer),
+}
+
+#[derive(Debug)]
+struct SequencedOutputCapture {
+    next_sequence: u64,
+    storage: SequencedOutputStorage,
+}
+
+#[derive(Debug)]
+struct SequencedOutputChunk {
+    stream: ExecOutputStream,
+    bytes: Vec<u8>,
+}
+
+impl SequencedOutputCapture {
+    fn new(max_bytes: Option<usize>) -> Self {
+        let storage = max_bytes.map_or_else(
+            || SequencedOutputStorage::Full(Vec::new()),
+            |max_bytes| SequencedOutputStorage::Capped(HeadTailBuffer::new(max_bytes)),
+        );
+        Self {
+            next_sequence: 0,
+            storage,
+        }
+    }
+
+    fn push(&mut self, stream: ExecOutputStream, chunk: &[u8]) {
+        let stream = match stream {
+            ExecOutputStream::Stdout => "stdout",
+            ExecOutputStream::Stderr => "stderr",
+        };
+        let header = format!(
+            "\n[command output: stream={stream} sequence={}]\n",
+            self.next_sequence
+        );
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        match &mut self.storage {
+            SequencedOutputStorage::Full(output) => {
+                output.extend_from_slice(header.as_bytes());
+                output.extend_from_slice(chunk);
+            }
+            SequencedOutputStorage::Capped(output) => {
+                output.push_chunk(header.into_bytes());
+                output.push_chunk(chunk.to_vec());
+            }
+        }
+    }
+
+    fn render(&self) -> Vec<u8> {
+        match &self.storage {
+            SequencedOutputStorage::Full(output) => output.clone(),
+            SequencedOutputStorage::Capped(output) => output.render_bytes(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.next_sequence == 0
+    }
+}
+
+async fn collect_sequenced_output(
+    mut chunks: mpsc::UnboundedReceiver<SequencedOutputChunk>,
+    max_bytes: Option<usize>,
+) -> SequencedOutputCapture {
+    let mut output = SequencedOutputCapture::new(max_bytes);
+    while let Some(chunk) = chunks.recv().await {
+        output.push(chunk.stream, &chunk.bytes);
+    }
+    output
 }
 
 fn insert_io_drain_incomplete_marker(mut data: Vec<u8>, max_bytes: Option<usize>) -> Vec<u8> {
@@ -1057,12 +1175,15 @@ async fn consume_output(
     let fallback_bytes_cap = retained_bytes_cap.unwrap_or(EXEC_OUTPUT_MAX_BYTES);
     let stdout_output = Arc::new(TokioMutex::new(HeadTailBuffer::new(fallback_bytes_cap)));
     let stderr_output = Arc::new(TokioMutex::new(HeadTailBuffer::new(fallback_bytes_cap)));
+    let (sequenced_tx, sequenced_rx) = mpsc::unbounded_channel();
+    let sequenced_handle = tokio::spawn(collect_sequenced_output(sequenced_rx, retained_bytes_cap));
     let stdout_handle = tokio::spawn(read_output(
         BufReader::new(stdout_reader),
         stdout_stream.clone(),
         /*is_stderr*/ false,
         Arc::clone(&stdout_output),
         retained_bytes_cap.is_none(),
+        Some(sequenced_tx.clone()),
     ));
     let stderr_handle = tokio::spawn(read_output(
         BufReader::new(stderr_reader),
@@ -1070,6 +1191,7 @@ async fn consume_output(
         /*is_stderr*/ true,
         Arc::clone(&stderr_output),
         retained_bytes_cap.is_none(),
+        Some(sequenced_tx),
     ));
 
     let expiration_wait = async {
@@ -1180,8 +1302,8 @@ async fn consume_output(
     };
     let stdout_completed = completed_output(stdout_result)?;
     let stderr_completed = completed_output(stderr_result)?;
-    let stdout_fallback = stdout_output.lock().await.to_bytes();
-    let stderr_fallback = stderr_output.lock().await.to_bytes();
+    let stdout_fallback = stdout_output.lock().await.render_bytes();
+    let stderr_fallback = stderr_output.lock().await.render_bytes();
     let stdout = StreamOutput {
         text: if io_drain_incomplete {
             stdout_fallback
@@ -1198,7 +1320,15 @@ async fn consume_output(
         },
         truncated_after_lines: None,
     };
-    let aggregated_output = aggregate_output(&stdout, &stderr, retained_bytes_cap);
+    let sequenced_output = sequenced_handle.await.map_err(io::Error::other)?;
+    let aggregated_output = if sequenced_output.is_empty() {
+        aggregate_output(&stdout, &stderr, retained_bytes_cap)
+    } else {
+        StreamOutput {
+            text: sequenced_output.render(),
+            truncated_after_lines: None,
+        }
+    };
 
     Ok(RawExecToolCallOutput {
         exit_status,
@@ -1217,6 +1347,7 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
     is_stderr: bool,
     retained_output: Arc<TokioMutex<HeadTailBuffer>>,
     retain_full_output: bool,
+    sequenced_output: Option<mpsc::UnboundedSender<SequencedOutputChunk>>,
 ) -> io::Result<Option<Vec<u8>>> {
     let mut full_output = if retain_full_output {
         Some(tokio::fs::File::from_std(tempfile::tempfile()?))
@@ -1237,6 +1368,16 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
 
         let chunk = tmp[..n].to_vec();
         retained_output.lock().await.push_chunk(chunk.clone());
+        if let Some(sequenced_output) = &sequenced_output {
+            let _ = sequenced_output.send(SequencedOutputChunk {
+                stream: if is_stderr {
+                    ExecOutputStream::Stderr
+                } else {
+                    ExecOutputStream::Stdout
+                },
+                bytes: chunk.clone(),
+            });
+        }
         if let Some(full_output) = full_output.as_mut() {
             full_output.write_all(&chunk).await?;
         }

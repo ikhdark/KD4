@@ -13,6 +13,7 @@ use tracing::warn;
 use super::LocalThreadStore;
 use super::create_thread;
 use crate::AppendThreadItemsParams;
+use crate::AppendThreadItemsReceipt;
 use crate::CreateThreadParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
@@ -134,25 +135,35 @@ pub(super) async fn append_items(
     if persisted_items.is_empty() {
         return Ok(());
     }
-    append_persisted_items(store, params.thread_id, persisted_items.as_slice()).await
+    let recorder = store.live_recorder(params.thread_id).await?;
+    recorder
+        .record_canonical_items(persisted_items.as_slice())
+        .await
+        .map_err(thread_store_io_error)?;
+    // Raw store appends are history-only and do not participate in LiveThread's metadata receipt
+    // sequence, so retain an explicit barrier without consuming an ordered projection receipt.
+    recorder.flush().await.map_err(thread_store_io_error)
 }
 
 pub(super) async fn append_persisted_items(
     store: &LocalThreadStore,
     thread_id: ThreadId,
     items: &[RolloutItem],
-) -> ThreadStoreResult<()> {
+) -> ThreadStoreResult<AppendThreadItemsReceipt> {
     if items.is_empty() {
-        return Ok(());
+        return Err(ThreadStoreError::InvalidRequest {
+            message: "cannot append an empty persisted rollout batch".to_string(),
+        });
     }
     let recorder = store.live_recorder(thread_id).await?;
-    recorder
-        .record_canonical_items(items)
+    let receipt = recorder
+        .append_and_ack(items)
         .await
         .map_err(thread_store_io_error)?;
-    // LiveThread applies metadata immediately after append_items returns. Wait for the local
-    // writer so SQLite never gets ahead of JSONL for accepted live appends.
-    recorder.flush().await.map_err(thread_store_io_error)
+    // The ordered writer receipt means every byte in this accepted batch was written before
+    // LiveThread applies its coalesced metadata patch, so SQLite can never get ahead of JSONL.
+    // Durability is intentionally deferred to an explicit barrier (terminal, flush, or shutdown).
+    Ok(AppendThreadItemsReceipt::new(receipt.sequence()))
 }
 
 pub(super) async fn persist_thread(

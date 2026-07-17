@@ -11,4 +11,4 @@ root policy requires it. Do not edit shared harness state, stage, commit, push,
 or publish. Report the integrated owner paths, dependency closure, focused
 validation, wiring evidence, and remaining risk to the coordinator.
 """
-model_reasoning_effort = "high"
+model_reasoning_effort = "xhigh"

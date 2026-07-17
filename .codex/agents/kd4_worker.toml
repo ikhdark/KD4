@@ -17,4 +17,4 @@ commit, push, publish, or perform unrelated cleanup. Report changed paths,
 validation receipts, wiring implications, and remaining risk to the
 coordinator.
 """
-model_reasoning_effort = "high"
+model_reasoning_effort = "xhigh"

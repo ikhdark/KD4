@@ -222,6 +222,10 @@ impl ThreadState {
         self.watch_registration = WatchRegistration::default();
     }
 
+    pub(crate) fn replace_watch_registration(&mut self, registration: WatchRegistration) {
+        self.watch_registration = registration;
+    }
+
     pub(crate) fn listener_command_tx(
         &self,
     ) -> Option<mpsc::UnboundedSender<ThreadListenerCommand>> {

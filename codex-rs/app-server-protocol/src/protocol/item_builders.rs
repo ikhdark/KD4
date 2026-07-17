@@ -23,6 +23,7 @@ use crate::protocol::v2::PatchApplyStatus;
 use crate::protocol::v2::PatchChangeKind;
 use crate::protocol::v2::ThreadItem;
 use codex_protocol::ThreadId;
+use codex_protocol::items::OrderedFileChange;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::ApplyPatchApprovalRequestEvent;
 use codex_protocol::protocol::ExecApprovalRequestEvent;
@@ -405,6 +406,17 @@ pub fn convert_patch_changes(changes: &HashMap<PathBuf, FileChange>) -> Vec<File
         .collect();
     converted.sort_by(|a, b| a.path.cmp(&b.path));
     converted
+}
+
+pub fn convert_ordered_patch_changes(changes: &[OrderedFileChange]) -> Vec<FileUpdateChange> {
+    changes
+        .iter()
+        .map(|change| FileUpdateChange {
+            path: change.path.to_string_lossy().into_owned(),
+            kind: map_patch_change_kind(&change.change),
+            diff: format_file_change_diff(&change.change),
+        })
+        .collect()
 }
 
 fn map_patch_change_kind(change: &FileChange) -> PatchChangeKind {

@@ -43,8 +43,8 @@ use crate::mcp_tool_call::MCP_TOOL_APPROVAL_DECLINE_SYNTHETIC;
 use crate::mcp_tool_call::McpToolApprovalMetadata;
 use crate::mcp_tool_call::build_guardian_mcp_tool_review_request;
 use crate::mcp_tool_call::is_mcp_tool_approval_question_id;
-use crate::mcp_tool_call::lookup_mcp_tool_metadata;
 use crate::mcp_tool_call::mcp_approvals_reviewer;
+use crate::mcp_tool_call::take_delegated_mcp_tool_metadata;
 use crate::session::Codex;
 use crate::session::CodexSpawnArgs;
 use crate::session::CodexSpawnOk;
@@ -366,24 +366,14 @@ async fn forward_events(
                         id,
                         msg: EventMsg::McpToolCallBegin(event),
                     } => {
-                        // Runtime refreshes are published before a request step is captured, so
-                        // the child runtime at call begin is the one executing this invocation.
-                        // Cache its metadata now; the later approval event has only a call ID.
-                        let metadata = if let Some(turn_context) =
-                            codex.session.turn_context_for_sub_id(&id).await
-                        {
-                            let mcp = codex.session.services.latest_mcp_runtime();
-                            lookup_mcp_tool_metadata(
-                                codex.session.as_ref(),
-                                turn_context.as_ref(),
-                                mcp.manager(),
-                                &event.invocation.server,
-                                &event.invocation.tool,
-                            )
-                            .await
-                        } else {
-                            None
-                        };
+                        // The child caches metadata from the same frozen StepContext inventory
+                        // before emitting this begin event. Taking it here prevents a reconnect
+                        // or tool-list refresh from changing delegated approval semantics.
+                        let metadata = take_delegated_mcp_tool_metadata(
+                            codex.session.as_ref(),
+                            &event.call_id,
+                        )
+                        .await;
                         pending_mcp_invocations
                             .lock()
                             .await
@@ -531,7 +521,8 @@ async fn handle_exec_approval(
             reason,
             GuardianApprovalRequestSource::DelegatedSubagent,
             review_cancel.clone(),
-        );
+        )
+        .await;
         await_approval_with_cancel(
             async move { review_rx.await.unwrap_or_default() },
             parent_session,
@@ -639,7 +630,8 @@ async fn handle_patch_approval(
             reason.clone(),
             GuardianApprovalRequestSource::DelegatedSubagent,
             review_cancel.clone(),
-        );
+        )
+        .await;
         Some(
             await_approval_with_cancel(
                 async move { review_rx.await.unwrap_or_default() },
@@ -755,7 +747,8 @@ async fn maybe_auto_review_mcp_request_user_input(
         /*retry_reason*/ None,
         GuardianApprovalRequestSource::DelegatedSubagent,
         review_cancel.clone(),
-    );
+    )
+    .await;
     let decision = await_approval_with_cancel(
         async move { review_rx.await.unwrap_or_default() },
         parent_session,

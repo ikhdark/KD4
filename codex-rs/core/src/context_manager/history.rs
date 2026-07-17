@@ -29,9 +29,240 @@ use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::approx_tokens_from_byte_count_i64;
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 use codex_utils_output_truncation::truncate_text;
+use sha2::Digest;
+use sha2::Sha256;
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
+use std::sync::Arc;
 use std::sync::LazyLock;
+
+pub(crate) const PROMPT_HISTORY_CANONICAL_POLICY_VERSION: u16 = 1;
+const PROMPT_HISTORY_CANONICAL_HASH_DOMAIN: &[u8] = b"codex.websocket.history.v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PromptHistoryCanonicalHash {
+    pub(crate) item_count: usize,
+    pub(crate) digest: [u8; 32],
+}
+
+impl PromptHistoryCanonicalHash {
+    pub(crate) fn empty() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(PROMPT_HISTORY_CANONICAL_HASH_DOMAIN);
+        hasher.update(PROMPT_HISTORY_CANONICAL_POLICY_VERSION.to_be_bytes());
+        Self {
+            item_count: 0,
+            digest: hasher.finalize().into(),
+        }
+    }
+
+    pub(crate) fn from_items(items: &[ResponseItem]) -> serde_json::Result<Self> {
+        let mut prefix = Self::empty();
+        prefix.extend_items(items)?;
+        Ok(prefix)
+    }
+
+    pub(crate) fn extend_items(&mut self, items: &[ResponseItem]) -> serde_json::Result<()> {
+        for item in items {
+            let mut normalized = item.clone();
+            normalized.clear_internal_chat_message_metadata_passthrough();
+            let serialized = serde_json::to_vec(&normalized)?;
+            let mut hasher = Sha256::new();
+            hasher.update(PROMPT_HISTORY_CANONICAL_HASH_DOMAIN);
+            hasher.update(self.digest);
+            hasher.update((serialized.len() as u64).to_be_bytes());
+            hasher.update(serialized);
+            self.digest = hasher.finalize().into();
+            self.item_count = self.item_count.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PromptHistoryIncrementalProof {
+    pub(crate) suffix: Vec<ResponseItem>,
+    pub(crate) current_prefix: PromptHistoryCanonicalHash,
+    pub(crate) mutation_revision: u64,
+    pub(crate) rewrite_revision: u64,
+}
+
+#[derive(Debug)]
+struct PromptHistoryProofNode {
+    mutation_revision: u64,
+    rewrite_revision: u64,
+    canonical_prefix: PromptHistoryCanonicalHash,
+    parent: Option<Arc<PromptHistoryProofNode>>,
+    appended: Arc<[ResponseItem]>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PromptHistorySnapshot {
+    mutation_revision: u64,
+    rewrite_revision: u64,
+    raw_item_count: usize,
+    rolling_digest: [u8; 32],
+    normalized_token_weight: i64,
+    segments: Arc<PromptHistorySegments>,
+    proof_tail: Arc<PromptHistoryProofNode>,
+    #[cfg(test)]
+    normalization_work: usize,
+}
+
+impl PromptHistorySnapshot {
+    pub(crate) fn mutation_revision(&self) -> u64 {
+        self.mutation_revision
+    }
+
+    pub(crate) fn rewrite_revision(&self) -> u64 {
+        self.rewrite_revision
+    }
+
+    pub(crate) fn raw_item_count(&self) -> usize {
+        self.raw_item_count
+    }
+
+    pub(crate) fn rolling_digest(&self) -> &[u8; 32] {
+        &self.rolling_digest
+    }
+
+    pub(crate) fn normalized_token_weight(&self) -> i64 {
+        self.normalized_token_weight
+    }
+
+    pub(crate) fn materialize(&self) -> Vec<ResponseItem> {
+        self.segments
+            .materialize_segments()
+            .into_iter()
+            .flat_map(|segment| segment.as_ref().to_vec())
+            .collect()
+    }
+
+    pub(crate) fn canonical_prefix(&self) -> PromptHistoryCanonicalHash {
+        self.proof_tail.canonical_prefix
+    }
+
+    /// Proves that this snapshot is an append-only extension of a previously
+    /// sampled request and returns only the unsent suffix. The provider response
+    /// items are verified as the first appended items, so rollback, compaction,
+    /// normalization replacements, and reordered history all fail closed.
+    pub(crate) fn incremental_proof(
+        &self,
+        baseline_mutation_revision: u64,
+        baseline_rewrite_revision: u64,
+        baseline_prefix: PromptHistoryCanonicalHash,
+        response_items: &[ResponseItem],
+    ) -> Option<PromptHistoryIncrementalProof> {
+        if self.rewrite_revision != baseline_rewrite_revision
+            || self.mutation_revision < baseline_mutation_revision
+        {
+            return None;
+        }
+
+        let mut nodes = Vec::new();
+        let mut cursor = Arc::clone(&self.proof_tail);
+        while cursor.mutation_revision > baseline_mutation_revision {
+            nodes.push(Arc::clone(&cursor));
+            cursor = Arc::clone(cursor.parent.as_ref()?);
+        }
+        if cursor.mutation_revision != baseline_mutation_revision
+            || cursor.rewrite_revision != baseline_rewrite_revision
+            || cursor.canonical_prefix != baseline_prefix
+        {
+            return None;
+        }
+
+        let mut expected_response_prefix = baseline_prefix;
+        expected_response_prefix.extend_items(response_items).ok()?;
+        let mut running_prefix = baseline_prefix;
+        let mut response_prefix_verified = response_items.is_empty();
+        let mut suffix = Vec::new();
+        for node in nodes.into_iter().rev() {
+            for item in node.appended.iter() {
+                running_prefix
+                    .extend_items(std::slice::from_ref(item))
+                    .ok()?;
+                if !response_prefix_verified {
+                    if running_prefix.item_count < expected_response_prefix.item_count {
+                        continue;
+                    }
+                    if running_prefix != expected_response_prefix {
+                        return None;
+                    }
+                    response_prefix_verified = true;
+                    continue;
+                }
+                suffix.push(item.clone());
+            }
+        }
+        if !response_prefix_verified || running_prefix != self.proof_tail.canonical_prefix {
+            return None;
+        }
+
+        Some(PromptHistoryIncrementalProof {
+            suffix,
+            current_prefix: running_prefix,
+            mutation_revision: self.mutation_revision,
+            rewrite_revision: self.rewrite_revision,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn normalization_work(&self) -> usize {
+        self.normalization_work
+    }
+}
+
+#[derive(Debug)]
+enum PromptHistorySegments {
+    Base(Arc<[Arc<[ResponseItem]>]>),
+    Delta {
+        parent: Arc<PromptHistorySegments>,
+        replacements: Arc<[(usize, Arc<[ResponseItem]>)]>,
+        appended: Arc<[Arc<[ResponseItem]>]>,
+    },
+}
+
+impl PromptHistorySegments {
+    fn materialize_segments(&self) -> Vec<Arc<[ResponseItem]>> {
+        let mut deltas = Vec::new();
+        let mut current = self;
+        let base = loop {
+            match current {
+                Self::Base(base) => break base,
+                Self::Delta {
+                    parent,
+                    replacements,
+                    appended,
+                } => {
+                    deltas.push((replacements, appended));
+                    current = parent.as_ref();
+                }
+            }
+        };
+        let mut segments = base.to_vec();
+        for (replacements, appended) in deltas.into_iter().rev() {
+            for (position, segment) in replacements.iter() {
+                segments[*position] = Arc::clone(segment);
+            }
+            segments.extend(appended.iter().cloned());
+        }
+        segments
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PromptHistoryCache {
+    supports_images: bool,
+    rewrite_revision: u64,
+    raw_item_count: usize,
+    index: normalize::PromptNormalizationIndex,
+    segments: Vec<Arc<[ResponseItem]>>,
+    snapshot_segments: Arc<PromptHistorySegments>,
+    proof_tail: Arc<PromptHistoryProofNode>,
+    normalized_token_weight: i64,
+}
 
 /// Transcript of thread history
 #[derive(Debug, Clone, Default)]
@@ -40,6 +271,13 @@ pub(crate) struct ContextManager {
     items: Vec<ResponseItem>,
     /// Bumped whenever history is rewritten, such as compaction or rollback.
     history_version: u64,
+    /// Bumped for every model-visible history mutation, including appends.
+    mutation_revision: u64,
+    /// Append-friendly identity for the complete raw model-visible history.
+    rolling_digest: [u8; 32],
+    /// Cached prompt normalization. Rewrites discard it; appends update only
+    /// newly added and newly paired segments.
+    prompt_cache: Option<PromptHistoryCache>,
     token_info: Option<TokenUsageInfo>,
     /// Reference context snapshot used for diffing and producing model-visible
     /// settings update items.
@@ -61,6 +299,9 @@ impl ContextManager {
         Self {
             items: Vec::new(),
             history_version: 0,
+            mutation_revision: 0,
+            rolling_digest: [0; 32],
+            prompt_cache: None,
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
             ),
@@ -130,7 +371,9 @@ impl ContextManager {
             }
 
             let processed = self.process_item(item_ref, policy);
+            self.rolling_digest = append_rolling_history_digest(self.rolling_digest, &processed);
             self.items.push(processed);
+            self.mutation_revision = self.mutation_revision.saturating_add(1);
         }
     }
 
@@ -155,6 +398,45 @@ impl ContextManager {
 
     pub(crate) fn history_version(&self) -> u64 {
         self.history_version
+    }
+
+    pub(crate) fn mutation_revision(&self) -> u64 {
+        self.mutation_revision
+    }
+
+    pub(crate) fn prompt_snapshot(
+        &mut self,
+        input_modalities: &[InputModality],
+    ) -> PromptHistorySnapshot {
+        let supports_images = input_modalities.contains(&InputModality::Image);
+        let can_extend = self.prompt_cache.as_ref().is_some_and(|cache| {
+            cache.supports_images == supports_images
+                && cache.rewrite_revision == self.history_version
+                && cache.raw_item_count <= self.items.len()
+        });
+
+        let normalization_work = if can_extend {
+            self.extend_prompt_cache(input_modalities)
+        } else {
+            self.rebuild_prompt_cache(input_modalities)
+        };
+        #[cfg(not(test))]
+        let _ = normalization_work;
+        let cache = self
+            .prompt_cache
+            .as_ref()
+            .expect("prompt cache is initialized above");
+        PromptHistorySnapshot {
+            mutation_revision: self.mutation_revision,
+            rewrite_revision: self.history_version,
+            raw_item_count: self.items.len(),
+            rolling_digest: self.rolling_digest,
+            normalized_token_weight: cache.normalized_token_weight,
+            segments: Arc::clone(&cache.snapshot_segments),
+            proof_tail: Arc::clone(&cache.proof_tail),
+            #[cfg(test)]
+            normalization_work,
+        }
     }
 
     // Estimate token usage using byte-based heuristics from the truncation helpers.
@@ -192,13 +474,14 @@ impl ContextManager {
             // its corresponding counterpart to keep the invariants intact without
             // running a full normalization pass.
             normalize::remove_corresponding_for(&mut self.items, &removed);
+            self.record_rewrite(/*rewrite_count*/ 1);
             self.world_state_baseline = None;
         }
     }
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
         self.items = items;
-        self.history_version = self.history_version.saturating_add(1);
+        self.record_rewrite(/*rewrite_count*/ 1);
         self.world_state_baseline = None;
     }
 
@@ -208,9 +491,7 @@ impl ContextManager {
         rewrite_count: usize,
     ) {
         self.items = items;
-        self.history_version = self
-            .history_version
-            .saturating_add(u64::try_from(rewrite_count).unwrap_or(u64::MAX));
+        self.record_rewrite(rewrite_count);
         self.world_state_baseline = None;
     }
 
@@ -239,7 +520,7 @@ impl ContextManager {
                     }
                 }
                 if replaced {
-                    self.history_version = self.history_version.saturating_add(1);
+                    self.record_rewrite(/*rewrite_count*/ 1);
                 }
                 replaced
             }
@@ -378,6 +659,140 @@ impl ContextManager {
         normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
     }
 
+    fn rebuild_prompt_cache(&mut self, input_modalities: &[InputModality]) -> usize {
+        let index = normalize::PromptNormalizationIndex::from_items(&self.items);
+        let segments = self
+            .items
+            .iter()
+            .map(|item| Arc::from(index.normalize_segment(item, input_modalities)))
+            .collect::<Vec<Arc<[ResponseItem]>>>();
+        let normalized_token_weight = segments
+            .iter()
+            .flat_map(|segment| segment.iter())
+            .map(estimate_item_token_count)
+            .fold(0i64, i64::saturating_add);
+        let normalization_work = self.items.len();
+        let snapshot_segments = Arc::new(PromptHistorySegments::Base(segments.clone().into()));
+        let canonical_prefix = canonical_hash_from_segments(&segments)
+            .unwrap_or_else(|_| PromptHistoryCanonicalHash::empty());
+        let proof_tail = Arc::new(PromptHistoryProofNode {
+            mutation_revision: self.mutation_revision,
+            rewrite_revision: self.history_version,
+            canonical_prefix,
+            parent: None,
+            appended: Arc::from([]),
+        });
+        self.prompt_cache = Some(PromptHistoryCache {
+            supports_images: input_modalities.contains(&InputModality::Image),
+            rewrite_revision: self.history_version,
+            raw_item_count: self.items.len(),
+            index,
+            segments,
+            snapshot_segments,
+            proof_tail,
+            normalized_token_weight,
+        });
+        normalization_work
+    }
+
+    fn extend_prompt_cache(&mut self, input_modalities: &[InputModality]) -> usize {
+        let mutation_revision = self.mutation_revision;
+        let rewrite_revision = self.history_version;
+        let cache = self
+            .prompt_cache
+            .as_mut()
+            .expect("append extension requires an existing prompt cache");
+        let start = cache.raw_item_count;
+        if start == self.items.len() {
+            return 0;
+        }
+
+        let mut affected = HashSet::new();
+        for item in &self.items[start..] {
+            affected.extend(cache.index.affected_positions(item));
+        }
+        for (position, item) in self.items[start..].iter().enumerate() {
+            cache.index.insert(start + position, item);
+        }
+
+        let mut affected = affected.into_iter().collect::<Vec<_>>();
+        affected.sort_unstable();
+        let mut normalization_work = 0usize;
+        let mut replacements = Vec::with_capacity(affected.len());
+        for position in affected {
+            let old_weight = cache.segments[position]
+                .iter()
+                .map(estimate_item_token_count)
+                .fold(0i64, i64::saturating_add);
+            let segment: Arc<[ResponseItem]> = cache
+                .index
+                .normalize_segment(&self.items[position], input_modalities)
+                .into();
+            let new_weight = segment
+                .iter()
+                .map(estimate_item_token_count)
+                .fold(0i64, i64::saturating_add);
+            cache.normalized_token_weight = cache
+                .normalized_token_weight
+                .saturating_sub(old_weight)
+                .saturating_add(new_weight);
+            cache.segments[position] = segment;
+            replacements.push((position, Arc::clone(&cache.segments[position])));
+            normalization_work = normalization_work.saturating_add(1);
+        }
+
+        let mut appended = Vec::with_capacity(self.items.len().saturating_sub(start));
+        for item in &self.items[start..] {
+            let segment: Arc<[ResponseItem]> =
+                cache.index.normalize_segment(item, input_modalities).into();
+            cache.normalized_token_weight = segment
+                .iter()
+                .map(estimate_item_token_count)
+                .fold(cache.normalized_token_weight, i64::saturating_add);
+            appended.push(Arc::clone(&segment));
+            cache.segments.push(segment);
+            normalization_work = normalization_work.saturating_add(1);
+        }
+        let appended_items = appended
+            .iter()
+            .flat_map(|segment| segment.iter().cloned())
+            .collect::<Vec<_>>();
+        cache.snapshot_segments = Arc::new(PromptHistorySegments::Delta {
+            parent: Arc::clone(&cache.snapshot_segments),
+            replacements: replacements.into(),
+            appended: appended.into(),
+        });
+        cache.proof_tail = if let PromptHistorySegments::Delta { replacements, .. } =
+            cache.snapshot_segments.as_ref()
+            && replacements.is_empty()
+        {
+            let mut canonical_prefix = cache.proof_tail.canonical_prefix;
+            if canonical_prefix.extend_items(&appended_items).is_ok() {
+                Arc::new(PromptHistoryProofNode {
+                    mutation_revision,
+                    rewrite_revision,
+                    canonical_prefix,
+                    parent: Some(Arc::clone(&cache.proof_tail)),
+                    appended: appended_items.into(),
+                })
+            } else {
+                rebuild_prompt_history_proof(mutation_revision, rewrite_revision, &cache.segments)
+            }
+        } else {
+            rebuild_prompt_history_proof(mutation_revision, rewrite_revision, &cache.segments)
+        };
+        cache.raw_item_count = self.items.len();
+        normalization_work
+    }
+
+    fn record_rewrite(&mut self, rewrite_count: usize) {
+        let rewrite_count = u64::try_from(rewrite_count).unwrap_or(u64::MAX);
+        self.history_version = self.history_version.saturating_add(rewrite_count);
+        self.mutation_revision = self.mutation_revision.saturating_add(rewrite_count.max(1));
+        self.rolling_digest = rolling_history_digest(&self.items);
+        self.prompt_cache = None;
+    }
+
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
         let policy_with_serialization_budget = policy * 1.2;
         match item {
@@ -476,6 +891,9 @@ pub(crate) fn truncate_function_output_payload(
     policy: TruncationPolicy,
 ) -> FunctionCallOutputPayload {
     let body = match &output.body {
+        FunctionCallOutputBody::Text(content) if is_evidence_aware_shell_output(content) => {
+            FunctionCallOutputBody::Text(content.clone())
+        }
         FunctionCallOutputBody::Text(content) => {
             FunctionCallOutputBody::Text(truncate_text(content, policy))
         }
@@ -488,6 +906,11 @@ pub(crate) fn truncate_function_output_payload(
         body,
         success: output.success,
     }
+}
+
+fn is_evidence_aware_shell_output(content: &str) -> bool {
+    content.contains("Shell output summary:\n")
+        || (content.contains("\n[+") && content.contains("B/") && content.contains("L]\n"))
 }
 
 /// API messages include every non-system item (user/assistant messages, reasoning,
@@ -534,6 +957,55 @@ pub(crate) fn estimate_base_instruction_token_count(base_instructions: &BaseInst
 pub(crate) fn estimate_item_token_count(item: &ResponseItem) -> i64 {
     let model_visible_bytes = estimate_response_item_model_visible_bytes(item);
     approx_tokens_from_byte_count_i64(model_visible_bytes)
+}
+
+fn canonical_hash_from_segments(
+    segments: &[Arc<[ResponseItem]>],
+) -> serde_json::Result<PromptHistoryCanonicalHash> {
+    let mut prefix = PromptHistoryCanonicalHash::empty();
+    for segment in segments {
+        prefix.extend_items(segment)?;
+    }
+    Ok(prefix)
+}
+
+fn rebuild_prompt_history_proof(
+    mutation_revision: u64,
+    rewrite_revision: u64,
+    segments: &[Arc<[ResponseItem]>],
+) -> Arc<PromptHistoryProofNode> {
+    let canonical_prefix = canonical_hash_from_segments(segments)
+        .unwrap_or_else(|_| PromptHistoryCanonicalHash::empty());
+    Arc::new(PromptHistoryProofNode {
+        mutation_revision,
+        rewrite_revision,
+        canonical_prefix,
+        parent: None,
+        appended: Arc::from([]),
+    })
+}
+
+fn rolling_history_digest(items: &[ResponseItem]) -> [u8; 32] {
+    items.iter().fold([0; 32], |digest, item| {
+        append_rolling_history_digest(digest, item)
+    })
+}
+
+fn append_rolling_history_digest(previous: [u8; 32], item: &ResponseItem) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex.history.rolling.v1");
+    hasher.update(previous);
+    match serde_json::to_vec(item) {
+        Ok(serialized) => {
+            hasher.update((serialized.len() as u64).to_be_bytes());
+            hasher.update(serialized);
+        }
+        Err(error) => {
+            hasher.update(b"serialization-error");
+            hasher.update(error.to_string().as_bytes());
+        }
+    }
+    hasher.finalize().into()
 }
 
 /// Approximate model-visible byte cost for one image input.

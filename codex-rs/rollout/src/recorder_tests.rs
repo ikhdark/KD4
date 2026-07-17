@@ -16,6 +16,7 @@ use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::UserMessageEvent;
 use pretty_assertions::assert_eq;
@@ -535,6 +536,127 @@ async fn recorder_materializes_on_flush_with_pending_items() -> std::io::Result<
 }
 
 #[tokio::test]
+async fn append_and_ack_preserves_exact_replay_order() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let recorder = RolloutRecorder::new(
+        &config,
+        RolloutRecorderParams::new(
+            ThreadId::new(),
+            /*forked_from_id*/ None,
+            /*parent_thread_id*/ None,
+            SessionSource::Exec,
+            /*thread_source*/ None,
+            "test_originator".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        ),
+    )
+    .await?;
+
+    let item = |message: &str| {
+        RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+            message: message.to_string(),
+            phase: None,
+            memory_citation: None,
+        }))
+    };
+    let first_items = [item("first"), item("second")];
+    let second_items = [item("third")];
+    let (first_batch, second_batch) = tokio::join!(
+        recorder.append_and_ack(&first_items),
+        recorder.append_and_ack(&second_items),
+    );
+    assert_eq!(
+        [first_batch?.sequence(), second_batch?.sequence()],
+        [1, 2]
+    );
+
+    recorder.flush().await?;
+    let (items, _, parse_errors) =
+        RolloutRecorder::load_rollout_items(recorder.rollout_path()).await?;
+    assert_eq!(parse_errors, 0);
+    let messages = items
+        .into_iter()
+        .filter_map(|item| match item {
+            RolloutItem::EventMsg(EventMsg::AgentMessage(event)) => Some(event.message),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        messages,
+        vec![
+            "first".to_string(),
+            "second".to_string(),
+            "third".to_string()
+        ]
+    );
+    recorder.shutdown().await
+}
+
+#[tokio::test]
+async fn terminal_receipt_survives_writer_crash_exactly_once() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let config = test_config(home.path());
+    let recorder = RolloutRecorder::new(
+        &config,
+        RolloutRecorderParams::new(
+            ThreadId::new(),
+            /*forked_from_id*/ None,
+            /*parent_thread_id*/ None,
+            SessionSource::Exec,
+            /*thread_source*/ None,
+            "test_originator".to_string(),
+            BaseInstructions::default(),
+            Vec::new(),
+        ),
+    )
+    .await?;
+    let rollout_path = recorder.rollout_path().to_path_buf();
+    let terminal = RolloutItem::EventMsg(EventMsg::TurnComplete(TurnCompleteEvent {
+        turn_id: "turn-1".to_string(),
+        last_agent_message: Some("done".to_string()),
+        completion: None,
+        completed_at: None,
+        duration_ms: None,
+        time_to_first_token_ms: None,
+        timing: None,
+    }));
+
+    let receipt = recorder
+        .append_and_ack(std::slice::from_ref(&terminal))
+        .await?;
+    assert_eq!(receipt.sequence(), 1);
+
+    let handle = recorder
+        .writer_task
+        .handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("writer handle");
+    handle.abort();
+    let _ = handle.await;
+    drop(recorder);
+
+    let (items, _, parse_errors) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(parse_errors, 0);
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| matches!(item, RolloutItem::EventMsg(EventMsg::TurnComplete(_))))
+            .count(),
+        1
+    );
+    let Some(RolloutItem::EventMsg(EventMsg::TurnComplete(terminal))) = items.last() else {
+        panic!("terminal receipt should be the final replay item");
+    };
+    assert_eq!(terminal.turn_id, "turn-1");
+    assert_eq!(terminal.last_agent_message.as_deref(), Some("done"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn persist_reports_filesystem_error_and_retries_buffered_items() -> std::io::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let config = test_config(home.path());
@@ -614,7 +736,7 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
     let text_after_retry = std::fs::read_to_string(&rollout_path)?;
     assert!(
         text_after_retry.contains("queued-after-writer-error"),
-        "flush should retry after reopening and write buffered items"
+        "flush should retry after reopening and write buffered items; actual: {text_after_retry:?}"
     );
     Ok(())
 }

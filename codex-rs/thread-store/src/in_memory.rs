@@ -19,6 +19,7 @@ use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::persisted_rollout_items;
 
 use crate::AppendThreadItemsParams;
+use crate::AppendThreadItemsReceipt;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
@@ -394,6 +395,7 @@ struct InMemoryThreadStoreState {
     calls: InMemoryThreadStoreCalls,
     created_threads: HashMap<ThreadId, CreateThreadParams>,
     histories: HashMap<ThreadId, Vec<RolloutItem>>,
+    next_append_sequences: HashMap<ThreadId, u64>,
     metadata_updates: HashMap<ThreadId, ThreadMetadataPatch>,
     names: HashMap<ThreadId, Option<String>>,
     rollout_paths: HashMap<PathBuf, ThreadId>,
@@ -455,6 +457,7 @@ impl InMemoryThreadStore {
                 meta: session_meta,
                 git: None,
             }));
+        state.next_append_sequences.insert(params.thread_id, 1);
         state.created_threads.insert(params.thread_id, params);
         Ok(())
     }
@@ -479,6 +482,7 @@ impl InMemoryThreadStore {
         if let Some(rollout_path) = params.rollout_path {
             state.rollout_paths.insert(rollout_path, params.thread_id);
         }
+        state.next_append_sequences.insert(params.thread_id, 1);
         Ok(())
     }
 
@@ -505,19 +509,25 @@ impl InMemoryThreadStore {
         &self,
         thread_id: ThreadId,
         items: &[RolloutItem],
-    ) -> ThreadStoreResult<()> {
-        self.state.lock().await.calls.append_persisted_items += 1;
+    ) -> ThreadStoreResult<AppendThreadItemsReceipt> {
         if items.is_empty() {
-            return Ok(());
+            return Err(ThreadStoreError::InvalidRequest {
+                message: "cannot append an empty persisted rollout batch".to_string(),
+            });
         }
         let mut state = self.state.lock().await;
+        state.calls.append_persisted_items += 1;
         state.calls.append_items += 1;
         state
             .histories
             .entry(thread_id)
             .or_default()
             .extend_from_slice(items);
-        Ok(())
+        let sequence = *state.next_append_sequences.entry(thread_id).or_insert(1);
+        state
+            .next_append_sequences
+            .insert(thread_id, sequence.saturating_add(1));
+        Ok(AppendThreadItemsReceipt::new(sequence))
     }
 
     async fn load_history(
@@ -614,6 +624,7 @@ impl InMemoryThreadStore {
         state.created_threads.remove(&params.thread_id);
         state.names.remove(&params.thread_id);
         state.metadata_updates.remove(&params.thread_id);
+        state.next_append_sequences.remove(&params.thread_id);
         state
             .rollout_paths
             .retain(|_, thread_id| *thread_id != params.thread_id);
@@ -648,7 +659,7 @@ impl ThreadStore for InMemoryThreadStore {
         &'a self,
         thread_id: ThreadId,
         items: &'a [RolloutItem],
-    ) -> ThreadStoreFuture<'a, ()> {
+    ) -> ThreadStoreFuture<'a, AppendThreadItemsReceipt> {
         Box::pin(InMemoryThreadStore::append_persisted_items(
             self, thread_id, items,
         ))

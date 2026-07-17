@@ -650,6 +650,19 @@ impl CodexThread {
         self.codex.session.refresh_runtime_config(next_config).await;
     }
 
+    /// Apply a process-coordinated user-config snapshot after the caller has invalidated shared
+    /// plugin and skill caches. The shared snapshot is only used to derive this thread's minimal
+    /// user-layer overlay; session-static settings remain unchanged.
+    pub async fn refresh_runtime_config_from_process_reload(
+        &self,
+        next_config: Arc<crate::config::Config>,
+    ) -> bool {
+        self.codex
+            .session
+            .refresh_runtime_config_from_process_reload(next_config)
+            .await
+    }
+
     pub async fn environment_selections(&self) -> Vec<TurnEnvironmentSelection> {
         self.codex.thread_environment_selections().await
     }

@@ -1,3 +1,4 @@
+use crate::apply_patch::convert_applied_patch_delta_to_protocol_ordered;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
@@ -11,6 +12,7 @@ use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::items::CommandExecutionItem;
 use codex_protocol::items::CommandExecutionStatus;
 use codex_protocol::items::FileChangeItem;
+use codex_protocol::items::OrderedFileChange;
 use codex_protocol::items::TurnItem;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::EventMsg;
@@ -135,6 +137,7 @@ pub(crate) enum ToolEmitter {
     },
     ApplyPatch {
         changes: HashMap<PathBuf, FileChange>,
+        ordered_changes: Vec<OrderedFileChange>,
         auto_approved: bool,
         environment_id: Option<String>,
     },
@@ -146,6 +149,27 @@ pub(crate) enum ToolEmitter {
         process_id: Option<String>,
         environment_id: String,
     },
+}
+
+fn ordered_patch_paths(changes: &[OrderedFileChange]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for change in changes {
+        paths.push(change.path.clone());
+        if let FileChange::Update {
+            move_path: Some(move_path),
+            ..
+        } = &change.change
+        {
+            paths.push(move_path.clone());
+        }
+    }
+    paths
+}
+
+fn committed_ordered_patch_changes(delta: Option<&AppliedPatchDelta>) -> Vec<OrderedFileChange> {
+    delta
+        .map(convert_applied_patch_delta_to_protocol_ordered)
+        .unwrap_or_default()
 }
 
 impl ToolEmitter {
@@ -167,11 +191,13 @@ impl ToolEmitter {
 
     pub fn apply_patch_for_environment(
         changes: HashMap<PathBuf, FileChange>,
+        ordered_changes: Vec<OrderedFileChange>,
         auto_approved: bool,
         environment_id: String,
     ) -> Self {
         Self::ApplyPatch {
             changes,
+            ordered_changes,
             auto_approved,
             environment_id: Some(environment_id),
         }
@@ -226,12 +252,13 @@ impl ToolEmitter {
             (
                 Self::ApplyPatch {
                     changes,
+                    ordered_changes,
                     auto_approved,
                     ..
                 },
                 ToolEventStage::Begin,
             ) => {
-                let paths = changes.keys().cloned().collect::<Vec<_>>();
+                let paths = ordered_patch_paths(ordered_changes);
                 if let Some(cwd) = ctx
                     .turn
                     .environments
@@ -250,6 +277,7 @@ impl ToolEmitter {
                         &TurnItem::FileChange(FileChangeItem {
                             id: ctx.call_id.to_string(),
                             changes: changes.clone(),
+                            ordered_changes: Some(ordered_changes.clone()),
                             status: None,
                             auto_approved: Some(*auto_approved),
                             stdout: None,
@@ -259,11 +287,7 @@ impl ToolEmitter {
                     .await;
             }
             (
-                Self::ApplyPatch {
-                    changes,
-                    environment_id,
-                    ..
-                },
+                Self::ApplyPatch { environment_id, .. },
                 ToolEventStage::Success {
                     output,
                     applied_patch_delta,
@@ -279,7 +303,7 @@ impl ToolEmitter {
                     .unwrap_or(TurnDiffTrackerUpdate::Invalidate);
                 emit_patch_end(
                     ctx,
-                    changes.clone(),
+                    committed_ordered_patch_changes(applied_patch_delta),
                     output.stdout.text.clone(),
                     output.stderr.text.clone(),
                     status,
@@ -288,12 +312,12 @@ impl ToolEmitter {
                 .await;
             }
             (
-                Self::ApplyPatch { changes, .. },
+                Self::ApplyPatch { .. },
                 ToolEventStage::Failure(ToolEventFailure::Output(output)),
             ) => {
                 emit_patch_end(
                     ctx,
-                    changes.clone(),
+                    Vec::new(),
                     output.stdout.text.clone(),
                     output.stderr.text.clone(),
                     if output.exit_code == 0 {
@@ -306,12 +330,12 @@ impl ToolEmitter {
                 .await;
             }
             (
-                Self::ApplyPatch { changes, .. },
+                Self::ApplyPatch { .. },
                 ToolEventStage::Failure(ToolEventFailure::Message(message)),
             ) => {
                 emit_patch_end(
                     ctx,
-                    changes.clone(),
+                    Vec::new(),
                     String::new(),
                     (*message).to_string(),
                     PatchApplyStatus::Failed,
@@ -320,11 +344,7 @@ impl ToolEmitter {
                 .await;
             }
             (
-                Self::ApplyPatch {
-                    changes,
-                    environment_id,
-                    ..
-                },
+                Self::ApplyPatch { environment_id, .. },
                 ToolEventStage::Failure(ToolEventFailure::Rejected {
                     message,
                     applied_patch_delta,
@@ -332,7 +352,7 @@ impl ToolEmitter {
             ) => {
                 emit_patch_end(
                     ctx,
-                    changes.clone(),
+                    committed_ordered_patch_changes(applied_patch_delta),
                     String::new(),
                     (*message).to_string(),
                     PatchApplyStatus::Declined,
@@ -656,12 +676,17 @@ async fn emit_exec_end(
 
 async fn emit_patch_end(
     ctx: ToolEventCtx<'_>,
-    changes: HashMap<PathBuf, FileChange>,
+    ordered_changes: Vec<OrderedFileChange>,
     stdout: String,
     stderr: String,
     status: PatchApplyStatus,
     tracker_update: TurnDiffTrackerUpdate<'_>,
 ) {
+    let changes = ordered_changes
+        .iter()
+        .cloned()
+        .map(|change| (change.path, change.change))
+        .collect();
     let outcome = match &status {
         PatchApplyStatus::Completed => "completed",
         PatchApplyStatus::Failed => "failed",
@@ -678,6 +703,7 @@ async fn emit_patch_end(
             TurnItem::FileChange(FileChangeItem {
                 id: ctx.call_id.to_string(),
                 changes,
+                ordered_changes: Some(ordered_changes),
                 status: Some(status),
                 auto_approved: None,
                 stdout: Some(stdout),
@@ -766,6 +792,7 @@ mod tests {
 
         ToolEmitter::ApplyPatch {
             changes: HashMap::new(),
+            ordered_changes: Vec::new(),
             auto_approved: false,
             environment_id: None,
         }
@@ -778,17 +805,20 @@ mod tests {
         .expect_err("failed patch");
 
         let completed = rx_event.recv().await.expect("item completed event");
-        assert!(matches!(
-            completed.msg,
-            EventMsg::ItemCompleted(event)
-                if matches!(
-                    &event.item,
-                    TurnItem::FileChange(FileChangeItem {
-                        status: Some(status),
-                        ..
-                    }) if status == &expected_status
-                )
-        ));
+        let EventMsg::ItemCompleted(event) = completed.msg else {
+            panic!("expected item completed event");
+        };
+        let TurnItem::FileChange(file_change) = event.item else {
+            panic!("expected file change item");
+        };
+        assert_eq!(file_change.status, Some(expected_status));
+        assert_eq!(file_change.changes.len(), 1);
+        let ordered = file_change
+            .ordered_changes
+            .expect("committed ordered delta must be authoritative");
+        assert_eq!(ordered.len(), 1);
+        assert!(ordered[0].path.ends_with("out/dest.txt"));
+        assert!(matches!(ordered[0].change, FileChange::Add { .. }));
 
         let unified_diff = loop {
             let event = tokio::time::timeout(Duration::from_secs(1), rx_event.recv())
@@ -855,7 +885,7 @@ mod tests {
 
             emit_patch_end(
                 ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", Some(&tracker)),
-                HashMap::new(),
+                Vec::new(),
                 String::new(),
                 String::new(),
                 PatchApplyStatus::Completed,
@@ -904,7 +934,7 @@ mod tests {
 
         emit_patch_end(
             ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", Some(&tracker)),
-            HashMap::new(),
+            Vec::new(),
             String::new(),
             String::new(),
             PatchApplyStatus::Completed,

@@ -17,6 +17,7 @@ use super::X_OPENAI_SUBAGENT_HEADER;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
+use crate::context_manager::ContextManager;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
@@ -51,6 +52,7 @@ use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
+use codex_protocol::openai_models::default_input_modalities;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -63,6 +65,7 @@ use codex_rollout_trace::RolloutTrace;
 use codex_rollout_trace::TraceWriter;
 use codex_rollout_trace::replay_bundle;
 use futures::StreamExt;
+use codex_utils_output_truncation::TruncationPolicy;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 use sha2::Digest;
@@ -175,12 +178,17 @@ fn websocket_prefix_hash_ignores_internal_metadata_only() {
 }
 
 #[test]
-fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback() {
+fn websocket_incremental_history_uses_compact_digest_and_fails_closed_without_it() {
     let client = test_model_client(SessionSource::Cli);
     let mut session = client.new_session();
     let original = history_test_request(vec![history_test_item("user", Some("turn-a"))]);
-    session.remember_request_history(&original);
-    session.websocket_session.last_request = Some(original.clone());
+    session.remember_request_history(
+        &original,
+        CanonicalPrefixHash::from_items(&original.input),
+        None,
+        None,
+        None,
+    );
     let response = LastResponse {
         response_id: "response-1".to_string(),
         items_added: vec![history_test_item("assistant", Some("turn-a"))],
@@ -191,24 +199,70 @@ fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback
     extended.input.push(delta.clone());
 
     assert_eq!(
-        session.get_incremental_items(&extended, Some(&response), false),
+        session
+            .get_incremental_proof(&extended, None, &response, false)
+            .map(|proof| proof.input),
         Some(vec![delta.clone()])
     );
 
     let mut changed_prefix = extended.clone();
     changed_prefix.input[0] = history_test_item("changed", Some("turn-a"));
     assert_eq!(
-        session.get_incremental_items(&changed_prefix, Some(&response), false),
+        session
+            .get_incremental_proof(&changed_prefix, None, &response, false)
+            .map(|proof| proof.input),
         None
     );
 
-    // Missing hash state is uncertainty, not failure: retain the canonical
-    // full-materialization/full-comparison behavior.
+    // Missing proof state is uncertainty and forces a full request.
     session.websocket_session.last_request_history = None;
     assert_eq!(
-        session.get_incremental_items(&extended, Some(&response), false),
-        Some(vec![delta])
+        session
+            .get_incremental_proof(&extended, None, &response, false)
+            .map(|proof| proof.input),
+        None
     );
+}
+
+#[test]
+fn websocket_incremental_history_uses_snapshot_proof_without_current_full_input() {
+    let client = test_model_client(SessionSource::Cli);
+    let mut session = client.new_session();
+    let original_item = history_test_item("user", Some("turn-a"));
+    let mut history = ContextManager::new();
+    history.record_items(
+        [&original_item],
+        TruncationPolicy::Tokens(10_000),
+    );
+    let baseline = history.prompt_snapshot(&default_input_modalities());
+    let original = history_test_request(baseline.materialize());
+    session.remember_request_history(
+        &original,
+        Ok(baseline.canonical_prefix()),
+        Some(baseline.mutation_revision()),
+        Some(baseline.rewrite_revision()),
+        None,
+    );
+
+    let response_item = history_test_item("assistant", Some("turn-a"));
+    let delta = history_test_item("next", Some("turn-b"));
+    history.record_items(
+        [&response_item, &delta],
+        TruncationPolicy::Tokens(10_000),
+    );
+    let current = history.prompt_snapshot(&default_input_modalities());
+    let static_request = history_test_request(Vec::new());
+    let response = LastResponse {
+        response_id: "response-1".to_string(),
+        items_added: vec![response_item],
+    };
+
+    let proof = session
+        .get_incremental_proof(&static_request, Some(&current), &response, false)
+        .expect("snapshot chain should prove the suffix");
+    assert_eq!(proof.input, vec![delta]);
+    assert_eq!(proof.current_prefix, current.canonical_prefix());
+    assert_eq!(proof.mutation_revision, Some(current.mutation_revision()));
 }
 
 #[test]
@@ -216,13 +270,17 @@ fn websocket_incremental_history_invalidates_without_dropping_transport_contract
     let client = test_model_client(SessionSource::Cli);
     let mut session = client.new_session();
     let request = history_test_request(vec![history_test_item("user", None)]);
-    session.remember_request_history(&request);
-    session.websocket_session.last_request = Some(request);
+    session.remember_request_history(
+        &request,
+        CanonicalPrefixHash::from_items(&request.input),
+        None,
+        None,
+        None,
+    );
     let generation_before = session.websocket_session.next_history_generation;
 
     session.invalidate_incremental_history("test history replacement");
 
-    assert!(session.websocket_session.last_request.is_none());
     assert!(session.websocket_session.last_request_history.is_none());
     assert!(session.websocket_session.next_history_generation > generation_before);
 }
@@ -237,7 +295,7 @@ fn legacy_responses_request_properties_fingerprint(
     let serialized = serde_json::to_vec(&properties)?;
     let mut hasher = Sha256::new();
     hasher.update(super::WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN);
-    hasher.update(super::WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION.to_be_bytes());
+    hasher.update(crate::context_manager::PROMPT_HISTORY_CANONICAL_POLICY_VERSION.to_be_bytes());
     hasher.update((serialized.len() as u64).to_be_bytes());
     hasher.update(serialized);
     Ok(hasher.finalize().into())

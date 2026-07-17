@@ -109,6 +109,10 @@ pub enum RolloutRecorderParams {
 
 enum RolloutCmd {
     AddItems(Vec<RolloutItem>),
+    AppendAndAck {
+        items: Vec<RolloutItem>,
+        ack: oneshot::Sender<std::io::Result<RolloutAppendReceipt>>,
+    },
     Persist {
         ack: oneshot::Sender<std::io::Result<()>>,
     },
@@ -119,6 +123,23 @@ enum RolloutCmd {
     Shutdown {
         ack: oneshot::Sender<std::io::Result<()>>,
     },
+}
+
+/// Receipt proving that the ordered rollout writer accepted and wrote one append batch.
+///
+/// Sequence numbers are assigned by the per-thread writer in exact JSONL order. A receipt is a
+/// visibility/ordering guarantee, not a durability barrier; callers that need durable terminal
+/// state must follow the terminal receipt with [`RolloutRecorder::flush`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RolloutAppendReceipt {
+    sequence: u64,
+}
+
+impl RolloutAppendReceipt {
+    /// Return the writer-local sequence assigned to this accepted append batch.
+    pub fn sequence(self) -> u64 {
+        self.sequence
+    }
 }
 
 /// Observable state for the background rollout writer task.
@@ -882,6 +903,38 @@ impl RolloutRecorder {
             })
     }
 
+    /// Append one canonical batch and wait until the ordered writer has written it to JSONL.
+    ///
+    /// The returned sequence is assigned in writer order. Multiple queued calls are written as one
+    /// actor batch without flushing between lines or append commands. SQLite projections may be
+    /// updated after this receipt because JSONL is already ahead, while terminal durability still
+    /// requires one explicit [`Self::flush`] barrier.
+    pub async fn append_and_ack(
+        &self,
+        items: &[RolloutItem],
+    ) -> std::io::Result<RolloutAppendReceipt> {
+        if items.is_empty() {
+            return Err(IoError::other("cannot append an empty rollout batch"));
+        }
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .send(RolloutCmd::AppendAndAck {
+                items: items.to_vec(),
+                ack: tx,
+            })
+            .await
+            .map_err(|e| {
+                self.writer_task.terminal_failure().unwrap_or_else(|| {
+                    IoError::other(format!("failed to queue rollout append: {e}"))
+                })
+            })?;
+        rx.await.map_err(|e| {
+            self.writer_task.terminal_failure().unwrap_or_else(|| {
+                IoError::other(format!("failed waiting for rollout append receipt: {e}"))
+            })
+        })?
+    }
+
     /// Materialize the rollout file and persist all buffered items.
     ///
     /// This is idempotent. If materialization fails, the recorder keeps all pending items in memory
@@ -1541,9 +1594,9 @@ fn open_log_file(path: &Path) -> std::io::Result<File> {
 
 /// Mutable state owned by the background rollout writer.
 ///
-/// Items are first appended to `pending_items`; persist/flush/shutdown remove each item from that
-/// queue only after it is written successfully. I/O failures drop the file handle but keep the
-/// unwritten suffix so the next barrier can reopen the file and retry.
+/// Items are first appended to `pending_items`; append receipts and durability barriers remove each
+/// item from that queue only after it is written successfully. I/O failures drop the file handle
+/// but keep the unwritten suffix so the next append or barrier can reopen the file and retry.
 struct RolloutWriterState {
     writer: Option<JsonlWriter>,
     deferred_log_file_info: Option<LogFileInfo>,
@@ -1552,6 +1605,7 @@ struct RolloutWriterState {
     cwd: PathBuf,
     rollout_path: PathBuf,
     last_logged_error: Option<String>,
+    next_append_sequence: u64,
 }
 
 impl RolloutWriterState {
@@ -1570,6 +1624,7 @@ impl RolloutWriterState {
             cwd,
             rollout_path,
             last_logged_error: None,
+            next_append_sequence: 1,
         }
     }
 
@@ -1577,35 +1632,46 @@ impl RolloutWriterState {
         self.pending_items.extend(items);
     }
 
-    async fn flush_if_materialized(&mut self) {
-        if self.is_deferred() {
-            return;
-        }
-        if let Err(err) = self.flush().await {
-            self.enter_recovery_mode(&err);
-        }
+    fn next_append_receipt(&mut self) -> RolloutAppendReceipt {
+        let receipt = RolloutAppendReceipt {
+            sequence: self.next_append_sequence,
+        };
+        self.next_append_sequence = self.next_append_sequence.saturating_add(1);
+        receipt
+    }
+
+    async fn append_pending(&mut self) -> std::io::Result<()> {
+        self.write_pending_with_recovery("append", /*flush*/ true)
+            .await
     }
 
     async fn persist(&mut self) -> std::io::Result<()> {
-        self.write_pending_with_recovery("persist").await
+        self.write_pending_with_recovery("persist", /*flush*/ true)
+            .await
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
         if self.is_deferred() && self.pending_items.is_empty() {
             return Ok(());
         }
-        self.write_pending_with_recovery("flush").await
+        self.write_pending_with_recovery("flush", /*flush*/ true)
+            .await
     }
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
         if self.is_deferred() && self.pending_items.is_empty() {
             return Ok(());
         }
-        self.write_pending_with_recovery("shutdown").await
+        self.write_pending_with_recovery("shutdown", /*flush*/ true)
+            .await
     }
 
-    async fn write_pending_with_recovery(&mut self, operation: &str) -> std::io::Result<()> {
-        match self.write_pending_once().await {
+    async fn write_pending_with_recovery(
+        &mut self,
+        operation: &str,
+        flush: bool,
+    ) -> std::io::Result<()> {
+        match self.write_pending_once(flush).await {
             Ok(()) => {
                 self.last_logged_error = None;
                 Ok(())
@@ -1613,7 +1679,7 @@ impl RolloutWriterState {
             Err(first_err) => {
                 self.enter_recovery_mode(&first_err);
                 warn!("failed to {operation} rollout writer; reopening and retrying: {first_err}");
-                match self.write_pending_once().await {
+                match self.write_pending_once(flush).await {
                     Ok(()) => {
                         self.last_logged_error = None;
                         Ok(())
@@ -1672,21 +1738,54 @@ impl RolloutWriterState {
         let Some(session_meta) = self.meta.as_ref().cloned() else {
             return Ok(());
         };
-        write_session_meta(self.writer.as_mut(), session_meta, &self.cwd).await?;
-        self.meta = None;
+        write_session_meta(self.writer.as_mut(), session_meta, &self.cwd).await
+    }
+
+    async fn write_pending_once(&mut self, flush: bool) -> std::io::Result<()> {
+        self.ensure_writer_open().await?;
+        let batch_start_len = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| IoError::other("rollout writer is not open"))?
+            .file
+            .metadata()
+            .await?
+            .len();
+        let pending_count = self.pending_items.len();
+        let had_meta = self.meta.is_some();
+
+        let result = async {
+            self.write_session_meta_if_needed().await?;
+            self.write_pending_items_once().await?;
+
+            if flush && let Some(writer) = self.writer.as_mut() {
+                writer.file.flush().await?;
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = result {
+            self.rollback_failed_batch(batch_start_len).await?;
+            return Err(err);
+        }
+
+        if had_meta {
+            self.meta = None;
+        }
+        if pending_count > 0 {
+            self.pending_items.drain(..pending_count);
+        }
         Ok(())
     }
 
-    async fn write_pending_once(&mut self) -> std::io::Result<()> {
-        self.ensure_writer_open().await?;
-        self.write_session_meta_if_needed().await?;
-
-        self.write_pending_items_once().await?;
-
-        if let Some(writer) = self.writer.as_mut() {
-            writer.file.flush().await?;
-        }
-        Ok(())
+    async fn rollback_failed_batch(&mut self, batch_start_len: u64) -> std::io::Result<()> {
+        self.writer = None;
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.rollout_path)
+            .await?;
+        file.set_len(batch_start_len).await
     }
 
     async fn write_pending_items_once(&mut self) -> std::io::Result<()> {
@@ -1694,21 +1793,10 @@ impl RolloutWriterState {
             return Err(IoError::other("rollout writer is not open"));
         };
 
-        let mut written_count = 0usize;
-        let mut write_result = Ok(());
         for item in &self.pending_items {
-            if let Err(err) = writer.write_rollout_item(item).await {
-                write_result = Err(err);
-                break;
-            }
-            written_count += 1;
+            writer.write_rollout_item(item).await?;
         }
-
-        if written_count > 0 {
-            self.pending_items.drain(..written_count);
-        }
-
-        write_result
+        Ok(())
     }
 }
 
@@ -1721,13 +1809,40 @@ async fn rollout_writer(
     rollout_path: PathBuf,
 ) -> std::io::Result<()> {
     let mut state = RolloutWriterState::new(file, deferred_log_file_info, meta, cwd, rollout_path);
+    let mut deferred_cmd = None;
 
     // Process rollout commands
-    while let Some(cmd) = rx.recv().await {
+    while let Some(cmd) = match deferred_cmd.take() {
+        Some(cmd) => Some(cmd),
+        None => rx.recv().await,
+    } {
         match cmd {
             RolloutCmd::AddItems(items) => {
                 state.add_items(items);
-                state.flush_if_materialized().await;
+            }
+            RolloutCmd::AppendAndAck { items, ack } => {
+                let mut appends = vec![(items, ack)];
+                while let Ok(next_cmd) = rx.try_recv() {
+                    match next_cmd {
+                        RolloutCmd::AppendAndAck { items, ack } => appends.push((items, ack)),
+                        other => {
+                            deferred_cmd = Some(other);
+                            break;
+                        }
+                    }
+                }
+
+                for (items, _) in &mut appends {
+                    state.add_items(std::mem::take(items));
+                }
+                let result = state.append_pending().await;
+                for (_, ack) in appends {
+                    let result = match &result {
+                        Ok(()) => Ok(state.next_append_receipt()),
+                        Err(err) => Err(clone_io_error(err)),
+                    };
+                    let _ = ack.send(result);
+                }
             }
             RolloutCmd::Persist { ack } => {
                 let _ = ack.send(state.persist().await);
@@ -1779,7 +1894,7 @@ async fn write_session_meta(
 /// Append one already-filtered rollout item to an existing rollout JSONL file.
 ///
 /// This is for metadata updates to unloaded threads. Live sessions should use
-/// `RolloutRecorder::record_canonical_items` so rollout writes remain ordered
+/// `RolloutRecorder::append_and_ack` so rollout writes remain ordered
 /// with the rest of the session stream.
 pub async fn append_rollout_item_to_path(
     rollout_path: &Path,
@@ -1851,7 +1966,6 @@ impl JsonlWriter {
         let mut json = serde_json::to_string(item)?;
         json.push('\n');
         self.file.write_all(json.as_bytes()).await?;
-        self.file.flush().await?;
         Ok(())
     }
 }

@@ -6,6 +6,9 @@ use crate::function_tool::FunctionCallError;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
+use crate::tools::command_output_artifact::RawOutputArtifact;
+use crate::tools::command_output_artifact::create_content_addressed_output_artifact;
+use crate::tools::command_output_artifact::output_sha256;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
@@ -19,14 +22,18 @@ use crate::tools::handlers::verify_local_spec::VerifyLocalToolOptions;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
+use crate::tools::shell_output_summary::ShellOutputSummaryOptions;
+use crate::tools::shell_output_summary::reduce_shell_output_for_model;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_verify_local::CommandResultV2;
+use codex_verify_local::ExactOutputArtifactV2;
 use codex_verify_local::LaunchErrorKind;
 use codex_verify_local::LogState;
+use codex_verify_local::OutputOmissionV2;
 use codex_verify_local::PlanMode;
 use codex_verify_local::PlanRequest;
 use codex_verify_local::RawPath;
@@ -258,11 +265,29 @@ impl VerifyLocalHandler {
             .task_evidence
             .begin_verify_local_validation()
             .await;
+        let validation_cancellation_token = validation_start
+            .as_ref()
+            .map(|start| start.cancellation_token())
+            .unwrap_or_else(CancellationToken::new);
+        let command_cancellation_token = CancellationToken::new();
+        let cancellation_forwarder = {
+            let invocation_cancellation_token = cancellation_token.clone();
+            let validation_cancellation_token = validation_cancellation_token.clone();
+            let command_cancellation_token = command_cancellation_token.clone();
+            CancellationForwarder(tokio::spawn(async move {
+                tokio::select! {
+                    _ = invocation_cancellation_token.cancelled() => {}
+                    _ = validation_cancellation_token.cancelled() => {}
+                }
+                command_cancellation_token.cancel();
+            }))
+        };
         let mut facts = Vec::with_capacity(plan.commands.len());
+        let artifact_thread_id = format!("{}/verify-local", session.thread_id);
         if mode != PlanMode::Plan && plan.verdict.is_none() {
             for (ordinal, command) in plan.commands.iter().enumerate() {
                 let nonce = random_hex_128().unwrap_or_else(|_| "0".repeat(32));
-                if cancellation_token.is_cancelled() {
+                if command_cancellation_token.is_cancelled() {
                     facts.push(cancelled_command_result(&plan, command, ordinal, nonce));
                     continue;
                 }
@@ -282,11 +307,12 @@ impl VerifyLocalHandler {
                         ))
                     })?;
                 let hook_command = codex_shell_command::parse_command::shlex_join(&argv);
+                let evidence_command = hook_command.clone();
                 let exec_params = ExecParams {
                     command: argv.clone(),
                     cwd,
                     expiration: command.timeout_ms.into(),
-                    capture_policy: ExecCapturePolicy::ShellTool,
+                    capture_policy: ExecCapturePolicy::Verification,
                     env: base_env.clone(),
                     network: turn.network.clone(),
                     network_environment_id: Some(environment.environment_id.clone()),
@@ -303,7 +329,7 @@ impl VerifyLocalHandler {
                 let executed = run_exec_like_with_exit_code(RunExecLikeArgs {
                     tool_name: self.tool_name(),
                     exec_params,
-                    cancellation_token: cancellation_token.clone(),
+                    cancellation_token: command_cancellation_token.clone(),
                     hook_command,
                     safety_command: argv,
                     shell_type: None,
@@ -322,15 +348,21 @@ impl VerifyLocalHandler {
                 })
                 .await;
                 facts.push(match executed {
-                    Ok(executed) => command_result_from_core_execution(
-                        &plan,
-                        command,
-                        ordinal,
-                        nonce,
-                        executed.exec_output.as_ref(),
-                        executed.exit_code,
-                    ),
-                    Err(error) if cancellation_token.is_cancelled() => {
+                    Ok(executed) => {
+                        command_result_from_core_execution(
+                            &plan,
+                            command,
+                            ordinal,
+                            nonce,
+                            executed.exec_output.as_ref(),
+                            executed.exit_code,
+                            turn.config.codex_home.as_path(),
+                            &artifact_thread_id,
+                            &evidence_command,
+                        )
+                        .await
+                    }
+                    Err(_error) if command_cancellation_token.is_cancelled() => {
                         cancelled_command_result(&plan, command, ordinal, nonce)
                     }
                     Err(error) => CommandResultV2 {
@@ -405,10 +437,19 @@ impl VerifyLocalHandler {
                 /*clear_unknown_mutation*/ false,
             );
         }
+        drop(cancellation_forwarder);
         Ok(boxed_tool_output(FunctionToolOutput::from_text(
             output_text,
             Some(tool_success),
         )))
+    }
+}
+
+struct CancellationForwarder(tokio::task::JoinHandle<()>);
+
+impl Drop for CancellationForwarder {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -434,6 +475,8 @@ fn base_command_result(
         log_state: LogState::Complete,
         log_path: None,
         diagnostic: String::new(),
+        exact_output_artifact: None,
+        diagnostic_omission: None,
         cached: false,
         flaky: false,
         baseline: None,
@@ -467,13 +510,16 @@ fn unsupported_path_result(
     }
 }
 
-fn command_result_from_core_execution(
+async fn command_result_from_core_execution(
     plan: &codex_verify_local::PlanEnvelopeV2,
     command: &codex_verify_local::CommandSpecV2,
     ordinal: usize,
     nonce: String,
     output: Option<&ExecToolCallOutput>,
     exit_code: Option<i32>,
+    codex_home: &std::path::Path,
+    artifact_thread_id: &str,
+    command_text: &str,
 ) -> CommandResultV2 {
     let Some(output) = output else {
         return CommandResultV2 {
@@ -482,19 +528,70 @@ fn command_result_from_core_execution(
             ..base_command_result(plan, command, ordinal, nonce)
         };
     };
-    let mut diagnostic = output.aggregated_output.text.clone();
-    if diagnostic.len() > 64 * 1024 {
-        let mut boundary = 64 * 1024;
-        while !diagnostic.is_char_boundary(boundary) {
-            boundary -= 1;
-        }
-        diagnostic.truncate(boundary);
-    }
+    let exact_output = output
+        .aggregated_output_bytes
+        .as_deref()
+        .unwrap_or_else(|| output.aggregated_output.text.as_bytes());
+    let sha256 = output_sha256(exact_output);
+    let artifact =
+        create_content_addressed_output_artifact(codex_home, artifact_thread_id, exact_output)
+            .await;
+    let (exact_output_artifact, log_path, artifact_error) = match artifact {
+        RawOutputArtifact::Stored { path, bytes } => (
+            Some(ExactOutputArtifactV2 {
+                sha256: sha256.clone(),
+                path: path.clone(),
+                bytes,
+            }),
+            Some(path),
+            None,
+        ),
+        RawOutputArtifact::Failed {
+            message,
+            owned_path,
+            ..
+        } => (None, owned_path, Some(message)),
+    };
+    let reduction = reduce_shell_output_for_model(
+        &output.aggregated_output.text,
+        exit_code.unwrap_or(output.exit_code),
+        output.timed_out,
+        ShellOutputSummaryOptions {
+            enabled: true,
+            turn_cost_guard: true,
+            command_text: Some(command_text),
+        },
+    );
+    let (preview, diagnostic_omission) = reduction.map_or_else(
+        || (output.aggregated_output.text.clone(), None),
+        |reduction| {
+            (
+                reduction.summary,
+                Some(OutputOmissionV2 {
+                    bytes: u64::try_from(reduction.omitted_bytes).unwrap_or(u64::MAX),
+                    lines: u64::try_from(reduction.omitted_lines).unwrap_or(u64::MAX),
+                }),
+            )
+        },
+    );
+    let diagnostic = format!(
+        "Exact output: sha256:{sha256} ({} bytes)\n{preview}",
+        exact_output.len()
+    );
     CommandResultV2 {
         exit_code: exit_code.or(Some(output.exit_code)),
         duration_ns: u64::try_from(output.duration.as_nanos()).unwrap_or(u64::MAX),
         timed_out: output.timed_out,
+        runner_error: artifact_error,
+        log_state: if exact_output_artifact.is_some() {
+            LogState::Complete
+        } else {
+            LogState::IoFailure
+        },
+        log_path,
         diagnostic,
+        exact_output_artifact,
+        diagnostic_omission,
         ..base_command_result(plan, command, ordinal, nonce)
     }
 }

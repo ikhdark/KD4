@@ -5319,6 +5319,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                ordered_changes: None,
                 status: None,
                 auto_approved: Some(true),
                 stdout: None,
@@ -5433,6 +5434,7 @@ mod tests {
                 )]
                 .into_iter()
                 .collect(),
+                ordered_changes: None,
                 status: Some(PatchApplyStatus::Completed),
                 auto_approved: None,
                 stdout: Some("Done!".into()),

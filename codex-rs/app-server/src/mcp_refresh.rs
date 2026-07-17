@@ -50,6 +50,28 @@ pub(crate) async fn queue_best_effort_refresh(
     }
 }
 
+/// Queue MCP refreshes from the config snapshots already published to each thread.
+///
+/// Process-wide user-config reload uses this path so MCP refresh does not load the same layers a
+/// second time or rebuild a candidate from a snapshot that the session has already superseded.
+pub(crate) async fn queue_best_effort_refresh_from_current_configs(
+    thread_manager: &Arc<ThreadManager>,
+) {
+    let planned = plan_refreshes_from_current_configs(thread_manager).await;
+    let mut refreshes = Vec::with_capacity(planned.len());
+    for (thread_id, result) in planned {
+        match result {
+            Ok(refresh) => refreshes.push(refresh),
+            Err(err) => warn!("failed to plan MCP refresh for thread {thread_id}: {err}"),
+        }
+    }
+    for (_thread_id, result) in queue_planned_refreshes(refreshes).await {
+        if let Err(err) = result {
+            warn!("{err}");
+        }
+    }
+}
+
 async fn plan_refreshes(
     thread_manager: &Arc<ThreadManager>,
     config_manager: &ConfigManager,
@@ -62,6 +84,32 @@ async fn plan_refreshes(
                 io::Error::other(format!("failed to load thread {thread_id}: {err}"))
             })?;
             let config = build_refresh_config(thread.as_ref(), config_manager).await?;
+            Ok(PlannedRefresh {
+                thread_id,
+                thread,
+                config,
+            })
+        }
+        .await;
+        (thread_id, result)
+    });
+    let mut planned = collect_bounded(jobs).await;
+    planned.sort_by_key(|(thread_id, _)| thread_id.to_string());
+    planned
+}
+
+async fn plan_refreshes_from_current_configs(
+    thread_manager: &Arc<ThreadManager>,
+) -> Vec<(ThreadId, io::Result<PlannedRefresh>)> {
+    let mut thread_ids = thread_manager.list_thread_ids().await;
+    thread_ids.sort_by_key(|thread_id| thread_id.to_string());
+    let jobs = thread_ids.into_iter().map(|thread_id| async move {
+        let result = async {
+            let thread = thread_manager.get_thread(thread_id).await.map_err(|err| {
+                io::Error::other(format!("failed to load thread {thread_id}: {err}"))
+            })?;
+            let config = thread.config().await;
+            let config = build_refresh_config_from_config(thread.as_ref(), config.as_ref()).await?;
             Ok(PlannedRefresh {
                 thread_id,
                 thread,
@@ -147,7 +195,14 @@ async fn build_refresh_config(
     let config = config_manager
         .load_latest_config_for_thread(thread_config.as_ref())
         .await?;
-    let mcp_config = thread.runtime_mcp_config(&config).await;
+    build_refresh_config_from_config(thread, &config).await
+}
+
+async fn build_refresh_config_from_config(
+    thread: &CodexThread,
+    config: &codex_core::config::Config,
+) -> io::Result<McpServerRefreshConfig> {
+    let mcp_config = thread.runtime_mcp_config(config).await;
     let mcp_servers = codex_mcp::configured_mcp_servers(&mcp_config);
     Ok(McpServerRefreshConfig {
         mcp_servers: serde_json::to_value(mcp_servers).map_err(io::Error::other)?,
@@ -232,6 +287,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_config_refresh_does_not_reload_thread_config_layers() -> anyhow::Result<()> {
+        let (_temp_dir, thread_manager, _config_manager, loader) = refresh_test_state().await?;
+
+        queue_best_effort_refresh_from_current_configs(&thread_manager).await;
+
+        assert_eq!(loader.good_loads.load(Ordering::Relaxed), 0);
+        assert_eq!(loader.bad_loads.load(Ordering::Relaxed), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn refresh_config_uses_latest_auth_keyring_backend() -> anyhow::Result<()> {
         let (temp_dir, thread_manager, config_manager, _loader) = refresh_test_state().await?;
         std::fs::write(
@@ -271,11 +337,15 @@ mod tests {
         let completed = Arc::new(AtomicUsize::new(0));
         let release_blocked = Arc::new(Notify::new());
 
-        let jobs = (0..job_count).map(|job| {
-            let active = Arc::clone(&active);
-            let peak = Arc::clone(&peak);
-            let completed = Arc::clone(&completed);
-            let release_blocked = Arc::clone(&release_blocked);
+        let active_for_jobs = Arc::clone(&active);
+        let peak_for_jobs = Arc::clone(&peak);
+        let completed_for_jobs = Arc::clone(&completed);
+        let release_blocked_for_jobs = Arc::clone(&release_blocked);
+        let jobs = (0..job_count).map(move |job| {
+            let active = Arc::clone(&active_for_jobs);
+            let peak = Arc::clone(&peak_for_jobs);
+            let completed = Arc::clone(&completed_for_jobs);
+            let release_blocked = Arc::clone(&release_blocked_for_jobs);
             async move {
                 let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(now_active, Ordering::SeqCst);
@@ -305,9 +375,9 @@ mod tests {
 
     #[test]
     fn strict_refresh_errors_are_reported_in_thread_order() {
-        let first = ThreadId::from_str("11111111-1111-4111-8111-111111111111")
+        let first = ThreadId::from_string("11111111-1111-4111-8111-111111111111")
             .expect("valid first thread ID");
-        let second = ThreadId::from_str("22222222-2222-4222-8222-222222222222")
+        let second = ThreadId::from_string("22222222-2222-4222-8222-222222222222")
             .expect("valid second thread ID");
 
         let err = collect_strict_results::<()>(vec![
@@ -360,20 +430,23 @@ mod tests {
 
         let initial_config_manager =
             ConfigManager::without_managed_config_for_tests(temp_dir.path().to_path_buf());
-        let good_config = initial_config_manager
+        let mut good_config = initial_config_manager
             .load_for_cwd(
                 /*request_overrides*/ None,
                 ConfigOverrides::default(),
                 Some(good_cwd.clone()),
             )
             .await?;
-        let bad_config = initial_config_manager
+        let mut bad_config = initial_config_manager
             .load_for_cwd(
                 /*request_overrides*/ None,
                 ConfigOverrides::default(),
                 Some(bad_cwd.clone()),
             )
             .await?;
+        let sqlite_home = temp_dir.path().join("sqlite");
+        good_config.sqlite_home = sqlite_home.clone();
+        bad_config.sqlite_home = sqlite_home;
 
         let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy"));
         let state_db = init_state_db(&good_config)

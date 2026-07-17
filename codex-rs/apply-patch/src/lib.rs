@@ -49,6 +49,13 @@ pub enum ApplyPatchError {
     /// Error that occurs while computing replacements when applying patch chunks
     #[error("{0}")]
     ComputeReplacements(String),
+    /// The filesystem no longer matches the immutable plan verified for this patch.
+    #[error("stale apply_patch plan for {path}: expected {expected}, found {actual}")]
+    StalePlan {
+        path: String,
+        expected: String,
+        actual: String,
+    },
     /// A patch path could not be resolved as a path URI.
     #[error(transparent)]
     PathUri(#[from] PathUriParseError),
@@ -101,7 +108,7 @@ pub struct ApplyPatchArgs {
     pub environment_id: Option<String>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ApplyPatchFileChange {
     Add {
         content: String,
@@ -115,6 +122,115 @@ pub enum ApplyPatchFileChange {
         /// new_content that will result after the unified_diff is applied.
         new_content: String,
     },
+}
+
+/// A deterministic fingerprint for an expected filesystem state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApplyPatchFileFingerprint {
+    Missing,
+    Present { byte_len: usize, fnv1a64: u64 },
+}
+
+impl ApplyPatchFileFingerprint {
+    fn for_bytes(bytes: Option<&[u8]>) -> Self {
+        let Some(bytes) = bytes else {
+            return Self::Missing;
+        };
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        Self::Present {
+            byte_len: bytes.len(),
+            fnv1a64: hash,
+        }
+    }
+
+    pub fn stable_id(&self) -> String {
+        match self {
+            Self::Missing => "missing".to_string(),
+            Self::Present { byte_len, fnv1a64 } => {
+                format!("fnv1a64:{fnv1a64:016x}:{byte_len}")
+            }
+        }
+    }
+}
+
+/// Returns the stable fingerprint used by verified patch plans and results.
+pub fn patch_content_fingerprint(bytes: Option<&[u8]>) -> String {
+    ApplyPatchFileFingerprint::for_bytes(bytes).stable_id()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ApplyPatchFileSnapshot {
+    bytes: Option<Vec<u8>>,
+    fingerprint: ApplyPatchFileFingerprint,
+}
+
+impl ApplyPatchFileSnapshot {
+    fn new(bytes: Option<Vec<u8>>) -> Self {
+        let fingerprint = ApplyPatchFileFingerprint::for_bytes(bytes.as_deref());
+        Self { bytes, fingerprint }
+    }
+}
+
+/// One verified filesystem operation, preserved in patch order.
+#[derive(Debug, PartialEq)]
+pub struct ApplyPatchPlanOperation {
+    path: PathUri,
+    summary_path: PathBuf,
+    expected_old: ApplyPatchFileSnapshot,
+    expected_move_destination: Option<(PathUri, ApplyPatchFileSnapshot)>,
+    change: ApplyPatchFileChange,
+    new_bytes: Option<Vec<u8>>,
+}
+
+impl ApplyPatchPlanOperation {
+    pub(crate) fn new(
+        path: PathUri,
+        summary_path: PathBuf,
+        expected_old_bytes: Option<Vec<u8>>,
+        expected_move_destination: Option<(PathUri, Option<Vec<u8>>)>,
+        change: ApplyPatchFileChange,
+        new_bytes: Option<Vec<u8>>,
+    ) -> Self {
+        Self {
+            path,
+            summary_path,
+            expected_old: ApplyPatchFileSnapshot::new(expected_old_bytes),
+            expected_move_destination: expected_move_destination
+                .map(|(path, bytes)| (path, ApplyPatchFileSnapshot::new(bytes))),
+            change,
+            new_bytes,
+        }
+    }
+
+    pub fn path(&self) -> &PathUri {
+        &self.path
+    }
+
+    pub fn change(&self) -> &ApplyPatchFileChange {
+        &self.change
+    }
+
+    pub fn expected_old_fingerprint(&self) -> &ApplyPatchFileFingerprint {
+        &self.expected_old.fingerprint
+    }
+
+    pub fn new_fingerprint(&self) -> ApplyPatchFileFingerprint {
+        ApplyPatchFileFingerprint::for_bytes(self.new_bytes.as_deref())
+    }
+
+    pub fn new_bytes(&self) -> Option<&[u8]> {
+        self.new_bytes.as_deref()
+    }
+
+    pub fn move_destination(&self) -> Option<(&PathUri, &ApplyPatchFileFingerprint)> {
+        self.expected_move_destination
+            .as_ref()
+            .map(|(path, snapshot)| (path, &snapshot.fingerprint))
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -136,7 +252,8 @@ pub enum MaybeApplyPatchVerified {
 /// construction, all paths should be absolute paths.
 #[derive(Debug, PartialEq)]
 pub struct ApplyPatchAction {
-    changes: HashMap<PathUri, ApplyPatchFileChange>,
+    compatibility_changes: HashMap<PathUri, ApplyPatchFileChange>,
+    operations: Vec<ApplyPatchPlanOperation>,
 
     /// The raw patch argument that can be used to apply the patch. i.e., if the
     /// original arg was parsed in "lenient" mode with a
@@ -149,12 +266,27 @@ pub struct ApplyPatchAction {
 
 impl ApplyPatchAction {
     pub fn is_empty(&self) -> bool {
-        self.changes.is_empty()
+        self.operations.is_empty()
     }
 
-    /// Returns the changes that would be made by applying the patch.
-    pub fn changes(&self) -> &HashMap<PathUri, ApplyPatchFileChange> {
-        &self.changes
+    /// Returns every verified change in patch order.
+    pub fn changes(&self) -> impl ExactSizeIterator<Item = (&PathUri, &ApplyPatchFileChange)> {
+        self.operations
+            .iter()
+            .map(|operation| (operation.path(), operation.change()))
+    }
+
+    /// Returns the legacy per-path projection used by compatibility-only consumers.
+    ///
+    /// Repeated operations for one path collapse to the final entry and must not be
+    /// used for safety, approval, execution, or exact result derivation.
+    pub fn compatibility_changes(&self) -> &HashMap<PathUri, ApplyPatchFileChange> {
+        &self.compatibility_changes
+    }
+
+    /// Returns the immutable operations in the order verified from the patch.
+    pub fn operations(&self) -> &[ApplyPatchPlanOperation] {
+        &self.operations
     }
 
     /// Should be used exclusively for testing. (Not worth the overhead of
@@ -169,13 +301,40 @@ impl ApplyPatchAction {
 + {content}
 *** End Patch"#,
         );
-        let changes = HashMap::from([(path.clone(), ApplyPatchFileChange::Add { content })]);
+        let change = ApplyPatchFileChange::Add {
+            content: content.clone(),
+        };
+        let operations = vec![ApplyPatchPlanOperation::new(
+            path.clone(),
+            PathBuf::from(filename),
+            None,
+            None,
+            ApplyPatchFileChange::Add {
+                content: content.clone(),
+            },
+            Some(content.into_bytes()),
+        )];
+        let compatibility_changes = HashMap::from([(path.clone(), change)]);
         #[expect(clippy::expect_used)]
         Self {
-            changes,
+            compatibility_changes,
+            operations,
             cwd: path.parent().expect("path should have parent"),
             patch,
         }
+    }
+}
+
+impl ApplyPatchAction {
+    /// Executes the exact ordered plan produced during verification.
+    pub async fn execute(
+        &self,
+        stdout: &mut impl std::io::Write,
+        stderr: &mut impl std::io::Write,
+        fs: &dyn ExecutorFileSystem,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
+        apply_patch_action(self, stdout, stderr, fs, sandbox).await
     }
 }
 
@@ -311,6 +470,32 @@ pub async fn apply_patch(
     apply_hunks(&hunks, cwd, stdout, stderr, fs, sandbox).await
 }
 
+/// Executes the immutable plan created by verification without reparsing or
+/// rematching the original patch text.
+pub async fn apply_patch_action(
+    action: &ApplyPatchAction,
+    stdout: &mut impl std::io::Write,
+    stderr: &mut impl std::io::Write,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> Result<AppliedPatchDelta, ApplyPatchFailure> {
+    let mut delta = AppliedPatchDelta::empty();
+    match apply_plan_to_files(action.operations(), fs, sandbox, &mut delta).await {
+        Ok(affected_paths) => {
+            print_summary(&affected_paths, stdout).map_err(|error| {
+                ApplyPatchFailure::new(ApplyPatchError::from(error), delta.clone())
+            })?;
+            Ok(delta)
+        }
+        Err(error) => {
+            writeln!(stderr, "{error}").map_err(|write_error| {
+                ApplyPatchFailure::new(ApplyPatchError::from(write_error), delta.clone())
+            })?;
+            Err(ApplyPatchFailure::new(error, delta))
+        }
+    }
+}
+
 /// Applies hunks and continues to update stdout/stderr
 pub async fn apply_hunks(
     hunks: &[Hunk],
@@ -354,6 +539,245 @@ pub struct AffectedPaths {
     pub added: Vec<PathBuf>,
     pub modified: Vec<PathBuf>,
     pub deleted: Vec<PathBuf>,
+}
+
+async fn apply_plan_to_files(
+    operations: &[ApplyPatchPlanOperation],
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+    delta: &mut AppliedPatchDelta,
+) -> Result<AffectedPaths, ApplyPatchError> {
+    let mut affected = AffectedPaths {
+        added: Vec::new(),
+        modified: Vec::new(),
+        deleted: Vec::new(),
+    };
+
+    for operation in operations {
+        note_existing_path_delta_support(&operation.path, fs, sandbox, &mut delta.exact).await;
+        ensure_expected_snapshot(&operation.path, &operation.expected_old, fs, sandbox).await?;
+        if let Some((destination, expected)) = &operation.expected_move_destination {
+            note_existing_path_delta_support(destination, fs, sandbox, &mut delta.exact).await;
+            ensure_expected_snapshot(destination, expected, fs, sandbox).await?;
+        }
+
+        match &operation.change {
+            ApplyPatchFileChange::Add { content } => {
+                let overwritten_content = snapshot_text(&operation.expected_old, &mut delta.exact);
+                let new_bytes = operation.new_bytes.clone().unwrap_or_default();
+                if let Err(error) =
+                    write_file_with_missing_parent_retry(fs, &operation.path, new_bytes, sandbox)
+                        .await
+                {
+                    delta.exact = false;
+                    return Err(apply_patch_io_error(error));
+                }
+                delta.changes.push(AppliedPatchChange {
+                    path: operation.path.to_path_buf(),
+                    change: AppliedPatchFileChange::Add {
+                        content: content.clone(),
+                        overwritten_content,
+                    },
+                });
+                affected.added.push(operation.summary_path.clone());
+            }
+            ApplyPatchFileChange::Delete { content } => {
+                ensure_not_directory(&operation.path, fs, sandbox)
+                    .await
+                    .map_err(ApplyPatchError::from)?;
+                if let Err(error) = fs
+                    .remove(
+                        &operation.path,
+                        RemoveOptions {
+                            recursive: false,
+                            force: false,
+                        },
+                        sandbox,
+                    )
+                    .await
+                {
+                    delta.exact &= remove_failure_was_side_effect_free_bytes(
+                        &operation.path,
+                        operation.expected_old.bytes.as_deref(),
+                        fs,
+                        sandbox,
+                    )
+                    .await;
+                    return Err(ApplyPatchError::from(error));
+                }
+                delta.changes.push(AppliedPatchChange {
+                    path: operation.path.to_path_buf(),
+                    change: AppliedPatchFileChange::Delete {
+                        content: content.clone(),
+                    },
+                });
+                affected.deleted.push(operation.summary_path.clone());
+            }
+            ApplyPatchFileChange::Update {
+                move_path,
+                new_content,
+                ..
+            } => {
+                let old_content = snapshot_required_text(&operation.expected_old)?;
+                let new_bytes = operation.new_bytes.clone().unwrap_or_default();
+                if let Some(destination) = move_path {
+                    let expected_destination = operation
+                        .expected_move_destination
+                        .as_ref()
+                        .map(|(_, snapshot)| snapshot)
+                        .ok_or_else(|| {
+                            ApplyPatchError::ComputeReplacements(format!(
+                                "verified move {} has no destination snapshot",
+                                operation.path.inferred_native_path_string()
+                            ))
+                        })?;
+                    let overwritten_move_content =
+                        snapshot_text(expected_destination, &mut delta.exact);
+                    if let Err(error) =
+                        write_file_with_missing_parent_retry(fs, destination, new_bytes, sandbox)
+                            .await
+                    {
+                        delta.exact = false;
+                        return Err(apply_patch_io_error(error));
+                    }
+                    let destination_write_index = delta.changes.len();
+                    delta.changes.push(AppliedPatchChange {
+                        path: destination.to_path_buf(),
+                        change: AppliedPatchFileChange::Add {
+                            content: new_content.clone(),
+                            overwritten_content: overwritten_move_content.clone(),
+                        },
+                    });
+                    if let Err(error) = fs
+                        .remove(
+                            &operation.path,
+                            RemoveOptions {
+                                recursive: false,
+                                force: false,
+                            },
+                            sandbox,
+                        )
+                        .await
+                    {
+                        delta.exact &= remove_failure_was_side_effect_free_bytes(
+                            &operation.path,
+                            operation.expected_old.bytes.as_deref(),
+                            fs,
+                            sandbox,
+                        )
+                        .await;
+                        return Err(ApplyPatchError::from(error));
+                    }
+                    delta.changes[destination_write_index] = AppliedPatchChange {
+                        path: operation.path.to_path_buf(),
+                        change: AppliedPatchFileChange::Update {
+                            move_path: Some(destination.to_path_buf()),
+                            old_content,
+                            overwritten_move_content,
+                            new_content: new_content.clone(),
+                        },
+                    };
+                } else {
+                    if let Err(error) = fs.write_file(&operation.path, new_bytes, sandbox).await {
+                        delta.exact = false;
+                        return Err(ApplyPatchError::from(error));
+                    }
+                    delta.changes.push(AppliedPatchChange {
+                        path: operation.path.to_path_buf(),
+                        change: AppliedPatchFileChange::Update {
+                            move_path: None,
+                            old_content,
+                            overwritten_move_content: None,
+                            new_content: new_content.clone(),
+                        },
+                    });
+                }
+                affected.modified.push(operation.summary_path.clone());
+            }
+        }
+    }
+
+    Ok(affected)
+}
+
+async fn ensure_expected_snapshot(
+    path: &PathUri,
+    expected: &ApplyPatchFileSnapshot,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> Result<(), ApplyPatchError> {
+    let actual = read_optional_file_bytes(path, fs, sandbox).await?;
+    if actual == expected.bytes {
+        return Ok(());
+    }
+    Err(ApplyPatchError::StalePlan {
+        path: path.inferred_native_path_string(),
+        expected: expected.fingerprint.stable_id(),
+        actual: ApplyPatchFileFingerprint::for_bytes(actual.as_deref()).stable_id(),
+    })
+}
+
+async fn read_optional_file_bytes(
+    path: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> Result<Option<Vec<u8>>, ApplyPatchError> {
+    match fs.read_file(path, sandbox).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ApplyPatchError::IoError(IoError {
+            context: format!("Failed to read {}", path.inferred_native_path_string()),
+            source: error,
+        })),
+    }
+}
+
+fn snapshot_text(snapshot: &ApplyPatchFileSnapshot, exact: &mut bool) -> Option<String> {
+    let bytes = snapshot.bytes.clone()?;
+    match String::from_utf8(bytes) {
+        Ok(content) => Some(content),
+        Err(_) => {
+            *exact = false;
+            None
+        }
+    }
+}
+
+fn snapshot_required_text(snapshot: &ApplyPatchFileSnapshot) -> Result<String, ApplyPatchError> {
+    let bytes = snapshot.bytes.clone().ok_or_else(|| {
+        ApplyPatchError::ComputeReplacements("verified source file is missing".to_string())
+    })?;
+    String::from_utf8(bytes).map_err(|error| {
+        ApplyPatchError::IoError(IoError {
+            context: "verified source file is not UTF-8".to_string(),
+            source: io::Error::new(io::ErrorKind::InvalidData, error),
+        })
+    })
+}
+
+fn apply_patch_io_error(error: anyhow::Error) -> ApplyPatchError {
+    match error.downcast::<io::Error>() {
+        Ok(error) => ApplyPatchError::from(error),
+        Err(error) => ApplyPatchError::IoError(IoError {
+            context: error.to_string(),
+            source: io::Error::other(error),
+        }),
+    }
+}
+
+async fn remove_failure_was_side_effect_free_bytes(
+    path: &PathUri,
+    expected_content: Option<&[u8]>,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&FileSystemSandboxContext>,
+) -> bool {
+    match expected_content {
+        Some(expected_content) => fs
+            .read_file(path, sandbox)
+            .await
+            .is_ok_and(|content| content == expected_content),
+        None => false,
+    }
 }
 
 /// Apply the hunks to the filesystem, returning which files were added, modified, or deleted.
@@ -688,6 +1112,14 @@ async fn derive_new_contents_from_chunks(
         })
     })?;
 
+    derive_new_contents_from_content(path, chunks, original_contents)
+}
+
+fn derive_new_contents_from_content(
+    path: &PathUri,
+    chunks: &[UpdateFileChunk],
+    original_contents: String,
+) -> std::result::Result<AppliedPatch, ApplyPatchError> {
     let mut original_lines: Vec<String> = original_contents.split('\n').map(String::from).collect();
 
     // Drop the trailing empty element that results from the final newline so
@@ -857,13 +1289,41 @@ pub async fn unified_diff_from_chunks_with_context(
         original_contents,
         new_contents,
     } = derive_new_contents_from_chunks(path, chunks, fs, sandbox).await?;
+    Ok(file_update_from_contents(
+        original_contents,
+        new_contents,
+        context,
+    ))
+}
+
+pub(crate) fn unified_diff_from_content(
+    path: &PathUri,
+    chunks: &[UpdateFileChunk],
+    original_contents: String,
+) -> std::result::Result<ApplyPatchFileUpdate, ApplyPatchError> {
+    let AppliedPatch {
+        original_contents,
+        new_contents,
+    } = derive_new_contents_from_content(path, chunks, original_contents)?;
+    Ok(file_update_from_contents(
+        original_contents,
+        new_contents,
+        /*context*/ 1,
+    ))
+}
+
+fn file_update_from_contents(
+    original_contents: String,
+    new_contents: String,
+    context: usize,
+) -> ApplyPatchFileUpdate {
     let text_diff = TextDiff::from_lines(&original_contents, &new_contents);
     let unified_diff = text_diff.unified_diff().context_radius(context).to_string();
-    Ok(ApplyPatchFileUpdate {
+    ApplyPatchFileUpdate {
         unified_diff,
         original_content: original_contents,
         content: new_contents,
-    })
+    }
 }
 
 /// Print the summary of changes in git-style format.
@@ -1689,6 +2149,95 @@ g
 
             assert!(!delta.is_exact());
         }
+    }
+
+    #[tokio::test]
+    async fn verified_action_preserves_repeated_path_order_and_executes_plan() {
+        let dir = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute test path");
+        let patch =
+            wrap_patch("*** Add File: repeated.txt\n+first\n*** Add File: repeated.txt\n+second");
+        let args = parse_patch(&patch).expect("parse patch");
+        let mut action =
+            match verify_apply_patch_args(args, &cwd, LOCAL_FS.as_ref(), /*sandbox*/ None).await {
+                MaybeApplyPatchVerified::Body(action) => action,
+                other => panic!("expected verified action, got {other:?}"),
+            };
+
+        assert_eq!(action.operations().len(), 2);
+        assert_eq!(action.changes().count(), 2);
+        assert_eq!(action.compatibility_changes().len(), 1);
+        assert_eq!(
+            action.operations()[0].expected_old_fingerprint(),
+            &ApplyPatchFileFingerprint::Missing
+        );
+        assert_eq!(
+            action.operations()[1].expected_old_fingerprint(),
+            &action.operations()[0].new_fingerprint()
+        );
+
+        // Execution must consume the verified plan, not parse this mutable
+        // compatibility copy of the original tool argument again.
+        action.patch = "not a patch".to_string();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let delta = action
+            .execute(
+                &mut stdout,
+                &mut stderr,
+                LOCAL_FS.as_ref(),
+                /*sandbox*/ None,
+            )
+            .await
+            .expect("execute verified plan");
+
+        assert_eq!(delta.changes().len(), 2);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("repeated.txt")).unwrap(),
+            "second\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_action_rejects_stale_source_before_commit() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("stale.txt");
+        fs::write(&path, "before\n").unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute test path");
+        let patch = wrap_patch("*** Update File: stale.txt\n@@\n-before\n+after");
+        let action = match verify_apply_patch_args(
+            parse_patch(&patch).expect("parse patch"),
+            &cwd,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await
+        {
+            MaybeApplyPatchVerified::Body(action) => action,
+            other => panic!("expected verified action, got {other:?}"),
+        };
+        fs::write(&path, "changed after verification\n").unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let failure = action
+            .execute(
+                &mut stdout,
+                &mut stderr,
+                LOCAL_FS.as_ref(),
+                /*sandbox*/ None,
+            )
+            .await
+            .expect_err("stale plan must fail");
+        let (error, delta) = failure.into_parts();
+
+        assert!(matches!(error, ApplyPatchError::StalePlan { .. }));
+        assert!(delta.is_exact());
+        assert!(delta.is_empty());
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "changed after verification\n"
+        );
     }
 
     #[cfg(unix)]

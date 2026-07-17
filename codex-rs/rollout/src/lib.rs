@@ -65,6 +65,7 @@ pub use policy::is_persisted_rollout_item;
 pub use policy::persisted_rollout_items;
 pub use policy::should_persist_response_item_for_memories;
 pub use recorder::RolloutRecorder;
+pub use recorder::RolloutAppendReceipt;
 pub use recorder::RolloutRecorderParams;
 pub use recorder::append_rollout_item_to_path;
 pub use search::first_rollout_content_match_snippet;

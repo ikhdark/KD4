@@ -141,6 +141,25 @@ pub struct AppendThreadItemsParams {
     pub items: Vec<RolloutItem>,
 }
 
+/// Store receipt proving the accepted append's position in per-thread replay order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AppendThreadItemsReceipt {
+    sequence: u64,
+}
+
+impl AppendThreadItemsReceipt {
+    /// Create a receipt for a nonzero per-thread append sequence assigned by a store.
+    pub fn new(sequence: u64) -> Self {
+        debug_assert!(sequence > 0, "append receipt sequences must be nonzero");
+        Self { sequence }
+    }
+
+    /// Return the store-local per-thread append sequence.
+    pub fn sequence(self) -> u64 {
+        self.sequence
+    }
+}
+
 /// Parameters for loading persisted history for resume, fork, rollback, and memory jobs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoadThreadHistoryParams {

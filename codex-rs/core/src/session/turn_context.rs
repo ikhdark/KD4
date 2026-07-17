@@ -132,7 +132,7 @@ pub struct TurnContext {
     pub(crate) permission_profile: PermissionProfile,
     pub(crate) network: Option<NetworkProxy>,
     pub(crate) windows_sandbox_level: WindowsSandboxLevel,
-    pub(crate) available_models: Vec<ModelPreset>,
+    pub(crate) available_models: Arc<[ModelPreset]>,
     pub(crate) unified_exec_shell_mode: UnifiedExecShellMode,
     pub(crate) final_output_json_schema: Option<Value>,
     pub(crate) dynamic_tools: Vec<DynamicToolSpec>,
@@ -143,6 +143,31 @@ pub struct TurnContext {
     pub(crate) terminal_error: Arc<Mutex<Option<String>>>,
     pub(crate) server_model_warning_emitted: AtomicBool,
     pub(crate) model_verification_emitted: AtomicBool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TurnConfigOverlay {
+    cwd: AbsolutePathBuf,
+    workspace_roots: Vec<AbsolutePathBuf>,
+    reasoning_effort: Option<ReasoningEffortConfig>,
+    reasoning_summary: Option<ReasoningSummaryConfig>,
+    service_tier: Option<String>,
+    personality: Option<Personality>,
+    approvals_reviewer: ApprovalsReviewer,
+    permission_profile_state: PermissionProfileState,
+    permission_profile: PermissionProfile,
+}
+
+pub(super) struct TurnConfigSnapshotCache {
+    base: Arc<Config>,
+    overlay: TurnConfigOverlay,
+    snapshot: Arc<Config>,
+}
+
+impl TurnConfigSnapshotCache {
+    fn matches(&self, base: &Arc<Config>, overlay: &TurnConfigOverlay) -> bool {
+        Arc::ptr_eq(&self.base, base) && &self.overlay == overlay
+    }
 }
 
 enum TurnMultiAgentRuntime {
@@ -219,9 +244,13 @@ impl TurnContext {
     ) -> Self {
         let mut config = (*self.config).clone();
         config.model = Some(model.clone());
-        let model_info = models_manager
-            .get_model_info(model.as_str(), &config.to_models_manager_config())
+        let catalog = models_manager
+            .catalog_snapshot(
+                RefreshStrategy::OnlineIfUncached,
+                config.http_client_factory(),
+            )
             .await;
+        let model_info = catalog.model_info(model.as_str(), &config.to_models_manager_config());
         let supported_reasoning_levels = model_info
             .supported_reasoning_levels
             .iter()
@@ -250,12 +279,7 @@ impl TurnContext {
             Some(reasoning_effort.clone()),
             /*developer_instructions*/ None,
         );
-        let available_models = models_manager
-            .list_models(
-                RefreshStrategy::OnlineIfUncached,
-                config.http_client_factory(),
-            )
-            .await;
+        let available_models = catalog.available_models(models_manager.uses_codex_backend());
 
         Self {
             sub_id: self.sub_id.clone(),
@@ -422,35 +446,43 @@ fn local_time_context() -> (String, String) {
 }
 
 impl Session {
-    /// Don't expand the number of mutated arguments on config. We are in the process of getting rid of it.
-    pub(crate) fn build_per_turn_config(
+    fn turn_config_overlay(
         session_configuration: &SessionConfiguration,
         cwd: AbsolutePathBuf,
-    ) -> Config {
-        // todo(aibrahim): store this state somewhere else so we don't need to mut config
-        let config = session_configuration.original_config_do_not_use.clone();
-        let mut per_turn_config = (*config).clone();
-        per_turn_config.cwd = cwd;
-        per_turn_config.workspace_roots = session_configuration.workspace_roots.clone();
-        per_turn_config
+        service_tier: Option<String>,
+    ) -> TurnConfigOverlay {
+        TurnConfigOverlay {
+            cwd,
+            workspace_roots: session_configuration.workspace_roots.clone(),
+            reasoning_effort: session_configuration.collaboration_mode.reasoning_effort(),
+            reasoning_summary: session_configuration.model_reasoning_summary,
+            service_tier,
+            personality: session_configuration.personality,
+            approvals_reviewer: session_configuration.approvals_reviewer,
+            permission_profile_state: session_configuration.permission_profile_state().clone(),
+            permission_profile: session_configuration.permission_profile(),
+        }
+    }
+
+    fn config_with_turn_overlay(base: &Config, overlay: &TurnConfigOverlay) -> Config {
+        let mut config = base.clone();
+        config.cwd = overlay.cwd.clone();
+        config.workspace_roots = overlay.workspace_roots.clone();
+        config
             .permissions
-            .set_workspace_roots(session_configuration.workspace_roots.clone());
-        per_turn_config.model_reasoning_effort =
-            session_configuration.collaboration_mode.reasoning_effort();
-        per_turn_config.model_reasoning_summary = session_configuration.model_reasoning_summary;
-        per_turn_config.service_tier = session_configuration.service_tier.clone();
-        per_turn_config.personality = session_configuration.personality;
-        per_turn_config.approvals_reviewer = session_configuration.approvals_reviewer;
-        session_configuration
-            .apply_permission_profile_to_permissions(&mut per_turn_config.permissions);
-        let permission_profile = session_configuration.permission_profile();
+            .set_workspace_roots(overlay.workspace_roots.clone());
+        config.model_reasoning_effort = overlay.reasoning_effort.clone();
+        config.model_reasoning_summary = overlay.reasoning_summary;
+        config.service_tier = overlay.service_tier.clone();
+        config.personality = overlay.personality;
+        config.approvals_reviewer = overlay.approvals_reviewer;
+        config
+            .permissions
+            .set_permission_profile_state(overlay.permission_profile_state.clone());
         let resolved_web_search_mode =
-            resolve_web_search_mode_for_turn(&per_turn_config.web_search_mode, &permission_profile);
-        if let Err(err) = per_turn_config
-            .web_search_mode
-            .set(resolved_web_search_mode)
-        {
-            let fallback_value = per_turn_config.web_search_mode.value();
+            resolve_web_search_mode_for_turn(&config.web_search_mode, &overlay.permission_profile);
+        if let Err(err) = config.web_search_mode.set(resolved_web_search_mode) {
+            let fallback_value = config.web_search_mode.value();
             tracing::warn!(
                 error = %err,
                 ?resolved_web_search_mode,
@@ -458,8 +490,67 @@ impl Session {
                 "resolved web_search_mode is disallowed by requirements; keeping constrained value"
             );
         }
-        per_turn_config.features = config.features.clone();
-        per_turn_config
+        config.features = base.features.clone();
+        config
+    }
+
+    /// Don't expand the number of mutated arguments on config. We are in the process of getting rid of it.
+    pub(crate) fn build_per_turn_config(
+        session_configuration: &SessionConfiguration,
+        cwd: AbsolutePathBuf,
+    ) -> Config {
+        let overlay = Self::turn_config_overlay(
+            session_configuration,
+            cwd,
+            session_configuration.service_tier.clone(),
+        );
+        Self::config_with_turn_overlay(
+            session_configuration.original_config_do_not_use.as_ref(),
+            &overlay,
+        )
+    }
+
+    fn turn_config_snapshot(
+        &self,
+        session_configuration: &SessionConfiguration,
+        cwd: AbsolutePathBuf,
+        model_info: &ModelInfo,
+    ) -> Arc<Config> {
+        let base = &session_configuration.original_config_do_not_use;
+        let service_tier = get_service_tier(
+            session_configuration.service_tier.clone(),
+            base.features.enabled(Feature::FastMode),
+            model_info,
+        );
+        let overlay = Self::turn_config_overlay(session_configuration, cwd, service_tier);
+        {
+            let cache = self
+                .turn_config_snapshot_cache
+                .lock()
+                .expect("turn config snapshot cache lock should not be poisoned");
+            if let Some(cache) = cache.as_ref()
+                && cache.matches(base, &overlay)
+            {
+                return Arc::clone(&cache.snapshot);
+            }
+        }
+
+        let snapshot = Arc::new(Self::config_with_turn_overlay(base.as_ref(), &overlay));
+        let mut cache = self
+            .turn_config_snapshot_cache
+            .lock()
+            .expect("turn config snapshot cache lock should not be poisoned");
+        if let Some(cache) = cache.as_ref()
+            && cache.matches(base, &overlay)
+        {
+            return Arc::clone(&cache.snapshot);
+        }
+        *cache = Some(TurnConfigSnapshotCache {
+            base: Arc::clone(base),
+            overlay,
+            snapshot: Arc::clone(&snapshot),
+        });
+        snapshot
     }
 
     pub(crate) fn build_effective_session_config(
@@ -488,9 +579,9 @@ impl Session {
         user_shell: &shell::Shell,
         shell_zsh_path: Option<&PathBuf>,
         main_execve_wrapper_exe: Option<&PathBuf>,
-        per_turn_config: Config,
+        per_turn_config: Arc<Config>,
         model_info: ModelInfo,
-        models_manager: &SharedModelsManager,
+        available_models: Arc<[ModelPreset]>,
         network: Option<NetworkProxy>,
         environments: TurnEnvironmentSnapshot,
         cwd: AbsolutePathBuf,
@@ -509,7 +600,6 @@ impl Session {
         let auth_manager_for_context = auth_manager.clone();
         let provider_for_context = create_model_provider(provider, auth_manager);
         let session_telemetry_for_context = session_telemetry;
-        let available_models = models_manager.try_list_models().unwrap_or_default();
         let unified_exec_shell_mode = UnifiedExecShellMode::for_session(
             codex_tools::unified_exec_feature_mode_for_features(per_turn_config.features.get()),
             crate::tools::tool_user_shell_type(user_shell),
@@ -517,13 +607,6 @@ impl Session {
             main_execve_wrapper_exe,
         );
 
-        let mut per_turn_config = per_turn_config;
-        per_turn_config.service_tier = get_service_tier(
-            per_turn_config.service_tier,
-            per_turn_config.features.enabled(Feature::FastMode),
-            &model_info,
-        );
-        let per_turn_config = Arc::new(per_turn_config);
         let turn_metadata_state = Arc::new(TurnMetadataState::new(
             session_id.to_string(),
             thread_id.to_string(),
@@ -703,7 +786,6 @@ impl Session {
             .as_ref()
             .and_then(|turn_environment| turn_environment.cwd().to_abs_path().ok())
             .unwrap_or_else(|| session_configuration.cwd().clone());
-        let per_turn_config = Self::build_per_turn_config(&session_configuration, cwd.clone());
         {
             let mcp_runtime = self.services.latest_mcp_runtime();
             let mcp_connection_manager = mcp_runtime.manager();
@@ -712,14 +794,21 @@ impl Session {
                 .set_permission_profile(session_configuration.permission_profile());
         }
 
-        let model_info = self
+        let model_catalog = self
             .services
             .models_manager
-            .get_model_info(
-                session_configuration.collaboration_mode.model(),
-                &per_turn_config.to_models_manager_config(),
-            )
+            .current_catalog_snapshot()
             .await;
+        let model_info = model_catalog.model_info(
+            session_configuration.collaboration_mode.model(),
+            &session_configuration
+                .original_config_do_not_use
+                .to_models_manager_config(),
+        );
+        let available_models = model_catalog
+            .available_models(self.services.models_manager.uses_codex_backend());
+        let per_turn_config =
+            self.turn_config_snapshot(&session_configuration, cwd.clone(), &model_info);
         self.services
             .thread_extension_data
             .insert(model_info.clone());
@@ -745,7 +834,13 @@ impl Session {
             .plugins_manager
             .plugin_skill_snapshots_for_config(&plugins_input);
         let skills_input = skills_load_input_from_config(&per_turn_config, effective_skill_roots)
-            .with_plugin_skill_snapshots(plugin_skill_snapshots);
+            .with_plugin_skill_snapshots(plugin_skill_snapshots)
+            .with_environment_generation(turn_environments.generation)
+            .with_local_file_watching(
+                primary_turn_environment
+                    .as_ref()
+                    .is_some_and(|environment| !environment.environment.is_remote()),
+            );
         let fs = primary_turn_environment
             .map(|turn_environment| turn_environment.environment.get_filesystem());
         let skills_snapshot = self
@@ -766,7 +861,7 @@ impl Session {
             self.services.main_execve_wrapper_exe.as_ref(),
             per_turn_config,
             model_info,
-            &self.services.models_manager,
+            available_models,
             self.services
                 .network_proxy
                 .load_full()

@@ -1186,22 +1186,29 @@ impl PluginRequestProcessor {
             skill_name,
         } = params;
 
-        let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
-        if !config.features.enabled(Feature::Plugins) {
-            return Err(invalid_request(format!(
-                "remote plugin skill read is not enabled for marketplace {remote_marketplace_name}"
-            )));
-        }
-        validate_remote_plugin_id(&remote_plugin_id)?;
-        if skill_name.is_empty() {
-            return Err(invalid_request(
-                "invalid remote plugin skill name: cannot be empty",
-            ));
-        }
-
-        let auth = self.auth_manager.auth().await;
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
+        // Capture the config/auth inputs as owned values before beginning remote I/O. This RPC is
+        // intentionally unscoped at the request scheduler, so a slow remote read cannot retain the
+        // global config queue while the immutable snapshot remains valid for this response.
+        let (remote_plugin_service_config, auth) = {
+            let config = self.load_latest_config(/*fallback_cwd*/ None).await?;
+            if !config.features.enabled(Feature::Plugins) {
+                return Err(invalid_request(format!(
+                    "remote plugin skill read is not enabled for marketplace {remote_marketplace_name}"
+                )));
+            }
+            validate_remote_plugin_id(&remote_plugin_id)?;
+            if skill_name.is_empty() {
+                return Err(invalid_request(
+                    "invalid remote plugin skill name: cannot be empty",
+                ));
+            }
+            let auth = self.auth_manager.auth().await;
+            (
+                RemotePluginServiceConfig {
+                    chatgpt_base_url: config.chatgpt_base_url.clone(),
+                },
+                auth,
+            )
         };
         let remote_skill_detail = codex_core_plugins::remote::fetch_remote_plugin_skill_detail(
             &remote_plugin_service_config,
@@ -1325,14 +1332,22 @@ impl PluginRequestProcessor {
         &self,
         _params: PluginShareListParams,
     ) -> Result<PluginShareListResponse, JSONRPCErrorError> {
-        let (config, auth) = self.load_plugin_share_config_and_auth().await?;
-        let remote_plugin_service_config = RemotePluginServiceConfig {
-            chatgpt_base_url: config.chatgpt_base_url.clone(),
+        // Keep only the owned values needed by the filesystem/network phase. No config or auth
+        // manager guard survives into the remote request, and the request scheduler remains free.
+        let (remote_plugin_service_config, auth, codex_home) = {
+            let (config, auth) = self.load_plugin_share_config_and_auth().await?;
+            (
+                RemotePluginServiceConfig {
+                    chatgpt_base_url: config.chatgpt_base_url.clone(),
+                },
+                auth,
+                config.codex_home.clone(),
+            )
         };
         let data = codex_core_plugins::remote::list_remote_plugin_shares(
             &remote_plugin_service_config,
             auth.as_ref(),
-            config.codex_home.as_path(),
+            codex_home.as_path(),
         )
         .await
         .map_err(|err| remote_plugin_catalog_error_to_jsonrpc(err, "list remote plugin shares"))?

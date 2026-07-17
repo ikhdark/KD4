@@ -37,6 +37,23 @@ use wiremock::MockServer;
 
 const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
 
+#[tokio::test]
+async fn local_thread_store_construction_does_not_schedule_rollout_compression() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+    config
+        .features
+        .enable(codex_features::Feature::LocalThreadStoreCompression)
+        .expect("enable rollout compression");
+
+    let _thread_store = thread_store_from_config(&config, /*state_db*/ None);
+    tokio::task::yield_now().await;
+
+    assert!(!config.codex_home.join(".tmp").exists());
+}
+
 struct FakeAgentGraphStore {
     root_thread_id: ThreadId,
     descendant_thread_ids: Vec<ThreadId>,

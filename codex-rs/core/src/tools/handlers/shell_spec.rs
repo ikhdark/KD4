@@ -328,13 +328,21 @@ fn unified_exec_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "chunk_id": {
+            "outcome": {
                 "type": "string",
-                "description": "Chunk identifier included when the response reports one."
+                "enum": [
+                    "completed_success",
+                    "completed_failure",
+                    "running",
+                    "timed_out",
+                    "cancelled",
+                    "launch_failed"
+                ],
+                "description": "Stable semantic process outcome for this call."
             },
-            "wall_time_seconds": {
-                "type": "number",
-                "description": "Elapsed wall time spent waiting for output in seconds."
+            "timed_out": {
+                "type": "boolean",
+                "description": "True only when execution actually reached its timeout."
             },
             "exit_code": {
                 "type": "number",
@@ -369,7 +377,7 @@ fn unified_exec_output_schema() -> Value {
                 "description": "Command output text, possibly truncated."
             }
         },
-        "required": ["wall_time_seconds", "output"],
+        "required": ["outcome", "timed_out", "output"],
         "additionalProperties": false
     })
 }

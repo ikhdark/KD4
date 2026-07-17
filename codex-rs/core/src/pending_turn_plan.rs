@@ -39,16 +39,16 @@ pub(crate) struct FixedPointPlanningState {
 }
 
 impl FixedPointPlanningState {
+    pub(crate) fn record_stale_snapshot(&mut self) -> Result<(), String> {
+        self.advance_iteration_budget()?;
+        Ok(())
+    }
+
     pub(crate) fn begin_iteration(
         &mut self,
         snapshot: &PlanningSnapshotIdentity,
     ) -> Result<(), String> {
-        self.iterations = self.iterations.saturating_add(1);
-        if self.iterations > MAX_FIXED_POINT_ITERATIONS {
-            return Err(format!(
-                "pending-turn planning did not reach a fixed point after {MAX_FIXED_POINT_ITERATIONS} iterations"
-            ));
-        }
+        self.advance_iteration_budget()?;
         let visits = self
             .digest_visits
             .entry(snapshot.state_digest.clone())
@@ -58,6 +58,16 @@ impl FixedPointPlanningState {
             return Err(format!(
                 "pending-turn planning repeatedly invalidated the same model-visible state digest `{}`",
                 snapshot.state_digest
+            ));
+        }
+        Ok(())
+    }
+
+    fn advance_iteration_budget(&mut self) -> Result<(), String> {
+        self.iterations = self.iterations.saturating_add(1);
+        if self.iterations > MAX_FIXED_POINT_ITERATIONS {
+            return Err(format!(
+                "pending-turn planning did not reach a fixed point after {MAX_FIXED_POINT_ITERATIONS} iterations"
             ));
         }
         Ok(())
@@ -172,5 +182,16 @@ mod tests {
                 .expect("within bound");
         }
         assert!(state.begin_iteration(&snapshot(9, "state-9")).is_err());
+    }
+
+    #[test]
+    fn continuously_stale_snapshots_consume_the_fixed_point_budget() {
+        let mut state = FixedPointPlanningState::default();
+        for _ in 0..MAX_FIXED_POINT_ITERATIONS {
+            state
+                .record_stale_snapshot()
+                .expect("stale observation within bound");
+        }
+        assert!(state.record_stale_snapshot().is_err());
     }
 }

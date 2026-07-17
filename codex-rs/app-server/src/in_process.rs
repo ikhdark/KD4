@@ -25,11 +25,10 @@
 //!
 //! # Backpressure
 //!
-//! Command submission uses `try_send` and can return `WouldBlock`, while event
-//! fanout may drop notifications under saturation. Server requests are never
-//! silently abandoned: if they cannot be queued they are failed back into
-//! `MessageProcessor` with overload or internal errors so approval flows do
-//! not hang indefinitely.
+//! Request admission remains bounded, while control notifications and server
+//! request replies wait for queue acceptance. Reliable lifecycle/transcript
+//! events are delivered losslessly; only centrally classified best-effort
+//! progress may be dropped under saturation.
 //!
 //! # Relationship to `codex-app-server-client`
 //!

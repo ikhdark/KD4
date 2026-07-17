@@ -308,6 +308,44 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_counts_retry_fa
 }
 
 #[tokio::test]
+async fn intercepted_apply_patch_returns_the_structured_patch_result() {
+    let patch = "*** Begin Patch\n*** Add File: structured-intercept.txt\n+hello\n*** End Patch";
+    let payload = ToolPayload::Function {
+        arguments: serde_json::json!({
+            "kind": "argv",
+            "program": "apply_patch",
+            "args": [patch]
+        })
+        .to_string(),
+    };
+    let invocation =
+        invocation_for_payload("exec_command", "structured-intercept", payload.clone()).await;
+    let output = ExecCommandHandler::default()
+        .handle(invocation)
+        .await
+        .expect("intercepted patch output");
+
+    let structured = output.code_mode_result(&payload);
+    assert_eq!(structured["status"], "completed");
+    assert_eq!(structured["exact"], true);
+    assert_eq!(structured["operations"][0]["operation"], "add");
+    assert_eq!(structured["committed_delta"][0]["operation"], "add");
+
+    let response = output.to_response_item("structured-intercept", &payload);
+    let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
+    else {
+        panic!("expected function output");
+    };
+    assert_eq!(output.success, Some(true));
+    assert!(
+        output
+            .body
+            .to_text()
+            .is_some_and(|text| text.contains("Success. Updated"))
+    );
+}
+
+#[tokio::test]
 async fn unpolled_background_failure_finalizes_artifact_and_attempt_ledger() {
     let python = which::which("python")
         .or_else(|_| which::which("python3"))
@@ -723,6 +761,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
+        timed_out: false,
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
@@ -756,6 +795,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
+        timed_out: false,
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
@@ -790,6 +830,7 @@ async fn exec_command_post_tool_use_payload_skips_running_sessions() {
         max_output_tokens: None,
         process_id: Some(45),
         exit_code: None,
+        timed_out: false,
         original_token_count: None,
         hook_command: Some("echo three".to_string()),
         raw_output_artifact: None,
@@ -819,6 +860,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
+        timed_out: false,
         original_token_count: None,
         hook_command: Some("sleep 1; echo finished".to_string()),
         raw_output_artifact: None,
@@ -853,6 +895,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
+        timed_out: false,
         original_token_count: None,
         hook_command: Some("sleep 2; echo alpha".to_string()),
         raw_output_artifact: None,
@@ -868,6 +911,7 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(0),
+        timed_out: false,
         original_token_count: None,
         hook_command: Some("sleep 1; echo beta".to_string()),
         raw_output_artifact: None,

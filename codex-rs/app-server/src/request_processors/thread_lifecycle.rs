@@ -3,14 +3,129 @@ use codex_protocol::config_types::MultiAgentMode;
 
 pub(super) const THREAD_UNLOADING_DELAY: Duration = Duration::from_secs(30 * 60);
 
+#[derive(Default)]
+pub(crate) struct ThreadLifecycleCoordinator {
+    published_states:
+        std::sync::Mutex<HashMap<ThreadId, std::sync::Weak<ThreadLifecycleState>>>,
+}
+
+#[derive(Default)]
+struct ThreadLifecycleState {
+    operation_lock: Arc<Mutex<()>>,
+    subscription_state: Arc<Mutex<ThreadSubscriptionState>>,
+}
+
+#[derive(Default)]
+struct ThreadSubscriptionState {
+    unloading: bool,
+}
+
+pub(crate) struct ThreadLifecycleGuards {
+    _states: Vec<Arc<ThreadLifecycleState>>,
+    _guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+pub(super) struct ThreadSubscriptionGuard {
+    state: Arc<ThreadLifecycleState>,
+    guard: tokio::sync::OwnedMutexGuard<ThreadSubscriptionState>,
+}
+
+pub(super) struct ThreadUnloadToken {
+    state: Arc<ThreadLifecycleState>,
+}
+
+impl ThreadLifecycleCoordinator {
+    fn state(&self, thread_id: ThreadId) -> Arc<ThreadLifecycleState> {
+        let mut states = self
+            .published_states
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if let Some(state) = states.get(&thread_id).and_then(|state| state.upgrade()) {
+            return state;
+        }
+        if states.len() >= 1024 {
+            states.retain(|_, state| state.strong_count() > 0);
+        }
+        let state = Arc::new(ThreadLifecycleState::default());
+        states.insert(thread_id, Arc::downgrade(&state));
+        state
+    }
+
+    pub(crate) async fn lock_thread(&self, thread_id: ThreadId) -> ThreadLifecycleGuards {
+        self.lock_threads([thread_id]).await
+    }
+
+    pub(super) async fn lock_threads(
+        &self,
+        thread_ids: impl IntoIterator<Item = ThreadId>,
+    ) -> ThreadLifecycleGuards {
+        let mut thread_ids = thread_ids.into_iter().collect::<Vec<_>>();
+        thread_ids.sort_by_key(ToString::to_string);
+        thread_ids.dedup();
+
+        // Publish or resolve every keyed state while holding only the short
+        // synchronous registry lock inside `state`, then await the per-thread
+        // locks in a stable order without retaining that publication lock.
+        let states = thread_ids
+            .into_iter()
+            .map(|thread_id| self.state(thread_id))
+            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(states.len());
+        for state in &states {
+            guards.push(Arc::clone(&state.operation_lock).lock_owned().await);
+        }
+        ThreadLifecycleGuards {
+            _states: states,
+            _guards: guards,
+        }
+    }
+
+    pub(super) async fn subscription_guard(
+        &self,
+        thread_id: ThreadId,
+    ) -> ThreadSubscriptionGuard {
+        let state = self.state(thread_id);
+        let guard = Arc::clone(&state.subscription_state).lock_owned().await;
+        ThreadSubscriptionGuard { state, guard }
+    }
+
+    pub(super) async fn is_unloading(&self, thread_id: ThreadId) -> bool {
+        self.subscription_guard(thread_id).await.is_unloading()
+    }
+
+    pub(super) async fn clear_unloading(&self, thread_id: ThreadId) {
+        let mut subscription_guard = self.subscription_guard(thread_id).await;
+        subscription_guard.guard.unloading = false;
+    }
+}
+
+impl ThreadSubscriptionGuard {
+    pub(super) fn is_unloading(&self) -> bool {
+        self.guard.unloading
+    }
+
+    pub(super) fn mark_unloading(&mut self) -> ThreadUnloadToken {
+        self.guard.unloading = true;
+        ThreadUnloadToken {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl ThreadUnloadToken {
+    pub(super) async fn clear(self) {
+        let mut subscription_state = self.state.subscription_state.lock().await;
+        subscription_state.unloading = false;
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ListenerTaskContext {
     pub(super) thread_manager: Arc<ThreadManager>,
     pub(super) thread_state_manager: ThreadStateManager,
     pub(super) outgoing: Arc<OutgoingMessageSender>,
-    pub(super) pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    pub(super) thread_lifecycle: Arc<ThreadLifecycleCoordinator>,
     pub(super) thread_watch_manager: ThreadWatchManager,
-    pub(super) thread_list_state_permit: Arc<Semaphore>,
     pub(super) fallback_model_provider: String,
     pub(super) codex_home: PathBuf,
     pub(super) skills_watcher: Arc<SkillsWatcher>,
@@ -133,7 +248,7 @@ pub(super) enum EnsureConversationListenerResult {
 
 #[expect(
     clippy::await_holding_invalid_type,
-    reason = "listener subscription must be serialized against pending unloads"
+    reason = "listener subscription must be serialized against this thread's pending unload"
 )]
 pub(super) async fn ensure_conversation_listener(
     listener_task_context: ListenerTaskContext,
@@ -154,8 +269,11 @@ pub(super) async fn ensure_conversation_listener(
         }
     };
     let thread_state = {
-        let pending_thread_unloads = listener_task_context.pending_thread_unloads.lock().await;
-        if pending_thread_unloads.contains(&conversation_id) {
+        let subscription_guard = listener_task_context
+            .thread_lifecycle
+            .subscription_guard(conversation_id)
+            .await;
+        if subscription_guard.is_unloading() {
             return Err(invalid_request(format!(
                 "thread {conversation_id} is closing; retry after the thread is closed"
             )));
@@ -229,17 +347,16 @@ pub(super) async fn ensure_listener_task_running(
         )));
     };
     let config = conversation.config().await;
-    let environments = conversation.environment_selections().await;
+    let config_snapshot = conversation.config_snapshot().await;
     let watch_registration = listener_task_context
         .skills_watcher
         .register_thread_config(
             config.as_ref(),
             listener_task_context.thread_manager.as_ref(),
-            &environments,
+            &config_snapshot,
         )
         .await;
-    let thread_settings_baseline =
-        thread_settings_from_config_snapshot(&conversation.config_snapshot().await);
+    let thread_settings_baseline = thread_settings_from_config_snapshot(&config_snapshot);
     let (mut listener_command_rx, listener_generation) = {
         let mut thread_state = thread_state.lock().await;
         if thread_state.listener_matches(&conversation) {
@@ -266,9 +383,8 @@ pub(super) async fn ensure_listener_task_running(
         outgoing,
         thread_manager,
         thread_state_manager,
-        pending_thread_unloads,
+        thread_lifecycle,
         thread_watch_manager,
-        thread_list_state_permit,
         fallback_model_provider,
         codex_home,
         ..
@@ -294,7 +410,7 @@ pub(super) async fn ensure_listener_task_running(
                         &thread_state,
                         &thread_watch_manager,
                         &outgoing_for_task,
-                        &pending_thread_unloads,
+                        &thread_lifecycle,
                         listener_command,
                     )
                     .await;
@@ -332,7 +448,7 @@ pub(super) async fn ensure_listener_task_running(
                         thread_outgoing,
                         thread_state.clone(),
                         thread_watch_manager.clone(),
-                        thread_list_state_permit.clone(),
+                        Arc::clone(&thread_lifecycle),
                         fallback_model_provider.clone(),
                     )
                     .await;
@@ -348,20 +464,24 @@ pub(super) async fn ensure_listener_task_running(
                         unloading_state.note_thread_activity_observed();
                         continue;
                     }
-                    {
-                        let mut pending_thread_unloads = pending_thread_unloads.lock().await;
-                        if pending_thread_unloads.contains(&conversation_id) {
+                    let lifecycle_guard = thread_lifecycle.lock_thread(conversation_id).await;
+                    let unload_token = {
+                        let mut subscription_guard = thread_lifecycle
+                            .subscription_guard(conversation_id)
+                            .await;
+                        if subscription_guard.is_unloading() {
                             continue;
                         }
                         if !unloading_state.should_unload_now() {
                             continue;
                         }
-                        pending_thread_unloads.insert(conversation_id);
-                    }
+                        subscription_guard.mark_unloading()
+                    };
                     unload_thread_without_subscribers(
                         thread_manager.clone(),
                         outgoing_for_task.clone(),
-                        pending_thread_unloads.clone(),
+                        lifecycle_guard,
+                        unload_token,
                         thread_state_manager.clone(),
                         thread_watch_manager.clone(),
                         conversation_id,
@@ -393,7 +513,8 @@ pub(super) async fn wait_for_thread_shutdown(thread: &Arc<CodexThread>) -> Threa
 pub(super) async fn unload_thread_without_subscribers(
     thread_manager: Arc<ThreadManager>,
     outgoing: Arc<OutgoingMessageSender>,
-    pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    lifecycle_guard: ThreadLifecycleGuards,
+    unload_token: ThreadUnloadToken,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
     thread_id: ThreadId,
@@ -409,6 +530,7 @@ pub(super) async fn unload_thread_without_subscribers(
     thread_state_manager.remove_thread_state(thread_id).await;
 
     tokio::spawn(async move {
+        let _lifecycle_guard = lifecycle_guard;
         match wait_for_thread_shutdown(&thread).await {
             ThreadShutdownResult::Complete => {
                 if thread_manager.remove_thread(&thread_id).await.is_none() {
@@ -416,29 +538,26 @@ pub(super) async fn unload_thread_without_subscribers(
                     thread_watch_manager
                         .remove_thread(&thread_id.to_string())
                         .await;
-                    pending_thread_unloads.lock().await.remove(&thread_id);
-                    return;
+                } else {
+                    thread_watch_manager
+                        .remove_thread(&thread_id.to_string())
+                        .await;
+                    let notification = ThreadClosedNotification {
+                        thread_id: thread_id.to_string(),
+                    };
+                    outgoing
+                        .send_server_notification(ServerNotification::ThreadClosed(notification))
+                        .await;
                 }
-                thread_watch_manager
-                    .remove_thread(&thread_id.to_string())
-                    .await;
-                let notification = ThreadClosedNotification {
-                    thread_id: thread_id.to_string(),
-                };
-                outgoing
-                    .send_server_notification(ServerNotification::ThreadClosed(notification))
-                    .await;
-                pending_thread_unloads.lock().await.remove(&thread_id);
             }
             ThreadShutdownResult::SubmitFailed => {
-                pending_thread_unloads.lock().await.remove(&thread_id);
                 warn!("failed to submit Shutdown to thread {thread_id}");
             }
             ThreadShutdownResult::TimedOut => {
-                pending_thread_unloads.lock().await.remove(&thread_id);
                 warn!("thread {thread_id} shutdown timed out; leaving thread loaded");
             }
         }
+        unload_token.clear().await;
     });
 }
 
@@ -451,7 +570,7 @@ pub(super) async fn handle_thread_listener_command(
     thread_state: &Arc<Mutex<ThreadState>>,
     thread_watch_manager: &ThreadWatchManager,
     outgoing: &Arc<OutgoingMessageSender>,
-    pending_thread_unloads: &Arc<Mutex<HashSet<ThreadId>>>,
+    thread_lifecycle: &Arc<ThreadLifecycleCoordinator>,
     listener_command: ThreadListenerCommand,
 ) {
     match listener_command {
@@ -464,7 +583,7 @@ pub(super) async fn handle_thread_listener_command(
                 thread_state,
                 thread_watch_manager,
                 outgoing,
-                pending_thread_unloads,
+                thread_lifecycle,
                 *resume_request,
             )
             .await;
@@ -511,7 +630,7 @@ pub(super) async fn handle_thread_listener_command(
 #[allow(clippy::too_many_arguments)]
 #[expect(
     clippy::await_holding_invalid_type,
-    reason = "running-thread resume subscription must be serialized against pending unloads"
+    reason = "running-thread resume subscription must be serialized against this thread's pending unload"
 )]
 pub(super) async fn handle_pending_thread_resume_request(
     conversation_id: ThreadId,
@@ -521,7 +640,7 @@ pub(super) async fn handle_pending_thread_resume_request(
     thread_state: &Arc<Mutex<ThreadState>>,
     thread_watch_manager: &ThreadWatchManager,
     outgoing: &Arc<OutgoingMessageSender>,
-    pending_thread_unloads: &Arc<Mutex<HashSet<ThreadId>>>,
+    thread_lifecycle: &Arc<ThreadLifecycleCoordinator>,
     pending: crate::thread_state::PendingThreadResumeRequest,
 ) {
     let active_turn = {
@@ -588,9 +707,11 @@ pub(super) async fn handle_pending_thread_resume_request(
     }
 
     {
-        let pending_thread_unloads = pending_thread_unloads.lock().await;
-        if pending_thread_unloads.contains(&conversation_id) {
-            drop(pending_thread_unloads);
+        let subscription_guard = thread_lifecycle
+            .subscription_guard(conversation_id)
+            .await;
+        if subscription_guard.is_unloading() {
+            drop(subscription_guard);
             outgoing
                 .send_error(
                     request_id,
@@ -786,3 +907,7 @@ pub(super) fn set_thread_status_and_interrupt_stale_turns(
     }
     thread.status = status;
 }
+
+#[cfg(test)]
+#[path = "thread_lifecycle_tests.rs"]
+mod tests;

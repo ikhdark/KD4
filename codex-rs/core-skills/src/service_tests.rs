@@ -7,7 +7,20 @@ use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigLayerStack;
 use codex_config::ConfigRequirementsToml;
+use codex_exec_server::CopyOptions;
+use codex_exec_server::CreateDirectoryOptions;
+use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::ExecutorFileSystemFuture;
+use codex_exec_server::FileMetadata;
+use codex_exec_server::FileSystemReadStream;
+use codex_exec_server::FileSystemSandboxContext;
 use codex_exec_server::LOCAL_FS;
+use codex_exec_server::LocalFileSystem;
+use codex_exec_server::ReadDirectoryEntry;
+use codex_exec_server::RemoveOptions;
+use codex_exec_server::WalkOptions;
+use codex_exec_server::WalkOutcome;
+use codex_utils_path_uri::PathUri;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use codex_utils_absolute_path::test_support::PathExt;
@@ -18,13 +31,146 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tempfile::TempDir;
+
+struct CountingFileSystem {
+    inner: Arc<dyn ExecutorFileSystem>,
+    reads: AtomicUsize,
+    metadata_reads: AtomicUsize,
+    walks: AtomicUsize,
+}
+
+impl CountingFileSystem {
+    fn new(inner: Arc<dyn ExecutorFileSystem>) -> Self {
+        Self {
+            inner,
+            reads: AtomicUsize::new(0),
+            metadata_reads: AtomicUsize::new(0),
+            walks: AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> (usize, usize, usize) {
+        (
+            self.reads.load(Ordering::Relaxed),
+            self.metadata_reads.load(Ordering::Relaxed),
+            self.walks.load(Ordering::Relaxed),
+        )
+    }
+}
+
+impl ExecutorFileSystem for CountingFileSystem {
+    fn canonicalize<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, PathUri> {
+        self.inner.canonicalize(path, sandbox)
+    }
+
+    fn read_file<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Vec<u8>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.read_file(path, sandbox)
+    }
+
+    fn read_file_stream<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
+        self.inner.read_file_stream(path, sandbox)
+    }
+
+    fn write_file<'a>(
+        &'a self,
+        path: &'a PathUri,
+        contents: Vec<u8>,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ()> {
+        self.inner.write_file(path, contents, sandbox)
+    }
+
+    fn create_directory<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: CreateDirectoryOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ()> {
+        self.inner.create_directory(path, options, sandbox)
+    }
+
+    fn get_metadata<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, FileMetadata> {
+        self.metadata_reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_metadata(path, sandbox)
+    }
+
+    fn read_directory<'a>(
+        &'a self,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>> {
+        self.inner.read_directory(path, sandbox)
+    }
+
+    fn walk<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: WalkOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, WalkOutcome> {
+        self.walks.fetch_add(1, Ordering::Relaxed);
+        self.inner.walk(path, options, sandbox)
+    }
+
+    fn remove<'a>(
+        &'a self,
+        path: &'a PathUri,
+        options: RemoveOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ()> {
+        self.inner.remove(path, options, sandbox)
+    }
+
+    fn copy<'a>(
+        &'a self,
+        source_path: &'a PathUri,
+        destination_path: &'a PathUri,
+        options: CopyOptions,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ()> {
+        self.inner
+            .copy(source_path, destination_path, options, sandbox)
+    }
+}
 
 fn write_user_skill(codex_home: &TempDir, dir: &str, name: &str, description: &str) {
     let skill_dir = codex_home.path().join("skills").join(dir);
     fs::create_dir_all(&skill_dir).unwrap();
     let content = format!("---\nname: {name}\ndescription: {description}\n---\n\n# Body\n");
     fs::write(skill_dir.join("SKILL.md"), content).unwrap();
+}
+
+fn write_repo_skill(root: &Path, dir: &str, name: &str, description: &str) -> PathBuf {
+    let skill_dir = root.join(".agents").join("skills").join(dir);
+    fs::create_dir_all(&skill_dir).unwrap();
+    let skill_path = skill_dir.join("SKILL.md");
+    fs::write(
+        &skill_path,
+        format!("---\nname: {name}\ndescription: {description}\n---\n\n# Body for {name}\n"),
+    )
+    .unwrap();
+    skill_path
 }
 
 fn write_plugin_skill(
@@ -236,21 +382,27 @@ fn skills_cache_uses_keyed_singleflight() {
         /*bundled_skills_enabled*/ false,
     );
     let key_a = ConfigSkillsCacheKey {
-        roots: vec![(
-            codex_home.path().join("a").abs(),
-            0,
-            None,
-            None,
-        )],
+        environment_generation: 0,
+        roots: vec![SkillRootCacheKey {
+            path: codex_home.path().join("a").abs(),
+            scope_rank: 0,
+            filesystem_identity: file_system_identity(&LOCAL_FS),
+            plugin_id: None,
+            plugin_namespace: None,
+            plugin_root: None,
+        }],
         skill_config_rules: SkillConfigRules::default(),
     };
     let key_b = ConfigSkillsCacheKey {
-        roots: vec![(
-            codex_home.path().join("b").abs(),
-            0,
-            None,
-            None,
-        )],
+        environment_generation: 0,
+        roots: vec![SkillRootCacheKey {
+            path: codex_home.path().join("b").abs(),
+            scope_rank: 0,
+            filesystem_identity: file_system_identity(&LOCAL_FS),
+            plugin_id: None,
+            plugin_namespace: None,
+            plugin_root: None,
+        }],
         skill_config_rules: SkillConfigRules::default(),
     };
 
@@ -391,6 +543,236 @@ async fn skills_cache_invalidates_only_entries_overlapping_changed_paths() {
 }
 
 #[tokio::test]
+async fn stable_snapshot_reuses_layout_and_parsed_body_without_filesystem_reads() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let skill_path = write_repo_skill(cwd.path(), "demo", "demo-skill", "stable description");
+    let config_layer_stack = config_stack(&codex_home, "");
+    let skills_input = SkillsLoadInput::new(
+        cwd.path().abs(),
+        Vec::new(),
+        config_layer_stack,
+        /*bundled_skills_enabled*/ false,
+    )
+    .with_environment_generation(7);
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let counting = Arc::new(CountingFileSystem::new(Arc::clone(&LOCAL_FS)));
+    let executor_fs: Arc<dyn ExecutorFileSystem> = counting.clone();
+
+    let first = skills_service
+        .snapshot_for_config(&skills_input, Some(Arc::clone(&executor_fs)))
+        .await;
+    let calls_after_first = counting.calls();
+    let second = skills_service
+        .snapshot_for_config(&skills_input, Some(executor_fs))
+        .await;
+    assert_eq!(counting.calls(), calls_after_first);
+
+    let skill = second
+        .outcome()
+        .skills
+        .iter()
+        .find(|skill| skill.name == "demo-skill")
+        .expect("repo skill should be discovered")
+        .clone();
+    fs::remove_file(skill_path).expect("remove parsed skill source");
+    let plan = crate::injection::plan_skill_injections(
+        std::slice::from_ref(&skill),
+        Some(first.outcome()),
+    )
+    .await;
+    assert!(plan.injections.warnings.is_empty());
+    assert_eq!(plan.injections.items.len(), 1);
+    assert!(plan.injections.items[0].contents.contains("# Body for demo-skill"));
+    assert_eq!(counting.calls(), calls_after_first);
+}
+
+#[tokio::test]
+async fn filesystem_identity_separates_identical_skill_paths() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let skill_path = write_repo_skill(cwd.path(), "demo", "demo-skill", "first filesystem");
+    let config_layer_stack = config_stack(&codex_home, "");
+    let skills_input = SkillsLoadInput::new(
+        cwd.path().abs(),
+        Vec::new(),
+        config_layer_stack,
+        /*bundled_skills_enabled*/ false,
+    )
+    .with_environment_generation(3);
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let filesystem_a: Arc<dyn ExecutorFileSystem> = Arc::new(LocalFileSystem::unsandboxed());
+    let filesystem_b: Arc<dyn ExecutorFileSystem> = Arc::new(LocalFileSystem::unsandboxed());
+
+    let first = skills_service
+        .snapshot_for_config(&skills_input, Some(filesystem_a))
+        .await;
+    assert_eq!(
+        first.outcome().skills[0].description,
+        "first filesystem"
+    );
+    fs::write(
+        &skill_path,
+        "---\nname: demo-skill\ndescription: second filesystem\n---\n\n# Body\n",
+    )
+    .expect("rewrite skill");
+    let second = skills_service
+        .snapshot_for_config(&skills_input, Some(filesystem_b))
+        .await;
+    assert_eq!(
+        second.outcome().skills[0].description,
+        "second filesystem"
+    );
+}
+
+#[tokio::test]
+async fn environment_generation_invalidates_same_filesystem_snapshot() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let skill_path = write_repo_skill(cwd.path(), "demo", "demo-skill", "generation one");
+    let config_layer_stack = config_stack(&codex_home, "");
+    let base_input = SkillsLoadInput::new(
+        cwd.path().abs(),
+        Vec::new(),
+        config_layer_stack,
+        /*bundled_skills_enabled*/ false,
+    );
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let filesystem: Arc<dyn ExecutorFileSystem> = Arc::new(LocalFileSystem::unsandboxed());
+
+    let first = skills_service
+        .snapshot_for_config(
+            &base_input.clone().with_environment_generation(1),
+            Some(Arc::clone(&filesystem)),
+        )
+        .await;
+    assert_eq!(first.outcome().skills[0].description, "generation one");
+    fs::write(
+        &skill_path,
+        "---\nname: demo-skill\ndescription: generation two\n---\n\n# Body\n",
+    )
+    .expect("rewrite skill");
+    let second = skills_service
+        .snapshot_for_config(
+            &base_input.with_environment_generation(2),
+            Some(filesystem),
+        )
+        .await;
+    assert_eq!(second.outcome().skills[0].description, "generation two");
+}
+
+#[tokio::test]
+async fn local_file_watcher_refreshes_layout_after_skill_creation() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let config_layer_stack = config_stack(&codex_home, "");
+    let skills_input = SkillsLoadInput::new(
+        cwd.path().abs(),
+        Vec::new(),
+        config_layer_stack,
+        /*bundled_skills_enabled*/ false,
+    )
+    .with_local_file_watching(true);
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let first = skills_service
+        .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
+        .await;
+    assert!(first.outcome().skills.is_empty());
+
+    write_repo_skill(cwd.path(), "late", "late-skill", "created later");
+    let refreshed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = skills_service
+                .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
+                .await;
+            if snapshot
+                .outcome()
+                .skills
+                .iter()
+                .any(|skill| skill.name == "late-skill")
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("local skill creation should invalidate the cached layout");
+    assert!(
+        refreshed
+            .outcome()
+            .skills
+            .iter()
+            .any(|skill| skill.name == "late-skill")
+    );
+}
+
+#[tokio::test]
+async fn local_file_watcher_expands_layout_after_marker_creation() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let project = tempfile::tempdir().expect("tempdir");
+    let cwd = project.path().join("nested");
+    fs::create_dir_all(&cwd).expect("create nested cwd");
+    write_repo_skill(project.path(), "root", "root-skill", "from project root");
+    let config_layer_stack = config_stack(&codex_home, "");
+    let skills_input = SkillsLoadInput::new(
+        cwd.abs(),
+        Vec::new(),
+        config_layer_stack,
+        /*bundled_skills_enabled*/ false,
+    )
+    .with_local_file_watching(true);
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let first = skills_service
+        .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
+        .await;
+    assert!(first.outcome().skills.is_empty());
+
+    let marker_path = project.path().join(".git");
+    fs::create_dir(&marker_path).expect("create project root marker");
+    let refreshed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = skills_service
+                .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
+                .await;
+            if snapshot
+                .outcome()
+                .skills
+                .iter()
+                .any(|skill| skill.name == "root-skill")
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("project marker creation should invalidate the cached layout");
+    assert!(
+        refreshed
+            .outcome()
+            .skills
+            .iter()
+            .any(|skill| skill.name == "root-skill")
+    );
+}
+
+#[tokio::test]
 async fn set_extra_roots_replaces_runtime_roots_and_clears_cache() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let cwd = tempfile::tempdir().expect("tempdir");
@@ -430,7 +812,7 @@ async fn set_extra_roots_replaces_runtime_roots_and_clears_cache() {
         "---\nname: runtime-skill\ndescription: runtime skill\n---\n\n# Body\n",
     )
     .expect("write skill");
-    skills_service.set_extra_roots(vec![extra_skills_root.abs()]);
+    assert!(skills_service.set_extra_roots(vec![extra_skills_root.abs()]));
 
     let runtime_snapshot = skills_service
         .snapshot_for_cwd(
@@ -447,7 +829,9 @@ async fn set_extra_roots_replaces_runtime_roots_and_clears_cache() {
             .any(|skill| skill.name == "runtime-skill")
     );
 
-    skills_service.set_extra_roots(vec![extra_root.path().join("missing-skills").abs()]);
+    assert!(
+        skills_service.set_extra_roots(vec![extra_root.path().join("missing-skills").abs()])
+    );
     let replaced_snapshot = skills_service
         .snapshot_for_cwd(
             &skills_input,
@@ -463,6 +847,38 @@ async fn set_extra_roots_replaces_runtime_roots_and_clears_cache() {
             .iter()
             .all(|skill| skill.name != "runtime-skill")
     );
+}
+
+#[tokio::test]
+async fn set_extra_roots_is_a_noop_for_identical_ordered_roots() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let extra_root = tempfile::tempdir().expect("tempdir");
+    let config_layer_stack = config_stack(&codex_home, "");
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let extra_roots = vec![extra_root.path().join("skills").abs()];
+    assert!(skills_service.set_extra_roots(extra_roots.clone()));
+
+    let skills_input = SkillsLoadInput::new(
+        cwd.path().abs(),
+        Vec::new(),
+        config_layer_stack,
+        /*bundled_skills_enabled*/ false,
+    );
+    let first = skills_service
+        .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
+        .await;
+    let generation = skills_service.filesystem_generation();
+
+    assert!(!skills_service.set_extra_roots(extra_roots));
+    assert_eq!(skills_service.filesystem_generation(), generation);
+    let second = skills_service
+        .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
+        .await;
+    assert!(std::ptr::eq(first.outcome(), second.outcome()));
 }
 
 #[tokio::test]

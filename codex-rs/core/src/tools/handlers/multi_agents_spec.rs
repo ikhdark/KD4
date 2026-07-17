@@ -7,6 +7,7 @@ use codex_tools::ToolSpec;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
 const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
@@ -21,7 +22,7 @@ const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
 
 #[derive(Debug, Clone, Default)]
 pub struct SpawnAgentToolOptions {
-    pub available_models: Vec<ModelPreset>,
+    pub available_models: Arc<[ModelPreset]>,
     pub agent_type_description: String,
     pub hide_agent_type_model_reasoning: bool,
     pub usage_hint_text: Option<String>,

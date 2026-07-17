@@ -8,13 +8,13 @@ use std::time::Instant;
 
 use crate::apply_patch;
 use crate::apply_patch::InternalApplyPatchInvocation;
-use crate::apply_patch::convert_apply_patch_to_protocol;
+use crate::apply_patch::convert_apply_patch_to_protocol_compatibility;
+use crate::apply_patch::convert_apply_patch_to_protocol_ordered;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::tools::context::ApplyPatchToolOutput;
-use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -37,7 +37,6 @@ use crate::tools::runtimes::apply_patch::ApplyPatchRequest;
 use crate::tools::runtimes::apply_patch::ApplyPatchRuntime;
 use crate::tools::sandboxing::ToolCtx;
 use codex_apply_patch::ApplyPatchAction;
-use codex_apply_patch::ApplyPatchFileChange;
 use codex_apply_patch::Hunk;
 use codex_apply_patch::StreamingPatchParser;
 use codex_exec_server::ExecutorFileSystem;
@@ -206,17 +205,24 @@ fn format_update_chunks_for_progress(chunks: &[codex_apply_patch::UpdateFileChun
 
 fn file_paths_for_action(action: &ApplyPatchAction) -> Vec<PathUri> {
     let mut keys = Vec::new();
-    for (path, change) in action.changes() {
-        keys.push(path.clone());
+    for operation in action.operations() {
+        keys.push(operation.path().clone());
 
-        if let ApplyPatchFileChange::Update { move_path, .. } = change
-            && let Some(dest) = move_path
-        {
-            keys.push(dest.clone());
+        if let Some((destination, _)) = operation.move_destination() {
+            keys.push(destination.clone());
         }
     }
 
     keys
+}
+
+fn direct_apply_patch_output(
+    content: String,
+    execution_succeeded: bool,
+    action: &ApplyPatchAction,
+    delta: &codex_apply_patch::AppliedPatchDelta,
+) -> ApplyPatchToolOutput {
+    ApplyPatchToolOutput::from_execution(content, execution_succeeded, action, delta)
 }
 
 fn write_permissions_for_paths(
@@ -410,14 +416,25 @@ impl ApplyPatchHandler {
                 match apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes)
                     .await
                 {
-                    InternalApplyPatchInvocation::Output(item) => {
-                        let content = item?;
-                        Ok(boxed_tool_output(ApplyPatchToolOutput::from_text(content)))
+                    InternalApplyPatchInvocation::Output { action, result } => {
+                        let (content, execution_succeeded) = match result {
+                            Ok(content) => (content, true),
+                            Err(error) => (error.to_string(), false),
+                        };
+                        Ok(boxed_tool_output(direct_apply_patch_output(
+                            content,
+                            execution_succeeded,
+                            &action,
+                            &codex_apply_patch::AppliedPatchDelta::default(),
+                        )))
                     }
                     InternalApplyPatchInvocation::DelegateToRuntime(apply) => {
-                        let changes = convert_apply_patch_to_protocol(&apply.action);
+                        let ordered_changes =
+                            convert_apply_patch_to_protocol_ordered(&apply.action);
+                        let changes = convert_apply_patch_to_protocol_compatibility(&apply.action);
                         let emitter = ToolEmitter::apply_patch_for_environment(
                             changes.clone(),
+                            ordered_changes,
                             apply.auto_approved,
                             turn_environment.environment_id.clone(),
                         );
@@ -459,9 +476,12 @@ impl ApplyPatchHandler {
                             )
                             .await
                             .map(|result| result.output);
-                        let (out, delta) = match out {
-                            Ok(output) => (Ok(output.exec_output), Some(output.delta)),
-                            Err(error) => (Err(error), Some(runtime.committed_delta().clone())),
+                        let (out, delta, execution_succeeded) = match out {
+                            Ok(output) => {
+                                let execution_succeeded = output.exec_output.exit_code == 0;
+                                (Ok(output.exec_output), output.delta, execution_succeeded)
+                            }
+                            Err(error) => (Err(error), runtime.committed_delta().clone(), false),
                         };
                         let event_ctx = ToolEventCtx::new(
                             session.as_ref(),
@@ -469,8 +489,16 @@ impl ApplyPatchHandler {
                             &call_id,
                             Some(&tracker),
                         );
-                        let content = emitter.finish(event_ctx, out, delta.as_ref()).await?;
-                        Ok(boxed_tool_output(ApplyPatchToolOutput::from_text(content)))
+                        let content = match emitter.finish(event_ctx, out, Some(&delta)).await {
+                            Ok(content) => content,
+                            Err(error) => error.to_string(),
+                        };
+                        Ok(boxed_tool_output(direct_apply_patch_output(
+                            content,
+                            execution_succeeded,
+                            &req.action,
+                            &delta,
+                        )))
                     }
                 }
             }
@@ -566,7 +594,7 @@ pub(crate) async fn intercept_apply_patch(
     tracker: Option<&SharedTurnDiffTracker>,
     call_id: &str,
     tool_name: &str,
-) -> Result<Option<FunctionToolOutput>, FunctionCallError> {
+) -> Result<Option<ApplyPatchToolOutput>, FunctionCallError> {
     let sandbox = turn.file_system_sandbox_context(/*additional_permissions*/ None, cwd);
     match codex_apply_patch::maybe_parse_apply_patch_verified(command, cwd, fs, Some(&sandbox))
         .await
@@ -585,14 +613,24 @@ pub(crate) async fn intercept_apply_patch(
             match apply_patch::apply_patch(turn.as_ref(), &file_system_sandbox_policy, changes)
                 .await
             {
-                InternalApplyPatchInvocation::Output(item) => {
-                    let content = item?;
-                    Ok(Some(FunctionToolOutput::from_text(content, Some(true))))
+                InternalApplyPatchInvocation::Output { action, result } => {
+                    let (content, execution_succeeded) = match result {
+                        Ok(content) => (content, true),
+                        Err(error) => (error.to_string(), false),
+                    };
+                    Ok(Some(direct_apply_patch_output(
+                        content,
+                        execution_succeeded,
+                        &action,
+                        &codex_apply_patch::AppliedPatchDelta::default(),
+                    )))
                 }
                 InternalApplyPatchInvocation::DelegateToRuntime(apply) => {
-                    let changes = convert_apply_patch_to_protocol(&apply.action);
+                    let ordered_changes = convert_apply_patch_to_protocol_ordered(&apply.action);
+                    let changes = convert_apply_patch_to_protocol_compatibility(&apply.action);
                     let emitter = ToolEmitter::apply_patch_for_environment(
                         changes.clone(),
+                        ordered_changes,
                         apply.auto_approved,
                         turn_environment.environment_id.clone(),
                     );
@@ -634,9 +672,12 @@ pub(crate) async fn intercept_apply_patch(
                         )
                         .await
                         .map(|result| result.output);
-                    let (out, delta) = match out {
-                        Ok(output) => (Ok(output.exec_output), Some(output.delta)),
-                        Err(error) => (Err(error), Some(runtime.committed_delta().clone())),
+                    let (out, delta, execution_succeeded) = match out {
+                        Ok(output) => {
+                            let execution_succeeded = output.exec_output.exit_code == 0;
+                            (Ok(output.exec_output), output.delta, execution_succeeded)
+                        }
+                        Err(error) => (Err(error), runtime.committed_delta().clone(), false),
                     };
                     let event_ctx = ToolEventCtx::new(
                         session.as_ref(),
@@ -644,8 +685,16 @@ pub(crate) async fn intercept_apply_patch(
                         call_id,
                         tracker.as_ref().copied(),
                     );
-                    let content = emitter.finish(event_ctx, out, delta.as_ref()).await?;
-                    Ok(Some(FunctionToolOutput::from_text(content, Some(true))))
+                    let content = match emitter.finish(event_ctx, out, Some(&delta)).await {
+                        Ok(content) => content,
+                        Err(error) => error.to_string(),
+                    };
+                    Ok(Some(direct_apply_patch_output(
+                        content,
+                        execution_succeeded,
+                        &req.action,
+                        &delta,
+                    )))
                 }
             }
         }

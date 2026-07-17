@@ -1,6 +1,7 @@
 use chrono::DateTime;
 use chrono::Duration as ChronoDuration;
 use chrono::Utc;
+use codex_git_utils::GitInfo;
 use codex_git_utils::collect_git_info;
 use codex_protocol::ThreadId;
 use codex_protocol::plan_tool::PlanItemArg;
@@ -22,12 +23,17 @@ use std::io::Write;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
-use tokio::sync::Semaphore;
+use tokio::sync::Notify;
+use tokio::sync::OnceCell;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 2;
@@ -44,11 +50,49 @@ pub(crate) struct TaskEvidenceLedger {
     evidence_path: Option<PathBuf>,
     repo_root: Option<PathBuf>,
     trusted_wiring_guard_root: Option<PathBuf>,
-    document: Mutex<Option<TaskEvidenceDocument>>,
-    persistence_gate: Semaphore,
-    last_persisted_revision: AtomicU64,
+    deferred_start: Option<DeferredTaskEvidenceStart>,
+    initialization: OnceCell<()>,
+    document: Arc<Mutex<Option<TaskEvidenceDocument>>>,
+    persistence: Option<Arc<TaskEvidencePersistence>>,
+    active_validation: StdMutex<Option<ActiveTaskEvidenceValidation>>,
+    mutation_generation: AtomicU64,
     wiring_ledger_starts: Mutex<BTreeMap<String, WiringLedgerFingerprint>>,
     command_mutation_starts: Mutex<BTreeMap<String, CommandMutationStart>>,
+}
+
+struct TaskEvidencePersistence {
+    path: PathBuf,
+    document: Arc<Mutex<Option<TaskEvidenceDocument>>>,
+    enabled: AtomicBool,
+    state: Mutex<TaskEvidencePersistenceState>,
+    completed: Notify,
+    #[cfg(test)]
+    serialization_count: AtomicU64,
+    #[cfg(test)]
+    write_count: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct TaskEvidencePersistenceState {
+    requested_revision: u64,
+    persisted_revision: u64,
+    failed_revision: Option<u64>,
+    writer_running: bool,
+}
+
+#[derive(Clone)]
+struct ActiveTaskEvidenceValidation {
+    evidence_generation: u64,
+    cancellation_token: CancellationToken,
+}
+
+#[derive(Clone)]
+struct DeferredTaskEvidenceStart {
+    thread_id: String,
+    started_at: String,
+    cwd: String,
+    repository_root: String,
+    git: Option<GitInfo>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -88,8 +132,19 @@ enum ValidationConclusion {
 #[derive(Debug, Clone)]
 pub(crate) struct TaskEvidenceValidationStart {
     epoch: u64,
+    workspace_generation: String,
+    evidence_generation: u64,
+    hash_generation: String,
+    spec_generation: String,
+    cancellation_token: CancellationToken,
     file_snapshots: BTreeMap<String, FileHashSnapshot>,
     artifact_snapshots: BTreeMap<String, FileHashSnapshot>,
+}
+
+impl TaskEvidenceValidationStart {
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation_token.clone()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +154,7 @@ enum PersistOutcome {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct TaskEvidenceDocument {
     schema_version: u32,
     #[serde(default)]
@@ -138,7 +193,7 @@ struct TaskEvidenceDocument {
     completion: Option<TaskCompletionGate>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct TaskStartState {
     cwd: String,
     repository_root: String,
@@ -162,7 +217,7 @@ struct EvidencePlanStep {
     validation_receipt_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct EditIntent {
     call_id: String,
     step_id: Option<String>,
@@ -172,7 +227,7 @@ struct EditIntent {
     files: Vec<FileHashSnapshot>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct EditReceipt {
     id: String,
     call_id: String,
@@ -183,7 +238,7 @@ struct EditReceipt {
     files: Vec<FileHashTransition>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct FileHashTransition {
     path: String,
     before_sha1: Option<String>,
@@ -205,7 +260,7 @@ struct FileHashSnapshot {
     read_error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CommandReceipt {
     id: String,
     recorded_at: String,
@@ -223,7 +278,7 @@ struct CommandReceipt {
     coverage: Option<MutationCoverage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ValidationReceipt {
     id: String,
     recorded_at: String,
@@ -234,10 +289,27 @@ struct ValidationReceipt {
     tool_success: bool,
     proof_bearing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    evidence_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hash_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    spec_generation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     conclusion: Option<ValidationConclusion>,
     active_files: Vec<FileHashSnapshot>,
     stale_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exact_output_artifacts: Vec<ValidationOutputArtifact>,
     payload: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ValidationOutputArtifact {
+    sha256: String,
+    path: String,
+    bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -251,7 +323,7 @@ struct GeneratedArtifactRequirement {
     validation_receipt_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct EvidenceRisk {
     id: String,
     description: String,
@@ -261,7 +333,7 @@ struct EvidenceRisk {
     epoch: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct EpochReceipt {
     receipt_id: String,
     epoch: u64,
@@ -270,7 +342,7 @@ struct EpochReceipt {
     wiring_proof: Option<WiringProof>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WiringProof {
     schema_id: String,
     schema_version: String,
@@ -281,7 +353,7 @@ struct WiringProof {
     proof_graph_id: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DesktopActivationReceipt {
     epoch: u64,
     recorded_at: String,
@@ -290,8 +362,178 @@ struct DesktopActivationReceipt {
     runtime_evidence: String,
 }
 
+impl TaskEvidencePersistence {
+    fn new(path: PathBuf, document: Arc<Mutex<Option<TaskEvidenceDocument>>>) -> Self {
+        Self {
+            path,
+            document,
+            enabled: AtomicBool::new(true),
+            state: Mutex::new(TaskEvidencePersistenceState::default()),
+            completed: Notify::new(),
+            #[cfg(test)]
+            serialization_count: AtomicU64::new(0),
+            #[cfg(test)]
+            write_count: AtomicU64::new(0),
+        }
+    }
+
+    async fn enqueue(self: &Arc<Self>, revision: u64) {
+        if !self.enabled.load(Ordering::Acquire) {
+            return;
+        }
+        let should_spawn = {
+            let mut state = self.state.lock().await;
+            state.requested_revision = state.requested_revision.max(revision);
+            if state
+                .failed_revision
+                .is_some_and(|failed| revision >= failed)
+            {
+                state.failed_revision = None;
+            }
+            if state.persisted_revision >= revision || state.writer_running {
+                false
+            } else {
+                state.writer_running = true;
+                true
+            }
+        };
+        if should_spawn {
+            tokio::spawn(Self::run(Arc::clone(self)));
+        }
+    }
+
+    async fn wait_for_revision(self: &Arc<Self>, revision: u64) -> PersistOutcome {
+        self.enqueue(revision).await;
+        loop {
+            if !self.enabled.load(Ordering::Acquire) {
+                return PersistOutcome::Failed;
+            }
+            let notified = self.completed.notified();
+            let current_revision = self
+                .document
+                .lock()
+                .await
+                .as_ref()
+                .map(|document| document.revision);
+            if current_revision != Some(revision) {
+                return PersistOutcome::Superseded;
+            }
+            {
+                let state = self.state.lock().await;
+                if state.persisted_revision == revision {
+                    return PersistOutcome::Persisted;
+                }
+                if state.persisted_revision > revision {
+                    return PersistOutcome::Superseded;
+                }
+                if state.failed_revision == Some(revision) && !state.writer_running {
+                    return PersistOutcome::Failed;
+                }
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(50), notified).await;
+        }
+    }
+
+    async fn run(persistence: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            let requested_revision = persistence.state.lock().await.requested_revision;
+            let snapshot = {
+                let guard = persistence.document.lock().await;
+                guard.as_ref().cloned()
+            };
+            let Some(snapshot) = snapshot else {
+                persistence.finish_failure(requested_revision).await;
+                return;
+            };
+            if snapshot.revision < requested_revision {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            {
+                let mut state = persistence.state.lock().await;
+                state.requested_revision = state.requested_revision.max(snapshot.revision);
+                if state.requested_revision != snapshot.revision {
+                    continue;
+                }
+            }
+            #[cfg(test)]
+            persistence
+                .serialization_count
+                .fetch_add(1, Ordering::Relaxed);
+            let bytes = match serde_json::to_vec_pretty(&snapshot) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    warn!("failed to serialize KD4 task evidence: {err}");
+                    persistence.finish_failure(snapshot.revision).await;
+                    return;
+                }
+            };
+            let current_revision = persistence
+                .document
+                .lock()
+                .await
+                .as_ref()
+                .map(|document| document.revision);
+            let requested_revision = persistence.state.lock().await.requested_revision;
+            if current_revision != Some(snapshot.revision)
+                || requested_revision != snapshot.revision
+            {
+                continue;
+            }
+            let write_path = persistence.path.clone();
+            match tokio::task::spawn_blocking(move || atomic_write_evidence(&write_path, &bytes))
+                .await
+            {
+                Ok(Ok(())) => {
+                    #[cfg(test)]
+                    persistence.write_count.fetch_add(1, Ordering::Relaxed);
+                    let mut state = persistence.state.lock().await;
+                    state.persisted_revision = snapshot.revision;
+                    state.failed_revision = None;
+                    if state.requested_revision == snapshot.revision {
+                        state.writer_running = false;
+                        drop(state);
+                        persistence.completed.notify_waiters();
+                        return;
+                    }
+                    drop(state);
+                    persistence.completed.notify_waiters();
+                }
+                Ok(Err(err)) => {
+                    warn!("failed to persist KD4 task evidence: {err}");
+                    persistence.finish_failure(snapshot.revision).await;
+                    return;
+                }
+                Err(err) => {
+                    warn!("KD4 task-evidence persistence task failed: {err}");
+                    persistence.finish_failure(snapshot.revision).await;
+                    return;
+                }
+            }
+        }
+    }
+
+    async fn finish_failure(&self, revision: u64) {
+        let mut state = self.state.lock().await;
+        state.failed_revision = Some(state.requested_revision.max(revision));
+        state.writer_running = false;
+        drop(state);
+        self.completed.notify_waiters();
+    }
+}
+
 impl TaskEvidenceLedger {
     pub(crate) async fn load_or_new(codex_home: PathBuf, thread_id: ThreadId, cwd: &Path) -> Self {
+        let ledger = Self::deferred(codex_home, thread_id, cwd).await;
+        ledger.ensure_initialized().await;
+        if let Some(revision) = ledger.current_revision().await {
+            let _ = ledger.persist_revision(revision).await;
+        }
+        ledger
+    }
+
+    pub(crate) async fn deferred(codex_home: PathBuf, thread_id: ThreadId, cwd: &Path) -> Self {
         let Some(repo_root) = find_kd4_repo_root(cwd) else {
             return Self::disabled();
         };
@@ -299,103 +541,31 @@ impl TaskEvidenceLedger {
             .join("task-evidence")
             .join(format!("{thread_id}.json"));
         let trusted_wiring_guard_root = find_trusted_wiring_guard_root(&codex_home);
-        let now = timestamp();
-        let thread_id_text = thread_id.to_string();
-        let repository_root = repo_root.to_string_lossy().into_owned();
-
-        let existing =
-            load_existing_document(&evidence_path, &thread_id_text, &repository_root).await;
-        let mut storage_failure_reason = None;
-        let existing = match existing {
-            ExistingDocument::Loaded(document) => Some(*document),
-            ExistingDocument::Missing => None,
-            ExistingDocument::Rejected { kind, reason } => {
-                let quarantine = quarantine_evidence_file(&evidence_path, kind).await;
-                match quarantine {
-                    Ok(path) => warn!(
-                        "preserved rejected KD4 task evidence at {}: {reason}",
-                        path.display()
-                    ),
-                    Err(err) => {
-                        let failure = format!(
-                            "rejected task evidence could not be quarantined ({reason}; quarantine failed: {err})"
-                        );
-                        warn!(
-                            "refusing to overwrite rejected KD4 task evidence at {}: {failure}",
-                            evidence_path.display()
-                        );
-                        storage_failure_reason = Some(failure);
-                    }
-                }
-                None
-            }
+        let deferred_start = DeferredTaskEvidenceStart {
+            thread_id: thread_id.to_string(),
+            started_at: timestamp(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            repository_root: repo_root.to_string_lossy().into_owned(),
+            git: collect_git_info(&repo_root).await,
         };
-        let document = if let Some(mut document) = existing {
-            migrate_document(&mut document);
-            document.updated_at = now;
-            document.revision = document.revision.saturating_add(1);
-            document
-        } else {
-            let git = collect_git_info(&repo_root).await;
-            TaskEvidenceDocument {
-                schema_version: TASK_EVIDENCE_SCHEMA_VERSION,
-                revision: 1,
-                thread_id: thread_id_text,
-                started_at: now.clone(),
-                updated_at: now,
-                start: TaskStartState {
-                    cwd: cwd.to_string_lossy().into_owned(),
-                    repository_root,
-                    commit_hash: git
-                        .as_ref()
-                        .and_then(|info| info.commit_hash.as_ref())
-                        .map(|sha| sha.0.clone()),
-                    branch: git.as_ref().and_then(|info| info.branch.clone()),
-                    repository_url: git.and_then(|info| info.repository_url),
-                },
-                evidence_epoch: 0,
-                last_mutation_at: None,
-                plan: Vec::new(),
-                active_step_id: None,
-                edit_intents: Vec::new(),
-                edit_receipts: Vec::new(),
-                command_receipts: Vec::new(),
-                validation_receipts: Vec::new(),
-                generated_artifact_requirements: Vec::new(),
-                generated_artifact_hashes: BTreeMap::new(),
-                latest_generated_artifact_hashes: BTreeMap::new(),
-                latest_file_hashes: BTreeMap::new(),
-                risks: storage_failure_reason
-                    .as_deref()
-                    .map(|reason| vec![task_evidence_storage_risk(reason, 0)])
-                    .unwrap_or_default(),
-                verify_plan_epoch: None,
-                validation_epoch: None,
-                wiring_receipt: None,
-                desktop_activation_receipt: None,
-                automatic_plan_attempt_epoch: None,
-                repair_turns_used: 0,
-                next_edit_receipt_sequence: initial_receipt_sequence(),
-                next_command_receipt_sequence: initial_receipt_sequence(),
-                next_validation_receipt_sequence: initial_receipt_sequence(),
-                completion: None,
-            }
-        };
-        let writable_evidence_path = storage_failure_reason.is_none().then_some(evidence_path);
-        let ledger = Self {
-            evidence_path: writable_evidence_path,
+        let document = Arc::new(Mutex::new(None));
+        let persistence = Arc::new(TaskEvidencePersistence::new(
+            evidence_path.clone(),
+            Arc::clone(&document),
+        ));
+        Self {
+            evidence_path: Some(evidence_path),
             repo_root: Some(repo_root),
             trusted_wiring_guard_root,
-            document: Mutex::new(Some(document.clone())),
-            persistence_gate: Semaphore::new(1),
-            last_persisted_revision: AtomicU64::new(0),
+            deferred_start: Some(deferred_start),
+            initialization: OnceCell::new(),
+            document,
+            persistence: Some(persistence),
+            active_validation: StdMutex::new(None),
+            mutation_generation: AtomicU64::new(0),
             wiring_ledger_starts: Mutex::new(BTreeMap::new()),
             command_mutation_starts: Mutex::new(BTreeMap::new()),
-        };
-        if storage_failure_reason.is_none() {
-            let _ = ledger.persist_document(&document).await;
         }
-        ledger
     }
 
     pub(crate) fn disabled() -> Self {
@@ -403,19 +573,159 @@ impl TaskEvidenceLedger {
             evidence_path: None,
             repo_root: None,
             trusted_wiring_guard_root: None,
-            document: Mutex::new(None),
-            persistence_gate: Semaphore::new(1),
-            last_persisted_revision: AtomicU64::new(0),
+            deferred_start: None,
+            initialization: OnceCell::new(),
+            document: Arc::new(Mutex::new(None)),
+            persistence: None,
+            active_validation: StdMutex::new(None),
+            mutation_generation: AtomicU64::new(0),
             wiring_ledger_starts: Mutex::new(BTreeMap::new()),
             command_mutation_starts: Mutex::new(BTreeMap::new()),
         }
     }
 
+    async fn ensure_initialized(&self) {
+        let Some(start) = self.deferred_start.as_ref() else {
+            return;
+        };
+        self.initialization
+            .get_or_init(|| async {
+                let Some(evidence_path) = self.evidence_path.as_ref() else {
+                    return;
+                };
+                let now = timestamp();
+                let mut storage_failure_reason = None;
+                let existing = match load_existing_document(
+                    evidence_path,
+                    &start.thread_id,
+                    &start.repository_root,
+                )
+                .await
+                {
+                    ExistingDocument::Loaded(document) => Some(*document),
+                    ExistingDocument::Missing => None,
+                    ExistingDocument::Rejected { kind, reason } => {
+                        match quarantine_evidence_file(evidence_path, kind).await {
+                            Ok(path) => warn!(
+                                "preserved rejected KD4 task evidence at {}: {reason}",
+                                path.display()
+                            ),
+                            Err(err) => {
+                                let failure = format!(
+                                    "rejected task evidence could not be quarantined ({reason}; quarantine failed: {err})"
+                                );
+                                warn!(
+                                    "refusing to overwrite rejected KD4 task evidence at {}: {failure}",
+                                    evidence_path.display()
+                                );
+                                storage_failure_reason = Some(failure);
+                                if let Some(persistence) = self.persistence.as_ref() {
+                                    persistence.enabled.store(false, Ordering::Release);
+                                }
+                            }
+                        }
+                        None
+                    }
+                };
+                let document = if let Some(mut document) = existing {
+                    migrate_document(&mut document);
+                    document.updated_at = now;
+                    document.revision = document.revision.saturating_add(1);
+                    document
+                } else {
+                    TaskEvidenceDocument {
+                        schema_version: TASK_EVIDENCE_SCHEMA_VERSION,
+                        revision: 1,
+                        thread_id: start.thread_id.clone(),
+                        started_at: start.started_at.clone(),
+                        updated_at: now,
+                        start: TaskStartState {
+                            cwd: start.cwd.clone(),
+                            repository_root: start.repository_root.clone(),
+                            commit_hash: start
+                                .git
+                                .as_ref()
+                                .and_then(|info| info.commit_hash.as_ref())
+                                .map(|sha| sha.0.clone()),
+                            branch: start.git.as_ref().and_then(|info| info.branch.clone()),
+                            repository_url: start
+                                .git
+                                .as_ref()
+                                .and_then(|info| info.repository_url.clone()),
+                        },
+                        evidence_epoch: 0,
+                        last_mutation_at: None,
+                        plan: Vec::new(),
+                        active_step_id: None,
+                        edit_intents: Vec::new(),
+                        edit_receipts: Vec::new(),
+                        command_receipts: Vec::new(),
+                        validation_receipts: Vec::new(),
+                        generated_artifact_requirements: Vec::new(),
+                        generated_artifact_hashes: BTreeMap::new(),
+                        latest_generated_artifact_hashes: BTreeMap::new(),
+                        latest_file_hashes: BTreeMap::new(),
+                        risks: storage_failure_reason
+                            .as_deref()
+                            .map(|reason| vec![task_evidence_storage_risk(reason, 0)])
+                            .unwrap_or_default(),
+                        verify_plan_epoch: None,
+                        validation_epoch: None,
+                        wiring_receipt: None,
+                        desktop_activation_receipt: None,
+                        automatic_plan_attempt_epoch: None,
+                        repair_turns_used: 0,
+                        next_edit_receipt_sequence: initial_receipt_sequence(),
+                        next_command_receipt_sequence: initial_receipt_sequence(),
+                        next_validation_receipt_sequence: initial_receipt_sequence(),
+                        completion: None,
+                    }
+                };
+                *self.document.lock().await = Some(document.clone());
+            })
+            .await;
+    }
+
+    async fn ensure_existing_document_loaded(&self) {
+        if self.document.lock().await.is_some() {
+            return;
+        }
+        let Some(evidence_path) = self.evidence_path.as_ref() else {
+            return;
+        };
+        let should_initialize = match tokio::fs::try_exists(evidence_path).await {
+            Ok(exists) => exists,
+            Err(err) => {
+                warn!(
+                    "failed to inspect deferred KD4 task evidence at {}: {err}",
+                    evidence_path.display()
+                );
+                true
+            }
+        };
+        if should_initialize {
+            self.ensure_initialized().await;
+        }
+    }
+
+    async fn is_initialized(&self) -> bool {
+        self.document.lock().await.is_some()
+    }
+
+    async fn current_revision(&self) -> Option<u64> {
+        self.document
+            .lock()
+            .await
+            .as_ref()
+            .map(|document| document.revision)
+    }
+
     pub(crate) async fn begin_verify_local_validation(
         &self,
     ) -> Option<TaskEvidenceValidationStart> {
+        self.ensure_initialized().await;
         let repo_root = self.repo_root.as_ref()?;
-        let (epoch, mut file_paths, artifact_paths) = {
+        let (epoch, workspace_generation, spec_generation, mut file_paths, artifact_paths) = {
             let guard = self.document.lock().await;
             let document = guard.as_ref()?;
             let mut file_paths = document
@@ -431,7 +741,13 @@ impl TaskEvidenceLedger {
                 .iter()
                 .filter_map(|requirement| requirement.path.clone())
                 .collect::<BTreeSet<_>>();
-            (document.evidence_epoch, file_paths, artifact_paths)
+            (
+                document.evidence_epoch,
+                task_evidence_workspace_generation(document),
+                task_evidence_spec_generation(document),
+                file_paths,
+                artifact_paths,
+            )
         };
         file_paths.extend(git_dirty_paths(repo_root).await);
         let mut file_snapshots = BTreeMap::new();
@@ -442,8 +758,38 @@ impl TaskEvidenceLedger {
         for path in artifact_paths {
             artifact_snapshots.insert(path.clone(), snapshot_file(repo_root, &path).await);
         }
+        let hash_generation =
+            task_evidence_hash_generation(file_snapshots.values(), artifact_snapshots.values());
+        {
+            let guard = self.document.lock().await;
+            let document = guard.as_ref()?;
+            if document.evidence_epoch != epoch
+                || task_evidence_workspace_generation(document) != workspace_generation
+                || task_evidence_spec_generation(document) != spec_generation
+            {
+                return None;
+            }
+        }
+        let cancellation_token = CancellationToken::new();
+        {
+            let mut active = self
+                .active_validation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(previous) = active.replace(ActiveTaskEvidenceValidation {
+                evidence_generation: epoch,
+                cancellation_token: cancellation_token.clone(),
+            }) {
+                previous.cancellation_token.cancel();
+            }
+        }
         Some(TaskEvidenceValidationStart {
             epoch,
+            workspace_generation,
+            evidence_generation: epoch,
+            hash_generation,
+            spec_generation,
+            cancellation_token,
             file_snapshots,
             artifact_snapshots,
         })
@@ -453,7 +799,8 @@ impl TaskEvidenceLedger {
         let Some(_) = self.repo_root else {
             return update.clone();
         };
-        let Some((response, snapshot)) = self
+        self.ensure_initialized().await;
+        let Some((response, revision, changed)) = self
             .update_document(|document| {
                 let previous = document
                     .plan
@@ -522,7 +869,9 @@ impl TaskEvidenceLedger {
         else {
             return update.clone();
         };
-        self.persist_document(&snapshot).await;
+        if changed {
+            self.queue_persistence(revision).await;
+        }
         response
     }
 
@@ -530,6 +879,7 @@ impl TaskEvidenceLedger {
         let Some(repo_root) = self.repo_root.as_ref() else {
             return;
         };
+        self.ensure_initialized().await;
         let mut files = Vec::with_capacity(paths.len());
         for path in paths {
             let normalized = normalize_input_path(repo_root, Some(cwd), path);
@@ -538,7 +888,7 @@ impl TaskEvidenceLedger {
         files.sort_by(|left, right| left.path.cmp(&right.path));
         files.dedup_by(|left, right| left.path == right.path);
 
-        let Some((_, snapshot)) = self
+        let Some((_, revision, changed)) = self
             .update_document(|document| {
                 document
                     .edit_intents
@@ -558,7 +908,9 @@ impl TaskEvidenceLedger {
         else {
             return;
         };
-        self.persist_document(&snapshot).await;
+        if changed {
+            self.queue_persistence(revision).await;
+        }
     }
 
     pub(crate) async fn record_edit_result(&self, call_id: &str, outcome: &str) {
@@ -599,7 +951,7 @@ impl TaskEvidenceLedger {
         }
         let edit_succeeded = edit_outcome_succeeded(outcome);
 
-        let Some((_, snapshot)) = self
+        let Some((_, revision, changed)) = self
             .update_document(|document| {
                 if let Some(stored) = document
                     .edit_intents
@@ -684,7 +1036,9 @@ impl TaskEvidenceLedger {
         else {
             return;
         };
-        self.persist_document(&snapshot).await;
+        if changed {
+            self.queue_persistence(revision).await;
+        }
     }
 
     async fn capture_command_mutation_start(
@@ -692,6 +1046,7 @@ impl TaskEvidenceLedger {
         command: &[String],
         cwd: &PathUri,
     ) -> CommandMutationStart {
+        self.ensure_existing_document_loaded().await;
         let (epoch, artifact_paths) = {
             let guard = self.document.lock().await;
             guard.as_ref().map_or((0, BTreeSet::new()), |document| {
@@ -815,7 +1170,12 @@ impl TaskEvidenceLedger {
         } else {
             None
         };
-        let Some((observation, snapshot)) = self
+        if possible_mutation || wiring_proof.is_some() || self.is_initialized().await {
+            self.ensure_initialized().await;
+        } else {
+            return Some(candidate_observation);
+        }
+        let Some((observation, revision, changed)) = self
             .update_document(|document| {
                 let start_matches = mutation_start.as_ref().is_some_and(|start| {
                     start.epoch == document.evidence_epoch
@@ -896,7 +1256,9 @@ impl TaskEvidenceLedger {
         else {
             return Some(candidate_observation);
         };
-        self.persist_document(&snapshot).await;
+        if changed {
+            self.queue_persistence(revision).await;
+        }
         Some(observation)
     }
 
@@ -913,6 +1275,7 @@ impl TaskEvidenceLedger {
         stale_reasons: &[String],
         payload: Option<&Value>,
     ) -> bool {
+        self.ensure_initialized().await;
         let Some(repo_root) = self.repo_root.as_ref() else {
             return false;
         };
@@ -941,11 +1304,23 @@ impl TaskEvidenceLedger {
                 && start.file_snapshots == validation_end_files
                 && start.artifact_snapshots == validation_end_artifacts
         });
+        let validation_end_hash_generation = task_evidence_hash_generation(
+            validation_end_files.values(),
+            validation_end_artifacts.values(),
+        );
+        let exact_output_artifacts = validation_output_artifacts(payload);
 
-        let Some((accepted_proof, snapshot)) = self
+        let Some((accepted_proof, revision, changed)) = self
             .update_document(|document| {
                 let run_matches_start = validation_start.is_some_and(|start| {
-                    start.epoch == document.evidence_epoch && snapshots_unchanged
+                    start.epoch == document.evidence_epoch
+                        && start.evidence_generation == document.evidence_epoch
+                        && start.workspace_generation
+                            == task_evidence_workspace_generation(document)
+                        && start.spec_generation == task_evidence_spec_generation(document)
+                        && start.hash_generation == validation_end_hash_generation
+                        && !start.cancellation_token.is_cancelled()
+                        && snapshots_unchanged
                 });
                 let conclusion = if run_matches_start && contract_valid {
                     match verdict {
@@ -978,9 +1353,16 @@ impl TaskEvidenceLedger {
                     verdict: verdict.map(str::to_string),
                     tool_success,
                     proof_bearing,
+                    workspace_generation: validation_start
+                        .map(|start| start.workspace_generation.clone()),
+                    evidence_generation: validation_start
+                        .map(|start| start.evidence_generation),
+                    hash_generation: validation_start.map(|start| start.hash_generation.clone()),
+                    spec_generation: validation_start.map(|start| start.spec_generation.clone()),
                     conclusion,
                     active_files: file_snapshots.clone(),
                     stale_reasons: stale_reasons.to_vec(),
+                    exact_output_artifacts: exact_output_artifacts.clone(),
                     payload: payload.cloned(),
                 });
                 trim_validation_receipts(document);
@@ -1114,7 +1496,10 @@ impl TaskEvidenceLedger {
         else {
             return false;
         };
-        self.persist_document(&snapshot).await;
+        if changed {
+            self.queue_persistence(revision).await;
+        }
+        self.clear_completed_validation(validation_start);
         accepted_proof
     }
 
@@ -1123,7 +1508,7 @@ impl TaskEvidenceLedger {
         if gate.status == TaskCompletionStatus::Passed {
             return None;
         }
-        let (should_warn, snapshot) = self
+        let (should_warn, revision, changed) = self
             .update_document(|document| {
                 if document.repair_turns_used >= 1 {
                     return None;
@@ -1134,7 +1519,9 @@ impl TaskEvidenceLedger {
             })
             .await?;
         should_warn?;
-        self.persist_document(&snapshot).await;
+        if changed {
+            self.queue_persistence(revision).await;
+        }
 
         let reasons = gate.reasons.iter().take(2).cloned().collect::<Vec<_>>();
         let reason_summary = if reasons.is_empty() {
@@ -1155,7 +1542,9 @@ impl TaskEvidenceLedger {
     }
 
     pub(crate) async fn take_automatic_verify_plan_request(&self) -> Option<Vec<String>> {
-        let (changed_paths, snapshot) = self
+        self.ensure_existing_document_loaded().await;
+        self.wait_for_mutation_quiescence().await;
+        let (changed_paths, revision, changed) = self
             .update_document(|document| {
                 let epoch = document.evidence_epoch;
                 let has_mutation = document
@@ -1179,21 +1568,30 @@ impl TaskEvidenceLedger {
             })
             .await?;
         let changed_paths = changed_paths?;
-        self.persist_document(&snapshot).await;
+        if changed {
+            self.queue_persistence(revision).await;
+        }
         Some(changed_paths)
     }
 
     pub(crate) async fn completion_gate(&self) -> Option<TaskCompletionGate> {
+        self.ensure_existing_document_loaded().await;
         let mut latest_gate = None;
+        let evidence_path = self
+            .persistence
+            .as_ref()
+            .is_some_and(|persistence| persistence.enabled.load(Ordering::Acquire))
+            .then_some(self.evidence_path.as_deref())
+            .flatten();
         for _ in 0..8 {
             self.refresh_external_file_freshness().await;
-            let (gate, snapshot) = self
+            let (gate, revision, _changed) = self
                 .update_document(|document| {
                     if !task_is_tracked(document) {
                         return None;
                     }
                     promote_steps_with_fresh_evidence(document);
-                    let gate = derive_completion_gate(document, self.evidence_path.as_deref());
+                    let gate = derive_completion_gate(document, evidence_path);
                     document.completion = Some(gate.clone());
                     document.updated_at = timestamp();
                     Some(gate)
@@ -1201,14 +1599,14 @@ impl TaskEvidenceLedger {
                 .await?;
             let gate = gate?;
             latest_gate = Some(gate.clone());
-            match self.persist_document(&snapshot).await {
+            match self.persist_revision(revision).await {
                 PersistOutcome::Persisted => return Some(gate),
                 PersistOutcome::Superseded => continue,
                 PersistOutcome::Failed => {
                     return Some(
                         self.demote_gate_for_persistence(
                             gate,
-                            Some(snapshot.revision),
+                            Some(revision),
                             "task-evidence persistence failed; completion is not durably recorded",
                         )
                         .await,
@@ -1255,7 +1653,8 @@ impl TaskEvidenceLedger {
         binary_sha1: String,
         runtime_evidence: String,
     ) {
-        let Some((_, snapshot)) = self
+        self.ensure_initialized().await;
+        let Some((_, revision, changed)) = self
             .update_document(|document| {
                 document.desktop_activation_receipt = Some(DesktopActivationReceipt {
                     epoch: document.evidence_epoch,
@@ -1272,7 +1671,9 @@ impl TaskEvidenceLedger {
         else {
             return;
         };
-        self.persist_document(&snapshot).await;
+        if changed {
+            self.queue_persistence(revision).await;
+        }
     }
 
     async fn refresh_external_file_freshness(&self) {
@@ -1312,7 +1713,7 @@ impl TaskEvidenceLedger {
             return;
         }
 
-        let Some((_, snapshot)) = self
+        let Some((_, revision, changed)) = self
             .update_document(|document| {
                 let changed = changed
                     .into_iter()
@@ -1390,76 +1791,134 @@ impl TaskEvidenceLedger {
         else {
             return;
         };
-        self.persist_document(&snapshot).await;
+        if changed {
+            self.queue_persistence(revision).await;
+        }
     }
 
     async fn update_document<T>(
         &self,
         update: impl FnOnce(&mut TaskEvidenceDocument) -> T,
-    ) -> Option<(T, TaskEvidenceDocument)> {
+    ) -> Option<(T, u64, bool)> {
         let mut guard = self.document.lock().await;
         let document = guard.as_mut()?;
+        let before = document.clone();
         let result = update(document);
-        document.revision = document.revision.saturating_add(1);
-        Some((result, document.clone()))
+        let updated_at = document.updated_at.clone();
+        document.revision = before.revision;
+        document.updated_at = before.updated_at.clone();
+        if *document == before {
+            *document = before;
+            return Some((result, document.revision, false));
+        }
+        document.updated_at = updated_at;
+        document.revision = before.revision.saturating_add(1);
+        if document.evidence_epoch != before.evidence_epoch {
+            self.mutation_generation.fetch_add(1, Ordering::AcqRel);
+            let mut active = self
+                .active_validation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(validation) = active.as_ref()
+                && validation.evidence_generation == before.evidence_epoch
+            {
+                validation.cancellation_token.cancel();
+                *active = None;
+            }
+        }
+        Some((result, document.revision, true))
     }
 
-    async fn persist_document(&self, document: &TaskEvidenceDocument) -> PersistOutcome {
-        let _persistence_permit = match self.persistence_gate.acquire().await {
-            Ok(permit) => permit,
-            Err(err) => {
-                warn!("KD4 task-evidence persistence gate unexpectedly closed: {err}");
-                return PersistOutcome::Failed;
-            }
-        };
-        let document_guard = self.document.lock().await;
-        let Some(current_document) = document_guard.as_ref() else {
-            return PersistOutcome::Superseded;
-        };
-        if current_document.revision != document.revision {
-            return PersistOutcome::Superseded;
+    async fn queue_persistence(&self, revision: u64) {
+        if let Some(persistence) = self.persistence.as_ref() {
+            persistence.enqueue(revision).await;
         }
-        let Some(path) = self.evidence_path.as_ref() else {
+    }
+
+    async fn persist_revision(&self, revision: u64) -> PersistOutcome {
+        let Some(persistence) = self.persistence.as_ref() else {
             return PersistOutcome::Failed;
         };
-        let last_persisted_revision = self.last_persisted_revision.load(Ordering::Acquire);
-        if last_persisted_revision != 0 {
-            if last_persisted_revision > document.revision {
-                return PersistOutcome::Superseded;
-            }
-            if last_persisted_revision == document.revision {
-                return PersistOutcome::Persisted;
+        persistence.wait_for_revision(revision).await
+    }
+
+    async fn wait_for_mutation_quiescence(&self) {
+        loop {
+            let generation = self.mutation_generation.load(Ordering::Acquire);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if self.mutation_generation.load(Ordering::Acquire) == generation {
+                return;
             }
         }
-        let bytes = match serde_json::to_vec_pretty(document) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                warn!("failed to serialize KD4 task evidence: {err}");
-                return PersistOutcome::Failed;
-            }
-        };
-        let write_path = path.clone();
-        let outcome =
-            match tokio::task::spawn_blocking(move || atomic_write_evidence(&write_path, &bytes))
-                .await
-            {
-                Ok(Ok(())) => {
-                    self.last_persisted_revision
-                        .store(document.revision, Ordering::Release);
-                    PersistOutcome::Persisted
-                }
-                Ok(Err(err)) => {
-                    warn!("failed to persist KD4 task evidence: {err}");
-                    PersistOutcome::Failed
-                }
-                Err(err) => {
-                    warn!("KD4 task-evidence persistence task failed: {err}");
-                    PersistOutcome::Failed
-                }
-            };
-        drop(document_guard);
-        outcome
     }
+
+    fn clear_completed_validation(&self, validation_start: Option<&TaskEvidenceValidationStart>) {
+        let Some(validation_start) = validation_start else {
+            return;
+        };
+        if validation_start.cancellation_token.is_cancelled() {
+            return;
+        }
+        let mut active = self
+            .active_validation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if active.as_ref().is_some_and(|validation| {
+            validation.evidence_generation == validation_start.evidence_generation
+                && !validation.cancellation_token.is_cancelled()
+        }) {
+            *active = None;
+        }
+    }
+}
+
+fn task_evidence_workspace_generation(document: &TaskEvidenceDocument) -> String {
+    let mut hasher = Sha256::new();
+    hash_fingerprint_component(
+        &mut hasher,
+        b"repository-root",
+        document.start.repository_root.as_bytes(),
+    );
+    hash_fingerprint_component(
+        &mut hasher,
+        b"starting-commit",
+        document
+            .start
+            .commit_hash
+            .as_deref()
+            .unwrap_or("<none>")
+            .as_bytes(),
+    );
+    format!("{:x}", hasher.finalize())
+}
+
+fn task_evidence_spec_generation(document: &TaskEvidenceDocument) -> String {
+    let mut hasher = Sha256::new();
+    hash_fingerprint_component(
+        &mut hasher,
+        b"plan",
+        format!("{:?}", document.plan).as_bytes(),
+    );
+    hash_fingerprint_component(
+        &mut hasher,
+        b"generated-artifacts",
+        format!("{:?}", document.generated_artifact_requirements).as_bytes(),
+    );
+    format!("{:x}", hasher.finalize())
+}
+
+fn task_evidence_hash_generation<'a>(
+    files: impl IntoIterator<Item = &'a FileHashSnapshot>,
+    artifacts: impl IntoIterator<Item = &'a FileHashSnapshot>,
+) -> String {
+    let mut hasher = Sha256::new();
+    for snapshot in files {
+        hash_fingerprint_component(&mut hasher, b"file", format!("{snapshot:?}").as_bytes());
+    }
+    for snapshot in artifacts {
+        hash_fingerprint_component(&mut hasher, b"artifact", format!("{snapshot:?}").as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 enum ExistingDocument {
@@ -2601,6 +3060,33 @@ fn generated_artifact_is_fresh(document: &TaskEvidenceDocument, path: &str) -> b
         && latest.read_error.is_none()
         && baseline.sha1.is_some()
         && baseline.sha1 == latest.sha1
+}
+
+fn validation_output_artifacts(payload: Option<&Value>) -> Vec<ValidationOutputArtifact> {
+    payload
+        .and_then(|payload| payload.get("results"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|result| result.get("exact_output_artifact"))
+        .filter_map(|artifact| {
+            let sha256 = artifact.get("sha256")?.as_str()?;
+            if sha256.len() != 64
+                || !sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return None;
+            }
+            let path = artifact.get("path")?.as_str()?;
+            let bytes = artifact.get("bytes")?.as_u64()?;
+            Some(ValidationOutputArtifact {
+                sha256: sha256.to_string(),
+                path: path.to_string(),
+                bytes,
+            })
+        })
+        .collect()
 }
 
 fn verifier_requirement_satisfied(

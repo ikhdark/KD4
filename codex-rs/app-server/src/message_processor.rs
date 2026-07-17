@@ -79,8 +79,6 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::StateDbHandle;
 use codex_state::log_db::LogDbLayer;
-use tokio::sync::Mutex;
-use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio::time::Duration;
@@ -310,10 +308,11 @@ impl MessageProcessor {
             .set_analytics_events_client(analytics_events_client.clone());
         let skills_watcher = SkillsWatcher::new(thread_manager.skills_service(), outgoing.clone());
 
-        let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
+        let thread_lifecycle = Arc::new(
+            crate::request_processors::thread_lifecycle::ThreadLifecycleCoordinator::default(),
+        );
         let thread_watch_manager =
             crate::thread_status::ThreadWatchManager::new_with_outgoing(outgoing.clone());
-        let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
         let workspace_settings_cache =
             Arc::new(workspace_settings::WorkspaceSettingsCache::default());
         let app_list_shutdown_token = CancellationToken::new();
@@ -405,10 +404,9 @@ impl MessageProcessor {
             Arc::clone(&config),
             config_manager.clone(),
             Arc::clone(&thread_store),
-            Arc::clone(&pending_thread_unloads),
+            Arc::clone(&thread_lifecycle),
             thread_state_manager.clone(),
             thread_watch_manager.clone(),
-            Arc::clone(&thread_list_state_permit),
             thread_goal_processor.clone(),
             state_db.clone(),
             log_db,
@@ -423,10 +421,9 @@ impl MessageProcessor {
             arg0_paths.clone(),
             Arc::clone(&config),
             config_manager.clone(),
-            pending_thread_unloads,
+            thread_lifecycle,
             thread_state_manager,
             thread_watch_manager,
-            thread_list_state_permit,
             Arc::clone(&skills_watcher),
         );
         if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
@@ -446,6 +443,7 @@ impl MessageProcessor {
             config_manager.clone(),
             thread_manager.clone(),
             analytics_events_client.clone(),
+            config.as_ref(),
         );
         let external_agent_config_processor =
             ExternalAgentConfigRequestProcessor::new(ExternalAgentConfigRequestProcessorArgs {

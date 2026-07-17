@@ -204,12 +204,8 @@ async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<
     assert!(!compressed_rollout_path(&fresh_path).exists());
     assert!(!stale_temp.exists());
     assert!(fresh_temp.exists());
-    assert!(
-        home.path()
-            .join(".tmp")
-            .join("rollout-compression.lock")
-            .exists()
-    );
+    assert!(!home.path().join(".tmp/rollout-compression.lock").exists());
+    assert!(home.path().join(".tmp/rollout-compression.next").exists());
     Ok(())
 }
 
@@ -411,7 +407,7 @@ async fn worker_skips_when_fresh_run_marker_exists() -> anyhow::Result<()> {
 }
 
 #[test]
-fn run_marker_is_removed_unless_persisted() -> anyhow::Result<()> {
+fn run_marker_is_removed_on_drop() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let marker_path = home.path().join(".tmp").join("rollout-compression.lock");
 
@@ -420,14 +416,38 @@ fn run_marker_is_removed_unless_persisted() -> anyhow::Result<()> {
         assert!(marker.is_some());
     }
     assert!(!marker_path.exists());
+    Ok(())
+}
 
-    let marker = worker::CompressionRunMarker::try_claim(home.path())?;
-    let Some(marker) = marker else {
-        panic!("expected run marker claim");
-    };
-    marker.persist();
-    assert!(marker_path.exists());
-    assert!(worker::CompressionRunMarker::try_claim(home.path())?.is_none());
+#[test]
+fn next_eligible_time_is_persisted_independently_of_run_lock() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let expected = SystemTime::now() + Duration::from_secs(60 * 60);
+
+    worker::write_next_eligible_time(home.path(), expected)?;
+
+    let actual = worker::read_next_eligible_time(home.path()).expect("next eligible time");
+    let delta = expected.duration_since(actual).unwrap_or_default();
+    assert!(delta < Duration::from_secs(1));
+    assert!(!home.path().join(".tmp/rollout-compression.lock").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn worker_honors_persistent_next_eligible_time() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(12);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let rollout_path = archived_rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&rollout_path, thread_id, "not eligible yet")?;
+    set_old_mtime(&rollout_path)?;
+    worker::write_next_eligible_time(home.path(), SystemTime::now() + Duration::from_secs(60))?;
+
+    worker::run(home.path().to_path_buf()).await?;
+
+    assert!(rollout_path.exists());
+    assert!(!compressed_rollout_path(&rollout_path).exists());
+    assert!(!home.path().join(".tmp/rollout-compression.lock").exists());
     Ok(())
 }
 

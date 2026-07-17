@@ -36,6 +36,8 @@ fn result() -> CommandResultV2 {
         log_state: LogState::Complete,
         log_path: None,
         diagnostic: String::new(),
+        exact_output_artifact: None,
+        diagnostic_omission: None,
         cached: false,
         flaky: false,
         baseline: None,

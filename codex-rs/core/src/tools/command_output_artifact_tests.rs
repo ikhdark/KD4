@@ -185,17 +185,15 @@ async fn independent_roots_do_not_share_a_retention_wait() {
         .expect("artifact directory");
     let blocked_lock = retention_directory_lock(&blocked_directory);
     let blocked_guard = blocked_lock.lock().await;
-    let (blocked_artifact, free_artifact) = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        async {
+    let (blocked_artifact, free_artifact) =
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::join!(
                 create_raw_output_artifact(&blocked_home, "thread", b"blocked"),
                 create_raw_output_artifact(&free_home, "thread", b"free")
             )
-        },
-    )
-    .await
-    .expect("artifact creation must not wait for retention sweeps");
+        })
+        .await
+        .expect("artifact creation must not wait for retention sweeps");
     assert!(matches!(blocked_artifact, RawOutputArtifact::Stored { .. }));
     assert!(matches!(free_artifact, RawOutputArtifact::Stored { .. }));
 
@@ -245,10 +243,7 @@ async fn local_retention_retries_locked_overage_until_the_cap_is_met() {
         file.try_lock().expect("lock active artifact");
         active_files.push(file);
     }
-    let keep_path = directory.join(format!(
-        "{:04}.log",
-        max_retained_artifacts_per_thread()
-    ));
+    let keep_path = directory.join(format!("{:04}.log", max_retained_artifacts_per_thread()));
 
     enforce_retention(&directory, &keep_path);
     drop(active_files.remove(0));

@@ -469,6 +469,183 @@ fn total_token_usage_includes_all_items_after_last_model_generated_item() {
 }
 
 #[test]
+fn complete_history_mutation_revision_tracks_appends_and_rewrites() {
+    let mut history = ContextManager::new();
+    assert_eq!(history.mutation_revision(), 0);
+
+    history.record_items([&user_msg("first")], TruncationPolicy::Tokens(10_000));
+    assert_eq!(history.mutation_revision(), 1);
+    assert_eq!(history.history_version(), 0);
+
+    history.replace(vec![assistant_msg("rewritten")]);
+    assert_eq!(history.mutation_revision(), 2);
+    assert_eq!(history.history_version(), 1);
+
+    history.remove_first_item();
+    assert_eq!(history.mutation_revision(), 3);
+    assert_eq!(history.history_version(), 2);
+}
+
+#[test]
+fn prompt_snapshot_reuses_stable_segments_and_normalizes_only_the_append() {
+    let modalities = default_input_modalities();
+    let mut history = create_history_with_items(vec![user_msg("one"), assistant_msg("two")]);
+
+    let initial = history.prompt_snapshot(&modalities);
+    assert_eq!(initial.normalization_work(), 2);
+    let initial_digest = *initial.rolling_digest();
+    let initial_items = initial.materialize();
+
+    history.record_items([&user_msg("three")], TruncationPolicy::Tokens(10_000));
+    let appended = history.prompt_snapshot(&modalities);
+    assert_eq!(appended.normalization_work(), 1);
+    assert_ne!(*appended.rolling_digest(), initial_digest);
+    assert_eq!(initial.materialize(), initial_items);
+    assert_eq!(
+        appended.materialize(),
+        history.clone().for_prompt(&modalities)
+    );
+}
+
+#[test]
+fn prompt_snapshot_incremental_proof_returns_only_items_after_verified_response() {
+    let modalities = default_input_modalities();
+    let mut history = create_history_with_items(vec![user_msg("one")]);
+    let baseline = history.prompt_snapshot(&modalities);
+    let response = assistant_msg("two");
+    let suffix = user_msg("three");
+
+    history.record_items([&response, &suffix], TruncationPolicy::Tokens(10_000));
+    let current = history.prompt_snapshot(&modalities);
+    let proof = current
+        .incremental_proof(
+            baseline.mutation_revision(),
+            baseline.rewrite_revision(),
+            baseline.canonical_prefix(),
+            std::slice::from_ref(&response),
+        )
+        .expect("append-only history should produce a proof");
+
+    assert_eq!(proof.suffix, vec![suffix]);
+    assert_eq!(proof.current_prefix, current.canonical_prefix());
+    assert_eq!(proof.mutation_revision, current.mutation_revision());
+}
+
+#[test]
+fn prompt_snapshot_incremental_proof_rejects_rewrite_and_normalization_replacement() {
+    let modalities = default_input_modalities();
+    let mut rewritten = create_history_with_items(vec![user_msg("one")]);
+    let before_rewrite = rewritten.prompt_snapshot(&modalities);
+    rewritten.replace(vec![user_msg("compacted")]);
+    let after_rewrite = rewritten.prompt_snapshot(&modalities);
+    assert!(
+        after_rewrite
+            .incremental_proof(
+                before_rewrite.mutation_revision(),
+                before_rewrite.rewrite_revision(),
+                before_rewrite.canonical_prefix(),
+                &[],
+            )
+            .is_none()
+    );
+
+    let call = ResponseItem::FunctionCall {
+        id: Some("item-call".to_string()),
+        name: "lookup".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: "call-proof".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: Some("item-output".to_string()),
+        call_id: "call-proof".to_string(),
+        output: FunctionCallOutputPayload::from_text("done".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut replaced = create_history_with_items(vec![call]);
+    let before_replacement = replaced.prompt_snapshot(&modalities);
+    replaced.record_items([&output], TruncationPolicy::Tokens(10_000));
+    let after_replacement = replaced.prompt_snapshot(&modalities);
+    assert!(
+        after_replacement
+            .incremental_proof(
+                before_replacement.mutation_revision(),
+                before_replacement.rewrite_revision(),
+                before_replacement.canonical_prefix(),
+                &[],
+            )
+            .is_none()
+    );
+
+    let image_item = ResponseItem::Message {
+        id: None,
+        role: "user".to_string(),
+        content: vec![ContentItem::InputImage {
+            image_url: "https://example.com/proof.png".to_string(),
+            detail: Some(DEFAULT_IMAGE_DETAIL),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut modality_changed = create_history_with_items(vec![image_item]);
+    let image_capable = modality_changed.prompt_snapshot(&default_input_modalities());
+    let text_only = modality_changed.prompt_snapshot(&[InputModality::Text]);
+    assert!(
+        text_only
+            .incremental_proof(
+                image_capable.mutation_revision(),
+                image_capable.rewrite_revision(),
+                image_capable.canonical_prefix(),
+                &[],
+            )
+            .is_none()
+    );
+}
+
+#[test]
+fn prompt_snapshot_updates_only_newly_paired_segments_across_an_append() {
+    let modalities = default_input_modalities();
+    let call = ResponseItem::FunctionCall {
+        id: Some("item-call".to_string()),
+        name: "lookup".to_string(),
+        namespace: None,
+        arguments: "{}".to_string(),
+        call_id: "call-append".to_string(),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let output = ResponseItem::FunctionCallOutput {
+        id: Some("item-output".to_string()),
+        call_id: "call-append".to_string(),
+        output: FunctionCallOutputPayload::from_text("done".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = create_history_with_items(vec![call]);
+    let before = history.prompt_snapshot(&modalities);
+    assert_eq!(before.materialize().len(), 2, "synthetic output");
+
+    history.record_items([&output], TruncationPolicy::Tokens(10_000));
+    let after = history.prompt_snapshot(&modalities);
+    assert_eq!(after.normalization_work(), 2, "old call plus new output");
+    assert_eq!(after.materialize(), history.clone().for_prompt(&modalities));
+}
+
+#[test]
+fn prompt_snapshot_rebuilds_after_history_rewrite() {
+    let modalities = default_input_modalities();
+    let mut history = create_history_with_items(vec![user_msg("old"), assistant_msg("reply")]);
+    let before = history.prompt_snapshot(&modalities);
+
+    history.replace(vec![user_msg("compacted")]);
+    let after = history.prompt_snapshot(&modalities);
+
+    assert_eq!(after.normalization_work(), 1);
+    assert!(after.rewrite_revision() > before.rewrite_revision());
+    assert_ne!(after.rolling_digest(), before.rolling_digest());
+    assert_eq!(after.materialize(), vec![user_msg("compacted")]);
+}
+
+#[test]
 fn for_prompt_strips_images_when_model_does_not_support_images() {
     let items = vec![
         ResponseItem::Message {
@@ -2256,4 +2433,19 @@ fn text_only_items_unchanged() {
     let raw_len = serde_json::to_string(&item).unwrap().len() as i64;
 
     assert_eq!(estimated, raw_len);
+}
+#[test]
+fn evidence_aware_shell_summary_is_not_retruncated_in_history() {
+    let content = format!(
+        "Chunk ID: abc\nOutput:\nShell output summary:\n{}",
+        "bounded evidence line\n".repeat(256)
+    );
+    let payload = FunctionCallOutputPayload {
+        body: FunctionCallOutputBody::Text(content.clone()),
+        success: Some(false),
+    };
+
+    let processed = truncate_function_output_payload(&payload, TruncationPolicy::Bytes(64));
+
+    assert_eq!(processed.body, FunctionCallOutputBody::Text(content));
 }

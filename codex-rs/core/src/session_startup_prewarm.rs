@@ -10,7 +10,6 @@ use tracing::instrument;
 use tracing::warn;
 
 use crate::client::ModelClientSession;
-use crate::guardian::routes_approval_to_guardian;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::session::INITIAL_SUBMIT_ID;
@@ -364,19 +363,6 @@ async fn schedule_startup_prewarm_inner(
         prewarm_started_at.elapsed(),
         /*status*/ None,
     );
-    if routes_approval_to_guardian(&startup_turn_context) {
-        let guardian_session = Arc::clone(&session);
-        let guardian_parent_turn = Arc::clone(&startup_turn_context);
-        drop(tokio::spawn(async move {
-            if let Err(err) = guardian_session
-                .guardian_review_session
-                .initialize(Arc::clone(&guardian_session), guardian_parent_turn)
-                .await
-            {
-                warn!("failed to initialize guardian review session: {err:#}");
-            }
-        }));
-    }
     let startup_cancellation_token = CancellationToken::new();
     let built_tools_started_at = Instant::now();
     // Startup prewarm runs before run_turn and needs its own tool-building snapshot.

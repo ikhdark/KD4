@@ -17,6 +17,8 @@ use core_test_support::TempDirExt;
 use core_test_support::responses;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_message_item_added;
+use core_test_support::responses::ev_output_text_delta;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::ev_shell_command_call;
 use core_test_support::responses::sse;
@@ -72,17 +74,21 @@ async fn refresh_models_on_models_etag_mismatch_and_avoid_duplicate_models_fetch
     assert_eq!(spawn_models_mock.single_request_path(), "/v1/models");
 
     // 2) If the server sends a different X-Models-Etag on /responses, Codex refreshes /models.
-    let refresh_models_mock = responses::mount_models_once_with_etag(
+    let refresh_models_mock = responses::mount_models_once_with_etag_and_delay(
         &server,
         ModelsResponse { models: Vec::new() },
         ETAG_2,
+        Duration::from_secs(5),
     )
     .await;
 
-    // First /responses request (user message) succeeds and returns a tool call.
-    // It also includes a mismatched X-Models-Etag, which should trigger a /models refresh.
+    // First /responses request streams output and returns a tool call. Its mismatched
+    // X-Models-Etag starts a deliberately slow /models refresh without delaying the stream.
     let first_response_body = sse(vec![
         ev_response_created("resp-1"),
+        ev_message_item_added("msg-stream", ""),
+        ev_output_text_delta("streamed while model refresh is pending"),
+        ev_assistant_message("msg-stream", "streamed while model refresh is pending"),
         ev_shell_command_call(CALL_ID, "/bin/echo 'etag ok'"),
         ev_completed("resp-1"),
     ]);
@@ -132,12 +138,35 @@ async fn refresh_models_on_models_etag_mismatch_and_avoid_duplicate_models_fetch
         })
         .await?;
 
+    let delta = tokio::time::timeout(
+        Duration::from_secs(3),
+        wait_for_event_with_timeout(
+            &codex,
+            |ev| matches!(ev, EventMsg::AgentMessageContentDelta(_)),
+            Duration::from_secs(30),
+        ),
+    )
+    .await
+    .expect("output deltas should continue while the model refresh is pending");
+    let EventMsg::AgentMessageContentDelta(delta) = delta else {
+        panic!("expected an assistant output delta while model refresh was pending");
+    };
+    assert_eq!(
+        delta.delta,
+        "streamed while model refresh is pending".to_string()
+    );
+
     let _ = wait_for_event_with_timeout(
         &codex,
         |ev| matches!(ev, EventMsg::TurnComplete(_)),
         Duration::from_secs(30),
     )
     .await;
+
+    test.thread_manager
+        .get_models_manager()
+        .refresh_barrier()
+        .await;
 
     // Assert /models was refreshed exactly once after the X-Models-Etag mismatch.
     assert_eq!(refresh_models_mock.requests().len(), 1);

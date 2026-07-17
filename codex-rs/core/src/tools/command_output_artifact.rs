@@ -1,18 +1,20 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
+use sha2::Digest;
+use sha2::Sha256;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
+use tokio::sync::mpsc;
 
 const RETENTION_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
 const RETENTION_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
@@ -147,8 +149,9 @@ impl RawOutputArtifactWriteQueue {
 
     fn spawn_inner(
         state: Option<Arc<Mutex<RawOutputArtifact>>>,
-        #[cfg_attr(not(test), allow(unused_variables))]
-        io_gate: Option<Arc<tokio::sync::Semaphore>>,
+        #[cfg_attr(not(test), allow(unused_variables))] io_gate: Option<
+            Arc<tokio::sync::Semaphore>,
+        >,
     ) -> Option<Self> {
         let state = state?;
         let pending = Arc::new(StdMutex::new(PendingRawOutputArtifactBytes::default()));
@@ -179,7 +182,9 @@ impl RawOutputArtifactWriteQueue {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             pending.bytes.extend_from_slice(output);
-            self.positions.queued.fetch_add(output_len, Ordering::AcqRel);
+            self.positions
+                .queued
+                .fetch_add(output_len, Ordering::AcqRel);
         }
         let _ = self.wake_tx.try_send(());
     }
@@ -242,7 +247,10 @@ async fn run_raw_output_artifact_writer(
                 let mut pending = pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (std::mem::take(&mut pending.bytes), pending.finalize_requested)
+                (
+                    std::mem::take(&mut pending.bytes),
+                    pending.finalize_requested,
+                )
             };
             if !bytes.is_empty()
                 && let Some(writer) = writer.as_mut()
@@ -421,6 +429,122 @@ impl RawOutputArtifact {
             ),
             Self::Failed { message, .. } => format!("Raw output artifact unavailable: {message}"),
         }
+    }
+}
+
+pub(crate) fn output_sha256(output: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(output))
+}
+
+pub(crate) async fn create_content_addressed_output_artifact(
+    codex_home: &Path,
+    thread_id: &str,
+    output: &[u8],
+) -> RawOutputArtifact {
+    let directory = codex_home.join("tool-output").join(thread_id).join("exact");
+    create_content_addressed_output_artifact_in(&directory, output).await
+}
+
+pub(crate) async fn content_address_raw_output_artifact(
+    artifact: &RawOutputArtifact,
+) -> RawOutputArtifact {
+    let RawOutputArtifact::Stored { path, .. } = artifact else {
+        return artifact.clone();
+    };
+    let output = match tokio::fs::read(path).await {
+        Ok(output) => output,
+        Err(err) => {
+            return failed_with_owned_path(
+                path.clone(),
+                0,
+                format!(
+                    "failed to read `{}` for content addressing: {err}",
+                    path.display()
+                ),
+            )
+            .await;
+        }
+    };
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    create_content_addressed_output_artifact_in(directory, &output).await
+}
+
+async fn create_content_addressed_output_artifact_in(
+    directory: &Path,
+    output: &[u8],
+) -> RawOutputArtifact {
+    if let Err(err) = tokio::fs::create_dir_all(directory).await {
+        return RawOutputArtifact::unavailable(format!(
+            "failed to create `{}`: {err}",
+            directory.display()
+        ));
+    }
+
+    let digest = output_sha256(output);
+    let path = directory.join(format!("sha256-{digest}.log"));
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        return verify_content_addressed_output(path, output).await;
+    }
+
+    let temporary_path = directory.join(format!(".{}.tmp", uuid::Uuid::now_v7()));
+    let write_result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)
+            .await?;
+        file.write_all(output).await?;
+        file.flush().await?;
+        drop(file);
+        tokio::fs::rename(&temporary_path, &path).await
+    }
+    .await;
+
+    match write_result {
+        Ok(()) => {
+            enforce_retention(directory, &path);
+            RawOutputArtifact::Stored {
+                path,
+                bytes: u64::try_from(output.len()).unwrap_or(u64::MAX),
+            }
+        }
+        Err(_) if tokio::fs::try_exists(&path).await.unwrap_or(false) => {
+            let _ = tokio::fs::remove_file(&temporary_path).await;
+            verify_content_addressed_output(path, output).await
+        }
+        Err(err) => {
+            let _ = tokio::fs::remove_file(&temporary_path).await;
+            RawOutputArtifact::unavailable(format!(
+                "failed to create content-addressed output `{}`: {err}",
+                path.display()
+            ))
+        }
+    }
+}
+
+async fn verify_content_addressed_output(path: PathBuf, expected: &[u8]) -> RawOutputArtifact {
+    match tokio::fs::read(&path).await {
+        Ok(actual) if actual == expected => {
+            enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path);
+            RawOutputArtifact::Stored {
+                path,
+                bytes: u64::try_from(actual.len()).unwrap_or(u64::MAX),
+            }
+        }
+        Ok(actual) => RawOutputArtifact::Failed {
+            message: format!(
+                "content-addressed output integrity mismatch: expected {} bytes, found {}",
+                expected.len(),
+                actual.len()
+            ),
+            owned_path: Some(path),
+            bytes: u64::try_from(actual.len()).unwrap_or(u64::MAX),
+        },
+        Err(err) => RawOutputArtifact::Failed {
+            message: format!("failed to read content-addressed output: {err}"),
+            owned_path: Some(path),
+            bytes: 0,
+        },
     }
 }
 
@@ -850,9 +974,7 @@ async fn run_retention_janitor(janitor: &'static RetentionJanitor) {
 
         if should_delay {
             tokio::time::sleep(retry_delay).await;
-            retry_delay = retry_delay
-                .saturating_mul(2)
-                .min(RETENTION_RETRY_MAX_DELAY);
+            retry_delay = retry_delay.saturating_mul(2).min(RETENTION_RETRY_MAX_DELAY);
         } else {
             retry_delay = RETENTION_RETRY_INITIAL_DELAY;
         }
@@ -962,6 +1084,35 @@ mod tests {
         assert_eq!(
             tokio::fs::read(path).await.expect("read artifact"),
             b"alpha\0beta\nunicode: \xce\xbb\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn content_addressed_artifact_is_stable_and_replays_exact_bytes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let output = b"stdout\0stderr\nerror: tail\n";
+        let first = create_content_addressed_output_artifact(temp.path(), "thread", output).await;
+        let second = create_content_addressed_output_artifact(temp.path(), "thread", output).await;
+
+        let RawOutputArtifact::Stored {
+            path: first_path,
+            bytes,
+        } = first
+        else {
+            panic!("expected stored artifact");
+        };
+        let RawOutputArtifact::Stored {
+            path: second_path, ..
+        } = second
+        else {
+            panic!("expected reused artifact");
+        };
+        assert_eq!(first_path, second_path);
+        assert_eq!(bytes, output.len() as u64);
+        assert!(first_path.ends_with(format!("sha256-{}.log", output_sha256(output))));
+        assert_eq!(
+            tokio::fs::read(first_path).await.expect("exact bytes"),
+            output
         );
     }
 

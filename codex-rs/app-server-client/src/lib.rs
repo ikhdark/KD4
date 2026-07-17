@@ -447,9 +447,9 @@ pub enum AppServerClient {
 impl InProcessAppServerClient {
     /// Starts the in-process runtime and facade worker task.
     ///
-    /// The returned client is ready for requests and event consumption. If the
-    /// internal event queue is saturated later, server requests are rejected
-    /// with overload error instead of being silently dropped.
+    /// The returned client is ready for requests and event consumption.
+    /// Control replies use an independent command pump, so a saturated event
+    /// consumer cannot orphan an approval response.
     pub async fn start(args: InProcessClientStartArgs) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
         let mut handle =
@@ -458,60 +458,67 @@ impl InProcessAppServerClient {
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
 
+        let (shutdown_tx, mut shutdown_rx) =
+            mpsc::channel::<Option<oneshot::Sender<IoResult<()>>>>(1);
+        let command_request_sender = request_sender.clone();
+        let mut command_handle = tokio::spawn(async move {
+            while let Some(command) = command_rx.recv().await {
+                match command {
+                    ClientCommand::Request {
+                        request,
+                        response_tx,
+                    } => {
+                        let request_sender = command_request_sender.clone();
+                        tokio::spawn(async move {
+                            let result = request_sender.request(*request).await;
+                            let _ = response_tx.send(result);
+                        });
+                    }
+                    ClientCommand::Notify {
+                        notification,
+                        response_tx,
+                    } => {
+                        let result = command_request_sender.notify(notification).await;
+                        let _ = response_tx.send(result);
+                    }
+                    ClientCommand::ResolveServerRequest {
+                        request_id,
+                        result,
+                        response_tx,
+                    } => {
+                        let send_result = command_request_sender
+                            .respond_to_server_request(request_id, result)
+                            .await;
+                        let _ = response_tx.send(send_result);
+                    }
+                    ClientCommand::RejectServerRequest {
+                        request_id,
+                        error,
+                        response_tx,
+                    } => {
+                        let send_result = command_request_sender
+                            .fail_server_request(request_id, error)
+                            .await;
+                        let _ = response_tx.send(send_result);
+                    }
+                    ClientCommand::Shutdown { response_tx } => {
+                        let _ = shutdown_tx.send(Some(response_tx)).await;
+                        return;
+                    }
+                }
+            }
+            let _ = shutdown_tx.send(None).await;
+        });
+
         let worker_handle = tokio::spawn(async move {
             let mut event_stream_enabled = true;
             let mut skipped_events = 0usize;
+            let mut shutdown_response = None;
             loop {
                 tokio::select! {
-                    command = command_rx.recv() => {
-                        match command {
-                            Some(ClientCommand::Request { request, response_tx }) => {
-                                let request_sender = request_sender.clone();
-                                // Request waits happen on a detached task so
-                                // this loop can keep draining runtime events
-                                // while the request is blocked on client input.
-                                tokio::spawn(async move {
-                                    let result = request_sender.request(*request).await;
-                                    let _ = response_tx.send(result);
-                                });
-                            }
-                            Some(ClientCommand::Notify {
-                                notification,
-                                response_tx,
-                            }) => {
-                                let result = request_sender.notify(notification).await;
-                                let _ = response_tx.send(result);
-                            }
-                            Some(ClientCommand::ResolveServerRequest {
-                                request_id,
-                                result,
-                                response_tx,
-                            }) => {
-                                let send_result = request_sender
-                                    .respond_to_server_request(request_id, result)
-                                    .await;
-                                let _ = response_tx.send(send_result);
-                            }
-                            Some(ClientCommand::RejectServerRequest {
-                                request_id,
-                                error,
-                                response_tx,
-                            }) => {
-                                let send_result = request_sender
-                                    .fail_server_request(request_id, error)
-                                    .await;
-                                let _ = response_tx.send(send_result);
-                            }
-                            Some(ClientCommand::Shutdown { response_tx }) => {
-                                let shutdown_result = handle.shutdown().await;
-                                let _ = response_tx.send(shutdown_result);
-                                break;
-                            }
-                            None => {
-                                let _ = handle.shutdown().await;
-                                break;
-                            }
-                        }
+                    shutdown = shutdown_rx.recv() => {
+                        shutdown_response = shutdown.flatten();
+                        break;
                     }
                     event = handle.next_event(), if event_stream_enabled => {
                         let Some(event) = event else {
@@ -567,6 +574,12 @@ impl InProcessAppServerClient {
                         }
                     }
                 }
+            }
+            command_handle.abort();
+            let _ = command_handle.await;
+            let shutdown_result = handle.shutdown().await;
+            if let Some(response_tx) = shutdown_response {
+                let _ = response_tx.send(shutdown_result);
             }
         });
 
@@ -720,8 +733,8 @@ impl InProcessAppServerClient {
     /// Returns the next in-process event, or `None` when worker exits.
     ///
     /// Callers are expected to drain this stream promptly. If they fall behind,
-    /// the worker emits [`InProcessServerEvent::Lagged`] markers and may reject
-    /// pending server requests rather than letting approval flows hang.
+    /// the worker emits [`InProcessServerEvent::Lagged`] markers for dropped
+    /// best-effort progress while retaining control and lifecycle events.
     pub async fn next_event(&mut self) -> Option<InProcessServerEvent> {
         self.event_rx.recv().await
     }
@@ -1004,7 +1017,9 @@ mod tests {
         channel_capacity: usize,
     ) -> TestClient {
         let codex_home = TempDir::new().expect("temp dir");
-        let config = Arc::new(build_test_config_for_codex_home(codex_home.path()).await);
+        let mut config = build_test_config_for_codex_home(codex_home.path()).await;
+        config.sqlite_home = codex_home.path().join("sqlite");
+        let config = Arc::new(config);
         let state_db = init_state_db(config.as_ref())
             .await
             .expect("state db should initialize for in-process test");
@@ -1344,9 +1359,7 @@ mod tests {
     async fn forward_in_process_event_preserves_transcript_notifications_under_backpressure() {
         let (event_tx, mut event_rx) = mpsc::channel(1);
         event_tx
-            .send(InProcessServerEvent::ServerNotification(
-                command_execution_output_delta_notification("stdout-1"),
-            ))
+            .send(InProcessServerEvent::Lagged { skipped: 99 })
             .await
             .expect("initial event should enqueue");
 
@@ -1354,9 +1367,7 @@ mod tests {
         let result = forward_in_process_event(
             &event_tx,
             &mut skipped_events,
-            InProcessServerEvent::ServerNotification(command_execution_output_delta_notification(
-                "stdout-2",
-            )),
+            InProcessServerEvent::Lagged { skipped: 98 },
             |_| {},
         )
         .await;
@@ -1397,9 +1408,7 @@ mod tests {
             .expect("receiver task should join successfully");
         assert!(matches!(
             &events[0],
-            InProcessServerEvent::ServerNotification(
-                ServerNotification::CommandExecutionOutputDelta(notification)
-            ) if notification.delta == "stdout-1"
+            InProcessServerEvent::Lagged { skipped: 99 }
         ));
         assert!(matches!(
             &events[1],
@@ -2177,7 +2186,7 @@ mod tests {
         assert!(!event_requires_delivery(&InProcessServerEvent::Lagged {
             skipped: 1
         }));
-        assert!(!event_requires_delivery(
+        assert!(event_requires_delivery(
             &InProcessServerEvent::ServerNotification(
                 codex_app_server_protocol::ServerNotification::CommandExecutionOutputDelta(
                     codex_app_server_protocol::CommandExecutionOutputDeltaNotification {

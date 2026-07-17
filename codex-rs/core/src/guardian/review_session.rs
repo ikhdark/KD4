@@ -27,10 +27,11 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TokenUsage;
-use futures::future::BoxFuture;
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+use tokio::sync::SemaphorePermit;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -57,9 +58,9 @@ use super::prompt::GuardianTranscriptCursor;
 use super::prompt::build_guardian_prompt_items_with_parent_turn;
 use super::prompt::guardian_policy_prompt;
 use super::prompt::guardian_policy_prompt_with_config;
-use super::review::guardian_review_session_config;
 
 const GUARDIAN_INTERRUPT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const GUARDIAN_EPHEMERAL_REVIEW_CAPACITY: usize = 3;
 #[derive(Debug)]
 pub(crate) enum GuardianReviewSessionOutcome {
     Completed(anyhow::Result<Option<String>>),
@@ -91,10 +92,10 @@ pub(crate) struct GuardianReviewSessionParams {
     pub(crate) deadline: tokio::time::Instant,
 }
 
-#[derive(Default)]
 pub(crate) struct GuardianReviewSessionManager {
     state: Arc<Mutex<GuardianReviewSessionState>>,
     cancellation_token: CancellationToken,
+    fallback_capacity: Arc<Semaphore>,
 }
 
 #[derive(Default)]
@@ -135,6 +136,17 @@ fn token_usage_delta(start: &TokenUsage, end: &TokenUsage) -> TokenUsage {
 struct EphemeralReviewCleanup {
     state: Arc<Mutex<GuardianReviewSessionState>>,
     review_session: Option<Arc<GuardianReviewSession>>,
+    fallback_permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Default for GuardianReviewSessionManager {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(GuardianReviewSessionState::default())),
+            cancellation_token: CancellationToken::new(),
+            fallback_capacity: Arc::new(Semaphore::new(GUARDIAN_EPHEMERAL_REVIEW_CAPACITY)),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -257,15 +269,20 @@ impl EphemeralReviewCleanup {
     fn new(
         state: Arc<Mutex<GuardianReviewSessionState>>,
         review_session: Arc<GuardianReviewSession>,
+        fallback_permit: OwnedSemaphorePermit,
     ) -> Self {
         Self {
             state,
             review_session: Some(review_session),
+            fallback_permit: Some(fallback_permit),
         }
     }
 
-    fn disarm(&mut self) {
+    fn disarm(&mut self) -> OwnedSemaphorePermit {
         self.review_session = None;
+        self.fallback_permit
+            .take()
+            .expect("active fallback review must retain its capacity permit")
     }
 }
 
@@ -274,6 +291,7 @@ impl Drop for EphemeralReviewCleanup {
         let Some(review_session) = self.review_session.take() else {
             return;
         };
+        let fallback_permit = self.fallback_permit.take();
         let state = Arc::clone(&self.state);
         drop(tokio::spawn(async move {
             let review_session = {
@@ -287,45 +305,30 @@ impl Drop for EphemeralReviewCleanup {
             if let Some(review_session) = review_session {
                 review_session.shutdown().await;
             }
+            drop(fallback_permit);
         }));
     }
 }
 
+async fn acquire_trunk_review_lock_before_deadline<'a>(
+    review_lock: &'a Semaphore,
+    deadline: tokio::time::Instant,
+    external_cancel: Option<&CancellationToken>,
+) -> Result<SemaphorePermit<'a>, GuardianReviewSessionOutcome> {
+    match run_before_review_deadline(deadline, external_cancel, review_lock.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(GuardianReviewSessionOutcome::Completed(Err(anyhow!(
+            "guardian trunk review lock closed while waiting"
+        )))),
+        Err(outcome) => Err(outcome),
+    }
+}
+
 impl GuardianReviewSessionManager {
-    pub(crate) fn initialize(
-        &self,
-        parent_session: Arc<Session>,
-        parent_turn: Arc<TurnContext>,
-    ) -> BoxFuture<'_, anyhow::Result<()>> {
-        // Boxing breaks the Session::new -> Guardian -> Session::new future recursion.
-        Box::pin(async move {
-            let spawn_config = guardian_review_session_config(&parent_session, &parent_turn)
-                .await?
-                .spawn_config;
-            let reuse_key = GuardianReviewSessionReuseKey::from_spawn_config(
-                &spawn_config,
-                parent_session.user_instructions().await,
-            );
-            let spawn_cancel_token = self.cancellation_token.child_token();
-            let spawn_cancel_guard = spawn_cancel_token.clone().drop_guard();
-            let review_session = spawn_guardian_review_session(
-                &parent_session,
-                &parent_turn,
-                spawn_config,
-                reuse_key,
-                spawn_cancel_token.clone(),
-                /*fork_snapshot*/ None,
-            )
-            .await?;
-            // A first review or shutdown may win while eager initialization is in flight;
-            // install only if neither has happened.
-            let mut state = self.state.lock().await;
-            if !spawn_cancel_token.is_cancelled() && state.trunk.is_none() {
-                state.trunk = Some(Arc::new(review_session));
-                drop(spawn_cancel_guard.disarm());
-            }
-            Ok(())
-        })
+    fn try_acquire_fallback_capacity(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.fallback_capacity)
+            .try_acquire_owned()
+            .ok()
     }
 
     pub(crate) async fn trunk_rollout_path(&self) -> Option<PathBuf> {
@@ -440,25 +443,74 @@ impl GuardianReviewSessionManager {
         };
 
         if trunk.reuse_key != next_reuse_key {
-            return Box::pin(self.run_ephemeral_review(
-                params,
-                next_reuse_key,
+            if let Some(fallback_permit) = self.try_acquire_fallback_capacity() {
+                return Box::pin(self.run_ephemeral_review(
+                    params,
+                    next_reuse_key,
+                    deadline,
+                    /*fork_snapshot*/ None,
+                    fallback_permit,
+                ))
+                .await;
+            }
+
+            let trunk_guard = match acquire_trunk_review_lock_before_deadline(
+                &trunk.review_lock,
                 deadline,
-                /*fork_snapshot*/ None,
-            ))
-            .await;
+                params.external_cancel.as_ref(),
+            )
+            .await
+            {
+                Ok(trunk_guard) => trunk_guard,
+                Err(outcome) => {
+                    return (outcome, GuardianReviewAnalyticsResult::without_session());
+                }
+            };
+            let stale_trunk = self.remove_trunk_if_current(&trunk).await;
+            drop(trunk_guard);
+            if let Some(stale_trunk) = stale_trunk {
+                stale_trunk.shutdown_in_background();
+            }
+            return Box::pin(self.run_review(params)).await;
         }
 
         let trunk_guard = match trunk.review_lock.try_acquire() {
             Ok(trunk_guard) => trunk_guard,
             Err(_) => {
-                return Box::pin(self.run_ephemeral_review(
-                    params,
-                    next_reuse_key,
+                if let Some(fallback_permit) = self.try_acquire_fallback_capacity() {
+                    let fork_snapshot = match run_before_review_deadline(
+                        deadline,
+                        params.external_cancel.as_ref(),
+                        trunk.fork_snapshot(),
+                    )
+                    .await
+                    {
+                        Ok(fork_snapshot) => fork_snapshot,
+                        Err(outcome) => {
+                            return (outcome, GuardianReviewAnalyticsResult::without_session());
+                        }
+                    };
+                    return Box::pin(self.run_ephemeral_review(
+                        params,
+                        next_reuse_key,
+                        deadline,
+                        fork_snapshot,
+                        fallback_permit,
+                    ))
+                    .await;
+                }
+                match acquire_trunk_review_lock_before_deadline(
+                    &trunk.review_lock,
                     deadline,
-                    trunk.fork_snapshot().await,
-                ))
-                .await;
+                    params.external_cancel.as_ref(),
+                )
+                .await
+                {
+                    Ok(trunk_guard) => trunk_guard,
+                    Err(outcome) => {
+                        return (outcome, GuardianReviewAnalyticsResult::without_session());
+                    }
+                }
             }
         };
 
@@ -596,6 +648,7 @@ impl GuardianReviewSessionManager {
         reuse_key: GuardianReviewSessionReuseKey,
         deadline: tokio::time::Instant,
         fork_snapshot: Option<GuardianReviewForkSnapshot>,
+        fallback_permit: OwnedSemaphorePermit,
     ) -> (GuardianReviewSessionOutcome, GuardianReviewAnalyticsResult) {
         let spawn_cancel_token = self.cancellation_token.child_token();
         let mut fork_config = params.spawn_config.clone();
@@ -628,8 +681,11 @@ impl GuardianReviewSessionManager {
         };
         self.register_active_ephemeral(Arc::clone(&review_session))
             .await;
-        let mut cleanup =
-            EphemeralReviewCleanup::new(Arc::clone(&self.state), Arc::clone(&review_session));
+        let mut cleanup = EphemeralReviewCleanup::new(
+            Arc::clone(&self.state),
+            Arc::clone(&review_session),
+            fallback_permit,
+        );
 
         let (outcome, _, analytics_result) = Box::pin(run_review_on_session(
             review_session.as_ref(),
@@ -639,8 +695,11 @@ impl GuardianReviewSessionManager {
         ))
         .await;
         if let Some(review_session) = self.take_active_ephemeral(&review_session).await {
-            cleanup.disarm();
-            review_session.shutdown_in_background();
+            let fallback_permit = cleanup.disarm();
+            drop(tokio::spawn(async move {
+                review_session.shutdown().await;
+                drop(fallback_permit);
+            }));
         }
         (outcome, analytics_result)
     }
@@ -1494,6 +1553,71 @@ mod tests {
 
         assert_eq!(outcome.unwrap(), 42);
         assert!(!cancel_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn trunk_review_lock_wait_honors_existing_deadline() {
+        let (review_session, _tx_event, _rx_sub) = test_review_session().await;
+        let held = review_session
+            .review_lock
+            .acquire()
+            .await
+            .expect("trunk review lock should be open");
+
+        let outcome = acquire_trunk_review_lock_before_deadline(
+            &review_session.review_lock,
+            tokio::time::Instant::now(),
+            /*external_cancel*/ None,
+        )
+        .await;
+        assert!(matches!(outcome, Err(GuardianReviewSessionOutcome::TimedOut)));
+
+        drop(held);
+        let acquired = acquire_trunk_review_lock_before_deadline(
+            &review_session.review_lock,
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            /*external_cancel*/ None,
+        )
+        .await;
+        assert!(acquired.is_ok());
+    }
+
+    #[tokio::test]
+    async fn fallback_session_capacity_is_capped() {
+        let manager = GuardianReviewSessionManager::default();
+        let leases = (0..GUARDIAN_EPHEMERAL_REVIEW_CAPACITY)
+            .map(|_| {
+                manager
+                    .try_acquire_fallback_capacity()
+                    .expect("configured fallback slot should be available")
+            })
+            .collect::<Vec<_>>();
+
+        assert!(manager.try_acquire_fallback_capacity().is_none());
+        drop(leases);
+        assert_eq!(
+            manager.fallback_capacity.available_permits(),
+            GUARDIAN_EPHEMERAL_REVIEW_CAPACITY
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_capacity_is_retained_during_retirement_handoff() {
+        let capacity = Arc::new(Semaphore::new(/*permits*/ 1));
+        let permit = Arc::clone(&capacity)
+            .try_acquire_owned()
+            .expect("fallback capacity should be available");
+        let (review_session, _tx_event, _rx_sub) = test_review_session().await;
+        let mut cleanup = EphemeralReviewCleanup::new(
+            Arc::new(Mutex::new(GuardianReviewSessionState::default())),
+            Arc::new(review_session),
+            permit,
+        );
+
+        let retirement_permit = cleanup.disarm();
+        assert_eq!(capacity.available_permits(), 0);
+        drop(retirement_permit);
+        assert_eq!(capacity.available_permits(), 1);
     }
 
     #[test]

@@ -24,7 +24,9 @@ pub(crate) struct HeadTailBuffer {
     head: Vec<u8>,
     tail: CircularByteBuffer,
     omitted_bytes: usize,
+    omitted_lines: usize,
     unreported_omitted_bytes: usize,
+    unreported_omitted_lines: usize,
     lagged_chunks: u64,
     unreported_lagged_chunks: u64,
     recovery_evidence: SharedOutputRecoveryEvidence,
@@ -58,7 +60,9 @@ impl HeadTailBuffer {
             head: Vec::with_capacity(head_budget),
             tail: CircularByteBuffer::new(tail_budget),
             omitted_bytes: 0,
+            omitted_lines: 0,
             unreported_omitted_bytes: 0,
+            unreported_omitted_lines: 0,
             lagged_chunks: 0,
             unreported_lagged_chunks: 0,
             recovery_evidence,
@@ -98,7 +102,10 @@ impl HeadTailBuffer {
     }
 
     pub(crate) fn record_external_omitted_bytes(&mut self, omitted: usize) {
-        self.record_omitted_bytes(omitted);
+        self.record_omission(OutputOmission {
+            bytes: omitted,
+            lines: 0,
+        });
     }
 
     // Used for tests.
@@ -115,11 +122,20 @@ impl HeadTailBuffer {
         self.omitted_bytes
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn omitted_lines(&self) -> usize {
+        self.omitted_lines
+    }
+
     /// Consume capacity-omitted bytes not yet reported by an interim response.
     ///
     /// The cumulative `omitted_bytes` value remains available for final output.
     pub(crate) fn take_unreported_omitted_bytes(&mut self) -> usize {
         std::mem::take(&mut self.unreported_omitted_bytes)
+    }
+
+    pub(crate) fn take_unreported_omitted_lines(&mut self) -> usize {
+        std::mem::take(&mut self.unreported_omitted_lines)
     }
 
     pub(crate) fn record_lagged_chunks(&mut self, skipped: u64) {
@@ -147,7 +163,7 @@ impl HeadTailBuffer {
     /// dropped to preserve the tail budget.
     pub(crate) fn push_chunk(&mut self, chunk: Vec<u8>) {
         if self.max_bytes == 0 {
-            self.record_omitted_bytes(chunk.len());
+            self.record_omission(OutputOmission::from_bytes(&chunk));
             return;
         }
 
@@ -162,7 +178,7 @@ impl HeadTailBuffer {
         }
 
         let omitted = self.tail.push(remaining);
-        self.record_omitted_bytes(omitted);
+        self.record_omission(omitted);
     }
 
     /// Snapshot the retained output as a list of chunks.
@@ -212,6 +228,7 @@ impl HeadTailBuffer {
             data,
             self.max_bytes,
             self.omitted_bytes,
+            self.omitted_lines,
             self.lagged_chunks,
             recovery_detail.as_deref(),
         )
@@ -228,6 +245,7 @@ impl HeadTailBuffer {
             data,
             self.max_bytes,
             self.omitted_bytes,
+            self.omitted_lines,
             self.lagged_chunks,
             recovery_detail.as_deref(),
         )
@@ -251,9 +269,33 @@ impl HeadTailBuffer {
         out
     }
 
-    fn record_omitted_bytes(&mut self, omitted: usize) {
-        self.omitted_bytes = self.omitted_bytes.saturating_add(omitted);
-        self.unreported_omitted_bytes = self.unreported_omitted_bytes.saturating_add(omitted);
+    fn record_omission(&mut self, omitted: OutputOmission) {
+        self.omitted_bytes = self.omitted_bytes.saturating_add(omitted.bytes);
+        self.omitted_lines = self.omitted_lines.saturating_add(omitted.lines);
+        self.unreported_omitted_bytes = self.unreported_omitted_bytes.saturating_add(omitted.bytes);
+        self.unreported_omitted_lines = self.unreported_omitted_lines.saturating_add(omitted.lines);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct OutputOmission {
+    bytes: usize,
+    lines: usize,
+}
+
+impl OutputOmission {
+    fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            bytes: bytes.len(),
+            lines: count_line_breaks(bytes),
+        }
+    }
+
+    fn saturating_add(self, other: Self) -> Self {
+        Self {
+            bytes: self.bytes.saturating_add(other.bytes),
+            lines: self.lines.saturating_add(other.lines),
+        }
     }
 }
 
@@ -286,18 +328,17 @@ impl CircularByteBuffer {
 
     /// Append bytes and return the number of previously or newly supplied
     /// bytes that no longer fit in the retained suffix.
-    fn push(&mut self, input: &[u8]) -> usize {
+    fn push(&mut self, input: &[u8]) -> OutputOmission {
         if input.is_empty() {
-            return 0;
+            return OutputOmission::default();
         }
         if self.capacity == 0 {
-            return input.len();
+            return OutputOmission::from_bytes(input);
         }
         if input.len() >= self.capacity {
-            let omitted = self
-                .bytes
-                .len()
-                .saturating_add(input.len().saturating_sub(self.capacity));
+            let omitted = OutputOmission::from_bytes(&self.to_bytes()).saturating_add(
+                OutputOmission::from_bytes(&input[..input.len().saturating_sub(self.capacity)]),
+            );
             self.bytes.clear();
             self.bytes
                 .extend_from_slice(&input[input.len() - self.capacity..]);
@@ -311,19 +352,25 @@ impl CircularByteBuffer {
         self.bytes.extend_from_slice(&input[..fill_len]);
         let overwrite = &input[fill_len..];
         if overwrite.is_empty() {
-            return 0;
+            return OutputOmission::default();
         }
 
         debug_assert_eq!(self.bytes.len(), self.capacity);
+        let overwritten = if self.start + overwrite.len() <= self.capacity {
+            OutputOmission::from_bytes(&self.bytes[self.start..self.start + overwrite.len()])
+        } else {
+            let first = OutputOmission::from_bytes(&self.bytes[self.start..]);
+            let second_len = overwrite.len() - (self.capacity - self.start);
+            first.saturating_add(OutputOmission::from_bytes(&self.bytes[..second_len]))
+        };
         let first_len = overwrite.len().min(self.capacity - self.start);
-        self.bytes[self.start..self.start + first_len]
-            .copy_from_slice(&overwrite[..first_len]);
+        self.bytes[self.start..self.start + first_len].copy_from_slice(&overwrite[..first_len]);
         let second_len = overwrite.len().saturating_sub(first_len);
         if second_len > 0 {
             self.bytes[..second_len].copy_from_slice(&overwrite[first_len..]);
         }
         self.start = (self.start + overwrite.len()) % self.capacity;
-        overwrite.len()
+        overwritten
     }
 
     fn extend_into(&self, output: &mut Vec<u8>) {
@@ -353,6 +400,7 @@ fn render_capped_output(
     data: &[u8],
     cap: usize,
     recorded_omitted_bytes: usize,
+    recorded_omitted_lines: usize,
     lagged_chunks: u64,
     recovery_detail: Option<&str>,
 ) -> Vec<u8> {
@@ -361,23 +409,43 @@ fn render_capped_output(
     }
 
     let base_omitted_bytes = recorded_omitted_bytes.saturating_add(data.len().saturating_sub(cap));
+    let base_omitted_lines = recorded_omitted_lines;
     if base_omitted_bytes == 0 && lagged_chunks == 0 && recovery_detail.is_none() {
         return data.to_vec();
     }
 
     let mut omitted_bytes = base_omitted_bytes;
-    let mut marker = output_evidence_marker(omitted_bytes, lagged_chunks, recovery_detail);
+    let mut omitted_lines = base_omitted_lines;
+    let mut marker =
+        output_evidence_marker(omitted_bytes, omitted_lines, lagged_chunks, recovery_detail);
     for _ in 0..8 {
         let data_budget = cap.saturating_sub(marker.len());
         let stabilized_omitted =
             recorded_omitted_bytes.saturating_add(data.len().saturating_sub(data_budget));
-        let stabilized_marker =
-            output_evidence_marker(stabilized_omitted, lagged_chunks, recovery_detail);
-        if stabilized_omitted == omitted_bytes && stabilized_marker.len() == marker.len() {
+        let retained_head = data.len().min(data_budget / 2);
+        let retained_tail = data
+            .len()
+            .saturating_sub(retained_head)
+            .min(data_budget.saturating_sub(data_budget / 2));
+        let omitted_end = data.len().saturating_sub(retained_tail);
+        let stabilized_omitted_lines = recorded_omitted_lines.saturating_add(count_line_breaks(
+            &data[retained_head.min(omitted_end)..omitted_end],
+        ));
+        let stabilized_marker = output_evidence_marker(
+            stabilized_omitted,
+            stabilized_omitted_lines,
+            lagged_chunks,
+            recovery_detail,
+        );
+        if stabilized_omitted == omitted_bytes
+            && stabilized_omitted_lines == omitted_lines
+            && stabilized_marker.len() == marker.len()
+        {
             marker = stabilized_marker;
             break;
         }
         omitted_bytes = stabilized_omitted;
+        omitted_lines = stabilized_omitted_lines;
         marker = stabilized_marker;
     }
 
@@ -402,12 +470,13 @@ fn render_capped_output(
 
 fn output_evidence_marker(
     omitted_bytes: usize,
+    omitted_lines: usize,
     lagged_chunks: u64,
     recovery_detail: Option<&str>,
 ) -> Vec<u8> {
     let mut marker = match (omitted_bytes, lagged_chunks, recovery_detail) {
         (omitted_bytes, 0, None) => format!(
-            "\n[output truncated: {omitted_bytes} byte(s) omitted from the middle by the output retention limit]\n"
+            "\n[output truncated: {omitted_bytes} byte(s) and {omitted_lines} line break(s) omitted]\n"
         ),
         (0, lagged_chunks, None) => format!(
             "\n[output unavailable: streaming receiver lagged by {lagged_chunks} chunk(s)]\n"
@@ -416,7 +485,7 @@ fn output_evidence_marker(
             let mut details = Vec::new();
             if omitted_bytes > 0 {
                 details.push(format!(
-                    "{omitted_bytes} byte(s) omitted from the middle by the output retention limit"
+                    "{omitted_bytes} byte(s) and {omitted_lines} line break(s) omitted from the middle by the output retention limit"
                 ));
             }
             if lagged_chunks > 0 {
@@ -432,9 +501,16 @@ fn output_evidence_marker(
     }
     .into_bytes();
     if marker.len() > OUTPUT_EVIDENCE_MARKER_MAX_BYTES {
-        marker = b"\n[output incomplete]\n".to_vec();
+        marker = format!(
+            "\n[output incomplete: {omitted_bytes} byte(s) and {omitted_lines} line break(s) omitted; {lagged_chunks} streaming chunk(s) unavailable]\n"
+        )
+        .into_bytes();
     }
     marker
+}
+
+fn count_line_breaks(bytes: &[u8]) -> usize {
+    bytes.iter().filter(|byte| **byte == b'\n').count()
 }
 
 #[cfg(test)]

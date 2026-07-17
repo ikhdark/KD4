@@ -754,6 +754,27 @@ async fn skills_extra_roots_set_updates_process_runtime_roots() -> Result<()> {
     let _: SkillsExtraRootsSetResponse = to_response(set_response)?;
     expect_skills_changed_notification(&mut mcp, DEFAULT_TIMEOUT).await?;
 
+    let duplicate_request_id = mcp
+        .send_skills_extra_roots_set_request(SkillsExtraRootsSetParams {
+            extra_roots: vec![AbsolutePathBuf::from_absolute_path(&extra_skills_root)?],
+        })
+        .await?;
+    let duplicate_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(duplicate_request_id)),
+    )
+    .await??;
+    let _: SkillsExtraRootsSetResponse = to_response(duplicate_response)?;
+    assert!(
+        timeout(
+            Duration::from_millis(250),
+            mcp.read_stream_until_notification_message("skills/changed"),
+        )
+        .await
+        .is_err(),
+        "identical ordered roots must not emit skills/changed"
+    );
+
     let skills_request_id = mcp
         .send_skills_list_request(SkillsListParams {
             cwds: vec![cwd.path().to_path_buf()],

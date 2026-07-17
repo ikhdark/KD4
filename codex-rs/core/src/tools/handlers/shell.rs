@@ -16,7 +16,9 @@ use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::context::FunctionToolOutput;
+use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use crate::tools::context::boxed_tool_output;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
@@ -85,14 +87,14 @@ pub(super) struct RunExecLikeArgs {
 }
 
 pub(super) struct RunExecLikeResult {
-    pub(super) output: FunctionToolOutput,
+    pub(super) output: Box<dyn ToolOutput>,
     pub(super) exit_code: Option<i32>,
     pub(super) exec_output: Option<ExecToolCallOutput>,
 }
 
 pub(super) async fn run_exec_like(
     args: RunExecLikeArgs,
-) -> Result<FunctionToolOutput, FunctionCallError> {
+) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
     Ok(run_exec_like_with_exit_code(args).await?.output)
 }
 
@@ -235,16 +237,17 @@ pub(super) async fn run_exec_like_with_exit_code(
         }
     };
     if let Some(output) = intercepted {
+        let success = output.success_for_logging();
         if let Some(attempt_key) = attempt_key.as_ref() {
             session
                 .services
                 .command_execution
-                .record_exit(attempt_key, 0)
+                .record_exit(attempt_key, if success { 0 } else { -1 })
                 .await;
         }
         return Ok(RunExecLikeResult {
-            output,
-            exit_code: Some(0),
+            output: boxed_tool_output(output),
+            exit_code: Some(if success { 0 } else { -1 }),
             exec_output: None,
         });
     }
@@ -385,13 +388,13 @@ pub(super) async fn run_exec_like_with_exit_code(
         insert_metadata_before_output(&mut content, &raw_output_artifact.render_for_model());
     }
     Ok(RunExecLikeResult {
-        output: FunctionToolOutput {
+        output: boxed_tool_output(FunctionToolOutput {
             body: vec![
                 codex_protocol::models::FunctionCallOutputContentItem::InputText { text: content },
             ],
             success: Some(true),
             post_tool_use_response,
-        },
+        }),
         exit_code,
         exec_output,
     })

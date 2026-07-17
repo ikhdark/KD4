@@ -490,7 +490,7 @@ async fn resolve_initial_model(
         // match. Prefix/suffix metadata inference is not sufficient here because it can hide
         // unknown or provider-mismatched model IDs that still need online validation.
         let available_models = models_manager
-            .list_models(RefreshStrategy::Offline, config.http_client_factory())
+            .list_models_snapshot(RefreshStrategy::Offline, config.http_client_factory())
             .await;
         if available_models
             .iter()
@@ -505,7 +505,7 @@ async fn resolve_initial_model(
             let http_client_factory = config.http_client_factory();
             tokio::spawn(async move {
                 let _ = models_manager
-                    .list_models(RefreshStrategy::OnlineIfUncached, http_client_factory)
+                    .list_models_snapshot(RefreshStrategy::OnlineIfUncached, http_client_factory)
                     .await;
             });
             return (requested_model.clone(), model_info);
@@ -514,7 +514,7 @@ async fn resolve_initial_model(
 
     if config.model.is_none() || !matches!(refresh_strategy, RefreshStrategy::Offline) {
         let _ = models_manager
-            .list_models(refresh_strategy, config.http_client_factory())
+            .list_models_snapshot(refresh_strategy, config.http_client_factory())
             .await;
     }
     let model = models_manager
@@ -1679,29 +1679,55 @@ impl Session {
     }
 
     pub(crate) async fn refresh_runtime_config(&self, next_config: Config) {
+        self.refresh_runtime_config_inner(Arc::new(next_config), /*invalidate_shared_caches*/ true)
+            .await;
+    }
+
+    pub(crate) async fn refresh_runtime_config_from_process_reload(
+        &self,
+        next_config: Arc<Config>,
+    ) -> bool {
+        self.refresh_runtime_config_inner(next_config, /*invalidate_shared_caches*/ false)
+            .await
+    }
+
+    async fn refresh_runtime_config_inner(
+        &self,
+        next_config: Arc<Config>,
+        invalidate_shared_caches: bool,
+    ) -> bool {
         // Refresh only the user layer from the incoming snapshot. Preserve thread-local
         // layers such as request/session overrides that were present when this session
         // was created.
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
-        let (previous_config, new_config, config) = {
+        let refresh = {
             let mut state = self.state.lock().await;
-            let previous_config = notify_config_contributors
-                .then(|| Self::build_effective_session_config(&state.session_configuration));
             let mut config = (*state.session_configuration.original_config_do_not_use).clone();
             config.config_layer_stack = config
                 .config_layer_stack
                 .with_user_layer_from(&next_config.config_layer_stack);
             config.tool_suggest =
                 resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
-            let config = Arc::new(config);
-            state.session_configuration.original_config_do_not_use = Arc::clone(&config);
-            let new_config = notify_config_contributors
-                .then(|| Self::build_effective_session_config(&state.session_configuration));
-            (previous_config, new_config, config)
+            if config == *state.session_configuration.original_config_do_not_use {
+                None
+            } else {
+                let previous_config = notify_config_contributors
+                    .then(|| Self::build_effective_session_config(&state.session_configuration));
+                let config = Arc::new(config);
+                state.session_configuration.original_config_do_not_use = Arc::clone(&config);
+                let new_config = notify_config_contributors
+                    .then(|| Self::build_effective_session_config(&state.session_configuration));
+                Some((previous_config, new_config, config))
+            }
+        };
+        let Some((previous_config, new_config, config)) = refresh else {
+            return false;
         };
         self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
-        self.services.skills_service.clear_cache();
-        self.services.plugins_manager.clear_cache();
+        if invalidate_shared_caches {
+            self.services.skills_service.clear_cache();
+            self.services.plugins_manager.clear_cache();
+        }
         let environments = self.services.turn_environments.snapshot().await;
         let hooks = build_hooks_for_config(
             config.as_ref(),
@@ -1719,6 +1745,7 @@ impl Session {
         ) {
             self.services.hooks.store(Arc::new(hooks));
         }
+        true
     }
 
     fn emit_config_changed_contributors(
@@ -2443,7 +2470,8 @@ impl Session {
                 /*retry_reason*/ None,
                 codex_analytics::GuardianApprovalRequestSource::MainTurn,
                 cancellation_token.clone(),
-            );
+            )
+            .await;
             let decision = tokio::select! {
                 biased;
                 _ = cancellation_token.cancelled() => return None,
@@ -3632,6 +3660,19 @@ impl Session {
     pub(crate) async fn clone_history(&self) -> ContextManager {
         let state = self.state.lock().await;
         state.clone_history()
+    }
+
+    pub(crate) async fn prompt_history_snapshot(
+        &self,
+        input_modalities: &[codex_protocol::openai_models::InputModality],
+    ) -> crate::context_manager::PromptHistorySnapshot {
+        let mut state = self.state.lock().await;
+        state.history.prompt_snapshot(input_modalities)
+    }
+
+    pub(crate) async fn history_mutation_revision(&self) -> u64 {
+        let state = self.state.lock().await;
+        state.history.mutation_revision()
     }
 
     pub(crate) async fn current_window_id(&self) -> String {

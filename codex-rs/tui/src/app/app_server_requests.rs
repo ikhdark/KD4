@@ -488,17 +488,31 @@ mod tests {
 
         assert_eq!(pending.note_server_request(&request), None);
 
+        let op = Op::ExecApproval {
+            id: "approval-1".to_string(),
+            turn_id: None,
+            decision: CommandExecutionApprovalDecision::Accept,
+        };
+        let preview = pending
+            .resolution(&op)
+            .expect("resolution preview should serialize")
+            .expect("request should remain pending while delivery is attempted");
+        assert_eq!(preview.request_id, AppServerRequestId::Integer(41));
+
         let resolution = pending
-            .take_resolution(&Op::ExecApproval {
-                id: "approval-1".to_string(),
-                turn_id: None,
-                decision: CommandExecutionApprovalDecision::Accept,
-            })
+            .take_resolution(&op)
             .expect("resolution should serialize")
             .expect("request should be pending");
 
         assert_eq!(resolution.request_id, AppServerRequestId::Integer(41));
         assert_eq!(resolution.result, json!({ "decision": "accept" }));
+        assert_eq!(
+            pending
+                .take_resolution(&op)
+                .expect("second resolution should serialize"),
+            None,
+            "request should be removed only by the explicit commit"
+        );
     }
 
     #[test]

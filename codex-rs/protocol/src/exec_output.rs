@@ -42,6 +42,8 @@ pub struct ExecToolCallOutput {
     pub stdout: StreamOutput<String>,
     pub stderr: StreamOutput<String>,
     pub aggregated_output: StreamOutput<String>,
+    /// Exact aggregate process bytes before encoding detection or lossy decoding.
+    pub aggregated_output_bytes: Option<Vec<u8>>,
     pub duration: Duration,
     pub timed_out: bool,
 }
@@ -53,6 +55,7 @@ impl Default for ExecToolCallOutput {
             stdout: StreamOutput::new(String::new()),
             stderr: StreamOutput::new(String::new()),
             aggregated_output: StreamOutput::new(String::new()),
+            aggregated_output_bytes: None,
             duration: Duration::ZERO,
             timed_out: false,
         }

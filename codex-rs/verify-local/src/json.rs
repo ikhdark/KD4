@@ -220,7 +220,7 @@ fn legacy_result(
         })
         .transpose()?
         .unwrap_or_default();
-    Ok(LegacyValue::Object(vec![
+    let mut fields = vec![
         string_field("id", &result.raw.command_id),
         ("command".to_string(), LegacyValue::Array(command)),
         string_field("status", result.status.as_str()),
@@ -258,7 +258,39 @@ fn legacy_result(
                 .map(|value| LegacyValue::String(value.clone()))
                 .unwrap_or(LegacyValue::Null),
         ),
-    ]))
+    ];
+    if let Some(artifact) = &result.raw.exact_output_artifact {
+        fields.push((
+            "exact_output_artifact".to_string(),
+            LegacyValue::Object(vec![
+                string_field("sha256", &artifact.sha256),
+                (
+                    "path".to_string(),
+                    LegacyValue::String(artifact.path.to_string_lossy().into_owned()),
+                ),
+                (
+                    "bytes".to_string(),
+                    LegacyValue::Number(artifact.bytes.to_string()),
+                ),
+            ]),
+        ));
+    }
+    if let Some(omission) = result.raw.diagnostic_omission {
+        fields.push((
+            "diagnostic_omission".to_string(),
+            LegacyValue::Object(vec![
+                (
+                    "bytes".to_string(),
+                    LegacyValue::Number(omission.bytes.to_string()),
+                ),
+                (
+                    "lines".to_string(),
+                    LegacyValue::Number(omission.lines.to_string()),
+                ),
+            ]),
+        ));
+    }
+    Ok(LegacyValue::Object(fields))
 }
 
 pub fn render_human(finalized: &FinalizedVerification) -> String {

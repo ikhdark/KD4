@@ -10,6 +10,7 @@ use super::UserInput;
 use super::shared::v2_enum_from_core;
 use crate::protocol::item_builders::command_actions_for_path_uri;
 use crate::protocol::item_builders::command_display_string;
+use crate::protocol::item_builders::convert_ordered_patch_changes;
 use crate::protocol::item_builders::convert_patch_changes;
 use crate::protocol::item_builders::review_output_text;
 use codex_experimental_api_macros::ExperimentalApi;
@@ -932,15 +933,22 @@ impl From<CoreTurnItem> for ThreadItem {
                 id: review.id,
                 review: review_output_text(review.review_output.as_ref()),
             },
-            CoreTurnItem::FileChange(file_change) => ThreadItem::FileChange {
-                id: file_change.id,
-                changes: convert_patch_changes(&file_change.changes),
-                status: file_change
-                    .status
-                    .as_ref()
-                    .map(PatchApplyStatus::from)
-                    .unwrap_or(PatchApplyStatus::InProgress),
-            },
+            CoreTurnItem::FileChange(file_change) => {
+                let changes = file_change
+                    .ordered_changes
+                    .as_deref()
+                    .map(convert_ordered_patch_changes)
+                    .unwrap_or_else(|| convert_patch_changes(&file_change.changes));
+                ThreadItem::FileChange {
+                    id: file_change.id,
+                    changes,
+                    status: file_change
+                        .status
+                        .as_ref()
+                        .map(PatchApplyStatus::from)
+                        .unwrap_or(PatchApplyStatus::InProgress),
+                }
+            }
             CoreTurnItem::McpToolCall(mcp) => {
                 let duration_ms = mcp
                     .duration

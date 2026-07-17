@@ -48,7 +48,120 @@ fn structured_process_output(stdout: String, stderr: &str, exit_code: i32) -> Ex
     output.stdout.text = stdout.clone();
     output.stderr.text = stderr.to_string();
     output.aggregated_output.text = format!("{stdout}{stderr}");
+    output.aggregated_output_bytes = Some(output.aggregated_output.text.as_bytes().to_vec());
     output
+}
+
+#[tokio::test]
+async fn command_result_keeps_tail_failure_and_binds_exact_content_addressed_output() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let plan = codex_verify_local::PlanEnvelopeV2::new(PlanMode::Fast, "invocation");
+    let command = codex_verify_local::CommandSpecV2 {
+        id: "core-tests".to_string(),
+        kind: "owner_test".to_string(),
+        args: vec![codex_verify_local::CommandArgV2::text("cargo test")],
+        cwd: RawPath::from_utf8("."),
+        timeout_ms: 1_000,
+        owner_packages: vec!["codex-core".to_string()],
+        hash_paths: Vec::new(),
+        reason: "test".to_string(),
+    };
+    let mut lines = (0..9_000)
+        .map(|index| format!("ordinary diagnostic line {index}"))
+        .collect::<Vec<_>>();
+    lines.push("error: decisive tail failure".to_string());
+    let exact = lines.join("\n");
+    assert!(exact.len() > 64 * 1024);
+    let output = structured_process_output(exact.clone(), "", 101);
+
+    let result = command_result_from_core_execution(
+        &plan,
+        &command,
+        0,
+        "nonce".to_string(),
+        Some(&output),
+        Some(101),
+        temp.path(),
+        "thread/verify-local",
+        "cargo test -p codex-core",
+    )
+    .await;
+
+    assert!(result.diagnostic.contains("error: decisive tail failure"));
+    assert!(result.diagnostic.contains("Exact output: sha256:"));
+    let artifact = result
+        .exact_output_artifact
+        .as_ref()
+        .expect("exact artifact");
+    assert_eq!(artifact.sha256, output_sha256(exact.as_bytes()));
+    assert!(
+        artifact
+            .path
+            .ends_with(format!("sha256-{}.log", artifact.sha256))
+    );
+    assert_eq!(
+        tokio::fs::read(&artifact.path)
+            .await
+            .expect("artifact bytes"),
+        exact.as_bytes()
+    );
+    assert_eq!(result.log_path.as_ref(), Some(&artifact.path));
+    let omission = result
+        .diagnostic_omission
+        .expect("bounded preview omission");
+    assert!(omission.bytes > 0);
+    assert!(omission.lines > 0);
+
+    let finalized = finalize_plan(plan, vec![result]);
+    let contract = serialize_legacy_v1(&finalized, /*crlf*/ false).expect("contract bytes");
+    let contract: serde_json::Value = serde_json::from_slice(&contract).expect("contract json");
+    let receipt_artifact = &contract["results"][0]["exact_output_artifact"];
+    assert_eq!(receipt_artifact["sha256"], output_sha256(exact.as_bytes()));
+    let receipt_path = receipt_artifact["path"].as_str().expect("artifact handle");
+    let reread = tokio::fs::read_to_string(receipt_path)
+        .await
+        .expect("reread exact output from contract handle");
+    assert!(reread.ends_with("error: decisive tail failure"));
+    assert_eq!(output_sha256(reread.as_bytes()), receipt_artifact["sha256"]);
+}
+
+#[tokio::test]
+async fn command_result_artifact_preserves_non_utf8_process_bytes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let plan = codex_verify_local::PlanEnvelopeV2::new(PlanMode::Fast, "invocation");
+    let command = codex_verify_local::CommandSpecV2 {
+        id: "binary-output".to_string(),
+        kind: "owner_test".to_string(),
+        args: vec![codex_verify_local::CommandArgV2::text("binary verifier")],
+        cwd: RawPath::from_utf8("."),
+        timeout_ms: 1_000,
+        owner_packages: vec!["codex-core".to_string()],
+        hash_paths: Vec::new(),
+        reason: "test".to_string(),
+    };
+    let exact = vec![0xff, 0xfe, b'e', b'r', b'r', b'o', b'r', b'\n'];
+    let mut output = structured_process_output("��error\n".to_string(), "", 1);
+    output.aggregated_output_bytes = Some(exact.clone());
+
+    let result = command_result_from_core_execution(
+        &plan,
+        &command,
+        0,
+        "nonce".to_string(),
+        Some(&output),
+        Some(1),
+        temp.path(),
+        "thread/verify-local-binary",
+        "binary verifier",
+    )
+    .await;
+
+    let artifact = result.exact_output_artifact.expect("exact artifact");
+    assert_eq!(artifact.sha256, output_sha256(&exact));
+    assert_eq!(
+        tokio::fs::read(artifact.path).await.expect("artifact"),
+        exact
+    );
 }
 
 #[test]

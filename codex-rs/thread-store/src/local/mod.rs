@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::AppendThreadItemsParams;
+use crate::AppendThreadItemsReceipt;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
@@ -259,7 +260,7 @@ impl ThreadStore for LocalThreadStore {
         &'a self,
         thread_id: ThreadId,
         items: &'a [RolloutItem],
-    ) -> ThreadStoreFuture<'a, ()> {
+    ) -> ThreadStoreFuture<'a, AppendThreadItemsReceipt> {
         Box::pin(async move { live_writer::append_persisted_items(self, thread_id, items).await })
     }
 
@@ -487,6 +488,44 @@ mod tests {
         );
         assert_eq!(metadata.preview.as_deref(), Some("observed append"));
         assert_eq!(metadata.title, "observed append");
+    }
+
+    #[tokio::test]
+    async fn sqlite_metadata_never_precedes_jsonl_append_receipt() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            config.sqlite_home.clone(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
+        let thread_id = ThreadId::default();
+        let live_thread = LiveThread::create(store, create_thread_params(thread_id))
+            .await
+            .expect("create live thread");
+        let rollout_path = live_thread
+            .local_rollout_path()
+            .await
+            .expect("rollout path lookup")
+            .expect("local rollout path");
+
+        live_thread
+            .append_items(&[user_message_item("receipt ordered")])
+            .await
+            .expect("append receipt and metadata update");
+
+        let jsonl = tokio::fs::read_to_string(&rollout_path)
+            .await
+            .expect("receipt must make JSONL readable without a durability barrier");
+        assert!(jsonl.contains("receipt ordered"));
+        let metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("sqlite metadata read")
+            .expect("sqlite metadata");
+        assert_eq!(metadata.preview.as_deref(), Some("receipt ordered"));
     }
 
     #[tokio::test]

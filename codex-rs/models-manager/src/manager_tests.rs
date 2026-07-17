@@ -20,7 +20,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tempfile::tempdir;
+use tokio::sync::Semaphore;
 
 #[path = "model_info_overrides_tests.rs"]
 mod model_info_overrides_tests;
@@ -185,6 +187,73 @@ impl ModelsEndpointClient for TestModelsEndpoint {
     }
 }
 
+#[derive(Debug)]
+struct BlockingEtagModelsEndpoint {
+    responses: Mutex<VecDeque<(Vec<ModelInfo>, Option<String>)>>,
+    fetch_count: AtomicUsize,
+    started: Semaphore,
+    release: Semaphore,
+}
+
+impl BlockingEtagModelsEndpoint {
+    fn new(responses: Vec<(Vec<ModelInfo>, Option<String>)>) -> Arc<Self> {
+        Arc::new(Self {
+            responses: Mutex::new(responses.into()),
+            fetch_count: AtomicUsize::new(0),
+            started: Semaphore::new(0),
+            release: Semaphore::new(0),
+        })
+    }
+
+    async fn wait_started(&self) {
+        tokio::time::timeout(Duration::from_secs(1), self.started.acquire())
+            .await
+            .expect("model refresh should start")
+            .expect("started semaphore should remain open")
+            .forget();
+    }
+
+    fn release_one(&self) {
+        self.release.add_permits(1);
+    }
+
+    fn fetch_count(&self) -> usize {
+        self.fetch_count.load(Ordering::SeqCst)
+    }
+}
+
+impl ModelsEndpointClient for BlockingEtagModelsEndpoint {
+    fn has_command_auth(&self) -> bool {
+        false
+    }
+
+    fn uses_codex_backend(&self) -> ModelsEndpointFuture<'_, bool> {
+        Box::pin(async { true })
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        _client_version: &'a str,
+        _http_client_factory: HttpClientFactory,
+    ) -> ModelsEndpointFuture<'a, CoreResult<(Vec<ModelInfo>, Option<String>)>> {
+        Box::pin(async move {
+            self.fetch_count.fetch_add(1, Ordering::SeqCst);
+            self.started.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("release semaphore should remain open")
+                .forget();
+            Ok(self
+                .responses
+                .lock()
+                .expect("responses lock should not be poisoned")
+                .pop_front()
+                .expect("blocking endpoint should have a response"))
+        })
+    }
+}
+
 fn openai_manager_for_tests(
     codex_home: std::path::PathBuf,
     endpoint_client: Arc<dyn ModelsEndpointClient>,
@@ -331,6 +400,55 @@ async fn static_manager_uses_empty_default_when_fallback_is_allowed_and_catalog_
         .await;
 
     assert_eq!(model, "");
+}
+
+#[tokio::test]
+async fn stable_catalog_reads_share_indexed_picker_snapshot() {
+    let expected = remote_model("shared-model", "Shared Model", 0);
+    let manager = static_manager_for_tests(ModelsResponse {
+        models: vec![expected.clone()],
+    });
+
+    let first = manager
+        .list_models_snapshot(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    let second = manager
+        .list_models_snapshot(RefreshStrategy::Offline, DEFAULT_HTTP_CLIENT_FACTORY)
+        .await;
+    assert!(Arc::ptr_eq(&first, &second));
+
+    let catalog = manager.current_catalog_snapshot().await;
+    assert_eq!(catalog.generation(), 0);
+    assert_eq!(catalog.models(), &[expected]);
+    let resolved = catalog.model_info("shared-model", &ModelsManagerConfig::default());
+    assert_eq!(resolved.slug, "shared-model");
+    assert!(!resolved.used_fallback_model_metadata);
+}
+
+#[tokio::test]
+async fn identical_catalog_publication_preserves_snapshot_identity() {
+    let codex_home = tempdir().expect("temporary CODEX_HOME");
+    let manager = OpenAiModelsManager::new(
+        codex_home.path().to_path_buf(),
+        TestModelsEndpoint::new(Vec::new()),
+        None,
+    );
+    let before = manager.current_catalog_snapshot().await;
+
+    let same = manager
+        .publish_catalog(before.models().to_vec(), before.etag.clone())
+        .await;
+    assert!(Arc::ptr_eq(&before, &same));
+    assert_eq!(same.generation(), before.generation());
+
+    let changed = manager
+        .publish_catalog(
+            vec![remote_model("new-generation", "New Generation", 0)],
+            Some("new-etag".to_string()),
+        )
+        .await;
+    assert!(!Arc::ptr_eq(&same, &changed));
+    assert!(changed.generation() > same.generation());
 }
 
 #[tokio::test]
@@ -1110,6 +1228,144 @@ async fn static_manager_reads_latest_auth_mode() {
             .collect::<Vec<_>>(),
         vec!["api-model"]
     );
+}
+
+#[tokio::test]
+async fn repeated_etags_coalesce_without_blocking_catalog_event_handling() {
+    let codex_home = tempdir().expect("temporary CODEX_HOME");
+    let refreshed_model = remote_model("etag-refreshed", "ETag Refreshed", 0);
+    let endpoint = BlockingEtagModelsEndpoint::new(vec![(
+        vec![refreshed_model.clone()],
+        Some("etag-1".to_string()),
+    )]);
+    let manager = Arc::new(OpenAiModelsManager::new(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        None,
+    ));
+
+    Arc::clone(&manager)
+        .enqueue_refresh_if_new_etag("etag-1".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    endpoint.wait_started().await;
+    Arc::clone(&manager)
+        .enqueue_refresh_if_new_etag("etag-1".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+
+    let reader = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.get_remote_models().await })
+    };
+    tokio::task::yield_now().await;
+    assert!(
+        !reader.is_finished(),
+        "catalog reads after an ETag event should wait, while the enqueue itself returns"
+    );
+
+    endpoint.release_one();
+    manager.refresh_barrier().await;
+    let models = tokio::time::timeout(Duration::from_secs(1), reader)
+        .await
+        .expect("catalog reader should finish after refresh publication")
+        .expect("catalog reader should not panic");
+
+    assert_eq!(endpoint.fetch_count(), 1);
+    assert_models_contain(&models, &[refreshed_model]);
+    let catalog = manager.catalog.read().await;
+    assert_eq!(catalog.etag(), Some("etag-1"));
+    assert_models_contain(catalog.models(), &models);
+}
+
+#[tokio::test]
+async fn readers_wait_for_latest_coalesced_generation_and_atomic_catalog_publication() {
+    let codex_home = tempdir().expect("temporary CODEX_HOME");
+    let first_model = remote_model("etag-first", "ETag First", 0);
+    let latest_model = remote_model("etag-latest", "ETag Latest", 0);
+    let endpoint = BlockingEtagModelsEndpoint::new(vec![
+        (vec![first_model], Some("etag-first".to_string())),
+        (
+            vec![latest_model.clone()],
+            Some("etag-latest".to_string()),
+        ),
+    ]);
+    let manager = Arc::new(OpenAiModelsManager::new(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        None,
+    ));
+
+    Arc::clone(&manager)
+        .enqueue_refresh_if_new_etag("etag-first".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    endpoint.wait_started().await;
+    Arc::clone(&manager)
+        .enqueue_refresh_if_new_etag("etag-superseded".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    Arc::clone(&manager)
+        .enqueue_refresh_if_new_etag("etag-latest".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+
+    let reader = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.get_remote_models().await })
+    };
+    endpoint.release_one();
+    endpoint.wait_started().await;
+    tokio::task::yield_now().await;
+    assert!(
+        !reader.is_finished(),
+        "publishing an older generation must not release a reader waiting for the latest one"
+    );
+
+    endpoint.release_one();
+    let models = tokio::time::timeout(Duration::from_secs(1), reader)
+        .await
+        .expect("catalog reader should finish after latest refresh publication")
+        .expect("catalog reader should not panic");
+
+    assert_eq!(endpoint.fetch_count(), 2);
+    assert_models_contain(&models, &[latest_model]);
+    let catalog = manager.catalog.read().await;
+    assert_eq!(catalog.etag(), Some("etag-latest"));
+    assert_eq!(catalog.models(), models);
+}
+
+#[tokio::test]
+async fn latest_etag_matching_active_refresh_supersedes_stale_pending_refresh() {
+    let codex_home = tempdir().expect("temporary CODEX_HOME");
+    let active_model = remote_model("etag-active", "ETag Active", 0);
+    let endpoint = BlockingEtagModelsEndpoint::new(vec![(
+        vec![active_model.clone()],
+        Some("etag-active".to_string()),
+    )]);
+    let manager = Arc::new(OpenAiModelsManager::new(
+        codex_home.path().to_path_buf(),
+        endpoint.clone(),
+        None,
+    ));
+
+    Arc::clone(&manager)
+        .enqueue_refresh_if_new_etag("etag-active".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    endpoint.wait_started().await;
+    Arc::clone(&manager)
+        .enqueue_refresh_if_new_etag("etag-stale".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+    Arc::clone(&manager)
+        .enqueue_refresh_if_new_etag("etag-active".to_string(), DEFAULT_HTTP_CLIENT_FACTORY);
+
+    let reader = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.get_remote_models().await })
+    };
+    endpoint.release_one();
+    let models = tokio::time::timeout(Duration::from_secs(1), reader)
+        .await
+        .expect("catalog reader should finish after active ETag is restored as latest")
+        .expect("catalog reader should not panic");
+
+    assert_eq!(
+        endpoint.fetch_count(),
+        1,
+        "the stale pending ETag must not trigger a second model fetch"
+    );
+    assert_models_contain(&models, &[active_model]);
+    let catalog = manager.catalog.read().await;
+    assert_eq!(catalog.etag(), Some("etag-active"));
+    assert_eq!(catalog.models(), models);
 }
 
 #[test]

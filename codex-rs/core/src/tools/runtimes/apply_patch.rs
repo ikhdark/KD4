@@ -242,15 +242,15 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let result = codex_apply_patch::apply_patch(
-            &req.action.patch,
-            &req.action.cwd,
+        let result = codex_apply_patch::apply_patch_action(
+            &req.action,
             &mut stdout,
             &mut stderr,
             fs.as_ref(),
             sandbox.as_ref(),
         )
         .await;
+        let aggregated_output_bytes = [stdout.as_slice(), stderr.as_slice()].concat();
         let stdout = String::from_utf8_lossy(&stdout).into_owned();
         let stderr = String::from_utf8_lossy(&stderr).into_owned();
         let failed = result.is_err();
@@ -265,6 +265,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             stdout: StreamOutput::new(stdout.clone()),
             stderr: StreamOutput::new(stderr.clone()),
             aggregated_output: StreamOutput::new(format!("{stdout}{stderr}")),
+            aggregated_output_bytes: Some(aggregated_output_bytes),
             duration: started_at.elapsed(),
             timed_out: false,
         };

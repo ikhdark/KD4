@@ -107,12 +107,14 @@ fn merge_skill_root_snapshots(snapshots: Vec<SkillRootSnapshot>) -> SkillLoadOut
     let mut skill_roots = Vec::new();
     let mut skill_root_by_path = HashMap::new();
     let mut file_systems_by_skill_path = HashMap::new();
+    let mut skill_bodies_by_path = HashMap::new();
 
     for snapshot in snapshots {
         let SkillRootSnapshot {
             root,
             skills,
             errors,
+            skill_bodies,
             file_system,
         } = snapshot;
         if !skills.is_empty() && !skill_roots.contains(&root) {
@@ -125,6 +127,9 @@ fn merge_skill_root_snapshots(snapshots: Vec<SkillRootSnapshot>) -> SkillLoadOut
             file_systems_by_skill_path
                 .entry(skill.path_to_skills_md.clone())
                 .or_insert_with(|| Arc::clone(&file_system));
+        }
+        for (path, contents) in skill_bodies {
+            skill_bodies_by_path.entry(path).or_insert(contents);
         }
         outcome.skills.extend(skills);
         outcome.errors.extend(errors);
@@ -143,9 +148,11 @@ fn merge_skill_root_snapshots(snapshots: Vec<SkillRootSnapshot>) -> SkillLoadOut
     let used_roots = skill_root_by_path.values().cloned().collect::<HashSet<_>>();
     skill_roots.retain(|root| used_roots.contains(root));
     file_systems_by_skill_path.retain(|path, _| retained_skill_paths.contains(path));
+    skill_bodies_by_path.retain(|path, _| retained_skill_paths.contains(path));
     outcome.skill_roots = skill_roots;
     outcome.skill_root_by_path = Arc::new(skill_root_by_path);
-    outcome.file_systems_by_skill_path = SkillFileSystemsByPath::new(file_systems_by_skill_path);
+    outcome.file_systems_by_skill_path =
+        SkillFileSystemsByPath::new(file_systems_by_skill_path, skill_bodies_by_path);
 
     outcome.skills.sort_by(|a, b| {
         scope_rank(a.scope)

@@ -1,4 +1,5 @@
 use crate::context_manager::truncate_function_output_payload;
+use crate::exec::ExecCommandOutcome;
 use crate::original_image_detail::sanitize_original_image_detail;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -8,7 +9,7 @@ use crate::tools::TELEMETRY_PREVIEW_MAX_LINES;
 use crate::tools::TELEMETRY_PREVIEW_TRUNCATION_NOTICE;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::shell_output_summary::ShellOutputSummaryOptions;
-use crate::tools::shell_output_summary::summarize_shell_output_for_model;
+use crate::tools::shell_output_summary::reduce_shell_output_for_model_with_budget;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::OutputBudgetClass;
 use crate::unified_exec::resolve_adaptive_max_tokens;
@@ -21,6 +22,7 @@ use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_tools::LoadableToolSpec;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Serialize;
@@ -242,11 +244,133 @@ impl ToolOutput for FunctionToolOutput {
 
 pub struct ApplyPatchToolOutput {
     pub text: String,
+    result: Option<JsonValue>,
+    success: bool,
 }
 
 impl ApplyPatchToolOutput {
     pub fn from_text(text: String) -> Self {
-        Self { text }
+        Self {
+            text,
+            result: None,
+            success: true,
+        }
+    }
+
+    pub fn from_execution(
+        text: String,
+        execution_succeeded: bool,
+        action: &codex_apply_patch::ApplyPatchAction,
+        delta: &codex_apply_patch::AppliedPatchDelta,
+    ) -> Self {
+        let status = apply_patch_status(execution_succeeded, delta.is_empty(), delta.is_exact());
+        let operations = action
+            .operations()
+            .iter()
+            .map(|operation| {
+                let (kind, move_path) = match operation.change() {
+                    codex_apply_patch::ApplyPatchFileChange::Add { .. } => ("add", None),
+                    codex_apply_patch::ApplyPatchFileChange::Delete { .. } => ("delete", None),
+                    codex_apply_patch::ApplyPatchFileChange::Update { move_path, .. } => (
+                        "update",
+                        move_path
+                            .as_ref()
+                            .map(codex_utils_path_uri::PathUri::inferred_native_path_string),
+                    ),
+                };
+                let destination_fingerprint = operation
+                    .move_destination()
+                    .map(|(_, fingerprint)| fingerprint.stable_id());
+                serde_json::json!({
+                    "path": operation.path().inferred_native_path_string(),
+                    "operation": kind,
+                    "move_path": move_path,
+                    "expected_old_fingerprint": operation.expected_old_fingerprint().stable_id(),
+                    "expected_move_destination_fingerprint": destination_fingerprint,
+                    "new_fingerprint": operation.new_fingerprint().stable_id(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let committed_delta = delta
+            .changes()
+            .iter()
+            .map(|change| match &change.change {
+                codex_apply_patch::AppliedPatchFileChange::Add {
+                    content,
+                    overwritten_content,
+                } => serde_json::json!({
+                    "path": change.path.display().to_string(),
+                    "operation": "add",
+                    "old_content": overwritten_content,
+                    "new_content": content,
+                    "old_fingerprint": codex_apply_patch::patch_content_fingerprint(
+                        overwritten_content.as_deref().map(str::as_bytes),
+                    ),
+                    "new_fingerprint": codex_apply_patch::patch_content_fingerprint(
+                        Some(content.as_bytes()),
+                    ),
+                }),
+                codex_apply_patch::AppliedPatchFileChange::Delete { content } => {
+                    serde_json::json!({
+                        "path": change.path.display().to_string(),
+                        "operation": "delete",
+                        "old_content": content,
+                        "new_content": JsonValue::Null,
+                        "old_fingerprint": codex_apply_patch::patch_content_fingerprint(
+                            Some(content.as_bytes()),
+                        ),
+                        "new_fingerprint": codex_apply_patch::patch_content_fingerprint(None),
+                    })
+                }
+                codex_apply_patch::AppliedPatchFileChange::Update {
+                    move_path,
+                    old_content,
+                    overwritten_move_content,
+                    new_content,
+                } => serde_json::json!({
+                    "path": change.path.display().to_string(),
+                    "operation": "update",
+                    "move_path": move_path.as_ref().map(|path| path.display().to_string()),
+                    "old_content": old_content,
+                    "overwritten_move_content": overwritten_move_content,
+                    "new_content": new_content,
+                    "old_fingerprint": codex_apply_patch::patch_content_fingerprint(
+                        Some(old_content.as_bytes()),
+                    ),
+                    "overwritten_move_fingerprint": codex_apply_patch::patch_content_fingerprint(
+                        overwritten_move_content.as_deref().map(str::as_bytes),
+                    ),
+                    "new_fingerprint": codex_apply_patch::patch_content_fingerprint(
+                        Some(new_content.as_bytes()),
+                    ),
+                }),
+            })
+            .collect::<Vec<_>>();
+        let result = serde_json::json!({
+            "status": status,
+            "exact": delta.is_exact(),
+            "operations": operations,
+            "committed_delta": committed_delta,
+            "summary": text,
+        });
+        Self {
+            text,
+            result: Some(result),
+            success: execution_succeeded,
+        }
+    }
+}
+
+fn apply_patch_status(
+    execution_succeeded: bool,
+    delta_is_empty: bool,
+    delta_is_exact: bool,
+) -> &'static str {
+    match (execution_succeeded, delta_is_empty, delta_is_exact) {
+        (true, true, true) => "no_op",
+        (true, _, _) => "completed",
+        (false, true, true) => "failed",
+        (false, _, _) => "partial",
     }
 }
 
@@ -256,7 +380,7 @@ impl ToolOutput for ApplyPatchToolOutput {
     }
 
     fn success_for_logging(&self) -> bool {
-        true
+        self.success
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -266,16 +390,22 @@ impl ToolOutput for ApplyPatchToolOutput {
             vec![FunctionCallOutputContentItem::InputText {
                 text: self.text.clone(),
             }],
-            Some(true),
+            Some(self.success),
         )
     }
 
     fn post_tool_use_response(&self, _call_id: &str, _payload: &ToolPayload) -> Option<JsonValue> {
-        Some(JsonValue::String(self.text.clone()))
+        Some(
+            self.result
+                .clone()
+                .unwrap_or_else(|| JsonValue::String(self.text.clone())),
+        )
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        JsonValue::Object(serde_json::Map::new())
+        self.result
+            .clone()
+            .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()))
     }
 }
 
@@ -333,6 +463,7 @@ pub struct ExecCommandToolOutput {
     pub max_output_tokens: Option<usize>,
     pub process_id: Option<i32>,
     pub exit_code: Option<i32>,
+    pub timed_out: bool,
     pub original_token_count: Option<usize>,
     pub hook_command: Option<String>,
     pub raw_output_artifact: Option<RawOutputArtifact>,
@@ -350,6 +481,7 @@ impl PartialEq for ExecCommandToolOutput {
             && self.max_output_tokens == other.max_output_tokens
             && self.process_id == other.process_id
             && self.exit_code == other.exit_code
+            && self.timed_out == other.timed_out
             && self.original_token_count == other.original_token_count
             && self.hook_command == other.hook_command
             && self.raw_output_artifact == other.raw_output_artifact
@@ -363,7 +495,7 @@ impl ToolOutput for ExecCommandToolOutput {
     }
 
     fn success_for_logging(&self) -> bool {
-        true
+        self.outcome().is_success()
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -373,7 +505,7 @@ impl ToolOutput for ExecCommandToolOutput {
             vec![FunctionCallOutputContentItem::InputText {
                 text: self.response_text().to_string(),
             }],
-            Some(true),
+            Some(self.outcome().is_success()),
         )
     }
 
@@ -402,9 +534,8 @@ impl ToolOutput for ExecCommandToolOutput {
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
         #[derive(Serialize)]
         struct UnifiedExecCodeModeResult {
-            #[serde(skip_serializing_if = "Option::is_none")]
-            chunk_id: Option<String>,
-            wall_time_seconds: f64,
+            outcome: ExecCommandOutcome,
+            timed_out: bool,
             #[serde(skip_serializing_if = "Option::is_none")]
             exit_code: Option<i32>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -444,8 +575,8 @@ impl ToolOutput for ExecCommandToolOutput {
             };
 
         let result = UnifiedExecCodeModeResult {
-            chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
-            wall_time_seconds: self.wall_time.as_secs_f64(),
+            outcome: self.outcome(),
+            timed_out: self.timed_out,
             exit_code: self.exit_code,
             session_id: self.process_id,
             original_token_count: self.original_token_count,
@@ -463,6 +594,16 @@ impl ToolOutput for ExecCommandToolOutput {
 }
 
 impl ExecCommandToolOutput {
+    pub(crate) fn outcome(&self) -> ExecCommandOutcome {
+        ExecCommandOutcome::from_process_facts(
+            self.process_id,
+            self.exit_code,
+            self.timed_out,
+            /*cancelled*/ false,
+            /*launch_failed*/ false,
+        )
+    }
+
     fn decoded_output(&self) -> &str {
         self.analysis
             .decoded_output
@@ -502,21 +643,19 @@ impl ExecCommandToolOutput {
     fn model_output(&self) -> &str {
         self.analysis.model_output.get_or_init(|| {
             let raw = self.decoded_output();
-            let summarized = summarize_shell_output_for_model(
+            let max_tokens = self.model_output_max_tokens();
+            let summarized = reduce_shell_output_for_model_with_budget(
                 raw,
                 self.exit_code.unwrap_or_default(),
-                /*timed_out*/ self.process_id.is_some(),
+                self.timed_out,
                 ShellOutputSummaryOptions {
                     enabled: true,
                     turn_cost_guard: false,
                     command_text: self.hook_command.as_deref(),
                 },
+                approx_bytes_for_tokens(max_tokens),
             );
-            let content = summarized.as_deref().unwrap_or(raw);
-            formatted_truncate_text(
-                content,
-                TruncationPolicy::Tokens(self.model_output_max_tokens()),
-            )
+            summarized.map_or_else(|| raw.to_string(), |reduction| reduction.summary)
         })
     }
 

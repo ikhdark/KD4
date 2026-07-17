@@ -74,10 +74,9 @@ pub(crate) struct TurnRequestProcessor {
     arg0_paths: Arg0DispatchPaths,
     config: Arc<Config>,
     config_manager: ConfigManager,
-    pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+    thread_lifecycle: Arc<ThreadLifecycleCoordinator>,
     thread_state_manager: ThreadStateManager,
     thread_watch_manager: ThreadWatchManager,
-    thread_list_state_permit: Arc<Semaphore>,
     skills_watcher: Arc<SkillsWatcher>,
 }
 
@@ -130,10 +129,9 @@ impl TurnRequestProcessor {
         arg0_paths: Arg0DispatchPaths,
         config: Arc<Config>,
         config_manager: ConfigManager,
-        pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
+        thread_lifecycle: Arc<ThreadLifecycleCoordinator>,
         thread_state_manager: ThreadStateManager,
         thread_watch_manager: ThreadWatchManager,
-        thread_list_state_permit: Arc<Semaphore>,
         skills_watcher: Arc<SkillsWatcher>,
     ) -> Self {
         Self {
@@ -144,10 +142,9 @@ impl TurnRequestProcessor {
             arg0_paths,
             config,
             config_manager,
-            pending_thread_unloads,
+            thread_lifecycle,
             thread_state_manager,
             thread_watch_manager,
-            thread_list_state_permit,
             skills_watcher,
         }
     }
@@ -1423,9 +1420,8 @@ impl TurnRequestProcessor {
             thread_manager: Arc::clone(&self.thread_manager),
             thread_state_manager: self.thread_state_manager.clone(),
             outgoing: Arc::clone(&self.outgoing),
-            pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
+            thread_lifecycle: Arc::clone(&self.thread_lifecycle),
             thread_watch_manager: self.thread_watch_manager.clone(),
-            thread_list_state_permit: self.thread_list_state_permit.clone(),
             fallback_model_provider: self.config.model_provider_id.clone(),
             codex_home: self.config.codex_home.to_path_buf(),
             skills_watcher: Arc::clone(&self.skills_watcher),

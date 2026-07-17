@@ -3,6 +3,7 @@ use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::InputModality;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -13,6 +14,197 @@ const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =
     "image content omitted because you do not support image input";
 // Changing this value would change model-visible IDs and invalidate prompt caches.
 const SYNTHETIC_OUTPUT_ID_NAMESPACE: Uuid = Uuid::from_u128(0x90d38d3e_6a5b_4d52_bfe2_2f1e634bfac4);
+
+/// Pairing metadata used to normalize an append-only history without rescanning
+/// every preceding item. Each raw item owns one normalized segment; appending a
+/// matching call or output only invalidates the counterpart segments returned by
+/// [`Self::affected_positions`].
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PromptNormalizationIndex {
+    function_calls: HashMap<String, Vec<usize>>,
+    local_shell_calls: HashMap<String, Vec<usize>>,
+    function_outputs: HashMap<String, Vec<usize>>,
+    tool_search_calls: HashMap<String, Vec<usize>>,
+    tool_search_outputs: HashMap<String, Vec<usize>>,
+    custom_tool_calls: HashMap<String, Vec<usize>>,
+    custom_tool_outputs: HashMap<String, Vec<usize>>,
+}
+
+impl PromptNormalizationIndex {
+    pub(crate) fn from_items(items: &[ResponseItem]) -> Self {
+        let mut index = Self::default();
+        for (position, item) in items.iter().enumerate() {
+            index.insert(position, item);
+        }
+        index
+    }
+
+    pub(crate) fn insert(&mut self, position: usize, item: &ResponseItem) {
+        let entry = match item {
+            ResponseItem::FunctionCall { call_id, .. } => {
+                Some((&mut self.function_calls, call_id))
+            }
+            ResponseItem::LocalShellCall {
+                call_id: Some(call_id),
+                ..
+            } => Some((&mut self.local_shell_calls, call_id)),
+            ResponseItem::FunctionCallOutput { call_id, .. } => {
+                Some((&mut self.function_outputs, call_id))
+            }
+            ResponseItem::ToolSearchCall {
+                call_id: Some(call_id),
+                ..
+            } => Some((&mut self.tool_search_calls, call_id)),
+            ResponseItem::ToolSearchOutput {
+                call_id: Some(call_id),
+                ..
+            } => Some((&mut self.tool_search_outputs, call_id)),
+            ResponseItem::CustomToolCall { call_id, .. } => {
+                Some((&mut self.custom_tool_calls, call_id))
+            }
+            ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                Some((&mut self.custom_tool_outputs, call_id))
+            }
+            _ => None,
+        };
+        if let Some((positions, call_id)) = entry {
+            positions.entry(call_id.clone()).or_default().push(position);
+        }
+    }
+
+    pub(crate) fn affected_positions(&self, item: &ResponseItem) -> Vec<usize> {
+        match item {
+            ResponseItem::FunctionCall { call_id, .. }
+            | ResponseItem::LocalShellCall {
+                call_id: Some(call_id),
+                ..
+            } => positions(&self.function_outputs, call_id),
+            ResponseItem::FunctionCallOutput { call_id, .. } => {
+                let mut affected = positions(&self.function_calls, call_id);
+                affected.extend(positions(&self.local_shell_calls, call_id));
+                affected
+            }
+            ResponseItem::ToolSearchCall {
+                call_id: Some(call_id),
+                ..
+            } => positions(&self.tool_search_outputs, call_id),
+            ResponseItem::ToolSearchOutput {
+                call_id: Some(call_id),
+                ..
+            } => positions(&self.tool_search_calls, call_id),
+            ResponseItem::CustomToolCall { call_id, .. } => {
+                positions(&self.custom_tool_outputs, call_id)
+            }
+            ResponseItem::CustomToolCallOutput { call_id, .. } => {
+                positions(&self.custom_tool_calls, call_id)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    pub(crate) fn normalize_segment(
+        &self,
+        item: &ResponseItem,
+        input_modalities: &[InputModality],
+    ) -> Vec<ResponseItem> {
+        let mut segment = match item {
+            ResponseItem::FunctionCall {
+                id,
+                call_id,
+                ..
+            } if !self.function_outputs.contains_key(call_id) => vec![
+                item.clone(),
+                ResponseItem::FunctionCallOutput {
+                    id: synthetic_output_id("fco", id.as_deref()),
+                    call_id: call_id.clone(),
+                    output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ],
+            ResponseItem::LocalShellCall {
+                id,
+                call_id: Some(call_id),
+                ..
+            } if !self.function_outputs.contains_key(call_id) => vec![
+                item.clone(),
+                ResponseItem::FunctionCallOutput {
+                    id: synthetic_output_id("fco", id.as_deref()),
+                    call_id: call_id.clone(),
+                    output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ],
+            ResponseItem::ToolSearchCall {
+                id,
+                call_id: Some(call_id),
+                ..
+            } if !self.tool_search_outputs.contains_key(call_id) => vec![
+                item.clone(),
+                ResponseItem::ToolSearchOutput {
+                    id: synthetic_output_id("tso", id.as_deref()),
+                    call_id: Some(call_id.clone()),
+                    status: "completed".to_string(),
+                    execution: "client".to_string(),
+                    tools: Vec::new(),
+                    internal_chat_message_metadata_passthrough: None,
+                },
+            ],
+            ResponseItem::CustomToolCall {
+                id,
+                call_id,
+                ..
+            } if !self.custom_tool_outputs.contains_key(call_id) => {
+                error_or_panic(format!(
+                    "Custom tool call output is missing for call id: {call_id}"
+                ));
+                vec![
+                    item.clone(),
+                    ResponseItem::CustomToolCallOutput {
+                        id: synthetic_output_id("ctco", id.as_deref()),
+                        call_id: call_id.clone(),
+                        name: None,
+                        output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                        internal_chat_message_metadata_passthrough: None,
+                    },
+                ]
+            }
+            ResponseItem::FunctionCallOutput { call_id, .. }
+                if !self.function_calls.contains_key(call_id)
+                    && !self.local_shell_calls.contains_key(call_id) =>
+            {
+                error_or_panic(format!(
+                    "Orphan function call output for call id: {call_id}"
+                ));
+                Vec::new()
+            }
+            ResponseItem::CustomToolCallOutput { call_id, .. }
+                if !self.custom_tool_calls.contains_key(call_id) =>
+            {
+                error_or_panic(format!(
+                    "Orphan custom tool call output for call id: {call_id}"
+                ));
+                Vec::new()
+            }
+            ResponseItem::ToolSearchOutput { execution, .. } if execution == "server" => {
+                vec![item.clone()]
+            }
+            ResponseItem::ToolSearchOutput {
+                call_id: Some(call_id),
+                ..
+            } if !self.tool_search_calls.contains_key(call_id) => {
+                error_or_panic(format!("Orphan tool search output for call id: {call_id}"));
+                Vec::new()
+            }
+            _ => vec![item.clone()],
+        };
+        strip_images_when_unsupported(input_modalities, &mut segment);
+        segment
+    }
+}
+
+fn positions(index: &HashMap<String, Vec<usize>>, call_id: &str) -> Vec<usize> {
+    index.get(call_id).cloned().unwrap_or_default()
+}
 
 pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
     let mut function_output_ids = HashSet::new();

@@ -19,6 +19,8 @@ fn result() -> CommandResultV2 {
         log_state: LogState::Complete,
         log_path: None,
         diagnostic: String::new(),
+        exact_output_artifact: None,
+        diagnostic_omission: None,
         cached: false,
         flaky: false,
         baseline: None,
@@ -49,6 +51,22 @@ fn exact_json_parser_rejects_trailing_suffix() {
     let mut bytes = serde_json::to_vec(&result()).expect("json");
     bytes.extend_from_slice(b"\n{}");
     assert!(parse_exact_json::<CommandResultV2>(&bytes).is_err());
+}
+
+#[test]
+fn prior_v2_result_without_artifact_fields_deserializes_with_none_defaults() {
+    let mut value = serde_json::to_value(result()).expect("result json");
+    let object = value.as_object_mut().expect("result object");
+    assert!(!object.contains_key("exact_output_artifact"));
+    assert!(!object.contains_key("diagnostic_omission"));
+    object.remove("exact_output_artifact");
+    object.remove("diagnostic_omission");
+
+    let parsed: CommandResultV2 =
+        serde_json::from_value(value).expect("backward-compatible result");
+
+    assert_eq!(parsed.exact_output_artifact, None);
+    assert_eq!(parsed.diagnostic_omission, None);
 }
 
 #[test]

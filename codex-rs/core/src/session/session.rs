@@ -40,6 +40,10 @@ pub(crate) struct Session {
     pub(super) features: ManagedFeatures,
     pub(super) multi_agent_version: OnceLock<MultiAgentVersion>,
     pub(super) pending_mcp_server_refresh_config: Mutex<Option<McpServerRefreshConfig>>,
+    pub(crate) delegated_mcp_tool_metadata:
+        Mutex<std::collections::VecDeque<(String, crate::mcp_tool_call::McpToolApprovalMetadata)>>,
+    pub(super) turn_config_snapshot_cache:
+        std::sync::Mutex<Option<super::turn_context::TurnConfigSnapshotCache>>,
     pub(crate) conversation: Arc<RealtimeConversationManager>,
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     /// Correlated pre-turn startup phases, frozen at the first model send.
@@ -48,6 +52,8 @@ pub(crate) struct Session {
     pub(crate) terminal_tasks: tokio_util::task::TaskTracker,
     /// Prevents terminal cleanup from waking queued work after shutdown begins.
     pub(crate) shutting_down: std::sync::atomic::AtomicBool,
+    /// Starts rollout compression only after this session begins real work.
+    pub(crate) rollout_compression_scheduled: std::sync::atomic::AtomicBool,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
     pub(crate) services: SessionServices,
@@ -147,13 +153,6 @@ impl SessionConfiguration {
 
     pub(super) fn profile_workspace_roots(&self) -> &[AbsolutePathBuf] {
         self.permission_profile_state.profile_workspace_roots()
-    }
-
-    pub(super) fn apply_permission_profile_to_permissions(
-        &self,
-        permissions: &mut crate::config::Permissions,
-    ) {
-        permissions.set_permission_profile_state(self.permission_profile_state.clone());
     }
 
     #[cfg(test)]
@@ -457,7 +456,13 @@ async fn warm_plugins_and_skills_for_session_init(
     let effective_skill_roots = plugin_outcome.effective_plugin_skill_roots();
     let plugin_skill_snapshots = plugins_manager.plugin_skill_snapshots_for_config(&plugins_input);
     let skills_input = skills_load_input_from_config(config.as_ref(), effective_skill_roots)
-        .with_plugin_skill_snapshots(plugin_skill_snapshots);
+        .with_plugin_skill_snapshots(plugin_skill_snapshots)
+        .with_environment_generation(turn_environments.generation)
+        .with_local_file_watching(
+            turn_environments
+                .primary()
+                .is_some_and(|environment| !environment.environment.is_remote()),
+        );
     skills_service
         .snapshot_for_config(&skills_input, fs)
         .await
@@ -1059,7 +1064,7 @@ impl Session {
                     thread_store: &thread_extension_data,
                 }).await;
             }
-            let task_evidence = crate::task_evidence::TaskEvidenceLedger::load_or_new(
+            let task_evidence = crate::task_evidence::TaskEvidenceLedger::deferred(
                 config.codex_home.to_path_buf(),
                 thread_id,
                 session_configuration.cwd().as_path(),
@@ -1177,11 +1182,14 @@ impl Session {
                 features: config.features.clone(),
                 multi_agent_version,
                 pending_mcp_server_refresh_config: Mutex::new(None),
+                delegated_mcp_tool_metadata: Mutex::new(std::collections::VecDeque::new()),
+                turn_config_snapshot_cache: std::sync::Mutex::new(None),
                 conversation: Arc::new(RealtimeConversationManager::new()),
                 active_turn: Mutex::new(None),
                 startup_timing: Arc::clone(&startup_timing),
                 terminal_tasks: tokio_util::task::TaskTracker::new(),
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
+                rollout_compression_scheduled: std::sync::atomic::AtomicBool::new(false),
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
                 services,

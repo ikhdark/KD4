@@ -117,6 +117,10 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::context_manager::PROMPT_HISTORY_CANONICAL_POLICY_VERSION;
+use crate::context_manager::PromptHistoryCanonicalHash;
+use crate::context_manager::PromptHistoryIncrementalProof;
+use crate::context_manager::PromptHistorySnapshot;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
@@ -487,8 +491,8 @@ pub struct ModelClient {
 /// The session establishes a Responses WebSocket connection lazily and reuses it across multiple
 /// requests within the turn. It also caches per-turn state:
 ///
-/// - The last full request, so subsequent calls can reuse incremental websocket request payloads
-///   only when the current request is an incremental extension of the previous one.
+/// - A compact proof of the last request, so subsequent calls can reuse incremental websocket
+///   payloads without retaining the full request.
 /// - The `x-codex-turn-state` sticky-routing token, which must be replayed for all requests within
 ///   the same turn.
 ///
@@ -518,64 +522,35 @@ struct LastResponse {
     items_added: Vec<ResponseItem>,
 }
 
-const WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION: u16 = 1;
-const WEBSOCKET_HISTORY_HASH_DOMAIN: &[u8] = b"codex.websocket.history.v1";
 const WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN: &[u8] = b"codex.websocket.request-properties.v1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CanonicalPrefixHash {
-    item_count: usize,
-    digest: [u8; 32],
-}
+type CanonicalPrefixHash = PromptHistoryCanonicalHash;
 
-impl CanonicalPrefixHash {
-    fn empty() -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(WEBSOCKET_HISTORY_HASH_DOMAIN);
-        hasher.update(WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION.to_be_bytes());
-        Self {
-            item_count: 0,
-            digest: hasher.finalize().into(),
-        }
-    }
-
-    fn from_items(items: &[ResponseItem]) -> serde_json::Result<Self> {
-        let mut prefix = Self::empty();
-        prefix.extend_items(items)?;
-        Ok(prefix)
-    }
-
-    fn extend_items(&mut self, items: &[ResponseItem]) -> serde_json::Result<()> {
-        for item in items {
-            let mut normalized = item.clone();
-            normalized.clear_internal_chat_message_metadata_passthrough();
-            let serialized = serde_json::to_vec(&normalized)?;
-            let mut hasher = Sha256::new();
-            hasher.update(WEBSOCKET_HISTORY_HASH_DOMAIN);
-            hasher.update(self.digest);
-            hasher.update((serialized.len() as u64).to_be_bytes());
-            hasher.update(serialized);
-            self.digest = hasher.finalize().into();
-            self.item_count = self.item_count.saturating_add(1);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct WebsocketHistoryBaseline {
     /// Monotonic diagnostic identity for the immutable request prefix. Equality
     /// of this generation is never used as proof of model-visible equivalence.
     generation: u64,
+    mutation_revision: Option<u64>,
+    rewrite_revision: Option<u64>,
     request_prefix: CanonicalPrefixHash,
     request_properties_fingerprint: [u8; 32],
     normalization_policy_version: u16,
+    previous_response_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct IncrementalProof {
+    previous_response_id: String,
+    input: Vec<ResponseItem>,
+    current_prefix: CanonicalPrefixHash,
+    mutation_revision: Option<u64>,
+    rewrite_revision: Option<u64>,
 }
 
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
-    last_request: Option<ResponsesApiRequest>,
     last_request_history: Option<WebsocketHistoryBaseline>,
     next_history_generation: u64,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
@@ -612,9 +587,8 @@ struct BorrowedResponsesRequestProperties<'a> {
 fn responses_request_properties_fingerprint(
     request: &ResponsesApiRequest,
 ) -> serde_json::Result<[u8; 32]> {
-    // Keep this aligned with `responses_request_properties_match`: input is
-    // compared through the normalized prefix chain, while delivery-only stream
-    // options and client metadata do not affect previous_response_id reuse.
+    // Input is compared through the canonical history proof, while delivery-only
+    // stream options and client metadata do not affect previous_response_id reuse.
     let ResponsesApiRequest {
         model,
         instructions,
@@ -652,68 +626,10 @@ fn responses_request_properties_fingerprint(
     let serialized = serde_json::to_vec(&properties)?;
     let mut hasher = Sha256::new();
     hasher.update(WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN);
-    hasher.update(WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION.to_be_bytes());
+    hasher.update(PROMPT_HISTORY_CANONICAL_POLICY_VERSION.to_be_bytes());
     hasher.update((serialized.len() as u64).to_be_bytes());
     hasher.update(serialized);
     Ok(hasher.finalize().into())
-}
-
-// This is intentionally not a `PartialEq` implementation: request equality includes `input` and
-// `client_metadata`, while websocket reuse compares the input separately and ignores metadata.
-// Keep the destructuring exhaustive so new request fields require an explicit reuse decision.
-fn responses_request_properties_match(
-    previous: &ResponsesApiRequest,
-    current: &ResponsesApiRequest,
-) -> bool {
-    let ResponsesApiRequest {
-        model: previous_model,
-        instructions: previous_instructions,
-        input: _,
-        tools: previous_tools,
-        tool_choice: previous_tool_choice,
-        parallel_tool_calls: previous_parallel_tool_calls,
-        reasoning: previous_reasoning,
-        store: previous_store,
-        stream: previous_stream,
-        stream_options: _,
-        include: previous_include,
-        service_tier: previous_service_tier,
-        prompt_cache_key: previous_prompt_cache_key,
-        text: previous_text,
-        client_metadata: _,
-    } = previous;
-    let ResponsesApiRequest {
-        model: current_model,
-        instructions: current_instructions,
-        input: _,
-        tools: current_tools,
-        tool_choice: current_tool_choice,
-        parallel_tool_calls: current_parallel_tool_calls,
-        reasoning: current_reasoning,
-        store: current_store,
-        stream: current_stream,
-        stream_options: _,
-        include: current_include,
-        service_tier: current_service_tier,
-        prompt_cache_key: current_prompt_cache_key,
-        text: current_text,
-        client_metadata: _,
-    } = current;
-
-    previous_model == current_model
-        && previous_instructions == current_instructions
-        && previous_tools == current_tools
-        && previous_tool_choice == current_tool_choice
-        && previous_parallel_tool_calls == current_parallel_tool_calls
-        && previous_reasoning == current_reasoning
-        && previous_store == current_store
-        && previous_stream == current_stream
-        // Stream options control delivery for this response, not the context
-        // referenced by `previous_response_id`.
-        && previous_include == current_include
-        && previous_service_tier == current_service_tier
-        && previous_prompt_cache_key == current_prompt_cache_key
-        && previous_text == current_text
 }
 
 impl WebsocketSession {
@@ -1557,7 +1473,6 @@ impl ModelClientSession {
                 "invalidating websocket incremental history"
             );
         }
-        self.websocket_session.last_request = None;
         self.websocket_session.last_request_history = None;
         self.websocket_session.last_response_rx = None;
         self.websocket_session.last_response_from_untraced_warmup = false;
@@ -1568,8 +1483,14 @@ impl ModelClientSession {
             .max(1);
     }
 
-    fn remember_request_history(&mut self, request: &ResponsesApiRequest) {
-        let request_prefix = CanonicalPrefixHash::from_items(&request.input);
+    fn remember_request_history(
+        &mut self,
+        request: &ResponsesApiRequest,
+        request_prefix: serde_json::Result<CanonicalPrefixHash>,
+        mutation_revision: Option<u64>,
+        rewrite_revision: Option<u64>,
+        previous_response_id: Option<String>,
+    ) {
         let request_properties_fingerprint = responses_request_properties_fingerprint(request);
         self.websocket_session.next_history_generation = self
             .websocket_session
@@ -1582,10 +1503,12 @@ impl ModelClientSession {
                 (Ok(request_prefix), Ok(request_properties_fingerprint)) => {
                     Some(WebsocketHistoryBaseline {
                         generation,
+                        mutation_revision,
+                        rewrite_revision,
                         request_prefix,
                         request_properties_fingerprint,
-                        normalization_policy_version:
-                            WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION,
+                        normalization_policy_version: PROMPT_HISTORY_CANONICAL_POLICY_VERSION,
+                        previous_response_id,
                     })
                 }
                 (request_prefix, request_properties_fingerprint) => {
@@ -1593,7 +1516,7 @@ impl ModelClientSession {
                         history_generation = generation,
                         prefix_hash_error = ?request_prefix.err(),
                         properties_hash_error = ?request_properties_fingerprint.err(),
-                        "websocket history hashing unavailable; retaining full-comparison fallback"
+                        "websocket history proof unavailable; forcing a full next request"
                     );
                     None
                 }
@@ -1636,149 +1559,89 @@ impl ModelClientSession {
         }
     }
 
-    /// Checks whether the current request is an incremental extension of the previous request.
-    /// We only reuse an incremental input delta when non-input request fields are unchanged and
-    /// `input` is a strict extension of the previous known input. Server-returned output items
-    /// are treated as part of the baseline so we do not resend them.
-    fn get_incremental_items(
+    /// Produces a complete proof that the current request is an append-only
+    /// extension of the last request and its completed provider response.
+    fn get_incremental_proof(
         &self,
         request: &ResponsesApiRequest,
-        last_response: Option<&LastResponse>,
+        history: Option<&PromptHistorySnapshot>,
+        last_response: &LastResponse,
         allow_empty_delta: bool,
-    ) -> Option<Vec<ResponseItem>> {
-        let previous_request = self.websocket_session.last_request.as_ref()?;
-        if !responses_request_properties_match(previous_request, request) {
-            trace!("incremental request failed, websocket reuse properties didn't match");
+    ) -> Option<IncrementalProof> {
+        let baseline = self.websocket_session.last_request_history.as_ref()?;
+        let baseline_reused_previous_response = baseline.previous_response_id.is_some();
+        if baseline.normalization_policy_version != PROMPT_HISTORY_CANONICAL_POLICY_VERSION {
+            return None;
+        }
+        let current_properties_fingerprint = responses_request_properties_fingerprint(request).ok()?;
+        if current_properties_fingerprint != baseline.request_properties_fingerprint {
+            trace!(
+                history_generation = baseline.generation,
+                "incremental request failed, request-property fingerprint didn't match"
+            );
+            return None;
+        }
+        if last_response.response_id.is_empty() {
+            trace!("incremental request failed, no previous response id");
             return None;
         }
 
-        if !crate::latency_switches::stage3_persistence_history_enabled() {
-            return Self::get_incremental_items_full_compare(
-                previous_request,
-                request,
-                last_response,
-                allow_empty_delta,
-            );
-        }
-
-        if let Some(baseline) = self.websocket_session.last_request_history.as_ref()
-            && baseline.normalization_policy_version
-                == WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION
+        let (input, current_prefix, mutation_revision, rewrite_revision) = if crate::latency_switches::stage3_persistence_history_enabled()
+            && let Some(history) = history
+            && let (Some(mutation_revision), Some(rewrite_revision)) =
+                (baseline.mutation_revision, baseline.rewrite_revision)
+            && let Some(PromptHistoryIncrementalProof {
+                suffix,
+                current_prefix,
+                mutation_revision,
+                rewrite_revision,
+            }) = history.incremental_proof(
+                mutation_revision,
+                rewrite_revision,
+                baseline.request_prefix,
+                &last_response.items_added,
+            )
         {
-            let Ok(current_properties_fingerprint) =
-                responses_request_properties_fingerprint(request)
-            else {
-                trace!("incremental request fingerprint unavailable; using full comparison");
-                return Self::get_incremental_items_full_compare(
-                    previous_request,
-                    request,
-                    last_response,
-                    allow_empty_delta,
-                );
-            };
-            if current_properties_fingerprint != baseline.request_properties_fingerprint {
-                trace!(
-                    history_generation = baseline.generation,
-                    "incremental request failed, request-property fingerprint didn't match"
-                );
-                return None;
-            }
-
+            (
+                suffix,
+                current_prefix,
+                Some(mutation_revision),
+                Some(rewrite_revision),
+            )
+        } else {
             let mut expected_prefix = baseline.request_prefix;
-            if let Some(response) = last_response
-                && let Err(err) = expected_prefix.extend_items(&response.items_added)
-            {
-                trace!(
-                    ?err,
-                    "response-prefix hashing unavailable; using full comparison"
-                );
-                return Self::get_incremental_items_full_compare(
-                    previous_request,
-                    request,
-                    last_response,
-                    allow_empty_delta,
-                );
-            }
-            let Some((request_items_to_compare, incremental_items)) =
-                request.input.split_at_checked(expected_prefix.item_count)
-            else {
-                trace!("incremental request failed, incompatible request length");
-                return None;
-            };
-            let request_prefix = match CanonicalPrefixHash::from_items(request_items_to_compare) {
-                Ok(request_prefix) => request_prefix,
-                Err(err) => {
-                    trace!(
-                        ?err,
-                        "candidate-prefix hashing unavailable; using full comparison"
-                    );
-                    return Self::get_incremental_items_full_compare(
-                        previous_request,
-                        request,
-                        last_response,
-                        allow_empty_delta,
-                    );
-                }
-            };
-            if request_prefix != expected_prefix {
+            expected_prefix.extend_items(&last_response.items_added).ok()?;
+            let (candidate_prefix, input) =
+                request.input.split_at_checked(expected_prefix.item_count)?;
+            if CanonicalPrefixHash::from_items(candidate_prefix).ok()? != expected_prefix {
                 trace!(
                     history_generation = baseline.generation,
                     "incremental request failed, normalized prefix digest didn't match"
                 );
                 return None;
             }
-            if !allow_empty_delta && incremental_items.is_empty() {
-                return None;
-            }
-            return Some(incremental_items.to_vec());
-        }
-
-        Self::get_incremental_items_full_compare(
-            previous_request,
-            request,
-            last_response,
-            allow_empty_delta,
-        )
-    }
-
-    /// Correctness fallback for missing/unknown hash state. This retains the
-    /// prior full materialization and normalized comparison contract.
-    fn get_incremental_items_full_compare(
-        previous_request: &ResponsesApiRequest,
-        request: &ResponsesApiRequest,
-        last_response: Option<&LastResponse>,
-        allow_empty_delta: bool,
-    ) -> Option<Vec<ResponseItem>> {
-        // To compare the inputs, we concatenate the previous request items with the response items,
-        // then compare that against the equivalent slice of request items, ignoring metadata. If
-        // they match, we can consider the remaining items the incremental request.
-        let mut previous_items = previous_request.input.clone();
-        if let Some(response) = last_response {
-            previous_items.extend_from_slice(&response.items_added);
-        }
-        previous_items
-            .iter_mut()
-            .for_each(ResponseItem::clear_internal_chat_message_metadata_passthrough);
-
-        let Some((request_items_to_compare, incremental_items)) =
-            request.input.split_at_checked(previous_items.len())
-        else {
-            trace!("incremental request failed, incompatible request length");
-            return None;
+            let mut current_prefix = expected_prefix;
+            current_prefix.extend_items(input).ok()?;
+            (input.to_vec(), current_prefix, None, None)
         };
-        let mut request_prefix = request_items_to_compare.to_vec();
-        request_prefix
-            .iter_mut()
-            .for_each(ResponseItem::clear_internal_chat_message_metadata_passthrough);
 
-        if previous_items != request_prefix {
-            trace!("incremental request failed, items didn't match");
+        if !allow_empty_delta && input.is_empty() {
             return None;
         }
-        if !allow_empty_delta && incremental_items.is_empty() {
-            return None;
-        }
-        Some(incremental_items.to_vec())
+        Some(IncrementalProof {
+            previous_response_id: last_response.response_id.clone(),
+            input,
+            current_prefix,
+            mutation_revision,
+            rewrite_revision,
+        })
+        .inspect(|_| {
+            trace!(
+                history_generation = baseline.generation,
+                baseline_reused_previous_response,
+                "verified websocket incremental proof"
+            );
+        })
     }
 
     fn get_last_response(&mut self) -> Option<LastResponse> {
@@ -1791,37 +1654,39 @@ impl ModelClientSession {
             })
     }
 
-    fn prepare_websocket_request(
+    fn prepare_incremental_websocket_request(
         &mut self,
         payload: ResponseCreateWsRequest,
         request: &ResponsesApiRequest,
-    ) -> (ResponsesWsRequest, bool) {
-        let Some(last_response) = self.get_last_response() else {
-            return (ResponsesWsRequest::ResponseCreate(payload), false);
-        };
+        history: Option<&PromptHistorySnapshot>,
+        last_response: &LastResponse,
+    ) -> std::result::Result<
+        (ResponsesWsRequest, bool, IncrementalProof),
+        ResponseCreateWsRequest,
+    > {
         let previous_response_id_from_untraced_warmup =
             self.websocket_session.last_response_from_untraced_warmup;
-        let Some(incremental_items) = self.get_incremental_items(
+        let Some(proof) = self.get_incremental_proof(
             request,
-            Some(&last_response),
+            history,
+            last_response,
             /*allow_empty_delta*/ true,
         ) else {
-            return (ResponsesWsRequest::ResponseCreate(payload), false);
+            return Err(payload);
         };
-
-        if last_response.response_id.is_empty() {
-            trace!("incremental request failed, no previous response id");
-            return (ResponsesWsRequest::ResponseCreate(payload), false);
+        if let Some(baseline) = self.websocket_session.last_request_history.as_mut() {
+            baseline.previous_response_id = Some(proof.previous_response_id.clone());
         }
 
-        (
+        Ok((
             ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
-                previous_response_id: Some(last_response.response_id),
-                input: incremental_items,
+                previous_response_id: Some(proof.previous_response_id.clone()),
+                input: proof.input.clone(),
                 ..payload
             }),
             previous_response_id_from_untraced_warmup,
-        )
+            proof,
+        ))
     }
 
     /// Opportunistically preconnects a websocket for this turn-scoped client session.
@@ -1990,6 +1855,7 @@ impl ModelClientSession {
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
             let client_setup = self.client.current_client_setup().await?;
+            let request_provider = client_setup.api_provider.clone();
             let transport = self
                 .client
                 .build_api_transport(&client_setup.api_provider, RESPONSES_ENDPOINT)?;
@@ -2019,7 +1885,7 @@ impl ModelClientSession {
                 .as_ref()
                 .map(|timing| timing.begin_local_phase(TurnLocalPhase::Serialization));
             let mut request = self.client.build_responses_request(
-                &client_setup.api_provider,
+                &request_provider,
                 prompt,
                 model_info,
                 ResponsesRequestKind::Streaming,
@@ -2109,6 +1975,7 @@ impl ModelClientSession {
     async fn stream_responses_websocket(
         &mut self,
         prompt: &Prompt,
+        history: Option<&PromptHistorySnapshot>,
         model_info: &ModelInfo,
         session_telemetry: &SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
@@ -2127,6 +1994,7 @@ impl ModelClientSession {
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
             let client_setup = self.client.current_client_setup().await?;
+            let request_provider = client_setup.api_provider.clone();
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
@@ -2137,8 +2005,8 @@ impl ModelClientSession {
                 .turn_timing
                 .as_ref()
                 .map(|timing| timing.begin_local_phase(TurnLocalPhase::Serialization));
-            let request = self.client.build_responses_request(
-                &client_setup.api_provider,
+            let mut request = self.client.build_responses_request(
+                &request_provider,
                 prompt,
                 model_info,
                 ResponsesRequestKind::Streaming,
@@ -2153,6 +2021,7 @@ impl ModelClientSession {
             } else {
                 session_telemetry_for_request(session_telemetry, &request)
             };
+            let snapshot_input_is_direct = request.input.is_empty() && !model_info.use_responses_lite;
             let mut client_metadata = self
                 .client
                 .build_ws_client_metadata(responses_metadata, model_info.use_responses_lite);
@@ -2161,7 +2030,7 @@ impl ModelClientSession {
             }
             let mut ws_payload = ResponseCreateWsRequest {
                 client_metadata: response_create_client_metadata(
-                    Some(client_metadata),
+                    Some(client_metadata.clone()),
                     request_trace.as_ref(),
                 ),
                 ..ResponseCreateWsRequest::from(&request)
@@ -2207,8 +2076,90 @@ impl ModelClientSession {
                 Err(err) => return Err(self.client.state.provider.map_api_error(err)),
             }
 
-            let (mut ws_request, previous_response_id_from_untraced_warmup) =
-                self.prepare_websocket_request(ws_payload, &request);
+            let last_response = self.get_last_response();
+            let direct_incremental = match last_response.as_ref() {
+                Some(last_response) => self.prepare_incremental_websocket_request(
+                    ws_payload,
+                    &request,
+                    history,
+                    last_response,
+                ),
+                None => Err(ws_payload),
+            };
+            let (mut ws_request, previous_response_id_from_untraced_warmup, request_prefix, mutation_revision, rewrite_revision, previous_response_id) =
+                match direct_incremental {
+                    Ok((ws_request, from_untraced_warmup, proof)) => (
+                        ws_request,
+                        from_untraced_warmup,
+                        Ok(proof.current_prefix),
+                        proof.mutation_revision,
+                        proof.rewrite_revision,
+                        Some(proof.previous_response_id),
+                    ),
+                    Err(mut ws_payload) => {
+                    if let Some(history) = history {
+                        let mut full_prompt = prompt.clone();
+                        full_prompt.input = history.materialize();
+                        request = self.client.build_responses_request(
+                            &request_provider,
+                            &full_prompt,
+                            model_info,
+                            ResponsesRequestKind::Streaming,
+                            effort.clone(),
+                            summary,
+                            service_tier.clone(),
+                            responses_metadata,
+                        )?;
+                        ws_payload = ResponseCreateWsRequest {
+                            client_metadata: response_create_client_metadata(
+                                Some(client_metadata.clone()),
+                                request_trace.as_ref(),
+                            ),
+                            ..ResponseCreateWsRequest::from(&request)
+                        };
+                        if warmup {
+                            ws_payload.generate = Some(false);
+                        }
+                    }
+                    let legacy_incremental = match last_response.as_ref() {
+                        Some(last_response) => self.prepare_incremental_websocket_request(
+                            ws_payload,
+                            &request,
+                            /*history*/ None,
+                            last_response,
+                        ),
+                        None => Err(ws_payload),
+                    };
+                    match legacy_incremental {
+                        Ok((ws_request, from_untraced_warmup, proof)) => (
+                            ws_request,
+                            from_untraced_warmup,
+                            Ok(proof.current_prefix),
+                            None,
+                            None,
+                            Some(proof.previous_response_id),
+                        ),
+                        Err(ws_payload) => {
+                            let snapshot_identity = history.filter(|history| {
+                                snapshot_input_is_direct
+                                    && request.input.len()
+                                        == history.canonical_prefix().item_count
+                            });
+                            (
+                                ResponsesWsRequest::ResponseCreate(ws_payload),
+                                false,
+                                snapshot_identity.map_or_else(
+                                    || CanonicalPrefixHash::from_items(&request.input),
+                                    |history| Ok(history.canonical_prefix()),
+                                ),
+                                snapshot_identity.map(PromptHistorySnapshot::mutation_revision),
+                                snapshot_identity.map(PromptHistorySnapshot::rewrite_revision),
+                                None,
+                            )
+                        }
+                    }
+                    }
+                };
             let inference_trace_attempt = if warmup {
                 // Prewarm sends `generate=false`; it is connection setup, not a
                 // model inference attempt that should appear in rollout traces.
@@ -2229,8 +2180,13 @@ impl ModelClientSession {
             } else {
                 inference_trace_attempt.record_started(&ws_request);
             }
-            self.remember_request_history(&request);
-            self.websocket_session.last_request = Some(request);
+            self.remember_request_history(
+                &request,
+                request_prefix,
+                mutation_revision,
+                rewrite_revision,
+                previous_response_id,
+            );
             self.websocket_session.last_response_from_untraced_warmup = warmup;
             let websocket_connection =
                 self.websocket_session.connection.as_ref().ok_or_else(|| {
@@ -2321,7 +2277,7 @@ impl ModelClientSession {
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
-        if self.websocket_session.last_request.is_some() {
+        if self.websocket_session.last_request_history.is_some() {
             return Ok(());
         }
 
@@ -2329,6 +2285,7 @@ impl ModelClientSession {
         match self
             .stream_responses_websocket(
                 prompt,
+                /*history*/ None,
                 model_info,
                 session_telemetry,
                 effort,
@@ -2380,6 +2337,60 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        self.stream_inner(
+            prompt,
+            /*history*/ None,
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+            inference_trace,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stream_with_history_snapshot(
+        &mut self,
+        prompt: &Prompt,
+        history: &PromptHistorySnapshot,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        inference_trace: &InferenceTraceContext,
+    ) -> Result<ResponseStream> {
+        self.stream_inner(
+            prompt,
+            Some(history),
+            model_info,
+            session_telemetry,
+            effort,
+            summary,
+            service_tier,
+            responses_metadata,
+            inference_trace,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_inner(
+        &mut self,
+        prompt: &Prompt,
+        history: Option<&PromptHistorySnapshot>,
+        model_info: &ModelInfo,
+        session_telemetry: &SessionTelemetry,
+        effort: Option<ReasoningEffortConfig>,
+        summary: ReasoningSummaryConfig,
+        service_tier: Option<String>,
+        responses_metadata: &CodexResponsesMetadata,
+        inference_trace: &InferenceTraceContext,
+    ) -> Result<ResponseStream> {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
@@ -2388,6 +2399,7 @@ impl ModelClientSession {
                     match self
                         .stream_responses_websocket(
                             prompt,
+                            history,
                             model_info,
                             session_telemetry,
                             effort.clone(),
@@ -2407,17 +2419,33 @@ impl ModelClientSession {
                     }
                 }
 
-                self.stream_responses_api(
-                    prompt,
-                    model_info,
-                    session_telemetry,
-                    effort,
-                    summary,
-                    service_tier,
-                    responses_metadata,
-                    inference_trace,
-                )
-                .await
+                if let Some(history) = history {
+                    let mut full_prompt = prompt.clone();
+                    full_prompt.input = history.materialize();
+                    self.stream_responses_api(
+                        &full_prompt,
+                        model_info,
+                        session_telemetry,
+                        effort,
+                        summary,
+                        service_tier,
+                        responses_metadata,
+                        inference_trace,
+                    )
+                    .await
+                } else {
+                    self.stream_responses_api(
+                        prompt,
+                        model_info,
+                        session_telemetry,
+                        effort,
+                        summary,
+                        service_tier,
+                        responses_metadata,
+                        inference_trace,
+                    )
+                    .await
+                }
             }
         }
     }

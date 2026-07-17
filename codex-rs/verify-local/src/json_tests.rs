@@ -3,7 +3,9 @@ use crate::finalize::finalize_plan;
 use crate::model::CommandResultV2;
 use crate::model::CommandSpecV2;
 use crate::model::DirtyGroup;
+use crate::model::ExactOutputArtifactV2;
 use crate::model::LogState;
+use crate::model::OutputOmissionV2;
 use crate::model::PlanMode;
 use crate::model::SkippedDecision;
 use crate::model::Verdict;
@@ -241,7 +243,7 @@ fn populated_legacy_payload_matches_frozen_python_bytes() {
         reason: "skip".to_string(),
     });
     plan.cache_miss_reasons.push("cold".to_string());
-    let finalized = finalize_plan(
+    let mut finalized = finalize_plan(
         plan,
         vec![CommandResultV2 {
             schema_version: 2,
@@ -259,6 +261,8 @@ fn populated_legacy_payload_matches_frozen_python_bytes() {
             log_state: LogState::Complete,
             log_path: None,
             diagnostic: "ok\u{8}".to_string(),
+            exact_output_artifact: None,
+            diagnostic_omission: None,
             cached: true,
             flaky: false,
             baseline: None,
@@ -277,6 +281,19 @@ fn populated_legacy_payload_matches_frozen_python_bytes() {
         serialize_legacy_v1(&finalized, true).expect("CRLF serialization"),
         expected_crlf
     );
+
+    finalized.results[0].raw.exact_output_artifact = Some(ExactOutputArtifactV2 {
+        sha256: "ab".repeat(32),
+        path: std::path::PathBuf::from("exact/sha256.log"),
+        bytes: 4,
+    });
+    finalized.results[0].raw.diagnostic_omission = Some(OutputOmissionV2 { bytes: 9, lines: 2 });
+    let enriched =
+        String::from_utf8(serialize_legacy_v1(&finalized, false).expect("enriched serialization"))
+            .expect("utf8");
+    assert!(enriched.contains("\"exact_output_artifact\""));
+    assert!(enriched.contains("\"sha256\": \"abababab"));
+    assert!(enriched.contains("\"diagnostic_omission\""));
 }
 
 #[test]
@@ -310,6 +327,8 @@ fn optional_result_fields_are_null_and_command_arguments_are_preserved() {
             log_state: LogState::Complete,
             log_path: None,
             diagnostic: String::new(),
+            exact_output_artifact: None,
+            diagnostic_omission: None,
             cached: false,
             flaky: false,
             baseline: None,

@@ -40,6 +40,44 @@ no_memories_if_mcp_or_web_search = true
 }
 
 #[test]
+fn cloned_layer_stacks_share_immutable_layers_until_replaced() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let user_file = test_user_config_path(&temp_dir, "config.toml");
+    let stack = ConfigLayerStack::new(
+        vec![ConfigLayerEntry::new(
+            ConfigLayerSource::User {
+                file: user_file.clone(),
+                profile: None,
+            },
+            toml::from_str(r#"model = "base""#).expect("base config"),
+        )],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("single layer stack should be valid");
+    let cloned = stack.clone();
+
+    assert!(Arc::ptr_eq(&stack.layers, &cloned.layers));
+
+    let updated = cloned.with_user_config(
+        &user_file,
+        toml::from_str(r#"model = "updated""#).expect("updated config"),
+    );
+    assert!(!Arc::ptr_eq(&stack.layers, &updated.layers));
+    assert_eq!(
+        stack.effective_config().get("model").and_then(toml::Value::as_str),
+        Some("base")
+    );
+    assert_eq!(
+        updated
+            .effective_config()
+            .get("model")
+            .and_then(toml::Value::as_str),
+        Some("updated")
+    );
+}
+
+#[test]
 fn active_user_layer_is_highest_precedence_user_layer() {
     let temp_dir = TempDir::new().expect("tempdir");
     let base_file = test_user_config_path(&temp_dir, "config.toml");

@@ -53,6 +53,7 @@ fn draining_resets_bytes_but_preserves_cumulative_loss_accounting() {
     assert_eq!(buf.omitted_bytes(), 2);
     assert_eq!(buf.take_unreported_omitted_bytes(), 2);
     assert_eq!(buf.take_unreported_omitted_bytes(), 0);
+    assert_eq!(buf.take_unreported_omitted_lines(), 0);
     assert_eq!(buf.omitted_bytes(), 2);
     assert_eq!(buf.lagged_chunks(), 3);
     assert_eq!(buf.take_unreported_lagged_chunks(), 3);
@@ -141,6 +142,22 @@ fn rendered_marker_reserves_its_actual_length_and_preserves_head_and_tail() {
     assert!(rendered.ends_with(b"T"));
     let text = String::from_utf8(rendered).expect("marker is UTF-8");
     assert_eq!(text.matches("output truncated").count(), 1);
+}
+
+#[test]
+fn rendered_marker_reports_exact_omitted_bytes_and_line_breaks() {
+    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 160);
+    let output = (0..80)
+        .map(|index| format!("line-{index:02}\n"))
+        .collect::<String>();
+    buf.push_chunk(output.into_bytes());
+
+    let rendered = String::from_utf8(buf.render_bytes()).expect("rendered output");
+
+    assert!(buf.omitted_bytes() > 0);
+    assert!(buf.omitted_lines() > 0);
+    assert!(rendered.contains(" byte(s) and "));
+    assert!(rendered.contains(" line break(s) omitted"));
 }
 
 #[test]

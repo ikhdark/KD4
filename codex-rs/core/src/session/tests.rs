@@ -1534,11 +1534,35 @@ async fn refresh_runtime_config_refreshes_hooks() -> anyhow::Result<()> {
     };
     assert!(session.hooks().preview_session_start(&request).is_empty());
 
+    let previous_config = session.get_config().await;
+    let previous_hooks = session.hooks();
     let next_config = load_latest_config_for_session(&session).await;
-    session.refresh_runtime_config(next_config).await;
+    assert!(
+        session
+            .refresh_runtime_config_from_process_reload(Arc::new(next_config))
+            .await
+    );
 
+    assert!(!Arc::ptr_eq(&previous_config, &session.get_config().await));
+    assert!(!Arc::ptr_eq(&previous_hooks, &session.hooks()));
     assert_eq!(session.hooks().preview_session_start(&request).len(), 1);
     Ok(())
+}
+
+#[tokio::test]
+async fn unchanged_process_reload_preserves_config_and_hook_identities() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let config = session.get_config().await;
+    let hooks = session.hooks();
+
+    assert!(
+        !session
+            .refresh_runtime_config_from_process_reload(Arc::clone(&config))
+            .await
+    );
+
+    assert!(Arc::ptr_eq(&config, &session.get_config().await));
+    assert!(Arc::ptr_eq(&hooks, &session.hooks()));
 }
 
 #[tokio::test]
@@ -5578,6 +5602,10 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         .skills_service
         .snapshot_for_config(&skills_input, Some(Arc::clone(&skill_fs)))
         .await;
+    let available_models = models_manager
+        .current_catalog_snapshot()
+        .await
+        .available_models(models_manager.uses_codex_backend());
     let turn_context = Session::make_turn_context(
         thread_id,
         SessionId::from(thread_id),
@@ -5589,9 +5617,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         services.user_shell.as_ref(),
         services.shell_zsh_path.as_ref(),
         services.main_execve_wrapper_exe.as_ref(),
-        per_turn_config,
+        Arc::new(per_turn_config),
         model_info,
-        &models_manager,
+        available_models,
         /*network*/ None,
         resolved_turn_environments,
         session_configuration.cwd().clone(),
@@ -5609,11 +5637,14 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         features: config.features.clone(),
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
         pending_mcp_server_refresh_config: Mutex::new(None),
+        delegated_mcp_tool_metadata: Mutex::new(std::collections::VecDeque::new()),
+        turn_config_snapshot_cache: std::sync::Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
+        rollout_compression_scheduled: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -7717,6 +7748,10 @@ where
         .skills_service
         .snapshot_for_config(&skills_input, Some(Arc::clone(&skill_fs)))
         .await;
+    let available_models = models_manager
+        .current_catalog_snapshot()
+        .await
+        .available_models(models_manager.uses_codex_backend());
     let turn_context = Arc::new(Session::make_turn_context(
         thread_id,
         SessionId::from(thread_id),
@@ -7728,9 +7763,9 @@ where
         services.user_shell.as_ref(),
         services.shell_zsh_path.as_ref(),
         services.main_execve_wrapper_exe.as_ref(),
-        per_turn_config,
+        Arc::new(per_turn_config),
         model_info,
-        &models_manager,
+        available_models,
         /*network*/ None,
         resolved_turn_environments,
         session_configuration.cwd().clone(),
@@ -7748,11 +7783,14 @@ where
         features: config.features.clone(),
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
         pending_mcp_server_refresh_config: Mutex::new(None),
+        delegated_mcp_tool_metadata: Mutex::new(std::collections::VecDeque::new()),
+        turn_config_snapshot_cache: std::sync::Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
+        rollout_compression_scheduled: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -7786,6 +7824,48 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
     async_channel::Receiver<Event>,
 ) {
     make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await
+}
+
+#[tokio::test]
+async fn stable_turns_share_base_config_snapshot_and_overrides_invalidate_it() {
+    let (session, _initial_turn) = make_session_and_context().await;
+    let first = session
+        .new_default_turn_with_sub_id("shared-config-first".to_string())
+        .await;
+    let second = session
+        .new_default_turn_with_sub_id("shared-config-second".to_string())
+        .await;
+    assert!(Arc::ptr_eq(&first.config, &second.config));
+
+    let updated = session
+        .new_turn_with_sub_id(
+            "shared-config-updated".to_string(),
+            SessionSettingsUpdate {
+                approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("turn override should be accepted");
+    assert!(!Arc::ptr_eq(&first.config, &updated.config));
+    assert_eq!(updated.config.approvals_reviewer, ApprovalsReviewer::AutoReview);
+}
+
+#[tokio::test]
+async fn step_context_materializes_one_runtime_versioned_mcp_inventory() {
+    let (_session, turn_context) = make_session_and_context().await;
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let first = step_context.mcp_inventory().await;
+    let second = step_context.mcp_inventory().await;
+
+    assert!(std::ptr::eq(first, second));
+    assert_eq!(first.runtime_version(), step_context.mcp.version());
+
+    let next_runtime = crate::session::McpRuntimeSnapshot::new_uninitialized_for_test(
+        &turn_context.config,
+    );
+    assert_ne!(first.runtime_version(), next_runtime.version());
 }
 
 #[tokio::test]
@@ -9581,7 +9661,7 @@ async fn guardian_helper_review_interrupts_after_three_consecutive_denials() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_complete_flushes_terminal_event_after_delivery() {
+async fn turn_complete_uses_one_post_receipt_durability_barrier() {
     let (mut sess, tc, rx) = make_session_and_context_with_rx().await;
     let store = attach_in_memory_thread_store(
         Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
@@ -9600,15 +9680,14 @@ async fn turn_complete_flushes_terminal_event_after_delivery() {
 
     let event = recv_terminal_event(&rx, TerminalEventKind::TurnComplete).await;
     assert!(matches!(event.msg, EventMsg::TurnComplete(_)));
-    // Expected flushes:
-    // 1. Task-runner flush after the task body finishes, before TurnComplete is emitted.
-    // 2. Terminal-event flush after TurnComplete is appended.
-    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 2).await;
-    assert_eq!(2, calls.flush_thread);
+    // Ordered append receipts cover the regular stream and TurnComplete. The only durability
+    // barrier is issued after the terminal receipt has been appended and delivered.
+    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 1).await;
+    assert_eq!(1, calls.flush_thread);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_aborted_flushes_terminal_event_after_delivery() {
+async fn turn_aborted_uses_one_post_receipt_durability_barrier() {
     let (mut sess, tc, rx) = make_session_and_context_with_rx().await;
     let store = attach_in_memory_thread_store(
         Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
@@ -9645,12 +9724,10 @@ async fn turn_aborted_flushes_terminal_event_after_delivery() {
         other => panic!("unexpected event: {other:?}"),
     }
     abort_task.await.expect("abort task should finish");
-    // Expected flushes:
-    // 1. Task-runner flush after the task body observes cancellation.
-    // 2. Interrupted-marker flush before TurnAborted so abort observers can reread it.
-    // 3. Terminal-event flush after TurnAborted is appended.
-    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 3).await;
-    assert_eq!(3, calls.flush_thread);
+    // The interrupted marker and TurnAborted are ordered by append receipts; one post-terminal
+    // barrier makes the complete accepted terminal state durable.
+    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 1).await;
+    assert_eq!(1, calls.flush_thread);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

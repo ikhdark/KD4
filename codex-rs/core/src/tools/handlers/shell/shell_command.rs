@@ -17,7 +17,6 @@ use crate::shell::get_shell;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
-use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair_async;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments_with_base_path;
@@ -317,7 +316,6 @@ impl ShellCommandHandler {
             capture_exec_output: false,
         })
         .await
-        .map(boxed_tool_output)
     }
 }
 

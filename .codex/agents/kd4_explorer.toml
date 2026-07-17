@@ -9,5 +9,5 @@ from inference. Report inspected paths, concrete overlaps, dependencies,
 validation implications, and a clear stop condition to the coordinator.
 Do not update shared harness state; the coordinator is its only writer.
 """
-model_reasoning_effort = "high"
+model_reasoning_effort = "xhigh"
 sandbox_mode = "read-only"

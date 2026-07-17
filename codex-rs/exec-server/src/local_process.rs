@@ -929,6 +929,7 @@ async fn watch_exit(
                     aggregated_output: StreamOutput::new(
                         String::from_utf8_lossy(&aggregated).into_owned(),
                     ),
+                    aggregated_output_bytes: Some(aggregated),
                     ..Default::default()
                 };
                 process.sandbox_denied = is_likely_sandbox_denied(process.sandbox, &exec_output);

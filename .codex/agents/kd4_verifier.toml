@@ -10,4 +10,4 @@ serialize shared Cargo or just validation unless an isolated lane is assigned.
 Report pass/fail evidence, uncovered behavior, wiring requirements, and any
 task-scope limitation to the coordinator. Do not stage, commit, push, or publish.
 """
-model_reasoning_effort = "high"
+model_reasoning_effort = "xhigh"

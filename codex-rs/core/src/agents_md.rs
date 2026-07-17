@@ -51,6 +51,7 @@ pub(crate) struct ProjectInstructionsSnapshot {
     pub(crate) dependencies: Option<Vec<AgentsMdEnvironmentDependencies>>,
 }
 
+#[derive(Clone)]
 pub(crate) struct AgentsMdEnvironmentDependencies {
     pub(crate) filesystem: Arc<dyn ExecutorFileSystem>,
     pub(crate) specs: Vec<AgentsMdDependencySpec>,
@@ -237,12 +238,12 @@ async fn discover_agents_md_paths(
         /*sandbox*/ None,
     )
     .await?;
-    let search_dirs = if let Some(root) = project_root {
+    let search_dirs = if let Some(root) = project_root.as_ref() {
         let mut dirs = Vec::new();
         let mut cursor = dir.clone();
         loop {
             dirs.push(cursor.clone());
-            if cursor == root {
+            if &cursor == root {
                 break;
             }
             let Some(parent) = cursor.parent() else {
@@ -253,7 +254,7 @@ async fn discover_agents_md_paths(
         dirs.reverse();
         dirs
     } else {
-        vec![dir]
+        vec![dir.clone()]
     };
 
     let mut found = Vec::new();
@@ -330,7 +331,7 @@ pub(crate) fn effective_project_root_markers(config: &Config) -> Vec<String> {
 fn normalize_dependencies(
     mut dependencies: Vec<AgentsMdDependencySpec>,
 ) -> Option<Vec<AgentsMdDependencySpec>> {
-    dependencies.sort_by(|left, right| left.path.cmp(&right.path));
+    dependencies.sort_by_cached_key(|dependency| dependency.path.to_string());
     dependencies.dedup_by(|left, right| {
         if left.path != right.path {
             return false;
@@ -386,6 +387,20 @@ impl Default for LoadedAgentsMd {
 }
 
 impl LoadedAgentsMd {
+    #[cfg(test)]
+    fn from_parts_for_testing(
+        user_instructions: Option<UserInstructions>,
+        entries: Vec<InstructionEntry>,
+    ) -> Self {
+        let mut loaded = Self {
+            user_instructions,
+            entries,
+            ..Self::default()
+        };
+        loaded.recompose();
+        loaded
+    }
+
     /// Creates loaded instructions containing one user-level AGENTS.md entry.
     pub fn new_user(contents: String, path: AbsolutePathBuf) -> Self {
         if contents.trim().is_empty() {

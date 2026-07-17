@@ -672,7 +672,7 @@ client_request_definitions! {
     },
     HooksList => "hooks/list" {
         params: v2::HooksListParams,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::HooksListResponse,
     },
     MarketplaceAdd => "marketplace/add" {
@@ -707,7 +707,7 @@ client_request_definitions! {
     },
     PluginSkillRead => "plugin/skill/read" {
         params: v2::PluginSkillReadParams,
-        serialization: global("config"),
+        serialization: None,
         response: v2::PluginSkillReadResponse,
     },
     PluginShareSave => "plugin/share/save" {
@@ -722,7 +722,7 @@ client_request_definitions! {
     },
     PluginShareList => "plugin/share/list" {
         params: v2::PluginShareListParams,
-        serialization: global("config"),
+        serialization: None,
         response: v2::PluginShareListResponse,
     },
     PluginShareCheckout => "plugin/share/checkout" {
@@ -873,7 +873,7 @@ client_request_definitions! {
     },
     ExperimentalFeatureList => "experimentalFeature/list" {
         params: v2::ExperimentalFeatureListParams,
-        serialization: global("config"),
+        serialization: global_shared_read("config"),
         response: v2::ExperimentalFeatureListResponse,
     },
     PermissionProfileList => "permissionProfile/list" {
@@ -1746,6 +1746,46 @@ mod tests {
     fn request_id() -> RequestId {
         const REQUEST_ID: i64 = 1;
         RequestId::Integer(REQUEST_ID)
+    }
+
+    #[test]
+    fn config_backed_read_only_rpcs_avoid_exclusive_serialization() {
+        let shared_config_reads = [
+            ClientRequest::HooksList {
+                request_id: request_id(),
+                params: v2::HooksListParams { cwds: Vec::new() },
+            },
+            ClientRequest::ExperimentalFeatureList {
+                request_id: request_id(),
+                params: v2::ExperimentalFeatureListParams::default(),
+            },
+        ];
+
+        for request in shared_config_reads {
+            assert_eq!(
+                request.serialization_scope(),
+                Some(ClientRequestSerializationScope::GlobalSharedRead("config"))
+            );
+        }
+
+        let unscoped_remote_reads = [
+            ClientRequest::PluginSkillRead {
+                request_id: request_id(),
+                params: v2::PluginSkillReadParams {
+                    remote_marketplace_name: "marketplace".to_string(),
+                    remote_plugin_id: "plugin".to_string(),
+                    skill_name: "skill".to_string(),
+                },
+            },
+            ClientRequest::PluginShareList {
+                request_id: request_id(),
+                params: v2::PluginShareListParams {},
+            },
+        ];
+
+        for request in unscoped_remote_reads {
+            assert_eq!(request.serialization_scope(), None);
+        }
     }
 
     #[test]

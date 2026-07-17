@@ -130,10 +130,15 @@ impl SkillLoadOutcome {
         self.file_systems_by_skill_path
             .get(&skill.path_to_skills_md)
     }
+
+    pub(crate) fn body_for_skill(&self, skill: &SkillMetadata) -> Option<Arc<str>> {
+        self.file_systems_by_skill_path
+            .body(&skill.path_to_skills_md)
+    }
 }
 
-/// Immutable snapshot of host-owned skills and the filesystem mapping needed
-/// to read each skill through the environment that discovered it.
+/// Immutable snapshot of host-owned skills, parsed bodies, and the filesystem mapping needed
+/// for fallback reads through the environment that discovered each skill.
 #[derive(Debug, Clone)]
 pub struct HostSkillsSnapshot {
     outcome: Arc<SkillLoadOutcome>,
@@ -149,6 +154,9 @@ impl HostSkillsSnapshot {
     }
 
     pub async fn read_skill_text(&self, skill: &SkillMetadata) -> io::Result<String> {
+        if let Some(contents) = self.outcome.body_for_skill(skill) {
+            return Ok(contents.to_string());
+        }
         let fs = self
             .outcome
             .file_system_for_skill(skill)
@@ -161,17 +169,26 @@ impl HostSkillsSnapshot {
 #[derive(Clone, Default)]
 pub(crate) struct SkillFileSystemsByPath {
     values: Arc<HashMap<AbsolutePathBuf, Arc<dyn ExecutorFileSystem>>>,
+    bodies: Arc<HashMap<AbsolutePathBuf, Arc<str>>>,
 }
 
 impl SkillFileSystemsByPath {
-    pub(crate) fn new(values: HashMap<AbsolutePathBuf, Arc<dyn ExecutorFileSystem>>) -> Self {
+    pub(crate) fn new(
+        values: HashMap<AbsolutePathBuf, Arc<dyn ExecutorFileSystem>>,
+        bodies: HashMap<AbsolutePathBuf, Arc<str>>,
+    ) -> Self {
         Self {
             values: Arc::new(values),
+            bodies: Arc::new(bodies),
         }
     }
 
     fn get(&self, path: &AbsolutePathBuf) -> Option<Arc<dyn ExecutorFileSystem>> {
         self.values.get(path).map(Arc::clone)
+    }
+
+    fn body(&self, path: &AbsolutePathBuf) -> Option<Arc<str>> {
+        self.bodies.get(path).map(Arc::clone)
     }
 
     fn retain_paths(&mut self, paths: &HashSet<AbsolutePathBuf>) {
@@ -182,6 +199,13 @@ impl SkillFileSystemsByPath {
                 .map(|(path, fs)| (path.clone(), Arc::clone(fs)))
                 .collect(),
         );
+        self.bodies = Arc::new(
+            self.bodies
+                .iter()
+                .filter(|(path, _)| paths.contains(*path))
+                .map(|(path, contents)| (path.clone(), Arc::clone(contents)))
+                .collect(),
+        );
     }
 }
 
@@ -189,6 +213,7 @@ impl fmt::Debug for SkillFileSystemsByPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SkillFileSystemsByPath")
             .field("len", &self.values.len())
+            .field("body_len", &self.bodies.len())
             .finish()
     }
 }

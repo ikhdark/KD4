@@ -178,6 +178,17 @@ impl OutboundMailbox {
             }
         }
 
+        if class == ServerNotificationDeliveryClass::CoalescibleDelta
+            && state.bulk_count >= state.bulk_capacity
+            && let Some(index) = state.queue.iter().position(|entry| {
+                entry.class == ServerNotificationDeliveryClass::BestEffort
+            })
+        {
+            if let Some(removed) = state.queue.remove(index) {
+                state.decrement(removed.class);
+            }
+        }
+
         let has_capacity = match class {
             ServerNotificationDeliveryClass::Reliable => {
                 state.reliable_count < state.reliable_capacity

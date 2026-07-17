@@ -2822,6 +2822,21 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         )]
         .into_iter()
         .collect(),
+        ordered_changes: Some(vec![
+            codex_protocol::items::OrderedFileChange {
+                path: PathBuf::from("README.md"),
+                change: codex_protocol::protocol::FileChange::Add {
+                    content: "first\n".to_string(),
+                },
+            },
+            codex_protocol::items::OrderedFileChange {
+                path: PathBuf::from("README.md"),
+                change: codex_protocol::protocol::FileChange::Update {
+                    unified_diff: "second\n".to_string(),
+                    move_path: None,
+                },
+            },
+        ]),
         status: Some(codex_protocol::protocol::PatchApplyStatus::Completed),
         auto_approved: None,
         stdout: Some("Done!".to_string()),
@@ -2832,12 +2847,44 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         ThreadItem::from(file_change_item),
         ThreadItem::FileChange {
             id: "patch-1".to_string(),
-            changes: vec![FileUpdateChange {
-                path: "README.md".to_string(),
-                kind: PatchChangeKind::Add,
-                diff: "hello\n".to_string(),
-            }],
+            changes: vec![
+                FileUpdateChange {
+                    path: "README.md".to_string(),
+                    kind: PatchChangeKind::Add,
+                    diff: "first\n".to_string(),
+                },
+                FileUpdateChange {
+                    path: "README.md".to_string(),
+                    kind: PatchChangeKind::Update { move_path: None },
+                    diff: "second\n".to_string(),
+                },
+            ],
             status: PatchApplyStatus::Completed,
+        }
+    );
+
+    let zero_commit_item = TurnItem::FileChange(FileChangeItem {
+        id: "patch-zero".to_string(),
+        changes: [(
+            PathBuf::from("planned.txt"),
+            codex_protocol::protocol::FileChange::Add {
+                content: "planned only\n".to_string(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ordered_changes: Some(Vec::new()),
+        status: Some(codex_protocol::protocol::PatchApplyStatus::Failed),
+        auto_approved: None,
+        stdout: None,
+        stderr: Some("failed before commit".to_string()),
+    });
+    assert_eq!(
+        ThreadItem::from(zero_commit_item),
+        ThreadItem::FileChange {
+            id: "patch-zero".to_string(),
+            changes: Vec::new(),
+            status: PatchApplyStatus::Failed,
         }
     );
 

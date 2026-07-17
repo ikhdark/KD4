@@ -3,7 +3,7 @@ max_depth = 1
 
 [features.multi_agent_v2]
 enabled = true
-max_concurrent_threads_per_session = 4
+max_concurrent_threads_per_session = 5
 
 [agents.kd4_explorer]
 description = "Read-only KD4 source, ownership, and dependency investigator."
@@ -20,3 +20,7 @@ config_file = "./agents/kd4_verifier.toml"
 [agents.kd4_integrator]
 description = "Coordinates cross-cutting KD4 contracts and final integration."
 config_file = "./agents/kd4_integrator.toml"
+
+[agents.kd4_reviewer]
+description = "Read-only preflight reviewer for completed KD4 worker changes."
+config_file = "./agents/kd4_reviewer.toml"

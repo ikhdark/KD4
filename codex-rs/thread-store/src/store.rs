@@ -6,6 +6,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::AppendThreadItemsParams;
+use crate::AppendThreadItemsReceipt;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
@@ -57,20 +58,15 @@ pub trait ThreadStore: Any + Send + Sync {
 
     /// Appends items that have already passed the shared rollout persistence policy.
     ///
-    /// The default keeps third-party stores compatible by delegating to the raw append API.
+    /// The returned receipt must use a nonzero sequence that increases in the exact replay order
+    /// for each live-thread writer lifetime. LiveThread consumes those receipts in sequence before
+    /// applying append-derived metadata projections.
+    ///
     fn append_persisted_items<'a>(
         &'a self,
         thread_id: ThreadId,
         items: &'a [RolloutItem],
-    ) -> ThreadStoreFuture<'a, ()> {
-        Box::pin(async move {
-            self.append_items(AppendThreadItemsParams {
-                thread_id,
-                items: items.to_vec(),
-            })
-            .await
-        })
-    }
+    ) -> ThreadStoreFuture<'a, AppendThreadItemsReceipt>;
 
     /// Materializes the thread if persistence is lazy, then persists all queued items.
     fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;

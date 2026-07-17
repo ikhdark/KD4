@@ -3,7 +3,7 @@ use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
 use std::collections::BTreeMap;
 
-arpub(crate) const SEARCH_SOURCE_TOOL_NAME: &str = "search_source";
+pub(crate) const SEARCH_SOURCE_TOOL_NAME: &str = "search_source";
 pub(crate) const READ_FILE_SPAN_TOOL_NAME: &str = "read_file_span";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
