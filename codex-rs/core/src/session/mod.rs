@@ -921,9 +921,7 @@ impl Codex {
             .await?;
         self.session
             .services
-            .latest_mcp_runtime()
-            .manager()
-            .set_elicitations_auto_deny(mcp_elicitations_auto_deny);
+            .set_mcp_elicitations_auto_deny(mcp_elicitations_auto_deny);
         Ok(())
     }
 

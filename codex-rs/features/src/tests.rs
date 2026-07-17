@@ -652,6 +652,9 @@ multi_agent_mode_hint_text = "Custom mode guidance."
 tool_namespace = "agents"
 hide_spawn_agent_metadata = true
 non_code_mode_only = true
+high_risk_paths = ["codex-rs/protocol", "codex-rs/core/config.schema.json"]
+high_risk_contracts = ["app-server-protocol", "stored-session"]
+verifier_writable_roots = ["codex-rs/target", ".codex/verify-local"]
 "#,
     )
     .expect("features table should deserialize");
@@ -676,6 +679,18 @@ non_code_mode_only = true
             tool_namespace: Some("agents".to_string()),
             hide_spawn_agent_metadata: Some(true),
             non_code_mode_only: Some(true),
+            high_risk_paths: Some(vec![
+                "codex-rs/protocol".to_string(),
+                "codex-rs/core/config.schema.json".to_string(),
+            ]),
+            high_risk_contracts: Some(vec![
+                "app-server-protocol".to_string(),
+                "stored-session".to_string(),
+            ]),
+            verifier_writable_roots: Some(vec![
+                "codex-rs/target".to_string(),
+                ".codex/verify-local".to_string(),
+            ]),
         }))
     );
 }

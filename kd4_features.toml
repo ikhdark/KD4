@@ -469,7 +469,7 @@ contains = "tool_search_cache_rebuilds_when_deferred_sources_change"
 [[features]]
 id = "source-tools"
 version = 1
-status = "disabled"
+status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/file-search"
 summary = "Feature-gated structured source search and bounded file-span reads."

@@ -57,6 +57,8 @@ pub(crate) struct SessionServices {
     pub(crate) mcp_connection_manager: Arc<ArcSwap<McpConnectionManager>>,
     /// The latest atomically published MCP config and manager pair.
     pub(crate) mcp_runtime: ArcSwapOption<McpRuntimeSnapshot>,
+    /// The app-server compatibility policy to apply to both current and future MCP runtimes.
+    pub(crate) mcp_elicitations_auto_deny: AtomicBool,
     /// Aggregate generation for model-visible planning state. Every invalidating
     /// publication must advance this value before a pending turn may replan.
     pub(crate) planning_generation: AtomicU64,
@@ -143,6 +145,7 @@ impl SessionServices {
         manager: McpConnectionManager,
     ) -> Arc<McpRuntimeSnapshot> {
         let manager = Arc::new(manager);
+        manager.set_elicitations_auto_deny(self.mcp_elicitations_auto_deny.load(Ordering::Acquire));
         // Publish the manager for legacy resource clients first. Once the paired snapshot is
         // visible, every model-scoped consumer observes this exact manager.
         self.mcp_connection_manager.store(Arc::clone(&manager));
@@ -154,13 +157,29 @@ impl SessionServices {
             available_environment_ids,
         ));
         self.mcp_runtime.store(Some(Arc::clone(&runtime)));
+        // Close the publication race with an app-server update that arrived after the first
+        // policy read but before the runtime became visible.
+        runtime
+            .manager()
+            .set_elicitations_auto_deny(self.mcp_elicitations_auto_deny.load(Ordering::Acquire));
         self.bump_planning_generation();
         runtime
     }
 
     pub(crate) fn publish_mcp_runtime_snapshot(&self, runtime: Arc<McpRuntimeSnapshot>) {
+        runtime.manager().set_elicitations_auto_deny(
+            self.mcp_elicitations_auto_deny.load(Ordering::Acquire),
+        );
         self.mcp_runtime.store(Some(runtime));
         self.bump_planning_generation();
+    }
+
+    pub(crate) fn set_mcp_elicitations_auto_deny(&self, auto_deny: bool) {
+        self.mcp_elicitations_auto_deny
+            .store(auto_deny, Ordering::Release);
+        if let Some(runtime) = self.mcp_runtime.load_full() {
+            runtime.manager().set_elicitations_auto_deny(auto_deny);
+        }
     }
 
     pub(crate) fn planning_generation(&self) -> u64 {

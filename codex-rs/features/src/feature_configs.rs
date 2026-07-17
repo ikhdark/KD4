@@ -64,6 +64,15 @@ pub struct MultiAgentV2ConfigToml {
     pub hide_spawn_agent_metadata: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_code_mode_only: Option<bool>,
+    /// Repository-relative path prefixes that always require a cold review gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub high_risk_paths: Option<Vec<String>>,
+    /// Stable contract identifiers that always require a cold review gate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub high_risk_contracts: Option<Vec<String>>,
+    /// Repository-relative build or cache roots a typed verifier may write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verifier_writable_roots: Option<Vec<String>>,
 }
 
 impl FeatureConfig for MultiAgentV2ConfigToml {

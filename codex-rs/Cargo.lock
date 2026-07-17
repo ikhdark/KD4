@@ -1900,6 +1900,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "codex-agent-task-store"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "codex-state",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "codex-analytics"
 version = "0.0.0"
 dependencies = [

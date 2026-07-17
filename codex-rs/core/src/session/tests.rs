@@ -5507,6 +5507,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let services = SessionServices {
         mcp_connection_manager: Arc::new(arc_swap::ArcSwap::from(mcp_runtime.manager_arc())),
         mcp_runtime: arc_swap::ArcSwapOption::from(Some(mcp_runtime)),
+        mcp_elicitations_auto_deny: std::sync::atomic::AtomicBool::new(false),
         planning_generation: std::sync::atomic::AtomicU64::new(1),
         mcp_projection: crate::state::McpProjectionCoordinator::new(),
         mcp_startup_cancellation_token: std::sync::Mutex::new(CancellationToken::new()),
@@ -7657,6 +7658,7 @@ where
     let services = SessionServices {
         mcp_connection_manager: Arc::new(arc_swap::ArcSwap::from(mcp_runtime.manager_arc())),
         mcp_runtime: arc_swap::ArcSwapOption::from(Some(mcp_runtime)),
+        mcp_elicitations_auto_deny: std::sync::atomic::AtomicBool::new(false),
         planning_generation: std::sync::atomic::AtomicU64::new(1),
         mcp_projection: crate::state::McpProjectionCoordinator::new(),
         mcp_startup_cancellation_token: std::sync::Mutex::new(CancellationToken::new()),

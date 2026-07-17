@@ -1145,6 +1145,7 @@ impl Session {
                 // setup is straightforward enough and performs well.
                 mcp_connection_manager,
                 mcp_runtime: arc_swap::ArcSwapOption::empty(),
+                mcp_elicitations_auto_deny: std::sync::atomic::AtomicBool::new(false),
                 planning_generation: std::sync::atomic::AtomicU64::new(0),
                 mcp_projection: crate::state::McpProjectionCoordinator::new(),
                 mcp_startup_cancellation_token: std::sync::Mutex::new(CancellationToken::new()),

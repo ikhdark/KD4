@@ -851,6 +851,29 @@ async fn thread_start_publishes_configuration_before_discovery_and_gates_first_t
     };
     assert_eq!(warning.message, "startup warning before discovery");
 
+    assert!(
+        started
+            .thread
+            .codex
+            .session
+            .services
+            .mcp_runtime
+            .load_full()
+            .is_none(),
+        "MCP runtime should remain unpublished while discovery is blocked"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        started.thread.set_app_server_client_info(
+            Some("Xcode".to_string()),
+            Some("26.4".to_string()),
+            /*mcp_elicitations_auto_deny*/ true,
+        ),
+    )
+    .await
+    .expect("client info update must not wait for startup discovery")
+    .expect("client info update should succeed before MCP runtime publication");
+
     started
         .thread
         .submit(Op::UserInput {
@@ -884,6 +907,17 @@ async fn thread_start_publishes_configuration_before_discovery_and_gates_first_t
     .await
     .expect("turn should enter its public lifecycle after discovery");
     assert!(matches!(turn_started.msg, EventMsg::TurnStarted(_)));
+    assert!(
+        started
+            .thread
+            .codex
+            .session
+            .services
+            .latest_mcp_runtime()
+            .manager()
+            .elicitations_auto_deny(),
+        "client compatibility policy should apply to the runtime published after the update"
+    );
     tokio::time::timeout(Duration::from_secs(5), started.thread.shutdown_and_wait())
         .await
         .expect("thread shutdown should finish")
