@@ -319,6 +319,12 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
         .and_then(Value::as_array)
         .expect("response.create input array");
     assert!(!create_items.is_empty());
+    assert!(
+        create_items.iter().all(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+        }),
+        "production stream path should send only the unsent tool-output suffix"
+    );
 
     let output_item = create_items
         .iter()
@@ -333,6 +339,181 @@ async fn websocket_v2_test_codex_shell_chain() -> Result<()> {
     assert_eq!(
         handshake.header("openai-beta"),
         Some(WS_V2_BETA_HEADER_VALUE.to_string())
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_v2_reconnect_invalidates_previous_response_and_resends_full_history()
+-> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_websocket_server(vec![
+        vec![
+            vec![ev_response_created("warm-1"), ev_completed("warm-1")],
+            vec![
+                ev_response_created("resp-1"),
+                ev_assistant_message("msg-1", "first done"),
+                ev_completed("resp-1"),
+            ],
+        ],
+        vec![vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "second done"),
+            ev_completed("resp-2"),
+        ]],
+    ])
+    .await;
+
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::ResponsesWebsocketsV2)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_websocket_server(&server).await?;
+
+    test.submit_turn("first").await?;
+    test.submit_turn("second").await?;
+
+    assert_eq!(server.handshakes().len(), 2);
+    let connections = server.connections();
+    assert_eq!(connections.len(), 2);
+    let reconnected = connections[1]
+        .first()
+        .expect("missing request on reconnected websocket")
+        .body_json();
+    assert_eq!(reconnected.get("previous_response_id"), None);
+    let input = reconnected
+        .get("input")
+        .and_then(Value::as_array)
+        .expect("reconnect should send a full input array");
+    assert!(input.len() >= 3, "full history should include both turns");
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_v2_thread_rollback_invalidates_suffix_reuse() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_websocket_server(vec![vec![
+        vec![ev_response_created("warm-1"), ev_completed("warm-1")],
+        vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "first response"),
+            ev_completed("resp-1"),
+        ],
+        vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "rolled back response"),
+            ev_completed("resp-2"),
+        ],
+        vec![
+            ev_response_created("resp-3"),
+            ev_assistant_message("msg-3", "replacement response"),
+            ev_completed("resp-3"),
+        ],
+    ]])
+    .await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::ResponsesWebsocketsV2)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_websocket_server(&server).await?;
+
+    test.submit_turn("first request").await?;
+    test.submit_turn("request to remove").await?;
+    test.codex
+        .submit(Op::ThreadRollback { num_turns: 1 })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::ThreadRolledBack(_))
+    })
+    .await;
+    test.submit_turn("replacement request").await?;
+
+    let connection = server.single_connection();
+    let after_rollback = connection
+        .get(3)
+        .expect("missing post-rollback request")
+        .body_json();
+    assert_eq!(after_rollback.get("previous_response_id"), None);
+    let encoded = after_rollback.to_string();
+    assert!(encoded.contains("first request"));
+    assert!(encoded.contains("replacement request"));
+    assert!(!encoded.contains("request to remove"));
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_v2_output_schema_change_invalidates_previous_response() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_websocket_server(vec![vec![
+        vec![ev_response_created("warm-1"), ev_completed("warm-1")],
+        vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "plain response"),
+            ev_completed("resp-1"),
+        ],
+        vec![
+            ev_response_created("resp-2"),
+            ev_assistant_message("msg-2", "structured response"),
+            ev_completed("resp-2"),
+        ],
+    ]])
+    .await;
+    let mut builder = test_codex().with_config(|config| {
+        config
+            .features
+            .enable(Feature::ResponsesWebsocketsV2)
+            .expect("test config should allow feature update");
+    });
+    let test = builder.build_with_websocket_server(&server).await?;
+
+    test.submit_turn("plain request").await?;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "structured request".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {"answer": {"type": "string"}},
+                "required": ["answer"],
+                "additionalProperties": false
+            })),
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: ThreadSettingsOverrides::default(),
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    let connection = server.single_connection();
+    let structured = connection
+        .get(2)
+        .expect("missing structured request")
+        .body_json();
+    assert_eq!(structured.get("previous_response_id"), None);
+    assert!(structured.get("text").is_some());
+    assert!(
+        structured
+            .get("input")
+            .and_then(Value::as_array)
+            .is_some_and(|input| input.len() >= 3)
     );
 
     server.shutdown().await;

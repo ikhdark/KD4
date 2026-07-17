@@ -43,6 +43,7 @@ use tracing::instrument;
 
 use crate::context::ContextualUserFragment;
 use crate::context::HookAdditionalContext;
+use crate::context_manager::PromptHistorySnapshot;
 use crate::event_mapping::parse_turn_item;
 use crate::session::TurnInput;
 use crate::session::session::Session;
@@ -496,9 +497,10 @@ pub(crate) async fn run_post_compact_hooks(
 pub(crate) async fn run_legacy_after_agent_hook(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    input: &[ResponseItem],
+    history: &PromptHistorySnapshot,
     last_assistant_message: Option<String>,
 ) -> bool {
+    let input = history.materialize();
     let mut abort_message = None;
     let input_messages = input
         .iter()

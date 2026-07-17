@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 
 use crate::apply_skill_injection_observability;
 use crate::client::ModelClientSession;
+use crate::client::RequestAuthSnapshot;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::collect_explicit_skill_mentions;
@@ -95,12 +96,12 @@ use codex_core_skills::injection::PlannedSkillInjections;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
+use codex_protocol::auth::AuthMode;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
-use codex_protocol::auth::AuthMode;
 use codex_protocol::items::PlanItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::items::build_hook_prompt_message;
@@ -312,6 +313,7 @@ pub(crate) async fn run_turn(
                 &sess,
                 &turn_context,
                 Arc::clone(&step_context),
+                &client_session,
                 &mut first_router,
                 &cancellation_token,
             )
@@ -337,7 +339,7 @@ pub(crate) async fn run_turn(
         }
         .await;
         match sampling_request_result {
-            Ok((sampling_request_output, sampling_request_input)) => {
+            Ok((sampling_request_output, sampling_request_history)) => {
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
@@ -364,6 +366,8 @@ pub(crate) async fn run_turn(
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                 .await;
                 let needs_follow_up = model_needs_follow_up || has_pending_input;
+                let terminal_legacy_hook_history =
+                    terminal_legacy_hook_history(needs_follow_up, sampling_request_history);
                 let token_limit_reached = token_status.token_limit_reached;
 
                 trace!(
@@ -389,6 +393,33 @@ pub(crate) async fn run_turn(
                     token_status.tokens_until_compaction,
                 )
                 .await;
+
+                // Tool execution is quiescent at this boundary. Run any pending
+                // automatic validation before the next sampling request or terminal
+                // completion path so its receipt is bound to this evidence epoch.
+                if (model_needs_follow_up || !has_pending_input)
+                    && let Some(request) = sess
+                        .services
+                        .task_evidence
+                        .take_automatic_verify_plan_request()
+                        .await
+                    && let Err(err) = crate::tools::handlers::run_automatic_verify_local(
+                        Arc::clone(&sess),
+                        Arc::clone(&step_context),
+                        Arc::clone(&turn_diff_tracker),
+                        request,
+                        cancellation_token.child_token(),
+                    )
+                    .await
+                {
+                    sess.send_event(
+                        &turn_context,
+                        EventMsg::Warning(WarningEvent {
+                            message: format!("automatic verify_local failed: {err:?}"),
+                        }),
+                    )
+                    .await;
+                }
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if needs_follow_up
@@ -419,30 +450,6 @@ pub(crate) async fn run_turn(
 
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
-                    if let Some(changed_paths) = sess
-                        .services
-                        .task_evidence
-                        .take_automatic_verify_plan_request()
-                        .await
-                    {
-                        if let Err(err) = crate::tools::handlers::run_automatic_verify_local_plan(
-                            Arc::clone(&sess),
-                            Arc::clone(&step_context),
-                            Arc::clone(&turn_diff_tracker),
-                            changed_paths,
-                            cancellation_token.child_token(),
-                        )
-                        .await
-                        {
-                            sess.send_event(
-                                &turn_context,
-                                EventMsg::Warning(WarningEvent {
-                                    message: format!("automatic verify_local plan failed: {err:?}"),
-                                }),
-                            )
-                            .await;
-                        }
-                    }
                     if let Some(warning) = sess
                         .services
                         .task_evidence
@@ -489,7 +496,9 @@ pub(crate) async fn run_turn(
                     if run_legacy_after_agent_hook(
                         &sess,
                         &turn_context,
-                        &sampling_request_input,
+                        terminal_legacy_hook_history
+                            .as_ref()
+                            .expect("terminal sampling keeps its hook history snapshot"),
                         last_agent_message.clone(),
                     )
                     .await
@@ -555,6 +564,13 @@ async fn turn_diff_display_roots(
         .display_roots()
 }
 
+fn terminal_legacy_hook_history(
+    needs_follow_up: bool,
+    history: PromptHistorySnapshot,
+) -> Option<PromptHistorySnapshot> {
+    (!needs_follow_up).then_some(history)
+}
+
 #[instrument(level = "trace", skip_all)]
 async fn run_hooks_and_record_inputs(
     sess: &Arc<Session>,
@@ -609,6 +625,7 @@ enum PendingTurnPlanBuild {
 
 struct SamplingRequestSnapshot {
     generation: u64,
+    auth: RequestAuthSnapshot,
     history: PromptHistorySnapshot,
     step_context: Arc<StepContext>,
     router: Arc<ToolRouter>,
@@ -620,6 +637,7 @@ async fn capture_sampling_request_snapshot(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     initial_step_context: Arc<StepContext>,
+    client_session: &ModelClientSession,
     preferred_router: &mut Option<(u64, Option<AuthMode>, Arc<ToolRouter>)>,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<SamplingRequestSnapshot> {
@@ -629,6 +647,7 @@ async fn capture_sampling_request_snapshot(
             return Err(CodexErr::TurnAborted);
         }
         let generation = sess.services.planning_generation();
+        let auth = client_session.capture_request_auth_snapshot().await?;
         let auth_mode = turn_context
             .auth_manager
             .as_deref()
@@ -672,10 +691,12 @@ async fn capture_sampling_request_snapshot(
         if sess.services.planning_generation() == generation
             && sess.history_mutation_revision().await == history.mutation_revision()
             && current_auth_mode == auth_mode
+            && client_session.request_auth_generation_matches(&auth)
             && current_base_instructions.text.as_str() == base_instructions.text.as_str()
         {
             return Ok(SamplingRequestSnapshot {
                 generation,
+                auth,
                 history,
                 step_context: current_step_context,
                 router,
@@ -731,8 +752,7 @@ async fn build_pure_pending_turn_plan(
                 .as_deref()
                 .and_then(|auth| auth.auth_mode())
                 != auth_mode
-            || sess.get_base_instructions().await.text.as_str()
-                != base_instructions.text.as_str()
+            || sess.get_base_instructions().await.text.as_str() != base_instructions.text.as_str()
         {
             return Ok(PendingTurnPlanBuild::Stale);
         }
@@ -1169,8 +1189,7 @@ async fn stabilize_pending_turn_plan(
         }
 
         if sess.services.planning_generation() != plan.identity.generation
-            || sess.history_mutation_revision().await
-                != plan.history_snapshot.mutation_revision()
+            || sess.history_mutation_revision().await != plan.history_snapshot.mutation_revision()
             || turn_context
                 .auth_manager
                 .as_deref()
@@ -1239,7 +1258,17 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
     }
     hasher.update(format!("{:?}", step_context.turn.config.features.get()).as_bytes());
     hasher.update(format!("{:?}", step_context.turn.model_info.input_modalities).as_bytes());
-    hasher.update(format!("{:?}", step_context.turn.auth_manager.as_deref().and_then(|auth| auth.auth_mode())).as_bytes());
+    hasher.update(
+        format!(
+            "{:?}",
+            step_context
+                .turn
+                .auth_manager
+                .as_deref()
+                .and_then(|auth| auth.auth_mode())
+        )
+        .as_bytes(),
+    );
     hasher.update(step_context.mcp.version().to_be_bytes());
     hasher.update(base_instructions.text.as_bytes());
     for environment in &step_context.environments.turn_environments {
@@ -1781,7 +1810,7 @@ async fn run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
     cancellation_token: CancellationToken,
-) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
+) -> CodexResult<(SamplingRequestResult, PromptHistorySnapshot)> {
     let turn_context = Arc::clone(&sampling_snapshot.step_context.turn);
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
@@ -1790,6 +1819,7 @@ async fn run_sampling_request(
     loop {
         let SamplingRequestSnapshot {
             generation,
+            auth,
             history,
             step_context,
             router,
@@ -1833,17 +1863,17 @@ async fn run_sampling_request(
             Arc::clone(&turn_diff_tracker),
             &prompt,
             &history,
+            &auth,
             preparation_timing_guard,
             cancellation_token.child_token(),
         )
         .await
         {
             Ok(output) => {
-                let original_input = original_history
-                    .as_ref()
-                    .expect("sampling owns an initial history snapshot")
-                    .materialize();
-                return Ok((output, original_input));
+                let original_history = original_history
+                    .take()
+                    .expect("sampling owns an initial history snapshot");
+                return Ok((output, original_history));
             }
             Err(CodexErr::ContextWindowExceeded) => {
                 sess.set_total_tokens_full(&turn_context).await;
@@ -1888,6 +1918,7 @@ async fn run_sampling_request(
                 &sess,
                 &turn_context,
                 step_context,
+                client_session,
                 &mut preferred_router,
                 &cancellation_token,
             )
@@ -2641,6 +2672,7 @@ async fn try_run_sampling_request(
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
     history: &PromptHistorySnapshot,
+    auth: &RequestAuthSnapshot,
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
@@ -2684,6 +2716,7 @@ async fn try_run_sampling_request(
         .stream_with_history_snapshot(
             prompt,
             history,
+            auth,
             &turn_context.model_info,
             &turn_context.session_telemetry,
             turn_context.reasoning_effort.clone(),
@@ -2997,10 +3030,8 @@ async fn try_run_sampling_request(
                 should_emit_token_count = true;
             }
             ResponseEvent::ModelsEtag(etag) => {
-                Arc::clone(&sess.services.models_manager).enqueue_refresh_if_new_etag(
-                    etag,
-                    turn_context.config.http_client_factory(),
-                );
+                Arc::clone(&sess.services.models_manager)
+                    .enqueue_refresh_if_new_etag(etag, turn_context.config.http_client_factory());
             }
             ResponseEvent::Completed {
                 token_usage,

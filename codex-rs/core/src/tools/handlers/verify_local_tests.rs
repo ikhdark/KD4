@@ -1,24 +1,238 @@
 use super::*;
 use crate::function_tool::FunctionCallError;
+use crate::session::tests::make_session_and_context;
+use crate::turn_diff_tracker::TurnDiffTracker;
+use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::TaskCompletionStatus;
 use serde_json::json;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
-#[test]
-fn automatic_planning_calls_the_rust_library_without_a_planning_subprocess() {
-    let source = include_str!("verify_local.rs");
-    let start = source
-        .find("pub(crate) async fn run_automatic_verify_local_plan")
-        .expect("automatic planner");
-    let end = source[start..]
-        .find("\nfn parse_verify_local_arguments")
-        .map(|offset| start + offset)
-        .expect("next function");
-    let automatic = &source[start..end];
-    assert!(automatic.contains("plan_verification("));
-    assert!(automatic.contains("finalize_plan("));
-    assert!(!automatic.contains("handle_call("));
-    assert!(!automatic.contains("ToolInvocation"));
-    assert!(!automatic.contains("verify-local"));
-    assert!(!automatic.contains("Command::"));
+#[cfg(windows)]
+fn automatic_validation_command(long_running: bool) -> Vec<codex_verify_local::CommandArgV2> {
+    let script = if long_running {
+        "Start-Sleep -Seconds 30"
+    } else {
+        "exit 0"
+    };
+    [
+        "powershell.exe",
+        "-NonInteractive",
+        "-NoLogo",
+        "-Command",
+        script,
+    ]
+        .into_iter()
+        .map(codex_verify_local::CommandArgV2::text)
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn automatic_validation_command(long_running: bool) -> Vec<codex_verify_local::CommandArgV2> {
+    let script = if long_running { "sleep 30" } else { "exit 0" };
+    ["sh", "-c", script]
+        .into_iter()
+        .map(codex_verify_local::CommandArgV2::text)
+        .collect()
+}
+
+fn automatic_validation_plan(
+    repo_root: &std::path::Path,
+    changed_path: &str,
+    long_running: bool,
+) -> codex_verify_local::PlanEnvelopeV2 {
+    let changed = RawPath::from_utf8(changed_path);
+    let snapshot = RepositorySnapshot::from_explicit_paths(repo_root, [changed.clone()])
+        .expect("explicit automatic validation snapshot");
+    let mut plan = plan_verification(
+        PlanRequest {
+            mode: Some(PlanMode::Fast),
+            changed: vec![changed.clone()],
+            ..PlanRequest::default()
+        },
+        snapshot,
+    );
+    plan.verdict = None;
+    plan.commands = vec![codex_verify_local::CommandSpecV2 {
+        id: if long_running {
+            "automatic-cancellation"
+        } else {
+            "automatic-success"
+        }
+        .to_string(),
+        kind: "owner_test".to_string(),
+        args: automatic_validation_command(long_running),
+        cwd: RawPath::from_utf8("."),
+        timeout_ms: 30_000,
+        owner_packages: vec!["codex-core".to_string()],
+        hash_paths: vec![changed],
+        reason: "exercise Core's in-process automatic validation execution".to_string(),
+    }];
+    plan
+}
+
+#[tokio::test]
+async fn automatic_validation_cancels_stale_generation_then_records_one_exact_fast_receipt() {
+    const CHANGED_PATH: &str = "codex-rs/core/src/task_evidence.rs";
+    let (session, mut turn) = make_session_and_context().await;
+    turn.approval_policy
+        .set(AskForApproval::Never)
+        .expect("test approval policy");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    #[allow(deprecated)]
+    let repo_root = find_verify_local_repo_root(&turn.cwd).expect("KD4 repository root");
+    let ledger = &session.services.task_evidence;
+    ledger
+        .seed_automatic_validation_mutation_for_test(&[CHANGED_PATH])
+        .await;
+    let stale = ledger
+        .take_automatic_verify_plan_request()
+        .await
+        .expect("stale automatic claim");
+    let stale_generation = stale.evidence_generation;
+    let stale_claim_id = stale.claim_id.clone();
+    let stale_run = tokio::spawn(run_automatic_verify_local_with_plan(
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        Arc::clone(&tracker),
+        stale,
+        CancellationToken::new(),
+        automatic_validation_plan(&repo_root, CHANGED_PATH, true),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ledger.validation_active_for_generation_for_test(stale_generation) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("automatic validation should become active");
+
+    ledger
+        .seed_automatic_validation_mutation_for_test(&[CHANGED_PATH])
+        .await;
+    tokio::time::timeout(Duration::from_secs(5), stale_run)
+        .await
+        .expect("stale automatic validation should cancel promptly")
+        .expect("stale automatic validation task should join")
+        .expect("cancelled verifier execution still returns its contract");
+    let stale_receipts = ledger
+        .automatic_validation_receipts_for_test(&stale_claim_id)
+        .await;
+    assert_eq!(stale_receipts.len(), 1);
+    assert!(!stale_receipts[0].2);
+
+    let current = ledger
+        .take_automatic_verify_plan_request()
+        .await
+        .expect("current automatic claim");
+    let current_claim_id = current.claim_id.clone();
+    run_automatic_verify_local_with_plan(
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        Arc::clone(&tracker),
+        current,
+        CancellationToken::new(),
+        automatic_validation_plan(&repo_root, CHANGED_PATH, false),
+    )
+    .await
+    .expect("current automatic validation");
+
+    assert_eq!(
+        ledger
+            .automatic_validation_receipts_for_test(&current_claim_id)
+            .await,
+        vec![(
+            "fast".to_string(),
+            vec![CHANGED_PATH.to_string()],
+            true,
+        )]
+    );
+}
+
+#[tokio::test]
+async fn automatic_fast_pass_cannot_override_stronger_final_failure() {
+    const CHANGED_PATH: &str = "codex-rs/core/src/task_evidence.rs";
+    let (session, mut turn) = make_session_and_context().await;
+    turn.approval_policy
+        .set(AskForApproval::Never)
+        .expect("test approval policy");
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let step_context = StepContext::for_test(Arc::clone(&turn));
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    #[allow(deprecated)]
+    let repo_root = find_verify_local_repo_root(&turn.cwd).expect("KD4 repository root");
+    let ledger = &session.services.task_evidence;
+    ledger
+        .seed_automatic_validation_mutation_for_test(&[CHANGED_PATH])
+        .await;
+    let first = ledger
+        .take_automatic_verify_plan_request()
+        .await
+        .expect("first automatic claim");
+    run_automatic_verify_local_with_plan(
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        Arc::clone(&tracker),
+        first,
+        CancellationToken::new(),
+        automatic_validation_plan(&repo_root, CHANGED_PATH, false),
+    )
+    .await
+    .expect("first automatic fast pass");
+
+    let final_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("final validation start");
+    assert!(
+        !ledger
+            .record_verify_local(
+                "final",
+                Some("FAILED"),
+                false,
+                false,
+                true,
+                Some(&final_start),
+                &[PathBuf::from(CHANGED_PATH)],
+                &[],
+                Some(&json!({"verdict": "FAILED"})),
+            )
+            .await
+    );
+    let retry = ledger
+        .take_automatic_verify_plan_request()
+        .await
+        .expect("automatic claim after final failure");
+    let retry_claim_id = retry.claim_id.clone();
+    run_automatic_verify_local_with_plan(
+        Arc::clone(&session),
+        step_context,
+        tracker,
+        retry,
+        CancellationToken::new(),
+        automatic_validation_plan(&repo_root, CHANGED_PATH, false),
+    )
+    .await
+    .expect("later automatic fast pass");
+
+    let receipts = ledger
+        .automatic_validation_receipts_for_test(&retry_claim_id)
+        .await;
+    assert_eq!(receipts.len(), 1);
+    assert!(receipts[0].2);
+    let gate = ledger.completion_gate().await.expect("completion gate");
+    assert_ne!(gate.status, TaskCompletionStatus::Passed);
+    assert!(
+        gate.reasons
+            .iter()
+            .any(|reason| reason.contains("conclusively failed"))
+    );
 }
 
 fn base_args() -> serde_json::Value {
@@ -162,6 +376,52 @@ async fn command_result_artifact_preserves_non_utf8_process_bytes() {
         tokio::fs::read(artifact.path).await.expect("artifact"),
         exact
     );
+}
+
+#[tokio::test]
+async fn incomplete_process_capture_is_not_bound_as_exact_verifier_output() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let plan = codex_verify_local::PlanEnvelopeV2::new(PlanMode::Fast, "invocation");
+    let command = codex_verify_local::CommandSpecV2 {
+        id: "incomplete-output".to_string(),
+        kind: "owner_test".to_string(),
+        args: vec![codex_verify_local::CommandArgV2::text("partial verifier")],
+        cwd: RawPath::from_utf8("."),
+        timeout_ms: 1_000,
+        owner_packages: vec!["codex-core".to_string()],
+        hash_paths: Vec::new(),
+        reason: "test".to_string(),
+    };
+    let mut output = structured_process_output("partial output\n".to_string(), "", 0);
+    output.output_complete = false;
+
+    let result = command_result_from_core_execution(
+        &plan,
+        &command,
+        0,
+        "nonce".to_string(),
+        Some(&output),
+        Some(0),
+        temp.path(),
+        "thread/verify-local-incomplete",
+        "partial verifier",
+    )
+    .await;
+
+    assert_eq!(result.log_state, LogState::IncompleteAfterTermination);
+    assert!(result.exact_output_artifact.is_none());
+    assert!(result.log_path.is_some());
+    assert!(
+        result
+            .runner_error
+            .as_deref()
+            .is_some_and(|error| error.contains("incomplete after termination"))
+    );
+    assert!(result.diagnostic.starts_with("Incomplete captured output:"));
+
+    let finalized = finalize_plan(plan, vec![result]);
+    assert_eq!(finalized.verdict, codex_verify_local::Verdict::ToolingError);
+    assert!(!finalized.cache_eligible);
 }
 
 #[test]

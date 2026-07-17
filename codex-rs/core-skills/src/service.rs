@@ -99,7 +99,7 @@ pub struct SkillsService {
     restriction_product: Option<Product>,
     extra_roots: RwLock<Vec<AbsolutePathBuf>>,
     cache: Arc<RwLock<SkillsCache>>,
-    local_watcher: Option<FileWatcherSubscriber>,
+    local_watcher: OnceCell<Option<FileWatcherSubscriber>>,
 }
 
 #[derive(Default)]
@@ -143,7 +143,7 @@ impl SkillsService {
             codex_home,
             restriction_product,
             extra_roots: RwLock::new(Vec::new()),
-            local_watcher: Self::start_local_watcher(Arc::clone(&cache)),
+            local_watcher: OnceCell::new(),
             cache,
         };
         if !bundled_skills_enabled {
@@ -267,7 +267,7 @@ impl SkillsService {
             {
                 return snapshot;
             }
-            let watch_registration = self.register_local_watch_paths(input, &layout);
+            let watch_registration = self.register_local_watch_paths(input, &layout).await;
             if self.filesystem_generation() != generation {
                 continue;
             }
@@ -286,7 +286,7 @@ impl SkillsService {
         }
     }
 
-    fn register_local_watch_paths(
+    async fn register_local_watch_paths(
         &self,
         input: &SkillsLoadInput,
         layout: &SkillRootLayout,
@@ -294,7 +294,11 @@ impl SkillsService {
         if !input.watch_local_filesystem {
             return WatchRegistration::default();
         }
-        let Some(subscriber) = self.local_watcher.as_ref() else {
+        let subscriber = self
+            .local_watcher
+            .get_or_init(|| async { Self::start_local_watcher(Arc::clone(&self.cache)) })
+            .await;
+        let Some(subscriber) = subscriber.as_ref() else {
             return WatchRegistration::default();
         };
 

@@ -89,7 +89,7 @@ pub use unified_exec::ExecCommandHandler;
 pub(crate) use unified_exec::ExecCommandHandlerOptions;
 pub use unified_exec::WriteStdinHandler;
 pub use verify_local::VerifyLocalHandler;
-pub(crate) use verify_local::run_automatic_verify_local_plan;
+pub(crate) use verify_local::run_automatic_verify_local;
 pub use view_image::ViewImageHandler;
 pub(crate) use wait_for_environment::WaitForEnvironmentHandler;
 

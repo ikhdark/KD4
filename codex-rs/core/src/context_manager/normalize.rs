@@ -41,9 +41,7 @@ impl PromptNormalizationIndex {
 
     pub(crate) fn insert(&mut self, position: usize, item: &ResponseItem) {
         let entry = match item {
-            ResponseItem::FunctionCall { call_id, .. } => {
-                Some((&mut self.function_calls, call_id))
-            }
+            ResponseItem::FunctionCall { call_id, .. } => Some((&mut self.function_calls, call_id)),
             ResponseItem::LocalShellCall {
                 call_id: Some(call_id),
                 ..
@@ -108,19 +106,19 @@ impl PromptNormalizationIndex {
         input_modalities: &[InputModality],
     ) -> Vec<ResponseItem> {
         let mut segment = match item {
-            ResponseItem::FunctionCall {
-                id,
-                call_id,
-                ..
-            } if !self.function_outputs.contains_key(call_id) => vec![
-                item.clone(),
-                ResponseItem::FunctionCallOutput {
-                    id: synthetic_output_id("fco", id.as_deref()),
-                    call_id: call_id.clone(),
-                    output: FunctionCallOutputPayload::from_text("aborted".to_string()),
-                    internal_chat_message_metadata_passthrough: None,
-                },
-            ],
+            ResponseItem::FunctionCall { id, call_id, .. }
+                if !self.function_outputs.contains_key(call_id) =>
+            {
+                vec![
+                    item.clone(),
+                    ResponseItem::FunctionCallOutput {
+                        id: synthetic_output_id("fco", id.as_deref()),
+                        call_id: call_id.clone(),
+                        output: FunctionCallOutputPayload::from_text("aborted".to_string()),
+                        internal_chat_message_metadata_passthrough: None,
+                    },
+                ]
+            }
             ResponseItem::LocalShellCall {
                 id,
                 call_id: Some(call_id),
@@ -149,11 +147,9 @@ impl PromptNormalizationIndex {
                     internal_chat_message_metadata_passthrough: None,
                 },
             ],
-            ResponseItem::CustomToolCall {
-                id,
-                call_id,
-                ..
-            } if !self.custom_tool_outputs.contains_key(call_id) => {
+            ResponseItem::CustomToolCall { id, call_id, .. }
+                if !self.custom_tool_outputs.contains_key(call_id) =>
+            {
                 error_or_panic(format!(
                     "Custom tool call output is missing for call id: {call_id}"
                 ));

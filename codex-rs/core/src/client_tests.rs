@@ -5,6 +5,7 @@ use super::LastResponse;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
+use super::RequestAuthSnapshot;
 use super::RequestSchemaCacheKey;
 use super::RequestSchemaCacheValue;
 use super::RequestSchemaSerializationCache;
@@ -35,6 +36,9 @@ use codex_login::AuthCredentialsStoreMode;
 use codex_login::AuthKeyringBackendKind;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_login::ExternalAuth;
+use codex_login::ExternalAuthFuture;
+use codex_login::ExternalAuthRefreshContext;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider::BearerAuthProvider;
 use codex_model_provider::SharedModelProvider;
@@ -64,9 +68,15 @@ use codex_rollout_trace::RawTraceEventPayload;
 use codex_rollout_trace::RolloutTrace;
 use codex_rollout_trace::TraceWriter;
 use codex_rollout_trace::replay_bundle;
-use futures::StreamExt;
 use codex_utils_output_truncation::TruncationPolicy;
+use core_test_support::responses::ev_assistant_message;
+use core_test_support::responses::ev_completed;
+use core_test_support::responses::ev_response_created;
+use core_test_support::responses::start_websocket_server;
+use core_test_support::skip_if_no_network;
+use futures::StreamExt;
 use pretty_assertions::assert_eq;
+use serde_json::Value;
 use serde_json::json;
 use sha2::Digest;
 use sha2::Sha256;
@@ -127,6 +137,46 @@ fn test_model_client_with_thread_id(
     )
 }
 
+fn test_model_client_with_auth_manager(auth_manager: Arc<AuthManager>) -> ModelClient {
+    ModelClient::new(
+        Some(auth_manager),
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        ModelProviderInfo::create_openai_provider(/*base_url*/ None),
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*item_ids_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    )
+}
+
+struct MutableExternalAuth {
+    auth: Mutex<CodexAuth>,
+}
+
+impl MutableExternalAuth {
+    fn replace(&self, auth: CodexAuth) {
+        *self.auth.lock().unwrap() = auth;
+    }
+}
+
+impl ExternalAuth for MutableExternalAuth {
+    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
+        let auth = self.auth.lock().unwrap().clone();
+        Box::pin(async move { Ok(auth) })
+    }
+
+    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
+        self.resolve()
+    }
+}
+
 fn history_test_item(text: &str, turn_id: Option<&str>) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -163,6 +213,19 @@ fn history_test_request(input: Vec<ResponseItem>) -> ResponsesApiRequest {
     }
 }
 
+fn no_auth_snapshot() -> RequestAuthSnapshot {
+    RequestAuthSnapshot {
+        generation: None,
+        identity_digest: super::request_auth_identity_digest(None, None),
+    }
+}
+
+fn default_history_policy() -> crate::context_manager::PromptHistoryPolicyIdentity {
+    crate::context_manager::PromptHistoryPolicyIdentity::for_input_modalities(
+        &default_input_modalities(),
+    )
+}
+
 #[test]
 fn websocket_prefix_hash_ignores_internal_metadata_only() {
     let first = CanonicalPrefixHash::from_items(&[history_test_item("same", Some("turn-a"))])
@@ -184,6 +247,8 @@ fn websocket_incremental_history_uses_compact_digest_and_fails_closed_without_it
     let original = history_test_request(vec![history_test_item("user", Some("turn-a"))]);
     session.remember_request_history(
         &original,
+        &no_auth_snapshot(),
+        default_history_policy(),
         CanonicalPrefixHash::from_items(&original.input),
         None,
         None,
@@ -200,7 +265,14 @@ fn websocket_incremental_history_uses_compact_digest_and_fails_closed_without_it
 
     assert_eq!(
         session
-            .get_incremental_proof(&extended, None, &response, false)
+            .get_incremental_proof(
+                &extended,
+                None,
+                &no_auth_snapshot(),
+                default_history_policy(),
+                &response,
+                false,
+            )
             .map(|proof| proof.input),
         Some(vec![delta.clone()])
     );
@@ -209,7 +281,14 @@ fn websocket_incremental_history_uses_compact_digest_and_fails_closed_without_it
     changed_prefix.input[0] = history_test_item("changed", Some("turn-a"));
     assert_eq!(
         session
-            .get_incremental_proof(&changed_prefix, None, &response, false)
+            .get_incremental_proof(
+                &changed_prefix,
+                None,
+                &no_auth_snapshot(),
+                default_history_policy(),
+                &response,
+                false,
+            )
             .map(|proof| proof.input),
         None
     );
@@ -218,7 +297,14 @@ fn websocket_incremental_history_uses_compact_digest_and_fails_closed_without_it
     session.websocket_session.last_request_history = None;
     assert_eq!(
         session
-            .get_incremental_proof(&extended, None, &response, false)
+            .get_incremental_proof(
+                &extended,
+                None,
+                &no_auth_snapshot(),
+                default_history_policy(),
+                &response,
+                false,
+            )
             .map(|proof| proof.input),
         None
     );
@@ -230,14 +316,13 @@ fn websocket_incremental_history_uses_snapshot_proof_without_current_full_input(
     let mut session = client.new_session();
     let original_item = history_test_item("user", Some("turn-a"));
     let mut history = ContextManager::new();
-    history.record_items(
-        [&original_item],
-        TruncationPolicy::Tokens(10_000),
-    );
+    history.record_items([&original_item], TruncationPolicy::Tokens(10_000));
     let baseline = history.prompt_snapshot(&default_input_modalities());
     let original = history_test_request(baseline.materialize());
     session.remember_request_history(
         &original,
+        &no_auth_snapshot(),
+        baseline.policy_identity(),
         Ok(baseline.canonical_prefix()),
         Some(baseline.mutation_revision()),
         Some(baseline.rewrite_revision()),
@@ -246,10 +331,7 @@ fn websocket_incremental_history_uses_snapshot_proof_without_current_full_input(
 
     let response_item = history_test_item("assistant", Some("turn-a"));
     let delta = history_test_item("next", Some("turn-b"));
-    history.record_items(
-        [&response_item, &delta],
-        TruncationPolicy::Tokens(10_000),
-    );
+    history.record_items([&response_item, &delta], TruncationPolicy::Tokens(10_000));
     let current = history.prompt_snapshot(&default_input_modalities());
     let static_request = history_test_request(Vec::new());
     let response = LastResponse {
@@ -258,7 +340,14 @@ fn websocket_incremental_history_uses_snapshot_proof_without_current_full_input(
     };
 
     let proof = session
-        .get_incremental_proof(&static_request, Some(&current), &response, false)
+        .get_incremental_proof(
+            &static_request,
+            Some(&current),
+            &no_auth_snapshot(),
+            current.policy_identity(),
+            &response,
+            false,
+        )
         .expect("snapshot chain should prove the suffix");
     assert_eq!(proof.input, vec![delta]);
     assert_eq!(proof.current_prefix, current.canonical_prefix());
@@ -272,6 +361,8 @@ fn websocket_incremental_history_invalidates_without_dropping_transport_contract
     let request = history_test_request(vec![history_test_item("user", None)]);
     session.remember_request_history(
         &request,
+        &no_auth_snapshot(),
+        default_history_policy(),
         CanonicalPrefixHash::from_items(&request.input),
         None,
         None,
@@ -287,15 +378,19 @@ fn websocket_incremental_history_invalidates_without_dropping_transport_contract
 
 fn legacy_responses_request_properties_fingerprint(
     request: &ResponsesApiRequest,
+    auth_snapshot: &RequestAuthSnapshot,
+    history_policy_identity: crate::context_manager::PromptHistoryPolicyIdentity,
 ) -> serde_json::Result<[u8; 32]> {
     let mut properties = request.clone();
     properties.input.clear();
     properties.stream_options = None;
     properties.client_metadata = None;
     let serialized = serde_json::to_vec(&properties)?;
+    let static_identity = serde_json::to_vec(&(auth_snapshot, history_policy_identity))?;
     let mut hasher = Sha256::new();
     hasher.update(super::WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN);
-    hasher.update(crate::context_manager::PROMPT_HISTORY_CANONICAL_POLICY_VERSION.to_be_bytes());
+    hasher.update((static_identity.len() as u64).to_be_bytes());
+    hasher.update(static_identity);
     hasher.update((serialized.len() as u64).to_be_bytes());
     hasher.update(serialized);
     Ok(hasher.finalize().into())
@@ -377,13 +472,363 @@ fn borrowed_request_properties_fingerprint_matches_clone_and_clear_for_every_fie
 
     for (index, request) in cases.iter().enumerate() {
         assert_eq!(
-            super::responses_request_properties_fingerprint(request)
-                .expect("borrowed fingerprint should serialize"),
-            legacy_responses_request_properties_fingerprint(request)
-                .expect("legacy fingerprint should serialize"),
+            super::responses_request_properties_fingerprint(
+                request,
+                &no_auth_snapshot(),
+                default_history_policy(),
+            )
+            .expect("borrowed fingerprint should serialize"),
+            legacy_responses_request_properties_fingerprint(
+                request,
+                &no_auth_snapshot(),
+                default_history_policy(),
+            )
+            .expect("legacy fingerprint should serialize"),
             "request case {index}"
         );
     }
+}
+
+#[test]
+fn request_properties_fingerprint_binds_text_only_history_to_modality_policy() {
+    let request = history_test_request(Vec::new());
+    let auth = no_auth_snapshot();
+    let image_capable = crate::context_manager::PromptHistoryPolicyIdentity::for_input_modalities(
+        &default_input_modalities(),
+    );
+    let text_only = crate::context_manager::PromptHistoryPolicyIdentity::for_input_modalities(&[
+        codex_protocol::openai_models::InputModality::Text,
+    ]);
+
+    assert_ne!(
+        super::responses_request_properties_fingerprint(&request, &auth, image_capable,)
+            .expect("image-capable fingerprint"),
+        super::responses_request_properties_fingerprint(&request, &auth, text_only)
+            .expect("text-only fingerprint"),
+    );
+}
+
+#[tokio::test]
+async fn immutable_auth_snapshot_rejects_same_mode_capture_to_send_change() -> anyhow::Result<()> {
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("key-a"));
+    let external = Arc::new(MutableExternalAuth {
+        auth: Mutex::new(CodexAuth::from_api_key("key-a")),
+    });
+    let external_auth: Arc<dyn ExternalAuth> = external.clone();
+    auth_manager.set_external_auth(external_auth).await?;
+    let mut session = test_model_client_with_auth_manager(Arc::clone(&auth_manager)).new_session();
+    let captured = session.capture_request_auth_snapshot().await?;
+    let request = history_test_request(vec![history_test_item("user", None)]);
+    session.remember_request_history(
+        &request,
+        &captured,
+        default_history_policy(),
+        CanonicalPrefixHash::from_items(&request.input),
+        None,
+        None,
+        None,
+    );
+
+    external.replace(CodexAuth::from_api_key("key-b"));
+    assert!(auth_manager.reload().await);
+    let error = match session
+        .client
+        .current_client_setup_for(&captured, /*allow_newer_generation*/ false)
+        .await
+    {
+        Ok(_) => panic!("same-mode credential replacement must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("authentication changed"));
+    let current = session.capture_request_auth_snapshot().await?;
+    let response = LastResponse {
+        response_id: "response-before-auth-change".to_string(),
+        items_added: Vec::new(),
+    };
+    assert!(
+        session
+            .get_incremental_proof(
+                &request,
+                None,
+                &current,
+                default_history_policy(),
+                &response,
+                true,
+            )
+            .is_none(),
+        "websocket previous_response_id reuse must be invalidated"
+    );
+    let debug = format!("{captured:?}");
+    assert!(!debug.contains("key-a"));
+    assert!(!debug.contains("key-b"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn immutable_auth_snapshot_rejects_same_mode_account_change() -> anyhow::Result<()> {
+    let initial = CodexAuth::from_external_chatgpt_tokens(
+        TEST_CHATGPT_ID_TOKEN,
+        "account-before",
+        Some("pro"),
+    )?;
+    let auth_manager = AuthManager::from_auth_for_testing(initial.clone());
+    let external = Arc::new(MutableExternalAuth {
+        auth: Mutex::new(initial),
+    });
+    let external_auth: Arc<dyn ExternalAuth> = external.clone();
+    auth_manager.set_external_auth(external_auth).await?;
+    let session = test_model_client_with_auth_manager(Arc::clone(&auth_manager)).new_session();
+    let captured = session.capture_request_auth_snapshot().await?;
+
+    external.replace(CodexAuth::from_external_chatgpt_tokens(
+        TEST_CHATGPT_ID_TOKEN,
+        "account-after",
+        Some("pro"),
+    )?);
+    assert!(auth_manager.reload().await);
+    let error = match session
+        .client
+        .current_client_setup_for(&captured, /*allow_newer_generation*/ false)
+        .await
+    {
+        Ok(_) => panic!("same-mode account replacement must fail closed"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("authentication changed"));
+    let debug = format!("{captured:?}");
+    assert!(!debug.contains("account-before"));
+    assert!(!debug.contains("account-after"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn production_history_stream_http_fallback_materializes_the_frozen_snapshot()
+-> anyhow::Result<()> {
+    let server = MockServer::start().await;
+    let sse = [
+        json!({"type":"response.created","response":{"id":"resp-http"}}),
+        json!({
+            "type":"response.completed",
+            "response":{
+                "id":"resp-http",
+                "usage":{
+                    "input_tokens":0,
+                    "input_tokens_details":null,
+                    "output_tokens":0,
+                    "output_tokens_details":null,
+                    "total_tokens":0
+                }
+            }
+        }),
+    ]
+    .into_iter()
+    .map(|event| format!("data: {event}\n\n"))
+    .collect::<String>();
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test-key"));
+    let mut provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.supports_websockets = false;
+    let client = ModelClient::new(
+        Some(auth_manager),
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*item_ids_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ None,
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let mut session = client.new_session();
+    let auth_snapshot = session.capture_request_auth_snapshot().await?;
+    let mut history = ContextManager::new();
+    let first = history_test_item("first", None);
+    let second = history_test_item("second", None);
+    history.record_items([&first, &second], TruncationPolicy::Tokens(10_000));
+    let history = history.prompt_snapshot(&default_input_modalities());
+    let prompt = Prompt {
+        base_instructions: BaseInstructions {
+            text: "base instructions".to_string(),
+        },
+        ..Default::default()
+    };
+    let model_info = test_model_info();
+    let telemetry = test_session_telemetry();
+    let inference_trace = InferenceTraceContext::disabled();
+
+    let mut stream = session
+        .stream_with_history_snapshot(
+            &prompt,
+            &history,
+            &auth_snapshot,
+            &model_info,
+            &telemetry,
+            None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            None,
+            &responses_metadata,
+            &inference_trace,
+        )
+        .await?;
+    while stream.next().await.is_some() {}
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    let body: Value =
+        serde_json::from_slice(&requests.first().expect("HTTP fallback request").body)?;
+    assert_eq!(body["input"].as_array().map(Vec::len), Some(2));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_history_stream_invalidates_previous_response_on_modality_change()
+-> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_websocket_server(vec![vec![
+        vec![
+            ev_response_created("resp-1"),
+            ev_assistant_message("msg-1", "first done"),
+            ev_completed("resp-1"),
+        ],
+        vec![ev_response_created("resp-2"), ev_completed("resp-2")],
+    ]])
+    .await;
+    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test-key"));
+    let mut provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
+    provider.base_url = Some(format!("{}/v1", server.uri()));
+    provider.supports_websockets = true;
+    let client = ModelClient::new(
+        Some(auth_manager),
+        AgentIdentityAuthPolicy::JwtOnly,
+        ThreadId::new(),
+        provider,
+        SessionSource::Cli,
+        "test_originator".to_string(),
+        /*model_verbosity*/ None,
+        /*enable_request_compression*/ false,
+        /*include_timing_metrics*/ false,
+        /*beta_features_header*/ None,
+        /*item_ids_enabled*/ false,
+        /*concurrent_reasoning_summaries_enabled*/ false,
+        /*attestation_provider*/ None,
+        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
+    );
+    let responses_metadata = test_responses_metadata_for_client(
+        &client,
+        /*turn_id*/ None,
+        format!("{}:0", client.state.thread_id),
+        /*parent_thread_id*/ None,
+        TestCodexResponsesRequestKind::Turn,
+    );
+    let mut session = client.new_session();
+    let auth_snapshot = session.capture_request_auth_snapshot().await?;
+    let mut history = ContextManager::new();
+    let first = history_test_item("first", None);
+    history.record_items([&first], TruncationPolicy::Tokens(10_000));
+    let prompt = Prompt {
+        base_instructions: BaseInstructions {
+            text: "base instructions".to_string(),
+        },
+        ..Default::default()
+    };
+    let image_capable_model = test_model_info();
+    let telemetry = test_session_telemetry();
+    let inference_trace = InferenceTraceContext::disabled();
+    let image_capable_history = history.prompt_snapshot(&image_capable_model.input_modalities);
+    let mut first_stream = session
+        .stream_with_history_snapshot(
+            &prompt,
+            &image_capable_history,
+            &auth_snapshot,
+            &image_capable_model,
+            &telemetry,
+            None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            None,
+            &responses_metadata,
+            &inference_trace,
+        )
+        .await?;
+    while let Some(event) = first_stream.next().await {
+        event?;
+    }
+
+    let assistant = ResponseItem::Message {
+        id: Some("msg-1".to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "first done".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let second = history_test_item("second", None);
+    history.record_items([&assistant, &second], TruncationPolicy::Tokens(10_000));
+    let mut text_only_model = image_capable_model.clone();
+    text_only_model.input_modalities = vec![codex_protocol::openai_models::InputModality::Text];
+    let text_only_history = history.prompt_snapshot(&text_only_model.input_modalities);
+    assert_ne!(
+        image_capable_history.policy_identity(),
+        text_only_history.policy_identity()
+    );
+    let mut second_stream = session
+        .stream_with_history_snapshot(
+            &prompt,
+            &text_only_history,
+            &auth_snapshot,
+            &text_only_model,
+            &telemetry,
+            None,
+            codex_protocol::config_types::ReasoningSummary::None,
+            None,
+            &responses_metadata,
+            &inference_trace,
+        )
+        .await?;
+    while let Some(event) = second_stream.next().await {
+        event?;
+    }
+
+    let connection = server.single_connection();
+    let second_request = connection
+        .get(1)
+        .expect("missing text-only request")
+        .body_json();
+    assert_eq!(second_request.get("previous_response_id"), None);
+    assert_eq!(
+        second_request
+            .get("input")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(3)
+    );
+    server.shutdown().await;
+    Ok(())
 }
 
 #[test]

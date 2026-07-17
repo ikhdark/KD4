@@ -16,6 +16,7 @@ use std::time::Instant;
 use anyhow::Context;
 use arc_swap::ArcSwapOption;
 use codex_login::CodexAuth;
+use codex_config::McpServerConfig;
 use codex_protocol::mcp::McpServerInfo;
 use serde::Deserialize;
 use serde::Serialize;
@@ -29,23 +30,81 @@ use crate::tools::ToolInfo;
 
 const MCP_TOOLS_CACHE_PUBLISH_DURATION_METRIC: &str = "codex.mcp.tools.cache_publish.duration_ms";
 
-/// The CodexAuth bits that identify a Codex Apps catalog.
-///
-/// Debug bearer-token overrides bypass the shared cache, so shared entries only
-/// need the CodexAuth-backed identity.
+/// Privacy-bounded identity for one host-owned Codex Apps catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct CodexAppsToolsCacheKey {
-    pub(crate) account_id: Option<String>,
-    pub(crate) chatgpt_user_id: Option<String>,
-    pub(crate) is_workspace_account: bool,
+pub(crate) struct CodexAppsToolsCacheKey {
+    auth_identity_digest: String,
+    server_config_digest: String,
 }
 
-/// Builds the CodexAuth-backed Codex Apps cache key.
-pub fn codex_apps_tools_cache_key(auth: Option<&CodexAuth>) -> CodexAppsToolsCacheKey {
+/// Builds a key from both the active ChatGPT identity and the exact resolved
+/// host registration. Raw account/user ids and endpoint/config values are never
+/// stored in the key or cache filename.
+pub(crate) fn codex_apps_tools_cache_key(
+    auth: Option<&CodexAuth>,
+    server_name: &str,
+    server_config: &McpServerConfig,
+) -> CodexAppsToolsCacheKey {
+    let auth_identity = serde_json::to_vec(&(
+        auth.and_then(CodexAuth::get_account_id),
+        auth.and_then(CodexAuth::get_chatgpt_user_id),
+        auth.is_some_and(CodexAuth::is_workspace_account),
+    ))
+    .expect("Codex Apps auth cache identity should serialize");
+    let server_config = serde_json::to_value(server_config)
+        .expect("Codex Apps server config should serialize");
+    let mut server_identity = server_name.as_bytes().to_vec();
+    server_identity.push(0);
+    server_identity.extend_from_slice(canonical_json(&server_config).as_bytes());
     CodexAppsToolsCacheKey {
-        account_id: auth.and_then(CodexAuth::get_account_id),
-        chatgpt_user_id: auth.and_then(CodexAuth::get_chatgpt_user_id),
-        is_workspace_account: auth.is_some_and(CodexAuth::is_workspace_account),
+        auth_identity_digest: sha1_hex(&auth_identity),
+        server_config_digest: sha1_hex(&server_identity),
+    }
+}
+
+fn sha1_hex(value: &[u8]) -> String {
+    format!("{:x}", Sha1::digest(value))
+}
+
+#[cfg(test)]
+pub(crate) fn codex_apps_tools_cache_key_for_test(
+    auth_identity: &str,
+    server_identity: &str,
+) -> CodexAppsToolsCacheKey {
+    CodexAppsToolsCacheKey {
+        auth_identity_digest: sha1_hex(auth_identity.as_bytes()),
+        server_config_digest: sha1_hex(server_identity.as_bytes()),
+    }
+}
+
+fn canonical_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => serde_json::to_string(value)
+            .expect("primitive JSON cache identity should serialize"),
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values.iter().map(canonical_json).collect::<Vec<_>>().join(",")
+        ),
+        serde_json::Value::Object(values) => {
+            let mut keys = values.keys().collect::<Vec<_>>();
+            keys.sort_unstable();
+            let fields = keys
+                .into_iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key)
+                            .expect("JSON object key should serialize"),
+                        canonical_json(&values[key])
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{fields}}}")
+        }
     }
 }
 
@@ -109,8 +168,8 @@ impl CodexAppsToolsCacheContext {
         &self,
         ticket: CodexAppsToolsFetchTicket,
         server_info: &McpServerInfo,
-        tools: Vec<ToolInfo>,
-    ) -> Vec<ToolInfo> {
+        tools: &[ToolInfo],
+    ) -> bool {
         let publish_start = Instant::now();
         let mut last_accepted_generation = lock_unpoisoned(&self.entry.last_accepted_generation);
         if ticket.generation <= *last_accepted_generation {
@@ -119,20 +178,20 @@ impl CodexAppsToolsCacheContext {
                 publish_start.elapsed(),
                 &[("source", ticket.source.as_str()), ("result", "stale")],
             );
-            return self.current_tools().unwrap_or(tools);
+            return false;
         }
 
         *last_accepted_generation = ticket.generation;
         self.entry
             .current_tools
-            .store(Some(Arc::new(tools.clone())));
-        persist_codex_apps_cache(self, server_info, &tools);
+            .store(Some(Arc::new(tools.to_vec())));
+        persist_codex_apps_cache(self, server_info, tools);
         emit_duration(
             MCP_TOOLS_CACHE_PUBLISH_DURATION_METRIC,
             publish_start.elapsed(),
             &[("source", ticket.source.as_str()), ("result", "published")],
         );
-        tools
+        true
     }
 
     #[cfg(test)]

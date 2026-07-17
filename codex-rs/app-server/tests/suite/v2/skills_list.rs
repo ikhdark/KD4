@@ -20,7 +20,10 @@ use codex_app_server_protocol::SkillsExtraRootsSetParams;
 use codex_app_server_protocol::SkillsExtraRootsSetResponse;
 use codex_app_server_protocol::SkillsListParams;
 use codex_app_server_protocol::SkillsListResponse;
+use codex_app_server_protocol::ThreadSettingsUpdateParams;
+use codex_app_server_protocol::ThreadSettingsUpdateResponse;
 use codex_app_server_protocol::ThreadStartParams;
+use codex_app_server_protocol::ThreadStartResponse;
 use codex_config::types::AuthCredentialsStoreMode;
 use codex_exec_server::CODEX_EXEC_SERVER_URL_ENV_VAR;
 use codex_utils_absolute_path::AbsolutePathBuf;
@@ -1012,4 +1015,72 @@ async fn skills_changed_notification_is_emitted_after_skill_change() -> Result<(
             .any(|skill| skill.name == "demo" && skill.description == "updated")
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn skills_watcher_moves_to_updated_thread_cwd() -> Result<()> {
+    skip_if_remote!(
+        Ok(()),
+        "host-local skill changes are not visible to remote executors"
+    );
+
+    let server = create_mock_responses_server_repeating_assistant("Done").await;
+    let codex_home = TempDir::new()?;
+    let initial_cwd = TempDir::new()?;
+    let updated_cwd = TempDir::new()?;
+    write_mock_responses_config_toml_with_chatgpt_base_url(
+        codex_home.path(),
+        &server.uri(),
+        &server.uri(),
+    )?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .build()
+        .await?;
+    timeout(DEFAULT_TIMEOUT, mcp.initialize()).await??;
+    let thread_start_request_id = mcp
+        .send_thread_start_request_with_auto_env(ThreadStartParams {
+            cwd: Some(initial_cwd.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .await?;
+    let thread_start_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(thread_start_request_id)),
+    )
+    .await??;
+    let ThreadStartResponse { thread, .. } = to_response(thread_start_response)?;
+
+    let settings_request_id = mcp
+        .send_thread_settings_update_request(ThreadSettingsUpdateParams {
+            thread_id: thread.id,
+            cwd: Some(updated_cwd.path().to_path_buf()),
+            ..Default::default()
+        })
+        .await?;
+    let settings_response: JSONRPCResponse = timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(settings_request_id)),
+    )
+    .await??;
+    let _: ThreadSettingsUpdateResponse = to_response(settings_response)?;
+    timeout(
+        DEFAULT_TIMEOUT,
+        mcp.read_stream_until_notification_message("thread/settings/updated"),
+    )
+    .await??;
+
+    let skill_dir = updated_cwd
+        .path()
+        .join(".agents")
+        .join("skills")
+        .join("updated-cwd-skill");
+    std::fs::create_dir_all(&skill_dir)?;
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: updated-cwd-skill\ndescription: updated cwd\n---\n\n# Body\n",
+    )?;
+
+    expect_skills_changed_notification(&mut mcp, WATCHER_TIMEOUT).await
 }

@@ -51,11 +51,10 @@ fn create_codex_apps_tools_cache_context(
 ) -> CodexAppsToolsCacheContext {
     CodexAppsToolsCache::default().context(
         codex_home,
-        CodexAppsToolsCacheKey {
-            account_id: account_id.map(ToOwned::to_owned),
-            chatgpt_user_id: chatgpt_user_id.map(ToOwned::to_owned),
-            is_workspace_account: false,
-        },
+        codex_apps_tools_cache_key_for_test(
+            &format!("{account_id:?}:{chatgpt_user_id:?}"),
+            "default-server",
+        ),
     )
 }
 
@@ -75,6 +74,54 @@ fn model_tool_names(tools: &[ToolInfo]) -> HashSet<ToolName> {
         .iter()
         .map(ToolInfo::canonical_tool_name)
         .collect::<HashSet<_>>()
+}
+
+#[test]
+fn codex_apps_cache_key_changes_with_server_name_endpoint_and_config() {
+    let base = crate::codex_apps_mcp_server_config(
+        "https://chatgpt.com",
+        Some("codex"),
+        Some("test-originator"),
+    );
+    let mut endpoint_changed = base.clone();
+    let codex_config::McpServerTransportConfig::StreamableHttp { url, .. } =
+        &mut endpoint_changed.transport
+    else {
+        panic!("Codex Apps transport should be HTTP");
+    };
+    *url = "https://chatgpt.example/ps/mcp".to_string();
+    let mut config_changed = base.clone();
+    config_changed.tool_timeout_sec = Some(std::time::Duration::from_secs(7));
+
+    let base_key = codex_apps_tools_cache_key(
+        /*auth*/ None,
+        CODEX_APPS_MCP_SERVER_NAME,
+        &base,
+    );
+    assert_ne!(
+        base_key,
+        codex_apps_tools_cache_key(
+            /*auth*/ None,
+            "another-host-registration",
+            &base,
+        )
+    );
+    assert_ne!(
+        base_key,
+        codex_apps_tools_cache_key(
+            /*auth*/ None,
+            CODEX_APPS_MCP_SERVER_NAME,
+            &endpoint_changed,
+        )
+    );
+    assert_ne!(
+        base_key,
+        codex_apps_tools_cache_key(
+            /*auth*/ None,
+            CODEX_APPS_MCP_SERVER_NAME,
+            &config_changed,
+        )
+    );
 }
 
 #[test]
@@ -357,19 +404,11 @@ fn codex_apps_tools_cache_publishes_newest_shared_snapshot() {
     let cache = CodexAppsToolsCache::default();
     let cache_context_1 = cache.context(
         codex_home.path().to_path_buf(),
-        CodexAppsToolsCacheKey {
-            account_id: Some("account-one".to_string()),
-            chatgpt_user_id: Some("user-one".to_string()),
-            is_workspace_account: false,
-        },
+        codex_apps_tools_cache_key_for_test("account-one:user-one", "default-server"),
     );
     let cache_context_2 = cache.context(
         codex_home.path().to_path_buf(),
-        CodexAppsToolsCacheKey {
-            account_id: Some("account-one".to_string()),
-            chatgpt_user_id: Some("user-one".to_string()),
-            is_workspace_account: false,
-        },
+        codex_apps_tools_cache_key_for_test("account-one:user-one", "default-server"),
     );
     let older_ticket = cache_context_1.begin_fetch(CodexAppsToolsFetchSource::Startup);
     let newer_ticket = cache_context_2.begin_fetch(CodexAppsToolsFetchSource::HardRefresh);
@@ -377,20 +416,26 @@ fn codex_apps_tools_cache_publishes_newest_shared_snapshot() {
     let newer_tools = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "newer")];
     let older_tools = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "older")];
 
-    let published_tools =
-        cache_context_2.publish_if_newest_accepted(newer_ticket, &server_info, newer_tools);
+    assert!(cache_context_2.publish_if_newest_accepted(
+        newer_ticket,
+        &server_info,
+        &newer_tools,
+    ));
     assert_eq!(
-        model_tool_names(&published_tools),
+        model_tool_names(&newer_tools),
         model_tool_names(
             &cache_context_1
                 .current_tools()
                 .expect("new snapshot should publish")
         )
     );
-    let current_tools =
-        cache_context_1.publish_if_newest_accepted(older_ticket, &server_info, older_tools);
+    assert!(!cache_context_1.publish_if_newest_accepted(
+        older_ticket,
+        &server_info,
+        &older_tools,
+    ));
 
-    assert_eq!(current_tools[0].callable_name, "newer");
+    assert_eq!(older_tools[0].callable_name, "older");
     assert_eq!(
         cache_context_2.current_tools().expect("shared snapshot")[0].callable_name,
         "newer"
@@ -409,20 +454,16 @@ fn codex_apps_tools_cache_keeps_live_publish_when_disk_persistence_fails() {
     std::fs::write(&codex_home_file, b"occupied").expect("create codex home file");
     let cache_context = CodexAppsToolsCache::default().context(
         codex_home_file,
-        CodexAppsToolsCacheKey {
-            account_id: Some("account-one".to_string()),
-            chatgpt_user_id: Some("user-one".to_string()),
-            is_workspace_account: false,
-        },
+        codex_apps_tools_cache_key_for_test("account-one:user-one", "default-server"),
     );
     let tools = vec![create_test_tool(CODEX_APPS_MCP_SERVER_NAME, "live")];
-    let published_tools = cache_context.publish_if_newest_accepted(
+    let published = cache_context.publish_if_newest_accepted(
         cache_context.begin_fetch(CodexAppsToolsFetchSource::HardRefresh),
         &create_test_server_info("Codex Apps"),
-        tools.clone(),
+        &tools,
     );
 
-    assert_eq!(model_tool_names(&published_tools), model_tool_names(&tools));
+    assert!(published);
     assert_eq!(
         model_tool_names(&cache_context.current_tools().expect("live snapshot")),
         model_tool_names(&tools)
@@ -438,19 +479,11 @@ fn codex_apps_tools_cache_scopes_non_utf8_home_disk_paths() {
     let cache = CodexAppsToolsCache::default();
     let user_one_context = cache.context(
         codex_home.clone(),
-        CodexAppsToolsCacheKey {
-            account_id: Some("account-one".to_string()),
-            chatgpt_user_id: Some("user-one".to_string()),
-            is_workspace_account: false,
-        },
+        codex_apps_tools_cache_key_for_test("account-one:user-one", "default-server"),
     );
     let user_two_context = cache.context(
         codex_home,
-        CodexAppsToolsCacheKey {
-            account_id: Some("account-two".to_string()),
-            chatgpt_user_id: Some("user-two".to_string()),
-            is_workspace_account: false,
-        },
+        codex_apps_tools_cache_key_for_test("account-two:user-two", "default-server"),
     );
     let cache_paths = [
         user_one_context.tools_cache_path(),

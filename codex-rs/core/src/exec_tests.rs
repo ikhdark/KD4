@@ -22,6 +22,7 @@ fn make_exec_output(
         stderr: StreamOutput::new(stderr.to_string()),
         aggregated_output: StreamOutput::new(aggregated.to_string()),
         aggregated_output_bytes: None,
+        output_complete: true,
         duration: Duration::from_millis(1),
         timed_out: false,
     }

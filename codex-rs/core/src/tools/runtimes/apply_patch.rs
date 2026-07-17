@@ -266,6 +266,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             stderr: StreamOutput::new(stderr.clone()),
             aggregated_output: StreamOutput::new(format!("{stdout}{stderr}")),
             aggregated_output_bytes: Some(aggregated_output_bytes),
+            output_complete: true,
             duration: started_at.elapsed(),
             timed_out: false,
         };

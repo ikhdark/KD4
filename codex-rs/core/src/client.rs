@@ -117,9 +117,9 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
-use crate::context_manager::PROMPT_HISTORY_CANONICAL_POLICY_VERSION;
 use crate::context_manager::PromptHistoryCanonicalHash;
 use crate::context_manager::PromptHistoryIncrementalProof;
+use crate::context_manager::PromptHistoryPolicyIdentity;
 use crate::context_manager::PromptHistorySnapshot;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
@@ -456,6 +456,27 @@ struct CurrentClientSetup {
     agent_identity_telemetry: Option<AgentIdentityTelemetry>,
 }
 
+/// Privacy-safe identity for the auth state accepted by an immutable sampling request.
+///
+/// The digest never leaves process memory and contains no recoverable credentials. The
+/// generation catches same-manager credential replacement, while the identity digest keeps
+/// account-scoped request state from crossing an auth-manager replacement or reset.
+#[derive(Clone, Copy, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct RequestAuthSnapshot {
+    generation: Option<u64>,
+    identity_digest: [u8; 32],
+}
+
+impl std::fmt::Debug for RequestAuthSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RequestAuthSnapshot")
+            .field("generation", &self.generation)
+            .field("identity", &"redacted")
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RequestRouteTelemetry {
     endpoint: &'static str,
@@ -523,8 +544,56 @@ struct LastResponse {
 }
 
 const WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN: &[u8] = b"codex.websocket.request-properties.v1";
+const REQUEST_AUTH_IDENTITY_DOMAIN: &[u8] = b"codex.request-auth-identity.v1";
+const REQUEST_AUTH_CAPTURE_ATTEMPTS: usize = 4;
 
 type CanonicalPrefixHash = PromptHistoryCanonicalHash;
+
+fn update_identity_digest(hasher: &mut Sha256, value: Option<&str>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn request_auth_identity_digest(
+    auth: Option<&CodexAuth>,
+    agent_identity_telemetry: Option<&AgentIdentityTelemetry>,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(REQUEST_AUTH_IDENTITY_DOMAIN);
+    let Some(auth) = auth else {
+        hasher.update([0]);
+        return hasher.finalize().into();
+    };
+    hasher.update([1]);
+    hasher.update(format!("{:?}", auth.auth_mode()).as_bytes());
+    let account_id = auth.get_account_id();
+    let chatgpt_user_id = auth.get_chatgpt_user_id();
+    update_identity_digest(&mut hasher, account_id.as_deref());
+    update_identity_digest(&mut hasher, chatgpt_user_id.as_deref());
+    hasher.update([u8::from(auth.is_workspace_account())]);
+    hasher.update([u8::from(auth.is_fedramp_account())]);
+    if matches!(
+        auth.auth_mode(),
+        AuthMode::ApiKey | AuthMode::PersonalAccessToken
+    ) {
+        let credential = auth.get_token().ok();
+        update_identity_digest(&mut hasher, credential.as_deref());
+    }
+    if let Some(agent_identity) = agent_identity_telemetry {
+        update_identity_digest(&mut hasher, Some(agent_identity.agent_id.as_str()));
+        update_identity_digest(&mut hasher, Some(agent_identity.task_id.as_str()));
+    } else {
+        update_identity_digest(&mut hasher, None);
+        update_identity_digest(&mut hasher, None);
+    }
+    hasher.finalize().into()
+}
 
 #[derive(Debug, Clone)]
 struct WebsocketHistoryBaseline {
@@ -535,7 +604,7 @@ struct WebsocketHistoryBaseline {
     rewrite_revision: Option<u64>,
     request_prefix: CanonicalPrefixHash,
     request_properties_fingerprint: [u8; 32],
-    normalization_policy_version: u16,
+    history_policy_identity: PromptHistoryPolicyIdentity,
     previous_response_id: Option<String>,
 }
 
@@ -551,6 +620,7 @@ struct IncrementalProof {
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
+    connection_auth_snapshot: Option<RequestAuthSnapshot>,
     last_request_history: Option<WebsocketHistoryBaseline>,
     next_history_generation: u64,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
@@ -586,6 +656,8 @@ struct BorrowedResponsesRequestProperties<'a> {
 
 fn responses_request_properties_fingerprint(
     request: &ResponsesApiRequest,
+    auth_snapshot: &RequestAuthSnapshot,
+    history_policy_identity: PromptHistoryPolicyIdentity,
 ) -> serde_json::Result<[u8; 32]> {
     // Input is compared through the canonical history proof, while delivery-only
     // stream options and client metadata do not affect previous_response_id reuse.
@@ -624,9 +696,11 @@ fn responses_request_properties_fingerprint(
         client_metadata: None,
     };
     let serialized = serde_json::to_vec(&properties)?;
+    let static_identity = serde_json::to_vec(&(auth_snapshot, history_policy_identity))?;
     let mut hasher = Sha256::new();
     hasher.update(WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN);
-    hasher.update(PROMPT_HISTORY_CANONICAL_POLICY_VERSION.to_be_bytes());
+    hasher.update((static_identity.len() as u64).to_be_bytes());
+    hasher.update(static_identity);
     hasher.update((serialized.len() as u64).to_be_bytes());
     hasher.update(serialized);
     Ok(hasher.finalize().into())
@@ -1293,6 +1367,65 @@ impl ModelClient {
         })
     }
 
+    fn current_auth_generation(&self) -> Option<u64> {
+        let auth_manager = self.state.provider.auth_manager()?;
+        let receiver = auth_manager.auth_change_receiver();
+        let generation = *receiver.borrow();
+        Some(generation)
+    }
+
+    fn request_auth_snapshot_for_setup(
+        &self,
+        setup: &CurrentClientSetup,
+        generation: Option<u64>,
+    ) -> RequestAuthSnapshot {
+        RequestAuthSnapshot {
+            generation,
+            identity_digest: request_auth_identity_digest(
+                setup.auth.as_ref(),
+                setup.agent_identity_telemetry.as_ref(),
+            ),
+        }
+    }
+
+    async fn capture_request_auth_snapshot(&self) -> Result<RequestAuthSnapshot> {
+        for _ in 0..REQUEST_AUTH_CAPTURE_ATTEMPTS {
+            let generation_before = self.current_auth_generation();
+            let setup = self.current_client_setup().await?;
+            let generation_after = self.current_auth_generation();
+            if generation_before == generation_after {
+                return Ok(self.request_auth_snapshot_for_setup(&setup, generation_after));
+            }
+        }
+        Err(CodexErr::Stream(
+            "request auth state did not stabilize before sampling".to_string(),
+            None,
+        ))
+    }
+
+    async fn current_client_setup_for(
+        &self,
+        expected: &RequestAuthSnapshot,
+        allow_newer_generation: bool,
+    ) -> Result<CurrentClientSetup> {
+        let setup = self.current_client_setup().await?;
+        let current = self.request_auth_snapshot_for_setup(&setup, self.current_auth_generation());
+        let generation_matches = current.generation == expected.generation
+            || (allow_newer_generation
+                && current
+                    .generation
+                    .zip(expected.generation)
+                    .is_some_and(|(current, expected)| current >= expected));
+        if !generation_matches || current.identity_digest != expected.identity_digest {
+            return Err(CodexErr::Stream(
+                "authentication changed after the immutable sampling snapshot was captured"
+                    .to_string(),
+                None,
+            ));
+        }
+        Ok(setup)
+    }
+
     fn build_api_transport(
         &self,
         api_provider: &ApiProvider,
@@ -1445,6 +1578,14 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
+    pub(crate) async fn capture_request_auth_snapshot(&self) -> Result<RequestAuthSnapshot> {
+        self.client.capture_request_auth_snapshot().await
+    }
+
+    pub(crate) fn request_auth_generation_matches(&self, snapshot: &RequestAuthSnapshot) -> bool {
+        self.client.current_auth_generation() == snapshot.generation
+    }
+
     pub(crate) fn set_turn_timing(&mut self, turn_timing: Arc<TurnTimingState>) {
         self.turn_timing = Some(turn_timing);
     }
@@ -1455,6 +1596,7 @@ impl ModelClientSession {
 
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
+        self.websocket_session.connection_auth_snapshot = None;
         self.invalidate_incremental_history("websocket reset");
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
@@ -1486,12 +1628,18 @@ impl ModelClientSession {
     fn remember_request_history(
         &mut self,
         request: &ResponsesApiRequest,
+        auth_snapshot: &RequestAuthSnapshot,
+        history_policy_identity: PromptHistoryPolicyIdentity,
         request_prefix: serde_json::Result<CanonicalPrefixHash>,
         mutation_revision: Option<u64>,
         rewrite_revision: Option<u64>,
         previous_response_id: Option<String>,
     ) {
-        let request_properties_fingerprint = responses_request_properties_fingerprint(request);
+        let request_properties_fingerprint = responses_request_properties_fingerprint(
+            request,
+            auth_snapshot,
+            history_policy_identity,
+        );
         self.websocket_session.next_history_generation = self
             .websocket_session
             .next_history_generation
@@ -1507,7 +1655,7 @@ impl ModelClientSession {
                         rewrite_revision,
                         request_prefix,
                         request_properties_fingerprint,
-                        normalization_policy_version: PROMPT_HISTORY_CANONICAL_POLICY_VERSION,
+                        history_policy_identity,
                         previous_response_id,
                     })
                 }
@@ -1565,15 +1713,19 @@ impl ModelClientSession {
         &self,
         request: &ResponsesApiRequest,
         history: Option<&PromptHistorySnapshot>,
+        auth_snapshot: &RequestAuthSnapshot,
+        history_policy_identity: PromptHistoryPolicyIdentity,
         last_response: &LastResponse,
         allow_empty_delta: bool,
     ) -> Option<IncrementalProof> {
         let baseline = self.websocket_session.last_request_history.as_ref()?;
         let baseline_reused_previous_response = baseline.previous_response_id.is_some();
-        if baseline.normalization_policy_version != PROMPT_HISTORY_CANONICAL_POLICY_VERSION {
-            return None;
-        }
-        let current_properties_fingerprint = responses_request_properties_fingerprint(request).ok()?;
+        let current_properties_fingerprint = responses_request_properties_fingerprint(
+            request,
+            auth_snapshot,
+            history_policy_identity,
+        )
+        .ok()?;
         if current_properties_fingerprint != baseline.request_properties_fingerprint {
             trace!(
                 history_generation = baseline.generation,
@@ -1586,44 +1738,48 @@ impl ModelClientSession {
             return None;
         }
 
-        let (input, current_prefix, mutation_revision, rewrite_revision) = if crate::latency_switches::stage3_persistence_history_enabled()
-            && let Some(history) = history
-            && let (Some(mutation_revision), Some(rewrite_revision)) =
-                (baseline.mutation_revision, baseline.rewrite_revision)
-            && let Some(PromptHistoryIncrementalProof {
-                suffix,
-                current_prefix,
-                mutation_revision,
-                rewrite_revision,
-            }) = history.incremental_proof(
-                mutation_revision,
-                rewrite_revision,
-                baseline.request_prefix,
-                &last_response.items_added,
-            )
-        {
-            (
-                suffix,
-                current_prefix,
-                Some(mutation_revision),
-                Some(rewrite_revision),
-            )
-        } else {
-            let mut expected_prefix = baseline.request_prefix;
-            expected_prefix.extend_items(&last_response.items_added).ok()?;
-            let (candidate_prefix, input) =
-                request.input.split_at_checked(expected_prefix.item_count)?;
-            if CanonicalPrefixHash::from_items(candidate_prefix).ok()? != expected_prefix {
-                trace!(
-                    history_generation = baseline.generation,
-                    "incremental request failed, normalized prefix digest didn't match"
-                );
-                return None;
-            }
-            let mut current_prefix = expected_prefix;
-            current_prefix.extend_items(input).ok()?;
-            (input.to_vec(), current_prefix, None, None)
-        };
+        let (input, current_prefix, mutation_revision, rewrite_revision) =
+            if crate::latency_switches::stage3_persistence_history_enabled()
+                && let Some(history) = history
+                && let (Some(mutation_revision), Some(rewrite_revision)) =
+                    (baseline.mutation_revision, baseline.rewrite_revision)
+                && let Some(PromptHistoryIncrementalProof {
+                    suffix,
+                    current_prefix,
+                    mutation_revision,
+                    rewrite_revision,
+                }) = history.incremental_proof(
+                    mutation_revision,
+                    rewrite_revision,
+                    baseline.request_prefix,
+                    baseline.history_policy_identity,
+                    &last_response.items_added,
+                )
+            {
+                (
+                    suffix,
+                    current_prefix,
+                    Some(mutation_revision),
+                    Some(rewrite_revision),
+                )
+            } else {
+                let mut expected_prefix = baseline.request_prefix;
+                expected_prefix
+                    .extend_items(&last_response.items_added)
+                    .ok()?;
+                let (candidate_prefix, input) =
+                    request.input.split_at_checked(expected_prefix.item_count)?;
+                if CanonicalPrefixHash::from_items(candidate_prefix).ok()? != expected_prefix {
+                    trace!(
+                        history_generation = baseline.generation,
+                        "incremental request failed, normalized prefix digest didn't match"
+                    );
+                    return None;
+                }
+                let mut current_prefix = expected_prefix;
+                current_prefix.extend_items(input).ok()?;
+                (input.to_vec(), current_prefix, None, None)
+            };
 
         if !allow_empty_delta && input.is_empty() {
             return None;
@@ -1638,8 +1794,7 @@ impl ModelClientSession {
         .inspect(|_| {
             trace!(
                 history_generation = baseline.generation,
-                baseline_reused_previous_response,
-                "verified websocket incremental proof"
+                baseline_reused_previous_response, "verified websocket incremental proof"
             );
         })
     }
@@ -1659,16 +1814,18 @@ impl ModelClientSession {
         payload: ResponseCreateWsRequest,
         request: &ResponsesApiRequest,
         history: Option<&PromptHistorySnapshot>,
+        auth_snapshot: &RequestAuthSnapshot,
+        history_policy_identity: PromptHistoryPolicyIdentity,
         last_response: &LastResponse,
-    ) -> std::result::Result<
-        (ResponsesWsRequest, bool, IncrementalProof),
-        ResponseCreateWsRequest,
-    > {
+    ) -> std::result::Result<(ResponsesWsRequest, bool, IncrementalProof), ResponseCreateWsRequest>
+    {
         let previous_response_id_from_untraced_warmup =
             self.websocket_session.last_response_from_untraced_warmup;
         let Some(proof) = self.get_incremental_proof(
             request,
             history,
+            auth_snapshot,
+            history_policy_identity,
             last_response,
             /*allow_empty_delta*/ true,
         ) else {
@@ -1840,6 +1997,7 @@ impl ModelClientSession {
     async fn stream_responses_api(
         &self,
         prompt: &Prompt,
+        auth_snapshot: &RequestAuthSnapshot,
         model_info: &ModelInfo,
         session_telemetry: &SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
@@ -1854,7 +2012,10 @@ impl ModelClientSession {
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self.client.current_client_setup().await?;
+            let client_setup = self
+                .client
+                .current_client_setup_for(auth_snapshot, pending_retry.retry_after_unauthorized)
+                .await?;
             let request_provider = client_setup.api_provider.clone();
             let transport = self
                 .client
@@ -1976,6 +2137,7 @@ impl ModelClientSession {
         &mut self,
         prompt: &Prompt,
         history: Option<&PromptHistorySnapshot>,
+        auth_snapshot: &RequestAuthSnapshot,
         model_info: &ModelInfo,
         session_telemetry: &SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
@@ -1987,13 +2149,26 @@ impl ModelClientSession {
         inference_trace: &InferenceTraceContext,
     ) -> Result<WebsocketStreamOutcome> {
         let auth_manager = self.client.state.provider.auth_manager();
+        let history_policy_identity = history
+            .map(PromptHistorySnapshot::policy_identity)
+            .unwrap_or_else(|| {
+                PromptHistoryPolicyIdentity::for_input_modalities(&model_info.input_modalities)
+            });
 
         let mut auth_recovery = auth_manager
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self.client.current_client_setup().await?;
+            if self.websocket_session.connection.is_some()
+                && self.websocket_session.connection_auth_snapshot.as_ref() != Some(auth_snapshot)
+            {
+                self.reset_websocket_session();
+            }
+            let client_setup = self
+                .client
+                .current_client_setup_for(auth_snapshot, pending_retry.retry_after_unauthorized)
+                .await?;
             let request_provider = client_setup.api_provider.clone();
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
@@ -2021,7 +2196,8 @@ impl ModelClientSession {
             } else {
                 session_telemetry_for_request(session_telemetry, &request)
             };
-            let snapshot_input_is_direct = request.input.is_empty() && !model_info.use_responses_lite;
+            let snapshot_input_is_direct =
+                request.input.is_empty() && !model_info.use_responses_lite;
             let mut client_metadata = self
                 .client
                 .build_ws_client_metadata(responses_metadata, model_info.use_responses_lite);
@@ -2053,7 +2229,9 @@ impl ModelClientSession {
                 })
                 .await
             {
-                Ok(_) => {}
+                Ok(_) => {
+                    self.websocket_session.connection_auth_snapshot = Some(*auth_snapshot);
+                }
                 Err(ApiError::Transport(TransportError::Http { status, .. }))
                     if status == StatusCode::UPGRADE_REQUIRED =>
                 {
@@ -2082,21 +2260,29 @@ impl ModelClientSession {
                     ws_payload,
                     &request,
                     history,
+                    auth_snapshot,
+                    history_policy_identity,
                     last_response,
                 ),
                 None => Err(ws_payload),
             };
-            let (mut ws_request, previous_response_id_from_untraced_warmup, request_prefix, mutation_revision, rewrite_revision, previous_response_id) =
-                match direct_incremental {
-                    Ok((ws_request, from_untraced_warmup, proof)) => (
-                        ws_request,
-                        from_untraced_warmup,
-                        Ok(proof.current_prefix),
-                        proof.mutation_revision,
-                        proof.rewrite_revision,
-                        Some(proof.previous_response_id),
-                    ),
-                    Err(mut ws_payload) => {
+            let (
+                mut ws_request,
+                previous_response_id_from_untraced_warmup,
+                request_prefix,
+                mutation_revision,
+                rewrite_revision,
+                previous_response_id,
+            ) = match direct_incremental {
+                Ok((ws_request, from_untraced_warmup, proof)) => (
+                    ws_request,
+                    from_untraced_warmup,
+                    Ok(proof.current_prefix),
+                    proof.mutation_revision,
+                    proof.rewrite_revision,
+                    Some(proof.previous_response_id),
+                ),
+                Err(mut ws_payload) => {
                     if let Some(history) = history {
                         let mut full_prompt = prompt.clone();
                         full_prompt.input = history.materialize();
@@ -2126,6 +2312,8 @@ impl ModelClientSession {
                             ws_payload,
                             &request,
                             /*history*/ None,
+                            auth_snapshot,
+                            history_policy_identity,
                             last_response,
                         ),
                         None => Err(ws_payload),
@@ -2142,8 +2330,7 @@ impl ModelClientSession {
                         Err(ws_payload) => {
                             let snapshot_identity = history.filter(|history| {
                                 snapshot_input_is_direct
-                                    && request.input.len()
-                                        == history.canonical_prefix().item_count
+                                    && request.input.len() == history.canonical_prefix().item_count
                             });
                             (
                                 ResponsesWsRequest::ResponseCreate(ws_payload),
@@ -2158,8 +2345,8 @@ impl ModelClientSession {
                             )
                         }
                     }
-                    }
-                };
+                }
+            };
             let inference_trace_attempt = if warmup {
                 // Prewarm sends `generate=false`; it is connection setup, not a
                 // model inference attempt that should appear in rollout traces.
@@ -2182,6 +2369,8 @@ impl ModelClientSession {
             }
             self.remember_request_history(
                 &request,
+                auth_snapshot,
+                history_policy_identity,
                 request_prefix,
                 mutation_revision,
                 rewrite_revision,
@@ -2281,11 +2470,13 @@ impl ModelClientSession {
             return Ok(());
         }
 
+        let auth_snapshot = self.capture_request_auth_snapshot().await?;
         let disabled_trace = InferenceTraceContext::disabled();
         match self
             .stream_responses_websocket(
                 prompt,
                 /*history*/ None,
+                &auth_snapshot,
                 model_info,
                 session_telemetry,
                 effort,
@@ -2337,9 +2528,11 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
+        let auth_snapshot = self.capture_request_auth_snapshot().await?;
         self.stream_inner(
             prompt,
             /*history*/ None,
+            &auth_snapshot,
             model_info,
             session_telemetry,
             effort,
@@ -2356,6 +2549,7 @@ impl ModelClientSession {
         &mut self,
         prompt: &Prompt,
         history: &PromptHistorySnapshot,
+        auth_snapshot: &RequestAuthSnapshot,
         model_info: &ModelInfo,
         session_telemetry: &SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
@@ -2367,6 +2561,7 @@ impl ModelClientSession {
         self.stream_inner(
             prompt,
             Some(history),
+            auth_snapshot,
             model_info,
             session_telemetry,
             effort,
@@ -2383,6 +2578,7 @@ impl ModelClientSession {
         &mut self,
         prompt: &Prompt,
         history: Option<&PromptHistorySnapshot>,
+        auth_snapshot: &RequestAuthSnapshot,
         model_info: &ModelInfo,
         session_telemetry: &SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
@@ -2400,6 +2596,7 @@ impl ModelClientSession {
                         .stream_responses_websocket(
                             prompt,
                             history,
+                            auth_snapshot,
                             model_info,
                             session_telemetry,
                             effort.clone(),
@@ -2424,6 +2621,7 @@ impl ModelClientSession {
                     full_prompt.input = history.materialize();
                     self.stream_responses_api(
                         &full_prompt,
+                        auth_snapshot,
                         model_info,
                         session_telemetry,
                         effort,
@@ -2436,6 +2634,7 @@ impl ModelClientSession {
                 } else {
                     self.stream_responses_api(
                         prompt,
+                        auth_snapshot,
                         model_info,
                         session_telemetry,
                         effort,

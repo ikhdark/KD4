@@ -1119,6 +1119,7 @@ fn map_exec_result(
         stderr: StreamOutput::new(result.stderr.clone()),
         aggregated_output: StreamOutput::new(result.output.clone()),
         aggregated_output_bytes: None,
+        output_complete: true,
         duration: result.duration,
         timed_out: result.timed_out,
     };

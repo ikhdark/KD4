@@ -44,13 +44,15 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::ResolvedMcpCatalog;
+use crate::McpServerSource;
 use crate::codex_apps_cache::CodexAppsToolsCache;
-use crate::codex_apps_cache::codex_apps_tools_cache_key;
 use crate::connection_manager::McpConnectionManager;
 use crate::runtime::McpRuntimeContext;
 use crate::server::EffectiveMcpServer;
 
 pub const CODEX_APPS_MCP_SERVER_NAME: &str = "codex_apps";
+pub const CODEX_APPS_COMPATIBILITY_REGISTRATION_ID: &str = "legacy_codex_apps";
+pub const HOSTED_PLUGIN_RUNTIME_EXTENSION_ID: &str = "hosted_plugin_runtime";
 const DEFAULT_CODEX_APPS_MCP_PRODUCT_SKU: &str = "codex";
 const MCP_TOOL_NAME_PREFIX: &str = "mcp";
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
@@ -251,7 +253,26 @@ pub fn effective_mcp_servers(
     config: &McpConfig,
     auth: Option<&CodexAuth>,
 ) -> HashMap<String, EffectiveMcpServer> {
-    effective_mcp_servers_from_configured(configured_mcp_servers(config), config, auth)
+    let configured_servers = config
+        .mcp_server_catalog
+        .servers()
+        .map(|(name, server)| {
+            let host_owned_codex_apps = name == CODEX_APPS_MCP_SERVER_NAME
+                && matches!(
+                    server.source(),
+                    McpServerSource::Compatibility { id }
+                        if id == CODEX_APPS_COMPATIBILITY_REGISTRATION_ID
+                )
+                || name == CODEX_APPS_MCP_SERVER_NAME
+                    && matches!(
+                        server.source(),
+                        McpServerSource::Extension { id }
+                            if id == HOSTED_PLUGIN_RUNTIME_EXTENSION_ID
+                    );
+            (name.to_string(), server.config().clone(), host_owned_codex_apps)
+        })
+        .collect();
+    effective_mcp_servers_with_provenance(configured_servers, config, auth)
 }
 
 /// Converts a materialized server map to its auth-gated runtime view.
@@ -263,12 +284,27 @@ pub fn effective_mcp_servers_from_configured(
     config: &McpConfig,
     auth: Option<&CodexAuth>,
 ) -> HashMap<String, EffectiveMcpServer> {
+    effective_mcp_servers_with_provenance(
+        configured_servers
+            .into_iter()
+            .map(|(name, server)| (name, server, false))
+            .collect(),
+        config,
+        auth,
+    )
+}
+
+fn effective_mcp_servers_with_provenance(
+    configured_servers: Vec<(String, McpServerConfig, bool)>,
+    config: &McpConfig,
+    auth: Option<&CodexAuth>,
+) -> HashMap<String, EffectiveMcpServer> {
     let chatgpt_origin = url::Url::parse(CHATGPT_CODEX_BASE_URL)
         .ok()
         .map(|url| url.origin());
     let mut servers = configured_servers
         .into_iter()
-        .map(|(name, mut server)| {
+        .map(|(name, mut server, host_owned_codex_apps)| {
             match server.auth.clone() {
                 McpServerAuth::ChatGpt => {
                     let server_origin = match &server.transport {
@@ -286,7 +322,12 @@ pub fn effective_mcp_servers_from_configured(
                 }
                 McpServerAuth::OAuth => {}
             }
-            (name, EffectiveMcpServer::configured(server))
+            let server = if host_owned_codex_apps {
+                EffectiveMcpServer::host_owned_codex_apps(server)
+            } else {
+                EffectiveMcpServer::configured(server)
+            };
+            (name, server)
         })
         .collect::<HashMap<_, _>>();
     if !host_owned_codex_apps_enabled(config, auth) {
@@ -333,7 +374,6 @@ pub async fn read_mcp_resource(
         runtime_context,
         config.codex_home.clone(),
         codex_apps_tools_cache,
-        codex_apps_tools_cache_key(auth),
         config.prefix_mcp_tool_names,
         config.client_elicitation_capability.clone(),
         /*supports_openai_form_elicitation*/ false,
@@ -412,7 +452,6 @@ pub async fn collect_mcp_server_status_snapshot_with_detail(
         runtime_context,
         config.codex_home.clone(),
         codex_apps_tools_cache,
-        codex_apps_tools_cache_key(auth),
         config.prefix_mcp_tool_names,
         config.client_elicitation_capability.clone(),
         /*supports_openai_form_elicitation*/ false,

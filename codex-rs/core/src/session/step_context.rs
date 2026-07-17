@@ -32,6 +32,22 @@ pub(crate) struct McpToolInventorySnapshot {
 }
 
 impl McpToolInventorySnapshot {
+    pub(crate) fn new(runtime_version: u64, tools: Arc<[ToolInfo]>) -> Self {
+        let mut route_index = HashMap::with_capacity(tools.len());
+        for (index, tool) in tools.iter().enumerate() {
+            route_index
+                .entry(tool.server_name.clone())
+                .or_insert_with(HashMap::new)
+                .entry(tool.tool.name.to_string())
+                .or_insert(index);
+        }
+        Self {
+            runtime_version,
+            tools,
+            route_index,
+        }
+    }
+
     pub(crate) fn runtime_version(&self) -> u64 {
         self.runtime_version
     }
@@ -68,19 +84,7 @@ impl StepContext {
         self.mcp_tool_snapshot
             .get_or_init(|| async {
                 let tools = Arc::<[ToolInfo]>::from(self.mcp.manager().list_all_tools().await);
-                let mut route_index = HashMap::with_capacity(tools.len());
-                for (index, tool) in tools.iter().enumerate() {
-                    route_index
-                        .entry(tool.server_name.clone())
-                        .or_insert_with(HashMap::new)
-                        .entry(tool.tool.name.to_string())
-                        .or_insert(index);
-                }
-                McpToolInventorySnapshot {
-                    runtime_version: self.mcp.version(),
-                    tools,
-                    route_index,
-                }
+                McpToolInventorySnapshot::new(self.mcp.version(), tools)
             })
             .await
     }

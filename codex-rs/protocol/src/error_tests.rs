@@ -120,6 +120,7 @@ fn sandbox_denied_uses_aggregated_output_when_stderr_empty() {
         stderr: StreamOutput::new(String::new()),
         aggregated_output: StreamOutput::new("aggregate detail".to_string()),
         aggregated_output_bytes: None,
+        output_complete: true,
         duration: Duration::from_millis(10),
         timed_out: false,
     };
@@ -138,6 +139,7 @@ fn sandbox_denied_reports_both_streams_when_available() {
         stderr: StreamOutput::new("stderr detail".to_string()),
         aggregated_output: StreamOutput::new(String::new()),
         aggregated_output_bytes: None,
+        output_complete: true,
         duration: Duration::from_millis(10),
         timed_out: false,
     };
@@ -156,6 +158,7 @@ fn sandbox_denied_reports_stdout_when_no_stderr() {
         stderr: StreamOutput::new(String::new()),
         aggregated_output: StreamOutput::new(String::new()),
         aggregated_output_bytes: None,
+        output_complete: true,
         duration: Duration::from_millis(8),
         timed_out: false,
     };
@@ -201,6 +204,7 @@ fn sandbox_denied_reports_exit_code_when_no_output_available() {
         stderr: StreamOutput::new(String::new()),
         aggregated_output: StreamOutput::new(String::new()),
         aggregated_output_bytes: None,
+        output_complete: true,
         duration: Duration::from_millis(5),
         timed_out: false,
     };

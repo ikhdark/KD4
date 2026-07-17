@@ -466,6 +466,8 @@ fn command_receipt(id: &str) -> CommandReceipt {
         possible_mutation: false,
         observation: None,
         coverage: None,
+        changed_paths: Vec::new(),
+        reconciliation_attempted: false,
     }
 }
 
@@ -481,6 +483,7 @@ fn validation_receipt(id: &str) -> ValidationReceipt {
         proof_bearing: true,
         workspace_generation: None,
         evidence_generation: None,
+        automatic_claim_id: None,
         hash_generation: None,
         spec_generation: None,
         conclusion: Some(ValidationConclusion::Passed),
@@ -508,6 +511,98 @@ async fn semantic_noop_plan_update_does_not_advance_or_write() {
     tokio::time::sleep(Duration::from_millis(15)).await;
 
     assert_eq!(ledger.current_revision().await, Some(revision));
+    assert_eq!(persistence.write_count.load(Ordering::Acquire), writes);
+}
+
+#[tokio::test]
+async fn identical_normalized_plan_after_completion_preserves_gate_revision_and_writes() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    tokio::fs::create_dir_all(repo.join("docs"))
+        .await
+        .expect("docs directory");
+    tokio::fs::write(repo.join("docs/item.md"), "before")
+        .await
+        .expect("seed documentation");
+    let mut item = plan_item("stable-completion", StepStatus::InProgress);
+    item.runtime_paths.clear();
+    ledger.record_plan_update(&plan_with(vec![item])).await;
+    let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo");
+    ledger
+        .record_edit_intent("docs-edit", cwd.as_path(), &[PathBuf::from("docs/item.md")])
+        .await;
+    tokio::fs::write(repo.join("docs/item.md"), "after")
+        .await
+        .expect("update documentation");
+    ledger.record_edit_result("docs-edit", "completed").await;
+    let plan_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("plan validation start");
+    ledger
+        .record_verify_local(
+            "plan",
+            Some("PLANNED"),
+            true,
+            false,
+            true,
+            Some(&plan_start),
+            &[PathBuf::from("docs/item.md")],
+            &[],
+            Some(&serde_json::json!({"planned": []})),
+        )
+        .await;
+    let final_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("final validation start");
+    assert!(
+        ledger
+            .record_verify_local(
+                "final",
+                Some("VERIFIED"),
+                true,
+                true,
+                true,
+                Some(&final_start),
+                &[PathBuf::from("docs/item.md")],
+                &[],
+                Some(&serde_json::json!({"verdict": "VERIFIED"})),
+            )
+            .await
+    );
+    let gate = ledger.completion_gate().await.expect("completed gate");
+    assert_eq!(gate.status, TaskCompletionStatus::Passed);
+    let normalized = {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("document");
+        UpdatePlanArgs {
+            explanation: None,
+            plan: document.plan.iter().map(plan_item_from_evidence).collect(),
+        }
+    };
+    let revision = ledger.current_revision().await.expect("completed revision");
+    let completion = ledger
+        .document
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|document| document.completion.clone());
+    let persistence = ledger.persistence.as_ref().expect("persistence");
+    let writes = persistence.write_count.load(Ordering::Acquire);
+
+    ledger.record_plan_update(&normalized).await;
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    assert_eq!(ledger.current_revision().await, Some(revision));
+    assert_eq!(
+        ledger
+            .document
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|document| document.completion.clone()),
+        completion
+    );
     assert_eq!(persistence.write_count.load(Ordering::Acquire), writes);
 }
 
@@ -545,6 +640,90 @@ async fn coalescing_writer_serializes_only_the_latest_requested_revision() {
     .expect("evidence JSON");
     assert_eq!(persisted.revision, revision);
     assert_eq!(persisted.plan[0].id, "three");
+}
+
+#[tokio::test]
+async fn interrupted_atomic_write_recovers_last_durable_document_and_ignores_orphan() {
+    let (temp, repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("durable", StepStatus::Pending)]))
+        .await;
+    let durable_revision = ledger.current_revision().await.expect("durable revision");
+    assert_eq!(
+        ledger.persist_revision(durable_revision).await,
+        PersistOutcome::Persisted
+    );
+    let evidence_path = ledger.evidence_path.as_ref().expect("evidence path").clone();
+    let durable_bytes = tokio::fs::read(&evidence_path)
+        .await
+        .expect("durable evidence");
+    let thread_id = ledger
+        .document
+        .lock()
+        .await
+        .as_ref()
+        .expect("document")
+        .thread_id
+        .clone();
+    let persistence = ledger.persistence.as_ref().expect("persistence");
+    persistence
+        .interrupt_next_write_before_replace
+        .store(true, Ordering::Release);
+
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("interrupted", StepStatus::Pending)]))
+        .await;
+    let interrupted_revision = ledger.current_revision().await.expect("interrupted revision");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let state = persistence.state.lock().await;
+            let interrupted = state.failed_revision == Some(interrupted_revision)
+                && !state.writer_running;
+            drop(state);
+            if interrupted {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("injected writer interruption");
+
+    assert_eq!(
+        tokio::fs::read(&evidence_path)
+            .await
+            .expect("canonical evidence after interruption"),
+        durable_bytes
+    );
+    let mut entries = tokio::fs::read_dir(evidence_path.parent().expect("evidence directory"))
+        .await
+        .expect("evidence directory");
+    let mut orphan = None;
+    while let Some(entry) = entries.next_entry().await.expect("directory entry") {
+        if entry.path() != evidence_path {
+            orphan = Some(entry.path());
+            break;
+        }
+    }
+    let orphan = orphan.expect("interrupted temporary evidence file");
+    assert!(
+        serde_json::from_slice::<TaskEvidenceDocument>(
+            &tokio::fs::read(orphan).await.expect("orphaned partial write")
+        )
+        .is_err()
+    );
+    drop(ledger);
+
+    let resumed = TaskEvidenceLedger::load_or_new(
+        temp.path().join("home"),
+        ThreadId::from_string(&thread_id).expect("thread id"),
+        &repo,
+    )
+    .await;
+    let guard = resumed.document.lock().await;
+    let document = guard.as_ref().expect("recovered document");
+    assert_eq!(document.plan[0].id, "durable");
+    assert!(document.revision > durable_revision);
 }
 
 #[tokio::test]
@@ -1378,7 +1557,10 @@ async fn complete_coverage_detects_existing_untracked_content_changes_even_on_fa
         1
     );
     assert_eq!(
-        ledger.take_automatic_verify_plan_request().await,
+        ledger
+            .take_automatic_verify_plan_request()
+            .await
+            .map(|request| request.changed_paths),
         Some(Vec::new())
     );
 }
@@ -2020,9 +2202,195 @@ async fn successful_fast_or_final_validation_suppresses_automatic_planning() {
 }
 
 #[tokio::test]
+async fn automatic_validation_claim_is_generation_bound_and_retriable_after_setup_failure() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    record_observed_command_change(&ledger, &repo, "automatic-generation-one").await;
+    let first = ledger
+        .take_automatic_verify_plan_request()
+        .await
+        .expect("first automatic validation claim");
+    ledger
+        .release_automatic_verify_plan_request(first.evidence_generation, &first.claim_id)
+        .await;
+    let retry = ledger
+        .take_automatic_verify_plan_request()
+        .await
+        .expect("released automatic validation claim");
+    assert_eq!(retry.evidence_generation, first.evidence_generation);
+    assert_ne!(retry.claim_id, first.claim_id);
+
+    record_observed_command_change(&ledger, &repo, "automatic-generation-two").await;
+    assert!(
+        ledger
+            .begin_verify_local_validation_for_automatic_request(&retry)
+            .await
+            .is_none(),
+        "a stale automatic run must not attach to the newer evidence generation"
+    );
+    let replacement = ledger
+        .take_automatic_verify_plan_request()
+        .await
+        .expect("replacement automatic validation claim");
+    assert!(replacement.evidence_generation > retry.evidence_generation);
+}
+
+#[tokio::test]
+async fn historical_conclusive_claim_does_not_block_retry_after_current_nonconclusive() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    record_observed_command_change(&ledger, &repo, "claim-sequence").await;
+    let first = ledger
+        .take_automatic_verify_plan_request()
+        .await
+        .expect("first automatic claim");
+    let first_start = ledger
+        .begin_verify_local_validation_for_automatic_request(&first)
+        .await
+        .expect("first claim validation start");
+    assert!(
+        !ledger
+            .record_verify_local(
+                "fast",
+                Some("FAILED"),
+                false,
+                false,
+                true,
+                Some(&first_start),
+                &[PathBuf::from("observed.txt")],
+                &[],
+                Some(&serde_json::json!({"verdict": "FAILED"})),
+            )
+            .await
+    );
+    ledger
+        .finish_automatic_verify_local_request(first.evidence_generation, &first.claim_id)
+        .await;
+    {
+        let guard = ledger.document.lock().await;
+        let receipt = guard
+            .as_ref()
+            .expect("document")
+            .validation_receipts
+            .last()
+            .expect("first receipt");
+        assert_eq!(receipt.automatic_claim_id.as_deref(), Some(first.claim_id.as_str()));
+        assert_eq!(receipt.conclusion, Some(ValidationConclusion::Failed));
+    }
+
+    let second = ledger
+        .take_automatic_verify_plan_request()
+        .await
+        .expect("second automatic claim");
+    assert_ne!(second.claim_id, first.claim_id);
+    let second_start = ledger
+        .begin_verify_local_validation_for_automatic_request(&second)
+        .await
+        .expect("second claim validation start");
+    assert!(
+        !ledger
+            .record_verify_local(
+                "fast",
+                None,
+                false,
+                false,
+                true,
+                Some(&second_start),
+                &[PathBuf::from("observed.txt")],
+                &[],
+                Some(&serde_json::json!({"verdict": "INCONCLUSIVE"})),
+            )
+            .await
+    );
+    ledger
+        .finish_automatic_verify_local_request(second.evidence_generation, &second.claim_id)
+        .await;
+
+    let third = ledger
+        .take_automatic_verify_plan_request()
+        .await
+        .expect("third automatic claim after nonconclusive retry");
+    assert_eq!(third.evidence_generation, first.evidence_generation);
+    assert_ne!(third.claim_id, first.claim_id);
+    assert_ne!(third.claim_id, second.claim_id);
+}
+
+#[tokio::test]
+async fn command_only_change_schedules_exact_changed_path() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    record_observed_command_change(&ledger, &repo, "exact-command-scope").await;
+
+    let request = ledger
+        .take_automatic_verify_plan_request()
+        .await
+        .expect("automatic validation request");
+
+    assert_eq!(request.changed_paths, vec!["observed.txt".to_string()]);
+}
+
+#[tokio::test]
+async fn unknown_command_mutations_share_one_reconciliation_before_scheduling() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    initialize_git_repo(&repo).await;
+    tokio::fs::write(repo.join("unknown.txt"), "dirty")
+        .await
+        .expect("dirty file");
+    let cwd = repo_uri(&repo);
+    let command = trusted_noop_command();
+    for call_id in ["unknown-one", "unknown-two"] {
+        assert_eq!(
+            ledger
+                .record_command(call_id, &command, &cwd, 0, false, 1, true)
+                .await,
+            Some(MutationObservation::Unknown)
+        );
+    }
+
+    let request = ledger
+        .take_automatic_verify_plan_request()
+        .await
+        .expect("reconciled automatic request");
+    assert!(request.changed_paths.contains(&"unknown.txt".to_string()));
+    assert_eq!(
+        ledger.unknown_reconciliation_count.load(Ordering::Acquire),
+        1
+    );
+    {
+        let guard = ledger.document.lock().await;
+        let receipts = guard
+            .as_ref()
+            .expect("document")
+            .command_receipts
+            .iter()
+            .filter(|receipt| receipt.observation == Some(MutationObservation::Unknown))
+            .collect::<Vec<_>>();
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts.iter().all(|receipt| receipt.reconciliation_attempted));
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| receipt.changed_paths == request.changed_paths)
+        );
+    }
+    ledger
+        .release_automatic_verify_plan_request(request.evidence_generation, &request.claim_id)
+        .await;
+    assert!(ledger.take_automatic_verify_plan_request().await.is_some());
+    assert_eq!(
+        ledger.unknown_reconciliation_count.load(Ordering::Acquire),
+        1
+    );
+}
+
+#[tokio::test]
 async fn stronger_final_failure_restores_automatic_planning_after_fast_success() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     record_observed_command_change(&ledger, &repo, "stronger-failure").await;
+    assert!(
+        ledger
+            .take_automatic_verify_plan_request()
+            .await
+            .is_some(),
+        "automatic fast validation should claim the current evidence generation"
+    );
     let fast_start = ledger
         .begin_verify_local_validation()
         .await
@@ -2063,12 +2431,11 @@ async fn stronger_final_failure_restores_automatic_planning_after_fast_success()
     );
 
     assert_eq!(
-        ledger.take_automatic_verify_plan_request().await,
-        Some(vec![
-            "kd4_features.toml".to_string(),
-            "observed.txt".to_string(),
-            "scripts/verify_local.py".to_string(),
-        ])
+        ledger
+            .take_automatic_verify_plan_request()
+            .await
+            .map(|request| request.changed_paths),
+        Some(vec!["observed.txt".to_string()])
     );
 }
 

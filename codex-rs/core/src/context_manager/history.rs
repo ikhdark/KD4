@@ -40,6 +40,21 @@ use std::sync::LazyLock;
 pub(crate) const PROMPT_HISTORY_CANONICAL_POLICY_VERSION: u16 = 1;
 const PROMPT_HISTORY_CANONICAL_HASH_DOMAIN: &[u8] = b"codex.websocket.history.v1";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub(crate) struct PromptHistoryPolicyIdentity {
+    canonical_policy_version: u16,
+    supports_images: bool,
+}
+
+impl PromptHistoryPolicyIdentity {
+    pub(crate) fn for_input_modalities(input_modalities: &[InputModality]) -> Self {
+        Self {
+            canonical_policy_version: PROMPT_HISTORY_CANONICAL_POLICY_VERSION,
+            supports_images: input_modalities.contains(&InputModality::Image),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PromptHistoryCanonicalHash {
     pub(crate) item_count: usize,
@@ -104,6 +119,7 @@ pub(crate) struct PromptHistorySnapshot {
     raw_item_count: usize,
     rolling_digest: [u8; 32],
     normalized_token_weight: i64,
+    policy_identity: PromptHistoryPolicyIdentity,
     segments: Arc<PromptHistorySegments>,
     proof_tail: Arc<PromptHistoryProofNode>,
     #[cfg(test)]
@@ -131,6 +147,10 @@ impl PromptHistorySnapshot {
         self.normalized_token_weight
     }
 
+    pub(crate) fn policy_identity(&self) -> PromptHistoryPolicyIdentity {
+        self.policy_identity
+    }
+
     pub(crate) fn materialize(&self) -> Vec<ResponseItem> {
         self.segments
             .materialize_segments()
@@ -152,9 +172,11 @@ impl PromptHistorySnapshot {
         baseline_mutation_revision: u64,
         baseline_rewrite_revision: u64,
         baseline_prefix: PromptHistoryCanonicalHash,
+        baseline_policy_identity: PromptHistoryPolicyIdentity,
         response_items: &[ResponseItem],
     ) -> Option<PromptHistoryIncrementalProof> {
-        if self.rewrite_revision != baseline_rewrite_revision
+        if self.policy_identity != baseline_policy_identity
+            || self.rewrite_revision != baseline_rewrite_revision
             || self.mutation_revision < baseline_mutation_revision
         {
             return None;
@@ -408,7 +430,8 @@ impl ContextManager {
         &mut self,
         input_modalities: &[InputModality],
     ) -> PromptHistorySnapshot {
-        let supports_images = input_modalities.contains(&InputModality::Image);
+        let policy_identity = PromptHistoryPolicyIdentity::for_input_modalities(input_modalities);
+        let supports_images = policy_identity.supports_images;
         let can_extend = self.prompt_cache.as_ref().is_some_and(|cache| {
             cache.supports_images == supports_images
                 && cache.rewrite_revision == self.history_version
@@ -432,6 +455,7 @@ impl ContextManager {
             raw_item_count: self.items.len(),
             rolling_digest: self.rolling_digest,
             normalized_token_weight: cache.normalized_token_weight,
+            policy_identity,
             segments: Arc::clone(&cache.snapshot_segments),
             proof_tail: Arc::clone(&cache.proof_tail),
             #[cfg(test)]
@@ -804,7 +828,11 @@ impl ContextManager {
             } => ResponseItem::FunctionCallOutput {
                 id: id.clone(),
                 call_id: call_id.clone(),
-                output: truncate_function_output_payload(output, policy_with_serialization_budget),
+                output: truncate_function_output_payload(
+                    output,
+                    policy_with_serialization_budget,
+                    self.has_bounded_evidence_aware_shell_call(call_id, output),
+                ),
                 internal_chat_message_metadata_passthrough: metadata.clone(),
             },
             ResponseItem::CustomToolCallOutput {
@@ -817,7 +845,11 @@ impl ContextManager {
                 id: id.clone(),
                 call_id: call_id.clone(),
                 name: name.clone(),
-                output: truncate_function_output_payload(output, policy_with_serialization_budget),
+                output: truncate_function_output_payload(
+                    output,
+                    policy_with_serialization_budget,
+                    self.has_bounded_evidence_aware_shell_call(call_id, output),
+                ),
                 internal_chat_message_metadata_passthrough: metadata.clone(),
             },
             ResponseItem::AdditionalTools { .. }
@@ -836,6 +868,43 @@ impl ContextManager {
             | ResponseItem::ContextCompaction { .. }
             | ResponseItem::Other => item.clone(),
         }
+    }
+
+    fn has_bounded_evidence_aware_shell_call(
+        &self,
+        call_id: &str,
+        output: &FunctionCallOutputPayload,
+    ) -> bool {
+        const MAX_EVIDENCE_AWARE_SHELL_OUTPUT_BYTES: usize = 40 * 1024;
+
+        let FunctionCallOutputBody::Text(content) = &output.body else {
+            return false;
+        };
+        if content.len() > MAX_EVIDENCE_AWARE_SHELL_OUTPUT_BYTES {
+            return false;
+        }
+
+        self.items.iter().rev().find_map(|item| match item {
+            ResponseItem::FunctionCall {
+                call_id: candidate,
+                name,
+                namespace: None,
+                ..
+            }
+            | ResponseItem::CustomToolCall {
+                call_id: candidate,
+                name,
+                namespace: None,
+                ..
+            } if candidate == call_id => Some(is_evidence_aware_shell_tool(name)),
+            ResponseItem::FunctionCall {
+                call_id: candidate, ..
+            }
+            | ResponseItem::CustomToolCall {
+                call_id: candidate, ..
+            } if candidate == call_id => Some(false),
+            _ => None,
+        }) == Some(true)
     }
 
     /// Walk backward from a rollback cut and trim contiguous pre-turn context-update items.
@@ -889,9 +958,10 @@ impl ContextManager {
 pub(crate) fn truncate_function_output_payload(
     output: &FunctionCallOutputPayload,
     policy: TruncationPolicy,
+    preserve_bounded_shell_evidence: bool,
 ) -> FunctionCallOutputPayload {
     let body = match &output.body {
-        FunctionCallOutputBody::Text(content) if is_evidence_aware_shell_output(content) => {
+        FunctionCallOutputBody::Text(content) if preserve_bounded_shell_evidence => {
             FunctionCallOutputBody::Text(content.clone())
         }
         FunctionCallOutputBody::Text(content) => {
@@ -908,9 +978,11 @@ pub(crate) fn truncate_function_output_payload(
     }
 }
 
-fn is_evidence_aware_shell_output(content: &str) -> bool {
-    content.contains("Shell output summary:\n")
-        || (content.contains("\n[+") && content.contains("B/") && content.contains("L]\n"))
+fn is_evidence_aware_shell_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "exec_command" | "write_stdin" | "shell_command" | "unified_exec"
+    )
 }
 
 /// API messages include every non-system item (user/assistant messages, reasoning,

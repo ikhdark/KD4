@@ -296,6 +296,7 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         stderr: StreamOutput::new(String::new()),
         aggregated_output_bytes: Some(aggregated_output.as_bytes().to_vec()),
         aggregated_output: StreamOutput::new(aggregated_output),
+        output_complete: true,
         duration,
         timed_out: false,
     };
@@ -356,6 +357,7 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         stderr: StreamOutput::new(message),
         aggregated_output_bytes: Some(aggregated_output.as_bytes().to_vec()),
         aggregated_output: StreamOutput::new(aggregated_output),
+        output_complete: true,
         duration,
         timed_out: false,
     };

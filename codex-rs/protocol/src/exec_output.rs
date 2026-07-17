@@ -44,6 +44,8 @@ pub struct ExecToolCallOutput {
     pub aggregated_output: StreamOutput<String>,
     /// Exact aggregate process bytes before encoding detection or lossy decoding.
     pub aggregated_output_bytes: Option<Vec<u8>>,
+    /// Whether stdout/stderr capture reached EOF before the drain deadline.
+    pub output_complete: bool,
     pub duration: Duration,
     pub timed_out: bool,
 }
@@ -56,6 +58,7 @@ impl Default for ExecToolCallOutput {
             stderr: StreamOutput::new(String::new()),
             aggregated_output: StreamOutput::new(String::new()),
             aggregated_output_bytes: None,
+            output_complete: true,
             duration: Duration::ZERO,
             timed_out: false,
         }

@@ -522,6 +522,7 @@ fn prompt_snapshot_incremental_proof_returns_only_items_after_verified_response(
             baseline.mutation_revision(),
             baseline.rewrite_revision(),
             baseline.canonical_prefix(),
+            baseline.policy_identity(),
             std::slice::from_ref(&response),
         )
         .expect("append-only history should produce a proof");
@@ -544,6 +545,7 @@ fn prompt_snapshot_incremental_proof_rejects_rewrite_and_normalization_replaceme
                 before_rewrite.mutation_revision(),
                 before_rewrite.rewrite_revision(),
                 before_rewrite.canonical_prefix(),
+                before_rewrite.policy_identity(),
                 &[],
             )
             .is_none()
@@ -573,6 +575,7 @@ fn prompt_snapshot_incremental_proof_rejects_rewrite_and_normalization_replaceme
                 before_replacement.mutation_revision(),
                 before_replacement.rewrite_revision(),
                 before_replacement.canonical_prefix(),
+                before_replacement.policy_identity(),
                 &[],
             )
             .is_none()
@@ -597,6 +600,31 @@ fn prompt_snapshot_incremental_proof_rejects_rewrite_and_normalization_replaceme
                 image_capable.mutation_revision(),
                 image_capable.rewrite_revision(),
                 image_capable.canonical_prefix(),
+                image_capable.policy_identity(),
+                &[],
+            )
+            .is_none()
+    );
+}
+
+#[test]
+fn prompt_snapshot_incremental_proof_rejects_text_only_history_after_modality_change() {
+    let mut history = create_history_with_items(vec![user_msg("text stays identical")]);
+    let image_capable = history.prompt_snapshot(&default_input_modalities());
+    let text_only = history.prompt_snapshot(&[InputModality::Text]);
+
+    assert_eq!(
+        image_capable.canonical_prefix(),
+        text_only.canonical_prefix()
+    );
+    assert_ne!(image_capable.policy_identity(), text_only.policy_identity());
+    assert!(
+        text_only
+            .incremental_proof(
+                image_capable.mutation_revision(),
+                image_capable.rewrite_revision(),
+                image_capable.canonical_prefix(),
+                image_capable.policy_identity(),
                 &[],
             )
             .is_none()
@@ -2435,17 +2463,74 @@ fn text_only_items_unchanged() {
     assert_eq!(estimated, raw_len);
 }
 #[test]
-fn evidence_aware_shell_summary_is_not_retruncated_in_history() {
+fn bounded_exec_output_is_not_retruncated_in_history() {
     let content = format!(
         "Chunk ID: abc\nOutput:\nShell output summary:\n{}",
         "bounded evidence line\n".repeat(256)
     );
-    let payload = FunctionCallOutputPayload {
-        body: FunctionCallOutputBody::Text(content.clone()),
-        success: Some(false),
+    let call_id = "call-exec".to_string();
+    let mut history = ContextManager::new();
+    history.record_items(
+        [
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: call_id.clone(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id,
+                output: FunctionCallOutputPayload {
+                    body: FunctionCallOutputBody::Text(content.clone()),
+                    success: Some(false),
+                },
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ]
+        .iter(),
+        TruncationPolicy::Bytes(64),
+    );
+
+    let ResponseItem::FunctionCallOutput { output, .. } = &history.raw_items()[1] else {
+        panic!("expected function call output");
     };
+    assert_eq!(output.body, FunctionCallOutputBody::Text(content));
+}
 
-    let processed = truncate_function_output_payload(&payload, TruncationPolicy::Bytes(64));
+#[test]
+fn unrelated_output_that_looks_like_shell_evidence_is_still_truncated() {
+    let content = format!(
+        "Shell output summary:\n{}\n[+999B/99L]\n",
+        "untrusted output line\n".repeat(256)
+    );
+    let call_id = "call-unrelated".to_string();
+    let mut history = ContextManager::new();
+    history.record_items(
+        [
+            ResponseItem::FunctionCall {
+                id: None,
+                name: "lookup".to_string(),
+                namespace: None,
+                arguments: "{}".to_string(),
+                call_id: call_id.clone(),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id,
+                output: FunctionCallOutputPayload::from_text(content.clone()),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ]
+        .iter(),
+        TruncationPolicy::Bytes(64),
+    );
 
-    assert_eq!(processed.body, FunctionCallOutputBody::Text(content));
+    let ResponseItem::FunctionCallOutput { output, .. } = &history.raw_items()[1] else {
+        panic!("expected function call output");
+    };
+    assert_ne!(output.body, FunctionCallOutputBody::Text(content));
 }

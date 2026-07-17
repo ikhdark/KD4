@@ -1,7 +1,9 @@
 use super::*;
+use crate::context_manager::ContextManager;
 use codex_extension_api::ExtensionData;
 use codex_extension_api::TurnItemContributor;
 use codex_protocol::items::AgentMessageContent;
+use codex_utils_output_truncation::TruncationPolicy;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -37,6 +39,25 @@ fn assistant_output_text(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+#[test]
+fn multi_step_sampling_keeps_history_lazy_until_terminal_legacy_hook() {
+    let modalities = codex_protocol::openai_models::default_input_modalities();
+    let mut history = ContextManager::new();
+
+    for step in 0..2 {
+        let item = assistant_output_text(&format!("continuation-{step}"));
+        history.record_items([&item], TruncationPolicy::Tokens(10_000));
+        let snapshot = history.prompt_snapshot(&modalities);
+        assert!(terminal_legacy_hook_history(true, snapshot).is_none());
+    }
+
+    let terminal_item = assistant_output_text("terminal");
+    history.record_items([&terminal_item], TruncationPolicy::Tokens(10_000));
+    let terminal = terminal_legacy_hook_history(false, history.prompt_snapshot(&modalities))
+        .expect("terminal step retains the immutable history snapshot");
+    assert_eq!(terminal.materialize().len(), 3);
 }
 
 #[test]

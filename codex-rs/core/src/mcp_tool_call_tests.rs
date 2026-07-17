@@ -21,6 +21,7 @@ use codex_config::types::McpServerToolConfig;
 use codex_features::Features;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
+use codex_mcp::ToolInfo;
 use codex_model_provider::create_model_provider;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -42,6 +43,7 @@ use core_test_support::responses::mount_sse_once;
 use core_test_support::responses::sse;
 use core_test_support::responses::start_mock_server;
 use pretty_assertions::assert_eq;
+use rmcp::model::Tool;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -91,6 +93,128 @@ fn approval_metadata(
         codex_apps_meta: None,
         openai_file_input_params: None,
     }
+}
+
+fn inventory_tool(
+    server: &str,
+    tool_name: &str,
+    connector_id: Option<&str>,
+    connector_name: Option<&str>,
+    namespace_description: Option<&str>,
+) -> ToolInfo {
+    ToolInfo {
+        server_name: server.to_string(),
+        supports_parallel_tool_calls: false,
+        server_origin: None,
+        callable_name: tool_name.to_string(),
+        callable_namespace: server.to_string(),
+        namespace_description: namespace_description.map(str::to_string),
+        tool: Tool::new_with_raw(
+            tool_name.to_string(),
+            None,
+            Arc::new(serde_json::Map::new()),
+        ),
+        connector_id: connector_id.map(str::to_string),
+        connector_name: connector_name.map(str::to_string),
+        plugin_display_names: Vec::new(),
+    }
+}
+
+#[test]
+fn frozen_mcp_inventory_metadata_survives_reconnect_tool_changes_and_filtering() {
+    let frozen = crate::session::step_context::McpToolInventorySnapshot::new(
+        7,
+        Arc::from(vec![inventory_tool(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "search",
+            Some("connector-old"),
+            Some("Old App"),
+            Some("Old description"),
+        )]),
+    );
+    let refreshed = crate::session::step_context::McpToolInventorySnapshot::new(
+        8,
+        Arc::from(vec![
+            inventory_tool(
+                CODEX_APPS_MCP_SERVER_NAME,
+                "search",
+                Some("connector-new"),
+                Some("New App"),
+                Some("New description"),
+            ),
+            inventory_tool(
+                CODEX_APPS_MCP_SERVER_NAME,
+                "new_after_reconnect",
+                Some("connector-new"),
+                Some("New App"),
+                Some("New description"),
+            ),
+        ]),
+    );
+
+    let frozen_metadata = mcp_tool_metadata_from_inventory(
+        &frozen,
+        /*plugin_id*/ None,
+        CODEX_APPS_MCP_SERVER_NAME,
+        "search",
+    )
+    .expect("sampled tool remains indexed in the frozen inventory");
+    assert_eq!(frozen_metadata.connector_id.as_deref(), Some("connector-old"));
+    assert_eq!(frozen_metadata.connector_name.as_deref(), Some("Old App"));
+    assert_eq!(
+        frozen_metadata.connector_description.as_deref(),
+        Some("Old description")
+    );
+    assert!(
+        mcp_tool_metadata_from_inventory(
+            &frozen,
+            /*plugin_id*/ None,
+            CODEX_APPS_MCP_SERVER_NAME,
+            "new_after_reconnect",
+        )
+        .is_none(),
+        "a tool filtered out of the sampling inventory must stay unavailable for metadata/approval"
+    );
+
+    let refreshed_metadata = mcp_tool_metadata_from_inventory(
+        &refreshed,
+        /*plugin_id*/ None,
+        CODEX_APPS_MCP_SERVER_NAME,
+        "search",
+    )
+    .expect("refreshed inventory contains the replacement tool");
+    assert_eq!(
+        refreshed_metadata.connector_id.as_deref(),
+        Some("connector-new")
+    );
+}
+
+#[tokio::test]
+async fn delegated_approval_consumes_pre_event_snapshot_metadata() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let metadata = approval_metadata(
+        Some("captured-connector"),
+        Some("Captured App"),
+        Some("Captured description"),
+        Some("Captured action"),
+        Some("Captured tool description"),
+    );
+    cache_delegated_mcp_tool_metadata(&session, "delegated-call", Some(&metadata)).await;
+
+    let captured = take_delegated_mcp_tool_metadata(&session, "delegated-call")
+        .await
+        .expect("delegated metadata should remain available until the begin event consumes it");
+    assert_eq!(
+        captured.connector_id.as_deref(),
+        Some("captured-connector")
+    );
+    assert_eq!(captured.connector_name.as_deref(), Some("Captured App"));
+    assert!(
+        take_delegated_mcp_tool_metadata(&session, "delegated-call")
+            .await
+            .is_none(),
+        "delegation metadata must be consumed exactly once"
+    );
 }
 
 fn mcp_turn_metadata_context(turn_context: &TurnContext) -> McpTurnMetadataContext<'_> {
@@ -1276,6 +1400,7 @@ async fn mcp_tool_call_item_includes_app_identity() {
             tool: "echo".to_string(),
             arguments: None,
         },
+        None,
         McpToolCallItemMetadata {
             connector_id: Some("asdk_app_0123456789abcdef0123456789abcdef".to_string()),
             link_id: Some("link_fedcba9876543210fedcba9876543210".to_string()),
@@ -1457,7 +1582,6 @@ async fn host_owned_codex_apps_manager(
         ),
         turn_context.config.codex_home.to_path_buf(),
         session.services.mcp_manager.codex_apps_tools_cache(),
-        codex_mcp::codex_apps_tools_cache_key(auth.as_ref()),
         turn_context.config.prefix_mcp_tool_names(),
         rmcp::model::ElicitationCapability::default(),
         /*supports_openai_form_elicitation*/ false,

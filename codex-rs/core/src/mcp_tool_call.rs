@@ -1480,14 +1480,19 @@ pub(crate) async fn lookup_mcp_tool_metadata(
         .plugin_id_for_mcp_server_name(server)
         .map(str::to_string);
     let inventory = step_context.mcp_inventory().await;
+    mcp_tool_metadata_from_inventory(inventory, plugin_id, server, tool_name)
+}
+
+fn mcp_tool_metadata_from_inventory(
+    inventory: &crate::session::step_context::McpToolInventorySnapshot,
+    plugin_id: Option<String>,
+    server: &str,
+    tool_name: &str,
+) -> Option<McpToolApprovalMetadata> {
     let tool_info = inventory.tool(server, tool_name)?.clone();
     let connector_description = if server == CODEX_APPS_MCP_SERVER_NAME {
-        Some(connectors::accessible_connectors_from_mcp_tools(
-            inventory.tools(),
-        ))
-        .and_then(|connectors| {
-            let connector_id = tool_info.connector_id.as_deref()?;
-            connectors
+        tool_info.connector_id.as_deref().and_then(|connector_id| {
+            connectors::accessible_connectors_from_mcp_tools(inventory.tools())
                 .into_iter()
                 .find(|connector| connector.id == connector_id)
                 .and_then(|connector| connector.description)

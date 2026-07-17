@@ -58,6 +58,9 @@ pub(crate) struct TaskEvidenceLedger {
     mutation_generation: AtomicU64,
     wiring_ledger_starts: Mutex<BTreeMap<String, WiringLedgerFingerprint>>,
     command_mutation_starts: Mutex<BTreeMap<String, CommandMutationStart>>,
+    unknown_command_reconciliation: Mutex<()>,
+    #[cfg(test)]
+    unknown_reconciliation_count: AtomicU64,
 }
 
 struct TaskEvidencePersistence {
@@ -70,6 +73,8 @@ struct TaskEvidencePersistence {
     serialization_count: AtomicU64,
     #[cfg(test)]
     write_count: AtomicU64,
+    #[cfg(test)]
+    interrupt_next_write_before_replace: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -106,6 +111,7 @@ struct WiringLedgerFingerprint {
 struct CommandMutationStart {
     epoch: u64,
     artifact_paths: BTreeSet<String>,
+    target_snapshots: BTreeMap<String, FileHashSnapshot>,
     coverage: MutationCoverage,
     fingerprint: Option<String>,
 }
@@ -139,6 +145,14 @@ pub(crate) struct TaskEvidenceValidationStart {
     cancellation_token: CancellationToken,
     file_snapshots: BTreeMap<String, FileHashSnapshot>,
     artifact_snapshots: BTreeMap<String, FileHashSnapshot>,
+    automatic_claim_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AutomaticVerifyLocalRequest {
+    pub(crate) changed_paths: Vec<String>,
+    pub(crate) evidence_generation: u64,
+    pub(crate) claim_id: String,
 }
 
 impl TaskEvidenceValidationStart {
@@ -183,6 +197,8 @@ struct TaskEvidenceDocument {
     desktop_activation_receipt: Option<DesktopActivationReceipt>,
     #[serde(default)]
     automatic_plan_attempt_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    automatic_plan_attempt_claim_id: Option<String>,
     repair_turns_used: u8,
     #[serde(default = "initial_receipt_sequence")]
     next_edit_receipt_sequence: u64,
@@ -190,6 +206,8 @@ struct TaskEvidenceDocument {
     next_command_receipt_sequence: u64,
     #[serde(default = "initial_receipt_sequence")]
     next_validation_receipt_sequence: u64,
+    #[serde(default = "initial_receipt_sequence")]
+    next_automatic_validation_claim_sequence: u64,
     completion: Option<TaskCompletionGate>,
 }
 
@@ -276,6 +294,10 @@ struct CommandReceipt {
     observation: Option<MutationObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     coverage: Option<MutationCoverage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    changed_paths: Vec<String>,
+    #[serde(default)]
+    reconciliation_attempted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,6 +314,8 @@ struct ValidationReceipt {
     workspace_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     evidence_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    automatic_claim_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hash_generation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -374,6 +398,8 @@ impl TaskEvidencePersistence {
             serialization_count: AtomicU64::new(0),
             #[cfg(test)]
             write_count: AtomicU64::new(0),
+            #[cfg(test)]
+            interrupt_next_write_before_replace: AtomicBool::new(false),
         }
     }
 
@@ -482,8 +508,16 @@ impl TaskEvidencePersistence {
                 continue;
             }
             let write_path = persistence.path.clone();
-            match tokio::task::spawn_blocking(move || atomic_write_evidence(&write_path, &bytes))
-                .await
+            #[cfg(test)]
+            let interrupt_before_replace = persistence
+                .interrupt_next_write_before_replace
+                .swap(false, Ordering::AcqRel);
+            #[cfg(not(test))]
+            let interrupt_before_replace = false;
+            match tokio::task::spawn_blocking(move || {
+                atomic_write_evidence(&write_path, &bytes, interrupt_before_replace)
+            })
+            .await
             {
                 Ok(Ok(())) => {
                     #[cfg(test)]
@@ -565,6 +599,9 @@ impl TaskEvidenceLedger {
             mutation_generation: AtomicU64::new(0),
             wiring_ledger_starts: Mutex::new(BTreeMap::new()),
             command_mutation_starts: Mutex::new(BTreeMap::new()),
+            unknown_command_reconciliation: Mutex::new(()),
+            #[cfg(test)]
+            unknown_reconciliation_count: AtomicU64::new(0),
         }
     }
 
@@ -581,6 +618,9 @@ impl TaskEvidenceLedger {
             mutation_generation: AtomicU64::new(0),
             wiring_ledger_starts: Mutex::new(BTreeMap::new()),
             command_mutation_starts: Mutex::new(BTreeMap::new()),
+            unknown_command_reconciliation: Mutex::new(()),
+            #[cfg(test)]
+            unknown_reconciliation_count: AtomicU64::new(0),
         }
     }
 
@@ -674,14 +714,16 @@ impl TaskEvidenceLedger {
                         wiring_receipt: None,
                         desktop_activation_receipt: None,
                         automatic_plan_attempt_epoch: None,
+                        automatic_plan_attempt_claim_id: None,
                         repair_turns_used: 0,
                         next_edit_receipt_sequence: initial_receipt_sequence(),
                         next_command_receipt_sequence: initial_receipt_sequence(),
                         next_validation_receipt_sequence: initial_receipt_sequence(),
+                        next_automatic_validation_claim_sequence: initial_receipt_sequence(),
                         completion: None,
                     }
                 };
-                *self.document.lock().await = Some(document.clone());
+                *self.document.lock().await = Some(document);
             })
             .await;
     }
@@ -723,11 +765,34 @@ impl TaskEvidenceLedger {
     pub(crate) async fn begin_verify_local_validation(
         &self,
     ) -> Option<TaskEvidenceValidationStart> {
+        self.begin_verify_local_validation_for_claim(None).await
+    }
+
+    pub(crate) async fn begin_verify_local_validation_for_automatic_request(
+        &self,
+        request: &AutomaticVerifyLocalRequest,
+    ) -> Option<TaskEvidenceValidationStart> {
+        self.begin_verify_local_validation_for_claim(Some(request))
+            .await
+    }
+
+    async fn begin_verify_local_validation_for_claim(
+        &self,
+        automatic_request: Option<&AutomaticVerifyLocalRequest>,
+    ) -> Option<TaskEvidenceValidationStart> {
         self.ensure_initialized().await;
         let repo_root = self.repo_root.as_ref()?;
         let (epoch, workspace_generation, spec_generation, mut file_paths, artifact_paths) = {
             let guard = self.document.lock().await;
             let document = guard.as_ref()?;
+            if automatic_request.is_some_and(|request| {
+                document.evidence_epoch != request.evidence_generation
+                    || document.automatic_plan_attempt_epoch != Some(request.evidence_generation)
+                    || document.automatic_plan_attempt_claim_id.as_deref()
+                        != Some(request.claim_id.as_str())
+            }) {
+                return None;
+            }
             let mut file_paths = document
                 .latest_file_hashes
                 .keys()
@@ -763,7 +828,13 @@ impl TaskEvidenceLedger {
         {
             let guard = self.document.lock().await;
             let document = guard.as_ref()?;
-            if document.evidence_epoch != epoch
+            if automatic_request.is_some_and(|request| {
+                document.evidence_epoch != request.evidence_generation
+                    || document.automatic_plan_attempt_epoch != Some(request.evidence_generation)
+                    || document.automatic_plan_attempt_claim_id.as_deref()
+                        != Some(request.claim_id.as_str())
+            })
+                || document.evidence_epoch != epoch
                 || task_evidence_workspace_generation(document) != workspace_generation
                 || task_evidence_spec_generation(document) != spec_generation
             {
@@ -792,6 +863,7 @@ impl TaskEvidenceLedger {
             cancellation_token,
             file_snapshots,
             artifact_snapshots,
+            automatic_claim_id: automatic_request.map(|request| request.claim_id.clone()),
         })
     }
 
@@ -802,8 +874,11 @@ impl TaskEvidenceLedger {
         self.ensure_initialized().await;
         let Some((response, revision, changed)) = self
             .update_document(|document| {
-                let previous = document
-                    .plan
+                let previous_plan = document.plan.clone();
+                let previous_requirements = document.generated_artifact_requirements.clone();
+                let previous_risks = document.risks.clone();
+                let previous_active_step_id = document.active_step_id.clone();
+                let previous = previous_plan
                     .iter()
                     .cloned()
                     .map(|step| (step.id.clone(), step))
@@ -858,12 +933,21 @@ impl TaskEvidenceLedger {
                 rebuild_declared_requirements_and_risks(document);
                 sync_plan_structure_state(document, &duplicate_explicit_ids);
                 promote_steps_with_fresh_evidence(document);
-                document.updated_at = timestamp();
-                document.completion = None;
-                UpdatePlanArgs {
-                    explanation: update.explanation.clone(),
-                    plan: document.plan.iter().map(plan_item_from_evidence).collect(),
+                let changed = previous_plan != document.plan
+                    || previous_requirements != document.generated_artifact_requirements
+                    || previous_risks != document.risks
+                    || previous_active_step_id != document.active_step_id;
+                if changed {
+                    document.updated_at = timestamp();
+                    document.completion = None;
                 }
+                (
+                    UpdatePlanArgs {
+                        explanation: update.explanation.clone(),
+                        plan: document.plan.iter().map(plan_item_from_evidence).collect(),
+                    },
+                    changed,
+                )
             })
             .await
         else {
@@ -903,6 +987,7 @@ impl TaskEvidenceLedger {
                 });
                 trim_to_last(&mut document.edit_intents, MAX_EDIT_RECEIPTS);
                 document.updated_at = timestamp();
+                ((), true)
             })
             .await
         else {
@@ -1031,6 +1116,7 @@ impl TaskEvidenceLedger {
                     trim_to_last(&mut document.edit_receipts, MAX_EDIT_RECEIPTS);
                 }
                 document.updated_at = timestamp();
+                ((), true)
             })
             .await
         else {
@@ -1057,6 +1143,7 @@ impl TaskEvidenceLedger {
             return CommandMutationStart {
                 epoch,
                 artifact_paths,
+                target_snapshots: BTreeMap::new(),
                 coverage: MutationCoverage::Incomplete,
                 fingerprint: None,
             };
@@ -1065,12 +1152,19 @@ impl TaskEvidenceLedger {
             .to_abs_path()
             .ok()
             .map(|path| path.as_path().to_path_buf());
-        let mut coverage = match cwd.as_deref() {
-            Some(cwd) => {
-                mutation_coverage_for_command(repo_root, cwd, command, &artifact_paths).await
-            }
-            None => MutationCoverage::Incomplete,
+        let target_paths = match cwd.as_deref() {
+            Some(cwd) => command_write_paths(repo_root, cwd, command, &artifact_paths).await,
+            None => None,
         };
+        let mut coverage = if target_paths.is_some() {
+            MutationCoverage::Complete
+        } else {
+            MutationCoverage::Incomplete
+        };
+        let mut target_snapshots = BTreeMap::new();
+        for path in target_paths.unwrap_or_default() {
+            target_snapshots.insert(path.clone(), snapshot_file(repo_root, &path).await);
+        }
         let fingerprint = if coverage == MutationCoverage::Complete {
             capture_stable_mutation_fingerprint(repo_root, &artifact_paths).await
         } else {
@@ -1082,6 +1176,7 @@ impl TaskEvidenceLedger {
         CommandMutationStart {
             epoch,
             artifact_paths,
+            target_snapshots,
             coverage,
             fingerprint,
         }
@@ -1152,6 +1247,19 @@ impl TaskEvidenceLedger {
             _ => (MutationObservation::Unknown, MutationCoverage::Incomplete),
         };
         let wiring_ledger_start = self.wiring_ledger_starts.lock().await.remove(call_id);
+        let mut command_after_snapshots = BTreeMap::new();
+        let mut command_changed_paths = Vec::new();
+        if candidate_observation == MutationObservation::Changed
+            && let Some(start) = mutation_start.as_ref()
+        {
+            for (path, before) in &start.target_snapshots {
+                let after = snapshot_file(repo_root, path).await;
+                if &after != before {
+                    command_changed_paths.push(path.clone());
+                }
+                command_after_snapshots.insert(path.clone(), after);
+            }
+        }
         let command_succeeded = exit_code == 0 && !timed_out;
         let trusted_launcher = trusted_wiring_guard_check_invocation(
             command,
@@ -1191,8 +1299,18 @@ impl TaskEvidenceLedger {
                 } else {
                     MutationCoverage::Incomplete
                 };
-                if observation == MutationObservation::Changed {
+                if matches!(
+                    observation,
+                    MutationObservation::Changed | MutationObservation::Unknown
+                ) {
                     invalidate_for_mutation(document);
+                }
+                if observation == MutationObservation::Changed {
+                    for snapshot in command_after_snapshots.values() {
+                        document
+                            .latest_file_hashes
+                            .insert(snapshot.path.clone(), snapshot.clone());
+                    }
                     if let Some(active_step_id) = document.active_step_id.clone()
                         && let Some(step) = document
                             .plan
@@ -1237,6 +1355,12 @@ impl TaskEvidenceLedger {
                     possible_mutation,
                     observation: Some(observation),
                     coverage: Some(coverage),
+                    changed_paths: if observation == MutationObservation::Changed {
+                        command_changed_paths.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    reconciliation_attempted: false,
                 });
                 trim_to_last(&mut document.command_receipts, MAX_COMMAND_RECEIPTS);
                 if let Some(wiring_proof) = wiring_proof {
@@ -1250,7 +1374,7 @@ impl TaskEvidenceLedger {
                 }
                 document.updated_at = timestamp();
                 document.completion = None;
-                observation
+                (observation, true)
             })
             .await
         else {
@@ -1357,6 +1481,8 @@ impl TaskEvidenceLedger {
                         .map(|start| start.workspace_generation.clone()),
                     evidence_generation: validation_start
                         .map(|start| start.evidence_generation),
+                    automatic_claim_id: validation_start
+                        .and_then(|start| start.automatic_claim_id.clone()),
                     hash_generation: validation_start.map(|start| start.hash_generation.clone()),
                     spec_generation: validation_start.map(|start| start.spec_generation.clone()),
                     conclusion,
@@ -1423,6 +1549,8 @@ impl TaskEvidenceLedger {
                     && conclusion == Some(ValidationConclusion::Failed)
                 {
                     document.validation_epoch = None;
+                    document.automatic_plan_attempt_epoch = None;
+                    document.automatic_plan_attempt_claim_id = None;
                     for step in &mut document.plan {
                         step.validation_receipt_ids.clear();
                     }
@@ -1490,7 +1618,7 @@ impl TaskEvidenceLedger {
                 promote_steps_with_fresh_evidence(document);
                 document.updated_at = timestamp();
                 document.completion = None;
-                accepted_proof
+                (accepted_proof, true)
             })
             .await
         else {
@@ -1511,11 +1639,11 @@ impl TaskEvidenceLedger {
         let (should_warn, revision, changed) = self
             .update_document(|document| {
                 if document.repair_turns_used >= 1 {
-                    return None;
+                    return (None, false);
                 }
                 document.repair_turns_used += 1;
                 document.updated_at = timestamp();
-                Some(())
+                (Some(()), true)
             })
             .await?;
         should_warn?;
@@ -1541,30 +1669,116 @@ impl TaskEvidenceLedger {
         ))
     }
 
-    pub(crate) async fn take_automatic_verify_plan_request(&self) -> Option<Vec<String>> {
+    async fn reconcile_unknown_command_mutations(&self) {
+        let Some(repo_root) = self.repo_root.as_ref() else {
+            return;
+        };
+        let _reconciliation = self.unknown_command_reconciliation.lock().await;
+        let epoch = {
+            let guard = self.document.lock().await;
+            let Some(document) = guard.as_ref() else {
+                return;
+            };
+            let epoch = document.evidence_epoch;
+            if !document.command_receipts.iter().any(|receipt| {
+                receipt.epoch == epoch
+                    && receipt.observation == Some(MutationObservation::Unknown)
+                    && !receipt.reconciliation_attempted
+            }) {
+                return;
+            }
+            epoch
+        };
+        #[cfg(test)]
+        self.unknown_reconciliation_count
+            .fetch_add(1, Ordering::AcqRel);
+        let dirty_paths = git_dirty_paths(repo_root).await;
+        let mut snapshots = BTreeMap::new();
+        for path in &dirty_paths {
+            snapshots.insert(path.clone(), snapshot_file(repo_root, path).await);
+        }
+        let Some((_, revision, changed)) = self
+            .update_document(|document| {
+                if document.evidence_epoch != epoch {
+                    return ((), false);
+                }
+                let mut changed = false;
+                for receipt in &mut document.command_receipts {
+                    if receipt.epoch == epoch
+                        && receipt.observation == Some(MutationObservation::Unknown)
+                        && !receipt.reconciliation_attempted
+                    {
+                        receipt.reconciliation_attempted = true;
+                        receipt.changed_paths = dirty_paths.iter().cloned().collect();
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    return ((), false);
+                }
+                for snapshot in snapshots.values() {
+                    document
+                        .latest_file_hashes
+                        .insert(snapshot.path.clone(), snapshot.clone());
+                }
+                document.updated_at = timestamp();
+                ((), true)
+            })
+            .await
+        else {
+            return;
+        };
+        if changed {
+            self.queue_persistence(revision).await;
+        }
+    }
+
+    pub(crate) async fn take_automatic_verify_plan_request(
+        &self,
+    ) -> Option<AutomaticVerifyLocalRequest> {
         self.ensure_existing_document_loaded().await;
+        {
+            let guard = self.document.lock().await;
+            let document = guard.as_ref()?;
+            let epoch = document.evidence_epoch;
+            let has_mutation = automatic_validation_mutation_pending(document, epoch);
+            if !has_mutation
+                || document.verify_plan_epoch == Some(epoch)
+                || document.validation_epoch == Some(epoch)
+                || document.automatic_plan_attempt_epoch == Some(epoch)
+            {
+                return None;
+            }
+        }
         self.wait_for_mutation_quiescence().await;
+        self.reconcile_unknown_command_mutations().await;
         let (changed_paths, revision, changed) = self
             .update_document(|document| {
                 let epoch = document.evidence_epoch;
-                let has_mutation = document
-                    .edit_receipts
-                    .iter()
-                    .any(|receipt| receipt.epoch == epoch)
-                    || document.command_receipts.iter().any(|receipt| {
-                        receipt.epoch == epoch
-                            && receipt.observation == Some(MutationObservation::Changed)
-                    });
+                let has_mutation = automatic_validation_mutation_pending(document, epoch);
                 if !has_mutation
                     || document.verify_plan_epoch == Some(epoch)
                     || document.validation_epoch == Some(epoch)
                     || document.automatic_plan_attempt_epoch == Some(epoch)
                 {
-                    return None;
+                    return (None, false);
                 }
+                let changed_paths = automatic_validation_changed_paths(document, epoch);
+                let claim_id = next_receipt_id(
+                    "automatic-validation",
+                    &mut document.next_automatic_validation_claim_sequence,
+                );
                 document.automatic_plan_attempt_epoch = Some(epoch);
+                document.automatic_plan_attempt_claim_id = Some(claim_id.clone());
                 document.updated_at = timestamp();
-                Some(document.latest_file_hashes.keys().cloned().collect())
+                (
+                    Some(AutomaticVerifyLocalRequest {
+                        changed_paths,
+                        evidence_generation: epoch,
+                        claim_id,
+                    }),
+                    true,
+                )
             })
             .await?;
         let changed_paths = changed_paths?;
@@ -1572,6 +1786,69 @@ impl TaskEvidenceLedger {
             self.queue_persistence(revision).await;
         }
         Some(changed_paths)
+    }
+
+    pub(crate) async fn release_automatic_verify_plan_request(
+        &self,
+        evidence_generation: u64,
+        claim_id: &str,
+    ) {
+        let Some((_, revision, changed)) = self
+            .update_document(|document| {
+                if document.evidence_epoch != evidence_generation
+                    || document.automatic_plan_attempt_epoch != Some(evidence_generation)
+                    || document.automatic_plan_attempt_claim_id.as_deref() != Some(claim_id)
+                {
+                    return ((), false);
+                }
+                document.automatic_plan_attempt_epoch = None;
+                document.automatic_plan_attempt_claim_id = None;
+                document.updated_at = timestamp();
+                ((), true)
+            })
+            .await
+        else {
+            return;
+        };
+        if changed {
+            self.queue_persistence(revision).await;
+        }
+    }
+
+    pub(crate) async fn finish_automatic_verify_local_request(
+        &self,
+        evidence_generation: u64,
+        claim_id: &str,
+    ) {
+        let Some((_, revision, changed)) = self
+            .update_document(|document| {
+                if document.evidence_epoch != evidence_generation
+                    || document.automatic_plan_attempt_epoch != Some(evidence_generation)
+                    || document.automatic_plan_attempt_claim_id.as_deref() != Some(claim_id)
+                {
+                    return ((), false);
+                }
+                let conclusive = document.validation_receipts.iter().rev().any(|receipt| {
+                    receipt.mode == "fast"
+                        && receipt.evidence_generation == Some(evidence_generation)
+                        && receipt.automatic_claim_id.as_deref() == Some(claim_id)
+                        && receipt.conclusion.is_some()
+                });
+                if conclusive {
+                    return ((), false);
+                }
+                document.automatic_plan_attempt_epoch = None;
+                document.automatic_plan_attempt_claim_id = None;
+                document.updated_at = timestamp();
+                ((), true)
+            })
+            .await
+        else {
+            return;
+        };
+        if changed {
+            self.queue_persistence(revision).await;
+        }
     }
 
     pub(crate) async fn completion_gate(&self) -> Option<TaskCompletionGate> {
@@ -1588,13 +1865,18 @@ impl TaskEvidenceLedger {
             let (gate, revision, _changed) = self
                 .update_document(|document| {
                     if !task_is_tracked(document) {
-                        return None;
+                        return (None, false);
                     }
+                    let previous_plan = document.plan.clone();
                     promote_steps_with_fresh_evidence(document);
                     let gate = derive_completion_gate(document, evidence_path);
+                    let changed = document.plan != previous_plan
+                        || document.completion.as_ref() != Some(&gate);
                     document.completion = Some(gate.clone());
-                    document.updated_at = timestamp();
-                    Some(gate)
+                    if changed {
+                        document.updated_at = timestamp();
+                    }
+                    (Some(gate), changed)
                 })
                 .await?;
             let gate = gate?;
@@ -1666,6 +1948,7 @@ impl TaskEvidenceLedger {
                 promote_steps_with_fresh_evidence(document);
                 document.updated_at = timestamp();
                 document.completion = None;
+                ((), true)
             })
             .await
         else {
@@ -1730,7 +2013,7 @@ impl TaskEvidenceLedger {
                     .map(|(_, current)| current)
                     .collect::<Vec<_>>();
                 if changed.is_empty() && changed_artifacts.is_empty() {
-                    return;
+                    return ((), false);
                 }
                 invalidate_for_mutation(document);
                 let epoch = document.evidence_epoch;
@@ -1786,6 +2069,7 @@ impl TaskEvidenceLedger {
                     },
                 );
                 document.updated_at = timestamp();
+                ((), true)
             })
             .await
         else {
@@ -1798,29 +2082,28 @@ impl TaskEvidenceLedger {
 
     async fn update_document<T>(
         &self,
-        update: impl FnOnce(&mut TaskEvidenceDocument) -> T,
+        update: impl FnOnce(&mut TaskEvidenceDocument) -> (T, bool),
     ) -> Option<(T, u64, bool)> {
         let mut guard = self.document.lock().await;
         let document = guard.as_mut()?;
-        let before = document.clone();
-        let result = update(document);
-        let updated_at = document.updated_at.clone();
-        document.revision = before.revision;
-        document.updated_at = before.updated_at.clone();
-        if *document == before {
-            *document = before;
+        let previous_revision = document.revision;
+        let previous_updated_at = document.updated_at.clone();
+        let previous_evidence_epoch = document.evidence_epoch;
+        let (result, changed) = update(document);
+        if !changed {
+            document.revision = previous_revision;
+            document.updated_at = previous_updated_at;
             return Some((result, document.revision, false));
         }
-        document.updated_at = updated_at;
-        document.revision = before.revision.saturating_add(1);
-        if document.evidence_epoch != before.evidence_epoch {
+        document.revision = previous_revision.saturating_add(1);
+        if document.evidence_epoch != previous_evidence_epoch {
             self.mutation_generation.fetch_add(1, Ordering::AcqRel);
             let mut active = self
                 .active_validation
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(validation) = active.as_ref()
-                && validation.evidence_generation == before.evidence_epoch
+                && validation.evidence_generation == previous_evidence_epoch
             {
                 validation.cancellation_token.cancel();
                 *active = None;
@@ -1869,6 +2152,107 @@ impl TaskEvidenceLedger {
         }) {
             *active = None;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn seed_automatic_validation_mutation_for_test(
+        &self,
+        changed_paths: &[&str],
+    ) {
+        self.ensure_initialized().await;
+        let Some(repo_root) = self.repo_root.as_ref() else {
+            return;
+        };
+        let changed_paths = changed_paths
+            .iter()
+            .map(|path| normalize_input_path(repo_root, Some(repo_root), Path::new(path)))
+            .collect::<BTreeSet<_>>();
+        let mut snapshots = BTreeMap::new();
+        for path in &changed_paths {
+            snapshots.insert(path.clone(), snapshot_file(repo_root, path).await);
+        }
+        let Some((_, revision, changed)) = self
+            .update_document(|document| {
+                invalidate_for_mutation(document);
+                let epoch = document.evidence_epoch;
+                for snapshot in snapshots.values() {
+                    document
+                        .latest_file_hashes
+                        .insert(snapshot.path.clone(), snapshot.clone());
+                }
+                let receipt_id = next_receipt_id(
+                    "command",
+                    &mut document.next_command_receipt_sequence,
+                );
+                document.command_receipts.push(CommandReceipt {
+                    id: receipt_id,
+                    recorded_at: timestamp(),
+                    epoch,
+                    step_id: document.active_step_id.clone(),
+                    command: vec!["<automatic-validation-test-mutation>".to_string()],
+                    cwd: document.start.repository_root.clone(),
+                    exit_code: 0,
+                    timed_out: false,
+                    duration_ms: 0,
+                    possible_mutation: true,
+                    observation: Some(MutationObservation::Changed),
+                    coverage: Some(MutationCoverage::Complete),
+                    changed_paths: changed_paths.iter().cloned().collect(),
+                    reconciliation_attempted: true,
+                });
+                trim_to_last(&mut document.command_receipts, MAX_COMMAND_RECEIPTS);
+                document.updated_at = timestamp();
+                ((), true)
+            })
+            .await
+        else {
+            return;
+        };
+        if changed {
+            self.queue_persistence(revision).await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn validation_active_for_generation_for_test(
+        &self,
+        evidence_generation: u64,
+    ) -> bool {
+        self.active_validation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|validation| validation.evidence_generation == evidence_generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn automatic_validation_receipts_for_test(
+        &self,
+        claim_id: &str,
+    ) -> Vec<(String, Vec<String>, bool)> {
+        self.document
+            .lock()
+            .await
+            .as_ref()
+            .map(|document| {
+                document
+                    .validation_receipts
+                    .iter()
+                    .filter(|receipt| receipt.automatic_claim_id.as_deref() == Some(claim_id))
+                    .map(|receipt| {
+                        (
+                            receipt.mode.clone(),
+                            receipt
+                                .active_files
+                                .iter()
+                                .map(|snapshot| snapshot.path.clone())
+                                .collect(),
+                            receipt.conclusion.is_some(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -2009,6 +2393,10 @@ async fn quarantine_evidence_file(path: &Path, kind: &str) -> io::Result<PathBuf
 
 fn migrate_document(document: &mut TaskEvidenceDocument) {
     document.schema_version = TASK_EVIDENCE_SCHEMA_VERSION;
+    // Automatic verifier runs are process-local. A persisted claim cannot still
+    // be active after resume, so make the current evidence generation retriable.
+    document.automatic_plan_attempt_epoch = None;
+    document.automatic_plan_attempt_claim_id = None;
     document.next_edit_receipt_sequence =
         document
             .next_edit_receipt_sequence
@@ -2036,6 +2424,14 @@ fn migrate_document(document: &mut TaskEvidenceDocument) {
                     .iter()
                     .map(|receipt| receipt.id.as_str()),
             ));
+    document.next_automatic_validation_claim_sequence = document
+        .next_automatic_validation_claim_sequence
+        .max(next_sequence_after_ids(
+            document
+                .validation_receipts
+                .iter()
+                .filter_map(|receipt| receipt.automatic_claim_id.as_deref()),
+        ));
     let (duplicate_edit_indices, _) = duplicate_receipt_indices(
         document
             .edit_receipts
@@ -2139,7 +2535,11 @@ fn duplicate_receipt_indices<'a>(
     (duplicate_indices, duplicate_ids)
 }
 
-fn atomic_write_evidence(path: &Path, bytes: &[u8]) -> io::Result<()> {
+fn atomic_write_evidence(
+    path: &Path,
+    bytes: &[u8],
+    interrupt_before_replace: bool,
+) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2148,8 +2548,24 @@ fn atomic_write_evidence(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })?;
     std::fs::create_dir_all(parent)?;
     let mut temp = NamedTempFile::new_in(parent)?;
-    temp.write_all(bytes)?;
+    if interrupt_before_replace {
+        let interrupted_len = bytes.len().saturating_div(2).max(1).min(bytes.len());
+        temp.write_all(&bytes[..interrupted_len])?;
+    } else {
+        temp.write_all(bytes)?;
+    }
     temp.as_file_mut().sync_all()?;
+    if interrupt_before_replace {
+        let (_file, orphan_path) = temp.keep().map_err(|err| err.error)?;
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            format!(
+                "injected task-evidence writer interruption before replacing {} (orphaned {})",
+                path.display(),
+                orphan_path.display()
+            ),
+        ));
+    }
     let persisted = temp.persist(path).map_err(|err| err.error)?;
     persisted.sync_all()?;
     #[cfg(unix)]
@@ -2277,37 +2693,38 @@ fn is_trusted_system_executable(path: &Path) -> bool {
     })
 }
 
-async fn mutation_coverage_for_command(
+async fn command_write_paths(
     repo_root: &Path,
     cwd: &Path,
     command: &[String],
     artifact_paths: &BTreeSet<String>,
-) -> MutationCoverage {
+) -> Option<BTreeSet<String>> {
     let Some(targets) = closed_write_targets(repo_root, cwd, command).await else {
-        return MutationCoverage::Incomplete;
+        return None;
     };
     let Some(canonical_root) = tokio::fs::canonicalize(repo_root).await.ok() else {
-        return MutationCoverage::Incomplete;
+        return None;
     };
     let Some(canonical_cwd) = tokio::fs::canonicalize(cwd).await.ok() else {
-        return MutationCoverage::Incomplete;
+        return None;
     };
     if !canonical_cwd.starts_with(&canonical_root) {
-        return MutationCoverage::Incomplete;
+        return None;
     }
 
+    let mut paths = BTreeSet::new();
     for target in targets {
         let Some(target) = resolve_possible_target(&canonical_cwd, &target).await else {
-            return MutationCoverage::Incomplete;
+            return None;
         };
         if !target.starts_with(&canonical_root) {
-            return MutationCoverage::Incomplete;
+            return None;
         }
         if tokio::fs::metadata(&target)
             .await
             .is_ok_and(|metadata| metadata.is_dir())
         {
-            return MutationCoverage::Incomplete;
+            return None;
         }
         let Some(relative) = target
             .strip_prefix(&canonical_root)
@@ -2315,7 +2732,7 @@ async fn mutation_coverage_for_command(
             .and_then(Path::to_str)
             .map(normalize_evidence_path)
         else {
-            return MutationCoverage::Incomplete;
+            return None;
         };
         let Some(check_ignored) = run_fixed_git(
             &canonical_root,
@@ -2323,17 +2740,18 @@ async fn mutation_coverage_for_command(
         )
         .await
         else {
-            return MutationCoverage::Incomplete;
+            return None;
         };
         match check_ignored.code {
             Some(0) if !artifact_paths.contains(&relative) => {
-                return MutationCoverage::Incomplete;
+                return None;
             }
             Some(0 | 1) => {}
-            _ => return MutationCoverage::Incomplete,
+            _ => return None,
         }
+        paths.insert(relative);
     }
-    MutationCoverage::Complete
+    Some(paths)
 }
 
 async fn resolve_possible_target(cwd: &Path, target: &str) -> Option<PathBuf> {
@@ -3299,6 +3717,7 @@ fn invalidate_evidence(
     document.wiring_receipt = None;
     document.desktop_activation_receipt = None;
     document.automatic_plan_attempt_epoch = None;
+    document.automatic_plan_attempt_claim_id = None;
     if reset_repair_budget {
         document.repair_turns_used = 0;
     }
@@ -3329,6 +3748,42 @@ fn task_is_tracked(document: &TaskEvidenceDocument) -> bool {
             .risks
             .iter()
             .any(|risk| risk.source == "task_evidence_storage" && !risk.resolved)
+}
+
+fn automatic_validation_mutation_pending(document: &TaskEvidenceDocument, epoch: u64) -> bool {
+    document
+        .edit_receipts
+        .iter()
+        .any(|receipt| receipt.epoch == epoch)
+        || document.command_receipts.iter().any(|receipt| {
+            receipt.epoch == epoch
+                && matches!(
+                    receipt.observation,
+                    Some(MutationObservation::Changed | MutationObservation::Unknown)
+                )
+        })
+}
+
+fn automatic_validation_changed_paths(
+    document: &TaskEvidenceDocument,
+    epoch: u64,
+) -> Vec<String> {
+    let mut paths = BTreeSet::new();
+    for receipt in document
+        .edit_receipts
+        .iter()
+        .filter(|receipt| receipt.epoch == epoch)
+    {
+        paths.extend(receipt.files.iter().map(|file| file.path.clone()));
+    }
+    for receipt in document
+        .command_receipts
+        .iter()
+        .filter(|receipt| receipt.epoch == epoch)
+    {
+        paths.extend(receipt.changed_paths.iter().cloned());
+    }
+    paths.into_iter().collect()
 }
 
 fn validation_mode_strength(mode: &str) -> u8 {
@@ -4493,7 +4948,10 @@ mod tests {
         ledger.record_edit_result("patch-1", "completed").await;
 
         assert_eq!(
-            ledger.take_automatic_verify_plan_request().await,
+            ledger
+                .take_automatic_verify_plan_request()
+                .await
+                .map(|request| request.changed_paths),
             Some(vec!["src/lib.rs".to_string()])
         );
         assert_eq!(ledger.take_automatic_verify_plan_request().await, None);

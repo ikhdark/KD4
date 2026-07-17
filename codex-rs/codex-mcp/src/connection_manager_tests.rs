@@ -1,6 +1,8 @@
 use super::*;
 use crate::codex_apps_cache::CodexAppsToolsCache;
 use crate::codex_apps_cache::CodexAppsToolsCacheContext;
+use crate::codex_apps_cache::codex_apps_tools_cache_key;
+use crate::codex_apps_cache::codex_apps_tools_cache_key_for_test;
 use crate::declared_openai_file_input_param_names;
 use crate::elicitation::ElicitationLifecycle;
 use crate::elicitation::ElicitationRequestManager;
@@ -76,11 +78,10 @@ fn create_codex_apps_tools_cache_context(
 ) -> CodexAppsToolsCacheContext {
     CodexAppsToolsCache::default().context(
         codex_home,
-        CodexAppsToolsCacheKey {
-            account_id: account_id.map(ToOwned::to_owned),
-            chatgpt_user_id: chatgpt_user_id.map(ToOwned::to_owned),
-            is_workspace_account: false,
-        },
+        codex_apps_tools_cache_key_for_test(
+            &format!("{account_id:?}:{chatgpt_user_id:?}"),
+            "default-server",
+        ),
     )
 }
 
@@ -122,6 +123,31 @@ async fn create_test_managed_client(tools: Vec<ToolInfo>) -> ManagedClient {
         server_supports_sandbox_state_meta_capability: false,
         codex_apps_tools_cache_context: None,
     }
+}
+
+#[tokio::test]
+async fn connected_catalog_authorization_ignores_later_shared_cache_mutation() {
+    let codex_home = tempdir().expect("tempdir");
+    let cache_context = create_codex_apps_tools_cache_context(
+        codex_home.path().to_path_buf(),
+        Some("catalog-account"),
+        Some("catalog-user"),
+    );
+    let mut client = create_test_managed_client(vec![create_test_tool(
+        CODEX_APPS_MCP_SERVER_NAME,
+        "connected_tool",
+    )])
+    .await;
+    client.codex_apps_tools_cache_context = Some(cache_context.clone());
+
+    cache_context.store_current_tools_for_test(vec![create_test_tool(
+        CODEX_APPS_MCP_SERVER_NAME,
+        "later_cached_tool",
+    )]);
+
+    assert!(client.connected_catalog_contains("connected_tool"));
+    assert!(!client.connected_catalog_contains("later_cached_tool"));
+    assert_eq!(client.listed_tools()[0].callable_name, "later_cached_tool");
 }
 
 async fn create_ready_async_managed_client(tools: Vec<ToolInfo>) -> AsyncManagedClient {
@@ -1452,7 +1478,7 @@ fn host_owned_codex_apps_requires_server_metadata() {
 }
 
 #[test]
-fn host_owned_codex_apps_matches_reserved_name_with_server_metadata() {
+fn host_owned_codex_apps_requires_validated_registration_provenance() {
     let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
     let permission_profile = Constrained::allow_any(PermissionProfile::default());
     let mut manager = McpConnectionManager::new_uninitialized(
@@ -1460,7 +1486,7 @@ fn host_owned_codex_apps_matches_reserved_name_with_server_metadata() {
         &permission_profile,
         /*prefix_mcp_tool_names*/ true,
     );
-    let server = EffectiveMcpServer::configured(crate::codex_apps_mcp_server_config(
+    let server = EffectiveMcpServer::host_owned_codex_apps(crate::codex_apps_mcp_server_config(
         "https://chatgpt.com",
         /*apps_mcp_product_sku*/ None,
         /*originator*/ None,
@@ -1472,6 +1498,325 @@ fn host_owned_codex_apps_matches_reserved_name_with_server_metadata() {
 
     assert!(manager.is_host_owned_codex_apps_server(CODEX_APPS_MCP_SERVER_NAME));
     assert!(!manager.is_host_owned_codex_apps_server("docs"));
+
+    let user_owned_reserved_name = EffectiveMcpServer::configured(
+        crate::codex_apps_mcp_server_config(
+            "https://chatgpt.com",
+            /*apps_mcp_product_sku*/ None,
+            /*originator*/ None,
+        ),
+    );
+    manager.server_metadata.insert(
+        CODEX_APPS_MCP_SERVER_NAME.to_string(),
+        McpServerMetadata::from(&user_owned_reserved_name),
+    );
+    assert!(!manager.is_host_owned_codex_apps_server(CODEX_APPS_MCP_SERVER_NAME));
+    assert!(!should_share_codex_apps_tools_cache(
+        &user_owned_reserved_name,
+        /*uses_env_bearer_token*/ false,
+    ));
+}
+
+#[test]
+fn cached_catalog_never_defers_a_required_server() {
+    let codex_home = tempdir().expect("tempdir");
+    let cache_context = create_codex_apps_tools_cache_context(
+        codex_home.path().to_path_buf(),
+        Some("required-account"),
+        Some("required-user"),
+    );
+    cache_context.store_current_tools_for_test(vec![create_test_tool(
+        CODEX_APPS_MCP_SERVER_NAME,
+        "cached_search",
+    )]);
+    let mut config = crate::codex_apps_mcp_server_config(
+        "https://chatgpt.com",
+        /*apps_mcp_product_sku*/ None,
+        /*originator*/ None,
+    );
+    let optional = EffectiveMcpServer::host_owned_codex_apps(config.clone());
+    assert!(should_defer_server_startup(
+        &optional,
+        Some(&cache_context)
+    ));
+
+    config.required = true;
+    let required = EffectiveMcpServer::host_owned_codex_apps(config);
+    assert!(!should_defer_server_startup(
+        &required,
+        Some(&cache_context)
+    ));
+}
+
+#[tokio::test]
+async fn cached_optional_apps_catalog_stays_dormant_until_authoritative_use() {
+    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let (tx_event, rx_event) = async_channel::unbounded();
+    let codex_home = tempdir().expect("tempdir");
+    let cache = CodexAppsToolsCache::default();
+    let apps_config = McpServerConfig {
+        auth: Default::default(),
+        transport: McpServerTransportConfig::StreamableHttp {
+            url: "http://127.0.0.1:1".to_string(),
+            bearer_token_env_var: None,
+            http_headers: None,
+            env_http_headers: None,
+        },
+        environment_id: codex_config::DEFAULT_MCP_SERVER_ENVIRONMENT_ID.to_string(),
+        enabled: true,
+        required: false,
+        supports_parallel_tool_calls: false,
+        disabled_reason: None,
+        startup_timeout_sec: Some(Duration::from_millis(50)),
+        tool_timeout_sec: None,
+        default_tools_approval_mode: None,
+        enabled_tools: None,
+        disabled_tools: None,
+        scopes: None,
+        oauth: None,
+        oauth_resource: None,
+        tools: HashMap::new(),
+    };
+    let cache_key = codex_apps_tools_cache_key(
+        /*auth*/ None,
+        CODEX_APPS_MCP_SERVER_NAME,
+        &apps_config,
+    );
+    cache
+        .context(codex_home.path().to_path_buf(), cache_key)
+        .store_current_tools_for_test(vec![create_test_tool(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "cached_search",
+        )]);
+    let mcp_servers = HashMap::from([(
+        CODEX_APPS_MCP_SERVER_NAME.to_string(),
+        EffectiveMcpServer::host_owned_codex_apps(apps_config),
+    )]);
+
+    let manager = McpConnectionManager::new(
+        &mcp_servers,
+        OAuthCredentialsStoreMode::default(),
+        AuthKeyringBackendKind::default(),
+        HashMap::new(),
+        &approval_policy,
+        "lazy-start".to_string(),
+        tx_event,
+        CancellationToken::new(),
+        PermissionProfile::default(),
+        McpRuntimeContext::new(
+            Arc::new(EnvironmentManager::without_environments()),
+            PathBuf::from("/tmp"),
+        ),
+        codex_home.path().to_path_buf(),
+        cache,
+        /*prefix_mcp_tool_names*/ true,
+        ElicitationCapability::default(),
+        /*supports_openai_form_elicitation*/ false,
+        ToolPluginProvenance::default(),
+        /*auth*/ None,
+        /*codex_apps_auth_manager*/ None,
+        /*elicitation_reviewer*/ None,
+        /*elicitation_lifecycle*/ None,
+        ElicitationRequestRouter::default(),
+    )
+    .await;
+    let client = manager
+        .clients
+        .get(CODEX_APPS_MCP_SERVER_NAME)
+        .expect("apps client");
+
+    tokio::task::yield_now().await;
+    assert!(!client.startup_complete.load(Ordering::Acquire));
+    let tools = manager.list_all_tools().await;
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].tool.name.as_ref(), "cached_search");
+    assert!(!client.startup_complete.load(Ordering::Acquire));
+    while let Ok(event) = rx_event.try_recv() {
+        assert!(
+            !matches!(
+                event.msg,
+                EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                    server,
+                    status: McpStartupStatus::Starting,
+                }) if server == CODEX_APPS_MCP_SERVER_NAME
+            ),
+            "dormant cached server emitted an eager startup event"
+        );
+    }
+
+    assert!(
+        !manager
+            .wait_for_server_ready(CODEX_APPS_MCP_SERVER_NAME, Duration::from_secs(1))
+            .await
+    );
+    assert!(client.startup_complete.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn concurrent_authoritative_uses_share_one_deferred_startup() {
+    let polls = Arc::new(AtomicUsize::new(0));
+    let managed = create_test_managed_client(vec![create_test_tool(
+        CODEX_APPS_MCP_SERVER_NAME,
+        "cached_search",
+    )])
+    .await;
+    let client: ManagedClientFuture = {
+        let polls = Arc::clone(&polls);
+        futures::future::lazy(move |_| {
+            polls.fetch_add(1, Ordering::SeqCst);
+            Ok(managed)
+        })
+        .boxed()
+        .shared()
+    };
+    let codex_home = tempdir().expect("tempdir");
+    let cache_context = create_codex_apps_tools_cache_context(
+        codex_home.path().to_path_buf(),
+        Some("singleflight-account"),
+        Some("singleflight-user"),
+    );
+    cache_context.store_current_tools_for_test(vec![create_test_tool(
+        CODEX_APPS_MCP_SERVER_NAME,
+        "cached_search",
+    )]);
+    let approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
+    let permission_profile = Constrained::allow_any(PermissionProfile::default());
+    let mut manager = McpConnectionManager::new_uninitialized(
+        &approval_policy,
+        &permission_profile,
+        /*prefix_mcp_tool_names*/ true,
+    );
+    manager.clients.insert(
+        CODEX_APPS_MCP_SERVER_NAME.to_string(),
+        AsyncManagedClient {
+            client,
+            is_codex_apps_mcp_server: true,
+            cached_server_info: None,
+            codex_apps_tools_cache_context: Some(cache_context),
+            tool_filter: ToolFilter::default(),
+            startup_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            startup_reconnect: None,
+            tool_plugin_provenance: Arc::new(ToolPluginProvenance::default()),
+            cancel_token: CancellationToken::new(),
+        },
+    );
+
+    assert_eq!(manager.list_all_tools().await.len(), 1);
+    assert_eq!(polls.load(Ordering::SeqCst), 0);
+    let (first, second) = tokio::join!(
+        manager.client_by_name(CODEX_APPS_MCP_SERVER_NAME),
+        manager.client_by_name(CODEX_APPS_MCP_SERVER_NAME),
+    );
+    assert!(first.is_ok());
+    assert!(second.is_ok());
+    assert_eq!(polls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn concurrent_authoritative_uses_join_one_reconnect_after_deferred_failure() {
+    let recovered_client = create_test_managed_client(vec![create_test_tool(
+        CODEX_APPS_MCP_SERVER_NAME,
+        "recovered_tool",
+    )])
+    .await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let reconnect_started = Arc::new(tokio::sync::Notify::new());
+    let release_reconnect = Arc::new(tokio::sync::Notify::new());
+    let reconnect_factory = {
+        let attempts = Arc::clone(&attempts);
+        let reconnect_started = Arc::clone(&reconnect_started);
+        let release_reconnect = Arc::clone(&release_reconnect);
+        Arc::new(move || {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let reconnect_started = Arc::clone(&reconnect_started);
+            let release_reconnect = Arc::clone(&release_reconnect);
+            let recovered_client = recovered_client.clone();
+            async move {
+                reconnect_started.notify_one();
+                release_reconnect.notified().await;
+                Ok(recovered_client)
+            }
+            .boxed()
+            .shared()
+        })
+    };
+    let manager = Arc::new(create_test_manager_with_failed_apps_startup(
+        vec![create_test_tool(
+            CODEX_APPS_MCP_SERVER_NAME,
+            "cached_tool",
+        )],
+        reconnect_factory,
+    ));
+
+    let first = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move { manager.client_by_name(CODEX_APPS_MCP_SERVER_NAME).await }
+    });
+    reconnect_started.notified().await;
+    let second = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move { manager.client_by_name(CODEX_APPS_MCP_SERVER_NAME).await }
+    });
+    tokio::task::yield_now().await;
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    release_reconnect.notify_waiters();
+
+    assert!(first.await.expect("first authoritative task").is_ok());
+    assert!(second.await.expect("second authoritative task").is_ok());
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn authoritative_use_retries_failed_reconnect_after_bounded_backoff() {
+    let recovered_client = create_test_managed_client(vec![create_test_tool(
+        CODEX_APPS_MCP_SERVER_NAME,
+        "recovered_tool",
+    )])
+    .await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let reconnect_factory = {
+        let attempts = Arc::clone(&attempts);
+        Arc::new(move || {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let recovered_client = recovered_client.clone();
+            async move {
+                if attempt == 0 {
+                    Err(StartupOutcomeError::Failed {
+                        error: "first reconnect failed".to_string(),
+                        is_authentication_required: false,
+                    })
+                } else {
+                    Ok(recovered_client)
+                }
+            }
+            .boxed()
+            .shared()
+        })
+    };
+    let manager = create_test_manager_with_failed_apps_startup(Vec::new(), reconnect_factory);
+
+    assert!(
+        manager
+            .client_by_name(CODEX_APPS_MCP_SERVER_NAME)
+            .await
+            .is_err()
+    );
+    assert!(
+        manager
+            .client_by_name(CODEX_APPS_MCP_SERVER_NAME)
+            .await
+            .is_err()
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    tokio::time::advance(CODEX_APPS_RECONNECT_INITIAL_BACKOFF).await;
+    assert!(
+        manager
+            .client_by_name(CODEX_APPS_MCP_SERVER_NAME)
+            .await
+            .is_ok()
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -1553,11 +1898,6 @@ async fn no_local_runtime_fails_local_stdio_but_keeps_local_http_server() {
         ),
         codex_home.path().to_path_buf(),
         CodexAppsToolsCache::default(),
-        CodexAppsToolsCacheKey {
-            account_id: None,
-            chatgpt_user_id: None,
-            is_workspace_account: false,
-        },
         /*prefix_mcp_tool_names*/ true,
         ElicitationCapability::default(),
         /*supports_openai_form_elicitation*/ false,

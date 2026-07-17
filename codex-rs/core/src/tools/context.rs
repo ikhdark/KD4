@@ -146,7 +146,11 @@ impl McpToolOutput {
         //
         // The text is serialized again inside the Responses payload, so allow
         // a small buffer for JSON escaping and wrapper overhead.
-        truncate_function_output_payload(&payload, self.truncation_policy * 1.2)
+        truncate_function_output_payload(
+            &payload,
+            self.truncation_policy * 1.2,
+            /*preserve_bounded_shell_evidence*/ false,
+        )
     }
 }
 

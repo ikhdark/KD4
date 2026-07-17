@@ -119,6 +119,11 @@ struct ThreadSettingsBuildParams {
     personality: Option<Personality>,
 }
 
+struct ThreadSettingsBuildOutcome {
+    overrides: codex_protocol::protocol::ThreadSettingsOverrides,
+    preview_snapshot: Option<ThreadConfigSnapshot>,
+}
+
 impl TurnRequestProcessor {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -514,6 +519,8 @@ impl TurnRequestProcessor {
                 },
             )
             .await?;
+        let skills_watch_snapshot = thread_settings.preview_snapshot;
+        let thread_settings = thread_settings.overrides;
 
         // Start the turn by submitting the user input. Return its submission id as turn_id.
         let turn_op = Op::UserInput {
@@ -545,6 +552,10 @@ impl TurnRequestProcessor {
                 error
             })?;
         origin_reservation.commit();
+        if let Some(config_snapshot) = skills_watch_snapshot.as_ref() {
+            self.refresh_skills_watch_registration(thread_id, thread.as_ref(), config_snapshot)
+                .await;
+        }
 
         if turn_has_input {
             let config_snapshot = thread.config_snapshot().await;
@@ -612,7 +623,7 @@ impl TurnRequestProcessor {
         &self,
         thread: &CodexThread,
         params: ThreadSettingsBuildParams,
-    ) -> Result<codex_protocol::protocol::ThreadSettingsOverrides, JSONRPCErrorError> {
+    ) -> Result<ThreadSettingsBuildOutcome, JSONRPCErrorError> {
         let ThreadSettingsBuildParams {
             method,
             environments,
@@ -718,8 +729,8 @@ impl TurnRequestProcessor {
             };
         let effort = effort.map(Some);
 
-        if has_any_overrides {
-            thread
+        let preview_snapshot = if has_any_overrides {
+            let snapshot = thread
                 .preview_thread_settings_overrides(CodexThreadSettingsOverrides {
                     environments: environments.clone(),
                     workspace_roots: runtime_workspace_roots.clone(),
@@ -741,25 +752,53 @@ impl TurnRequestProcessor {
                 .map_err(|err| {
                     invalid_request(format!("invalid thread settings override: {err}"))
                 })?;
-        }
+            has_environment_override.then_some(snapshot)
+        } else {
+            None
+        };
 
-        Ok(codex_protocol::protocol::ThreadSettingsOverrides {
-            environments,
-            workspace_roots: runtime_workspace_roots,
-            profile_workspace_roots,
-            approval_policy,
-            approvals_reviewer,
-            sandbox_policy,
-            permission_profile,
-            active_permission_profile,
-            windows_sandbox_level: None,
-            model,
-            effort,
-            summary,
-            service_tier,
-            collaboration_mode,
-            personality,
+        Ok(ThreadSettingsBuildOutcome {
+            overrides: codex_protocol::protocol::ThreadSettingsOverrides {
+                environments,
+                workspace_roots: runtime_workspace_roots,
+                profile_workspace_roots,
+                approval_policy,
+                approvals_reviewer,
+                sandbox_policy,
+                permission_profile,
+                active_permission_profile,
+                windows_sandbox_level: None,
+                model,
+                effort,
+                summary,
+                service_tier,
+                collaboration_mode,
+                personality,
+            },
+            preview_snapshot,
         })
+    }
+
+    async fn refresh_skills_watch_registration(
+        &self,
+        thread_id: ThreadId,
+        thread: &CodexThread,
+        config_snapshot: &ThreadConfigSnapshot,
+    ) {
+        let config = thread.config().await;
+        let registration = self
+            .skills_watcher
+            .register_thread_config(
+                config.as_ref(),
+                self.thread_manager.as_ref(),
+                config_snapshot,
+            )
+            .await;
+        let thread_state = self.thread_state_manager.thread_state(thread_id).await;
+        thread_state
+            .lock()
+            .await
+            .replace_watch_registration(registration);
     }
 
     async fn thread_settings_update_inner(
@@ -767,7 +806,7 @@ impl TurnRequestProcessor {
         request_id: &ConnectionRequestId,
         params: ThreadSettingsUpdateParams,
     ) -> Result<ThreadSettingsUpdateResponse, JSONRPCErrorError> {
-        let (_, thread) = self.load_thread(&params.thread_id).await?;
+        let (thread_id, thread) = self.load_thread(&params.thread_id).await?;
         let cwd = resolve_request_cwd(params.cwd)?;
         let environments = self
             .build_environment_override(thread.as_ref(), cwd, /*environment_selections*/ None)
@@ -792,6 +831,8 @@ impl TurnRequestProcessor {
                 },
             )
             .await?;
+        let skills_watch_snapshot = thread_settings.preview_snapshot;
+        let thread_settings = thread_settings.overrides;
 
         if thread_settings != codex_protocol::protocol::ThreadSettingsOverrides::default() {
             self.submit_core_op(
@@ -801,6 +842,14 @@ impl TurnRequestProcessor {
             )
             .await
             .map_err(|err| internal_error(format!("failed to update thread settings: {err}")))?;
+            if let Some(config_snapshot) = skills_watch_snapshot.as_ref() {
+                self.refresh_skills_watch_registration(
+                    thread_id,
+                    thread.as_ref(),
+                    config_snapshot,
+                )
+                .await;
+            }
         }
 
         Ok(ThreadSettingsUpdateResponse {})

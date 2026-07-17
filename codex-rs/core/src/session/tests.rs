@@ -39,12 +39,14 @@ use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::bundled_models_response;
+use codex_models_manager::manager::ModelsManager;
 use codex_models_manager::model_info;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
+use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
@@ -4013,6 +4015,8 @@ async fn includes_timed_out_message() {
         stdout: StreamOutput::new(String::new()),
         stderr: StreamOutput::new(String::new()),
         aggregated_output: StreamOutput::new("Command output".to_string()),
+        aggregated_output_bytes: None,
+        output_complete: true,
         duration: StdDuration::from_secs(1),
         timed_out: true,
     };
@@ -7848,7 +7852,162 @@ async fn stable_turns_share_base_config_snapshot_and_overrides_invalidate_it() {
         .await
         .expect("turn override should be accepted");
     assert!(!Arc::ptr_eq(&first.config, &updated.config));
-    assert_eq!(updated.config.approvals_reviewer, ApprovalsReviewer::AutoReview);
+    assert_eq!(
+        updated.config.approvals_reviewer,
+        ApprovalsReviewer::AutoReview
+    );
+}
+
+#[derive(Debug)]
+struct PublishingBetweenModelCatalogReads {
+    first: Arc<codex_models_manager::manager::ModelCatalogSnapshot>,
+    second: Arc<codex_models_manager::manager::ModelCatalogSnapshot>,
+    snapshot_reads: std::sync::atomic::AtomicUsize,
+}
+
+impl codex_models_manager::manager::ModelsManager for PublishingBetweenModelCatalogReads {
+    fn catalog_snapshot(
+        &self,
+        _refresh_strategy: RefreshStrategy,
+        _http_client_factory: HttpClientFactory,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<
+        '_,
+        Arc<codex_models_manager::manager::ModelCatalogSnapshot>,
+    > {
+        self.snapshot_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Box::pin(async { Arc::clone(&self.first) })
+    }
+
+    fn raw_model_catalog(
+        &self,
+        _refresh_strategy: RefreshStrategy,
+        _http_client_factory: HttpClientFactory,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<
+        '_,
+        codex_protocol::openai_models::ModelsResponse,
+    > {
+        Box::pin(async {
+            codex_protocol::openai_models::ModelsResponse {
+                models: self.second.models().to_vec(),
+            }
+        })
+    }
+
+    fn get_remote_models(
+        &self,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<'_, Vec<ModelInfo>> {
+        Box::pin(async { self.first.models().to_vec() })
+    }
+
+    fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, tokio::sync::TryLockError> {
+        Ok(self.second.models().to_vec())
+    }
+
+    fn current_catalog_snapshot(
+        &self,
+    ) -> codex_models_manager::manager::ModelsManagerFuture<
+        '_,
+        Arc<codex_models_manager::manager::ModelCatalogSnapshot>,
+    > {
+        self.snapshot_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Box::pin(async { Arc::clone(&self.first) })
+    }
+
+    fn try_current_catalog_snapshot(
+        &self,
+    ) -> Result<Arc<codex_models_manager::manager::ModelCatalogSnapshot>, tokio::sync::TryLockError>
+    {
+        self.snapshot_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Arc::clone(&self.second))
+    }
+
+    fn auth_manager(&self) -> Option<&AuthManager> {
+        None
+    }
+
+    fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
+        Vec::new()
+    }
+
+    fn enqueue_refresh_if_new_etag(
+        self: Arc<Self>,
+        _etag: String,
+        _http_client_factory: HttpClientFactory,
+    ) {
+    }
+}
+
+#[tokio::test]
+async fn turn_model_fields_share_one_catalog_generation_during_publication() {
+    let (mut session, initial_turn) = make_session_and_context().await;
+    let model = initial_turn.model_info.slug.clone();
+    let mut first_model = initial_turn.model_info.clone();
+    first_model.display_name = "Catalog generation one".to_string();
+    first_model.visibility = codex_protocol::openai_models::ModelVisibility::List;
+    first_model.supported_in_api = true;
+    let mut second_model = first_model.clone();
+    second_model.display_name = "Catalog generation two".to_string();
+    let first_manager = codex_models_manager::manager::StaticModelsManager::new(
+        /*auth_manager*/ None,
+        codex_protocol::openai_models::ModelsResponse {
+            models: vec![first_model],
+        },
+    );
+    let first = first_manager.current_catalog_snapshot().await;
+    let second_manager = codex_models_manager::manager::StaticModelsManager::new(
+        /*auth_manager*/ None,
+        codex_protocol::openai_models::ModelsResponse {
+            models: vec![second_model],
+        },
+    );
+    let second = second_manager.current_catalog_snapshot().await;
+    let publishing_manager = Arc::new(PublishingBetweenModelCatalogReads {
+        first,
+        second,
+        snapshot_reads: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let models_manager: SharedModelsManager = publishing_manager.clone();
+    session.services.models_manager = Arc::clone(&models_manager);
+
+    let turn = session
+        .new_default_turn_with_sub_id("catalog-publication-turn".to_string())
+        .await;
+    let preset = turn
+        .available_models
+        .iter()
+        .find(|preset| preset.model == model)
+        .expect("selected model should remain picker-visible");
+    assert_eq!(turn.model_info.display_name, "Catalog generation one");
+    assert_eq!(preset.display_name, "Catalog generation one");
+    assert_eq!(
+        publishing_manager
+            .snapshot_reads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "turn construction must capture exactly one catalog generation"
+    );
+
+    publishing_manager
+        .snapshot_reads
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let replaced = initial_turn.with_model(model, &models_manager).await;
+    let preset = replaced
+        .available_models
+        .iter()
+        .find(|preset| preset.model == replaced.model_info.slug)
+        .expect("replacement model should remain picker-visible");
+    assert_eq!(replaced.model_info.display_name, "Catalog generation one");
+    assert_eq!(preset.display_name, "Catalog generation one");
+    assert_eq!(
+        publishing_manager
+            .snapshot_reads
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "with_model must capture exactly one catalog generation"
+    );
 }
 
 #[tokio::test]
@@ -7862,9 +8021,8 @@ async fn step_context_materializes_one_runtime_versioned_mcp_inventory() {
     assert!(std::ptr::eq(first, second));
     assert_eq!(first.runtime_version(), step_context.mcp.version());
 
-    let next_runtime = crate::session::McpRuntimeSnapshot::new_uninitialized_for_test(
-        &turn_context.config,
-    );
+    let next_runtime =
+        crate::session::McpRuntimeSnapshot::new_uninitialized_for_test(&turn_context.config);
     assert_ne!(first.runtime_version(), next_runtime.version());
 }
 

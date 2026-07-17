@@ -38,8 +38,6 @@ use codex_verify_local::PlanMode;
 use codex_verify_local::PlanRequest;
 use codex_verify_local::RawPath;
 use codex_verify_local::RepositorySnapshot;
-use codex_verify_local::SnapshotRecord;
-use codex_verify_local::SnapshotSource;
 use codex_verify_local::finalize_plan;
 use codex_verify_local::plan_verification;
 use codex_verify_local::random_hex_128;
@@ -194,6 +192,33 @@ impl VerifyLocalHandler {
         };
 
         let args = parse_verify_local_arguments(&arguments)?;
+        self.run_call(
+            session,
+            turn,
+            step_context,
+            cancellation_token,
+            tracker,
+            call_id,
+            args,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_call(
+        &self,
+        session: Arc<Session>,
+        turn: Arc<crate::session::turn_context::TurnContext>,
+        step_context: Arc<StepContext>,
+        cancellation_token: CancellationToken,
+        tracker: SharedTurnDiffTracker,
+        call_id: String,
+        args: VerifyLocalArgs,
+        automatic_request: Option<&crate::task_evidence::AutomaticVerifyLocalRequest>,
+        plan_override: Option<codex_verify_local::PlanEnvelopeV2>,
+    ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
         let environment =
             resolve_tool_environment(&step_context.environments, args.environment_id.as_deref())?
                 .ok_or_else(|| {
@@ -229,17 +254,19 @@ impl VerifyLocalHandler {
             RepositorySnapshot::from_worktree(&repo_root)
         }
         .unwrap_or_else(|error| RepositorySnapshot::full_fallback(&repo_root, error.to_string()));
-        let plan = plan_verification(
-            PlanRequest {
-                mode: Some(mode),
-                changed,
-                staged: args.staged,
-                scope_current: args.scope_current,
-                no_cache: args.no_cache,
-                ..PlanRequest::default()
-            },
-            snapshot,
-        );
+        let plan = plan_override.unwrap_or_else(|| {
+            plan_verification(
+                PlanRequest {
+                    mode: Some(mode),
+                    changed,
+                    staged: args.staged,
+                    scope_current: args.scope_current,
+                    no_cache: args.no_cache,
+                    ..PlanRequest::default()
+                },
+                snapshot,
+            )
+        });
         let validation_command = vec!["verify_local".to_string(), args.mode_flag.to_string()];
         let validation_tracker = tracker.clone();
         let validation_environment_id = environment.environment_id.clone();
@@ -260,11 +287,28 @@ impl VerifyLocalHandler {
             "CODEX_SQLITE_HOME".to_string(),
             isolated_sqlite_home.to_string_lossy().into_owned(),
         );
-        let validation_start = session
-            .services
-            .task_evidence
-            .begin_verify_local_validation()
-            .await;
+        let validation_start = match automatic_request {
+            Some(request) => Some(
+                session
+                    .services
+                    .task_evidence
+                    .begin_verify_local_validation_for_automatic_request(request)
+                    .await
+                    .ok_or_else(|| {
+                        FunctionCallError::RespondToModel(
+                            "automatic verify_local run was superseded by newer task evidence"
+                                .to_string(),
+                        )
+                    })?,
+            ),
+            None => {
+                session
+                    .services
+                    .task_evidence
+                    .begin_verify_local_validation()
+                    .await
+            }
+        };
         let validation_cancellation_token = validation_start
             .as_ref()
             .map(|start| start.cancellation_token())
@@ -536,7 +580,7 @@ async fn command_result_from_core_execution(
     let artifact =
         create_content_addressed_output_artifact(codex_home, artifact_thread_id, exact_output)
             .await;
-    let (exact_output_artifact, log_path, artifact_error) = match artifact {
+    let (stored_output_artifact, log_path, artifact_error) = match artifact {
         RawOutputArtifact::Stored { path, bytes } => (
             Some(ExactOutputArtifactV2 {
                 sha256: sha256.clone(),
@@ -551,6 +595,17 @@ async fn command_result_from_core_execution(
             owned_path,
             ..
         } => (None, owned_path, Some(message)),
+    };
+    let exact_output_artifact = output
+        .output_complete
+        .then_some(stored_output_artifact)
+        .flatten();
+    let capture_error = (!output.output_complete)
+        .then(|| "Process output capture remained incomplete after termination".to_string());
+    let runner_error = match (capture_error, artifact_error) {
+        (Some(capture), Some(artifact)) => Some(format!("{capture}; {artifact}")),
+        (Some(capture), None) => Some(capture),
+        (None, artifact) => artifact,
     };
     let reduction = reduce_shell_output_for_model(
         &output.aggregated_output.text,
@@ -574,16 +629,23 @@ async fn command_result_from_core_execution(
             )
         },
     );
+    let output_label = if output.output_complete {
+        "Exact output"
+    } else {
+        "Incomplete captured output"
+    };
     let diagnostic = format!(
-        "Exact output: sha256:{sha256} ({} bytes)\n{preview}",
+        "{output_label}: sha256:{sha256} ({} bytes)\n{preview}",
         exact_output.len()
     );
     CommandResultV2 {
         exit_code: exit_code.or(Some(output.exit_code)),
         duration_ns: u64::try_from(output.duration.as_nanos()).unwrap_or(u64::MAX),
         timed_out: output.timed_out,
-        runner_error: artifact_error,
-        log_state: if exact_output_artifact.is_some() {
+        runner_error,
+        log_state: if !output.output_complete {
+            LogState::IncompleteAfterTermination
+        } else if exact_output_artifact.is_some() {
             LogState::Complete
         } else {
             LogState::IoFailure
@@ -596,63 +658,95 @@ async fn command_result_from_core_execution(
     }
 }
 
-pub(crate) async fn run_automatic_verify_local_plan(
+pub(crate) async fn run_automatic_verify_local(
     session: Arc<Session>,
     step_context: Arc<StepContext>,
     tracker: SharedTurnDiffTracker,
-    changed: Vec<String>,
+    request: crate::task_evidence::AutomaticVerifyLocalRequest,
     cancellation_token: CancellationToken,
-) -> Result<String, FunctionCallError> {
-    let _ = (session, tracker, cancellation_token);
-    let scope_current = changed.is_empty();
-    let environment =
-        resolve_tool_environment(&step_context.environments, None)?.ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "automatic verify_local planning requires a selected local environment".to_string(),
-            )
-        })?;
-    if environment.environment.is_remote() {
-        return Err(FunctionCallError::RespondToModel(
-            "automatic verify_local planning is available only locally".to_string(),
-        ));
-    }
-    let repo_root = find_verify_local_repo_root(environment.cwd()).ok_or_else(|| {
-        FunctionCallError::RespondToModel(
-            "automatic verify_local planning could not locate the repository root".to_string(),
-        )
-    })?;
-    let changed_paths = changed
-        .into_iter()
-        .map(RawPath::from_utf8)
-        .collect::<Vec<_>>();
-    let snapshot = RepositorySnapshot {
-        repository_root: Some(repo_root),
-        source: SnapshotSource::ExplicitPaths,
-        records: changed_paths
-            .iter()
-            .cloned()
-            .map(|path| SnapshotRecord {
-                status: "M".to_string(),
-                path,
-                original_path: None,
-                staged: false,
-                unstaged: false,
-                submodule_state: None,
-            })
-            .collect(),
-        complete: true,
-        fallback_reasons: Vec::new(),
+) -> Result<(), FunctionCallError> {
+    run_automatic_verify_local_inner(
+        session,
+        step_context,
+        tracker,
+        request,
+        cancellation_token,
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn run_automatic_verify_local_with_plan(
+    session: Arc<Session>,
+    step_context: Arc<StepContext>,
+    tracker: SharedTurnDiffTracker,
+    request: crate::task_evidence::AutomaticVerifyLocalRequest,
+    cancellation_token: CancellationToken,
+    plan: codex_verify_local::PlanEnvelopeV2,
+) -> Result<(), FunctionCallError> {
+    run_automatic_verify_local_inner(
+        session,
+        step_context,
+        tracker,
+        request,
+        cancellation_token,
+        Some(plan),
+    )
+    .await
+}
+
+async fn run_automatic_verify_local_inner(
+    session: Arc<Session>,
+    step_context: Arc<StepContext>,
+    tracker: SharedTurnDiffTracker,
+    request: crate::task_evidence::AutomaticVerifyLocalRequest,
+    cancellation_token: CancellationToken,
+    plan_override: Option<codex_verify_local::PlanEnvelopeV2>,
+) -> Result<(), FunctionCallError> {
+    let generation = request.evidence_generation;
+    let claim_id = request.claim_id.clone();
+    let args = VerifyLocalArgs {
+        mode_flag: "--fast",
+        scope_current: false,
+        changed: request.changed_paths.clone(),
+        staged: false,
+        no_cache: false,
+        json: false,
+        environment_id: None,
     };
-    let plan = plan_verification(
-        PlanRequest {
-            mode: Some(PlanMode::Plan),
-            changed: changed_paths,
-            scope_current,
-            ..PlanRequest::default()
-        },
-        snapshot,
-    );
-    Ok(render_human(&finalize_plan(plan, Vec::new())))
+    let turn = Arc::clone(&step_context.turn);
+    let result = VerifyLocalHandler::for_verify_local_environment_id(false)
+        .run_call(
+            Arc::clone(&session),
+            turn,
+            step_context,
+            cancellation_token,
+            tracker,
+            format!("automatic-verify-local-{claim_id}"),
+            args,
+            Some(&request),
+            plan_override,
+        )
+        .await
+        .map(|_| ());
+    match &result {
+        Ok(()) => {
+            session
+                .services
+                .task_evidence
+                .finish_automatic_verify_local_request(generation, &claim_id)
+                .await;
+        }
+        Err(_) => {
+            session
+                .services
+                .task_evidence
+                .release_automatic_verify_plan_request(generation, &claim_id)
+                .await;
+        }
+    }
+    result
 }
 
 fn parse_verify_local_arguments(arguments: &str) -> Result<VerifyLocalArgs, FunctionCallError> {

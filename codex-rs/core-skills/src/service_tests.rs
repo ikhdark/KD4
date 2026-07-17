@@ -689,7 +689,13 @@ async fn local_file_watcher_refreshes_layout_after_skill_creation() {
     let first = skills_service
         .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
         .await;
-    assert!(first.outcome().skills.is_empty());
+    assert!(
+        first
+            .outcome()
+            .skills
+            .iter()
+            .all(|skill| skill.name != "late-skill")
+    );
 
     write_repo_skill(cwd.path(), "late", "late-skill", "created later");
     let refreshed = tokio::time::timeout(Duration::from_secs(10), async {
@@ -720,6 +726,71 @@ async fn local_file_watcher_refreshes_layout_after_skill_creation() {
 }
 
 #[tokio::test]
+async fn local_file_watcher_refreshes_cached_skill_body_after_edit() {
+    let codex_home = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let skill_path = write_repo_skill(cwd.path(), "demo", "demo-skill", "before edit");
+    let skills_input = SkillsLoadInput::new(
+        cwd.path().abs(),
+        Vec::new(),
+        config_stack(&codex_home, ""),
+        /*bundled_skills_enabled*/ false,
+    )
+    .with_local_file_watching(true);
+    let skills_service = SkillsService::new(
+        codex_home.path().abs(),
+        /*bundled_skills_enabled*/ false,
+    );
+    let first = skills_service
+        .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
+        .await;
+    assert_eq!(
+        first
+            .outcome()
+            .skills
+            .iter()
+            .find(|skill| skill.name == "demo-skill")
+            .expect("demo skill")
+            .description,
+        "before edit"
+    );
+
+    fs::write(
+        skill_path,
+        "---\nname: demo-skill\ndescription: after edit\n---\n\n# Updated body\n",
+    )
+    .expect("rewrite skill");
+    let refreshed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = skills_service
+                .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
+                .await;
+            if snapshot
+                .outcome()
+                .skills
+                .iter()
+                .any(|skill| skill.description == "after edit")
+            {
+                break snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("SKILL.md edit should invalidate the cached snapshot");
+    assert_eq!(
+        refreshed
+            .outcome()
+            .skills
+            .iter()
+            .find(|skill| skill.name == "demo-skill")
+            .expect("demo skill")
+            .description,
+        "after edit"
+    );
+}
+
+#[tokio::test]
 async fn local_file_watcher_expands_layout_after_marker_creation() {
     let codex_home = tempfile::tempdir().expect("tempdir");
     let project = tempfile::tempdir().expect("tempdir");
@@ -741,7 +812,13 @@ async fn local_file_watcher_expands_layout_after_marker_creation() {
     let first = skills_service
         .snapshot_for_config(&skills_input, Some(Arc::clone(&LOCAL_FS)))
         .await;
-    assert!(first.outcome().skills.is_empty());
+    assert!(
+        first
+            .outcome()
+            .skills
+            .iter()
+            .all(|skill| skill.name != "root-skill")
+    );
 
     let marker_path = project.path().join(".git");
     fs::create_dir(&marker_path).expect("create project root marker");

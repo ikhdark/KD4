@@ -895,6 +895,7 @@ fn finalize_exec_result(
                 stderr,
                 aggregated_output,
                 aggregated_output_bytes,
+                output_complete: !raw_output.io_drain_incomplete,
                 duration,
                 timed_out,
             };

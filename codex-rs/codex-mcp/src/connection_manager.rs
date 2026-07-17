@@ -15,8 +15,8 @@ use std::time::Instant;
 
 use crate::McpAuthStatusEntry;
 use crate::codex_apps_cache::CodexAppsToolsCache;
-use crate::codex_apps_cache::CodexAppsToolsCacheKey;
 use crate::codex_apps_cache::CodexAppsToolsFetchSource;
+use crate::codex_apps_cache::codex_apps_tools_cache_key;
 use crate::elicitation::ElicitationRequestManager;
 use crate::elicitation::ElicitationRequestRouter;
 use crate::elicitation::ElicitationReviewerHandle;
@@ -136,7 +136,6 @@ impl McpConnectionManager {
         runtime_context: McpRuntimeContext,
         codex_home: PathBuf,
         codex_apps_tools_cache: CodexAppsToolsCache,
-        codex_apps_tools_cache_key: CodexAppsToolsCacheKey,
         prefix_mcp_tool_names: bool,
         client_elicitation_capability: ElicitationCapability,
         supports_openai_form_elicitation: bool,
@@ -173,22 +172,16 @@ impl McpConnectionManager {
                 codex_model_provider::auth_provider_from_auth_manager(auth_manager, auth)
             })
         });
-        let mcp_servers = mcp_servers.clone();
-        for (server_name, server) in mcp_servers
-            .into_iter()
+        let mut mcp_servers = mcp_servers
+            .iter()
             .filter(|(_, server)| server.enabled())
-        {
+            .map(|(name, server)| (name.clone(), server.clone()))
+            .collect::<Vec<_>>();
+        mcp_servers.sort_by(|(left, _), (right, _)| left.cmp(right));
+        for (server_name, server) in mcp_servers {
+            let host_owned_codex_apps = server.is_host_owned_codex_apps();
             server_metadata.insert(server_name.clone(), McpServerMetadata::from(&server));
             let cancel_token = startup_cancellation_token.child_token();
-            let _ = emit_update(
-                startup_submit_id.as_str(),
-                &tx_event,
-                McpStartupUpdateEvent {
-                    server: server_name.clone(),
-                    status: McpStartupStatus::Starting,
-                },
-            )
-            .await;
             let configured_config = server.configured_config();
             // For built-in Codex Apps, `CODEX_CONNECTORS_TOKEN` is a debug
             // override: it supplies runtime auth but bypasses the shared tools
@@ -202,16 +195,36 @@ impl McpConnectionManager {
                     McpServerTransportConfig::Stdio { .. } => false,
                 });
             let shares_codex_apps_tools_cache =
-                should_share_codex_apps_tools_cache(&server_name, uses_env_bearer_token);
+                should_share_codex_apps_tools_cache(&server, uses_env_bearer_token);
             let codex_apps_tools_cache_context = shares_codex_apps_tools_cache.then(|| {
-                codex_apps_tools_cache
-                    .context(codex_home.clone(), codex_apps_tools_cache_key.clone())
+                let config = configured_config
+                    .expect("host-owned Codex Apps server must have configured transport");
+                codex_apps_tools_cache.context(
+                    codex_home.clone(),
+                    codex_apps_tools_cache_key(auth, &server_name, config),
+                )
             });
+            // A cached Codex Apps catalog is identity-scoped, schema-validated on load, and
+            // sufficient to advertise the optional server without opening its transport. All
+            // required servers and optional servers without that catalog retain eager startup.
+            let deferred_startup =
+                should_defer_server_startup(&server, codex_apps_tools_cache_context.as_ref());
+            if !deferred_startup {
+                let _ = emit_update(
+                    startup_submit_id.as_str(),
+                    &tx_event,
+                    McpStartupUpdateEvent {
+                        server: server_name.clone(),
+                        status: McpStartupStatus::Starting,
+                    },
+                )
+                .await;
+            }
             // The reserved Codex Apps registration follows the shared
             // AuthManager across refreshes. In the hosted-plugin path, this
             // is the ChatGPT /ps/mcp connection. User-configured MCP
             // registrations keep their existing configured auth path.
-            let chatgpt_auth_provider = if server_name == CODEX_APPS_MCP_SERVER_NAME {
+            let chatgpt_auth_provider = if host_owned_codex_apps {
                 codex_apps_auth_provider
                     .clone()
                     .or_else(|| static_chatgpt_auth_provider.clone())
@@ -221,7 +234,7 @@ impl McpConnectionManager {
             // If Codex Apps has an env bearer token, that is its auth path. Do
             // not also attach the ambient CodexAuth provider.
             let runtime_auth_provider =
-                if server_name == CODEX_APPS_MCP_SERVER_NAME && uses_env_bearer_token {
+                if host_owned_codex_apps && uses_env_bearer_token {
                     None
                 } else {
                     chatgpt_auth_provider_for_server(&server, chatgpt_auth_provider)
@@ -243,6 +256,9 @@ impl McpConnectionManager {
                 supports_openai_form_elicitation,
             );
             clients.insert(server_name.clone(), async_managed_client.clone());
+            if deferred_startup {
+                continue;
+            }
             let tx_event = tx_event.clone();
             let submit_id = startup_submit_id.clone();
             let auth_entry = auth_entries.get(&server_name).cloned();
@@ -309,6 +325,9 @@ impl McpConnectionManager {
                     }
                 }
             }
+            summary.ready.sort();
+            summary.cancelled.sort();
+            summary.failed.sort_by(|left, right| left.server.cmp(&right.server));
             let _ = tx_event
                 .send(Event {
                     id: startup_submit_id,
@@ -451,7 +470,9 @@ impl McpConnectionManager {
     }
 
     pub fn is_host_owned_codex_apps_server(&self, server_name: &str) -> bool {
-        server_name == CODEX_APPS_MCP_SERVER_NAME && self.server_metadata.contains_key(server_name)
+        self.server_metadata
+            .get(server_name)
+            .is_some_and(|metadata| metadata.host_owned_codex_apps)
     }
 
     pub fn set_approval_policy(&self, approval_policy: &Constrained<AskForApproval>) {
@@ -494,7 +515,12 @@ impl McpConnectionManager {
             return false;
         };
 
-        match tokio::time::timeout(timeout, async_managed_client.client()).await {
+        match tokio::time::timeout(
+            timeout,
+            async_managed_client.client_for_authoritative_use(),
+        )
+        .await
+        {
             Ok(Ok(_)) => true,
             Ok(Err(_)) | Err(_) => false,
         }
@@ -555,11 +581,16 @@ impl McpConnectionManager {
     /// the caller. On failure, existing shared cache contents remain unchanged.
     pub async fn hard_refresh_codex_apps_tools_cache(&self) -> Result<Vec<ToolInfo>> {
         let refresh_start = Instant::now();
+        if !self.is_host_owned_codex_apps_server(CODEX_APPS_MCP_SERVER_NAME) {
+            return Err(anyhow!(
+                "MCP server '{CODEX_APPS_MCP_SERVER_NAME}' is not the host-owned ChatGPT Apps registration"
+            ));
+        }
         let managed_client = self
             .clients
             .get(CODEX_APPS_MCP_SERVER_NAME)
             .ok_or_else(|| anyhow!("unknown MCP server '{CODEX_APPS_MCP_SERVER_NAME}'"))?
-            .client()
+            .client_for_authoritative_use()
             .await
             .context("failed to get client")?;
 
@@ -581,16 +612,20 @@ impl McpConnectionManager {
             format!("failed to refresh tools for MCP server '{CODEX_APPS_MCP_SERVER_NAME}'")
         })?;
 
-        let tools =
-            match (
-                managed_client.codex_apps_tools_cache_context.as_ref(),
-                fetch_ticket,
-            ) {
-                (Some(cache_context), Some(fetch_ticket)) => cache_context
-                    .publish_if_newest_accepted(fetch_ticket, &managed_client.server_info, tools),
-                (None, None) => tools,
-                _ => unreachable!("Codex Apps fetch ticket requires cache context"),
-            };
+        match (
+            managed_client.codex_apps_tools_cache_context.as_ref(),
+            fetch_ticket,
+        ) {
+            (Some(cache_context), Some(fetch_ticket)) => {
+                cache_context.publish_if_newest_accepted(
+                    fetch_ticket,
+                    &managed_client.server_info,
+                    &tools,
+                );
+            }
+            (None, None) => {}
+            _ => unreachable!("Codex Apps fetch ticket requires cache context"),
+        }
         emit_duration(
             MCP_TOOLS_LIST_DURATION_METRIC,
             list_start.elapsed(),
@@ -626,7 +661,7 @@ impl McpConnectionManager {
             .filter(|(server_name, _)| include_server(server_name))
         {
             let server_name = server_name.clone();
-            let Ok(managed_client) = async_managed_client.client().await else {
+            let Ok(managed_client) = async_managed_client.client_for_authoritative_use().await else {
                 continue;
             };
             let timeout = managed_client.tool_timeout;
@@ -697,7 +732,7 @@ impl McpConnectionManager {
             .filter(|(server_name, _)| include_server(server_name))
         {
             let server_name_cloned = server_name.clone();
-            let Ok(managed_client) = async_managed_client.client().await else {
+            let Ok(managed_client) = async_managed_client.client_for_authoritative_use().await else {
                 continue;
             };
             let client = managed_client.client.clone();
@@ -769,6 +804,11 @@ impl McpConnectionManager {
         if !client.tool_filter.allows(tool) {
             return Err(anyhow!(
                 "tool '{tool}' is disabled for MCP server '{server}'"
+            ));
+        }
+        if !client.connected_catalog_contains(tool) {
+            return Err(anyhow!(
+                "tool '{tool}' is not available in the connected MCP catalog for server '{server}'"
             ));
         }
 
@@ -898,7 +938,7 @@ impl McpConnectionManager {
         self.clients
             .get(name)
             .ok_or_else(|| anyhow!("unknown MCP server '{name}'"))?
-            .client()
+            .client_for_authoritative_use()
             .await
             .context("failed to get client")
     }
@@ -939,8 +979,18 @@ fn chatgpt_auth_provider_for_server(
     chatgpt_auth_provider
 }
 
-fn should_share_codex_apps_tools_cache(server_name: &str, uses_env_bearer_token: bool) -> bool {
-    server_name == CODEX_APPS_MCP_SERVER_NAME && !uses_env_bearer_token
+fn should_share_codex_apps_tools_cache(
+    server: &EffectiveMcpServer,
+    uses_env_bearer_token: bool,
+) -> bool {
+    server.is_host_owned_codex_apps() && !uses_env_bearer_token
+}
+
+fn should_defer_server_startup(
+    server: &EffectiveMcpServer,
+    cache: Option<&crate::codex_apps_cache::CodexAppsToolsCacheContext>,
+) -> bool {
+    !server.required() && cache.is_some_and(|cache| cache.has_current_tools())
 }
 
 async fn emit_update(
