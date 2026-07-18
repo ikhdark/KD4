@@ -4,16 +4,14 @@ use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_tools::ToolSpec;
 use futures::Stream;
 use serde_json::Value;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::Context;
 use std::task::Poll;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
-use crate::tools::ToolSchemaBundle;
 
 /// API request payload for a single model turn
 #[derive(Debug, Clone)]
@@ -23,7 +21,7 @@ pub struct Prompt {
 
     /// Tools available to the model, including additional tools sourced from
     /// external MCP servers.
-    pub(crate) tools: Arc<ToolSchemaBundle>,
+    pub(crate) tools: Vec<ToolSpec>,
 
     /// Whether parallel tool calls are permitted for this prompt.
     pub(crate) parallel_tool_calls: bool,
@@ -41,7 +39,7 @@ impl Default for Prompt {
     fn default() -> Self {
         Self {
             input: Vec::new(),
-            tools: ToolSchemaBundle::empty(),
+            tools: Vec::new(),
             parallel_tool_calls: false,
             base_instructions: BaseInstructions::default(),
             output_schema: None,
@@ -56,17 +54,10 @@ impl Prompt {
         use_responses_lite: bool,
     ) -> Vec<ResponseItem> {
         let mut input = self.input.clone();
-        format_response_input_for_request(&mut input, use_responses_lite);
+        if use_responses_lite {
+            strip_image_details(&mut input);
+        }
         input
-    }
-}
-
-pub(crate) fn format_response_input_for_request(
-    items: &mut [ResponseItem],
-    use_responses_lite: bool,
-) {
-    if use_responses_lite {
-        strip_image_details(items);
     }
 }
 

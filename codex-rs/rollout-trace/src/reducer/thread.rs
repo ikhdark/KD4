@@ -208,15 +208,9 @@ impl TraceReducer {
         &self,
         metadata_payload: &RawPayloadRef,
     ) -> Result<ThreadStartedMetadata> {
-        match self.read_payload(metadata_payload) {
-            Ok(metadata) => Ok(metadata),
-            Err(_) => {
-                let value = self.read_payload_json(metadata_payload)?;
-                serde_json::from_value(value).with_context(|| {
-                    format!("parse thread metadata {}", metadata_payload.raw_payload_id)
-                })
-            }
-        }
+        let value = self.read_payload_json(metadata_payload)?;
+        serde_json::from_value(value)
+            .with_context(|| format!("parse thread metadata {}", metadata_payload.raw_payload_id))
     }
 }
 
@@ -273,50 +267,4 @@ fn task_name_from_agent_path(agent_path: &str) -> String {
         .find(|segment| !segment.is_empty())
         .unwrap_or(agent_path)
         .to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use pretty_assertions::assert_eq;
-    use serde_json::json;
-    use tempfile::TempDir;
-
-    use super::ThreadStartedMetadata;
-    use crate::payload::RawPayloadKind;
-    use crate::raw_event::RawTraceEventPayload;
-    use crate::replay_bundle;
-    use crate::writer::TraceWriter;
-
-    #[test]
-    fn malformed_thread_metadata_preserves_legacy_diagnostic() -> anyhow::Result<()> {
-        let temp = TempDir::new()?;
-        let writer = TraceWriter::create(
-            temp.path(),
-            "trace-1".to_string(),
-            "rollout-1".to_string(),
-            "thread-1".to_string(),
-        )?;
-        let value = json!({ "nickname": 42 });
-        let legacy_error = serde_json::from_value::<ThreadStartedMetadata>(value.clone())
-            .err()
-            .expect("legacy metadata projection must reject the same value");
-        let metadata = writer.write_json_payload(RawPayloadKind::SessionMetadata, &value)?;
-        let raw_payload_id = metadata.raw_payload_id.clone();
-        writer.append(RawTraceEventPayload::ThreadStarted {
-            thread_id: "thread-1".to_string(),
-            agent_path: "/root".to_string(),
-            metadata_payload: Some(metadata),
-        })?;
-
-        let error = replay_bundle(temp.path()).expect_err("malformed metadata must fail replay");
-        assert_eq!(
-            error.to_string(),
-            format!("parse thread metadata {raw_payload_id}")
-        );
-        assert_eq!(
-            format!("{error:#}"),
-            format!("parse thread metadata {raw_payload_id}: {legacy_error}")
-        );
-        Ok(())
-    }
 }

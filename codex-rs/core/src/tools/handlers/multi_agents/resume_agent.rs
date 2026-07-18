@@ -152,10 +152,6 @@ async fn handle_resume_agent(
 }
 
 impl CoreToolRuntime for Handler {
-    fn tool_call_admission(&self, payload: &ToolPayload) -> ToolCallAdmission {
-        ToolCallAdmission::serialize_on_string_argument(payload, "id", ToolConflictKey::Agent)
-    }
-
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

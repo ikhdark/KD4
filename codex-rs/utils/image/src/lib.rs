@@ -96,66 +96,85 @@ pub fn load_for_prompt_bytes(
         mode,
     };
 
-    IMAGE_CACHE.get_or_try_insert_with_mut(
-        key,
-        move || {
-            let guessed_format = image::guess_format(&file_bytes)
-                .map_err(|source| ImageProcessingError::decode_error(&path_buf, source))?;
-            let format = match guessed_format {
-                ImageFormat::Png => Some(ImageFormat::Png),
-                ImageFormat::Jpeg => Some(ImageFormat::Jpeg),
-                ImageFormat::Gif => Some(ImageFormat::Gif),
-                ImageFormat::WebP => Some(ImageFormat::WebP),
-                _ => None,
-            };
+    if let Some(image) = IMAGE_CACHE.get(&key) {
+        return Ok(image);
+    }
 
-            let mut decoder = ImageReader::with_format(Cursor::new(&file_bytes), guessed_format)
-                .into_decoder()
-                .map_err(|source| ImageProcessingError::decode_error(&path_buf, source))?;
-            // Preserve the metadata most important for rendering prompt images faithfully: the color
-            // profile and EXIF data, including orientation. Other format-specific metadata is
-            // intentionally not copied.
-            let metadata = ImageMetadata {
-                // Only RGB profiles are safe across every re-encoding path. For example, JPEG decoding
-                // can convert CMYK/YCCK pixels to RGB while retaining the source profile; copying it
-                // would mislabel the output. Bytes 16..20 are the ICC data color space signature.
-                icc_profile: decoder
-                    .icc_profile()
-                    .ok()
-                    .flatten()
-                    .filter(|profile| profile.get(16..20) == Some(b"RGB ")),
-                exif: decoder.exif_metadata().ok().flatten(),
-            };
-            let dynamic = DynamicImage::from_decoder(decoder)
-                .map_err(|source| ImageProcessingError::decode_error(&path_buf, source))?;
+    let image = (move || {
+        let guessed_format = image::guess_format(&file_bytes)
+            .map_err(|source| ImageProcessingError::decode_error(&path_buf, source))?;
+        let format = match guessed_format {
+            ImageFormat::Png => Some(ImageFormat::Png),
+            ImageFormat::Jpeg => Some(ImageFormat::Jpeg),
+            ImageFormat::Gif => Some(ImageFormat::Gif),
+            ImageFormat::WebP => Some(ImageFormat::WebP),
+            _ => None,
+        };
 
-            let (width, height) = dynamic.dimensions();
+        let mut decoder = ImageReader::with_format(Cursor::new(&file_bytes), guessed_format)
+            .into_decoder()
+            .map_err(|source| ImageProcessingError::decode_error(&path_buf, source))?;
+        // Preserve the metadata most important for rendering prompt images faithfully: the color
+        // profile and EXIF data, including orientation. Other format-specific metadata is
+        // intentionally not copied.
+        let metadata = ImageMetadata {
+            // Only RGB profiles are safe across every re-encoding path. For example, JPEG decoding
+            // can convert CMYK/YCCK pixels to RGB while retaining the source profile; copying it
+            // would mislabel the output. Bytes 16..20 are the ICC data color space signature.
+            icc_profile: decoder
+                .icc_profile()
+                .ok()
+                .flatten()
+                .filter(|profile| profile.get(16..20) == Some(b"RGB ")),
+            exif: decoder.exif_metadata().ok().flatten(),
+        };
+        let dynamic = DynamicImage::from_decoder(decoder)
+            .map_err(|source| ImageProcessingError::decode_error(&path_buf, source))?;
 
-            let target_dimensions = match mode {
-                PromptImageMode::ResizeToFit if width > MAX_DIMENSION || height > MAX_DIMENSION => {
+        let (width, height) = dynamic.dimensions();
+
+        let target_dimensions = match mode {
+            PromptImageMode::ResizeToFit if width > MAX_DIMENSION || height > MAX_DIMENSION => {
+                let resized = dynamic.resize(MAX_DIMENSION, MAX_DIMENSION, FilterType::Triangle);
+                Some((resized.width(), resized.height(), resized))
+            }
+            PromptImageMode::ResizeWithLimits(limits) => {
+                let (target_width, target_height) =
+                    prompt_image_output_dimensions_for_limits(width, height, limits);
+                if (target_width, target_height) == (width, height) {
+                    None
+                } else {
                     let resized =
-                        dynamic.resize(MAX_DIMENSION, MAX_DIMENSION, FilterType::Triangle);
-                    Some((resized.width(), resized.height(), resized))
+                        dynamic.resize_exact(target_width, target_height, FilterType::Triangle);
+                    Some((target_width, target_height, resized))
                 }
-                PromptImageMode::ResizeWithLimits(limits) => {
-                    let (target_width, target_height) =
-                        prompt_image_output_dimensions_for_limits(width, height, limits);
-                    if (target_width, target_height) == (width, height) {
-                        None
-                    } else {
-                        let resized =
-                            dynamic.resize_exact(target_width, target_height, FilterType::Triangle);
-                        Some((target_width, target_height, resized))
-                    }
-                }
-                PromptImageMode::ResizeToFit | PromptImageMode::Original => None,
-            };
+            }
+            PromptImageMode::ResizeToFit | PromptImageMode::Original => None,
+        };
 
-            let encoded = if let Some((width, height, resized)) = target_dimensions {
-                let target_format = format
-                    .filter(|format| can_preserve_source_bytes(*format))
-                    .unwrap_or(ImageFormat::Png);
-                let (bytes, output_format) = encode_image(&resized, target_format, metadata)?;
+        let encoded = if let Some((width, height, resized)) = target_dimensions {
+            let target_format = format
+                .filter(|format| can_preserve_source_bytes(*format))
+                .unwrap_or(ImageFormat::Png);
+            let (bytes, output_format) = encode_image(&resized, target_format, metadata)?;
+            let mime = format_to_mime(output_format);
+            EncodedImage {
+                bytes: bytes.into(),
+                mime,
+                width,
+                height,
+            }
+        } else {
+            if let Some(format) = format.filter(|format| can_preserve_source_bytes(*format)) {
+                let mime = format_to_mime(format);
+                EncodedImage {
+                    bytes: file_bytes.into(),
+                    mime,
+                    width,
+                    height,
+                }
+            } else {
+                let (bytes, output_format) = encode_image(&dynamic, ImageFormat::Png, metadata)?;
                 let mime = format_to_mime(output_format);
                 EncodedImage {
                     bytes: bytes.into(),
@@ -163,49 +182,16 @@ pub fn load_for_prompt_bytes(
                     width,
                     height,
                 }
-            } else {
-                if let Some(format) = format.filter(|format| can_preserve_source_bytes(*format)) {
-                    let mime = format_to_mime(format);
-                    EncodedImage {
-                        bytes: file_bytes.into(),
-                        mime,
-                        width,
-                        height,
-                    }
-                } else {
-                    let (bytes, output_format) =
-                        encode_image(&dynamic, ImageFormat::Png, metadata)?;
-                    let mime = format_to_mime(output_format);
-                    EncodedImage {
-                        bytes: bytes.into(),
-                        mime,
-                        width,
-                        height,
-                    }
-                }
-            };
-
-            Ok(encoded)
-        },
-        |cache, key, image| {
-            if image.bytes.len() <= MAX_IMAGE_CACHE_BYTES {
-                cache.put(key, image.clone());
-                let mut cached_bytes = cache
-                    .iter()
-                    .map(|(_, image)| image.bytes.len())
-                    .sum::<usize>();
-                while cached_bytes > MAX_IMAGE_CACHE_BYTES {
-                    let Some((_, evicted)) = cache.pop_lru() else {
-                        break;
-                    };
-                    cached_bytes -= evicted.bytes.len();
-                }
             }
-        },
-    )
+        };
+
+        Ok(encoded)
+    })()?;
+
+    cache_image(&IMAGE_CACHE, key, image.clone(), MAX_IMAGE_CACHE_BYTES);
+    Ok(image)
 }
 
-#[cfg(test)]
 fn cache_image(cache: &ImageCache, key: ImageCacheKey, image: EncodedImage, byte_capacity: usize) {
     if image.bytes.len() > byte_capacity {
         return;

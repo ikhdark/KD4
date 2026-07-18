@@ -39,14 +39,12 @@ use codex_login::CodexAuth;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_models_manager::bundled_models_response;
-use codex_models_manager::manager::ModelsManager;
 use codex_models_manager::model_info;
 use codex_models_manager::test_support::construct_model_info_offline_for_tests;
 use codex_models_manager::test_support::get_model_offline_for_tests;
 use codex_protocol::AgentPath;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
-use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
@@ -267,10 +265,10 @@ async fn paginated_turn_context_assigns_missing_response_item_ids_without_featur
     turn_context.history_mode = ThreadHistoryMode::Paginated;
     let response_item = user_message("hello");
 
-    let items = session
-        .prepare_conversation_items_for_history(&turn_context, std::slice::from_ref(&response_item))
-        .await
-        .expect("image preparation");
+    let items = session.prepare_conversation_items_for_history(
+        &turn_context,
+        std::slice::from_ref(&response_item),
+    );
 
     assert!(
         items[0]
@@ -1536,35 +1534,11 @@ async fn refresh_runtime_config_refreshes_hooks() -> anyhow::Result<()> {
     };
     assert!(session.hooks().preview_session_start(&request).is_empty());
 
-    let previous_config = session.get_config().await;
-    let previous_hooks = session.hooks();
     let next_config = load_latest_config_for_session(&session).await;
-    assert!(
-        session
-            .refresh_runtime_config_from_process_reload(Arc::new(next_config))
-            .await
-    );
+    session.refresh_runtime_config(next_config).await;
 
-    assert!(!Arc::ptr_eq(&previous_config, &session.get_config().await));
-    assert!(!Arc::ptr_eq(&previous_hooks, &session.hooks()));
     assert_eq!(session.hooks().preview_session_start(&request).len(), 1);
     Ok(())
-}
-
-#[tokio::test]
-async fn unchanged_process_reload_preserves_config_and_hook_identities() {
-    let (session, _turn_context) = make_session_and_context().await;
-    let config = session.get_config().await;
-    let hooks = session.hooks();
-
-    assert!(
-        !session
-            .refresh_runtime_config_from_process_reload(Arc::clone(&config))
-            .await
-    );
-
-    assert!(Arc::ptr_eq(&config, &session.get_config().await));
-    assert!(Arc::ptr_eq(&hooks, &session.hooks()));
 }
 
 #[tokio::test]
@@ -4015,8 +3989,6 @@ async fn includes_timed_out_message() {
         stdout: StreamOutput::new(String::new()),
         stderr: StreamOutput::new(String::new()),
         aggregated_output: StreamOutput::new("Command output".to_string()),
-        aggregated_output_bytes: None,
-        output_complete: true,
         duration: StdDuration::from_secs(1),
         timed_out: true,
     };
@@ -5507,10 +5479,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
     let services = SessionServices {
         mcp_connection_manager: Arc::new(arc_swap::ArcSwap::from(mcp_runtime.manager_arc())),
         mcp_runtime: arc_swap::ArcSwapOption::from(Some(mcp_runtime)),
-        mcp_elicitations_auto_deny: std::sync::atomic::AtomicBool::new(false),
         planning_generation: std::sync::atomic::AtomicU64::new(1),
-        mcp_projection: crate::state::McpProjectionCoordinator::new(),
-        mcp_startup_cancellation_token: std::sync::Mutex::new(CancellationToken::new()),
+        mcp_projection_lock: Mutex::new(()),
+        mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
         unified_exec_manager: UnifiedExecProcessManager::new(
             config.background_terminal_max_timeout,
         ),
@@ -5547,9 +5518,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         session_extension_data: codex_extension_api::ExtensionData::new(
             agent_control.session_id().to_string(),
         ),
-        thread_extension_data: Arc::new(codex_extension_api::ExtensionData::new(
-            thread_id.to_string(),
-        )),
+        thread_extension_data: codex_extension_api::ExtensionData::new(thread_id.to_string()),
         selected_capability_roots: Vec::new(),
         mcp_thread_init: codex_extension_api::ExtensionDataInit::default(),
         supports_openai_form_elicitation: std::sync::atomic::AtomicBool::new(false),
@@ -5609,10 +5578,6 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         .skills_service
         .snapshot_for_config(&skills_input, Some(Arc::clone(&skill_fs)))
         .await;
-    let available_models = models_manager
-        .current_catalog_snapshot()
-        .await
-        .available_models(models_manager.uses_codex_backend());
     let turn_context = Session::make_turn_context(
         thread_id,
         SessionId::from(thread_id),
@@ -5624,9 +5589,9 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         services.user_shell.as_ref(),
         services.shell_zsh_path.as_ref(),
         services.main_execve_wrapper_exe.as_ref(),
-        Arc::new(per_turn_config),
+        per_turn_config,
         model_info,
-        available_models,
+        &models_manager,
         /*network*/ None,
         resolved_turn_environments,
         session_configuration.cwd().clone(),
@@ -5644,16 +5609,11 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         features: config.features.clone(),
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
         pending_mcp_server_refresh_config: Mutex::new(None),
-        delegated_mcp_tool_metadata: Mutex::new(std::collections::VecDeque::new()),
-        turn_config_snapshot_cache: std::sync::Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
-        startup_discovery_readiness: super::session::StartupDiscoveryReadiness::completed(),
-        startup_discovery_cancellation: CancellationToken::new(),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
-        rollout_compression_scheduled: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -7658,10 +7618,9 @@ where
     let services = SessionServices {
         mcp_connection_manager: Arc::new(arc_swap::ArcSwap::from(mcp_runtime.manager_arc())),
         mcp_runtime: arc_swap::ArcSwapOption::from(Some(mcp_runtime)),
-        mcp_elicitations_auto_deny: std::sync::atomic::AtomicBool::new(false),
         planning_generation: std::sync::atomic::AtomicU64::new(1),
-        mcp_projection: crate::state::McpProjectionCoordinator::new(),
-        mcp_startup_cancellation_token: std::sync::Mutex::new(CancellationToken::new()),
+        mcp_projection_lock: Mutex::new(()),
+        mcp_startup_cancellation_token: Mutex::new(CancellationToken::new()),
         unified_exec_manager: UnifiedExecProcessManager::new(
             config.background_terminal_max_timeout,
         ),
@@ -7698,9 +7657,7 @@ where
         session_extension_data: codex_extension_api::ExtensionData::new(
             agent_control.session_id().to_string(),
         ),
-        thread_extension_data: Arc::new(codex_extension_api::ExtensionData::new(
-            thread_id.to_string(),
-        )),
+        thread_extension_data: codex_extension_api::ExtensionData::new(thread_id.to_string()),
         selected_capability_roots: Vec::new(),
         mcp_thread_init: codex_extension_api::ExtensionDataInit::default(),
         supports_openai_form_elicitation: std::sync::atomic::AtomicBool::new(false),
@@ -7760,10 +7717,6 @@ where
         .skills_service
         .snapshot_for_config(&skills_input, Some(Arc::clone(&skill_fs)))
         .await;
-    let available_models = models_manager
-        .current_catalog_snapshot()
-        .await
-        .available_models(models_manager.uses_codex_backend());
     let turn_context = Arc::new(Session::make_turn_context(
         thread_id,
         SessionId::from(thread_id),
@@ -7775,9 +7728,9 @@ where
         services.user_shell.as_ref(),
         services.shell_zsh_path.as_ref(),
         services.main_execve_wrapper_exe.as_ref(),
-        Arc::new(per_turn_config),
+        per_turn_config,
         model_info,
-        available_models,
+        &models_manager,
         /*network*/ None,
         resolved_turn_environments,
         session_configuration.cwd().clone(),
@@ -7795,16 +7748,11 @@ where
         features: config.features.clone(),
         multi_agent_version: OnceLock::from(config.multi_agent_version_from_features()),
         pending_mcp_server_refresh_config: Mutex::new(None),
-        delegated_mcp_tool_metadata: Mutex::new(std::collections::VecDeque::new()),
-        turn_config_snapshot_cache: std::sync::Mutex::new(None),
         conversation: Arc::new(RealtimeConversationManager::new()),
         active_turn: Mutex::new(None),
         startup_timing: Arc::clone(&startup_timing),
-        startup_discovery_readiness: super::session::StartupDiscoveryReadiness::completed(),
-        startup_discovery_cancellation: CancellationToken::new(),
         terminal_tasks: tokio_util::task::TaskTracker::new(),
         shutting_down: std::sync::atomic::AtomicBool::new(false),
-        rollout_compression_scheduled: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
         services,
@@ -7838,202 +7786,6 @@ pub(crate) async fn make_session_and_context_with_rx() -> (
     async_channel::Receiver<Event>,
 ) {
     make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await
-}
-
-#[tokio::test]
-async fn stable_turns_share_base_config_snapshot_and_overrides_invalidate_it() {
-    let (session, _initial_turn) = make_session_and_context().await;
-    let first = session
-        .new_default_turn_with_sub_id("shared-config-first".to_string())
-        .await;
-    let second = session
-        .new_default_turn_with_sub_id("shared-config-second".to_string())
-        .await;
-    assert!(Arc::ptr_eq(&first.config, &second.config));
-
-    let updated = session
-        .new_turn_with_sub_id(
-            "shared-config-updated".to_string(),
-            SessionSettingsUpdate {
-                approvals_reviewer: Some(ApprovalsReviewer::AutoReview),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("turn override should be accepted");
-    assert!(!Arc::ptr_eq(&first.config, &updated.config));
-    assert_eq!(
-        updated.config.approvals_reviewer,
-        ApprovalsReviewer::AutoReview
-    );
-}
-
-#[derive(Debug)]
-struct PublishingBetweenModelCatalogReads {
-    first: Arc<codex_models_manager::manager::ModelCatalogSnapshot>,
-    second: Arc<codex_models_manager::manager::ModelCatalogSnapshot>,
-    snapshot_reads: std::sync::atomic::AtomicUsize,
-}
-
-impl codex_models_manager::manager::ModelsManager for PublishingBetweenModelCatalogReads {
-    fn catalog_snapshot(
-        &self,
-        _refresh_strategy: RefreshStrategy,
-        _http_client_factory: HttpClientFactory,
-    ) -> codex_models_manager::manager::ModelsManagerFuture<
-        '_,
-        Arc<codex_models_manager::manager::ModelCatalogSnapshot>,
-    > {
-        self.snapshot_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Box::pin(async { Arc::clone(&self.first) })
-    }
-
-    fn raw_model_catalog(
-        &self,
-        _refresh_strategy: RefreshStrategy,
-        _http_client_factory: HttpClientFactory,
-    ) -> codex_models_manager::manager::ModelsManagerFuture<
-        '_,
-        codex_protocol::openai_models::ModelsResponse,
-    > {
-        Box::pin(async {
-            codex_protocol::openai_models::ModelsResponse {
-                models: self.second.models().to_vec(),
-            }
-        })
-    }
-
-    fn get_remote_models(
-        &self,
-    ) -> codex_models_manager::manager::ModelsManagerFuture<'_, Vec<ModelInfo>> {
-        Box::pin(async { self.first.models().to_vec() })
-    }
-
-    fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, tokio::sync::TryLockError> {
-        Ok(self.second.models().to_vec())
-    }
-
-    fn current_catalog_snapshot(
-        &self,
-    ) -> codex_models_manager::manager::ModelsManagerFuture<
-        '_,
-        Arc<codex_models_manager::manager::ModelCatalogSnapshot>,
-    > {
-        self.snapshot_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Box::pin(async { Arc::clone(&self.first) })
-    }
-
-    fn try_current_catalog_snapshot(
-        &self,
-    ) -> Result<Arc<codex_models_manager::manager::ModelCatalogSnapshot>, tokio::sync::TryLockError>
-    {
-        self.snapshot_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Arc::clone(&self.second))
-    }
-
-    fn auth_manager(&self) -> Option<&AuthManager> {
-        None
-    }
-
-    fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
-        Vec::new()
-    }
-
-    fn enqueue_refresh_if_new_etag(
-        self: Arc<Self>,
-        _etag: String,
-        _http_client_factory: HttpClientFactory,
-    ) {
-    }
-}
-
-#[tokio::test]
-async fn turn_model_fields_share_one_catalog_generation_during_publication() {
-    let (mut session, initial_turn) = make_session_and_context().await;
-    let model = initial_turn.model_info.slug.clone();
-    let mut first_model = initial_turn.model_info.clone();
-    first_model.display_name = "Catalog generation one".to_string();
-    first_model.visibility = codex_protocol::openai_models::ModelVisibility::List;
-    first_model.supported_in_api = true;
-    let mut second_model = first_model.clone();
-    second_model.display_name = "Catalog generation two".to_string();
-    let first_manager = codex_models_manager::manager::StaticModelsManager::new(
-        /*auth_manager*/ None,
-        codex_protocol::openai_models::ModelsResponse {
-            models: vec![first_model],
-        },
-    );
-    let first = first_manager.current_catalog_snapshot().await;
-    let second_manager = codex_models_manager::manager::StaticModelsManager::new(
-        /*auth_manager*/ None,
-        codex_protocol::openai_models::ModelsResponse {
-            models: vec![second_model],
-        },
-    );
-    let second = second_manager.current_catalog_snapshot().await;
-    let publishing_manager = Arc::new(PublishingBetweenModelCatalogReads {
-        first,
-        second,
-        snapshot_reads: std::sync::atomic::AtomicUsize::new(0),
-    });
-    let models_manager: SharedModelsManager = publishing_manager.clone();
-    session.services.models_manager = Arc::clone(&models_manager);
-
-    let turn = session
-        .new_default_turn_with_sub_id("catalog-publication-turn".to_string())
-        .await;
-    let preset = turn
-        .available_models
-        .iter()
-        .find(|preset| preset.model == model)
-        .expect("selected model should remain picker-visible");
-    assert_eq!(turn.model_info.display_name, "Catalog generation one");
-    assert_eq!(preset.display_name, "Catalog generation one");
-    assert_eq!(
-        publishing_manager
-            .snapshot_reads
-            .load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "turn construction must capture exactly one catalog generation"
-    );
-
-    publishing_manager
-        .snapshot_reads
-        .store(0, std::sync::atomic::Ordering::Relaxed);
-    let replaced = initial_turn.with_model(model, &models_manager).await;
-    let preset = replaced
-        .available_models
-        .iter()
-        .find(|preset| preset.model == replaced.model_info.slug)
-        .expect("replacement model should remain picker-visible");
-    assert_eq!(replaced.model_info.display_name, "Catalog generation one");
-    assert_eq!(preset.display_name, "Catalog generation one");
-    assert_eq!(
-        publishing_manager
-            .snapshot_reads
-            .load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "with_model must capture exactly one catalog generation"
-    );
-}
-
-#[tokio::test]
-async fn step_context_materializes_one_runtime_versioned_mcp_inventory() {
-    let (_session, turn_context) = make_session_and_context().await;
-    let turn_context = Arc::new(turn_context);
-    let step_context = StepContext::for_test(Arc::clone(&turn_context));
-    let first = step_context.mcp_inventory().await;
-    let second = step_context.mcp_inventory().await;
-
-    assert!(std::ptr::eq(first, second));
-    assert_eq!(first.runtime_version(), step_context.mcp.version());
-
-    let next_runtime =
-        crate::session::McpRuntimeSnapshot::new_uninitialized_for_test(&turn_context.config);
-    assert_ne!(first.runtime_version(), next_runtime.version());
 }
 
 #[tokio::test]
@@ -9829,7 +9581,7 @@ async fn guardian_helper_review_interrupts_after_three_consecutive_denials() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_complete_uses_one_post_receipt_durability_barrier() {
+async fn turn_complete_flushes_terminal_event_after_delivery() {
     let (mut sess, tc, rx) = make_session_and_context_with_rx().await;
     let store = attach_in_memory_thread_store(
         Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
@@ -9848,14 +9600,15 @@ async fn turn_complete_uses_one_post_receipt_durability_barrier() {
 
     let event = recv_terminal_event(&rx, TerminalEventKind::TurnComplete).await;
     assert!(matches!(event.msg, EventMsg::TurnComplete(_)));
-    // Ordered append receipts cover the regular stream and TurnComplete. The only durability
-    // barrier is issued after the terminal receipt has been appended and delivered.
-    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 1).await;
-    assert_eq!(1, calls.flush_thread);
+    // Expected flushes:
+    // 1. Task-runner flush after the task body finishes, before TurnComplete is emitted.
+    // 2. Terminal-event flush after TurnComplete is appended.
+    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 2).await;
+    assert_eq!(2, calls.flush_thread);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn turn_aborted_uses_one_post_receipt_durability_barrier() {
+async fn turn_aborted_flushes_terminal_event_after_delivery() {
     let (mut sess, tc, rx) = make_session_and_context_with_rx().await;
     let store = attach_in_memory_thread_store(
         Arc::get_mut(&mut sess).expect("session should be uniquely owned"),
@@ -9892,10 +9645,12 @@ async fn turn_aborted_uses_one_post_receipt_durability_barrier() {
         other => panic!("unexpected event: {other:?}"),
     }
     abort_task.await.expect("abort task should finish");
-    // The interrupted marker and TurnAborted are ordered by append receipts; one post-terminal
-    // barrier makes the complete accepted terminal state durable.
-    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 1).await;
-    assert_eq!(1, calls.flush_thread);
+    // Expected flushes:
+    // 1. Task-runner flush after the task body observes cancellation.
+    // 2. Interrupted-marker flush before TurnAborted so abort observers can reread it.
+    // 3. Terminal-event flush after TurnAborted is appended.
+    let calls = wait_for_flush_count(&store, /*expected_flushes*/ 3).await;
+    assert_eq!(3, calls.flush_thread);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -5,7 +5,6 @@ use codex_extension_api::McpServerContribution;
 use codex_extension_api::McpServerContributionContext;
 use codex_extension_api::McpServerContributor;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
-use codex_mcp::HOSTED_PLUGIN_RUNTIME_EXTENSION_ID;
 use codex_mcp::hosted_plugin_runtime_mcp_server_config;
 
 mod executor_plugin;
@@ -14,7 +13,7 @@ struct HostedPluginRuntimeExtension;
 
 impl McpServerContributor<Config> for HostedPluginRuntimeExtension {
     fn id(&self) -> &'static str {
-        HOSTED_PLUGIN_RUNTIME_EXTENSION_ID
+        "hosted_plugin_runtime"
     }
 
     fn contribute<'a>(

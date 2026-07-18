@@ -25,163 +25,6 @@ use crate::reducer::test_support::trace_context_for_thread;
 use crate::replay_bundle;
 use crate::writer::TraceWriter;
 
-#[derive(Debug, serde::Deserialize)]
-struct TestCurrentAgentEndPayload {
-    receiver_thread_id: String,
-}
-
-#[test]
-fn agent_runtime_end_payload_preserves_marker_based_legacy_selection() {
-    let current: super::AgentRuntimeEndPayload<TestCurrentAgentEndPayload> =
-        serde_json::from_value(json!({
-            "receiver_thread_id": "019d0000-0000-7000-8000-000000000002"
-        }))
-        .expect("current payload");
-    let super::AgentRuntimeEndPayload::Current(current) = current else {
-        panic!("payload without legacy marker must select current variant");
-    };
-    assert_eq!(
-        current.into_payload().receiver_thread_id,
-        "019d0000-0000-7000-8000-000000000002"
-    );
-
-    let legacy: super::AgentRuntimeEndPayload<TestCurrentAgentEndPayload> =
-        serde_json::from_value(json!({
-            "event_id": "call-close",
-            "occurred_at_ms": 1234,
-            "agent_thread_id": "019d0000-0000-7000-8000-000000000002",
-            "agent_path": "/root/child",
-            "kind": "interrupted"
-        }))
-        .expect("legacy payload");
-    assert!(matches!(legacy, super::AgentRuntimeEndPayload::Legacy(_)));
-
-    let hybrid_value = json!({
-        "agent_thread_id": null,
-        "receiver_thread_id": "019d0000-0000-7000-8000-000000000002"
-    });
-    let hybrid: super::AgentRuntimeEndPayload<TestCurrentAgentEndPayload> =
-        serde_json::from_value(hybrid_value.clone()).expect("typed hybrid envelope");
-    let super::AgentRuntimeEndPayload::Current(hybrid) = hybrid else {
-        panic!("invalid legacy payload may not deserialize as legacy");
-    };
-    assert!(hybrid.agent_thread_id.0);
-
-    let legacy_error = serde_json::from_value::<codex_protocol::protocol::SubAgentActivityEvent>(
-        hybrid_value.clone(),
-    )
-    .err()
-    .expect("legacy marker with null thread id must fail");
-    let compatibility_error = super::parse_agent_runtime_end_payload_legacy_compatible::<
-        TestCurrentAgentEndPayload,
-    >(hybrid_value)
-    .err()
-    .expect("legacy-compatible selector must reject malformed legacy payload");
-    assert_eq!(compatibility_error.to_string(), legacy_error.to_string(),);
-}
-
-#[test]
-fn malformed_agent_invocation_preserves_missing_arguments_context() {
-    for invocation in [
-        json!({}),
-        json!({ "payload": {} }),
-        json!({ "payload": { "arguments": 42 } }),
-    ] {
-        let error = super::legacy_agent_invocation_arguments(&invocation, "call-followup")
-            .err()
-            .expect("malformed invocation must fail");
-        assert_eq!(
-            error.to_string(),
-            "agent activity tool call call-followup missing function arguments"
-        );
-    }
-}
-
-#[test]
-fn malformed_agent_runtime_begin_preserves_legacy_diagnostic() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let writer = create_started_agent_writer(&temp)?;
-    start_agent_turn(&writer, "turn-1")?;
-    append_followup_tool_started(&writer)?;
-
-    let value = json!({});
-    let legacy_error = serde_json::from_value::<
-        codex_protocol::protocol::CollabAgentInteractionBeginEvent,
-    >(value.clone())
-    .expect_err("legacy projection must reject the same begin payload");
-    let runtime_payload = writer.write_json_payload(RawPayloadKind::ToolRuntimeEvent, &value)?;
-    writer.append_with_context(
-        trace_context_for_agent("turn-1"),
-        RawTraceEventPayload::ToolCallRuntimeStarted {
-            tool_call_id: "call-followup-v2".to_string(),
-            runtime_payload,
-        },
-    )?;
-
-    let error = replay_bundle(temp.path()).expect_err("malformed begin payload must fail replay");
-    assert_eq!(error.to_string(), legacy_error.to_string());
-    Ok(())
-}
-
-#[test]
-fn malformed_agent_runtime_end_preserves_legacy_diagnostic_in_replay() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let writer = create_started_agent_writer(&temp)?;
-    start_agent_turn(&writer, "turn-1")?;
-    append_followup_tool_started(&writer)?;
-
-    let value = json!({
-        "agent_thread_id": null,
-        "receiver_thread_id": "019d0000-0000-7000-8000-000000000002"
-    });
-    let legacy_error =
-        serde_json::from_value::<codex_protocol::protocol::SubAgentActivityEvent>(value.clone())
-            .expect_err("legacy marker selection must reject the same end payload");
-    let runtime_payload = writer.write_json_payload(RawPayloadKind::ToolRuntimeEvent, &value)?;
-    writer.append_with_context(
-        trace_context_for_agent("turn-1"),
-        RawTraceEventPayload::ToolCallRuntimeEnded {
-            tool_call_id: "call-followup-v2".to_string(),
-            status: ExecutionStatus::Completed,
-            runtime_payload,
-        },
-    )?;
-
-    let error = replay_bundle(temp.path()).expect_err("malformed end payload must fail replay");
-    assert_eq!(error.to_string(), legacy_error.to_string());
-    Ok(())
-}
-
-fn append_followup_tool_started(writer: &TraceWriter) -> anyhow::Result<()> {
-    let invocation_payload = writer.write_json_payload(
-        RawPayloadKind::ToolInvocation,
-        &json!({
-            "tool_name": "followup_task",
-            "payload": {
-                "type": "function",
-                "arguments": "{\"target\":\"/root/child\",\"message\":\"continue\"}"
-            }
-        }),
-    )?;
-    writer.append_with_context(
-        trace_context_for_agent("turn-1"),
-        RawTraceEventPayload::ToolCallStarted {
-            tool_call_id: "call-followup-v2".to_string(),
-            model_visible_call_id: Some("call-followup-v2".to_string()),
-            code_mode_runtime_tool_id: None,
-            requester: RawToolCallRequester::Model,
-            kind: ToolCallKind::AssignAgentTask,
-            summary: ToolCallSummary::Generic {
-                label: "followup_task".to_string(),
-                input_preview: None,
-                output_preview: None,
-            },
-            invocation_payload: Some(invocation_payload),
-        },
-    )?;
-    Ok(())
-}
-
 #[test]
 fn child_thread_metadata_creates_spawn_origin_without_delivery_edge() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
@@ -636,29 +479,6 @@ fn send_message_activity_targets_delivered_child_message() -> anyhow::Result<()>
 
 #[test]
 fn followup_activity_targets_delivered_child_message() -> anyhow::Result<()> {
-    assert_followup_runtime_payload_targets_delivered_child_message(json!({
-        "event_id": "call-followup-v2",
-        "occurred_at_ms": 1234,
-        "agent_thread_id": "019d0000-0000-7000-8000-000000000002",
-        "agent_path": "/root/child",
-        "kind": "interacted"
-    }))
-}
-
-#[test]
-fn followup_current_runtime_payload_targets_delivered_child_message() -> anyhow::Result<()> {
-    assert_followup_runtime_payload_targets_delivered_child_message(json!({
-        "call_id": "call-followup-v2",
-        "sender_thread_id": "019d0000-0000-7000-8000-000000000001",
-        "receiver_thread_id": "019d0000-0000-7000-8000-000000000002",
-        "prompt": "continue",
-        "status": "running"
-    }))
-}
-
-fn assert_followup_runtime_payload_targets_delivered_child_message(
-    end_payload_value: serde_json::Value,
-) -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_agent_writer(&temp)?;
     start_agent_turn(&writer, "turn-1")?;
@@ -689,8 +509,16 @@ fn assert_followup_runtime_payload_targets_delivered_child_message(
             invocation_payload: Some(invocation_payload.clone()),
         },
     )?;
-    let activity_payload =
-        writer.write_json_payload(RawPayloadKind::ToolRuntimeEvent, &end_payload_value)?;
+    let activity_payload = writer.write_json_payload(
+        RawPayloadKind::ToolRuntimeEvent,
+        &json!({
+            "event_id": "call-followup-v2",
+            "occurred_at_ms": 1234,
+            "agent_thread_id": child_thread_id,
+            "agent_path": "/root/child",
+            "kind": "interacted"
+        }),
+    )?;
     writer.append_with_context(
         trace_context_for_agent("turn-1"),
         RawTraceEventPayload::ToolCallRuntimeEnded {
@@ -737,30 +565,6 @@ fn assert_followup_runtime_payload_targets_delivered_child_message(
 
 #[test]
 fn close_agent_runtime_payload_targets_thread() -> anyhow::Result<()> {
-    assert_close_agent_runtime_payload_targets_thread(json!({
-        "call_id": "call-close",
-        "sender_thread_id": "019d0000-0000-7000-8000-000000000001",
-        "receiver_thread_id": "019d0000-0000-7000-8000-000000000002",
-        "receiver_agent_nickname": "Scout",
-        "receiver_agent_role": "explorer",
-        "status": "running"
-    }))
-}
-
-#[test]
-fn close_agent_legacy_activity_targets_thread() -> anyhow::Result<()> {
-    assert_close_agent_runtime_payload_targets_thread(json!({
-        "event_id": "call-close",
-        "occurred_at_ms": 1234,
-        "agent_thread_id": "019d0000-0000-7000-8000-000000000002",
-        "agent_path": "/root/child",
-        "kind": "interrupted"
-    }))
-}
-
-fn assert_close_agent_runtime_payload_targets_thread(
-    end_payload_value: serde_json::Value,
-) -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_agent_writer(&temp)?;
     start_thread(
@@ -810,8 +614,17 @@ fn assert_close_agent_runtime_payload_targets_thread(
             runtime_payload: begin_payload.clone(),
         },
     )?;
-    let end_payload =
-        writer.write_json_payload(RawPayloadKind::ToolRuntimeEvent, &end_payload_value)?;
+    let end_payload = writer.write_json_payload(
+        RawPayloadKind::ToolRuntimeEvent,
+        &json!({
+            "call_id": "call-close",
+            "sender_thread_id": "019d0000-0000-7000-8000-000000000001",
+            "receiver_thread_id": "019d0000-0000-7000-8000-000000000002",
+            "receiver_agent_nickname": "Scout",
+            "receiver_agent_role": "explorer",
+            "status": "running"
+        }),
+    )?;
     writer.append_with_context(
         trace_context_for_agent("turn-1"),
         RawTraceEventPayload::ToolCallRuntimeEnded {

@@ -25,7 +25,6 @@ use crate::codex_apps_cache::CodexAppsToolsCacheContext;
 use crate::codex_apps_cache::CodexAppsToolsFetchSource;
 use crate::codex_apps_cache::load_startup_cached_codex_apps_server_info;
 use crate::elicitation::ElicitationRequestManager;
-#[cfg(test)]
 use crate::mcp::CODEX_APPS_MCP_SERVER_NAME;
 use crate::mcp::ToolPluginProvenance;
 use crate::runtime::McpRuntimeContext;
@@ -136,12 +135,6 @@ impl ManagedClient {
 
         self.tools.clone()
     }
-
-    pub(crate) fn connected_catalog_contains(&self, tool_name: &str) -> bool {
-        self.tools
-            .iter()
-            .any(|listed| listed.tool.name.as_ref() == tool_name)
-    }
 }
 
 pub(crate) type ManagedClientFuture =
@@ -150,20 +143,9 @@ pub(crate) type ManagedClientFuture =
 #[derive(Default)]
 struct CodexAppsStartupReconnectState {
     current_client: Option<ManagedClient>,
-    reconnect_in_flight: Option<(u64, ManagedClientFuture)>,
-    next_generation: u64,
+    reconnect_in_flight: bool,
     consecutive_failures: u32,
     retry_not_before: Option<TokioInstant>,
-    last_error: Option<StartupOutcomeError>,
-}
-
-enum CodexAppsReconnectAttempt {
-    Ready(ManagedClient),
-    Await {
-        generation: u64,
-        future: ManagedClientFuture,
-    },
-    Backoff(StartupOutcomeError),
 }
 
 #[derive(Clone)]
@@ -211,104 +193,67 @@ impl CodexAppsStartupReconnect {
     }
 
     fn reconnect_in_background(self: &Arc<Self>) {
-        let reconnect = Arc::clone(self);
-        tokio::spawn(async move {
-            let _ = reconnect.reconnect().await;
-        });
-    }
-
-    async fn reconnect(self: &Arc<Self>) -> Result<ManagedClient, StartupOutcomeError> {
-        let attempt = {
+        {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(client) = state.current_client.clone() {
-                CodexAppsReconnectAttempt::Ready(client)
-            } else if let Some((generation, future)) = state.reconnect_in_flight.clone() {
-                CodexAppsReconnectAttempt::Await { generation, future }
-            } else if state
+            if state.current_client.is_some() || state.reconnect_in_flight {
+                return;
+            }
+            if state
                 .retry_not_before
                 .is_some_and(|retry_not_before| TokioInstant::now() < retry_not_before)
             {
-                CodexAppsReconnectAttempt::Backoff(state.last_error.clone().unwrap_or_else(|| {
-                    StartupOutcomeError::Failed {
-                        error: "Apps MCP startup reconnect is backing off".to_string(),
-                        is_authentication_required: false,
-                    }
-                }))
-            } else {
-                state.next_generation = state.next_generation.saturating_add(1);
-                let generation = state.next_generation;
-                let future = (self.factory)();
-                state.reconnect_in_flight = Some((generation, future.clone()));
-                CodexAppsReconnectAttempt::Await { generation, future }
-            }
-        };
-
-        match attempt {
-            CodexAppsReconnectAttempt::Ready(client) => Ok(client),
-            CodexAppsReconnectAttempt::Backoff(error) => Err(error),
-            CodexAppsReconnectAttempt::Await { generation, future } => {
-                let result = future.await;
-                self.finish_reconnect(generation, result.clone()).await;
-                result
-            }
-        }
-    }
-
-    async fn finish_reconnect(
-        &self,
-        generation: u64,
-        result: Result<ManagedClient, StartupOutcomeError>,
-    ) {
-        let recovered = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !matches!(
-                state.reconnect_in_flight.as_ref(),
-                Some((active_generation, _)) if *active_generation == generation
-            ) {
                 return;
             }
-            state.reconnect_in_flight = None;
-            match result {
-                Ok(client) => {
-                    state.current_client = Some(client);
-                    state.consecutive_failures = 0;
-                    state.retry_not_before = None;
-                    state.last_error = None;
-                    true
-                }
-                Err(error) => {
-                    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
-                    let retry_after = codex_apps_reconnect_backoff(state.consecutive_failures);
-                    state.retry_not_before = Some(TokioInstant::now() + retry_after);
-                    state.last_error = Some(error.clone());
-                    warn!(
-                        error = %error,
-                        retry_after_ms = retry_after.as_millis(),
-                        "Apps MCP startup reconnect failed; continuing with cached tools"
-                    );
-                    false
-                }
-            }
-        };
-
-        if recovered && let Some(context) = self.startup_status_context.clone() {
-            let _ = context
-                .tx_event
-                .send(Event {
-                    id: context.submit_id,
-                    msg: EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
-                        server: context.server_name,
-                        status: McpStartupStatus::Ready,
-                    }),
-                })
-                .await;
+            state.reconnect_in_flight = true;
         }
+
+        let reconnect = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = (reconnect.factory)().await;
+            let startup_status_context = reconnect.startup_status_context.clone();
+            let recovered = {
+                let mut state = reconnect
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.reconnect_in_flight = false;
+                match result {
+                    Ok(client) => {
+                        state.current_client = Some(client);
+                        state.consecutive_failures = 0;
+                        state.retry_not_before = None;
+                        true
+                    }
+                    Err(error) => {
+                        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+                        let retry_after = codex_apps_reconnect_backoff(state.consecutive_failures);
+                        state.retry_not_before = Some(TokioInstant::now() + retry_after);
+                        warn!(
+                            error = %error,
+                            retry_after_ms = retry_after.as_millis(),
+                            "Apps MCP startup reconnect failed; continuing with cached tools"
+                        );
+                        false
+                    }
+                }
+            };
+
+            if recovered && let Some(context) = startup_status_context {
+                let _ = context
+                    .tx_event
+                    .send(Event {
+                        id: context.submit_id,
+                        msg: EventMsg::McpStartupUpdate(McpStartupUpdateEvent {
+                            server: context.server_name,
+                            status: McpStartupStatus::Ready,
+                        }),
+                    })
+                    .await;
+            }
+        });
     }
 }
 
@@ -353,7 +298,7 @@ impl ManagedClientStartup {
             cancel_token,
             startup_complete,
         } = self.clone();
-        let is_codex_apps_mcp_server = server.is_host_owned_codex_apps();
+        let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
         let tool_filter = server
             .configured_config()
             .map(ToolFilter::from_config)
@@ -459,7 +404,7 @@ impl AsyncManagedClient {
         client_elicitation_capability: ElicitationCapability,
         supports_openai_form_elicitation: bool,
     ) -> Self {
-        let is_codex_apps_mcp_server = server.is_host_owned_codex_apps();
+        let is_codex_apps_mcp_server = server_name == CODEX_APPS_MCP_SERVER_NAME;
         let reconnect_server_name = server_name.clone();
         let reconnect_tx_event = tx_event.clone();
         let tool_filter = server
@@ -501,6 +446,16 @@ impl AsyncManagedClient {
                     ),
             )
         });
+        if codex_apps_tools_cache_context
+            .as_ref()
+            .is_some_and(CodexAppsToolsCacheContext::has_current_tools)
+        {
+            let startup_task = client.clone();
+            tokio::spawn(async move {
+                let _ = startup_task.await;
+            });
+        }
+
         Self {
             client,
             is_codex_apps_mcp_server,
@@ -523,21 +478,6 @@ impl AsyncManagedClient {
             return Ok(client);
         }
         self.client.clone().await
-    }
-
-    pub(crate) async fn client_for_authoritative_use(
-        &self,
-    ) -> Result<ManagedClient, StartupOutcomeError> {
-        match self.client().await {
-            Ok(client) => Ok(client),
-            Err(error @ StartupOutcomeError::Cancelled) => Err(error),
-            Err(error @ StartupOutcomeError::Failed { .. }) => {
-                let Some(startup_reconnect) = self.startup_reconnect.as_ref() else {
-                    return Err(error);
-                };
-                startup_reconnect.reconnect().await
-            }
-        }
     }
 
     pub(crate) async fn reconnect_failed_startup(&self) {
@@ -920,13 +860,13 @@ async fn start_server_task(
     .await
     .map_err(StartupOutcomeError::from)?;
     let server_info = mcp_server_info_from_implementation(initialize_result.server_info);
-    match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
+    let tools = match (codex_apps_tools_cache_context.as_ref(), fetch_ticket) {
         (Some(cache_context), Some(fetch_ticket)) => {
-            cache_context.publish_if_newest_accepted(fetch_ticket, &server_info, &tools);
+            cache_context.publish_if_newest_accepted(fetch_ticket, &server_info, tools)
         }
-        (None, None) => {}
+        (None, None) => tools,
         _ => unreachable!("Codex Apps fetch ticket requires cache context"),
-    }
+    };
     if is_codex_apps_mcp_server {
         emit_duration(
             MCP_TOOLS_LIST_DURATION_METRIC,

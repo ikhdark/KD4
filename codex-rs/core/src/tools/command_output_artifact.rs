@@ -1,23 +1,12 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
-use std::sync::Weak;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 
-use sha2::Digest;
-use sha2::Sha256;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use tokio::sync::Notify;
-use tokio::sync::mpsc;
-
-const RETENTION_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
-const RETENTION_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+use tokio::sync::Semaphore;
+use tokio::sync::SemaphorePermit;
 
 fn max_retained_artifacts_per_thread() -> usize {
     128
@@ -25,26 +14,6 @@ fn max_retained_artifacts_per_thread() -> usize {
 
 fn max_retained_artifacts_total() -> usize {
     1_024
-}
-
-#[derive(Clone, Default)]
-struct PendingRetention {
-    directories: HashMap<PathBuf, PathBuf>,
-    roots: HashMap<PathBuf, PathBuf>,
-}
-
-struct RetentionJanitor {
-    pending: StdMutex<PendingRetention>,
-    running: AtomicBool,
-}
-
-impl RetentionJanitor {
-    fn new() -> Self {
-        Self {
-            pending: StdMutex::new(PendingRetention::default()),
-            running: AtomicBool::new(false),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,229 +32,7 @@ pub(crate) enum RawOutputArtifact {
 pub(crate) struct RawOutputArtifactWriter {
     path: Option<PathBuf>,
     file: Option<tokio::fs::File>,
-    initial_bytes: u64,
     bytes: u64,
-}
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RawOutputArtifactWritePositions {
-    pub(crate) observed: u64,
-    pub(crate) queued: u64,
-    pub(crate) committed: u64,
-    pub(crate) finalized: u64,
-}
-
-#[derive(Default)]
-struct RawOutputArtifactPositionTracker {
-    observed: AtomicU64,
-    queued: AtomicU64,
-    committed: AtomicU64,
-    finalized: AtomicU64,
-    worker_done: AtomicBool,
-    worker_done_notify: Notify,
-}
-
-impl RawOutputArtifactPositionTracker {
-    #[cfg(test)]
-    fn snapshot(&self) -> RawOutputArtifactWritePositions {
-        RawOutputArtifactWritePositions {
-            observed: self.observed.load(Ordering::Acquire),
-            queued: self.queued.load(Ordering::Acquire),
-            committed: self.committed.load(Ordering::Acquire),
-            finalized: self.finalized.load(Ordering::Acquire),
-        }
-    }
-
-    async fn wait_until_done(&self) {
-        loop {
-            let notified = self.worker_done_notify.notified();
-            if self.worker_done.load(Ordering::Acquire) {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
-
-#[derive(Default)]
-struct PendingRawOutputArtifactBytes {
-    bytes: Vec<u8>,
-    finalize_requested: bool,
-}
-
-/// Non-blocking producer for one serialized raw-output artifact writer.
-///
-/// Exact bytes live in one ordered staging buffer while the capacity-one channel
-/// only coalesces wakeups. This keeps process draining independent of artifact
-/// latency without creating a task or channel entry per output chunk.
-pub(crate) struct RawOutputArtifactWriteQueue {
-    pending: Arc<StdMutex<PendingRawOutputArtifactBytes>>,
-    positions: Arc<RawOutputArtifactPositionTracker>,
-    wake_tx: mpsc::Sender<()>,
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct RawOutputArtifactWriteObserver {
-    positions: Arc<RawOutputArtifactPositionTracker>,
-}
-
-#[cfg(test)]
-impl RawOutputArtifactWriteObserver {
-    pub(crate) fn positions(&self) -> RawOutputArtifactWritePositions {
-        self.positions.snapshot()
-    }
-
-    pub(crate) async fn wait_until_done(&self) {
-        self.positions.wait_until_done().await;
-    }
-}
-
-impl RawOutputArtifactWriteQueue {
-    pub(crate) fn spawn(state: Option<Arc<Mutex<RawOutputArtifact>>>) -> Option<Self> {
-        Self::spawn_inner(state, None)
-    }
-
-    fn spawn_inner(
-        state: Option<Arc<Mutex<RawOutputArtifact>>>,
-        #[cfg_attr(not(test), allow(unused_variables))] io_gate: Option<
-            Arc<tokio::sync::Semaphore>,
-        >,
-    ) -> Option<Self> {
-        let state = state?;
-        let pending = Arc::new(StdMutex::new(PendingRawOutputArtifactBytes::default()));
-        let positions = Arc::new(RawOutputArtifactPositionTracker::default());
-        let (wake_tx, wake_rx) = mpsc::channel(1);
-        tokio::spawn(run_raw_output_artifact_writer(
-            state,
-            Arc::clone(&pending),
-            Arc::clone(&positions),
-            wake_rx,
-            io_gate,
-        ));
-        Some(Self {
-            pending,
-            positions,
-            wake_tx,
-        })
-    }
-
-    pub(crate) fn enqueue(&self, output: &[u8]) {
-        let output_len = u64::try_from(output.len()).unwrap_or(u64::MAX);
-        self.positions
-            .observed
-            .fetch_add(output_len, Ordering::AcqRel);
-        {
-            let mut pending = self
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending.bytes.extend_from_slice(output);
-            self.positions
-                .queued
-                .fetch_add(output_len, Ordering::AcqRel);
-        }
-        let _ = self.wake_tx.try_send(());
-    }
-
-    pub(crate) async fn finish(self) {
-        {
-            let mut pending = self
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            pending.finalize_requested = true;
-        }
-        let _ = self.wake_tx.try_send(());
-        self.positions.wait_until_done().await;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn spawn_with_io_gate(
-        state: Option<Arc<Mutex<RawOutputArtifact>>>,
-        io_gate: Arc<tokio::sync::Semaphore>,
-    ) -> Option<Self> {
-        Self::spawn_inner(state, Some(io_gate))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn observer(&self) -> RawOutputArtifactWriteObserver {
-        RawOutputArtifactWriteObserver {
-            positions: Arc::clone(&self.positions),
-        }
-    }
-}
-
-impl Drop for RawOutputArtifactWriteQueue {
-    fn drop(&mut self) {
-        let mut pending = self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.finalize_requested = true;
-    }
-}
-
-async fn run_raw_output_artifact_writer(
-    state: Arc<Mutex<RawOutputArtifact>>,
-    pending: Arc<StdMutex<PendingRawOutputArtifactBytes>>,
-    positions: Arc<RawOutputArtifactPositionTracker>,
-    mut wake_rx: mpsc::Receiver<()>,
-    #[cfg_attr(not(test), allow(unused_variables))] io_gate: Option<Arc<tokio::sync::Semaphore>>,
-) {
-    #[cfg(test)]
-    if let Some(io_gate) = io_gate {
-        let _permit = io_gate.acquire().await;
-    }
-
-    let mut writer = RawOutputArtifactWriter::open(Some(&state)).await;
-    loop {
-        let channel_closed = wake_rx.recv().await.is_none();
-        loop {
-            let (bytes, finalize_requested) = {
-                let mut pending = pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (
-                    std::mem::take(&mut pending.bytes),
-                    pending.finalize_requested,
-                )
-            };
-            if !bytes.is_empty()
-                && let Some(writer) = writer.as_mut()
-            {
-                writer.write_chunk(Some(&state), &bytes).await;
-                positions
-                    .committed
-                    .store(writer.committed_position(), Ordering::Release);
-            }
-
-            let pending_is_empty = pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .bytes
-                .is_empty();
-            if pending_is_empty && (finalize_requested || channel_closed) {
-                if let Some(writer) = writer.as_mut() {
-                    writer.finish(Some(&state)).await;
-                    positions
-                        .committed
-                        .store(writer.committed_position(), Ordering::Release);
-                }
-                positions.finalized.store(
-                    positions.committed.load(Ordering::Acquire),
-                    Ordering::Release,
-                );
-                positions.worker_done.store(true, Ordering::Release);
-                positions.worker_done_notify.notify_waiters();
-                return;
-            }
-            if pending_is_empty {
-                break;
-            }
-        }
-    }
 }
 
 impl RawOutputArtifactWriter {
@@ -296,7 +43,6 @@ impl RawOutputArtifactWriter {
             return Some(Self {
                 path: None,
                 file: None,
-                initial_bytes: 0,
                 bytes: 0,
             });
         };
@@ -310,11 +56,10 @@ impl RawOutputArtifactWriter {
                 Ok(file) => Some(Self {
                     path: Some(path),
                     file: Some(file),
-                    initial_bytes: bytes,
                     bytes,
                 }),
                 Err(err) => {
-                    enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path);
+                    enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path).await;
                     *state.lock().await = RawOutputArtifact::Failed {
                         message: format!(
                             "failed to lock `{}` for streaming: {err}",
@@ -326,13 +71,12 @@ impl RawOutputArtifactWriter {
                     Some(Self {
                         path: Some(path),
                         file: None,
-                        initial_bytes: bytes,
                         bytes,
                     })
                 }
             },
             Err(err) => {
-                enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path);
+                enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path).await;
                 *state.lock().await = RawOutputArtifact::Failed {
                     message: format!("failed to open `{}` for streaming: {err}", path.display()),
                     owned_path: Some(path.clone()),
@@ -341,7 +85,6 @@ impl RawOutputArtifactWriter {
                 Some(Self {
                     path: Some(path),
                     file: None,
-                    initial_bytes: bytes,
                     bytes,
                 })
             }
@@ -392,10 +135,6 @@ impl RawOutputArtifactWriter {
             .await;
         }
     }
-
-    fn committed_position(&self) -> u64 {
-        self.bytes.saturating_sub(self.initial_bytes)
-    }
 }
 
 async fn lock_output_file(file: tokio::fs::File) -> std::io::Result<tokio::fs::File> {
@@ -429,122 +168,6 @@ impl RawOutputArtifact {
             ),
             Self::Failed { message, .. } => format!("Raw output artifact unavailable: {message}"),
         }
-    }
-}
-
-pub(crate) fn output_sha256(output: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(output))
-}
-
-pub(crate) async fn create_content_addressed_output_artifact(
-    codex_home: &Path,
-    thread_id: &str,
-    output: &[u8],
-) -> RawOutputArtifact {
-    let directory = codex_home.join("tool-output").join(thread_id).join("exact");
-    create_content_addressed_output_artifact_in(&directory, output).await
-}
-
-pub(crate) async fn content_address_raw_output_artifact(
-    artifact: &RawOutputArtifact,
-) -> RawOutputArtifact {
-    let RawOutputArtifact::Stored { path, .. } = artifact else {
-        return artifact.clone();
-    };
-    let output = match tokio::fs::read(path).await {
-        Ok(output) => output,
-        Err(err) => {
-            return failed_with_owned_path(
-                path.clone(),
-                0,
-                format!(
-                    "failed to read `{}` for content addressing: {err}",
-                    path.display()
-                ),
-            )
-            .await;
-        }
-    };
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    create_content_addressed_output_artifact_in(directory, &output).await
-}
-
-async fn create_content_addressed_output_artifact_in(
-    directory: &Path,
-    output: &[u8],
-) -> RawOutputArtifact {
-    if let Err(err) = tokio::fs::create_dir_all(directory).await {
-        return RawOutputArtifact::unavailable(format!(
-            "failed to create `{}`: {err}",
-            directory.display()
-        ));
-    }
-
-    let digest = output_sha256(output);
-    let path = directory.join(format!("sha256-{digest}.log"));
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        return verify_content_addressed_output(path, output).await;
-    }
-
-    let temporary_path = directory.join(format!(".{}.tmp", uuid::Uuid::now_v7()));
-    let write_result = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary_path)
-            .await?;
-        file.write_all(output).await?;
-        file.flush().await?;
-        drop(file);
-        tokio::fs::rename(&temporary_path, &path).await
-    }
-    .await;
-
-    match write_result {
-        Ok(()) => {
-            enforce_retention(directory, &path);
-            RawOutputArtifact::Stored {
-                path,
-                bytes: u64::try_from(output.len()).unwrap_or(u64::MAX),
-            }
-        }
-        Err(_) if tokio::fs::try_exists(&path).await.unwrap_or(false) => {
-            let _ = tokio::fs::remove_file(&temporary_path).await;
-            verify_content_addressed_output(path, output).await
-        }
-        Err(err) => {
-            let _ = tokio::fs::remove_file(&temporary_path).await;
-            RawOutputArtifact::unavailable(format!(
-                "failed to create content-addressed output `{}`: {err}",
-                path.display()
-            ))
-        }
-    }
-}
-
-async fn verify_content_addressed_output(path: PathBuf, expected: &[u8]) -> RawOutputArtifact {
-    match tokio::fs::read(&path).await {
-        Ok(actual) if actual == expected => {
-            enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path);
-            RawOutputArtifact::Stored {
-                path,
-                bytes: u64::try_from(actual.len()).unwrap_or(u64::MAX),
-            }
-        }
-        Ok(actual) => RawOutputArtifact::Failed {
-            message: format!(
-                "content-addressed output integrity mismatch: expected {} bytes, found {}",
-                expected.len(),
-                actual.len()
-            ),
-            owned_path: Some(path),
-            bytes: u64::try_from(actual.len()).unwrap_or(u64::MAX),
-        },
-        Err(err) => RawOutputArtifact::Failed {
-            message: format!("failed to read content-addressed output: {err}"),
-            owned_path: Some(path),
-            bytes: 0,
-        },
     }
 }
 
@@ -600,14 +223,14 @@ pub(crate) async fn create_raw_output_artifact(
                 .await;
             }
             drop(file);
-            enforce_retention(&directory, &path);
+            enforce_retention(&directory, &path).await;
             RawOutputArtifact::Stored {
                 path,
                 bytes: output.len() as u64,
             }
         }
         Err(err) => {
-            enforce_retention(&directory, &path);
+            enforce_retention(&directory, &path).await;
             RawOutputArtifact::unavailable(format!("failed to create `{}`: {err}", path.display()))
         }
     }
@@ -659,7 +282,7 @@ pub(crate) async fn append_raw_output_artifact(
             }
             match file.metadata().await {
                 Ok(metadata) => {
-                    enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), path);
+                    enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), path).await;
                     RawOutputArtifact::Stored {
                         path: path.clone(),
                         bytes: metadata.len(),
@@ -743,7 +366,7 @@ pub(crate) async fn replace_raw_output_artifact(
                 )
                 .await;
             }
-            enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), path);
+            enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), path).await;
             RawOutputArtifact::Stored {
                 path: path.clone(),
                 bytes: output.len() as u64,
@@ -768,7 +391,7 @@ async fn failed_with_owned_path(
     let bytes = tokio::fs::metadata(&path)
         .await
         .map_or(fallback_bytes, |metadata| metadata.len());
-    enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path);
+    enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path).await;
     RawOutputArtifact::Failed {
         message,
         owned_path: Some(path),
@@ -776,21 +399,20 @@ async fn failed_with_owned_path(
     }
 }
 
-fn enforce_retention(directory: &Path, keep_path: &Path) {
-    schedule_retention(directory, keep_path);
+async fn enforce_retention(directory: &Path, keep_path: &Path) {
+    let _retention_permit = retention_sweep_permit().await;
+    enforce_retention_locked(directory, keep_path).await;
 }
 
-async fn enforce_local_retention_locked(directory: &Path, keep_path: &Path) -> bool {
-    let mut entries = match tokio::fs::read_dir(directory).await {
-        Ok(entries) => entries,
-        Err(err) => return err.kind() == std::io::ErrorKind::NotFound,
+async fn enforce_retention_locked(directory: &Path, keep_path: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
+        return;
     };
     let mut paths = Vec::new();
     loop {
         let entry = match entries.next_entry().await {
             Ok(Some(entry)) => entry,
-            Ok(None) => break,
-            Err(_) => return false,
+            Ok(None) | Err(_) => break,
         };
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) == Some("log") {
@@ -799,49 +421,49 @@ async fn enforce_local_retention_locked(directory: &Path, keep_path: &Path) -> b
     }
     paths.sort_unstable();
 
-    let mut retained_count = paths.len();
+    let mut remove_count = paths
+        .len()
+        .saturating_sub(max_retained_artifacts_per_thread());
     for path in paths {
-        if retained_count <= max_retained_artifacts_per_thread() {
+        if remove_count == 0 {
             break;
         }
         if path == keep_path {
             continue;
         }
         if remove_inactive_output_path(path).await {
-            retained_count = retained_count.saturating_sub(1);
+            remove_count -= 1;
         }
     }
-    retained_count <= max_retained_artifacts_per_thread()
+
+    if let Some(tool_output_root) = directory.parent() {
+        enforce_global_retention_locked(tool_output_root, keep_path).await;
+    }
 }
 
 #[cfg(test)]
 async fn enforce_global_retention(tool_output_root: &Path, keep_path: &Path) {
-    schedule_global_retention(tool_output_root, keep_path);
-    wait_for_retention_idle().await;
+    let _retention_permit = retention_sweep_permit().await;
+    enforce_global_retention_locked(tool_output_root, keep_path).await;
 }
 
-async fn enforce_global_retention_locked(tool_output_root: &Path, keep_path: &Path) -> bool {
-    let mut thread_directories = match tokio::fs::read_dir(tool_output_root).await {
-        Ok(entries) => entries,
-        Err(err) => return err.kind() == std::io::ErrorKind::NotFound,
+async fn enforce_global_retention_locked(tool_output_root: &Path, keep_path: &Path) {
+    let Ok(mut thread_directories) = tokio::fs::read_dir(tool_output_root).await else {
+        return;
     };
     let mut paths = Vec::new();
     loop {
         let thread_directory = match thread_directories.next_entry().await {
             Ok(Some(entry)) => entry.path(),
-            Ok(None) => break,
-            Err(_) => return false,
+            Ok(None) | Err(_) => break,
         };
-        let mut entries = match tokio::fs::read_dir(&thread_directory).await {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return false,
+        let Ok(mut entries) = tokio::fs::read_dir(&thread_directory).await else {
+            continue;
         };
         loop {
             let entry = match entries.next_entry().await {
                 Ok(Some(entry)) => entry,
-                Ok(None) => break,
-                Err(_) => return false,
+                Ok(None) | Err(_) => break,
             };
             let path = entry.path();
             if path.extension().and_then(|extension| extension.to_str()) == Some("log") {
@@ -860,183 +482,27 @@ async fn enforce_global_retention_locked(tool_output_root: &Path, keep_path: &Pa
             .cmp(right_time)
             .then_with(|| left_path.cmp(right_path))
     });
-    let mut retained_count = paths.len();
+    let mut remove_count = paths.len().saturating_sub(max_retained_artifacts_total());
     for (_, path) in paths {
-        if retained_count <= max_retained_artifacts_total() {
+        if remove_count == 0 {
             break;
         }
         if path != keep_path && remove_inactive_output_path(path).await {
-            retained_count = retained_count.saturating_sub(1);
-        }
-    }
-    retained_count <= max_retained_artifacts_total()
-}
-
-fn schedule_retention(directory: &Path, keep_path: &Path) {
-    let Some(tool_output_root) = directory.parent() else {
-        return;
-    };
-    let janitor = retention_janitor();
-    {
-        let mut pending = janitor
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending
-            .directories
-            .insert(directory.to_path_buf(), keep_path.to_path_buf());
-        pending
-            .roots
-            .insert(tool_output_root.to_path_buf(), keep_path.to_path_buf());
-    }
-    start_retention_janitor(janitor);
-}
-
-#[cfg(test)]
-fn schedule_global_retention(tool_output_root: &Path, keep_path: &Path) {
-    let janitor = retention_janitor();
-    janitor
-        .pending
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .roots
-        .insert(tool_output_root.to_path_buf(), keep_path.to_path_buf());
-    start_retention_janitor(janitor);
-}
-
-fn start_retention_janitor(janitor: &'static RetentionJanitor) {
-    if !janitor.running.swap(true, Ordering::AcqRel) {
-        tokio::spawn(run_retention_janitor(janitor));
-    }
-}
-
-async fn run_retention_janitor(janitor: &'static RetentionJanitor) {
-    let mut worker_guard = RetentionWorkerGuard {
-        janitor,
-        armed: true,
-    };
-    let mut retry_delay = RETENTION_RETRY_INITIAL_DELAY;
-    loop {
-        let pending = {
-            let pending = janitor
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if pending.directories.is_empty() && pending.roots.is_empty() {
-                janitor.running.store(false, Ordering::Release);
-                worker_guard.armed = false;
-                return;
-            }
-            pending.clone()
-        };
-
-        let mut completed_directories = Vec::new();
-        let mut should_delay = false;
-        for (directory, keep_path) in pending.directories {
-            let directory_lock = retention_directory_lock(&directory);
-            let Ok(_directory_guard) = directory_lock.try_lock() else {
-                should_delay = true;
-                continue;
-            };
-            let cap_satisfied = enforce_local_retention_locked(&directory, &keep_path).await;
-            if cap_satisfied {
-                completed_directories.push((directory, keep_path));
-            } else {
-                should_delay = true;
-            }
-        }
-
-        let mut completed_roots = Vec::new();
-        for (tool_output_root, keep_path) in pending.roots {
-            if enforce_global_retention_locked(&tool_output_root, &keep_path).await {
-                completed_roots.push((tool_output_root, keep_path));
-            } else {
-                should_delay = true;
-            }
-        }
-
-        {
-            let mut pending = janitor
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (directory, keep_path) in completed_directories {
-                if pending.directories.get(&directory) == Some(&keep_path) {
-                    pending.directories.remove(&directory);
-                }
-            }
-            for (tool_output_root, keep_path) in completed_roots {
-                if pending.roots.get(&tool_output_root) == Some(&keep_path) {
-                    pending.roots.remove(&tool_output_root);
-                }
-            }
-        }
-
-        if should_delay {
-            tokio::time::sleep(retry_delay).await;
-            retry_delay = retry_delay.saturating_mul(2).min(RETENTION_RETRY_MAX_DELAY);
-        } else {
-            retry_delay = RETENTION_RETRY_INITIAL_DELAY;
+            remove_count -= 1;
         }
     }
 }
 
-struct RetentionWorkerGuard {
-    janitor: &'static RetentionJanitor,
-    armed: bool,
-}
-
-impl Drop for RetentionWorkerGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            self.janitor.running.store(false, Ordering::Release);
-        }
+async fn retention_sweep_permit() -> SemaphorePermit<'static> {
+    match retention_sweep_semaphore().acquire().await {
+        Ok(permit) => permit,
+        Err(_) => unreachable!("the process-wide retention sweep semaphore is never closed"),
     }
 }
 
-fn retention_janitor() -> &'static RetentionJanitor {
-    static RETENTION_JANITOR: OnceLock<RetentionJanitor> = OnceLock::new();
-    RETENTION_JANITOR.get_or_init(RetentionJanitor::new)
-}
-
-fn retention_directory_lock(directory: &Path) -> Arc<Mutex<()>> {
-    static DIRECTORY_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
-    let locks = DIRECTORY_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
-    let mut locks = locks
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(directory).and_then(Weak::upgrade) {
-        return lock;
-    }
-    let lock = Arc::new(Mutex::new(()));
-    locks.insert(directory.to_path_buf(), Arc::downgrade(&lock));
-    lock
-}
-
-#[cfg(test)]
-async fn wait_for_retention_idle() {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let janitor = retention_janitor();
-            let pending_empty = {
-                let pending = janitor
-                    .pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                pending.directories.is_empty() && pending.roots.is_empty()
-            };
-            if pending_empty && !janitor.running.load(Ordering::Acquire) {
-                return;
-            }
-            if !pending_empty && !janitor.running.load(Ordering::Acquire) {
-                start_retention_janitor(janitor);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("retention janitor should become idle");
+fn retention_sweep_semaphore() -> &'static Semaphore {
+    static RETENTION_SWEEP_SEMAPHORE: OnceLock<Semaphore> = OnceLock::new();
+    RETENTION_SWEEP_SEMAPHORE.get_or_init(|| Semaphore::new(1))
 }
 
 #[cfg(test)]
@@ -1088,35 +554,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn content_addressed_artifact_is_stable_and_replays_exact_bytes() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let output = b"stdout\0stderr\nerror: tail\n";
-        let first = create_content_addressed_output_artifact(temp.path(), "thread", output).await;
-        let second = create_content_addressed_output_artifact(temp.path(), "thread", output).await;
-
-        let RawOutputArtifact::Stored {
-            path: first_path,
-            bytes,
-        } = first
-        else {
-            panic!("expected stored artifact");
-        };
-        let RawOutputArtifact::Stored {
-            path: second_path, ..
-        } = second
-        else {
-            panic!("expected reused artifact");
-        };
-        assert_eq!(first_path, second_path);
-        assert_eq!(bytes, output.len() as u64);
-        assert!(first_path.ends_with(format!("sha256-{}.log", output_sha256(output))));
-        assert_eq!(
-            tokio::fs::read(first_path).await.expect("exact bytes"),
-            output
-        );
-    }
-
-    #[tokio::test]
     async fn replacement_finalizes_background_output_without_duplicates() {
         let temp = tempfile::tempdir().expect("tempdir");
         let initial = create_raw_output_artifact(temp.path(), "thread", b"partial\n").await;
@@ -1162,7 +599,6 @@ mod tests {
             };
             paths.push(path);
         }
-        wait_for_retention_idle().await;
 
         let mut retained = tokio::fs::read_dir(temp.path().join("tool-output").join("thread"))
             .await

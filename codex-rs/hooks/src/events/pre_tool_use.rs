@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HookCompletedEvent;
@@ -16,7 +15,6 @@ use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
-use crate::engine::dispatcher::HookMatchContext;
 use crate::engine::output_parser;
 use crate::schema::PreToolUseCommandInput;
 use crate::schema::SubagentCommandInputFields;
@@ -34,15 +32,6 @@ pub struct PreToolUseRequest {
     pub matcher_aliases: Vec<String>,
     pub tool_use_id: String,
     pub tool_input: Value,
-}
-
-impl PreToolUseRequest {
-    pub(crate) fn match_context(&self) -> HookMatchContext<'_> {
-        HookMatchContext::PreToolUse {
-            canonical_tool_name: &self.tool_name,
-            matcher_aliases: &self.matcher_aliases,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -90,14 +79,6 @@ pub(crate) async fn run(
         HookEventName::PreToolUse,
         &matcher_inputs,
     );
-    run_prepared(matched, shell, request).await
-}
-
-pub(crate) async fn run_prepared(
-    matched: Vec<Arc<ConfiguredHandler>>,
-    shell: &CommandShell,
-    request: PreToolUseRequest,
-) -> PreToolUseOutcome {
     if matched.is_empty() {
         return PreToolUseOutcome {
             hook_events: Vec::new(),
@@ -333,8 +314,6 @@ fn serialization_failure_outcome(hook_events: Vec<HookCompletedEvent>) -> PreToo
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use codex_protocol::ThreadId;
     use codex_protocol::protocol::HookEventName;
     use codex_protocol::protocol::HookOutputEntry;
@@ -343,18 +322,14 @@ mod tests {
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
     use pretty_assertions::assert_eq;
-    use tempfile::tempdir;
 
     use super::PreToolUseHandlerData;
     use super::command_input_json;
     use super::latest_updated_input;
     use super::parse_completed;
     use super::preview;
-    use crate::engine::CommandShell;
     use crate::engine::ConfiguredHandler;
     use crate::engine::command_runner::CommandRunResult;
-    use crate::engine::dispatcher::HandlerIndex;
-    use crate::engine::dispatcher::HookMatchContext;
     use crate::events::common;
 
     #[test]
@@ -451,164 +426,6 @@ mod tests {
         assert_eq!(
             latest_updated_input(&[later_configured, earlier_configured]),
             Some(serde_json::json!({ "command": "echo finished later" }))
-        );
-    }
-
-    #[tokio::test]
-    async fn concurrent_handlers_share_stdin_and_real_completion_order_wins() {
-        let temp = tempdir().expect("create temp dir");
-        let slow_capture = temp.path().join("slow-stdin.json");
-        let fast_capture = temp.path().join("fast-stdin.json");
-        let gate = temp.path().join("fast-finished");
-        let script = temp.path().join(if cfg!(windows) {
-            "capture-hook.ps1"
-        } else {
-            "capture-hook.sh"
-        });
-        #[cfg(windows)]
-        std::fs::write(
-            &script,
-            r#"$Capture = $env:CODEX_HOOK_TEST_CAPTURE
-$Gate = $env:CODEX_HOOK_TEST_GATE
-$Mode = $env:CODEX_HOOK_TEST_MODE
-$payload = [Console]::In.ReadToEnd()
-[IO.File]::WriteAllText($Capture, $payload, [Text.UTF8Encoding]::new($false))
-if ($Mode -eq "fast") {
-    [IO.File]::WriteAllText($Gate, "ready")
-} else {
-    for ($i = 0; $i -lt 500 -and -not (Test-Path -LiteralPath $Gate); $i++) {
-        Start-Sleep -Milliseconds 10
-    }
-    if (-not (Test-Path -LiteralPath $Gate)) {
-        throw "fast hook did not create gate"
-    }
-    Start-Sleep -Milliseconds 200
-}
-if ($Mode -eq "slow") {
-    [Console]::Out.WriteLine('{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{"winner":"slow"}}}')
-} else {
-    [Console]::Out.WriteLine('{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{"winner":"fast"}}}')
-}
-"#,
-        )
-        .expect("write PowerShell hook");
-        #[cfg(not(windows))]
-        std::fs::write(
-            &script,
-            r#"#!/bin/sh
-capture=$CODEX_HOOK_TEST_CAPTURE
-gate=$CODEX_HOOK_TEST_GATE
-mode=$CODEX_HOOK_TEST_MODE
-cat > "$capture"
-if [ "$mode" = "fast" ]; then
-    printf ready > "$gate"
-else
-    i=0
-    while [ ! -e "$gate" ] && [ "$i" -lt 500 ]; do
-        sleep 0.01
-        i=$((i + 1))
-    done
-    [ -e "$gate" ] || exit 3
-    sleep 0.2
-fi
-if [ "$mode" = "slow" ]; then
-    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{"winner":"slow"}}}'
-else
-    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{"winner":"fast"}}}'
-fi
-"#,
-        )
-        .expect("write shell hook");
-
-        let configure_handler =
-            |handler: &mut ConfiguredHandler, capture: &std::path::Path, mode: &str| {
-                handler.command = script.display().to_string();
-                handler.env.insert(
-                    "CODEX_HOOK_TEST_CAPTURE".to_string(),
-                    capture.display().to_string(),
-                );
-                handler.env.insert(
-                    "CODEX_HOOK_TEST_GATE".to_string(),
-                    gate.display().to_string(),
-                );
-                handler
-                    .env
-                    .insert("CODEX_HOOK_TEST_MODE".to_string(), mode.to_string());
-            };
-        #[cfg(windows)]
-        let shell = CommandShell {
-            program: "powershell.exe".to_string(),
-            args: vec![
-                "-NoProfile".to_string(),
-                "-NonInteractive".to_string(),
-                "-ExecutionPolicy".to_string(),
-                "Bypass".to_string(),
-                "-File".to_string(),
-            ],
-        };
-        #[cfg(not(windows))]
-        let shell = CommandShell {
-            program: "sh".to_string(),
-            args: Vec::new(),
-        };
-
-        let mut slow = handler();
-        slow.matcher = Some("Write".to_string());
-        configure_handler(&mut slow, &slow_capture, "slow");
-        slow.source_path = script.clone().abs();
-        slow.display_order = 0;
-        let mut fast = handler();
-        fast.matcher = Some("Edit".to_string());
-        configure_handler(&mut fast, &fast_capture, "fast");
-        fast.source_path = script.clone().abs();
-        fast.display_order = 1;
-        let handlers = vec![Arc::new(slow), Arc::new(fast)];
-        let index = HandlerIndex::new(&handlers);
-        let matcher_aliases = vec!["Write".to_string(), "Edit".to_string()];
-        let plan = index.prepare(HookMatchContext::PreToolUse {
-            canonical_tool_name: "apply_patch",
-            matcher_aliases: &matcher_aliases,
-        });
-        assert_eq!(plan.len(), 2);
-
-        let mut request = request_for_tool_use("call-apply-patch");
-        request.cwd = temp.path().to_path_buf().abs();
-        request.tool_name = "apply_patch".to_string();
-        request.matcher_aliases = matcher_aliases;
-        let expected_stdin = command_input_json(&request).expect("serialize command input");
-        let outcome = super::run_prepared(plan.into_handlers(), &shell, request).await;
-
-        let hook_failures = outcome
-            .hook_events
-            .iter()
-            .filter(|event| event.run.status != HookRunStatus::Completed)
-            .map(|event| (event.run.display_order, &event.run.entries))
-            .collect::<Vec<_>>();
-        if !hook_failures.is_empty() {
-            panic!("hook execution failed: {hook_failures:?}");
-        }
-        assert_eq!(
-            std::fs::read(&slow_capture).expect("read slow stdin"),
-            expected_stdin.as_bytes()
-        );
-        assert_eq!(
-            std::fs::read(&fast_capture).expect("read fast stdin"),
-            expected_stdin.as_bytes()
-        );
-        let captured: serde_json::Value =
-            serde_json::from_slice(expected_stdin.as_bytes()).expect("parse captured stdin");
-        assert_eq!(captured["tool_name"], "apply_patch");
-        assert_eq!(
-            outcome
-                .hook_events
-                .iter()
-                .map(|event| event.run.display_order)
-                .collect::<Vec<_>>(),
-            vec![0, 1]
-        );
-        assert_eq!(
-            outcome.updated_input,
-            Some(serde_json::json!({ "winner": "slow" }))
         );
     }
 
@@ -829,43 +646,29 @@ fi
 
     #[test]
     fn invalid_json_like_stdout_fails_instead_of_becoming_noop() {
-        for stdout in [
-            "{\"decision\":\n",
-            "[]",
-            r#"{"unknownField":true}"#,
-            r#"{"hookSpecificOutput":{}}"#,
-            r#"{"continue":"yes"}"#,
-        ] {
-            let parsed = parse_completed(
-                &handler(),
-                run_result(Some(0), stdout, ""),
-                Some("turn-1".to_string()),
-            );
+        let parsed = parse_completed(
+            &handler(),
+            run_result(Some(0), "{\"decision\":\n", ""),
+            Some("turn-1".to_string()),
+        );
 
-            assert_eq!(
-                parsed.data,
-                PreToolUseHandlerData {
-                    should_block: false,
-                    block_reason: None,
-                    additional_contexts_for_model: Vec::new(),
-                    updated_input: None,
-                },
-                "stdout: {stdout}"
-            );
-            assert_eq!(
-                parsed.completed.run.status,
-                HookRunStatus::Failed,
-                "stdout: {stdout}"
-            );
-            assert_eq!(
-                parsed.completed.run.entries,
-                vec![HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: "hook returned invalid pre-tool-use JSON output".to_string(),
-                }],
-                "stdout: {stdout}"
-            );
-        }
+        assert_eq!(
+            parsed.data,
+            PreToolUseHandlerData {
+                should_block: false,
+                block_reason: None,
+                additional_contexts_for_model: Vec::new(),
+                updated_input: None,
+            }
+        );
+        assert_eq!(parsed.completed.run.status, HookRunStatus::Failed);
+        assert_eq!(
+            parsed.completed.run.entries,
+            vec![HookOutputEntry {
+                kind: HookOutputEntryKind::Error,
+                text: "hook returned invalid pre-tool-use JSON output".to_string(),
+            }]
+        );
     }
 
     #[test]
@@ -925,7 +728,7 @@ fi
         let runs = preview(&[handler()], &request);
 
         let completed = common::serialization_failure_hook_events_for_tool_use(
-            vec![handler().into()],
+            vec![handler()],
             Some(request.turn_id.clone()),
             "serialize failed".into(),
             &request.tool_use_id,

@@ -1900,23 +1900,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "codex-agent-task-store"
-version = "0.0.0"
-dependencies = [
- "chrono",
- "codex-state",
- "pretty_assertions",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "codex-analytics"
 version = "0.0.0"
 dependencies = [
@@ -2671,7 +2654,6 @@ dependencies = [
  "codex-feedback",
  "codex-file-search",
  "codex-file-system",
- "codex-file-watcher",
  "codex-git-utils",
  "codex-home",
  "codex-hooks",
@@ -2713,7 +2695,6 @@ dependencies = [
  "codex-utils-pty",
  "codex-utils-stream-parser",
  "codex-utils-string",
- "codex-verify-local",
  "codex-web-search-extension",
  "codex-windows-sandbox",
  "core_test_support",
@@ -2817,7 +2798,6 @@ dependencies = [
  "codex-utils-plugins",
  "dirs",
  "flate2",
- "futures",
  "libc",
  "pretty_assertions",
  "regex",
@@ -2848,7 +2828,6 @@ dependencies = [
  "codex-config",
  "codex-context-fragments",
  "codex-exec-server",
- "codex-file-watcher",
  "codex-login",
  "codex-model-provider",
  "codex-otel",
@@ -3126,7 +3105,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
- "tracing",
  "unicode-casefold",
 ]
 
@@ -3975,7 +3953,6 @@ dependencies = [
  "serde",
  "serde_json",
  "shlex",
- "tokio",
  "tree-sitter",
  "tree-sitter-bash",
  "url",
@@ -4239,7 +4216,6 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
- "tracing-test",
  "two-face",
  "unicode-segmentation",
  "unicode-width 0.2.1",
@@ -4498,28 +4474,6 @@ version = "0.0.0"
 dependencies = [
  "pretty_assertions",
  "v8",
-]
-
-[[package]]
-name = "codex-verify-local"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "clap",
- "globset",
- "indexmap 2.14.0",
- "libc",
- "pretty_assertions",
- "rand 0.9.3",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.18",
- "toml 0.9.11+spec-1.1.0",
- "walkdir",
- "windows-sys 0.52.0",
 ]
 
 [[package]]

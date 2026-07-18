@@ -5,15 +5,9 @@ use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerSource;
 use codex_config::ConfigRequirements;
 use codex_config::ConfigRequirementsToml;
-use codex_plugin::AppConnectorId;
-use codex_plugin::AppDeclaration;
 use codex_plugin::PluginId;
-use codex_plugin::PluginLoadOutcome;
 use pretty_assertions::assert_eq;
-use std::sync::Arc;
-use std::sync::Mutex;
 use tempfile::TempDir;
-use tokio::sync::oneshot;
 
 fn user_config_path(temp_dir: &TempDir, file_name: &str) -> AbsolutePathBuf {
     AbsolutePathBuf::from_absolute_path(temp_dir.path().join(file_name))
@@ -28,141 +22,6 @@ fn user_layer(path: AbsolutePathBuf, config: &str) -> ConfigLayerEntry {
         },
         toml::from_str(config).expect("user config toml"),
     )
-}
-
-fn ordered_test_plugin(config_name: &str, mcp_server: &str) -> LoadedPlugin<String> {
-    LoadedPlugin {
-        config_name: config_name.to_string(),
-        manifest_name: Some(config_name.to_string()),
-        plugin_namespace: Some(config_name.to_string()),
-        manifest_description: Some(format!("{config_name} prompt")),
-        root: AbsolutePathBuf::from_absolute_path(std::env::temp_dir().join(config_name))
-            .expect("absolute plugin root"),
-        enabled: true,
-        skill_roots: Vec::new(),
-        disabled_skill_paths: HashSet::new(),
-        has_enabled_skills: true,
-        mcp_servers: HashMap::from([
-            ("app".to_string(), format!("{config_name}-legacy-app-route")),
-            ("shared".to_string(), mcp_server.to_string()),
-        ]),
-        apps: vec![AppDeclaration {
-            name: "app".to_string(),
-            connector_id: AppConnectorId(format!("connector_{config_name}")),
-            category: None,
-        }],
-        hook_sources: Vec::new(),
-        hook_load_warnings: Vec::new(),
-        error: None,
-    }
-}
-
-#[tokio::test]
-async fn reverse_completion_preserves_plugin_conflict_prompt_and_router_order() {
-    let (alpha_tx, alpha_rx) = oneshot::channel();
-    let (beta_tx, beta_rx) = oneshot::channel();
-    let (alpha_started_tx, alpha_started_rx) = oneshot::channel();
-    let (beta_started_tx, beta_started_rx) = oneshot::channel();
-    let (alpha_done_tx, alpha_done_rx) = oneshot::channel();
-    let (beta_done_tx, beta_done_rx) = oneshot::channel();
-    let completion_order = Arc::new(Mutex::new(Vec::new()));
-    let job_completion_order = Arc::clone(&completion_order);
-    let jobs = vec![
-        (
-            "alpha",
-            "alpha-route",
-            alpha_started_tx,
-            alpha_rx,
-            alpha_done_tx,
-        ),
-        (
-            "beta",
-            "beta-route",
-            beta_started_tx,
-            beta_rx,
-            beta_done_tx,
-        ),
-    ]
-    .into_iter()
-    .map(move |(config_name, mcp_server, started, release, done)| {
-        let completion_order = Arc::clone(&job_completion_order);
-        async move {
-            started.send(()).expect("mark plugin started");
-            release.await.expect("release plugin");
-            completion_order
-                .lock()
-                .expect("completion order")
-                .push(config_name);
-            done.send(()).expect("mark plugin complete");
-            ordered_test_plugin(config_name, mcp_server)
-        }
-    });
-    let load = tokio::spawn(collect_bounded_in_order(jobs, /*concurrency*/ 2));
-    alpha_started_rx.await.expect("alpha started");
-    beta_started_rx.await.expect("beta started");
-    beta_tx.send(()).expect("release beta");
-    beta_done_rx.await.expect("beta complete");
-    alpha_tx.send(()).expect("release alpha");
-    alpha_done_rx.await.expect("alpha complete");
-    let mut plugins = load.await.expect("join ordered load");
-
-    assert_eq!(
-        completion_order.lock().expect("completion order").as_slice(),
-        &["beta", "alpha"]
-    );
-    assert_eq!(
-        plugins
-            .iter()
-            .map(|plugin| plugin.config_name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["alpha", "beta"]
-    );
-    for plugin in &mut plugins {
-        crate::app_mcp_routing::apply_app_mcp_routing_policy(
-            &mut plugin.apps,
-            &mut plugin.mcp_servers,
-            Some(AuthMode::Chatgpt),
-            /*plugin_active*/ true,
-        );
-    }
-    let outcome = PluginLoadOutcome::from_plugins(plugins);
-    assert_eq!(
-        outcome
-            .capability_summaries()
-            .iter()
-            .map(|summary| (
-                summary.config_name.clone(),
-                summary.description.clone(),
-                summary.mcp_server_names.clone(),
-                summary.app_connector_ids.clone(),
-            ))
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                "alpha".to_string(),
-                Some("alpha prompt".to_string()),
-                vec!["shared".to_string()],
-                vec![AppConnectorId("connector_alpha".to_string())],
-            ),
-            (
-                "beta".to_string(),
-                Some("beta prompt".to_string()),
-                vec!["shared".to_string()],
-                vec![AppConnectorId("connector_beta".to_string())],
-            ),
-        ]
-    );
-    assert_eq!(
-        outcome.effective_mcp_servers(),
-        HashMap::from([("shared".to_string(), "alpha-route".to_string())])
-    );
-    assert_eq!(
-        outcome.effective_apps(),
-        vec![
-            AppConnectorId("connector_alpha".to_string()),
-            AppConnectorId("connector_beta".to_string()),
-        ]
-    );
 }
 
 #[test]

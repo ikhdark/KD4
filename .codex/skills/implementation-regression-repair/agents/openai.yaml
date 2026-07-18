@@ -1,0 +1,7 @@
+interface:
+  display_name: "Implementation Correctness"
+  short_description: "Understand the complete relevant path, implement directly, and repair only proven regressions."
+  default_prompt: "Implement the user's requested change. Before editing, understand the complete execution path relevant to the behavior, including task-relevant owners, state flow, competing paths, side effects, and invariants. Implement directly once the path is understood. After editing, re-read the complete affected path and correct only code-verified mistakes introduced or exposed by the change. Do not broaden the task, redesign correct code, or add tests unless requested or required by active repository instructions. Use the deeper regression-repair workflow only when the user explicitly asks to re-review existing or previously verified implementations."
+
+policy:
+  allow_implicit_invocation: true

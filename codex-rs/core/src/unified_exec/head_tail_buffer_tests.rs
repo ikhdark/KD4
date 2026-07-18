@@ -53,7 +53,6 @@ fn draining_resets_bytes_but_preserves_cumulative_loss_accounting() {
     assert_eq!(buf.omitted_bytes(), 2);
     assert_eq!(buf.take_unreported_omitted_bytes(), 2);
     assert_eq!(buf.take_unreported_omitted_bytes(), 0);
-    assert_eq!(buf.take_unreported_omitted_lines(), 0);
     assert_eq!(buf.omitted_bytes(), 2);
     assert_eq!(buf.lagged_chunks(), 3);
     assert_eq!(buf.take_unreported_lagged_chunks(), 3);
@@ -95,102 +94,4 @@ fn fills_head_then_tail_across_multiple_chunks() {
     buf.push_chunk(b"a".to_vec());
     assert_eq!(buf.to_bytes(), b"012346789a".to_vec());
     assert_eq!(buf.omitted_bytes(), 1);
-}
-
-#[test]
-fn one_byte_chunks_use_bounded_storage_and_preserve_exact_head_and_tail() {
-    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 1_024);
-
-    for index in 0..100_000_u32 {
-        buf.push_chunk(vec![(index % 251) as u8]);
-    }
-
-    let retained = buf.to_bytes();
-    let expected_head = (0..512_u32)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
-    let expected_tail = (100_000_u32 - 512..100_000_u32)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
-    assert_eq!(buf.retained_bytes(), 1_024);
-    assert_eq!(buf.omitted_bytes(), 100_000 - 1_024);
-    assert_eq!(&retained[..512], expected_head);
-    assert_eq!(&retained[512..], expected_tail);
-    assert!(buf.snapshot_chunks().len() <= super::MAX_RETAINED_CHUNKS);
-}
-
-#[test]
-fn circular_tail_wraps_across_both_storage_segments() {
-    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 10);
-    buf.push_chunk(b"0123456789".to_vec());
-    buf.push_chunk(b"abc".to_vec());
-    buf.push_chunk(b"defg".to_vec());
-
-    assert_eq!(buf.to_bytes(), b"01234cdefg".to_vec());
-    assert_eq!(buf.omitted_bytes(), 7);
-}
-
-#[test]
-fn rendered_marker_reserves_its_actual_length_and_preserves_head_and_tail() {
-    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 100);
-    buf.push_chunk([vec![b'H'; 100], vec![b'T'; 100]].concat());
-
-    let rendered = buf.render_bytes();
-
-    assert_eq!(rendered.len(), 100);
-    assert!(rendered.starts_with(b"H"));
-    assert!(rendered.ends_with(b"T"));
-    let text = String::from_utf8(rendered).expect("marker is UTF-8");
-    assert_eq!(text.matches("output truncated").count(), 1);
-}
-
-#[test]
-fn rendered_marker_reports_exact_omitted_bytes_and_line_breaks() {
-    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 160);
-    let output = (0..80)
-        .map(|index| format!("line-{index:02}\n"))
-        .collect::<String>();
-    buf.push_chunk(output.into_bytes());
-
-    let rendered = String::from_utf8(buf.render_bytes()).expect("rendered output");
-
-    assert!(buf.omitted_bytes() > 0);
-    assert!(buf.omitted_lines() > 0);
-    assert!(rendered.contains(" byte(s) and "));
-    assert!(rendered.contains(" line break(s) omitted"));
-}
-
-#[test]
-fn rendered_marker_uses_only_its_prefix_when_the_cap_is_tiny() {
-    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 8);
-    buf.push_chunk(b"0123456789".to_vec());
-
-    assert_eq!(buf.render_bytes(), b"\n[output".to_vec());
-}
-
-#[test]
-fn rendered_output_without_evidence_is_exact() {
-    let mut buf = HeadTailBuffer::new(/*max_bytes*/ 64);
-    buf.push_chunk(b"exact output".to_vec());
-
-    assert_eq!(buf.render_bytes(), b"exact output".to_vec());
-}
-
-#[test]
-fn recovery_evidence_is_shared_and_reported_once_per_buffer() {
-    let evidence = std::sync::Arc::new(std::sync::Mutex::new(Default::default()));
-    let mut first = HeadTailBuffer::new_with_recovery_evidence(128, evidence.clone());
-    let second = HeadTailBuffer::new_with_recovery_evidence(128, evidence);
-
-    assert!(first.record_recovery_detail("missing sequences 2-4, 8-9".to_string()));
-    assert_eq!(
-        first.take_unreported_recovery_detail().as_deref(),
-        Some("missing sequences 2-4, 8-9")
-    );
-    assert_eq!(first.take_unreported_recovery_detail(), None);
-    assert!(
-        String::from_utf8(second.render_bytes())
-            .expect("rendered output")
-            .contains("missing sequences 2-4, 8-9")
-    );
 }

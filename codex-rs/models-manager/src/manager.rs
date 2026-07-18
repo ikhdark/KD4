@@ -13,17 +13,12 @@ use codex_protocol::openai_models::ModelVisibility;
 use codex_protocol::openai_models::ModelsResponse;
 use std::fmt;
 use std::future::Future;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::sync::TryLockError;
-use tokio::sync::watch;
 use tracing::Instrument as _;
 use tracing::error;
 use tracing::info;
@@ -94,43 +89,16 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     ) -> ModelsManagerFuture<'_, Vec<ModelPreset>> {
         Box::pin(
             async move {
-                self.list_models_snapshot(refresh_strategy, http_client_factory)
-                    .await
-                    .as_ref()
-                    .to_vec()
+                let catalog = self
+                    .raw_model_catalog(refresh_strategy, http_client_factory)
+                    .await;
+                self.build_available_models(catalog.models)
             }
             .instrument(tracing::info_span!(
                 "list_models",
                 refresh_strategy = %refresh_strategy
             )),
         )
-    }
-
-    /// Return the picker-ready models in the immutable catalog snapshot.
-    fn list_models_snapshot(
-        &self,
-        refresh_strategy: RefreshStrategy,
-        http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, Arc<[ModelPreset]>> {
-        Box::pin(async move {
-            self.catalog_snapshot(refresh_strategy, http_client_factory)
-                .await
-                .available_models(self.uses_codex_backend())
-        })
-    }
-
-    /// Return one immutable catalog generation after applying the requested refresh policy.
-    fn catalog_snapshot(
-        &self,
-        refresh_strategy: RefreshStrategy,
-        http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, Arc<ModelCatalogSnapshot>> {
-        Box::pin(async move {
-            let catalog = self
-                .raw_model_catalog(refresh_strategy, http_client_factory)
-                .await;
-            Arc::new(ModelCatalogSnapshot::new(0, catalog.models, None))
-        })
     }
 
     /// Return the active raw model catalog, refreshing according to the specified strategy.
@@ -148,32 +116,22 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     /// Returns an error if the internal lock cannot be acquired.
     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError>;
 
-    /// Return the current immutable, indexed catalog snapshot.
-    fn current_catalog_snapshot(&self) -> ModelsManagerFuture<'_, Arc<ModelCatalogSnapshot>> {
-        Box::pin(async move {
-            Arc::new(ModelCatalogSnapshot::new(
-                0,
-                self.get_remote_models().await,
-                None,
-            ))
-        })
-    }
-
-    /// Attempt to return the current immutable catalog snapshot without blocking.
-    fn try_current_catalog_snapshot(&self) -> Result<Arc<ModelCatalogSnapshot>, TryLockError> {
-        Ok(Arc::new(ModelCatalogSnapshot::new(
-            0,
-            self.try_get_remote_models()?,
-            None,
-        )))
-    }
-
     /// Return the auth manager used for picker filtering.
     fn auth_manager(&self) -> Option<&AuthManager>;
 
     /// Build picker-ready presets from the active catalog snapshot.
-    fn build_available_models(&self, remote_models: Vec<ModelInfo>) -> Vec<ModelPreset> {
-        build_available_models_for_auth(remote_models, self.uses_codex_backend())
+    fn build_available_models(&self, mut remote_models: Vec<ModelInfo>) -> Vec<ModelPreset> {
+        remote_models.sort_by_key(|model| model.priority);
+
+        let mut presets: Vec<ModelPreset> = remote_models.into_iter().map(Into::into).collect();
+        let uses_codex_backend = self
+            .auth_manager()
+            .is_some_and(AuthManager::current_auth_uses_codex_backend);
+        presets = ModelPreset::filter_by_auth(presets, uses_codex_backend);
+
+        ModelPreset::mark_default_by_picker_visibility(&mut presets);
+
+        presets
     }
 
     /// List collaboration mode presets.
@@ -185,13 +143,8 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     ///
     /// Returns an error if the internal lock cannot be acquired.
     fn try_list_models(&self) -> Result<Vec<ModelPreset>, TryLockError> {
-        Ok(self.try_list_models_snapshot()?.as_ref().to_vec())
-    }
-
-    /// Attempt to share picker-ready models from the current catalog snapshot.
-    fn try_list_models_snapshot(&self) -> Result<Arc<[ModelPreset]>, TryLockError> {
-        let snapshot = self.try_current_catalog_snapshot()?;
-        Ok(snapshot.available_models(self.uses_codex_backend()))
+        let remote_models = self.try_get_remote_models()?;
+        Ok(self.build_available_models(remote_models))
     }
 
     // todo(aibrahim): should be visible to core only and sent on session_configured event
@@ -235,31 +188,21 @@ pub trait ModelsManager: fmt::Debug + Send + Sync {
     ) -> ModelsManagerFuture<'a, ModelInfo> {
         Box::pin(
             async move {
-                self.current_catalog_snapshot().await.model_info(model, config)
+                let remote_models = self.get_remote_models().await;
+                construct_model_info_from_candidates(model, &remote_models, config)
             }
             .instrument(tracing::info_span!("get_model_info", model = model)),
         )
     }
 
-    fn uses_codex_backend(&self) -> bool {
-        self.auth_manager()
-            .is_some_and(AuthManager::current_auth_uses_codex_backend)
-    }
-
-    /// Enqueue a catalog refresh if the provided ETag differs from the cached ETag.
+    /// Refresh models if the provided ETag differs from the cached ETag.
     ///
-    /// Implementations must return without waiting for network or cache I/O. Async catalog reads
-    /// started after this call observe the queued refresh through [`Self::refresh_barrier`].
-    fn enqueue_refresh_if_new_etag(
-        self: Arc<Self>,
+    /// Uses `Online` strategy to fetch latest models when ETags differ.
+    fn refresh_if_new_etag(
+        &self,
         etag: String,
         http_client_factory: HttpClientFactory,
-    );
-
-    /// Wait until every ETag refresh queued before this call has either published or failed.
-    fn refresh_barrier(&self) -> ModelsManagerFuture<'_, ()> {
-        Box::pin(async {})
-    }
+    ) -> ModelsManagerFuture<'_, ()>;
 }
 
 pub type ModelsManagerFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -267,129 +210,20 @@ pub type ModelsManagerFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a
 /// Shared model manager handle used across runtime services.
 pub type SharedModelsManager = Arc<dyn ModelsManager>;
 
-/// Immutable, indexed model catalog published as one atomic generation.
-#[derive(Debug)]
-pub struct ModelCatalogSnapshot {
-    generation: u64,
-    models: Arc<[ModelInfo]>,
-    etag: Option<String>,
-    exact_model_index: HashMap<String, usize>,
-    codex_backend_presets: Arc<[ModelPreset]>,
-    api_presets: Arc<[ModelPreset]>,
-}
-
-impl ModelCatalogSnapshot {
-    fn new(generation: u64, models: Vec<ModelInfo>, etag: Option<String>) -> Self {
-        let exact_model_index = models
-            .iter()
-            .enumerate()
-            .map(|(index, model)| (model.slug.clone(), index))
-            .collect();
-        let codex_backend_presets = Arc::from(build_available_models_for_auth(
-            models.clone(),
-            /*uses_codex_backend*/ true,
-        ));
-        let api_presets = Arc::from(build_available_models_for_auth(
-            models.clone(),
-            /*uses_codex_backend*/ false,
-        ));
-        Self {
-            generation,
-            models: Arc::from(models),
-            etag,
-            exact_model_index,
-            codex_backend_presets,
-            api_presets,
-        }
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub fn models(&self) -> &[ModelInfo] {
-        self.models.as_ref()
-    }
-
-    pub fn etag(&self) -> Option<&str> {
-        self.etag.as_deref()
-    }
-
-    pub fn available_models(&self, uses_codex_backend: bool) -> Arc<[ModelPreset]> {
-        if uses_codex_backend {
-            Arc::clone(&self.codex_backend_presets)
-        } else {
-            Arc::clone(&self.api_presets)
-        }
-    }
-
-    pub fn model_info(&self, model: &str, config: &ModelsManagerConfig) -> ModelInfo {
-        let remote = self
-            .exact_model_index
-            .get(model)
-            .and_then(|index| self.models.get(*index))
-            .cloned()
-            .or_else(|| find_model_by_longest_prefix(model, &self.models))
-            .or_else(|| find_model_by_namespaced_suffix(model, &self.models));
-        let model_info = if let Some(remote) = remote {
-            ModelInfo {
-                slug: model.to_string(),
-                used_fallback_model_metadata: false,
-                ..remote
-            }
-        } else {
-            model_info::model_info_from_slug(model)
-        };
-        model_info::with_config_overrides(model_info, config)
-    }
-}
-
 /// OpenAI-compatible model manager backed by bundled models, cache, and `/models`.
 #[derive(Debug)]
 pub struct OpenAiModelsManager {
-    catalog: RwLock<Arc<ModelCatalogSnapshot>>,
-    catalog_generation: AtomicU64,
+    remote_models: RwLock<Vec<ModelInfo>>,
+    etag: RwLock<Option<String>>,
     cache_manager: ModelsCacheManager,
     endpoint_client: SharedModelsEndpointClient,
     auth_manager: Option<Arc<AuthManager>>,
-    refresh_coordinator: ModelRefreshCoordinator,
-    refresh_execution: tokio::sync::Mutex<()>,
-}
-
-#[derive(Debug)]
-struct ModelRefreshCoordinator {
-    state: Mutex<ModelRefreshCoordinatorState>,
-    completed_generation: watch::Sender<u64>,
-}
-
-#[derive(Debug, Default)]
-struct ModelRefreshCoordinatorState {
-    next_generation: u64,
-    worker_running: bool,
-    active: Option<(u64, String)>,
-    pending: Option<PendingModelRefresh>,
-}
-
-struct PendingModelRefresh {
-    generation: u64,
-    etag: String,
-    http_client_factory: HttpClientFactory,
-}
-
-impl fmt::Debug for PendingModelRefresh {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PendingModelRefresh")
-            .field("generation", &self.generation)
-            .field("etag", &self.etag)
-            .finish_non_exhaustive()
-    }
 }
 
 /// Static model manager backed by an authoritative in-process catalog.
 #[derive(Debug)]
 pub struct StaticModelsManager {
-    catalog: Arc<ModelCatalogSnapshot>,
+    remote_models: Vec<ModelInfo>,
     auth_manager: Option<Arc<AuthManager>>,
 }
 
@@ -403,22 +237,12 @@ impl OpenAiModelsManager {
         let cache_path = codex_home.join(MODEL_CACHE_FILE);
         let cache_manager = ModelsCacheManager::new(cache_path, DEFAULT_MODEL_CACHE_TTL);
         let remote_models = load_remote_models_from_file().unwrap_or_default();
-        let (completed_generation, _) = watch::channel(0);
         Self {
-            catalog: RwLock::new(Arc::new(ModelCatalogSnapshot::new(
-                0,
-                remote_models,
-                None,
-            ))),
-            catalog_generation: AtomicU64::new(0),
+            remote_models: RwLock::new(remote_models),
+            etag: RwLock::new(None),
             cache_manager,
             endpoint_client,
             auth_manager,
-            refresh_coordinator: ModelRefreshCoordinator {
-                state: Mutex::new(ModelRefreshCoordinatorState::default()),
-                completed_generation,
-            },
-            refresh_execution: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -427,33 +251,13 @@ impl StaticModelsManager {
     /// Construct a static model manager from an authoritative catalog.
     pub fn new(auth_manager: Option<Arc<AuthManager>>, model_catalog: ModelsResponse) -> Self {
         Self {
-            catalog: Arc::new(ModelCatalogSnapshot::new(0, model_catalog.models, None)),
+            remote_models: model_catalog.models,
             auth_manager,
         }
     }
 }
 
 impl ModelsManager for OpenAiModelsManager {
-    fn catalog_snapshot(
-        &self,
-        refresh_strategy: RefreshStrategy,
-        http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, Arc<ModelCatalogSnapshot>> {
-        Box::pin(self.refresh_catalog_snapshot(refresh_strategy, http_client_factory))
-    }
-
-    fn list_models_snapshot(
-        &self,
-        refresh_strategy: RefreshStrategy,
-        http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, Arc<[ModelPreset]>> {
-        Box::pin(async move {
-            self.refresh_catalog_snapshot(refresh_strategy, http_client_factory)
-                .await
-                .available_models(self.uses_codex_backend())
-        })
-    }
-
     fn raw_model_catalog(
         &self,
         refresh_strategy: RefreshStrategy,
@@ -467,22 +271,11 @@ impl ModelsManager for OpenAiModelsManager {
     }
 
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
-        Box::pin(async move { self.current_catalog_snapshot().await.models().to_vec() })
+        Box::pin(async move { self.remote_models.read().await.clone() })
     }
 
     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
-        Ok(self.try_current_catalog_snapshot()?.models().to_vec())
-    }
-
-    fn current_catalog_snapshot(&self) -> ModelsManagerFuture<'_, Arc<ModelCatalogSnapshot>> {
-        Box::pin(async move {
-            self.wait_for_refresh_barrier().await;
-            Arc::clone(&*self.catalog.read().await)
-        })
-    }
-
-    fn try_current_catalog_snapshot(&self) -> Result<Arc<ModelCatalogSnapshot>, TryLockError> {
-        Ok(Arc::clone(&*self.catalog.try_read()?))
+        Ok(self.remote_models.try_read()?.clone())
     }
 
     fn auth_manager(&self) -> Option<&AuthManager> {
@@ -493,150 +286,37 @@ impl ModelsManager for OpenAiModelsManager {
         builtin_collaboration_mode_presets()
     }
 
-    fn enqueue_refresh_if_new_etag(
-        self: Arc<Self>,
+    fn refresh_if_new_etag(
+        &self,
         etag: String,
         http_client_factory: HttpClientFactory,
-    ) {
-        self.enqueue_model_refresh(etag, http_client_factory);
-    }
-
-    fn refresh_barrier(&self) -> ModelsManagerFuture<'_, ()> {
-        Box::pin(self.wait_for_refresh_barrier())
+    ) -> ModelsManagerFuture<'_, ()> {
+        Box::pin(OpenAiModelsManager::refresh_if_new_etag(
+            self,
+            etag,
+            http_client_factory,
+        ))
     }
 }
 
 impl OpenAiModelsManager {
-    async fn refresh_catalog_snapshot(
+    async fn raw_model_catalog(
         &self,
         refresh_strategy: RefreshStrategy,
         http_client_factory: HttpClientFactory,
-    ) -> Arc<ModelCatalogSnapshot> {
-        self.wait_for_refresh_barrier().await;
+    ) -> ModelsResponse {
         if let Err(err) = self
             .refresh_available_models(refresh_strategy, &http_client_factory)
             .await
         {
             error!("failed to refresh available models: {err}");
         }
-        Arc::clone(&*self.catalog.read().await)
-    }
-
-    async fn raw_model_catalog(
-        &self,
-        refresh_strategy: RefreshStrategy,
-        http_client_factory: HttpClientFactory,
-    ) -> ModelsResponse {
-        let snapshot = self
-            .refresh_catalog_snapshot(refresh_strategy, http_client_factory)
-            .await;
         ModelsResponse {
-            models: snapshot.models().to_vec(),
+            models: self.get_remote_models().await,
         }
     }
 
-    fn enqueue_model_refresh(
-        self: Arc<Self>,
-        etag: String,
-        http_client_factory: HttpClientFactory,
-    ) {
-        let should_start_worker = {
-            let mut state = self
-                .refresh_coordinator
-                .state
-                .lock()
-                .expect("model refresh coordinator lock should not be poisoned");
-            if let Some(pending) = state.pending.as_mut()
-                && pending.etag == etag
-            {
-                pending.http_client_factory = http_client_factory;
-                return;
-            }
-            if state
-                .active
-                .as_ref()
-                .is_some_and(|(_, active_etag)| active_etag == &etag)
-                && state.pending.is_none()
-            {
-                return;
-            }
-
-            state.next_generation = state
-                .next_generation
-                .checked_add(1)
-                .expect("model refresh generation should not overflow");
-            let generation = state.next_generation;
-            state.pending = Some(PendingModelRefresh {
-                generation,
-                etag,
-                http_client_factory,
-            });
-            if state.worker_running {
-                false
-            } else {
-                state.worker_running = true;
-                true
-            }
-        };
-
-        if should_start_worker {
-            tokio::spawn(async move {
-                self.run_model_refresh_worker().await;
-            });
-        }
-    }
-
-    async fn run_model_refresh_worker(self: Arc<Self>) {
-        loop {
-            let refresh = {
-                let mut state = self
-                    .refresh_coordinator
-                    .state
-                    .lock()
-                    .expect("model refresh coordinator lock should not be poisoned");
-                let Some(refresh) = state.pending.take() else {
-                    state.worker_running = false;
-                    return;
-                };
-                state.active = Some((refresh.generation, refresh.etag.clone()));
-                refresh
-            };
-
-            self.refresh_if_new_etag_now(refresh.etag, refresh.http_client_factory)
-                .await;
-
-            let _ = self
-                .refresh_coordinator
-                .completed_generation
-                .send_replace(refresh.generation);
-            self.refresh_coordinator
-                .state
-                .lock()
-                .expect("model refresh coordinator lock should not be poisoned")
-                .active = None;
-        }
-    }
-
-    async fn wait_for_refresh_barrier(&self) {
-        let target_generation = self
-            .refresh_coordinator
-            .state
-            .lock()
-            .expect("model refresh coordinator lock should not be poisoned")
-            .next_generation;
-        let mut completed = self.refresh_coordinator.completed_generation.subscribe();
-        while *completed.borrow_and_update() < target_generation {
-            if completed.changed().await.is_err() {
-                return;
-            }
-        }
-    }
-
-    async fn refresh_if_new_etag_now(
-        &self,
-        etag: String,
-        http_client_factory: HttpClientFactory,
-    ) {
+    async fn refresh_if_new_etag(&self, etag: String, http_client_factory: HttpClientFactory) {
         let current_etag = self.get_etag().await;
         if current_etag.clone().is_some() && current_etag.as_deref() == Some(etag.as_str()) {
             if let Err(err) = self.cache_manager.renew_cache_ttl().await {
@@ -658,7 +338,6 @@ impl OpenAiModelsManager {
         refresh_strategy: RefreshStrategy,
         http_client_factory: &HttpClientFactory,
     ) -> CoreResult<()> {
-        let _refresh_guard = self.refresh_execution.lock().await;
         if !self.should_refresh_models().await {
             if matches!(
                 refresh_strategy,
@@ -700,8 +379,8 @@ impl OpenAiModelsManager {
             .endpoint_client
             .list_models(&client_version, http_client_factory.clone())
             .await?;
-        let published_models = self.merge_remote_models(models.clone());
-        self.publish_catalog(published_models, etag.clone()).await;
+        self.apply_remote_models(models.clone()).await;
+        *self.etag.write().await = etag.clone();
         self.cache_manager
             .persist_cache(&models, etag, client_version)
             .await;
@@ -713,31 +392,11 @@ impl OpenAiModelsManager {
     }
 
     async fn get_etag(&self) -> Option<String> {
-        self.catalog.read().await.etag.clone()
+        self.etag.read().await.clone()
     }
 
-    async fn publish_catalog(
-        &self,
-        models: Vec<ModelInfo>,
-        etag: Option<String>,
-    ) -> Arc<ModelCatalogSnapshot> {
-        {
-            let current = self.catalog.read().await;
-            if current.models() == models.as_slice() && current.etag() == etag.as_deref() {
-                return Arc::clone(&current);
-            }
-        }
-        let generation = self
-            .catalog_generation
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
-        let snapshot = Arc::new(ModelCatalogSnapshot::new(generation, models, etag));
-        *self.catalog.write().await = Arc::clone(&snapshot);
-        snapshot
-    }
-
-    /// Merge fetched models into the bundled catalog before atomically publishing the snapshot.
-    fn merge_remote_models(&self, models: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    /// Replace the cached remote models and rebuild the derived presets list.
+    async fn apply_remote_models(&self, models: Vec<ModelInfo>) {
         // Use the remote models list as the source of truth if it contains at least one
         // non-hidden model and the user is using ChatGPT auth.
         let should_use_remote_models_only = !models.is_empty()
@@ -750,7 +409,8 @@ impl OpenAiModelsManager {
                     .is_some_and(AuthMode::has_chatgpt_account)
             });
         if should_use_remote_models_only {
-            return models;
+            *self.remote_models.write().await = models;
+            return;
         }
 
         let mut existing_models = load_remote_models_from_file().unwrap_or_default();
@@ -764,7 +424,7 @@ impl OpenAiModelsManager {
                 existing_models.push(model);
             }
         }
-        existing_models
+        *self.remote_models.write().await = existing_models;
     }
 
     /// Attempt to satisfy the refresh from the cache when it matches the provider and TTL.
@@ -783,9 +443,8 @@ impl OpenAiModelsManager {
             }
         };
         let models = cache.models.clone();
-        let published_models = self.merge_remote_models(models.clone());
-        self.publish_catalog(published_models, cache.etag.clone())
-            .await;
+        *self.etag.write().await = cache.etag.clone();
+        self.apply_remote_models(models.clone()).await;
         info!(
             models_count = models.len(),
             etag = ?cache.etag,
@@ -796,22 +455,6 @@ impl OpenAiModelsManager {
 }
 
 impl ModelsManager for StaticModelsManager {
-    fn catalog_snapshot(
-        &self,
-        _refresh_strategy: RefreshStrategy,
-        _http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, Arc<ModelCatalogSnapshot>> {
-        Box::pin(async { Arc::clone(&self.catalog) })
-    }
-
-    fn list_models_snapshot(
-        &self,
-        _refresh_strategy: RefreshStrategy,
-        _http_client_factory: HttpClientFactory,
-    ) -> ModelsManagerFuture<'_, Arc<[ModelPreset]>> {
-        Box::pin(async { self.catalog.available_models(self.uses_codex_backend()) })
-    }
-
     fn get_default_model<'a>(
         &'a self,
         model: &'a Option<String>,
@@ -861,19 +504,11 @@ impl ModelsManager for StaticModelsManager {
     }
 
     fn get_remote_models(&self) -> ModelsManagerFuture<'_, Vec<ModelInfo>> {
-        Box::pin(async { self.catalog.models().to_vec() })
+        Box::pin(async { self.remote_models.clone() })
     }
 
     fn try_get_remote_models(&self) -> Result<Vec<ModelInfo>, TryLockError> {
-        Ok(self.catalog.models().to_vec())
-    }
-
-    fn current_catalog_snapshot(&self) -> ModelsManagerFuture<'_, Arc<ModelCatalogSnapshot>> {
-        Box::pin(async { Arc::clone(&self.catalog) })
-    }
-
-    fn try_current_catalog_snapshot(&self) -> Result<Arc<ModelCatalogSnapshot>, TryLockError> {
-        Ok(Arc::clone(&self.catalog))
+        Ok(self.remote_models.clone())
     }
 
     fn auth_manager(&self) -> Option<&AuthManager> {
@@ -884,27 +519,17 @@ impl ModelsManager for StaticModelsManager {
         builtin_collaboration_mode_presets()
     }
 
-    fn enqueue_refresh_if_new_etag(
-        self: Arc<Self>,
+    fn refresh_if_new_etag(
+        &self,
         _etag: String,
         _http_client_factory: HttpClientFactory,
-    ) {
+    ) -> ModelsManagerFuture<'_, ()> {
+        Box::pin(async {})
     }
 }
 
 fn load_remote_models_from_file() -> Result<Vec<ModelInfo>, std::io::Error> {
     Ok(crate::bundled_models_response()?.models)
-}
-
-fn build_available_models_for_auth(
-    mut remote_models: Vec<ModelInfo>,
-    uses_codex_backend: bool,
-) -> Vec<ModelPreset> {
-    remote_models.sort_by_key(|model| model.priority);
-    let presets = remote_models.into_iter().map(Into::into).collect();
-    let mut presets = ModelPreset::filter_by_auth(presets, uses_codex_backend);
-    ModelPreset::mark_default_by_picker_visibility(&mut presets);
-    presets
 }
 
 fn default_model_from_available(available: Vec<ModelPreset>) -> String {

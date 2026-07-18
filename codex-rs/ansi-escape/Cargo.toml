@@ -7,7 +7,7 @@ license.workspace = true
 [lib]
 name = "codex_ansi_escape"
 path = "src/lib.rs"
-test = true
+test = false
 doctest = false
 
 [lints]

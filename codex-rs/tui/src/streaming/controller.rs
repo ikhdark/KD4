@@ -31,8 +31,7 @@
 //!
 //! - `emitted_stable_len <= enqueued_stable_len <= rendered_lines.len()`.
 //! - `raw_source` is append-only until `reset()`; never modified mid-stream.
-//! - The committed tail starts at `enqueued_stable_len`; the bounded provisional partial suffix
-//!   follows it and never enters the stable queue.
+//! - Tail starts exactly at `enqueued_stable_len`.
 //! - During confirmed table streaming, only lines from the table header onward
 //!   are forced into tail; pre-table lines may remain stable.
 
@@ -58,18 +57,6 @@ use super::table_holdback::TableHoldbackState;
 #[cfg(test)]
 use super::table_holdback::table_holdback_state;
 
-/// Maximum delay between provisional renders of one unterminated source line.
-///
-/// The first suffix is rendered immediately; only follow-up mutations are coalesced, and the
-/// commit animation tick wakes the controller again within the next frame.
-const LIVE_PARTIAL_RENDER_DEBOUNCE: Duration = Duration::from_millis(16);
-
-/// Maximum raw source bytes reparsed for one mutable streaming Markdown window.
-const MUTABLE_MARKDOWN_SOURCE_MAX_BYTES: usize = 16 * 1024;
-
-/// Maximum rendered rows retained in the replaceable provisional tail.
-const LIVE_PARTIAL_MAX_RENDERED_LINES: usize = 64;
-
 // ---------------------------------------------------------------------------
 // StreamCore — shared bookkeeping for both stream controllers
 // ---------------------------------------------------------------------------
@@ -89,7 +76,7 @@ struct StreamCore {
     width: Option<usize>,
     /// Accumulated raw markdown source for the current stream.
     raw_source: String,
-    /// Retained completed render plus the bounded mutable suffix at `width`.
+    /// Full re-render of `raw_source` at `width`. Rebuilt on every committed delta.
     rendered_lines: Vec<HyperlinkLine>,
     /// Lines enqueued into the commit-animation queue.
     enqueued_stable_len: usize,
@@ -102,21 +89,6 @@ struct StreamCore {
     stable_prefix_len_cache: Option<StablePrefixLenCache>,
     /// Incremental holdback scanner state for append-only source updates.
     holdback_scanner: TableHoldbackScanner,
-    /// Bounded provisional render of the collector's unterminated source suffix.
-    live_partial_lines: Vec<HyperlinkLine>,
-    /// Whether a follow-up partial render is waiting for the debounce boundary.
-    live_partial_dirty: bool,
-    /// Timestamp of the most recent provisional suffix render.
-    last_live_partial_render_at: Option<Instant>,
-    /// Byte offset where the currently replaceable completed-source render begins.
-    mutable_source_start: usize,
-    /// Rendered-line offset corresponding to `mutable_source_start`.
-    mutable_render_start: usize,
-    /// Earliest rendered row that must remain out of the stable queue after a bounded rotation.
-    forced_tail_render_start: Option<usize>,
-    /// Largest completed-source window parsed by the incremental streaming path.
-    #[cfg(test)]
-    max_streaming_render_source_len: usize,
 }
 
 struct StablePrefixLenCache {
@@ -144,56 +116,32 @@ impl StreamCore {
             render_mode,
             stable_prefix_len_cache: None,
             holdback_scanner: TableHoldbackScanner::new(),
-            live_partial_lines: Vec::new(),
-            live_partial_dirty: false,
-            last_live_partial_render_at: None,
-            mutable_source_start: 0,
-            mutable_render_start: 0,
-            forced_tail_render_start: None,
-            #[cfg(test)]
-            max_streaming_render_source_len: 0,
         }
     }
 
     /// Push a streaming delta and enqueue any newly-stable rendered lines.
     ///
-    /// Only newline-terminated source is committed into canonical `raw_source`. The collector's
-    /// unterminated suffix is rendered separately as a bounded, replaceable live tail so it can be
-    /// shown immediately without entering the stable queue.
+    /// Only newline-terminated source is committed into `raw_source`. This is
+    /// important for tables because an unterminated partial row must stay out
+    /// of both the stable queue and the live tail until its structure is
+    /// unambiguous; otherwise the user can briefly see malformed columns that
+    /// immediately disappear on the next delta.
     fn push_delta(&mut self, delta: &str) -> bool {
-        self.push_delta_at(delta, Instant::now())
-    }
-
-    fn push_delta_at(&mut self, delta: &str, now: Instant) -> bool {
-        let received_delta = !delta.is_empty();
-        if received_delta {
+        if !delta.is_empty() {
             self.state.has_seen_delta = true;
         }
         self.state.collector.push_delta(delta);
 
         let mut enqueued = false;
-        let mut committed_source = false;
         if delta.contains('\n')
-            && let Some(source) = self.state.collector.commit_complete_source()
+            && let Some(committed_source) = self.state.collector.commit_complete_source()
         {
-            let previous_source_len = self.raw_source.len();
-            self.raw_source.push_str(&source);
-            self.holdback_scanner.push_source_chunk(&source);
-            self.recompute_streaming_render(previous_source_len);
+            self.raw_source.push_str(&committed_source);
+            self.holdback_scanner.push_source_chunk(&committed_source);
+            self.recompute_streaming_render();
             enqueued = self.sync_stable_queue();
-            committed_source = true;
         }
-
-        if received_delta {
-            self.live_partial_dirty = true;
-            let first_partial_render = self.last_live_partial_render_at.is_none();
-            self.refresh_live_partial(now, committed_source || first_partial_render);
-        }
-
-        // A non-empty delta either changed the provisional tail immediately or left it dirty for
-        // the next frame. In both cases the chat widget must start or keep the commit animation so
-        // the live tail becomes visible without waiting for a newline.
-        enqueued || received_delta
+        enqueued
     }
 
     /// Drain the collector, render the final source snapshot, and return lines not yet emitted.
@@ -219,7 +167,6 @@ impl StreamCore {
 
     /// Step animation: dequeue one line, update the emitted count.
     fn tick(&mut self) -> Vec<HyperlinkLine> {
-        self.refresh_live_partial(Instant::now(), /*force*/ false);
         let step = self.state.step();
         self.emitted_stable_len += step.len();
         step
@@ -227,7 +174,6 @@ impl StreamCore {
 
     /// Batch drain: dequeue up to `max_lines`, update the emitted count.
     fn tick_batch(&mut self, max_lines: usize) -> Vec<HyperlinkLine> {
-        self.refresh_live_partial(Instant::now(), /*force*/ false);
         if max_lines == 0 {
             return Vec::new();
         }
@@ -244,7 +190,7 @@ impl StreamCore {
 
     #[inline]
     fn is_idle(&self) -> bool {
-        self.state.is_idle() && !self.live_partial_dirty
+        self.state.is_idle()
     }
 
     #[inline]
@@ -263,28 +209,16 @@ impl StreamCore {
     /// of the current render snapshot that is still allowed to change without
     /// violating scrollback ordering. If callers were to derive the tail from
     /// `emitted_stable_len` instead, queued-but-not-yet-emitted lines could
-    /// reappear in the active cell and duplicate content on screen. The bounded
-    /// provisional partial render is appended after that committed tail slice.
+    /// reappear in the active cell and duplicate content on screen.
     #[inline]
     fn current_tail_lines(&self) -> Vec<HyperlinkLine> {
         let start = self.enqueued_stable_len.min(self.rendered_lines.len());
-        let bounded_start = start.max(
-            self.rendered_lines
-                .len()
-                .saturating_sub(LIVE_PARTIAL_MAX_RENDERED_LINES),
-        );
-        let mut lines = self.rendered_lines[bounded_start..].to_vec();
-        lines.extend(self.live_partial_lines.iter().cloned());
-        if lines.len() > LIVE_PARTIAL_MAX_RENDERED_LINES {
-            lines.drain(..lines.len() - LIVE_PARTIAL_MAX_RENDERED_LINES);
-        }
-        lines
+        self.rendered_lines[start..].to_vec()
     }
 
     #[inline]
     fn has_tail(&self) -> bool {
         self.enqueued_stable_len < self.rendered_lines.len()
-            || !self.state.collector.pending_source().is_empty()
     }
 
     /// Update rendering width and rebuild queued stable lines for the new layout.
@@ -304,15 +238,11 @@ impl StreamCore {
         let had_live_tail = self.has_tail();
         self.width = width;
         self.state.collector.set_width(width);
-        if !self.state.collector.pending_source().is_empty() {
-            self.live_partial_dirty = true;
-            self.refresh_live_partial(Instant::now(), /*force*/ true);
-        }
         if self.raw_source.is_empty() {
             return;
         }
 
-        self.recompute_full_render();
+        self.recompute_streaming_render();
         self.emitted_stable_len = self.emitted_stable_len.min(self.rendered_lines.len());
         if had_pending_queue
             && self.emitted_stable_len == self.rendered_lines.len()
@@ -343,16 +273,6 @@ impl StreamCore {
         self.emitted_stable_len = 0;
         self.stable_prefix_len_cache = None;
         self.holdback_scanner.reset();
-        self.live_partial_lines.clear();
-        self.live_partial_dirty = false;
-        self.last_live_partial_render_at = None;
-        self.mutable_source_start = 0;
-        self.mutable_render_start = 0;
-        self.forced_tail_render_start = None;
-        #[cfg(test)]
-        {
-            self.max_streaming_render_source_len = 0;
-        }
     }
 
     fn render_source(&self, source: &str) -> Vec<HyperlinkLine> {
@@ -366,137 +286,8 @@ impl StreamCore {
         }
     }
 
-    /// Re-render only the bounded completed-source suffix that is still allowed to change.
-    ///
-    /// Once the active source window would exceed the byte budget, the existing render is retained
-    /// as canonical completed output and the window rotates to the newly committed source. Any
-    /// output produced after that rotation remains conservatively held out of the stable queue;
-    /// finalization still performs one full canonical render from `raw_source`.
-    fn recompute_streaming_render(&mut self, previous_source_len: usize) {
-        debug_assert!(self.mutable_source_start <= previous_source_len);
-        debug_assert!(previous_source_len <= self.raw_source.len());
-
-        if self.raw_source.len().saturating_sub(self.mutable_source_start)
-            <= MUTABLE_MARKDOWN_SOURCE_MAX_BYTES
-        {
-            self.rendered_lines.truncate(self.mutable_render_start);
-            let source = self.raw_source[self.mutable_source_start..].to_string();
-            let rendered = self.render_streaming_source(&source);
-            self.rendered_lines.extend(rendered);
-            return;
-        }
-
-        let conservative_tail_start = self
-            .rendered_lines
-            .len()
-            .saturating_sub(LIVE_PARTIAL_MAX_RENDERED_LINES);
-        self.forced_tail_render_start = Some(
-            self.forced_tail_render_start
-                .map_or(conservative_tail_start, |start| {
-                    start.min(conservative_tail_start)
-                }),
-        );
-
-        // The previous completed render is already canonical for its source snapshot. Retain it
-        // byte-for-byte and rotate only the newly appended source through bounded parser windows.
-        self.mutable_source_start = previous_source_len;
-        self.mutable_render_start = self.rendered_lines.len();
-        let appended_source = self.raw_source[previous_source_len..].to_string();
-        self.append_bounded_streaming_source(previous_source_len, &appended_source);
-    }
-
-    /// Re-render the entire canonical source for explicit resize/render-mode changes.
-    fn recompute_full_render(&mut self) {
+    fn recompute_streaming_render(&mut self) {
         self.rendered_lines = self.render_source(&self.raw_source);
-        if self.raw_source.len() <= MUTABLE_MARKDOWN_SOURCE_MAX_BYTES {
-            self.mutable_source_start = 0;
-            self.mutable_render_start = 0;
-            self.forced_tail_render_start = None;
-        } else {
-            self.mutable_source_start = self.raw_source.len();
-            self.mutable_render_start = self.rendered_lines.len();
-            self.forced_tail_render_start = Some(
-                self.rendered_lines
-                    .len()
-                    .saturating_sub(LIVE_PARTIAL_MAX_RENDERED_LINES),
-            );
-        }
-    }
-
-    /// Render appended completed source in parser calls that never exceed the mutable byte budget.
-    fn append_bounded_streaming_source(&mut self, source_start: usize, source: &str) {
-        let mut consumed = 0usize;
-        while source.len().saturating_sub(consumed) > MUTABLE_MARKDOWN_SOURCE_MAX_BYTES {
-            let remaining = &source[consumed..];
-            let split = bounded_complete_source_chunk_end(remaining);
-            if split == 0 {
-                // One committed logical line exceeds the parser budget. Keep all canonical bytes
-                // in `raw_source`, but advance to a UTF-8-safe suffix so the live tail still shows
-                // the newest portion without sending an oversized input to the parser.
-                let line_end = remaining.find('\n').map_or(remaining.len(), |idx| idx + 1);
-                let mut skipped = line_end.saturating_sub(MUTABLE_MARKDOWN_SOURCE_MAX_BYTES);
-                while !remaining.is_char_boundary(skipped) {
-                    skipped += 1;
-                }
-                consumed += skipped;
-                self.mutable_source_start = source_start + consumed;
-                self.mutable_render_start = self.rendered_lines.len();
-                continue;
-            }
-
-            let rendered = self.render_streaming_source(&remaining[..split]);
-            self.rendered_lines.extend(rendered);
-            consumed += split;
-            self.mutable_source_start = source_start + consumed;
-            self.mutable_render_start = self.rendered_lines.len();
-        }
-
-        self.mutable_source_start = source_start + consumed;
-        self.mutable_render_start = self.rendered_lines.len();
-        let rendered = self.render_streaming_source(&source[consumed..]);
-        self.rendered_lines.extend(rendered);
-    }
-
-    fn render_streaming_source(&mut self, source: &str) -> Vec<HyperlinkLine> {
-        debug_assert!(source.len() <= MUTABLE_MARKDOWN_SOURCE_MAX_BYTES);
-        #[cfg(test)]
-        {
-            self.max_streaming_render_source_len =
-                self.max_streaming_render_source_len.max(source.len());
-        }
-        self.render_source(source)
-    }
-
-    /// Re-render the collector's provisional suffix when its bounded debounce permits.
-    ///
-    /// The canonical newline-stable prefix is never included in this parse. Very long
-    /// unterminated lines are clipped at a UTF-8 boundary before rendering, and only a bounded
-    /// number of rendered rows remain mutable in the active cell.
-    fn refresh_live_partial(&mut self, now: Instant, force: bool) {
-        if self.state.collector.pending_source().is_empty() {
-            self.live_partial_lines.clear();
-            self.live_partial_dirty = false;
-            self.last_live_partial_render_at = None;
-            return;
-        }
-        if !self.live_partial_dirty {
-            return;
-        }
-        let debounce_elapsed = self.last_live_partial_render_at.is_none_or(|last_render| {
-            now.saturating_duration_since(last_render) >= LIVE_PARTIAL_RENDER_DEBOUNCE
-        });
-        if !force && !debounce_elapsed {
-            return;
-        }
-
-        let source = bounded_live_partial_source(self.state.collector.pending_source()).to_string();
-        let mut rendered = self.render_streaming_source(&source);
-        if rendered.len() > LIVE_PARTIAL_MAX_RENDERED_LINES {
-            rendered.drain(..rendered.len() - LIVE_PARTIAL_MAX_RENDERED_LINES);
-        }
-        self.live_partial_lines = rendered;
-        self.live_partial_dirty = false;
-        self.last_live_partial_render_at = Some(now);
     }
 
     fn set_render_mode(&mut self, render_mode: HistoryRenderMode) {
@@ -507,15 +298,11 @@ impl StreamCore {
         let had_pending_queue = self.state.queued_len() > 0;
         let had_live_tail = self.has_tail();
         self.render_mode = render_mode;
-        if !self.state.collector.pending_source().is_empty() {
-            self.live_partial_dirty = true;
-            self.refresh_live_partial(Instant::now(), /*force*/ true);
-        }
         if self.raw_source.is_empty() {
             return;
         }
 
-        self.recompute_full_render();
+        self.recompute_streaming_render();
         self.emitted_stable_len = self.emitted_stable_len.min(self.rendered_lines.len());
         if had_pending_queue
             && self.emitted_stable_len == self.rendered_lines.len()
@@ -589,26 +376,21 @@ impl StreamCore {
     /// table region is held as tail because adding a row can reshape table
     /// column widths. For `PendingHeader`, only content from the speculative
     /// header line onward is kept mutable so earlier prose can continue
-    /// streaming. A bounded-window rotation also forces its conservative suffix
-    /// to remain mutable in both rich and raw modes. This is the core decision
-    /// point for the holdback mechanism.
+    /// streaming. When no table is detected, everything flows directly to
+    /// stable. This is the core decision point for the holdback mechanism.
     fn active_tail_budget_lines(&mut self) -> usize {
+        if self.render_mode == HistoryRenderMode::Raw {
+            return 0;
+        }
         let scan_start = Instant::now();
         let holdback_state = self.holdback_scanner.state();
-        let table_tail_budget = match self.render_mode {
-            HistoryRenderMode::Raw => 0,
-            HistoryRenderMode::Rich => match holdback_state {
-                TableHoldbackState::Confirmed { table_start: start }
-                | TableHoldbackState::PendingHeader {
-                    header_start: start,
-                } => self.tail_budget_from_source_start(start),
-                TableHoldbackState::None => 0,
-            },
+        let tail_budget = match holdback_state {
+            TableHoldbackState::Confirmed { table_start: start }
+            | TableHoldbackState::PendingHeader {
+                header_start: start,
+            } => self.tail_budget_from_source_start(start),
+            TableHoldbackState::None => 0,
         };
-        let forced_tail_budget = self.forced_tail_render_start.map_or(0, |start| {
-            self.rendered_lines.len().saturating_sub(start)
-        });
-        let tail_budget = table_tail_budget.max(forced_tail_budget);
         tracing::trace!(
             state = ?holdback_state,
             tail_budget,
@@ -651,19 +433,6 @@ impl StreamCore {
             return cache.stable_prefix_len;
         }
 
-        if source_start > MUTABLE_MARKDOWN_SOURCE_MAX_BYTES {
-            let stable_prefix_len = self
-                .forced_tail_render_start
-                .unwrap_or(self.emitted_stable_len)
-                .min(self.rendered_lines.len());
-            self.stable_prefix_len_cache = Some(StablePrefixLenCache {
-                source_start,
-                width: self.width,
-                stable_prefix_len,
-            });
-            return stable_prefix_len;
-        }
-
         let render_start = Instant::now();
         let stable_prefix_render = render_markdown_agent_with_links_and_cwd(
             &self.raw_source[..source_start.min(self.raw_source.len())],
@@ -685,32 +454,6 @@ impl StreamCore {
         });
         stable_prefix_len
     }
-}
-
-/// Return at most the configured live suffix bytes without splitting a UTF-8 scalar value.
-fn bounded_live_partial_source(source: &str) -> &str {
-    if source.len() <= MUTABLE_MARKDOWN_SOURCE_MAX_BYTES {
-        return source;
-    }
-
-    let mut start = source.len() - MUTABLE_MARKDOWN_SOURCE_MAX_BYTES;
-    while !source.is_char_boundary(start) {
-        start += 1;
-    }
-    &source[start..]
-}
-
-/// Return a newline boundary at or below the parser byte budget, or zero for an oversized line.
-fn bounded_complete_source_chunk_end(source: &str) -> usize {
-    if source.len() <= MUTABLE_MARKDOWN_SOURCE_MAX_BYTES {
-        return source.len();
-    }
-
-    let mut end = MUTABLE_MARKDOWN_SOURCE_MAX_BYTES;
-    while !source.is_char_boundary(end) {
-        end -= 1;
-    }
-    source[..end].rfind('\n').map_or(0, |idx| idx + 1)
 }
 
 /// Controller for streaming agent message content with table-aware holdback.
@@ -1145,7 +888,7 @@ mod tests {
     }
 
     #[test]
-    fn controller_live_tail_exposes_uncommitted_table_cell_immediately() {
+    fn controller_live_tail_keeps_uncommitted_table_cell_newline_gated() {
         let mut ctrl = stream_controller(Some(80));
         ctrl.push("| A | B |\n");
         ctrl.push("| --- | --- |\n");
@@ -1153,130 +896,21 @@ mod tests {
 
         let tail = hyperlink_lines_to_plain_strings(&ctrl.current_tail_lines()).join("\n");
         assert!(
-            tail.contains("partial"),
-            "expected unterminated table content in the live tail: {tail:?}",
+            !tail.contains("partial"),
+            "expected live tail to remain newline-gated: {tail:?}",
         );
     }
 
     #[test]
-    fn controller_live_tail_exposes_plain_unterminated_line_immediately() {
+    fn controller_live_tail_requires_table_holdback_state() {
         let mut ctrl = stream_controller(Some(80));
-        assert!(ctrl.push("plain text without newline"));
+        ctrl.push("plain text without newline");
 
-        let tail = hyperlink_lines_to_plain_strings(&ctrl.current_tail_lines()).join("\n");
-        assert!(tail.contains("plain text without newline"), "tail: {tail:?}");
-        assert!(ctrl.has_live_tail());
-    }
-
-    #[test]
-    fn controller_debounces_follow_up_partial_renders_to_one_frame() {
-        let mut ctrl = stream_controller(Some(80));
-        let started_at = Instant::now();
-        ctrl.core.push_delta_at("hel", started_at);
-        let first = hyperlink_lines_to_plain_strings(&ctrl.current_tail_lines()).join("\n");
-        assert!(first.contains("hel"), "first partial render: {first:?}");
-
-        assert!(ctrl.core.push_delta_at("lo", started_at + Duration::from_millis(1)));
-        let debounced = hyperlink_lines_to_plain_strings(&ctrl.current_tail_lines()).join("\n");
-        assert_eq!(debounced, first, "follow-up mutation should be coalesced");
-        assert!(!ctrl.core.is_idle(), "dirty tail must keep the frame tick alive");
-
-        ctrl.core.refresh_live_partial(
-            started_at + LIVE_PARTIAL_RENDER_DEBOUNCE,
-            /*force*/ false,
-        );
-        let refreshed = hyperlink_lines_to_plain_strings(&ctrl.current_tail_lines()).join("\n");
-        assert!(refreshed.contains("hello"), "refreshed tail: {refreshed:?}");
-        assert!(ctrl.core.is_idle());
-    }
-
-    #[test]
-    fn live_partial_source_is_bounded_at_utf8_boundary() {
-        let oversized = format!(
-            "prefix{}tail",
-            "é".repeat(MUTABLE_MARKDOWN_SOURCE_MAX_BYTES)
-        );
-        let bounded = bounded_live_partial_source(&oversized);
-
-        assert!(bounded.len() <= MUTABLE_MARKDOWN_SOURCE_MAX_BYTES);
-        assert!(bounded.ends_with("tail"));
-        assert!(!bounded.starts_with("prefix"));
-    }
-
-    #[test]
-    fn completed_render_prefix_is_retained_when_mutable_window_rotates() {
-        let mut ctrl =
-            StreamController::new(Some(80), &test_cwd(), HistoryRenderMode::Raw);
-        let prefix = (0..700)
-            .map(|line| format!("prefix line {line:04}\n"))
-            .collect::<String>();
-        assert!(prefix.len() < MUTABLE_MARKDOWN_SOURCE_MAX_BYTES);
-        assert!(ctrl.push(&prefix));
-        let retained_prefix = hyperlink_lines_to_plain_strings(&ctrl.core.rendered_lines[..8]);
-
-        let suffix = (0..1_000)
-            .map(|line| format!("suffix line {line:04}\n"))
-            .collect::<String>();
-        assert!(suffix.len() > MUTABLE_MARKDOWN_SOURCE_MAX_BYTES);
-        assert!(ctrl.push(&suffix));
-
-        assert_eq!(
-            hyperlink_lines_to_plain_strings(&ctrl.core.rendered_lines[..8]),
-            retained_prefix,
-        );
-        assert!(ctrl.core.forced_tail_render_start.is_some());
         assert!(
-            ctrl.core.max_streaming_render_source_len <= MUTABLE_MARKDOWN_SOURCE_MAX_BYTES,
-            "largest parser window was {} bytes",
-            ctrl.core.max_streaming_render_source_len,
+            ctrl.current_tail_lines().is_empty(),
+            "expected no live tail outside table holdback state",
         );
-        let (first_cell, idle) = ctrl.on_commit_tick();
-        let first_cell = first_cell.expect("expected retained stable prefix to remain queued");
-        let first_line = lines_to_plain_strings(&first_cell.transcript_lines(u16::MAX));
-        assert!(
-            first_line
-                .first()
-                .is_some_and(|line| line.contains("prefix line 0000")),
-            "stable queue order changed after rotation: {first_line:?}",
-        );
-        assert!(!idle, "retained prefix should continue draining in order");
-    }
-
-    #[test]
-    fn bounded_streaming_windows_preserve_large_final_fence_and_table_render() {
-        let code = format!(
-            "const HUGE: &str = \"{}\";\n",
-            "é".repeat(MUTABLE_MARKDOWN_SOURCE_MAX_BYTES)
-        );
-        let source = format!(
-            "```rust\n{code}```\n\n| Name | Value |\n| --- | --- |\n| final | exact |\n"
-        );
-        assert!(source.len() > MUTABLE_MARKDOWN_SOURCE_MAX_BYTES);
-
-        let mut expected = Vec::new();
-        crate::markdown::append_markdown_agent(&source, Some(80), &mut expected);
-        let expected = lines_to_plain_strings(&expected);
-
-        let mut ctrl = stream_controller(Some(80));
-        assert!(ctrl.push(&source));
-        assert_eq!(ctrl.queued_lines(), 0, "rotated output must remain mutable");
-        assert!(
-            ctrl.core.max_streaming_render_source_len <= MUTABLE_MARKDOWN_SOURCE_MAX_BYTES,
-            "largest parser window was {} bytes",
-            ctrl.core.max_streaming_render_source_len,
-        );
-
-        let (cell, finalized_source) = ctrl.finalize();
-        assert_eq!(finalized_source.as_deref(), Some(source.as_str()));
-        let finalized = lines_to_plain_strings(
-            &cell
-                .expect("expected canonical final cell")
-                .transcript_lines(u16::MAX),
-        )
-        .into_iter()
-        .map(|line| line.chars().skip(2).collect::<String>())
-        .collect::<Vec<_>>();
-        assert_eq!(finalized, expected);
+        assert!(!ctrl.has_live_tail());
     }
 
     #[test]

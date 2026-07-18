@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io;
 use std::sync::LazyLock;
 
 use codex_exec_server::ExecutorFileSystem;
@@ -14,13 +13,12 @@ use crate::ApplyPatchArgs;
 use crate::ApplyPatchError;
 use crate::ApplyPatchFileChange;
 use crate::ApplyPatchFileUpdate;
-use crate::ApplyPatchPlanOperation;
 use crate::IoError;
 use crate::MaybeApplyPatchVerified;
 use crate::parser::Hunk;
 use crate::parser::ParseError;
 use crate::parser::parse_patch;
-use crate::unified_diff_from_content;
+use crate::unified_diff_from_chunks;
 use codex_utils_path_uri::PathConvention;
 use codex_utils_path_uri::PathUri;
 use std::str::Utf8Error;
@@ -197,128 +195,46 @@ async fn try_verify_apply_patch_args(
         .transpose()?
         .unwrap_or_else(|| cwd.clone());
     let mut changes = HashMap::new();
-    let mut operations = Vec::with_capacity(hunks.len());
-    let mut planned_state: HashMap<PathUri, Option<Vec<u8>>> = HashMap::new();
     for hunk in hunks {
-        let summary_path = hunk.path().to_path_buf();
         let path = hunk.resolve_path(&effective_cwd)?;
-        let expected_old = planned_file_state(&path, &mut planned_state, fs, sandbox).await?;
         match hunk {
             Hunk::AddFile { contents, .. } => {
-                let new_bytes = contents.clone().into_bytes();
-                let change = ApplyPatchFileChange::Add { content: contents };
-                operations.push(ApplyPatchPlanOperation::new(
-                    path.clone(),
-                    summary_path,
-                    expected_old,
-                    None,
-                    change.clone(),
-                    Some(new_bytes.clone()),
-                ));
-                planned_state.insert(path.clone(), Some(new_bytes));
-                changes.insert(path, change);
+                changes.insert(path, ApplyPatchFileChange::Add { content: contents });
             }
             Hunk::DeleteFile { .. } => {
-                let content = required_utf8_content(&path, expected_old.as_deref())?;
-                let change = ApplyPatchFileChange::Delete { content };
-                operations.push(ApplyPatchPlanOperation::new(
-                    path.clone(),
-                    summary_path,
-                    expected_old,
-                    None,
-                    change.clone(),
-                    None,
-                ));
-                planned_state.insert(path.clone(), None);
-                changes.insert(path, change);
+                let content = fs.read_file_text(&path, sandbox).await.map_err(|source| {
+                    ApplyPatchError::IoError(IoError {
+                        context: format!("Failed to read {}", path.inferred_native_path_string()),
+                        source,
+                    })
+                })?;
+                changes.insert(path, ApplyPatchFileChange::Delete { content });
             }
             Hunk::UpdateFile {
                 move_path, chunks, ..
             } => {
-                let original_content = required_utf8_content(&path, expected_old.as_deref())?;
                 let ApplyPatchFileUpdate {
                     unified_diff,
                     content: contents,
                     ..
-                } = unified_diff_from_content(&path, &chunks, original_content)?;
-                let move_path = move_path
-                    .map(|path| effective_cwd.join(&path.to_string_lossy()))
-                    .transpose()?;
-                let expected_move_destination = if let Some(destination) = &move_path {
-                    Some((
-                        destination.clone(),
-                        planned_file_state(destination, &mut planned_state, fs, sandbox).await?,
-                    ))
-                } else {
-                    None
-                };
-                let new_bytes = contents.clone().into_bytes();
-                let change = ApplyPatchFileChange::Update {
-                    unified_diff,
-                    move_path: move_path.clone(),
-                    new_content: contents,
-                };
-                operations.push(ApplyPatchPlanOperation::new(
-                    path.clone(),
-                    summary_path,
-                    expected_old,
-                    expected_move_destination,
-                    change.clone(),
-                    Some(new_bytes.clone()),
-                ));
-                if let Some(destination) = move_path {
-                    planned_state.insert(path.clone(), None);
-                    planned_state.insert(destination, Some(new_bytes));
-                } else {
-                    planned_state.insert(path.clone(), Some(new_bytes));
-                }
-                changes.insert(path, change);
+                } = unified_diff_from_chunks(&path, &chunks, fs, sandbox).await?;
+                changes.insert(
+                    path,
+                    ApplyPatchFileChange::Update {
+                        unified_diff,
+                        move_path: move_path
+                            .map(|path| effective_cwd.join(&path.to_string_lossy()))
+                            .transpose()?,
+                        new_content: contents,
+                    },
+                );
             }
         }
     }
     Ok(ApplyPatchAction {
-        compatibility_changes: changes,
-        operations,
+        changes,
         patch,
         cwd: effective_cwd,
-    })
-}
-
-async fn planned_file_state(
-    path: &PathUri,
-    planned_state: &mut HashMap<PathUri, Option<Vec<u8>>>,
-    fs: &dyn ExecutorFileSystem,
-    sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
-) -> Result<Option<Vec<u8>>, ApplyPatchError> {
-    if let Some(bytes) = planned_state.get(path) {
-        return Ok(bytes.clone());
-    }
-    let bytes = match fs.read_file(path, sandbox).await {
-        Ok(bytes) => Some(bytes),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => None,
-        Err(source) => {
-            return Err(ApplyPatchError::IoError(IoError {
-                context: format!("Failed to read {}", path.inferred_native_path_string()),
-                source,
-            }));
-        }
-    };
-    planned_state.insert(path.clone(), bytes.clone());
-    Ok(bytes)
-}
-
-fn required_utf8_content(path: &PathUri, bytes: Option<&[u8]>) -> Result<String, ApplyPatchError> {
-    let bytes = bytes.ok_or_else(|| {
-        ApplyPatchError::IoError(IoError {
-            context: format!("Failed to read {}", path.inferred_native_path_string()),
-            source: io::Error::new(io::ErrorKind::NotFound, "file not found"),
-        })
-    })?;
-    String::from_utf8(bytes.to_vec()).map_err(|source| {
-        ApplyPatchError::IoError(IoError {
-            context: format!("Failed to read {}", path.inferred_native_path_string()),
-            source: io::Error::new(io::ErrorKind::InvalidData, source),
-        })
     })
 }
 
@@ -924,32 +840,27 @@ PATCH"#,
 
         // Verify the patch contents - as otherwise we may have pulled contents
         // from the wrong file (as we're using relative paths)
-        let action = match result {
-            MaybeApplyPatchVerified::Body(action) => action,
-            other => panic!("expected verified body, got {other:?}"),
-        };
         assert_eq!(
-            action.compatibility_changes,
-            HashMap::from([(
-                PathUri::from_host_native_path(session_dir.path().join(relative_path))
-                    .expect("absolute test path"),
-                ApplyPatchFileChange::Update {
-                    unified_diff: r#"@@ -1 +1 @@
+            result,
+            MaybeApplyPatchVerified::Body(ApplyPatchAction {
+                changes: HashMap::from([(
+                    PathUri::from_host_native_path(session_dir.path().join(relative_path))
+                        .expect("absolute test path"),
+                    ApplyPatchFileChange::Update {
+                        unified_diff: r#"@@ -1 +1 @@
 -session directory content
 +updated session directory content
 "#
-                    .to_string(),
-                    move_path: None,
-                    new_content: "updated session directory content\n".to_string(),
-                },
-            )])
+                        .to_string(),
+                        move_path: None,
+                        new_content: "updated session directory content\n".to_string(),
+                    },
+                )]),
+                patch: argv[1].clone(),
+                cwd: PathUri::from_host_native_path(session_dir.path())
+                    .expect("absolute test path"),
+            })
         );
-        assert_eq!(action.patch, argv[1]);
-        assert_eq!(
-            action.cwd,
-            PathUri::from_host_native_path(session_dir.path()).expect("absolute test path")
-        );
-        assert_eq!(action.operations.len(), 1);
     }
 
     #[tokio::test]
@@ -995,7 +906,7 @@ PATCH"#,
         let source_path = PathUri::from_host_native_path(worktree_dir.join(source_name))
             .expect("absolute test path");
         let change = action
-            .compatibility_changes()
+            .changes()
             .get(&source_path)
             .expect("source file change present");
 

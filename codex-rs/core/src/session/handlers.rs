@@ -536,22 +536,8 @@ pub async fn thread_rollback(sess: &Arc<Session>, sub_id: String, num_turns: u32
         .into_iter()
         .chain(std::iter::once(RolloutItem::EventMsg(rollback_msg.clone())))
         .collect::<Vec<_>>();
-    if let Err(err) = sess
-        .apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
-        .await
-    {
-        sess.send_event_raw(Event {
-            id: turn_context.sub_id.clone(),
-            msg: EventMsg::Error(ErrorEvent {
-                message: format!(
-                    "failed to prepare reconstructed history for rollback replay: {err}"
-                ),
-                codex_error_info: Some(CodexErrorInfo::ThreadRollbackFailed),
-            }),
-        })
+    sess.apply_rollout_reconstruction(turn_context.as_ref(), replay_items.as_slice())
         .await;
-        return;
-    }
     sess.services
         .agent_control
         .rollout_budget()

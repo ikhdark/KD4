@@ -182,14 +182,6 @@ impl CoreToolRuntime for McpHandler {
         })
     }
 
-    fn pre_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
-        matches!(&invocation.payload, ToolPayload::Function { .. }).then(|| self.hook_tool_name())
-    }
-
-    fn post_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
-        matches!(&invocation.payload, ToolPayload::Function { .. }).then(|| self.hook_tool_name())
-    }
-
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
         let ToolPayload::Function { arguments } = &invocation.payload else {
             return None;

@@ -4,17 +4,15 @@ use std::sync::Arc;
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
 use crate::tools::command_execution::CommandAttemptKey;
-use crate::tools::command_output_artifact::content_address_raw_output_artifact;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::command_output_artifact::replace_raw_output_artifact;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolInvocation;
-use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
-use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair_async;
+use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
@@ -242,12 +240,11 @@ impl ExecCommandHandler {
         )
         .map_err(FunctionCallError::RespondToModel)?;
         let original_safety_command = original_resolved_command.safety_command.clone();
-        let preflight = preflight_invocation_with_equivalent_repair_async(
+        let preflight = preflight_invocation_with_equivalent_repair(
             &original_invocation,
             &original_safety_command,
             original_resolved_command.preflight_shell_type,
         )
-        .await
         .map_err(|issue| {
             FunctionCallError::RespondToModel(format!(
                 "{issue}\nRegenerate the command and call `exec_command` again."
@@ -421,13 +418,32 @@ impl ExecCommandHandler {
         match intercepted {
             Ok(Some(output)) => {
                 manager.release_process_id(process_id).await;
-                let success = output.success_for_logging();
+                let raw_output = output.into_text().into_bytes();
+                let raw_output_artifact = create_raw_output_artifact(
+                    turn.config.codex_home.as_path(),
+                    &session.thread_id.to_string(),
+                    &raw_output,
+                )
+                .await;
                 session
                     .services
                     .command_execution
-                    .record_exit(&attempt_key, if success { 0 } else { -1 })
+                    .record_exit(&attempt_key, 0)
                     .await;
-                return Ok(boxed_tool_output(output));
+                return Ok(boxed_tool_output(ExecCommandToolOutput {
+                    event_call_id: String::new(),
+                    chunk_id: String::new(),
+                    wall_time: std::time::Duration::ZERO,
+                    raw_output,
+                    truncation_policy: turn.model_info.truncation_policy.into(),
+                    max_output_tokens,
+                    process_id: None,
+                    exit_code: None,
+                    original_token_count: None,
+                    hook_command: None,
+                    raw_output_artifact: Some(raw_output_artifact),
+                    repair_notice,
+                }));
             }
             Ok(None) => {}
             Err(err) => {
@@ -485,7 +501,7 @@ impl ExecCommandHandler {
             .await;
         match exec_result {
             Ok(mut response) => {
-                let mut finalized_artifact = response
+                let finalized_artifact = response
                     .raw_output_artifact
                     .clone()
                     .unwrap_or_else(|| raw_output_artifact.clone());
@@ -497,9 +513,6 @@ impl ExecCommandHandler {
                         .update_running_artifact(process_id, finalized_artifact)
                         .await;
                 } else if let Some(exit_code) = response.exit_code {
-                    finalized_artifact =
-                        content_address_raw_output_artifact(&finalized_artifact).await;
-                    response.raw_output_artifact = Some(finalized_artifact);
                     let tracked = session
                         .services
                         .command_execution
@@ -519,8 +532,6 @@ impl ExecCommandHandler {
                 let output_text = output.aggregated_output.text;
                 let finalized_artifact =
                     replace_raw_output_artifact(&raw_output_artifact, output_text.as_bytes()).await;
-                let finalized_artifact =
-                    content_address_raw_output_artifact(&finalized_artifact).await;
                 let tracked = session
                     .services
                     .command_execution
@@ -555,12 +566,10 @@ impl ExecCommandHandler {
                     // process for write_stdin to resume.
                     process_id: None,
                     exit_code: Some(output.exit_code),
-                    timed_out: output.timed_out,
                     original_token_count: Some(original_token_count),
                     hook_command: Some(hook_command),
                     raw_output_artifact: Some(finalized_artifact),
                     repair_notice,
-                    analysis: Default::default(),
                 }))
             }
             Err(err) => {
@@ -605,14 +614,6 @@ impl CoreToolRuntime for ExecCommandHandler {
 
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
-    }
-
-    fn pre_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
-        matches!(&invocation.payload, ToolPayload::Function { .. }).then(HookToolName::bash)
-    }
-
-    fn post_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
-        matches!(&invocation.payload, ToolPayload::Function { .. }).then(HookToolName::bash)
     }
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {

@@ -6,7 +6,6 @@ use std::sync::atomic::Ordering;
 
 use crate::apply_skill_injection_observability;
 use crate::client::ModelClientSession;
-use crate::client::RequestAuthSnapshot;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::collect_explicit_skill_mentions;
@@ -17,7 +16,6 @@ use crate::compact_remote::run_inline_remote_auto_compact_task;
 use crate::compact_remote_v2::run_inline_remote_auto_compact_task as run_inline_remote_auto_compact_task_v2;
 use crate::connectors;
 use crate::context::ContextualUserFragment;
-use crate::context_manager::PromptHistorySnapshot;
 use crate::feedback_tags;
 use crate::hook_runtime::inspect_pending_input;
 use crate::hook_runtime::record_additional_contexts;
@@ -42,7 +40,6 @@ use crate::mentions::collect_tool_mentions_from_messages;
 use crate::pending_turn_plan::CompletedEffect;
 use crate::pending_turn_plan::EffectImpact;
 use crate::pending_turn_plan::FixedPointPlanningState;
-use crate::pending_turn_plan::MAX_FIXED_POINT_ITERATIONS;
 use crate::pending_turn_plan::PlanningSnapshotIdentity;
 use crate::plan_skill_injections;
 use crate::plugins::PluginCapabilitySummary;
@@ -77,7 +74,6 @@ use crate::tools::router::extension_tool_executors;
 use crate::tools::spec_plan::search_tool_enabled;
 use crate::tools::spec_plan::tool_suggest_enabled;
 use crate::turn_diff_tracker::TurnDiffTracker;
-use crate::turn_timing::ModelStreamTimingGuard;
 use crate::turn_timing::TurnLocalPhase;
 use crate::turn_timing::TurnTimingGuard;
 use crate::turn_timing::record_turn_ttft_metric;
@@ -96,6 +92,7 @@ use codex_core_skills::injection::PlannedSkillInjections;
 use codex_extension_api::TurnInputContext;
 use codex_extension_api::TurnInputEnvironment;
 use codex_features::Feature;
+use codex_git_utils::get_git_repo_root_with_fs;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::ServiceTier;
@@ -165,7 +162,6 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
-    sess.wait_for_startup_discovery(&cancellation_token).await?;
     let mut preparation_timing_guard = Some(
         turn_context
             .turn_timing_state
@@ -199,10 +195,8 @@ pub(crate) async fn run_turn(
         }
     };
     let PendingTurnPlan {
-        identity: first_identity,
         step_context: first_step_context,
         first_router,
-        auth: first_auth,
         injection_items,
         explicitly_enabled_connectors,
         ..
@@ -212,7 +206,7 @@ pub(crate) async fn run_turn(
     // Only now may normal turn persistence begin.
     let (mut world_state, display_roots) = tokio::join!(
         sess.record_context_updates_and_set_reference_context_item(first_step_context.as_ref()),
-        turn_diff_display_roots(sess.as_ref(), turn_context.as_ref()),
+        turn_diff_display_roots(turn_context.as_ref()),
     );
 
     if run_pending_session_start_hooks(&sess, &turn_context).await {
@@ -242,6 +236,7 @@ pub(crate) async fn run_turn(
             }
         }
     }
+
     track_turn_resolved_config_analytics(&sess, &turn_context, &input).await;
 
     let mut last_agent_message: Option<String> = None;
@@ -260,7 +255,7 @@ pub(crate) async fn run_turn(
     // 2. After auto-compact, when model/tool continuation needs to resume before any steer.
 
     let mut next_step_context = Some(first_step_context);
-    let mut first_router = Some((first_identity.generation, first_auth, first_router));
+    let mut first_router = Some(first_router);
     loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
@@ -283,8 +278,7 @@ pub(crate) async fn run_turn(
         )
         .await;
 
-        // Capture the candidate step view; request stabilization replaces it if
-        // any semantic dependency changes before the snapshot is accepted.
+        // Capture once so context, advertised tools, and tool calls share one request view.
         let step_context = match next_step_context.take() {
             Some(step_context) => step_context,
             None => sess.capture_step_context(Arc::clone(&turn_context)).await,
@@ -307,18 +301,14 @@ pub(crate) async fn run_turn(
                     .await;
             }
 
-            // Bind exact first-send history, capabilities, and the accepted router
-            // into one immutable request snapshot before any transport work starts.
-            let sampling_snapshot = capture_sampling_request_snapshot(
-                &sess,
-                &turn_context,
-                Arc::clone(&step_context),
-                &client_session,
-                &mut first_router,
-                &cancellation_token,
-            )
-            .instrument(trace_span!("run_turn.prepare_sampling_request_snapshot"))
-            .await?;
+            // Construct the input that we will send to the model.
+            let sampling_request_input: Vec<ResponseItem> = async {
+                sess.clone_history()
+                    .await
+                    .for_prompt(&turn_context.model_info.input_modalities)
+            }
+            .instrument(trace_span!("run_turn.prepare_sampling_request_input"))
+            .await;
 
             let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
                 sess.installation_id.clone(),
@@ -327,11 +317,13 @@ pub(crate) async fn run_turn(
             );
             run_sampling_request(
                 Arc::clone(&sess),
-                sampling_snapshot,
+                Arc::clone(&step_context),
                 Arc::clone(&turn_extension_data),
                 Arc::clone(&turn_diff_tracker),
                 &mut client_session,
                 &responses_metadata,
+                sampling_request_input,
+                &mut first_router,
                 &mut preparation_timing_guard,
                 cancellation_token.child_token(),
             )
@@ -339,7 +331,7 @@ pub(crate) async fn run_turn(
         }
         .await;
         match sampling_request_result {
-            Ok((sampling_request_output, sampling_request_history)) => {
+            Ok((sampling_request_output, sampling_request_input)) => {
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
@@ -353,21 +345,13 @@ pub(crate) async fn run_turn(
                         turn_context.as_ref(),
                     )
                     .await;
-                    let estimated_token_count = maybe_estimate_history_for_trace(
-                        tracing::enabled!(
-                            target: "codex_core::session::turn",
-                            tracing::Level::TRACE
-                        ),
-                        || sess.get_estimated_token_count(turn_context.as_ref()),
-                    )
-                    .await;
+                    let estimated_token_count =
+                        sess.get_estimated_token_count(turn_context.as_ref()).await;
                     (has_pending_input, token_status, estimated_token_count)
                 }
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                 .await;
                 let needs_follow_up = model_needs_follow_up || has_pending_input;
-                let terminal_legacy_hook_history =
-                    terminal_legacy_hook_history(needs_follow_up, sampling_request_history);
                 let token_limit_reached = token_status.token_limit_reached;
 
                 trace!(
@@ -393,33 +377,6 @@ pub(crate) async fn run_turn(
                     token_status.tokens_until_compaction,
                 )
                 .await;
-
-                // Tool execution is quiescent at this boundary. Run any pending
-                // automatic validation before the next sampling request or terminal
-                // completion path so its receipt is bound to this evidence epoch.
-                if (model_needs_follow_up || !has_pending_input)
-                    && let Some(request) = sess
-                        .services
-                        .task_evidence
-                        .take_automatic_verify_plan_request()
-                        .await
-                    && let Err(err) = crate::tools::handlers::run_automatic_verify_local(
-                        Arc::clone(&sess),
-                        Arc::clone(&step_context),
-                        Arc::clone(&turn_diff_tracker),
-                        request,
-                        cancellation_token.child_token(),
-                    )
-                    .await
-                {
-                    sess.send_event(
-                        &turn_context,
-                        EventMsg::Warning(WarningEvent {
-                            message: format!("automatic verify_local failed: {err:?}"),
-                        }),
-                    )
-                    .await;
-                }
 
                 // as long as compaction works well in getting us way below the token limit, we shouldn't worry about being in an infinite loop.
                 if needs_follow_up
@@ -450,6 +407,30 @@ pub(crate) async fn run_turn(
 
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
+                    if let Some(changed_paths) = sess
+                        .services
+                        .task_evidence
+                        .take_automatic_verify_plan_request()
+                        .await
+                    {
+                        if let Err(err) = crate::tools::handlers::run_automatic_verify_local_plan(
+                            Arc::clone(&sess),
+                            Arc::clone(&step_context),
+                            Arc::clone(&turn_diff_tracker),
+                            changed_paths,
+                            cancellation_token.child_token(),
+                        )
+                        .await
+                        {
+                            sess.send_event(
+                                &turn_context,
+                                EventMsg::Warning(WarningEvent {
+                                    message: format!("automatic verify_local plan failed: {err:?}"),
+                                }),
+                            )
+                            .await;
+                        }
+                    }
                     if let Some(warning) = sess
                         .services
                         .task_evidence
@@ -496,9 +477,7 @@ pub(crate) async fn run_turn(
                     if run_legacy_after_agent_hook(
                         &sess,
                         &turn_context,
-                        terminal_legacy_hook_history
-                            .as_ref()
-                            .expect("terminal sampling keeps its hook history snapshot"),
+                        &sampling_request_input,
                         last_agent_message.clone(),
                     )
                     .await
@@ -553,22 +532,22 @@ pub(crate) async fn run_turn(
 }
 
 #[instrument(level = "trace", skip_all)]
-async fn turn_diff_display_roots(
-    sess: &Session,
-    turn_context: &TurnContext,
-) -> Vec<(String, PathBuf)> {
-    sess.services
-        .turn_environments
-        .git_workspace_snapshot(&turn_context.environments)
-        .await
-        .display_roots()
-}
-
-fn terminal_legacy_hook_history(
-    needs_follow_up: bool,
-    history: PromptHistorySnapshot,
-) -> Option<PromptHistorySnapshot> {
-    (!needs_follow_up).then_some(history)
+async fn turn_diff_display_roots(turn_context: &TurnContext) -> Vec<(String, PathBuf)> {
+    let mut display_roots = Vec::new();
+    for turn_environment in &turn_context.environments.turn_environments {
+        // TODO(anp): Migrate git-root discovery and diff display roots to PathUri so foreign
+        // environment roots can participate without host-native conversion.
+        let Ok(cwd) = turn_environment.cwd().to_abs_path() else {
+            continue;
+        };
+        let root =
+            get_git_repo_root_with_fs(turn_environment.environment.get_filesystem().as_ref(), &cwd)
+                .await
+                .unwrap_or(cwd)
+                .into_path_buf();
+        display_roots.push((turn_environment.environment_id.clone(), root));
+    }
+    display_roots
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -602,11 +581,8 @@ async fn run_hooks_and_record_inputs(
 
 struct PendingTurnPlan {
     identity: PlanningSnapshotIdentity,
-    history_snapshot: PromptHistorySnapshot,
     step_context: Arc<StepContext>,
     first_router: Arc<ToolRouter>,
-    auth: RequestAuthSnapshot,
-    base_instructions: BaseInstructions,
     injection_items: Vec<ResponseItem>,
     explicitly_enabled_connectors: HashSet<String>,
     pending_token_estimate: i64,
@@ -623,103 +599,15 @@ enum PendingTurnPlanBuild {
     Ready(Box<PendingTurnPlan>),
 }
 
-struct SamplingRequestSnapshot {
-    generation: u64,
-    auth: RequestAuthSnapshot,
-    history: PromptHistorySnapshot,
-    step_context: Arc<StepContext>,
-    router: Arc<ToolRouter>,
-    base_instructions: BaseInstructions,
-}
-
-#[instrument(level = "trace", skip_all)]
-async fn capture_sampling_request_snapshot(
-    sess: &Arc<Session>,
-    turn_context: &Arc<TurnContext>,
-    initial_step_context: Arc<StepContext>,
-    client_session: &ModelClientSession,
-    preferred_router: &mut Option<(u64, RequestAuthSnapshot, Arc<ToolRouter>)>,
-    cancellation_token: &CancellationToken,
-) -> CodexResult<SamplingRequestSnapshot> {
-    let mut step_context = Some(initial_step_context);
-    for _ in 0..MAX_FIXED_POINT_ITERATIONS {
-        if cancellation_token.is_cancelled() {
-            return Err(CodexErr::TurnAborted);
-        }
-        let generation = sess.services.planning_generation();
-        let auth = client_session.capture_request_auth_snapshot().await?;
-        let (preferred, preferred_mismatch) = match preferred_router.take() {
-            Some((router_generation, router_auth, router))
-                if crate::latency_switches::stage2_critical_path_enabled()
-                    && router_generation == generation
-                    && router_auth == auth =>
-            {
-                (Some(router), false)
-            }
-            Some(_) => (None, true),
-            None => (None, false),
-        };
-        let current_step_context = match (preferred_mismatch, step_context.take()) {
-            (false, Some(step_context)) => step_context,
-            _ => sess.capture_step_context(Arc::clone(turn_context)).await,
-        };
-        let (history, router) = match preferred {
-            Some(router) => (
-                sess.prompt_history_snapshot(&turn_context.model_info.input_modalities)
-                    .await,
-                router,
-            ),
-            None => {
-                let (history, router) = tokio::join!(
-                    sess.prompt_history_snapshot(&turn_context.model_info.input_modalities),
-                    built_tools(
-                        sess.as_ref(),
-                        current_step_context.as_ref(),
-                        cancellation_token
-                    )
-                );
-                (history, router?)
-            }
-        };
-        let current_auth = client_session.capture_request_auth_snapshot().await?;
-        let base_instructions = sess.get_base_instructions().await;
-        let current_base_instructions = sess.get_base_instructions().await;
-        if sess.services.planning_generation() == generation
-            && sess.history_mutation_revision().await == history.mutation_revision()
-            && current_auth == auth
-            && current_base_instructions.text.as_str() == base_instructions.text.as_str()
-        {
-            return Ok(SamplingRequestSnapshot {
-                generation,
-                auth,
-                history,
-                step_context: current_step_context,
-                router,
-                base_instructions,
-            });
-        }
-    }
-    Err(planning_failure(format!(
-        "sampling request state did not stabilize after {MAX_FIXED_POINT_ITERATIONS} snapshots"
-    )))
-}
-
 #[instrument(level = "trace", skip_all)]
 async fn build_pure_pending_turn_plan(
     sess: &Arc<Session>,
     step_context: Arc<StepContext>,
     input: &[TurnInput],
-    client_session: &ModelClientSession,
-    generation: u64,
-    auth: RequestAuthSnapshot,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<PendingTurnPlanBuild> {
     let turn_context = step_context.turn.as_ref();
-    if sess.services.planning_generation() != generation
-        || client_session.capture_request_auth_snapshot().await? != auth
-    {
-        return Ok(PendingTurnPlanBuild::Stale);
-    }
+    let generation = sess.services.planning_generation();
     let user_input = input
         .iter()
         .filter_map(|item| match item {
@@ -737,20 +625,15 @@ async fn build_pure_pending_turn_plan(
     );
 
     if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
-        let (history_snapshot, first_router, base_instructions) = tokio::join!(
-            sess.prompt_history_snapshot(&turn_context.model_info.input_modalities),
-            built_tools(sess.as_ref(), step_context.as_ref(), cancellation_token),
-            sess.get_base_instructions(),
+        let (history_items, first_router) = tokio::join!(
+            async {
+                sess.clone_history()
+                    .await
+                    .for_prompt(&turn_context.model_info.input_modalities)
+            },
+            built_tools(sess.as_ref(), step_context.as_ref(), cancellation_token)
         );
         let first_router = first_router?;
-        let current_auth = client_session.capture_request_auth_snapshot().await?;
-        if sess.services.planning_generation() != generation
-            || sess.history_mutation_revision().await != history_snapshot.mutation_revision()
-            || current_auth != auth
-            || sess.get_base_instructions().await.text.as_str() != base_instructions.text.as_str()
-        {
-            return Ok(PendingTurnPlanBuild::Stale);
-        }
         let identity = PlanningSnapshotIdentity {
             generation,
             state_digest: planning_state_digest(PlanningStateDigestInput {
@@ -760,19 +643,14 @@ async fn build_pure_pending_turn_plan(
                 plugins: &[],
                 injection_items: &[],
                 user_input: &user_input,
-                auth: &auth,
                 router: first_router.as_ref(),
-                history_snapshot: &history_snapshot,
-                base_instructions: &base_instructions,
+                history_items: &history_items,
             }),
         };
         return Ok(PendingTurnPlanBuild::Ready(Box::new(PendingTurnPlan {
             identity,
-            history_snapshot,
             step_context,
             first_router,
-            auth,
-            base_instructions,
             injection_items: Vec::new(),
             explicitly_enabled_connectors: HashSet::new(),
             pending_token_estimate: estimate_pending_tokens(&user_input, &[]),
@@ -802,11 +680,13 @@ async fn build_pure_pending_turn_plan(
     let connector_snapshot = step_context.mcp.config().connector_snapshot.clone();
     let mcp_tools = if turn_context.apps_enabled() || !mentioned_plugins.is_empty() {
         step_context
-            .mcp_tools()
+            .mcp
+            .manager_arc()
+            .list_all_tools()
             .or_cancel(cancellation_token)
             .await?
     } else {
-        &[]
+        Vec::new()
     };
     let available_connectors = if turn_context.apps_enabled() {
         let connectors = codex_connectors::merge::merge_plugin_connectors_with_accessible(
@@ -814,7 +694,7 @@ async fn build_pure_pending_turn_plan(
                 .connector_ids()
                 .iter()
                 .map(|connector_id| connector_id.0.clone()),
-            connectors::accessible_connectors_from_mcp_tools(mcp_tools),
+            connectors::accessible_connectors_from_mcp_tools(&mcp_tools),
         );
         connectors::with_app_enabled_state(connectors, &turn_context.config)
     } else {
@@ -850,7 +730,7 @@ async fn build_pure_pending_turn_plan(
         &skill_name_counts_lower,
     );
     let plugin_items =
-        build_plugin_injections(&mentioned_plugins, mcp_tools, &available_connectors);
+        build_plugin_injections(&mentioned_plugins, &mcp_tools, &available_connectors);
     let mut explicitly_enabled_connectors = collect_explicit_app_ids(&user_input);
     explicitly_enabled_connectors.extend(skill_connector_ids);
     let connector_names_by_id = available_connectors
@@ -891,18 +771,16 @@ async fn build_pure_pending_turn_plan(
 
     // Final read-only DAG leaves: capture the model-visible history and build the
     // router concurrently, then validate the generation before accepting either.
-    let (history_snapshot, first_router, base_instructions) = tokio::join!(
-        sess.prompt_history_snapshot(&turn_context.model_info.input_modalities),
-        built_tools(sess.as_ref(), step_context.as_ref(), cancellation_token),
-        sess.get_base_instructions(),
+    let (history_items, first_router) = tokio::join!(
+        async {
+            sess.clone_history()
+                .await
+                .for_prompt(&turn_context.model_info.input_modalities)
+        },
+        built_tools(sess.as_ref(), step_context.as_ref(), cancellation_token)
     );
     let first_router = first_router?;
-    let current_auth = client_session.capture_request_auth_snapshot().await?;
-    if sess.services.planning_generation() != generation
-        || sess.history_mutation_revision().await != history_snapshot.mutation_revision()
-        || current_auth != auth
-        || sess.get_base_instructions().await.text.as_str() != base_instructions.text.as_str()
-    {
+    if sess.services.planning_generation() != generation {
         return Ok(PendingTurnPlanBuild::Stale);
     }
     let mut warnings = planned_mcp.warnings;
@@ -911,24 +789,19 @@ async fn build_pure_pending_turn_plan(
         generation,
         state_digest: planning_state_digest(PlanningStateDigestInput {
             step_context: step_context.as_ref(),
-            mcp_tools,
+            mcp_tools: &mcp_tools,
             connectors: &available_connectors,
             plugins: &mentioned_plugins,
             injection_items: &injection_items,
             user_input: &user_input,
-            auth: &auth,
             router: first_router.as_ref(),
-            history_snapshot: &history_snapshot,
-            base_instructions: &base_instructions,
+            history_items: &history_items,
         }),
     };
     Ok(PendingTurnPlanBuild::Ready(Box::new(PendingTurnPlan {
         identity,
-        history_snapshot,
         step_context,
         first_router,
-        auth,
-        base_instructions,
         pending_token_estimate: estimate_pending_tokens(&user_input, &injection_items),
         injection_items,
         explicitly_enabled_connectors,
@@ -973,26 +846,11 @@ async fn stabilize_pending_turn_plan(
             }
         }
 
-        let generation = sess.services.planning_generation();
-        let auth = client_session.capture_request_auth_snapshot().await?;
         let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
-        let plan = match build_pure_pending_turn_plan(
-            sess,
-            step_context,
-            input,
-            client_session,
-            generation,
-            auth,
-            cancellation_token,
-        )
-        .await?
+        let plan = match build_pure_pending_turn_plan(sess, step_context, input, cancellation_token)
+            .await?
         {
-            PendingTurnPlanBuild::Stale => {
-                fixed_point
-                    .record_stale_snapshot()
-                    .map_err(planning_failure)?;
-                continue;
-            }
+            PendingTurnPlanBuild::Stale => continue,
             PendingTurnPlanBuild::Ready(plan) => *plan,
         };
         fixed_point
@@ -1192,13 +1050,7 @@ async fn stabilize_pending_turn_plan(
             }
         }
 
-        let current_auth = client_session.capture_request_auth_snapshot().await?;
-        if sess.services.planning_generation() != plan.identity.generation
-            || sess.history_mutation_revision().await != plan.history_snapshot.mutation_revision()
-            || current_auth != plan.auth
-            || sess.get_base_instructions().await.text.as_str()
-                != plan.base_instructions.text.as_str()
-        {
+        if sess.services.planning_generation() != plan.identity.generation {
             continue;
         }
         return Ok(plan);
@@ -1231,10 +1083,8 @@ struct PlanningStateDigestInput<'a> {
     plugins: &'a [PluginCapabilitySummary],
     injection_items: &'a [ResponseItem],
     user_input: &'a [UserInput],
-    auth: &'a RequestAuthSnapshot,
     router: &'a ToolRouter,
-    history_snapshot: &'a PromptHistorySnapshot,
-    base_instructions: &'a BaseInstructions,
+    history_items: &'a [ResponseItem],
 }
 
 fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
@@ -1245,27 +1095,10 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
         plugins,
         injection_items,
         user_input,
-        auth,
         router,
-        history_snapshot,
-        base_instructions,
+        history_items,
     } = input;
     let mut hasher = Sha256::new();
-    hasher.update(b"codex.immutable-planning-snapshot.v2");
-    hasher.update(step_context.turn.model_info.slug.as_bytes());
-    if let Some(comp_hash) = &step_context.turn.model_info.comp_hash {
-        hasher.update([1]);
-        hasher.update(comp_hash.as_bytes());
-    } else {
-        hasher.update([0]);
-    }
-    hasher.update(format!("{:?}", step_context.turn.config.features.get()).as_bytes());
-    hasher.update(format!("{:?}", step_context.turn.model_info.input_modalities).as_bytes());
-    hasher.update(
-        serde_json::to_vec(auth).expect("request auth snapshot should serialize for planning"),
-    );
-    hasher.update(step_context.mcp.version().to_be_bytes());
-    hasher.update(base_instructions.text.as_bytes());
     for environment in &step_context.environments.turn_environments {
         hasher.update(environment.environment_id.as_bytes());
         hasher.update(environment.cwd().to_string().as_bytes());
@@ -1274,12 +1107,7 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
         hasher.update(format!("{:?}", starting.selection).as_bytes());
     }
     hasher.update(format!("{:?}", step_context.selected_capability_roots).as_bytes());
-    if let Some(loaded_agents_md) = &step_context.loaded_agents_md {
-        hasher.update([1]);
-        hasher.update(loaded_agents_md.semantic_digest());
-    } else {
-        hasher.update([0]);
-    }
+    hasher.update(format!("{:?}", step_context.loaded_agents_md).as_bytes());
     for plugin in plugins {
         hasher.update(plugin.config_name.as_bytes());
         hasher.update(plugin.display_name.as_bytes());
@@ -1295,6 +1123,8 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
         serde_json::to_vec(connectors),
         serde_json::to_vec(injection_items),
         serde_json::to_vec(user_input),
+        serde_json::to_vec(&router.model_visible_specs()),
+        serde_json::to_vec(history_items),
     ]
     .into_iter()
     .flatten()
@@ -1302,29 +1132,7 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
         hasher.update(serialized);
         hasher.update([0xff]);
     }
-    append_planning_schema_digest(
-        &mut hasher,
-        router.model_visible_schema_bundle().planning_digest_bytes(),
-    );
-    hasher.update(history_snapshot.mutation_revision().to_be_bytes());
-    hasher.update(history_snapshot.rewrite_revision().to_be_bytes());
-    hasher.update((history_snapshot.raw_item_count() as u64).to_be_bytes());
-    hasher.update(history_snapshot.rolling_digest());
-    hasher.update(history_snapshot.normalized_token_weight().to_be_bytes());
     format!("{:x}", hasher.finalize())
-}
-
-fn append_planning_schema_digest(
-    hasher: &mut Sha256,
-    serialized: serde_json::Result<&[u8]>,
-) -> bool {
-    if let Ok(serialized) = serialized {
-        hasher.update(serialized);
-        hasher.update([0xff]);
-        true
-    } else {
-        false
-    }
 }
 
 fn estimate_pending_tokens(user_input: &[UserInput], injection_items: &[ResponseItem]) -> i64 {
@@ -1776,7 +1584,7 @@ pub(crate) fn build_prompt(
 ) -> Prompt {
     Prompt {
         input,
-        tools: Arc::clone(router.model_visible_schema_bundle()),
+        tools: router.model_visible_specs(),
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
         output_schema: turn_context.final_output_json_schema.clone(),
@@ -1791,62 +1599,63 @@ pub(crate) fn build_prompt(
 #[instrument(level = "trace",
     skip_all,
     fields(
-        turn_id = %sampling_snapshot.step_context.turn.sub_id,
-        model = %sampling_snapshot.step_context.turn.model_info.slug,
-        cwd = %sampling_snapshot.step_context.turn.cwd.display()
+        turn_id = %step_context.turn.sub_id,
+        model = %step_context.turn.model_info.slug,
+        cwd = %step_context.turn.cwd.display()
     )
 )]
 async fn run_sampling_request(
     sess: Arc<Session>,
-    sampling_snapshot: SamplingRequestSnapshot,
+    step_context: Arc<StepContext>,
     turn_store: Arc<codex_extension_api::ExtensionData>,
     turn_diff_tracker: SharedTurnDiffTracker,
     client_session: &mut ModelClientSession,
     responses_metadata: &CodexResponsesMetadata,
+    input: Vec<ResponseItem>,
+    prebuilt_router: &mut Option<Arc<ToolRouter>>,
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
     cancellation_token: CancellationToken,
-) -> CodexResult<(SamplingRequestResult, PromptHistorySnapshot)> {
-    let turn_context = Arc::clone(&sampling_snapshot.step_context.turn);
+) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
+    let turn_context = Arc::clone(&step_context.turn);
+    let router = match prebuilt_router
+        .take()
+        .filter(|_| crate::latency_switches::stage2_critical_path_enabled())
+    {
+        Some(router) => router,
+        None => built_tools(sess.as_ref(), step_context.as_ref(), &cancellation_token).await?,
+    };
+
+    let base_instructions = sess.get_base_instructions().await;
+
+    let tool_runtime = ToolCallRuntime::new(
+        Arc::clone(&router),
+        Arc::clone(&sess),
+        Arc::clone(&step_context),
+        Arc::clone(&turn_diff_tracker),
+    );
+    let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
+        &sess,
+        Arc::clone(&step_context),
+        Arc::clone(&router),
+        Arc::clone(&turn_diff_tracker),
+    );
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut retries = 0;
-    let mut current_snapshot = Some(sampling_snapshot);
-    let mut original_history = None;
+    let mut initial_input = Some(input);
+    let mut original_input = None;
     loop {
-        let SamplingRequestSnapshot {
-            generation,
-            auth,
-            history,
-            step_context,
-            router,
-            base_instructions,
-        } = current_snapshot
-            .take()
-            .expect("each sampling attempt owns one immutable snapshot");
-        trace!(
-            generation,
-            history_revision = history.mutation_revision(),
-            history_items = history.raw_item_count(),
-            "using immutable sampling request snapshot"
-        );
-        if original_history.is_none() {
-            original_history = Some(history.clone());
-        }
-        let tool_runtime = ToolCallRuntime::new(
-            Arc::clone(&router),
-            Arc::clone(&sess),
-            Arc::clone(&step_context),
-            Arc::clone(&turn_diff_tracker),
-        );
-        let _code_mode_worker = sess.services.code_mode_service.start_turn_worker(
-            &sess,
-            Arc::clone(&step_context),
-            tool_runtime.clone(),
-        );
+        let prompt_input = if let Some(input) = initial_input.take() {
+            input
+        } else {
+            sess.clone_history()
+                .await
+                .for_prompt(&turn_context.model_info.input_modalities)
+        };
         let prompt = build_prompt(
-            Vec::new(),
+            prompt_input,
             router.as_ref(),
             turn_context.as_ref(),
-            base_instructions,
+            base_instructions.clone(),
         );
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
@@ -1857,18 +1666,13 @@ async fn run_sampling_request(
             responses_metadata,
             Arc::clone(&turn_diff_tracker),
             &prompt,
-            &history,
-            &auth,
             preparation_timing_guard,
             cancellation_token.child_token(),
         )
         .await
         {
             Ok(output) => {
-                let original_history = original_history
-                    .take()
-                    .expect("sampling owns an initial history snapshot");
-                return Ok((output, original_history));
+                return Ok((output, original_input.unwrap_or(prompt.input)));
             }
             Err(CodexErr::ContextWindowExceeded) => {
                 sess.set_total_tokens_full(&turn_context).await;
@@ -1883,6 +1687,10 @@ async fn run_sampling_request(
             }
             Err(err) => err,
         };
+
+        if original_input.is_none() {
+            original_input = Some(prompt.input);
+        }
 
         if !err.is_retryable() {
             return Err(err);
@@ -1902,19 +1710,6 @@ async fn run_sampling_request(
         drop(retry_timing_guard);
         retry_result?;
         turn_context.turn_timing_state.record_sampling_retry();
-
-        let mut preferred_router = Some((generation, auth, Arc::clone(&router)));
-        current_snapshot = Some(
-            capture_sampling_request_snapshot(
-                &sess,
-                &turn_context,
-                step_context,
-                client_session,
-                &mut preferred_router,
-                &cancellation_token,
-            )
-            .await?,
-        );
     }
 }
 
@@ -2662,8 +2457,6 @@ async fn try_run_sampling_request(
     responses_metadata: &CodexResponsesMetadata,
     turn_diff_tracker: SharedTurnDiffTracker,
     prompt: &Prompt,
-    history: &PromptHistorySnapshot,
-    auth: &RequestAuthSnapshot,
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
@@ -2704,10 +2497,8 @@ async fn try_run_sampling_request(
     );
     client_session.set_turn_timing(Arc::clone(&turn_context.turn_timing_state));
     let stream_result = client_session
-        .stream_with_history_snapshot(
+        .stream(
             prompt,
-            history,
-            auth,
             &turn_context.model_info,
             &turn_context.session_telemetry,
             turn_context.reasoning_effort.clone(),
@@ -2740,15 +2531,29 @@ async fn try_run_sampling_request(
         !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
     let receiving_span = trace_span!("receiving_stream");
-    let mut stream_timing = ModelStreamTimingGuard::new(Some(&turn_context.turn_timing_state));
     let outcome: CodexResult<SamplingRequestResult> = loop {
-        stream_timing.begin_wait();
+        let handle_responses = trace_span!(
+            parent: &receiving_span,
+            "handle_responses",
+            otel.name = field::Empty,
+            tool_name = field::Empty,
+            from = field::Empty,
+            codex.request.reasoning_effort = %reasoning_effort,
+            gen_ai.usage.input_tokens = field::Empty,
+            gen_ai.usage.cache_read.input_tokens = field::Empty,
+            gen_ai.usage.output_tokens = field::Empty,
+            codex.usage.reasoning_output_tokens = field::Empty,
+            codex.usage.total_tokens = field::Empty,
+        );
+
+        let model_stream_wait_timing_guard =
+            turn_context.turn_timing_state.begin_model_stream_wait();
         let stream_event = stream
             .next()
-            .instrument(trace_span!(parent: &receiving_span, "receiving"))
+            .instrument(trace_span!(parent: &handle_responses, "receiving"))
             .or_cancel(&cancellation_token)
             .await;
-        stream_timing.begin_processing();
+        drop(model_stream_wait_timing_guard);
         let event = match stream_event {
             Ok(event) => event,
             Err(codex_async_utils::CancelErr::Cancelled) => break Err(CodexErr::TurnAborted),
@@ -2765,29 +2570,9 @@ async fn try_run_sampling_request(
             }
         };
 
-        let handle_responses = if matches!(
-            &event,
-            ResponseEvent::OutputTextDelta(_)
-                | ResponseEvent::ReasoningSummaryDelta { .. }
-                | ResponseEvent::ReasoningContentDelta { .. }
-        ) {
-            tracing::Span::none()
-        } else {
-            trace_span!(
-                parent: &receiving_span,
-                "handle_responses",
-                otel.name = field::Empty,
-                tool_name = field::Empty,
-                from = field::Empty,
-                codex.request.reasoning_effort = %reasoning_effort,
-                gen_ai.usage.input_tokens = field::Empty,
-                gen_ai.usage.cache_read.input_tokens = field::Empty,
-                gen_ai.usage.output_tokens = field::Empty,
-                codex.usage.reasoning_output_tokens = field::Empty,
-                codex.usage.total_tokens = field::Empty,
-            )
-        };
-
+        let _model_stream_processing_timing_guard = turn_context
+            .turn_timing_state
+            .begin_model_stream_processing();
         sess.services
             .session_telemetry
             .record_responses(&handle_responses, &event);
@@ -3021,8 +2806,11 @@ async fn try_run_sampling_request(
                 should_emit_token_count = true;
             }
             ResponseEvent::ModelsEtag(etag) => {
-                Arc::clone(&sess.services.models_manager)
-                    .enqueue_refresh_if_new_etag(etag, turn_context.config.http_client_factory());
+                // Update internal state with latest models etag
+                sess.services
+                    .models_manager
+                    .refresh_if_new_etag(etag, turn_context.config.http_client_factory())
+                    .await;
             }
             ResponseEvent::Completed {
                 token_usage,
@@ -3201,7 +2989,6 @@ async fn try_run_sampling_request(
             }
         }
     };
-    stream_timing.finish();
     drop(sampling_timing_guard);
 
     flush_assistant_text_segments_all(
@@ -3265,14 +3052,6 @@ async fn try_run_sampling_request(
     }
 
     outcome
-}
-
-async fn maybe_estimate_history_for_trace<F, Fut>(enabled: bool, estimate: F) -> Option<i64>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = Option<i64>>,
-{
-    if enabled { estimate().await } else { None }
 }
 
 pub(crate) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<String> {

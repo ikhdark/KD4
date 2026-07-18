@@ -477,6 +477,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
+use tokio::sync::SemaphorePermit;
 use tokio::sync::broadcast;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -603,7 +605,7 @@ mod config_errors;
 mod request_errors;
 mod thread_delete;
 mod thread_goal_processor;
-pub(crate) mod thread_lifecycle;
+mod thread_lifecycle;
 mod thread_resume_redaction;
 mod thread_summary;
 

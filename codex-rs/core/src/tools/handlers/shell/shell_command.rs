@@ -17,7 +17,8 @@ use crate::shell::get_shell;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
-use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair_async;
+use crate::tools::context::boxed_tool_output;
+use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_workdir_base_path;
@@ -224,12 +225,11 @@ impl ShellCommandHandler {
         } else {
             Some(original_safety_shell.shell_type)
         };
-        let preflight = preflight_invocation_with_equivalent_repair_async(
+        let preflight = preflight_invocation_with_equivalent_repair(
             &original_invocation,
             &original_safety_command,
             original_shell_type,
         )
-        .await
         .map_err(|issue| {
             FunctionCallError::RespondToModel(format!(
                 "{issue}\nRegenerate the command and call `shell_command` again."
@@ -316,6 +316,7 @@ impl ShellCommandHandler {
             capture_exec_output: false,
         })
         .await
+        .map(boxed_tool_output)
     }
 }
 
@@ -357,14 +358,6 @@ impl CoreToolRuntime for ShellCommandHandler {
 
     fn waits_for_runtime_cancellation(&self) -> bool {
         true
-    }
-
-    fn pre_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
-        matches!(&invocation.payload, ToolPayload::Function { .. }).then(HookToolName::bash)
-    }
-
-    fn post_tool_use_hook_name(&self, invocation: &ToolInvocation) -> Option<HookToolName> {
-        matches!(&invocation.payload, ToolPayload::Function { .. }).then(HookToolName::bash)
     }
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {

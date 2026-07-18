@@ -15,7 +15,6 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use toml::Value as TomlValue;
 
 /// User-facing config loading behavior that is not part of the config document.
@@ -241,7 +240,7 @@ pub enum ConfigLayerStackOrdering {
 pub struct ConfigLayerStack {
     /// Layers are listed from lowest precedence (base) to highest (top), so
     /// later entries in the Vec override earlier ones.
-    layers: Arc<Vec<ConfigLayerEntry>>,
+    layers: Vec<ConfigLayerEntry>,
 
     /// Index into [layers] of the active user config layer, if any.
     ///
@@ -278,7 +277,7 @@ impl ConfigLayerStack {
     ) -> std::io::Result<Self> {
         let user_layer_index = verify_layer_ordering(&layers)?;
         Ok(Self {
-            layers: Arc::new(layers),
+            layers,
             user_layer_index,
             requirements,
             requirements_toml,
@@ -401,7 +400,7 @@ impl ConfigLayerStack {
             user_config,
         );
 
-        let mut layers = self.layers.as_ref().clone();
+        let mut layers = self.layers.clone();
         if let Some(index) = layers.iter().position(|layer| {
             matches!(
                 &layer.name,
@@ -425,7 +424,7 @@ impl ConfigLayerStack {
             }
         });
         Self {
-            layers: Arc::new(layers),
+            layers,
             user_layer_index,
             requirements: self.requirements.clone(),
             requirements_toml: self.requirements_toml.clone(),
@@ -467,7 +466,7 @@ impl ConfigLayerStack {
             }
         });
         Self {
-            layers: Arc::new(layers),
+            layers,
             user_layer_index,
             requirements: self.requirements.clone(),
             requirements_toml: self.requirements_toml.clone(),

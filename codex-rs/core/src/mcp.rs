@@ -19,10 +19,11 @@ use codex_mcp::McpConfig;
 use codex_mcp::McpPluginAttribution;
 use codex_mcp::McpServerRegistration;
 use codex_mcp::codex_apps_mcp_server_config;
-use codex_mcp::CODEX_APPS_COMPATIBILITY_REGISTRATION_ID;
 use codex_mcp::configured_mcp_servers;
 use codex_mcp::effective_mcp_servers;
 use codex_plugin::AppConnectorId;
+
+const LEGACY_CODEX_APPS_REGISTRATION_ID: &str = "legacy_codex_apps";
 
 /// MCP configuration and capability availability derived from the same inputs.
 pub(crate) struct McpRuntimeProjection {
@@ -188,7 +189,7 @@ impl McpManager {
         if mcp_config.apps_enabled {
             catalog.register(McpServerRegistration::from_compatibility(
                 CODEX_APPS_MCP_SERVER_NAME.to_string(),
-                CODEX_APPS_COMPATIBILITY_REGISTRATION_ID,
+                LEGACY_CODEX_APPS_REGISTRATION_ID,
                 codex_apps_mcp_server_config(
                     &mcp_config.chatgpt_base_url,
                     mcp_config.apps_mcp_product_sku.as_deref(),
@@ -198,7 +199,7 @@ impl McpManager {
         } else {
             catalog.remove_compatibility(
                 CODEX_APPS_MCP_SERVER_NAME.to_string(),
-                CODEX_APPS_COMPATIBILITY_REGISTRATION_ID,
+                LEGACY_CODEX_APPS_REGISTRATION_ID,
             );
         }
 

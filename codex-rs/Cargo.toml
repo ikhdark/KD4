@@ -4,7 +4,6 @@ members = [
     "analytics",
     "agent-graph-store",
     "agent-identity",
-    "agent-task-store",
     "backend-client",
     "bwrap",
     "ansi-escape",
@@ -91,7 +90,6 @@ members = [
     "tui",
     "tools",
     "v8-poc",
-    "verify-local",
     "websocket-client",
     "utils/absolute-path",
     "utils/path-uri",
@@ -146,7 +144,6 @@ app_test_support = { path = "app-server/tests/common" }
 codex-analytics = { path = "analytics" }
 codex-agent-graph-store = { path = "agent-graph-store" }
 codex-agent-identity = { path = "agent-identity" }
-codex-agent-task-store = { path = "agent-task-store" }
 codex-ansi-escape = { path = "ansi-escape" }
 codex-api = { path = "codex-api" }
 codex-aws-auth = { path = "aws-auth" }
@@ -241,7 +238,6 @@ codex-thread-store = { path = "thread-store" }
 codex-tools = { path = "tools" }
 codex-tui = { path = "tui" }
 codex-uds = { path = "uds" }
-codex-verify-local = { path = "verify-local" }
 codex-utils-absolute-path = { path = "utils/absolute-path" }
 codex-utils-approval-presets = { path = "utils/approval-presets" }
 codex-utils-cache = { path = "utils/cache" }

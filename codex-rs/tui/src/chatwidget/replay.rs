@@ -84,9 +84,6 @@ impl ChatWidget {
                 phase,
                 memory_citation,
             } => {
-                if !from_replay {
-                    self.note_first_assistant_output(turn_id.as_str(), !text.is_empty());
-                }
                 self.on_agent_message_item_completed(
                     AgentMessageItem {
                         id,

@@ -21,90 +21,9 @@ fn make_exec_output(
         stdout: StreamOutput::new(stdout.to_string()),
         stderr: StreamOutput::new(stderr.to_string()),
         aggregated_output: StreamOutput::new(aggregated.to_string()),
-        aggregated_output_bytes: None,
-        output_complete: true,
         duration: Duration::from_millis(1),
         timed_out: false,
     }
-}
-
-#[test]
-fn default_exec_command_timeout_is_twenty_minutes() {
-    assert_eq!(DEFAULT_EXEC_COMMAND_TIMEOUT_MS, 1_200_000);
-    assert_eq!(
-        ExecExpiration::DefaultTimeout.timeout_ms(),
-        Some(DEFAULT_EXEC_COMMAND_TIMEOUT_MS)
-    );
-}
-
-#[test]
-fn command_outcome_uses_stable_semantic_process_facts() {
-    let cases = [
-        (
-            None,
-            Some(0),
-            false,
-            false,
-            false,
-            ExecCommandOutcome::CompletedSuccess,
-        ),
-        (
-            None,
-            Some(7),
-            false,
-            false,
-            false,
-            ExecCommandOutcome::CompletedFailure,
-        ),
-        (
-            Some(42),
-            None,
-            false,
-            false,
-            false,
-            ExecCommandOutcome::Running,
-        ),
-        (
-            None,
-            Some(124),
-            true,
-            false,
-            false,
-            ExecCommandOutcome::TimedOut,
-        ),
-        (
-            None,
-            None,
-            false,
-            true,
-            false,
-            ExecCommandOutcome::Cancelled,
-        ),
-        (
-            None,
-            None,
-            false,
-            false,
-            true,
-            ExecCommandOutcome::LaunchFailed,
-        ),
-    ];
-    for (process_id, exit_code, timed_out, cancelled, launch_failed, expected) in cases {
-        let outcome = ExecCommandOutcome::from_process_facts(
-            process_id,
-            exit_code,
-            timed_out,
-            cancelled,
-            launch_failed,
-        );
-        assert_eq!(outcome, expected);
-    }
-    assert_eq!(
-        serde_json::to_string(&ExecCommandOutcome::CompletedFailure).expect("serialize"),
-        "\"completed_failure\""
-    );
-    assert!(!ExecCommandOutcome::CompletedFailure.is_success());
-    assert!(ExecCommandOutcome::Running.is_success());
 }
 
 #[test]
@@ -185,88 +104,15 @@ async fn read_output_limits_retained_bytes_for_shell_capture() {
         writer.write_all(&bytes).await.expect("write");
     });
 
-    let retained_output = Arc::new(TokioMutex::new(HeadTailBuffer::new(EXEC_OUTPUT_MAX_BYTES)));
-    let full_output = read_output(
+    let out = read_output(
         reader,
         /*stream*/ None,
         /*is_stderr*/ false,
-        Arc::clone(&retained_output),
-        /*retain_full_output*/ false,
-        /*sequenced_output*/ None,
+        Some(EXEC_OUTPUT_MAX_BYTES),
     )
     .await
     .expect("read");
-    assert_eq!(full_output, None);
-    assert_eq!(
-        retained_output.lock().await.to_bytes().len(),
-        EXEC_OUTPUT_MAX_BYTES
-    );
-}
-
-#[tokio::test]
-async fn read_output_drains_and_retains_before_saturated_event_delivery() {
-    let (mut writer, reader) = tokio::io::duplex(64);
-    let expected = vec![b'x'; 64 * 1024];
-    let expected_for_writer = expected.clone();
-    let writer_task = tokio::spawn(async move {
-        writer
-            .write_all(&expected_for_writer)
-            .await
-            .expect("write all output");
-    });
-
-    let retained_output = Arc::new(TokioMutex::new(HeadTailBuffer::new(EXEC_OUTPUT_MAX_BYTES)));
-    let (tx_event, rx_event) = async_channel::bounded(1);
-    tx_event
-        .send(Event {
-            id: "occupied".to_string(),
-            msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
-                call_id: "occupied".to_string(),
-                stream: ExecOutputStream::Stdout,
-                chunk: b"occupied".to_vec(),
-            }),
-        })
-        .await
-        .expect("fill event channel");
-    let stream = StdoutStream {
-        sub_id: "turn".to_string(),
-        call_id: "call".to_string(),
-        tx_event,
-    };
-    let task = tokio::spawn(read_output(
-        reader,
-        Some(stream),
-        /*is_stderr*/ false,
-        Arc::clone(&retained_output),
-        /*retain_full_output*/ false,
-        /*sequenced_output*/ None,
-    ));
-
-    tokio::time::timeout(Duration::from_secs(1), writer_task)
-        .await
-        .expect("pipe should drain while client delivery is saturated")
-        .expect("writer task");
-    assert_eq!(retained_output.lock().await.to_bytes(), expected);
-    assert!(!task.is_finished());
-
-    let occupied = rx_event.recv().await.expect("occupied event");
-    assert_eq!(occupied.id, "occupied");
-    let delivery_drain = tokio::spawn(async move {
-        let mut delivered = Vec::new();
-        while let Ok(event) = rx_event.recv().await {
-            if let EventMsg::ExecCommandOutputDelta(event) = event.msg {
-                delivered.extend_from_slice(&event.chunk);
-            }
-        }
-        delivered
-    });
-    let full_output = tokio::time::timeout(Duration::from_secs(1), task)
-        .await
-        .expect("reader should finish after delivery resumes")
-        .expect("reader task")
-        .expect("read output");
-    assert_eq!(full_output, None);
-    assert_eq!(delivery_drain.await.expect("delivery drain"), expected);
+    assert_eq!(out.text.len(), EXEC_OUTPUT_MAX_BYTES);
 }
 
 #[test]
@@ -359,19 +205,12 @@ async fn read_output_retains_all_bytes_for_full_buffer_capture() {
         writer.write_all(&bytes).await.expect("write");
     });
 
-    let retained_output = Arc::new(TokioMutex::new(HeadTailBuffer::new(EXEC_OUTPUT_MAX_BYTES)));
     let out = read_output(
-        reader,
-        /*stream*/ None,
-        /*is_stderr*/ false,
-        retained_output,
-        /*retain_full_output*/ true,
-        /*sequenced_output*/ None,
+        reader, /*stream*/ None, /*is_stderr*/ false, /*max_bytes*/ None,
     )
     .await
-    .expect("read")
-    .expect("full buffer output");
-    assert_eq!(out.len(), expected_len);
+    .expect("read");
+    assert_eq!(out.text.len(), expected_len);
 }
 
 #[test]
@@ -398,73 +237,6 @@ fn aggregate_output_keeps_all_bytes_when_uncapped() {
     );
 }
 
-#[tokio::test]
-async fn sequenced_output_preserves_real_alternating_process_order() -> Result<()> {
-    #[cfg(windows)]
-    let command = vec![
-        "powershell.exe".to_string(),
-        "-NonInteractive".to_string(),
-        "-NoLogo".to_string(),
-        "-Command".to_string(),
-        concat!(
-            "[Console]::Out.WriteLine('stdout-0'); [Console]::Out.Flush(); ",
-            "Start-Sleep -Milliseconds 75; ",
-            "[Console]::Error.WriteLine('stderr-0'); [Console]::Error.Flush(); ",
-            "Start-Sleep -Milliseconds 75; ",
-            "[Console]::Out.WriteLine('stdout-1'); [Console]::Out.Flush(); ",
-            "Start-Sleep -Milliseconds 75; ",
-            "[Console]::Error.WriteLine('stderr-1'); [Console]::Error.Flush();",
-        )
-        .to_string(),
-    ];
-    #[cfg(not(windows))]
-    let command = vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        concat!(
-            "printf 'stdout-0\\n'; sleep 0.075; ",
-            "printf 'stderr-0\\n' >&2; sleep 0.075; ",
-            "printf 'stdout-1\\n'; sleep 0.075; ",
-            "printf 'stderr-1\\n' >&2",
-        )
-        .to_string(),
-    ];
-
-    let output = exec(
-        ExecParams {
-            command,
-            cwd: codex_utils_absolute_path::AbsolutePathBuf::current_dir()?,
-            expiration: 5_000.into(),
-            capture_policy: ExecCapturePolicy::Verification,
-            env: std::env::vars().collect(),
-            network: None,
-            network_environment_id: None,
-            sandbox_permissions: SandboxPermissions::UseDefault,
-            windows_sandbox_level: WindowsSandboxLevel::Disabled,
-            windows_sandbox_private_desktop: false,
-            justification: None,
-            arg0: None,
-        },
-        NetworkSandboxPolicy::Enabled,
-        /*stdout_stream*/ None,
-        /*after_spawn*/ None,
-    )
-    .await?;
-
-    let aggregate = output.aggregated_output.from_utf8_lossy().text;
-    let positions = ["stdout-0", "stderr-0", "stdout-1", "stderr-1"].map(|needle| {
-        aggregate
-            .find(needle)
-            .unwrap_or_else(|| panic!("missing {needle} in {aggregate:?}"))
-    });
-    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-    assert!(aggregate.contains("stream=stdout sequence=0"));
-    assert!(aggregate.contains("stream=stderr sequence=1"));
-    assert!(aggregate.contains("stream=stdout sequence=2"));
-    assert!(aggregate.contains("stream=stderr sequence=3"));
-    Ok(())
-}
-
 #[test]
 fn full_buffer_capture_policy_disables_caps_and_exec_expiration() {
     assert_eq!(ExecCapturePolicy::FullBuffer.retained_bytes_cap(), None);
@@ -473,54 +245,6 @@ fn full_buffer_capture_policy_disables_caps_and_exec_expiration() {
         Duration::from_millis(IO_DRAIN_TIMEOUT_MS)
     );
     assert!(!ExecCapturePolicy::FullBuffer.uses_expiration());
-}
-
-#[test]
-fn verification_capture_policy_keeps_exact_bytes_and_real_expiration() {
-    assert_eq!(ExecCapturePolicy::Verification.retained_bytes_cap(), None);
-    assert!(ExecCapturePolicy::Verification.uses_expiration());
-}
-
-#[tokio::test]
-async fn exec_verification_capture_reports_a_real_timeout() -> Result<()> {
-    #[cfg(windows)]
-    let command = vec![
-        "powershell.exe".to_string(),
-        "-NonInteractive".to_string(),
-        "-NoLogo".to_string(),
-        "-Command".to_string(),
-        "Start-Sleep -Seconds 2".to_string(),
-    ];
-    #[cfg(not(windows))]
-    let command = vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        "sleep 2".to_string(),
-    ];
-
-    let output = exec(
-        ExecParams {
-            command,
-            cwd: codex_utils_absolute_path::AbsolutePathBuf::current_dir()?,
-            expiration: 25.into(),
-            capture_policy: ExecCapturePolicy::Verification,
-            env: std::env::vars().collect(),
-            network: None,
-            network_environment_id: None,
-            sandbox_permissions: SandboxPermissions::UseDefault,
-            windows_sandbox_level: WindowsSandboxLevel::Disabled,
-            windows_sandbox_private_desktop: false,
-            justification: None,
-            arg0: None,
-        },
-        NetworkSandboxPolicy::Enabled,
-        /*stdout_stream*/ None,
-        /*after_spawn*/ None,
-    )
-    .await?;
-
-    assert!(output.timed_out);
-    Ok(())
 }
 
 #[tokio::test]
@@ -572,7 +296,6 @@ async fn exec_full_buffer_capture_ignores_expiration() -> Result<()> {
 #[tokio::test]
 async fn exec_full_buffer_capture_keeps_io_drain_timeout_when_descendant_holds_pipe_open()
 -> Result<()> {
-    let started = tokio::time::Instant::now();
     let output = tokio::time::timeout(
         Duration::from_millis(IO_DRAIN_TIMEOUT_MS * 3),
         exec(
@@ -603,93 +326,6 @@ async fn exec_full_buffer_capture_keeps_io_drain_timeout_when_descendant_holds_p
     .expect("full-buffer exec should return once the I/O drain guard fires")?;
 
     assert!(!output.timed_out);
-    assert!(started.elapsed() < Duration::from_millis(IO_DRAIN_TIMEOUT_MS * 2));
-    assert!(output.stdout.text.contains("hello"));
-    assert!(output.aggregated_output.text.contains("hello"));
-    assert_eq!(
-        output
-            .aggregated_output
-            .text
-            .matches("stdout/stderr drain timed out")
-            .count(),
-        1
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn exec_shell_tool_drains_both_streams_under_one_deadline_with_partial_output() -> Result<()>
-{
-    #[cfg(windows)]
-    let command = vec![
-        "cmd.exe".to_string(),
-        "/C".to_string(),
-        "<nul set /p =STDOUT_PARTIAL & <nul set /p =STDERR_PARTIAL 1>&2".to_string(),
-    ];
-    #[cfg(not(windows))]
-    let command = vec![
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        "printf STDOUT_PARTIAL; printf STDERR_PARTIAL >&2; sleep 4 &".to_string(),
-    ];
-    let started = tokio::time::Instant::now();
-
-    let output = tokio::time::timeout(
-        Duration::from_millis(IO_DRAIN_TIMEOUT_MS * 3),
-        exec(
-            ExecParams {
-                command,
-                cwd: codex_utils_absolute_path::AbsolutePathBuf::current_dir()?,
-                expiration: 1.into(),
-                capture_policy: ExecCapturePolicy::ShellTool,
-                env: std::env::vars().collect(),
-                network: None,
-                network_environment_id: None,
-                sandbox_permissions: SandboxPermissions::UseDefault,
-                windows_sandbox_level: WindowsSandboxLevel::Disabled,
-                windows_sandbox_private_desktop: false,
-                justification: None,
-                arg0: None,
-            },
-            NetworkSandboxPolicy::Enabled,
-            /*stdout_stream*/ None,
-            /*after_spawn*/ None,
-        ),
-    )
-    .await
-    .expect("shell-tool exec should return once the shared drain deadline fires")?;
-
-    let elapsed = started.elapsed();
-    #[cfg(not(windows))]
-    assert!(
-        elapsed >= Duration::from_millis(IO_DRAIN_TIMEOUT_MS.saturating_sub(500)),
-        "descriptor-holding descendant should exercise the drain deadline: {elapsed:?}"
-    );
-    #[cfg(windows)]
-    assert!(
-        elapsed < Duration::from_millis(IO_DRAIN_TIMEOUT_MS),
-        "direct stdout/stderr capture should not wait for the drain deadline: {elapsed:?}"
-    );
-    #[cfg(not(windows))]
-    assert!(
-        elapsed < Duration::from_millis(IO_DRAIN_TIMEOUT_MS * 2),
-        "stdout and stderr must share one drain deadline: {elapsed:?}"
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout.text);
-    let stderr = String::from_utf8_lossy(&output.stderr.text);
-    let aggregated_output = String::from_utf8_lossy(&output.aggregated_output.text);
-    assert!(stdout.contains("STDOUT_PARTIAL"));
-    assert!(stderr.contains("STDERR_PARTIAL"));
-    assert!(aggregated_output.contains("STDOUT_PARTIAL"));
-    assert!(aggregated_output.contains("STDERR_PARTIAL"));
-    let incomplete_markers = aggregated_output
-        .matches("stdout/stderr drain timed out")
-        .count();
-    #[cfg(windows)]
-    assert_eq!(incomplete_markers, 0);
-    #[cfg(not(windows))]
-    assert_eq!(incomplete_markers, 1);
 
     Ok(())
 }

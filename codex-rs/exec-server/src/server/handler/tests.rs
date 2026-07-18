@@ -192,7 +192,6 @@ async fn long_poll_read_fails_after_session_resume() {
                 process_id: ProcessId::from("proc-long-poll"),
                 after_seq: None,
                 max_bytes: None,
-                max_chunks: None,
                 wait_ms: Some(500),
             })
             .await
@@ -333,7 +332,6 @@ async fn read_process_until_closed(
                 process_id: process_id.clone(),
                 after_seq,
                 max_bytes: None,
-                max_chunks: None,
                 wait_ms: Some(500),
             })
             .await

@@ -1,0 +1,287 @@
+KD4 PHASE 2 BOUNDED PORT COMPLETION REPORT
+==========================================
+
+Date: 2026-07-09
+Repository: C:\Users\kuh\Desktop\kd4
+Rust workspace: C:\Users\kuh\Desktop\kd4\codex-rs
+Comparison source: C:\Users\kuh\Desktop\codexKD2\codex-rs
+Phase 1 baseline: 3415199eb3d9edd056f0ea4a949f1700bb99ba37 (Phase 1)
+Branch at start: main, exactly synchronized with origin/main
+
+FINAL PHASE 2 OUTCOME
+---------------------
+
+Phase 2 candidates 9 through 14 were reviewed against the current KD4 owners.
+All six bounded improvements were implemented without replacing stronger KD4
+behavior. The runtime paths are wired, the relevant focused validations were
+run, and the closure sweeps found no generated-file, lockfile, placeholder, or
+stale parallel-path drift.
+
+Completion gate: PASSED for the requested Phase 2 scope.
+Aggregate Wiring Guard verdict: WIRED (intent-only proof over the declared
+runtime targets; nextest configuration was separately validated by nextest).
+
+Nothing was published, committed, pushed, staged, or installed during Phase 2.
+The Codex Desktop installation therefore still uses the previously published
+binary until the user later chooses to run just publish-local-codex-final and
+restart Codex Desktop.
+
+CANDIDATE 9 - BOUNDED TUI /diff FOR UNTRACKED FILES
+--------------------------------------------------
+
+Status: PORTED.
+
+Owner:
+  codex-rs/tui/src/get_git_diff.rs
+
+Implemented behavior:
+  - Keeps KD4's existing Git hardening, fsmonitor handling, executable-filter
+    protection, workspace command executor, and command timeouts.
+  - Includes full untracked-file diffs for at most the first 50 paths returned
+    by git ls-files.
+  - Adds a deterministic comment block with the omitted count and every omitted
+    path after the included diffs.
+  - Does not change tracked-diff behavior.
+
+Validation:
+  - 6/6 focused get_git_diff tests passed.
+  - The cap test proves 50 content diffs, two omitted paths, the exact notice,
+    and the bounded Git command count.
+  - Wiring Guard reaches get_git_diff,
+    append_omitted_untracked_diff_notice, and MAX_UNTRACKED_FILE_DIFFS.
+
+CANDIDATE 10 - ATOMIC GENERATED MEMORY WRITES
+---------------------------------------------
+
+Status: PORTED by activating KD4's existing stronger helper.
+
+Owners:
+  codex-rs/memories/write/Cargo.toml
+  codex-rs/memories/write/src/generated_files.rs
+  codex-rs/memories/write/src/lib.rs
+  codex-rs/memories/write/src/storage.rs
+  codex-rs/memories/write/src/workspace.rs
+
+Implemented behavior:
+  - Promotes the existing workspace tempfile dependency from test-only to a
+    production dependency without changing its version or Cargo.lock.
+  - Activates the generated_files module.
+  - Routes both raw-memory index writes, rollout-summary writes, and the Phase 2
+    workspace-diff write through write_generated_file.
+  - Preserves KD4's atomic same-directory temporary-file replacement behavior.
+  - Skips replacement when an existing file already has identical bytes,
+    including an unchanged read-only file.
+
+Validation:
+  - 38/38 codex-memories-write tests passed with live CODEX_SQLITE_HOME removed.
+  - The focused startup test passed with KD4's already-configured 8 MiB
+    RUST_MIN_STACK; no global stack setting was changed.
+  - A production-owner sweep found direct tokio::fs::write calls only in test
+    fixtures, not in the generated-memory production writers.
+  - Wiring Guard reaches the helper and its storage/workspace call sites.
+
+CANDIDATE 11 - SAFE HIDDEN APPLY_PATCH STDIN DISPATCH
+----------------------------------------------------
+
+Status: PORTED with the current apply-patch parser, filesystem, and sandbox
+safety behavior left unchanged.
+
+Owner:
+  codex-rs/arg0/src/lib.rs
+
+Implemented behavior:
+  - --codex-run-as-apply-patch accepts exactly one UTF-8 PATCH argument.
+  - When no PATCH argument exists, it reads a non-empty UTF-8 PATCH from stdin.
+  - Empty stdin and extra arguments are usage errors with exit code 2.
+  - Invalid UTF-8 argv/stdin and stdin read failures are execution/input errors
+    with exit code 1.
+  - The accepted patch still enters the same codex_apply_patch::apply_patch
+    implementation and local filesystem owner as current KD4.
+
+Validation:
+  - 12/12 codex-arg0 tests passed.
+  - Real debug codex.exe plus the generated apply_patch.bat route was exercised:
+      stdin patch: applied successfully, exit 0
+      empty stdin: rejected, exit 2
+      extra argv: rejected, exit 2
+      invalid UTF-8 stdin: rejected, exit 1
+  - The Windows package-layout alias test passed.
+  - No debug binary was published.
+  - Wiring Guard reaches arg0_dispatch and
+    apply_patch_arg_from_args_or_stdin.
+
+CANDIDATE 12 - BOUNDED PLAIN-ROLLOUT SEARCH SNIPPETS
+---------------------------------------------------
+
+Status: PORTED while preserving KD4's recursive discovery and compressed
+rollout behavior.
+
+Owners:
+  codex-rs/rollout/src/search.rs
+  codex-rs/rollout/src/compression_tests.rs
+
+Implemented behavior:
+  - Replaces ripgrep's path-only output with --json match events for plain
+    .jsonl rollouts.
+  - Parses the matched path and derives the first bounded conversation snippet.
+  - Retains a metadata-only path with no snippet and upgrades it if a later
+    conversation line supplies a snippet.
+  - Keeps the first real snippet rather than replacing it with later matches.
+  - Keeps compressed-rollout scanning and logical-path handling unchanged.
+  - When ripgrep is missing, keeps the existing rollout_contains discovery
+    path and adds bounded snippet extraction for plain files.
+
+Validation:
+  - 81/81 codex-rollout tests passed.
+  - A live installed rg.exe --json probe produced the path.text and lines.text
+    shape covered by the parser tests.
+  - Plain and compressed missing-ripgrep fallback snippets are both covered.
+  - Wiring Guard reaches parse_ripgrep_rollout_match and the thread-store
+    search_rollout_matches consumer.
+
+CANDIDATE 13 - WINDOWS CONFIG PROTO GENERATOR
+---------------------------------------------
+
+Status: PORTED through the current KD4 generator owner.
+
+Owners:
+  justfile
+  codex-rs/config/scripts/generate-proto.ps1 (new)
+
+Implemented behavior:
+  - Adds one cross-platform generate-config-proto recipe: the existing shell
+    wrapper on Unix and the new PowerShell wrapper on Windows.
+  - Calls the current codex-config generate-proto Rust example through KD4's
+    cargo-lane.ps1 owner.
+  - Generates in a unique system-temp directory so failed generation or
+    normalization never partially changes the tracked binding.
+  - Resolves protoc from -ProtocPath, PROTOC, PATH, or the installed Cargo
+    vendored win32 protoc cache.
+  - Restores the caller's PROTOC environment after the run.
+  - Applies the current clippy allow, rustfmt edition 2024, one blank line after
+    the allow, LF line endings, and UTF-8 without BOM.
+  - -Check byte-compares the normalized temporary result and does not write the
+    tracked binding.
+  - Write mode is idempotent and only replaces the binding when bytes differ.
+  - Cleanup verifies the resolved temporary path is under the system temp root
+    before recursive removal.
+
+Validation:
+  - PowerShell parser passed.
+  - just --list contains generate-config-proto.
+  - just --dry-run generate-config-proto routes to generate-proto.ps1.
+  - Final generate-proto.ps1 -Check passed using the vendored protoc.
+  - The tracked generated binding remained current with SHA-256:
+    0B1CF3E2814ED34781F473C72B7874F378A50FD4907BEB242C177BB43173FCAA
+  - The new script contains no UTF-8 BOM and no CR bytes.
+  - No codex-generate-proto-* temporary directories remained.
+  - Cargo.lock, MODULE.bazel.lock, and the generated binding were unchanged.
+  - Wiring Guard reaches Normalize-GeneratedProto; recipe routing is proven by
+    just parsing and dry-run output.
+
+CANDIDATE 14 - CONDITIONAL WINDOWS NEXTEST HEADROOM
+--------------------------------------------------
+
+Status: PORTED only after current pressure was reproduced.
+
+Owner:
+  codex-rs/.config/nextest.toml
+
+Evidence and implemented behavior:
+  - The existing windows_sandbox_legacy_sessions group remains max-threads = 1.
+  - The existing filter remains:
+      package(codex-windows-sandbox) & test(legacy_)
+  - A warm current run found five restricted-token/private-desktop tests taking
+    about 39 seconds each, leaving only about 21 seconds under the inherited
+    60-second termination ceiling.
+  - Only the slow timeout was raised to period = 30s, terminate-after = 4,
+    producing a bounded 120-second ceiling while retaining 30-second slow-test
+    reporting.
+  - Retries, filters, grouping, concurrency, and test code were not changed.
+
+Validation:
+  - nextest parsed the final configuration.
+  - nextest reported the existing serialized group with all 13 matching tests.
+  - The measured full lane ran 13 tests: 11 passed and two current behavioral
+    assertions failed. Neither failure was a nextest timeout:
+      legacy_capture_cancellation_is_not_reported_as_timeout failed at about 39s
+      legacy_workspace_write_delete_is_limited_to_writable_roots failed quickly
+  - Those two current sandbox behavior failures were recorded and intentionally
+    not changed in this timeout-only bounded port.
+  - This config-only slice was declared with no runtime wiring target and was
+    validated through nextest's owning parser/report.
+
+PHASE 2 CLOSURE EVIDENCE
+------------------------
+
+Static wiring:
+  - Wiring Guard 0.1.11 aggregate intent-only check: WIRED.
+  - Proven targets:
+      get_git_diff
+      append_omitted_untracked_diff_notice
+      MAX_UNTRACKED_FILE_DIFFS
+      generated_files::write_generated_file
+      storage and workspace write_generated_file call sites
+      arg0_dispatch
+      apply_patch_arg_from_args_or_stdin
+      parse_ripgrep_rollout_match
+      thread-store search_rollout_matches
+      Normalize-GeneratedProto
+
+Mechanical closure:
+  - cargo fmt --all -- --check: passed. The stable toolchain emitted only the
+    existing imports_granularity nightly-feature warnings.
+  - cargo metadata --no-deps --format-version 1 --locked: passed.
+  - git diff --check: passed.
+  - Added-line TODO/FIXME/XXX/todo!/unimplemented!/placeholder/stub scan: none.
+  - Protected generated/lock diff scan: none.
+  - Full focused diff review: no stale duplicate runtime path found.
+  - Exact accidental C:\Users\kuh\Desktop\kd4\nul artifact: absent.
+
+FILES IN THE PHASE 2 CHANGE SET
+-------------------------------
+
+Modified:
+  codex-rs/.config/nextest.toml
+  codex-rs/arg0/src/lib.rs
+  codex-rs/memories/write/Cargo.toml
+  codex-rs/memories/write/src/generated_files.rs
+  codex-rs/memories/write/src/lib.rs
+  codex-rs/memories/write/src/storage.rs
+  codex-rs/memories/write/src/workspace.rs
+  codex-rs/rollout/src/compression_tests.rs
+  codex-rs/rollout/src/search.rs
+  codex-rs/tui/src/get_git_diff.rs
+  justfile
+
+New:
+  codex-rs/config/scripts/generate-proto.ps1
+  kd4_phase2_completion_report.txt
+
+Harness evidence (normally ignored by git):
+  .codex/harness/runs/2026-07-09-phase2-bounded-ports/PLAN.md
+  .codex/harness/runs/2026-07-09-phase2-bounded-ports/EVAL.md
+
+KNOWN REMAINING RISK / DEFERRED WORK
+------------------------------------
+
+  - The two Windows sandbox assertion failures listed under Candidate 14 remain
+    current behavior and may deserve a separate diagnosis task. The timeout
+    port neither caused nor fixes them.
+  - The 120-second ceiling is justified by observed approximately 39-second
+    tests plus expected local build/disk contention, but an intentionally
+    induced maximum-contention stress run was not needed for this bounded port.
+  - Desktop-visible behavior is not updated until a later explicit publish and
+    Codex Desktop restart.
+  - No Phase 3 manual integrations were started.
+
+REPOSITORY ACTIONS NOT PERFORMED
+--------------------------------
+
+  publish: no
+  install/replace LOCAL-KD binaries: no
+  Codex Desktop restart: no
+  git stage: no
+  git commit: no
+  git push: no
+

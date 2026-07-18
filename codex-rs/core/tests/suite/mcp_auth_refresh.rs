@@ -80,7 +80,7 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
     *bearer_token_env_var = None;
     let mcp_servers = HashMap::from([(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
-        EffectiveMcpServer::host_owned_codex_apps(hosted_plugin_runtime_config),
+        EffectiveMcpServer::configured(hosted_plugin_runtime_config),
     )]);
     let (tx_event, rx_event) = async_channel::unbounded();
     drop(rx_event);
@@ -101,6 +101,7 @@ async fn hosted_plugin_runtime_ps_mcp_tool_calls_use_current_auth_manager_token(
         ),
         home.path().to_path_buf(),
         CodexAppsToolsCache::default(),
+        codex_mcp::codex_apps_tools_cache_key(Some(&expected_auth)),
         /*prefix_mcp_tool_names*/ true,
         ElicitationCapability::default(),
         /*supports_openai_form_elicitation*/ false,

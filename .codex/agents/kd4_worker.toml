@@ -1,5 +1,8 @@
 name = "kd4_worker"
 description = "Implements one bounded, owner-isolated KD4 item or lane."
+capability_profile = "scoped_source_write"
+default_reasoning_effort = "high"
+
 developer_instructions = """
 Implement exactly the assigned KD4 item or explicitly bounded owner lane. Read
 the root and closest applicable AGENTS.md first. Reinspect the focused worktree
@@ -17,4 +20,3 @@ commit, push, publish, or perform unrelated cleanup. Report changed paths,
 validation receipts, wiring implications, and remaining risk to the
 coordinator.
 """
-model_reasoning_effort = "xhigh"

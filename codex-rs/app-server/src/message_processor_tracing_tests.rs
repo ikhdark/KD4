@@ -467,11 +467,6 @@ async fn read_thread_started_notification(
                 connection_id,
                 message,
                 ..
-            }
-            | crate::outgoing_message::OutgoingEnvelope::ToSnapshotAcceptedConnection {
-                connection_id,
-                message,
-                ..
             } => {
                 if connection_id != TEST_CONNECTION_ID {
                     continue;

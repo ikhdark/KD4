@@ -3,7 +3,7 @@
 //! `ChatComposer` publishes every change of the `@token` as
 //! `AppEvent::StartFileSearch(query)`. This manager owns a single
 //! `codex-file-search` session for the current search root, updates the query
-//! on every keystroke, and retains the completed walk across empty queries.
+//! on every keystroke, and drops the session when the query becomes empty.
 
 use codex_file_search as file_search;
 use std::path::PathBuf;
@@ -60,9 +60,7 @@ impl FileSearchManager {
         st.latest_query.push_str(&query);
 
         if query.is_empty() {
-            if let Some(session) = st.session.as_ref() {
-                session.update_query("");
-            }
+            st.session.take();
             return;
         }
 
@@ -132,51 +130,4 @@ impl file_search::SessionReporter for TuiSessionReporter {
     }
 
     fn on_complete(&self) {}
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::fs;
-    use std::thread;
-    use std::time::Duration;
-    use std::time::Instant;
-
-    #[test]
-    fn empty_query_retains_session_and_reuses_the_walk() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        fs::write(temp.path().join("alpha.txt"), "alpha").expect("file");
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let manager = FileSearchManager::new(temp.path().to_path_buf(), AppEventSender::new(tx));
-
-        manager.on_user_query("alpha".to_string());
-        manager.on_user_query(String::new());
-        {
-            #[expect(clippy::unwrap_used)]
-            let state = manager.state.lock().unwrap();
-            assert!(state.session.is_some());
-        }
-        manager.on_user_query("beta".to_string());
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        'wait_for_beta: loop {
-            while let Ok(event) = rx.try_recv() {
-                if matches!(event, AppEvent::FileSearchResult { query, .. } if query == "beta") {
-                    break 'wait_for_beta;
-                }
-            }
-            assert!(Instant::now() < deadline, "beta query was not processed");
-            thread::sleep(Duration::from_millis(10));
-        }
-
-        #[expect(clippy::unwrap_used)]
-        let state = manager.state.lock().unwrap();
-        let usage = state
-            .session
-            .as_ref()
-            .expect("session retained")
-            .usage_snapshot();
-        assert_eq!(usage.query_updates, 3);
-        assert_eq!(usage.walker_runs, 1);
-    }
 }

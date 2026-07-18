@@ -11,7 +11,6 @@ use codex_analytics::AnalyticsEventsClient;
 use codex_analytics::TurnDeliveryFact;
 use codex_analytics::TurnDeliveryStatus;
 use codex_app_server_protocol::ClientResponsePayload;
-use codex_app_server_protocol::ExperimentalApi;
 use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result;
@@ -36,7 +35,6 @@ use tracing::warn;
 
 use crate::error_code::internal_error;
 use crate::server_request_error::TURN_TRANSITION_PENDING_REQUEST_ERROR_REASON;
-use crate::thread_state::RecipientSnapshot;
 pub(crate) use codex_app_server_transport::ConnectionId;
 pub(crate) use codex_app_server_transport::OutgoingError;
 pub(crate) use codex_app_server_transport::OutgoingMessage;
@@ -100,65 +98,9 @@ pub(crate) enum OutgoingEnvelope {
         message: OutgoingMessage,
         write_complete_tx: Option<oneshot::Sender<()>>,
     },
-    ToSnapshotAcceptedConnection {
-        connection_id: ConnectionId,
-        message: OutgoingMessage,
-        write_complete_tx: Option<oneshot::Sender<()>>,
-    },
     Broadcast {
         message: OutgoingMessage,
     },
-}
-
-struct CloneForAllButLast<T> {
-    value: Option<T>,
-    remaining: usize,
-}
-
-impl<T> CloneForAllButLast<T> {
-    fn new(value: T, recipients: usize) -> Self {
-        Self {
-            value: Some(value),
-            remaining: recipients,
-        }
-    }
-}
-
-impl<T: Clone> Iterator for CloneForAllButLast<T> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.remaining == 0 {
-            return None;
-        }
-        self.remaining -= 1;
-        if self.remaining == 0 {
-            self.value.take()
-        } else {
-            Some(
-                self.value
-                    .as_ref()
-                    .expect("fanout value remains available before the final recipient")
-                    .clone(),
-            )
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        (self.remaining, Some(self.remaining))
-    }
-}
-
-impl<T: Clone> ExactSizeIterator for CloneForAllButLast<T> {}
-
-fn snapshot_fanout<'a, T: Clone + 'a>(
-    connection_ids: &'a [ConnectionId],
-    value: T,
-) -> impl ExactSizeIterator<Item = (ConnectionId, T)> + 'a {
-    connection_ids
-        .iter()
-        .copied()
-        .zip(CloneForAllButLast::new(value, connection_ids.len()))
 }
 
 /// Sends messages to the client and manages request callbacks.
@@ -179,7 +121,7 @@ pub(crate) struct OutgoingMessageSender {
 #[derive(Clone)]
 pub(crate) struct ThreadScopedOutgoingMessageSender {
     outgoing: Arc<OutgoingMessageSender>,
-    recipients: RecipientSnapshot,
+    connection_ids: Arc<Vec<ConnectionId>>,
     thread_id: ThreadId,
 }
 
@@ -221,13 +163,15 @@ impl ThreadScopedOutgoingMessageSender {
     ) {
         self.outgoing
             .analytics_events_client
-            .track_notification(&notification);
+            .track_notification(notification.clone());
 
-        let target_connection_ids = self.accepted_connection_ids(&notification);
         let ServerNotification::TurnCompleted(completed) = &notification else {
-            if !target_connection_ids.is_empty() {
+            if !self.connection_ids.is_empty() {
                 self.outgoing
-                    .send_snapshot_notification_to_connections(&target_connection_ids, notification)
+                    .send_server_notification_to_connections(
+                        self.connection_ids.as_slice(),
+                        notification,
+                    )
                     .await;
             }
             return;
@@ -245,7 +189,7 @@ impl ThreadScopedOutgoingMessageSender {
             })
             .and_then(|milliseconds| u64::try_from(milliseconds).ok());
 
-        let mut target_connection_ids = target_connection_ids;
+        let mut target_connection_ids = self.connection_ids.as_ref().clone();
         target_connection_ids.sort_unstable_by_key(|connection_id| connection_id.0);
         target_connection_ids.dedup();
         self.outgoing
@@ -260,7 +204,6 @@ impl ThreadScopedOutgoingMessageSender {
             .await;
     }
 
-    #[cfg(test)]
     pub(crate) fn new(
         outgoing: Arc<OutgoingMessageSender>,
         connection_ids: Vec<ConnectionId>,
@@ -268,45 +211,9 @@ impl ThreadScopedOutgoingMessageSender {
     ) -> Self {
         Self {
             outgoing,
-            recipients: RecipientSnapshot::permissive(connection_ids),
+            connection_ids: Arc::new(connection_ids),
             thread_id,
         }
-    }
-
-    pub(crate) fn from_snapshot(
-        outgoing: Arc<OutgoingMessageSender>,
-        recipients: RecipientSnapshot,
-        thread_id: ThreadId,
-    ) -> Self {
-        Self {
-            outgoing,
-            recipients,
-            thread_id,
-        }
-    }
-
-    fn accepted_connection_ids(&self, notification: &ServerNotification) -> Vec<ConnectionId> {
-        let is_raw = matches!(
-            notification,
-            ServerNotification::RawResponseItemCompleted(_)
-        );
-        let is_experimental = notification.experimental_reason().is_some();
-        let method = notification.to_string();
-        self.recipients
-            .descriptors()
-            .iter()
-            .filter(|descriptor| !is_raw || descriptor.raw_events_enabled)
-            .filter(|descriptor| {
-                !is_experimental || descriptor.delivery_filter.experimental_api_enabled
-            })
-            .filter(|descriptor| {
-                !descriptor
-                    .delivery_filter
-                    .opted_out_notification_methods
-                    .contains(method.as_str())
-            })
-            .map(|descriptor| descriptor.connection_id)
-            .collect()
     }
 
     pub(crate) async fn send_request(
@@ -315,7 +222,7 @@ impl ThreadScopedOutgoingMessageSender {
     ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
         self.outgoing
             .send_request_to_connections(
-                Some(self.recipients.connection_ids()),
+                Some(self.connection_ids.as_slice()),
                 payload,
                 Some(self.thread_id),
             )
@@ -339,13 +246,12 @@ impl ThreadScopedOutgoingMessageSender {
     pub(crate) async fn send_server_notification(&self, notification: ServerNotification) {
         self.outgoing
             .analytics_events_client
-            .track_notification(&notification);
-        let connection_ids = self.accepted_connection_ids(&notification);
-        if connection_ids.is_empty() {
+            .track_notification(notification.clone());
+        if self.connection_ids.is_empty() {
             return;
         }
         self.outgoing
-            .send_snapshot_notification_to_connections(&connection_ids, notification)
+            .send_server_notification_to_connections(self.connection_ids.as_slice(), notification)
             .await;
     }
 
@@ -811,31 +717,6 @@ impl OutgoingMessageSender {
         }
     }
 
-    async fn send_snapshot_notification_to_connections(
-        &self,
-        connection_ids: &[ConnectionId],
-        notification: ServerNotification,
-    ) {
-        tracing::trace!(
-            targeted_connections = connection_ids.len(),
-            "app-server snapshot event: {notification}"
-        );
-        let outgoing_message = OutgoingMessage::AppServerNotification(notification);
-        for (connection_id, message) in snapshot_fanout(connection_ids, outgoing_message) {
-            if let Err(err) = self
-                .sender
-                .send(OutgoingEnvelope::ToSnapshotAcceptedConnection {
-                    connection_id,
-                    message,
-                    write_complete_tx: None,
-                })
-                .await
-            {
-                warn!("failed to send server notification to client: {err:?}");
-            }
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_turn_completed_with_receipts(
         &self,
@@ -856,15 +737,14 @@ impl OutgoingMessageSender {
             .map(|completed_at_ms| now_unix_timestamp_ms().saturating_sub(completed_at_ms));
         let outgoing_message = OutgoingMessage::AppServerNotification(notification);
         let mut receipts = Vec::with_capacity(target_connection_ids.len());
-        let target_count = target_connection_ids.len();
 
-        for (connection_id, message) in snapshot_fanout(&target_connection_ids, outgoing_message) {
+        for connection_id in target_connection_ids {
             let (write_complete_tx, write_complete_rx) = oneshot::channel();
             let send_result = self
                 .sender
-                .send(OutgoingEnvelope::ToSnapshotAcceptedConnection {
+                .send(OutgoingEnvelope::ToConnection {
                     connection_id,
-                    message,
+                    message: outgoing_message.clone(),
                     write_complete_tx: Some(write_complete_tx),
                 })
                 .await;
@@ -1213,9 +1093,6 @@ fn now_unix_timestamp_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     use codex_app_server_protocol::AccountLoginCompletedNotification;
@@ -1235,7 +1112,6 @@ mod tests {
     use codex_app_server_protocol::ModelVerificationNotification;
     use codex_app_server_protocol::RateLimitSnapshot;
     use codex_app_server_protocol::RateLimitWindow;
-    use codex_app_server_protocol::RawResponseItemCompletedNotification;
     use codex_app_server_protocol::ServerResponse;
     use codex_app_server_protocol::ToolRequestUserInputParams;
     use codex_app_server_protocol::Turn;
@@ -1244,8 +1120,6 @@ mod tests {
     use codex_app_server_protocol::TurnModerationMetadataNotification;
     use codex_app_server_protocol::TurnStatus;
     use codex_protocol::ThreadId;
-    use codex_protocol::models::ContentItem;
-    use codex_protocol::models::ResponseItem;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use std::sync::Arc;
@@ -1253,258 +1127,6 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::thread_state::ConnectionCapabilities;
-    use crate::thread_state::ResolvedDeliveryFilter;
-    use crate::thread_state::ThreadStateManager;
-
-    #[test]
-    fn accepted_recipient_snapshot_fanout_clones_exactly_n_minus_one_times() {
-        struct CountedClone(Arc<AtomicUsize>);
-
-        impl Clone for CountedClone {
-            fn clone(&self) -> Self {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Self(Arc::clone(&self.0))
-            }
-        }
-
-        for recipients in 0..=4 {
-            let clones = Arc::new(AtomicUsize::new(0));
-            let values = CloneForAllButLast::new(CountedClone(Arc::clone(&clones)), recipients)
-                .collect::<Vec<_>>();
-            assert_eq!(values.len(), recipients);
-            assert_eq!(clones.load(Ordering::SeqCst), recipients.saturating_sub(1));
-        }
-    }
-
-    #[tokio::test]
-    async fn raw_events_are_filtered_before_snapshot_fanout() {
-        let manager = ThreadStateManager::new();
-        let thread_id = ThreadId::new();
-        let raw_connection = ConnectionId(1);
-        let filtered_connection = ConnectionId(2);
-        for connection_id in [raw_connection, filtered_connection] {
-            manager
-                .connection_initialized(connection_id, ConnectionCapabilities::default())
-                .await;
-        }
-        manager
-            .try_ensure_connection_subscribed(thread_id, raw_connection, true)
-            .await
-            .expect("raw subscription");
-        manager
-            .try_ensure_connection_subscribed(thread_id, filtered_connection, false)
-            .await
-            .expect("filtered subscription");
-
-        let (tx, mut rx) = mpsc::channel(4);
-        let outgoing = Arc::new(OutgoingMessageSender::new(
-            tx,
-            codex_analytics::AnalyticsEventsClient::disabled(),
-        ));
-        let scoped = ThreadScopedOutgoingMessageSender::from_snapshot(
-            Arc::clone(&outgoing),
-            manager.recipient_snapshot(thread_id).await,
-            thread_id,
-        );
-        scoped
-            .send_server_notification(ServerNotification::RawResponseItemCompleted(
-                RawResponseItemCompletedNotification {
-                    thread_id: thread_id.to_string(),
-                    turn_id: "turn-1".to_string(),
-                    item: ResponseItem::Message {
-                        id: None,
-                        role: "assistant".to_string(),
-                        content: vec![ContentItem::OutputText {
-                            text: "done".to_string(),
-                        }],
-                        phase: None,
-                        internal_chat_message_metadata_passthrough: None,
-                    },
-                },
-            ))
-            .await;
-
-        let envelope = rx.recv().await.expect("raw recipient envelope");
-        assert!(matches!(
-            envelope,
-            OutgoingEnvelope::ToSnapshotAcceptedConnection { connection_id, .. }
-                if connection_id == raw_connection
-        ));
-        assert!(rx.try_recv().is_err());
-        outgoing.shutdown_delivery_tasks().await;
-    }
-
-    #[tokio::test]
-    async fn mixed_filters_run_before_ordered_n_minus_one_snapshot_cloning() {
-        struct CountedClone(Arc<AtomicUsize>);
-
-        impl Clone for CountedClone {
-            fn clone(&self) -> Self {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Self(Arc::clone(&self.0))
-            }
-        }
-
-        let manager = ThreadStateManager::new();
-        let thread_id = ThreadId::new();
-        let accepted_first = ConnectionId(1);
-        let raw_disabled = ConnectionId(2);
-        let method_opted_out = ConnectionId(3);
-        let accepted_second = ConnectionId(4);
-        let accepted_last = ConnectionId(5);
-        for connection_id in [accepted_first, raw_disabled, accepted_second, accepted_last] {
-            manager
-                .connection_initialized(connection_id, ConnectionCapabilities::default())
-                .await;
-        }
-        manager
-            .connection_initialized(
-                method_opted_out,
-                ConnectionCapabilities {
-                    request_attestation: false,
-                    delivery_filter: ResolvedDeliveryFilter::new(
-                        false,
-                        HashSet::from(["rawResponseItem/completed".to_string()]),
-                    ),
-                },
-            )
-            .await;
-        for (connection_id, raw_events_enabled) in [
-            (accepted_first, true),
-            (raw_disabled, false),
-            (method_opted_out, true),
-            (accepted_second, true),
-            (accepted_last, true),
-        ] {
-            manager
-                .try_ensure_connection_subscribed(thread_id, connection_id, raw_events_enabled)
-                .await
-                .expect("subscribe connection");
-        }
-
-        let (tx, mut rx) = mpsc::channel(8);
-        let outgoing = Arc::new(OutgoingMessageSender::new(
-            tx,
-            codex_analytics::AnalyticsEventsClient::disabled(),
-        ));
-        let snapshot = manager.recipient_snapshot(thread_id).await;
-        let expected_order = snapshot
-            .connection_ids()
-            .iter()
-            .copied()
-            .filter(|connection_id| {
-                matches!(
-                    *connection_id,
-                    id if id == accepted_first || id == accepted_second || id == accepted_last
-                )
-            })
-            .collect::<Vec<_>>();
-        let scoped = ThreadScopedOutgoingMessageSender::from_snapshot(
-            Arc::clone(&outgoing),
-            snapshot,
-            thread_id,
-        );
-        let notification =
-            ServerNotification::RawResponseItemCompleted(RawResponseItemCompletedNotification {
-                thread_id: thread_id.to_string(),
-                turn_id: "turn-1".to_string(),
-                item: ResponseItem::Message {
-                    id: None,
-                    role: "assistant".to_string(),
-                    content: vec![ContentItem::OutputText {
-                        text: "done".to_string(),
-                    }],
-                    phase: None,
-                    internal_chat_message_metadata_passthrough: None,
-                },
-            });
-        let accepted = scoped.accepted_connection_ids(&notification);
-        assert_eq!(accepted, expected_order);
-
-        let clones = Arc::new(AtomicUsize::new(0));
-        let cloned_for = snapshot_fanout(&accepted, CountedClone(Arc::clone(&clones)))
-            .map(|(connection_id, _)| connection_id)
-            .collect::<Vec<_>>();
-        assert_eq!(cloned_for, accepted);
-        assert_eq!(clones.load(Ordering::SeqCst), accepted.len() - 1);
-
-        scoped.send_server_notification(notification).await;
-        let mut delivered = Vec::new();
-        while let Ok(envelope) = rx.try_recv() {
-            let OutgoingEnvelope::ToSnapshotAcceptedConnection { connection_id, .. } = envelope
-            else {
-                panic!("snapshot fanout must use frozen accepted-recipient envelopes");
-            };
-            delivered.push(connection_id);
-        }
-        assert_eq!(delivered, accepted);
-        outgoing.shutdown_delivery_tasks().await;
-    }
-
-    #[tokio::test]
-    async fn terminal_receipts_are_created_only_for_snapshot_accepted_recipients() {
-        let manager = ThreadStateManager::new();
-        let thread_id = ThreadId::new();
-        let accepted_connection = ConnectionId(1);
-        let opted_out_connection = ConnectionId(2);
-        manager
-            .connection_initialized(accepted_connection, ConnectionCapabilities::default())
-            .await;
-        manager
-            .connection_initialized(
-                opted_out_connection,
-                ConnectionCapabilities {
-                    request_attestation: false,
-                    delivery_filter: ResolvedDeliveryFilter::new(
-                        false,
-                        HashSet::from(["turn/completed".to_string()]),
-                    ),
-                },
-            )
-            .await;
-        for connection_id in [accepted_connection, opted_out_connection] {
-            assert!(
-                manager
-                    .try_add_connection_to_thread(thread_id, connection_id)
-                    .await
-            );
-        }
-
-        let (tx, mut rx) = mpsc::channel(4);
-        let outgoing = Arc::new(OutgoingMessageSender::new(
-            tx,
-            codex_analytics::AnalyticsEventsClient::disabled(),
-        ));
-        let scoped = ThreadScopedOutgoingMessageSender::from_snapshot(
-            Arc::clone(&outgoing),
-            manager.recipient_snapshot(thread_id).await,
-            thread_id,
-        );
-        scoped
-            .send_server_notification_with_receipts(
-                turn_completed_notification(thread_id, "turn-1"),
-                None,
-            )
-            .await;
-
-        let envelope = rx.recv().await.expect("accepted terminal recipient");
-        let OutgoingEnvelope::ToSnapshotAcceptedConnection {
-            connection_id,
-            write_complete_tx,
-            ..
-        } = envelope
-        else {
-            panic!("terminal delivery should use the frozen snapshot decision");
-        };
-        assert_eq!(connection_id, accepted_connection);
-        write_complete_tx
-            .expect("accepted terminal delivery has a receipt")
-            .send(())
-            .expect("receipt collector is active");
-        assert!(rx.try_recv().is_err());
-        outgoing.shutdown_delivery_tasks().await;
-    }
 
     fn turn_completed_notification(thread_id: ThreadId, turn_id: &str) -> ServerNotification {
         ServerNotification::TurnCompleted(TurnCompletedNotification {
@@ -1986,7 +1608,7 @@ mod tests {
                 .await
                 .expect("terminal dispatch should arrive before timeout")
                 .expect("terminal dispatch channel should stay open");
-            let OutgoingEnvelope::ToSnapshotAcceptedConnection {
+            let OutgoingEnvelope::ToConnection {
                 connection_id,
                 message,
                 write_complete_tx,
@@ -2011,44 +1633,6 @@ mod tests {
     #[test]
     fn turn_delivery_aggregation_preserves_origin_and_broadcast_semantics() {
         let thread_id = ThreadId::new();
-        let empty = aggregate_turn_delivery(
-            thread_id,
-            "turn-empty".to_string(),
-            Some(ConnectionId(3)),
-            Vec::new(),
-        );
-        assert_eq!(empty.target_count, 0);
-        assert_eq!(empty.success_count, 0);
-        assert_eq!(empty.failure_count, 0);
-        assert_eq!(empty.timeout_count, 0);
-        assert!(!empty.origin_target_present);
-        assert_eq!(
-            empty.origin_delivery_status,
-            TurnDeliveryStatus::NotTargeted
-        );
-        assert_eq!(empty.first_successful_elapsed_ms, None);
-        assert_eq!(empty.last_successful_elapsed_ms, None);
-
-        let single = aggregate_turn_delivery(
-            thread_id,
-            "turn-single".to_string(),
-            Some(ConnectionId(3)),
-            vec![TurnDeliveryOutcome {
-                connection_id: ConnectionId(3),
-                kind: TurnDeliveryOutcomeKind::Success,
-                successful_elapsed_ms: Some(5),
-                post_core_delivery_latency_ms: Some(9),
-            }],
-        );
-        assert_eq!(single.target_count, 1);
-        assert_eq!(single.success_count, 1);
-        assert_eq!(single.failure_count, 0);
-        assert!(single.origin_target_present);
-        assert_eq!(single.origin_delivery_status, TurnDeliveryStatus::Success);
-        assert_eq!(single.origin_successful_elapsed_ms, Some(5));
-        assert_eq!(single.first_successful_elapsed_ms, Some(5));
-        assert_eq!(single.last_successful_elapsed_ms, Some(5));
-
         let fact = aggregate_turn_delivery(
             thread_id,
             "turn-1".to_string(),

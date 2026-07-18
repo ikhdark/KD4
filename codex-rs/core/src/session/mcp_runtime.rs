@@ -1,17 +1,12 @@
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 
 use codex_mcp::McpConfig;
 use codex_mcp::McpConnectionManager;
 use codex_mcp::McpRuntimeContext;
 
-static NEXT_MCP_RUNTIME_VERSION: AtomicU64 = AtomicU64::new(1);
-
 /// MCP config, plugin availability, exact environment bindings, and manager for one request.
 pub struct McpRuntimeSnapshot {
-    version: u64,
     config: Arc<McpConfig>,
     plugins_available: bool,
     manager: Arc<McpConnectionManager>,
@@ -28,17 +23,12 @@ impl McpRuntimeSnapshot {
         available_environment_ids: Vec<String>,
     ) -> Self {
         Self {
-            version: NEXT_MCP_RUNTIME_VERSION.fetch_add(1, Ordering::Relaxed),
             config,
             plugins_available,
             manager,
             runtime_context,
             available_environment_ids,
         }
-    }
-
-    pub(crate) fn version(&self) -> u64 {
-        self.version
     }
 
     pub fn config(&self) -> &McpConfig {

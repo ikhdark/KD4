@@ -1,6 +1,5 @@
 #![allow(clippy::module_inception)]
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -15,10 +14,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::exec::is_likely_sandbox_denied;
 use crate::tools::command_output_artifact::RawOutputArtifact;
-use crate::tools::command_output_artifact::RawOutputArtifactWriteQueue;
+use crate::tools::command_output_artifact::RawOutputArtifactWriter;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEvent;
-use codex_exec_server::OutputGap;
 use codex_exec_server::ProcessSignal as ExecServerProcessSignal;
 use codex_exec_server::ReadResponse as ExecReadResponse;
 use codex_exec_server::StartedExecProcess;
@@ -35,15 +33,9 @@ use codex_utils_pty::SpawnedPty;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
 use super::head_tail_buffer::HeadTailBuffer;
-use super::head_tail_buffer::SharedOutputRecoveryEvidence;
 use super::process_state::ProcessState;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
-const RECOVERY_PAGE_MAX_BYTES: usize = 64 * 1024;
-const RECOVERY_PAGE_MAX_CHUNKS: usize = 128;
-const RECOVERY_PAGE_LIMIT: usize = 32;
-const RECOVERY_GAP_LIMIT: usize = 32;
-const RECOVERY_MARKER_MAX_BYTES: usize = 256;
 pub(crate) trait SpawnLifecycle: std::fmt::Debug + Send + Sync {
     /// Returns file descriptors that must stay open across the child `exec()`.
     ///
@@ -73,7 +65,6 @@ pub(crate) struct OutputHandles {
     pub(crate) output_closed: Arc<AtomicBool>,
     pub(crate) output_closed_notify: Arc<Notify>,
     pub(crate) cancellation_token: CancellationToken,
-    pub(crate) recovery_evidence: SharedOutputRecoveryEvidence,
 }
 
 /// Transport-specific process handle used by unified exec.
@@ -92,7 +83,6 @@ pub(crate) struct UnifiedExecProcess {
     output_closed: Arc<AtomicBool>,
     output_closed_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
-    recovery_evidence: SharedOutputRecoveryEvidence,
     output_drained: Arc<Notify>,
     state_tx: watch::Sender<ProcessState>,
     state_rx: watch::Receiver<ProcessState>,
@@ -112,140 +102,6 @@ impl std::fmt::Debug for UnifiedExecProcess {
     }
 }
 
-pub(super) fn merge_recovery_gap(
-    gaps: &mut Vec<OutputGap>,
-    mut gap: OutputGap,
-    recovered: &BTreeSet<u64>,
-) -> bool {
-    if gap.first_missing_seq > gap.last_missing_seq
-        || recovered
-            .range(gap.first_missing_seq..=gap.last_missing_seq)
-            .next()
-            .is_some()
-    {
-        return false;
-    }
-    let mut merged = Vec::with_capacity(gaps.len().saturating_add(1));
-    let mut inserted = false;
-    for current in gaps.iter().copied() {
-        if current.last_missing_seq.saturating_add(1) < gap.first_missing_seq {
-            merged.push(current);
-        } else if gap.last_missing_seq.saturating_add(1) < current.first_missing_seq {
-            if !inserted {
-                merged.push(gap);
-                inserted = true;
-            }
-            merged.push(current);
-        } else {
-            gap.first_missing_seq = gap.first_missing_seq.min(current.first_missing_seq);
-            gap.last_missing_seq = gap.last_missing_seq.max(current.last_missing_seq);
-        }
-    }
-    if !inserted {
-        merged.push(gap);
-    }
-    if merged.len() > RECOVERY_GAP_LIMIT {
-        return false;
-    }
-    *gaps = merged;
-    true
-}
-
-fn range_is_declared_missing(gaps: &[OutputGap], first: u64, last: u64) -> bool {
-    if first > last {
-        return true;
-    }
-    let mut cursor = first;
-    for gap in gaps {
-        if gap.last_missing_seq < cursor {
-            continue;
-        }
-        if gap.first_missing_seq > cursor {
-            return false;
-        }
-        cursor = gap.last_missing_seq.saturating_add(1);
-        if cursor > last {
-            return true;
-        }
-    }
-    false
-}
-
-fn advance_through_declared_gaps(mut cursor: u64, gaps: &[OutputGap]) -> u64 {
-    loop {
-        let next = cursor.saturating_add(1);
-        let Some(gap) = gaps
-            .iter()
-            .find(|gap| gap.first_missing_seq <= next && next <= gap.last_missing_seq)
-        else {
-            return cursor;
-        };
-        if gap.last_missing_seq <= cursor {
-            return cursor;
-        }
-        cursor = gap.last_missing_seq;
-    }
-}
-
-pub(super) fn recovery_incomplete_detail(gaps: &[OutputGap], reasons: &BTreeSet<String>) -> String {
-    let mut details = Vec::new();
-    let mut gap_detail = String::new();
-    if !gaps.is_empty() {
-        gap_detail.push_str("missing sequence");
-        if gaps.len() != 1 || gaps[0].first_missing_seq != gaps[0].last_missing_seq {
-            gap_detail.push('s');
-        }
-        gap_detail.push(' ');
-    }
-    for (index, gap) in gaps.iter().enumerate() {
-        if index > 0 {
-            gap_detail.push_str(", ");
-        }
-        if gap.first_missing_seq == gap.last_missing_seq {
-            gap_detail.push_str(&gap.first_missing_seq.to_string());
-        } else {
-            gap_detail.push_str(&format!(
-                "{}-{}",
-                gap.first_missing_seq, gap.last_missing_seq
-            ));
-        }
-    }
-    if !gap_detail.is_empty() {
-        details.push(gap_detail);
-    }
-    details.extend(reasons.iter().cloned());
-    if details.is_empty() {
-        details.push("recovery completeness unknown".to_string());
-    }
-    let detailed = details.join("; ");
-    if detailed
-        .len()
-        .saturating_add("\n[output incomplete: ]\n".len())
-        > RECOVERY_MARKER_MAX_BYTES
-    {
-        if gaps.len() > 1 {
-            "multiple disjoint recovery gaps".to_string()
-        } else if gaps.len() == 1 {
-            format!(
-                "missing sequence range {}-{}",
-                gaps[0].first_missing_seq, gaps[0].last_missing_seq
-            )
-        } else {
-            "recovery completeness unknown".to_string()
-        }
-    } else {
-        detailed
-    }
-}
-
-fn recovery_incomplete_marker(gaps: &[OutputGap], reasons: &BTreeSet<String>) -> Vec<u8> {
-    format!(
-        "\n[output incomplete: {}]\n",
-        recovery_incomplete_detail(gaps, reasons)
-    )
-    .into_bytes()
-}
-
 impl UnifiedExecProcess {
     fn new(
         process_handle: ProcessHandle,
@@ -253,11 +109,7 @@ impl UnifiedExecProcess {
         spawn_lifecycle: Option<SpawnLifecycleHandle>,
         raw_output_artifact: Option<RawOutputArtifact>,
     ) -> Self {
-        let recovery_evidence = Arc::new(std::sync::Mutex::new(Default::default()));
-        let output_buffer = Arc::new(Mutex::new(HeadTailBuffer::new_with_recovery_evidence(
-            super::UNIFIED_EXEC_OUTPUT_MAX_BYTES,
-            Arc::clone(&recovery_evidence),
-        )));
+        let output_buffer = Arc::new(Mutex::new(HeadTailBuffer::default()));
         let output_notify = Arc::new(Notify::new());
         let output_closed = Arc::new(AtomicBool::new(false));
         let output_closed_notify = Arc::new(Notify::new());
@@ -274,7 +126,6 @@ impl UnifiedExecProcess {
             output_closed,
             output_closed_notify,
             cancellation_token,
-            recovery_evidence,
             output_drained,
             state_tx,
             state_rx,
@@ -317,12 +168,7 @@ impl UnifiedExecProcess {
             output_closed: Arc::clone(&self.output_closed),
             output_closed_notify: Arc::clone(&self.output_closed_notify),
             cancellation_token: self.cancellation_token.clone(),
-            recovery_evidence: Arc::clone(&self.recovery_evidence),
         }
-    }
-
-    pub(super) fn recovery_evidence(&self) -> SharedOutputRecoveryEvidence {
-        Arc::clone(&self.recovery_evidence)
     }
 
     pub(super) fn output_receiver(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>> {
@@ -595,58 +441,26 @@ impl UnifiedExecProcess {
             output_closed,
             output_closed_notify,
             cancellation_token,
-            recovery_evidence,
         } = output_handles;
         let process = started.process;
         let mut events = process.subscribe_events();
-        let mut wake_rx = process.subscribe_wake();
         tokio::spawn(async move {
-            let artifact_queue = RawOutputArtifactWriteQueue::spawn(raw_output_artifact.clone());
+            let mut artifact_writer =
+                RawOutputArtifactWriter::open(raw_output_artifact.as_ref()).await;
             let mut last_seq: u64 = 0;
-            let mut recovery_gaps = Vec::new();
-            let mut recovered_sequences = BTreeSet::new();
-            let mut recovery_reasons = BTreeSet::new();
-            let mut wake_open = true;
             loop {
-                let (event, event_delivery_lost) = tokio::select! {
-                    event = events.recv() => match event {
-                        Ok(event) => (Some(event), false),
-                        Err(broadcast::error::RecvError::Lagged(_)) => (None, true),
-                        Err(broadcast::error::RecvError::Closed) => {
-                            let state = state_tx.borrow().clone();
-                            let _ = state_tx.send_replace(
-                                state.failed("exec-server process event stream closed".to_string()),
-                            );
-                            output_closed.store(true, Ordering::Release);
-                            output_closed_notify.notify_waiters();
-                            cancellation_token.cancel();
-                            break;
-                        }
-                    },
-                    changed = wake_rx.changed(), if wake_open => {
-                        if changed.is_err() {
-                            wake_open = false;
-                            continue;
-                        }
-                        let wake_seq = *wake_rx.borrow_and_update();
-                        if wake_seq <= last_seq {
-                            continue;
-                        }
-                        match events.try_recv() {
-                            Ok(event) => (Some(event), false),
-                            Err(broadcast::error::TryRecvError::Lagged(_)) => (None, true),
-                            Err(broadcast::error::TryRecvError::Empty) => (None, false),
-                            Err(broadcast::error::TryRecvError::Closed) => {
-                                let state = state_tx.borrow().clone();
-                                let _ = state_tx.send_replace(
-                                    state.failed("exec-server process event stream closed".to_string()),
-                                );
-                                output_closed.store(true, Ordering::Release);
-                                output_closed_notify.notify_waiters();
-                                cancellation_token.cancel();
-                                break;
-                            }
-                        }
+                let event = match events.recv().await {
+                    Ok(event) => Some(event),
+                    Err(broadcast::error::RecvError::Lagged(_)) => None,
+                    Err(broadcast::error::RecvError::Closed) => {
+                        let state = state_tx.borrow().clone();
+                        let _ = state_tx.send_replace(
+                            state.failed("exec-server process event stream closed".to_string()),
+                        );
+                        output_closed.store(true, Ordering::Release);
+                        output_closed_notify.notify_waiters();
+                        cancellation_token.cancel();
+                        break;
                     }
                 };
                 let event_seq = event.as_ref().and_then(|event| match event {
@@ -667,241 +481,48 @@ impl UnifiedExecProcess {
                     || event_seq.is_some_and(|seq| seq > last_seq.saturating_add(1))
                     || missing_sandbox_denial
                 {
-                    let recovery_was_required = event_delivery_lost
-                        || event_seq.is_some_and(|seq| seq > last_seq.saturating_add(1));
-                    let mut received_recovery_page = false;
-                    let mut all_recovery_pages_explicit = true;
-                    let mut incomplete_reason: Option<String> = None;
-                    let mut terminal_exited = false;
-                    let mut terminal_exit_code = None;
-                    let mut terminal_closed = false;
-                    let mut terminal_failure = None;
-                    let mut terminal_sandbox_denied = false;
-
-                    for page_index in 0..RECOVERY_PAGE_LIMIT {
-                        let page_start_seq = last_seq;
-                        let response = match process
-                            .read_with_limits(
-                                Some(last_seq),
-                                Some(RECOVERY_PAGE_MAX_BYTES),
-                                Some(RECOVERY_PAGE_MAX_CHUNKS),
-                                Some(0),
-                            )
-                            .await
-                        {
-                            Ok(response) => response,
-                            Err(err) => {
-                                terminal_failure = Some(err.to_string());
-                                break;
-                            }
-                        };
-                        let ExecReadResponse {
-                            chunks,
-                            output_gaps,
-                            earliest_retained_seq,
-                            complete,
-                            next_seq,
-                            exited,
-                            exit_code,
-                            closed,
-                            failure,
-                            sandbox_denied,
-                        } = response;
-                        terminal_exited |= exited;
-                        if terminal_exit_code.is_some()
-                            && exit_code.is_some()
-                            && terminal_exit_code != exit_code
-                        {
-                            incomplete_reason =
-                                Some("recovery returned conflicting exit codes".to_string());
-                            break;
-                        }
-                        terminal_exit_code = terminal_exit_code.or(exit_code);
-                        terminal_closed |= closed;
-                        terminal_failure = terminal_failure.or(failure);
-                        terminal_sandbox_denied |= sandbox_denied;
-
-                        received_recovery_page = true;
-                        all_recovery_pages_explicit &=
-                            earliest_retained_seq.is_some() && complete.is_some();
-                        if let Some(earliest_retained_seq) = earliest_retained_seq
-                            && (earliest_retained_seq == 0
-                                || earliest_retained_seq > next_seq
-                                || chunks
-                                    .first()
-                                    .is_some_and(|chunk| earliest_retained_seq > chunk.seq)
-                                || output_gaps
-                                    .iter()
-                                    .any(|gap| gap.last_missing_seq >= earliest_retained_seq))
-                        {
-                            incomplete_reason = Some(
-                                "recovery returned an invalid earliest-retained boundary"
-                                    .to_string(),
-                            );
-                            break;
-                        }
-                        for gap in output_gaps {
-                            if !merge_recovery_gap(&mut recovery_gaps, gap, &recovered_sequences) {
-                                incomplete_reason =
-                                    Some("invalid or excessive disjoint recovery gaps".to_string());
-                                break;
-                            }
-                        }
-                        if incomplete_reason.is_some() {
-                            break;
-                        }
-
-                        let mut page_chunk_count = 0_usize;
-                        let mut page_bytes = 0_usize;
-                        let mut previous_seq = last_seq;
-                        let mut response_previous_seq = None;
-                        let mut local_page_limit_reached = false;
-                        for chunk in chunks {
-                            if response_previous_seq.is_some_and(|seq| chunk.seq <= seq) {
-                                incomplete_reason =
-                                    Some("recovery output ordering was invalid".to_string());
-                                break;
-                            }
-                            response_previous_seq = Some(chunk.seq);
-                            if recovery_gaps.iter().any(|gap| {
-                                gap.first_missing_seq <= chunk.seq
-                                    && chunk.seq <= gap.last_missing_seq
-                            }) {
-                                incomplete_reason =
-                                    Some("recovery gap overlapped recovered output".to_string());
-                                break;
-                            }
-                            if chunk.seq <= page_start_seq {
-                                continue;
-                            }
-                            if page_chunk_count >= RECOVERY_PAGE_MAX_CHUNKS {
-                                local_page_limit_reached = true;
-                                break;
-                            }
-                            let chunk_len = chunk.chunk.0.len();
-                            if page_bytes.saturating_add(chunk_len) > RECOVERY_PAGE_MAX_BYTES {
-                                if page_chunk_count == 0 {
-                                    incomplete_reason = Some(
-                                        "recovery chunk exceeded the recovery byte limit"
-                                            .to_string(),
-                                    );
-                                } else {
-                                    local_page_limit_reached = true;
-                                }
-                                break;
-                            }
-                            if recovered_sequences.contains(&chunk.seq) {
-                                incomplete_reason =
-                                    Some("recovery gap overlapped recovered output".to_string());
-                                break;
-                            }
-                            if chunk.seq > previous_seq.saturating_add(1)
-                                && !range_is_declared_missing(
-                                    &recovery_gaps,
-                                    previous_seq.saturating_add(1),
-                                    chunk.seq.saturating_sub(1),
-                                )
-                            {
-                                incomplete_reason = Some(
-                                    "recovery contained an unexplained sequence gap".to_string(),
-                                );
-                                break;
-                            }
-                            recovered_sequences.insert(chunk.seq);
-                            previous_seq = chunk.seq;
-                            last_seq = chunk.seq;
-                            page_chunk_count = page_chunk_count.saturating_add(1);
-                            page_bytes = page_bytes.saturating_add(chunk_len);
-                            let bytes = chunk.chunk.into_inner();
-                            publish_output_chunk(
-                                &output_buffer,
-                                &output_tx,
-                                &output_notify,
-                                artifact_queue.as_ref(),
-                                bytes,
-                            )
-                            .await;
-                        }
-                        last_seq = advance_through_declared_gaps(last_seq, &recovery_gaps);
-
-                        if incomplete_reason.is_some() {
-                            break;
-                        }
-
-                        let page_was_limited = local_page_limit_reached
-                            || match complete {
-                                Some(complete) => !complete,
-                                None => {
-                                    page_chunk_count >= RECOVERY_PAGE_MAX_CHUNKS
-                                        || page_bytes >= RECOVERY_PAGE_MAX_BYTES
-                                }
-                            };
-                        if page_chunk_count == 0
-                            && last_seq <= page_start_seq
-                            && next_seq <= page_start_seq.saturating_add(1)
-                            && !terminal_exited
-                            && !terminal_closed
-                            && terminal_failure.is_none()
-                        {
-                            incomplete_reason =
-                                Some("recovery stalled without cursor progress".to_string());
-                            break;
-                        }
-                        if !page_was_limited {
-                            let target_seq = next_seq.saturating_sub(1);
-                            last_seq = advance_through_declared_gaps(last_seq, &recovery_gaps);
-                            if target_seq > last_seq {
-                                let current_lifecycle_seq =
-                                    event.as_ref().and_then(|event| match event {
-                                        ExecProcessEvent::Exited { seq, .. }
-                                        | ExecProcessEvent::Closed { seq } => Some(*seq),
-                                        _ => None,
-                                    });
-                                if current_lifecycle_seq != Some(target_seq)
-                                    || target_seq != last_seq.saturating_add(1)
-                                {
-                                    incomplete_reason.get_or_insert_with(|| {
-                                        "recovery terminal continuity was ambiguous".to_string()
-                                    });
-                                }
-                                recovered_sequences.insert(target_seq);
-                                last_seq = target_seq;
-                            }
-                            break;
-                        }
-                        if last_seq <= page_start_seq {
-                            incomplete_reason =
-                                Some("recovery stalled without cursor progress".to_string());
-                            break;
-                        }
-                        if page_index + 1 == RECOVERY_PAGE_LIMIT {
-                            incomplete_reason =
-                                Some("recovery page limit was exhausted".to_string());
-                            break;
-                        }
-                    }
-
-                    if recovery_was_required
-                        && (!received_recovery_page || !all_recovery_pages_explicit)
+                    let response = match process
+                        .read(
+                            Some(last_seq),
+                            /*max_bytes*/ None,
+                            /*wait_ms*/ Some(0),
+                        )
+                        .await
                     {
-                        incomplete_reason.get_or_insert_with(|| {
-                            "peer supplied no explicit recovery completeness contract".to_string()
-                        });
-                    }
-                    if terminal_closed && !terminal_exited && terminal_failure.is_none() {
-                        incomplete_reason.get_or_insert_with(|| {
-                            "recovery returned closed without a conclusive exit".to_string()
-                        });
-                    }
-                    if let Some(reason) = incomplete_reason {
-                        recovery_reasons.insert(reason);
-                    }
-                    if !recovery_gaps.is_empty() || !recovery_reasons.is_empty() {
-                        let detail = recovery_incomplete_detail(&recovery_gaps, &recovery_reasons);
-                        HeadTailBuffer::record_shared_recovery_detail(&recovery_evidence, detail);
+                        Ok(response) => response,
+                        Err(err) => {
+                            let state = state_tx.borrow().clone();
+                            let _ = state_tx.send_replace(state.failed(err.to_string()));
+                            output_closed.store(true, Ordering::Release);
+                            output_closed_notify.notify_waiters();
+                            cancellation_token.cancel();
+                            break;
+                        }
+                    };
+                    let ExecReadResponse {
+                        chunks,
+                        next_seq,
+                        exited,
+                        exit_code,
+                        closed,
+                        failure,
+                        sandbox_denied,
+                    } = response;
+                    for chunk in chunks.into_iter().filter(|chunk| chunk.seq > last_seq) {
+                        let bytes = chunk.chunk.into_inner();
+                        if let Some(writer) = artifact_writer.as_mut() {
+                            writer
+                                .write_chunk(raw_output_artifact.as_ref(), &bytes)
+                                .await;
+                        }
+                        let mut guard = output_buffer.lock().await;
+                        guard.push_chunk(bytes.clone());
+                        drop(guard);
+                        let _ = output_tx.send(bytes);
                         output_notify.notify_waiters();
                     }
-                    if let Some(message) = terminal_failure {
+                    last_seq = last_seq.max(next_seq.saturating_sub(1));
+                    if let Some(message) = failure {
                         let state = state_tx.borrow().clone();
                         let _ = state_tx.send_replace(state.failed(message));
                         output_closed.store(true, Ordering::Release);
@@ -909,16 +530,16 @@ impl UnifiedExecProcess {
                         cancellation_token.cancel();
                         break;
                     }
-                    if terminal_sandbox_denied || terminal_exited {
+                    if sandbox_denied || exited {
                         let mut state = state_tx.borrow().clone();
-                        state.sandbox_denied |= terminal_sandbox_denied;
-                        let _ = state_tx.send_replace(if terminal_exited {
-                            state.exited(terminal_exit_code)
+                        state.sandbox_denied |= sandbox_denied;
+                        let _ = state_tx.send_replace(if exited {
+                            state.exited(exit_code)
                         } else {
                             state
                         });
                     }
-                    if terminal_closed {
+                    if closed {
                         output_closed.store(true, Ordering::Release);
                         output_closed_notify.notify_waiters();
                         cancellation_token.cancel();
@@ -935,17 +556,18 @@ impl UnifiedExecProcess {
                         if chunk.seq <= last_seq {
                             continue;
                         }
-                        recovered_sequences.insert(chunk.seq);
                         last_seq = chunk.seq;
                         let bytes = chunk.chunk.into_inner();
-                        publish_output_chunk(
-                            &output_buffer,
-                            &output_tx,
-                            &output_notify,
-                            artifact_queue.as_ref(),
-                            bytes,
-                        )
-                        .await;
+                        if let Some(writer) = artifact_writer.as_mut() {
+                            writer
+                                .write_chunk(raw_output_artifact.as_ref(), &bytes)
+                                .await;
+                        }
+                        let mut guard = output_buffer.lock().await;
+                        guard.push_chunk(bytes.clone());
+                        drop(guard);
+                        let _ = output_tx.send(bytes);
+                        output_notify.notify_waiters();
                     }
                     ExecProcessEvent::Exited {
                         seq,
@@ -955,7 +577,6 @@ impl UnifiedExecProcess {
                         if seq <= last_seq {
                             continue;
                         }
-                        recovered_sequences.insert(seq);
                         last_seq = seq;
                         let mut state = state_tx.borrow().clone();
                         state.sandbox_denied |= sandbox_denied.unwrap_or(false);
@@ -965,7 +586,6 @@ impl UnifiedExecProcess {
                         if seq <= last_seq {
                             continue;
                         }
-                        recovered_sequences.insert(seq);
                         output_closed.store(true, Ordering::Release);
                         output_closed_notify.notify_waiters();
                         cancellation_token.cancel();
@@ -981,39 +601,18 @@ impl UnifiedExecProcess {
                     }
                 }
             }
-            if let Some(artifact_queue) = artifact_queue {
-                if !recovery_gaps.is_empty() || !recovery_reasons.is_empty() {
-                    let marker = recovery_incomplete_marker(&recovery_gaps, &recovery_reasons);
-                    artifact_queue.enqueue(&marker);
-                }
-                artifact_queue.finish().await;
+            if let Some(writer) = artifact_writer.as_mut() {
+                writer.finish(raw_output_artifact.as_ref()).await;
             }
         })
     }
 
     fn spawn_local_output_task(
-        stdout_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-        stderr_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
-        output_handles: OutputHandles,
-        output_tx: broadcast::Sender<Vec<u8>>,
-        raw_output_artifact: Option<Arc<Mutex<RawOutputArtifact>>>,
-    ) -> JoinHandle<()> {
-        let artifact_queue = RawOutputArtifactWriteQueue::spawn(raw_output_artifact);
-        Self::spawn_local_output_task_with_artifact_queue(
-            stdout_rx,
-            stderr_rx,
-            output_handles,
-            output_tx,
-            artifact_queue,
-        )
-    }
-
-    pub(super) fn spawn_local_output_task_with_artifact_queue(
         mut stdout_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         mut stderr_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
         output_handles: OutputHandles,
         output_tx: broadcast::Sender<Vec<u8>>,
-        artifact_queue: Option<RawOutputArtifactWriteQueue>,
+        raw_output_artifact: Option<Arc<Mutex<RawOutputArtifact>>>,
     ) -> JoinHandle<()> {
         let OutputHandles {
             output_buffer,
@@ -1021,9 +620,10 @@ impl UnifiedExecProcess {
             output_closed,
             output_closed_notify,
             cancellation_token: _,
-            recovery_evidence: _,
         } = output_handles;
         tokio::spawn(async move {
+            let mut artifact_writer =
+                RawOutputArtifactWriter::open(raw_output_artifact.as_ref()).await;
             let mut stdout_open = true;
             let mut stderr_open = true;
             loop {
@@ -1045,20 +645,22 @@ impl UnifiedExecProcess {
                     else => break,
                 };
                 if let Some(chunk) = chunk {
-                    publish_output_chunk(
-                        &output_buffer,
-                        &output_tx,
-                        &output_notify,
-                        artifact_queue.as_ref(),
-                        chunk,
-                    )
-                    .await;
+                    if let Some(writer) = artifact_writer.as_mut() {
+                        writer
+                            .write_chunk(raw_output_artifact.as_ref(), &chunk)
+                            .await;
+                    }
+                    let mut guard = output_buffer.lock().await;
+                    guard.push_chunk(chunk.clone());
+                    drop(guard);
+                    let _ = output_tx.send(chunk);
+                    output_notify.notify_waiters();
                 }
             }
             output_closed.store(true, Ordering::Release);
             output_closed_notify.notify_waiters();
-            if let Some(artifact_queue) = artifact_queue {
-                artifact_queue.finish().await;
+            if let Some(writer) = artifact_writer.as_mut() {
+                writer.finish(raw_output_artifact.as_ref()).await;
             }
         })
     }
@@ -1067,23 +669,6 @@ impl UnifiedExecProcess {
         let state = self.state_rx.borrow().clone();
         let _ = self.state_tx.send_replace(state.exited(exit_code));
         self.cancellation_token.cancel();
-    }
-}
-
-async fn publish_output_chunk(
-    output_buffer: &OutputBuffer,
-    output_tx: &broadcast::Sender<Vec<u8>>,
-    output_notify: &Notify,
-    artifact_queue: Option<&RawOutputArtifactWriteQueue>,
-    chunk: Vec<u8>,
-) {
-    let mut guard = output_buffer.lock().await;
-    guard.push_chunk(chunk.clone());
-    drop(guard);
-    let _ = output_tx.send(chunk.clone());
-    output_notify.notify_waiters();
-    if let Some(artifact_queue) = artifact_queue {
-        artifact_queue.enqueue(&chunk);
     }
 }
 

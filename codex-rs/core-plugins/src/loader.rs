@@ -45,13 +45,10 @@ use codex_protocol::protocol::Product;
 use codex_protocol::protocol::SkillScope;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_plugins::find_plugin_manifest_path;
-use futures::future::join_all;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
-#[cfg(test)]
-use std::future::Future;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -65,7 +62,6 @@ const DEFAULT_MCP_CONFIG_FILE: &str = ".mcp.json";
 const DEFAULT_APP_CONFIG_FILE: &str = ".app.json";
 const CONFIG_TOML_FILE: &str = "config.toml";
 const CURATED_PLUGIN_CACHE_VERSION_SHA_PREFIX_LEN: usize = 8;
-const PLUGIN_LOAD_CONCURRENCY: usize = 8;
 
 /// Hook declarations and warnings resolved without loading other plugin capabilities.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -154,60 +150,26 @@ async fn load_plugins_from_layer_stack_with_scope(
     let mut configured_plugins: Vec<_> = configured_plugins.into_iter().collect();
     configured_plugins.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
-    let plugins = load_configured_plugins_bounded(&configured_plugins, store, &scope).await;
-
+    let mut plugins = Vec::with_capacity(configured_plugins.len());
     let mut seen_mcp_server_names = HashMap::<String, String>::new();
-    for loaded_plugin in &plugins {
+    for (configured_name, plugin) in configured_plugins {
+        let loaded_plugin = load_plugin(configured_name.clone(), &plugin, store, &scope).await;
         for name in loaded_plugin.mcp_servers.keys() {
             if let Some(previous_plugin) =
-                seen_mcp_server_names.insert(name.clone(), loaded_plugin.config_name.clone())
+                seen_mcp_server_names.insert(name.clone(), configured_name.clone())
             {
                 warn!(
-                    plugin = loaded_plugin.config_name,
+                    plugin = configured_name,
                     previous_plugin,
                     server = name,
                     "skipping duplicate plugin MCP server name"
                 );
             }
         }
+        plugins.push(loaded_plugin);
     }
 
     plugins
-}
-
-async fn load_configured_plugins_bounded(
-    configured_plugins: &[(String, PluginConfig)],
-    store: &PluginStore,
-    scope: &PluginLoadScope<'_>,
-) -> Vec<LoadedPlugin<McpServerConfig>> {
-    let mut plugins = Vec::with_capacity(configured_plugins.len());
-    for batch in configured_plugins.chunks(PLUGIN_LOAD_CONCURRENCY) {
-        let mut jobs = Vec::with_capacity(batch.len());
-        for (configured_name, plugin) in batch {
-            jobs.push(load_plugin(configured_name.clone(), plugin, store, scope));
-        }
-        plugins.extend(join_all(jobs).await);
-    }
-    plugins
-}
-
-#[cfg(test)]
-async fn collect_bounded_in_order<F, T>(
-    jobs: impl IntoIterator<Item = F>,
-    concurrency: usize,
-) -> Vec<T>
-where
-    F: Future<Output = T>,
-{
-    let mut jobs = jobs.into_iter();
-    let mut completed = Vec::new();
-    loop {
-        let batch = jobs.by_ref().take(concurrency.max(1)).collect::<Vec<_>>();
-        if batch.is_empty() {
-            return completed;
-        }
-        completed.extend(join_all(batch).await);
-    }
 }
 
 /// Load hooks from enabled plugins without loading their skills, MCP servers, or apps.
@@ -851,27 +813,25 @@ async fn load_plugin(
             loaded_plugin.manifest_name = Some(manifest.display_name().to_string());
             loaded_plugin.manifest_description = manifest.description.clone();
             loaded_plugin.skill_roots = plugin_skill_roots(&plugin_root, manifest_paths);
-            let skill_load = load_plugin_skills(
+            let resolved_skills = load_plugin_skills(
                 &plugin_root,
                 &loaded_plugin_id,
                 &manifest,
                 *restriction_product,
                 skill_config_rules,
                 *plugin_skill_snapshots,
-            );
-            let mcp_load = load_plugin_mcp_servers_from_manifest(
-                plugin_root.as_path(),
-                manifest_paths,
-                Some(&plugin.mcp_servers),
-            );
-            let app_load = load_plugin_apps_from_manifest(plugin_root.as_path(), manifest_paths);
-            let (resolved_skills, mcp_servers, apps) =
-                tokio::join!(skill_load, mcp_load, app_load);
+            )
+            .await;
             let has_enabled_skills = resolved_skills.has_enabled_skills();
             loaded_plugin.disabled_skill_paths = resolved_skills.disabled_skill_paths;
             loaded_plugin.has_enabled_skills = has_enabled_skills;
-            loaded_plugin.mcp_servers = mcp_servers;
-            loaded_plugin.apps = apps;
+            loaded_plugin.mcp_servers = load_plugin_mcp_servers_from_manifest(
+                plugin_root.as_path(),
+                manifest_paths,
+                Some(&plugin.mcp_servers),
+            )
+            .await;
+            loaded_plugin.apps = load_plugin_apps(plugin_root.as_path()).await;
         }
         PluginLoadScope::HooksOnly => {}
     }

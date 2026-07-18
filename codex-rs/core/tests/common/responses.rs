@@ -1232,26 +1232,6 @@ pub async fn mount_models_once_with_etag(
     models_mock
 }
 
-pub async fn mount_models_once_with_etag_and_delay(
-    server: &MockServer,
-    body: ModelsResponse,
-    etag: &str,
-    delay: Duration,
-) -> ModelsMock {
-    let (mock, models_mock) = models_mock();
-    mock.respond_with(
-        ResponseTemplate::new(200)
-            .insert_header("content-type", "application/json")
-            .insert_header("ETag", etag)
-            .set_body_json(body.clone())
-            .set_delay(delay),
-    )
-    .up_to_n_times(1)
-    .mount(server)
-    .await;
-    models_mock
-}
-
 pub async fn start_mock_server() -> MockServer {
     let server = MockServer::builder()
         .body_print_limit(BodyPrintLimit::Limited(80_000))

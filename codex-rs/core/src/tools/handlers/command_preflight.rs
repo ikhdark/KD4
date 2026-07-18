@@ -182,26 +182,6 @@ pub(crate) fn preflight_invocation_with_equivalent_repair(
         .map_err(|issue| issue.render_for_model())
 }
 
-pub(crate) async fn preflight_invocation_with_equivalent_repair_async(
-    invocation: &CommandInvocation,
-    command: &[String],
-    shell_type: Option<ShellType>,
-) -> Result<CommandPreflightOutcome, String> {
-    let may_parse_powershell = shell_type == Some(ShellType::PowerShell)
-        || infer_direct_shell_type(command) == Some(ShellType::PowerShell);
-    if !may_parse_powershell {
-        return preflight_invocation_with_equivalent_repair(invocation, command, shell_type);
-    }
-
-    let invocation = invocation.clone();
-    let command = command.to_vec();
-    tokio::task::spawn_blocking(move || {
-        preflight_invocation_with_equivalent_repair(&invocation, &command, shell_type)
-    })
-    .await
-    .map_err(|error| format!("PowerShell command preflight worker failed: {error}"))?
-}
-
 fn preflight_invocation_with_equivalent_repair_detailed(
     invocation: &CommandInvocation,
     command: &[String],

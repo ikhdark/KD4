@@ -1,12 +1,10 @@
 mod experimental_api;
-mod event_delivery;
 mod export;
 mod protocol;
 pub mod rpc;
 mod schema_fixtures;
 
 pub use experimental_api::*;
-pub use event_delivery::*;
 pub use export::GenerateTsOptions;
 pub use export::generate_internal_json_schema;
 pub use export::generate_json;

@@ -43,7 +43,6 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result as JsonRpcResult;
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ServerNotificationDeliveryClass;
 use codex_app_server_protocol::ServerRequest;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
@@ -135,13 +134,41 @@ impl From<InProcessServerEvent> for AppServerEvent {
 }
 
 fn event_requires_delivery(event: &InProcessServerEvent) -> bool {
+    // These transcript and terminal events must remain lossless. Dropping
+    // streamed assistant text or the authoritative completed item can leave
+    // the TUI with permanently corrupted markdown, while dropping completion
+    // notifications can leave surfaces waiting forever.
     match event {
         InProcessServerEvent::ServerNotification(notification) => {
-            notification.delivery_class() != ServerNotificationDeliveryClass::BestEffort
+            server_notification_requires_delivery(notification)
         }
-        InProcessServerEvent::ServerRequest(_) => true,
-        InProcessServerEvent::Lagged { .. } => false,
+        _ => false,
     }
+}
+
+/// Returns `true` for notifications that must survive backpressure.
+///
+/// Transcript events (`AgentMessageDelta`, `PlanDelta`, reasoning deltas) and
+/// the authoritative `ItemCompleted` / `TurnCompleted` form the lossless tier
+/// of the event stream. Dropping any of these corrupts the visible assistant
+/// output or leaves surfaces waiting for a completion signal that already
+/// fired. Everything else (`CommandExecutionOutputDelta`, progress, etc.) is
+/// best-effort and may be dropped with only cosmetic impact.
+///
+/// Both the in-process and remote transports delegate to this function so the
+/// classification stays in sync.
+pub(crate) fn server_notification_requires_delivery(notification: &ServerNotification) -> bool {
+    matches!(
+        notification,
+        ServerNotification::TurnCompleted(_)
+            | ServerNotification::ThreadSettingsUpdated(_)
+            | ServerNotification::ItemCompleted(_)
+            | ServerNotification::ExternalAgentConfigImportCompleted(_)
+            | ServerNotification::AgentMessageDelta(_)
+            | ServerNotification::PlanDelta(_)
+            | ServerNotification::ReasoningSummaryTextDelta(_)
+            | ServerNotification::ReasoningTextDelta(_)
+    )
 }
 
 /// Outcome of attempting to forward a single event to the consumer channel.
@@ -447,9 +474,9 @@ pub enum AppServerClient {
 impl InProcessAppServerClient {
     /// Starts the in-process runtime and facade worker task.
     ///
-    /// The returned client is ready for requests and event consumption.
-    /// Control replies use an independent command pump, so a saturated event
-    /// consumer cannot orphan an approval response.
+    /// The returned client is ready for requests and event consumption. If the
+    /// internal event queue is saturated later, server requests are rejected
+    /// with overload error instead of being silently dropped.
     pub async fn start(args: InProcessClientStartArgs) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
         let mut handle =
@@ -458,67 +485,57 @@ impl InProcessAppServerClient {
         let (command_tx, mut command_rx) = mpsc::channel::<ClientCommand>(channel_capacity);
         let (event_tx, event_rx) = mpsc::channel::<InProcessServerEvent>(channel_capacity);
 
-        let (shutdown_tx, mut shutdown_rx) =
-            mpsc::channel::<Option<oneshot::Sender<IoResult<()>>>>(1);
-        let command_request_sender = request_sender.clone();
-        let mut command_handle = tokio::spawn(async move {
-            while let Some(command) = command_rx.recv().await {
-                match command {
-                    ClientCommand::Request {
-                        request,
-                        response_tx,
-                    } => {
-                        let request_sender = command_request_sender.clone();
-                        tokio::spawn(async move {
-                            let result = request_sender.request(*request).await;
-                            let _ = response_tx.send(result);
-                        });
-                    }
-                    ClientCommand::Notify {
-                        notification,
-                        response_tx,
-                    } => {
-                        let result = command_request_sender.notify(notification).await;
-                        let _ = response_tx.send(result);
-                    }
-                    ClientCommand::ResolveServerRequest {
-                        request_id,
-                        result,
-                        response_tx,
-                    } => {
-                        let send_result = command_request_sender
-                            .respond_to_server_request(request_id, result)
-                            .await;
-                        let _ = response_tx.send(send_result);
-                    }
-                    ClientCommand::RejectServerRequest {
-                        request_id,
-                        error,
-                        response_tx,
-                    } => {
-                        let send_result = command_request_sender
-                            .fail_server_request(request_id, error)
-                            .await;
-                        let _ = response_tx.send(send_result);
-                    }
-                    ClientCommand::Shutdown { response_tx } => {
-                        let _ = shutdown_tx.send(Some(response_tx)).await;
-                        return;
-                    }
-                }
-            }
-            let _ = shutdown_tx.send(None).await;
-        });
-
         let worker_handle = tokio::spawn(async move {
             let mut event_stream_enabled = true;
             let mut skipped_events = 0usize;
-            let mut shutdown_response = None;
             loop {
                 tokio::select! {
-                    shutdown = shutdown_rx.recv() => {
-                        shutdown_response = shutdown.flatten();
-                        break;
+                    command = command_rx.recv() => {
+                        match command {
+                            Some(ClientCommand::Request { request, response_tx }) => {
+                                let request_sender = request_sender.clone();
+                                // Request waits happen on a detached task so
+                                // this loop can keep draining runtime events
+                                // while the request is blocked on client input.
+                                tokio::spawn(async move {
+                                    let result = request_sender.request(*request).await;
+                                    let _ = response_tx.send(result);
+                                });
+                            }
+                            Some(ClientCommand::Notify {
+                                notification,
+                                response_tx,
+                            }) => {
+                                let result = request_sender.notify(notification);
+                                let _ = response_tx.send(result);
+                            }
+                            Some(ClientCommand::ResolveServerRequest {
+                                request_id,
+                                result,
+                                response_tx,
+                            }) => {
+                                let send_result =
+                                    request_sender.respond_to_server_request(request_id, result);
+                                let _ = response_tx.send(send_result);
+                            }
+                            Some(ClientCommand::RejectServerRequest {
+                                request_id,
+                                error,
+                                response_tx,
+                            }) => {
+                                let send_result = request_sender.fail_server_request(request_id, error);
+                                let _ = response_tx.send(send_result);
+                            }
+                            Some(ClientCommand::Shutdown { response_tx }) => {
+                                let shutdown_result = handle.shutdown().await;
+                                let _ = response_tx.send(shutdown_result);
+                                break;
+                            }
+                            None => {
+                                let _ = handle.shutdown().await;
+                                break;
+                            }
+                        }
                     }
                     event = handle.next_event(), if event_stream_enabled => {
                         let Some(event) = event else {
@@ -535,7 +552,7 @@ impl InProcessAppServerClient {
                                     message: "chatgpt auth token refresh is not supported for in-process app-server clients".to_string(),
                                     data: None,
                                 },
-                            ).await;
+                            );
                             if let Err(err) = send_result {
                                 warn!(
                                     "failed to reject unsupported chatgpt auth token refresh request: {err}"
@@ -549,20 +566,15 @@ impl InProcessAppServerClient {
                             &mut skipped_events,
                             event,
                             |request| {
-                                let request_sender = request_sender.clone();
-                                tokio::spawn(async move {
-                                    let _ = request_sender
-                                        .fail_server_request(
-                                            request.id().clone(),
-                                            JSONRPCErrorError {
-                                                code: -32001,
-                                                message: "in-process app-server event queue is full"
-                                                    .to_string(),
-                                                data: None,
-                                            },
-                                        )
-                                        .await;
-                                });
+                                let _ = request_sender.fail_server_request(
+                                    request.id().clone(),
+                                    JSONRPCErrorError {
+                                        code: -32001,
+                                        message: "in-process app-server event queue is full"
+                                            .to_string(),
+                                        data: None,
+                                    },
+                                );
                             },
                         )
                         .await
@@ -574,12 +586,6 @@ impl InProcessAppServerClient {
                         }
                     }
                 }
-            }
-            command_handle.abort();
-            let _ = command_handle.await;
-            let shutdown_result = handle.shutdown().await;
-            if let Some(response_tx) = shutdown_response {
-                let _ = response_tx.send(shutdown_result);
             }
         });
 
@@ -733,8 +739,8 @@ impl InProcessAppServerClient {
     /// Returns the next in-process event, or `None` when worker exits.
     ///
     /// Callers are expected to drain this stream promptly. If they fall behind,
-    /// the worker emits [`InProcessServerEvent::Lagged`] markers for dropped
-    /// best-effort progress while retaining control and lifecycle events.
+    /// the worker emits [`InProcessServerEvent::Lagged`] markers and may reject
+    /// pending server requests rather than letting approval flows hang.
     pub async fn next_event(&mut self) -> Option<InProcessServerEvent> {
         self.event_rx.recv().await
     }
@@ -1017,9 +1023,7 @@ mod tests {
         channel_capacity: usize,
     ) -> TestClient {
         let codex_home = TempDir::new().expect("temp dir");
-        let mut config = build_test_config_for_codex_home(codex_home.path()).await;
-        config.sqlite_home = codex_home.path().join("sqlite");
-        let config = Arc::new(config);
+        let config = Arc::new(build_test_config_for_codex_home(codex_home.path()).await);
         let state_db = init_state_db(config.as_ref())
             .await
             .expect("state db should initialize for in-process test");
@@ -1359,7 +1363,9 @@ mod tests {
     async fn forward_in_process_event_preserves_transcript_notifications_under_backpressure() {
         let (event_tx, mut event_rx) = mpsc::channel(1);
         event_tx
-            .send(InProcessServerEvent::Lagged { skipped: 99 })
+            .send(InProcessServerEvent::ServerNotification(
+                command_execution_output_delta_notification("stdout-1"),
+            ))
             .await
             .expect("initial event should enqueue");
 
@@ -1367,7 +1373,9 @@ mod tests {
         let result = forward_in_process_event(
             &event_tx,
             &mut skipped_events,
-            InProcessServerEvent::Lagged { skipped: 98 },
+            InProcessServerEvent::ServerNotification(command_execution_output_delta_notification(
+                "stdout-2",
+            )),
             |_| {},
         )
         .await;
@@ -1408,7 +1416,9 @@ mod tests {
             .expect("receiver task should join successfully");
         assert!(matches!(
             &events[0],
-            InProcessServerEvent::Lagged { skipped: 99 }
+            InProcessServerEvent::ServerNotification(
+                ServerNotification::CommandExecutionOutputDelta(notification)
+            ) if notification.delta == "stdout-1"
         ));
         assert!(matches!(
             &events[1],
@@ -2186,7 +2196,7 @@ mod tests {
         assert!(!event_requires_delivery(&InProcessServerEvent::Lagged {
             skipped: 1
         }));
-        assert!(event_requires_delivery(
+        assert!(!event_requires_delivery(
             &InProcessServerEvent::ServerNotification(
                 codex_app_server_protocol::ServerNotification::CommandExecutionOutputDelta(
                     codex_app_server_protocol::CommandExecutionOutputDeltaNotification {

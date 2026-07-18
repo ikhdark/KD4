@@ -41,7 +41,6 @@ use futures::FutureExt;
 use futures::StreamExt;
 use namespace::SkillNamespaceResolver;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::error::Error;
 use std::fmt;
@@ -154,11 +153,6 @@ struct ResolvedDiscoveredSkill {
     path_uri: PathUri,
 }
 
-struct ParsedSkill {
-    metadata: SkillMetadata,
-    contents: Arc<str>,
-}
-
 #[derive(Debug)]
 enum SkillParseError {
     Read(std::io::Error),
@@ -186,7 +180,6 @@ impl fmt::Display for SkillParseError {
 
 impl Error for SkillParseError {}
 
-#[derive(Clone)]
 pub struct SkillRoot {
     pub path: AbsolutePathBuf,
     pub scope: SkillScope,
@@ -214,7 +207,6 @@ pub(crate) struct SkillRootSnapshot {
     pub(crate) root: AbsolutePathBuf,
     pub(crate) skills: Vec<SkillMetadata>,
     pub(crate) errors: Vec<SkillError>,
-    pub(crate) skill_bodies: HashMap<AbsolutePathBuf, Arc<str>>,
     pub(crate) file_system: Arc<dyn ExecutorFileSystem>,
 }
 
@@ -229,7 +221,6 @@ pub(crate) async fn load_skill_root(root: SkillRoot) -> SkillRootSnapshot {
     } = root;
     let root = canonicalize_for_skill_identity(file_system.as_ref(), &path).await;
     let mut outcome = SkillLoadOutcome::default();
-    let mut skill_bodies = HashMap::new();
     load_skills_under_root(
         file_system.as_ref(),
         &root,
@@ -238,24 +229,14 @@ pub(crate) async fn load_skill_root(root: SkillRoot) -> SkillRootSnapshot {
         plugin_namespace.as_deref(),
         plugin_root.as_ref(),
         &mut outcome,
-        &mut skill_bodies,
     )
     .await;
     SkillRootSnapshot {
         root,
         skills: outcome.skills,
         errors: outcome.errors,
-        skill_bodies,
         file_system,
     }
-}
-
-#[derive(Clone)]
-pub(crate) struct SkillRootLayout {
-    pub(crate) roots: Vec<SkillRoot>,
-    pub(crate) cwd: AbsolutePathBuf,
-    pub(crate) repo_fs: Option<Arc<dyn ExecutorFileSystem>>,
-    pub(crate) project_root_markers: Vec<String>,
 }
 
 pub(crate) async fn skill_roots(
@@ -265,26 +246,9 @@ pub(crate) async fn skill_roots(
     plugin_skill_roots: Vec<PluginSkillRoot>,
     extra_skill_roots: Vec<AbsolutePathBuf>,
 ) -> Vec<SkillRoot> {
-    resolve_skill_root_layout(skill_root_layout(
-        fs,
-        config_layer_stack,
-        cwd,
-        plugin_skill_roots,
-        extra_skill_roots,
-    ))
-    .await
-}
-
-pub(crate) fn skill_root_layout(
-    fs: Option<Arc<dyn ExecutorFileSystem>>,
-    config_layer_stack: &ConfigLayerStack,
-    cwd: &AbsolutePathBuf,
-    plugin_skill_roots: Vec<PluginSkillRoot>,
-    extra_skill_roots: Vec<AbsolutePathBuf>,
-) -> SkillRootLayout {
     let home_dir =
         home_dir().and_then(|path| AbsolutePathBuf::from_absolute_path_checked(path).ok());
-    skill_root_layout_with_home_dir(
+    skill_roots_with_home_dir(
         fs,
         config_layer_stack,
         cwd,
@@ -292,16 +256,17 @@ pub(crate) fn skill_root_layout(
         plugin_skill_roots,
         extra_skill_roots,
     )
+    .await
 }
 
-fn skill_root_layout_with_home_dir(
+async fn skill_roots_with_home_dir(
     fs: Option<Arc<dyn ExecutorFileSystem>>,
     config_layer_stack: &ConfigLayerStack,
     cwd: &AbsolutePathBuf,
     home_dir: Option<&AbsolutePathBuf>,
     plugin_skill_roots: Vec<PluginSkillRoot>,
     extra_skill_roots: Vec<AbsolutePathBuf>,
-) -> SkillRootLayout {
+) -> Vec<SkillRoot> {
     let mut roots = skill_roots_from_layer_stack_inner(config_layer_stack, home_dir, fs.clone());
     roots.extend(plugin_skill_roots.into_iter().map(|root| SkillRoot {
         path: root.path,
@@ -319,24 +284,7 @@ fn skill_root_layout_with_home_dir(
         plugin_namespace: None,
         plugin_root: None,
     }));
-    SkillRootLayout {
-        roots,
-        cwd: cwd.clone(),
-        repo_fs: fs,
-        project_root_markers: project_root_markers_from_stack(config_layer_stack),
-    }
-}
-
-pub(crate) async fn resolve_skill_root_layout(mut layout: SkillRootLayout) -> Vec<SkillRoot> {
-    layout.roots.extend(
-        repo_agents_skill_roots(
-            layout.repo_fs,
-            &layout.cwd,
-            &layout.project_root_markers,
-        )
-        .await,
-    );
-    let mut roots = layout.roots;
+    roots.extend(repo_agents_skill_roots(fs, config_layer_stack, cwd).await);
     dedupe_skill_roots_by_path(&mut roots);
     roots
 }
@@ -429,13 +377,14 @@ fn skill_roots_from_layer_stack_inner(
 
 async fn repo_agents_skill_roots(
     fs: Option<Arc<dyn ExecutorFileSystem>>,
+    config_layer_stack: &ConfigLayerStack,
     cwd: &AbsolutePathBuf,
-    project_root_markers: &[String],
 ) -> Vec<SkillRoot> {
     let Some(fs) = fs else {
         return Vec::new();
     };
-    let project_root = find_project_root(fs.as_ref(), cwd, project_root_markers).await;
+    let project_root_markers = project_root_markers_from_stack(config_layer_stack);
+    let project_root = find_project_root(fs.as_ref(), cwd, &project_root_markers).await;
     let dirs = dirs_between_project_root_and_cwd(cwd, &project_root);
     let mut roots = Vec::new();
     for dir in dirs {
@@ -463,10 +412,7 @@ async fn repo_agents_skill_roots(
     roots
 }
 
-/// Returns the effective marker names used by repo skill-root discovery.
-pub fn project_root_markers_from_stack(
-    config_layer_stack: &ConfigLayerStack,
-) -> Vec<String> {
+fn project_root_markers_from_stack(config_layer_stack: &ConfigLayerStack) -> Vec<String> {
     let mut merged = TomlValue::Table(toml::map::Map::new());
     for layer in config_layer_stack.get_layers(
         ConfigLayerStackOrdering::LowestPrecedenceFirst,
@@ -562,7 +508,6 @@ async fn load_skills_under_root(
     plugin_namespace: Option<&str>,
     plugin_root: Option<&AbsolutePathBuf>,
     outcome: &mut SkillLoadOutcome,
-    skill_bodies: &mut HashMap<AbsolutePathBuf, Arc<str>>,
 ) {
     let plugin_root = match plugin_root {
         Some(plugin_root) => Some(canonicalize_for_skill_identity(fs, plugin_root).await),
@@ -662,23 +607,16 @@ async fn load_skills_under_root(
         .boxed();
     let (namespace_resolver, skill_results) = tokio::join!(namespace_resolver, skill_results);
     for (path, path_uri, result) in skill_results {
-        let result = result.and_then(|mut parsed| {
-            parsed.metadata.name = namespace_resolver
+        let result = result.and_then(|mut skill| {
+            skill.name = namespace_resolver
                 .for_skill(&root_uri, &path_uri)
-                .qualify(&parsed.metadata.name);
-            validate_len(
-                &parsed.metadata.name,
-                MAX_QUALIFIED_NAME_LEN,
-                "qualified name",
-            )
+                .qualify(&skill.name);
+            validate_len(&skill.name, MAX_QUALIFIED_NAME_LEN, "qualified name")
                 .map_err(|err| err.to_string())?;
-            Ok(parsed)
+            Ok(skill)
         });
         match result {
-            Ok(parsed) => {
-                skill_bodies.insert(path, Arc::clone(&parsed.contents));
-                outcome.skills.push(parsed.metadata);
-            }
+            Ok(skill) => outcome.skills.push(skill),
             Err(err) if scope != SkillScope::System => {
                 outcome.errors.push(SkillError { path, message: err })
             }
@@ -695,7 +633,7 @@ async fn parse_skill_file(
     scope: SkillScope,
     plugin_id: Option<&str>,
     plugin_root: Option<&AbsolutePathBuf>,
-) -> Result<ParsedSkill, SkillParseError> {
+) -> Result<SkillMetadata, SkillParseError> {
     let metadata_path = path_uri
         .parent()
         .and_then(|parent| parent.join(SKILLS_METADATA_DIR).ok())
@@ -722,19 +660,16 @@ async fn parse_skill_file(
         policy,
     } = loaded_metadata;
 
-    Ok(ParsedSkill {
-        metadata: SkillMetadata {
-            name: base_name,
-            description,
-            short_description,
-            interface,
-            dependencies,
-            policy,
-            path_to_skills_md: path.clone(),
-            scope,
-            plugin_id: plugin_id.map(str::to_string),
-        },
-        contents: Arc::from(contents),
+    Ok(SkillMetadata {
+        name: base_name,
+        description,
+        short_description,
+        interface,
+        dependencies,
+        policy,
+        path_to_skills_md: path.clone(),
+        scope,
+        plugin_id: plugin_id.map(str::to_string),
     })
 }
 
@@ -1244,14 +1179,14 @@ pub(crate) async fn skill_roots_from_layer_stack(
     cwd: &AbsolutePathBuf,
     home_dir: Option<&AbsolutePathBuf>,
 ) -> Vec<SkillRoot> {
-    resolve_skill_root_layout(skill_root_layout_with_home_dir(
+    skill_roots_with_home_dir(
         Some(fs),
         config_layer_stack,
         cwd,
         home_dir,
         Vec::new(),
         Vec::new(),
-    ))
+    )
     .await
 }
 

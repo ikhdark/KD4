@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HookCompletedEvent;
@@ -15,7 +14,6 @@ use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
-use crate::engine::dispatcher::HookMatchContext;
 use crate::engine::output_parser;
 use crate::schema::NullableString;
 use crate::schema::SubagentCommandInputFields;
@@ -31,12 +29,6 @@ pub struct UserPromptSubmitRequest {
     pub model: String,
     pub permission_mode: String,
     pub prompt: String,
-}
-
-impl UserPromptSubmitRequest {
-    pub(crate) fn match_context(&self) -> HookMatchContext<'_> {
-        HookMatchContext::UserPromptSubmit
-    }
 }
 
 #[derive(Debug)]
@@ -78,14 +70,6 @@ pub(crate) async fn run(
         HookEventName::UserPromptSubmit,
         /*matcher_input*/ None,
     );
-    run_prepared(matched, shell, request).await
-}
-
-pub(crate) async fn run_prepared(
-    matched: Vec<Arc<ConfiguredHandler>>,
-    shell: &CommandShell,
-    request: UserPromptSubmitRequest,
-) -> UserPromptSubmitOutcome {
     if matched.is_empty() {
         return UserPromptSubmitOutcome {
             hook_events: Vec::new(),

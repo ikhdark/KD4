@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HookCompletedEvent;
@@ -16,7 +15,6 @@ use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
-use crate::engine::dispatcher::HookMatchContext;
 use crate::engine::output_parser;
 use crate::schema::PostToolUseCommandInput;
 use crate::schema::SubagentCommandInputFields;
@@ -35,15 +33,6 @@ pub struct PostToolUseRequest {
     pub tool_use_id: String,
     pub tool_input: Value,
     pub tool_response: Value,
-}
-
-impl PostToolUseRequest {
-    pub(crate) fn match_context(&self) -> HookMatchContext<'_> {
-        HookMatchContext::PostToolUse {
-            canonical_tool_name: &self.tool_name,
-            matcher_aliases: &self.matcher_aliases,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -89,14 +78,6 @@ pub(crate) async fn run(
         HookEventName::PostToolUse,
         &matcher_inputs,
     );
-    run_prepared(matched, shell, request).await
-}
-
-pub(crate) async fn run_prepared(
-    matched: Vec<Arc<ConfiguredHandler>>,
-    shell: &CommandShell,
-    request: PostToolUseRequest,
-) -> PostToolUseOutcome {
     if matched.is_empty() {
         return PostToolUseOutcome {
             hook_events: Vec::new(),
@@ -566,7 +547,7 @@ mod tests {
         let runs = preview(&[handler()], &request);
 
         let completed = common::serialization_failure_hook_events_for_tool_use(
-            vec![handler().into()],
+            vec![handler()],
             Some(request.turn_id.clone()),
             "serialize failed".into(),
             &request.tool_use_id,

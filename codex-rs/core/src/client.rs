@@ -26,7 +26,6 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::Condvar;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
@@ -90,6 +89,7 @@ use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout_trace::CompactionTraceContext;
 use codex_rollout_trace::InferenceTraceAttempt;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_tools::create_tools_json_for_responses_api;
 use eventsource_stream::Event;
 use eventsource_stream::EventStreamError;
 use futures::StreamExt;
@@ -117,16 +117,9 @@ use crate::attestation::X_OAI_ATTESTATION_HEADER;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
-use crate::client_common::format_response_input_for_request;
-use crate::context_manager::PromptHistoryCanonicalHash;
-use crate::context_manager::PromptHistoryIncrementalProof;
-use crate::context_manager::PromptHistoryPolicyIdentity;
-use crate::context_manager::PromptHistorySnapshot;
 use crate::feedback_tags;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::subagent_header_value;
-use crate::tools::ToolWireMode;
-use crate::tools::ToolWireValue;
 use crate::turn_timing::TurnLocalPhase;
 use crate::turn_timing::TurnTimingState;
 use crate::util::emit_feedback_auth_recovery_tags;
@@ -226,7 +219,7 @@ struct ModelClientState {
     disable_websockets: AtomicBool,
     agent_identity_session_fallback: AgentIdentitySessionFallback,
     cached_websocket_session: StdMutex<WebsocketSession>,
-    request_schema_cache: RequestSchemaSerializationCache,
+    request_schema_cache: StdMutex<RequestSchemaSerializationCache>,
 }
 
 const REQUEST_SCHEMA_CACHE_CAPACITY: usize = 8;
@@ -236,140 +229,18 @@ struct RequestSchemaCacheKey([u8; 32]);
 
 #[derive(Debug, Clone)]
 struct RequestSchemaCacheValue {
-    tools: ToolWireValue,
+    tools: Vec<serde_json::Value>,
     text: Option<TextControls>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ResponsesRequestKind {
-    Streaming,
-    Compact,
-}
-
-impl ResponsesRequestKind {
-    fn tool_wire_mode(self, use_responses_lite: bool) -> ToolWireMode {
-        if use_responses_lite {
-            ToolWireMode::ResponsesLite
-        } else {
-            match self {
-                Self::Streaming => ToolWireMode::Responses,
-                Self::Compact => ToolWireMode::Compact,
-            }
-        }
-    }
 }
 
 #[derive(Debug, Default)]
 struct RequestSchemaSerializationCache {
-    state: StdMutex<RequestSchemaCacheState>,
-}
-
-#[derive(Debug, Default)]
-struct RequestSchemaCacheState {
     entries: VecDeque<(RequestSchemaCacheKey, RequestSchemaCacheValue)>,
-    flights: Vec<(RequestSchemaCacheKey, Arc<RequestSchemaFlight>)>,
     hits: u64,
     misses: u64,
 }
 
-#[derive(Debug, Default)]
-struct RequestSchemaFlight {
-    completed: StdMutex<bool>,
-    wake: Condvar,
-}
-
-impl RequestSchemaFlight {
-    fn wait(&self) {
-        let wait = || {
-            let mut completed = self
-                .completed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            while !*completed {
-                completed = self
-                    .wake
-                    .wait(completed)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-        };
-        if matches!(
-            tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()),
-            Ok(tokio::runtime::RuntimeFlavor::MultiThread)
-        ) {
-            tokio::task::block_in_place(wait);
-        } else {
-            wait();
-        }
-    }
-
-    fn complete(&self) {
-        let mut completed = self
-            .completed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !*completed {
-            *completed = true;
-            self.wake.notify_all();
-        }
-    }
-}
-
-struct RequestSchemaFlightLeader<'a> {
-    cache: &'a RequestSchemaSerializationCache,
-    key: RequestSchemaCacheKey,
-    flight: Arc<RequestSchemaFlight>,
-    active: bool,
-}
-
 impl RequestSchemaSerializationCache {
-    fn get_or_insert_with(
-        &self,
-        key: RequestSchemaCacheKey,
-        factory: impl FnOnce() -> RequestSchemaCacheValue,
-    ) -> RequestSchemaCacheValue {
-        let mut factory = Some(factory);
-        loop {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(value) = state.get(key) {
-                trace!("request schema serialization cache hit");
-                return value;
-            }
-            state.record_miss();
-            if let Some(flight) = state
-                .flights
-                .iter()
-                .find(|(candidate, _)| *candidate == key)
-                .map(|(_, flight)| Arc::clone(flight))
-            {
-                drop(state);
-                flight.wait();
-                continue;
-            }
-
-            let flight = Arc::new(RequestSchemaFlight::default());
-            state.flights.push((key, Arc::clone(&flight)));
-            drop(state);
-            let leader = RequestSchemaFlightLeader {
-                cache: self,
-                key,
-                flight,
-                active: true,
-            };
-            let value = factory.take().expect("request-schema factory runs once")();
-            return leader.commit(value);
-        }
-    }
-
-    #[cfg(test)]
-    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, RequestSchemaCacheState>> {
-        self.state.lock()
-    }
-}
-
-impl RequestSchemaCacheState {
     fn get(&mut self, key: RequestSchemaCacheKey) -> Option<RequestSchemaCacheValue> {
         let index = self
             .entries
@@ -394,58 +265,6 @@ impl RequestSchemaCacheState {
     }
 }
 
-impl RequestSchemaFlightLeader<'_> {
-    fn commit(mut self, value: RequestSchemaCacheValue) -> RequestSchemaCacheValue {
-        let completion = RequestSchemaFlightCompletion(Arc::clone(&self.flight));
-        let mut state = self
-            .cache
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.remove_flight(&mut state);
-        self.active = false;
-        state.insert(self.key, value.clone());
-        drop(state);
-        drop(completion);
-        value
-    }
-
-    fn remove_flight(&self, state: &mut RequestSchemaCacheState) {
-        if let Some(index) = state
-            .flights
-            .iter()
-            .position(|(_, flight)| Arc::ptr_eq(flight, &self.flight))
-        {
-            state.flights.swap_remove(index);
-        }
-    }
-}
-
-impl Drop for RequestSchemaFlightLeader<'_> {
-    fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        let mut state = self
-            .cache
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.remove_flight(&mut state);
-        self.active = false;
-        drop(state);
-        self.flight.complete();
-    }
-}
-
-struct RequestSchemaFlightCompletion(Arc<RequestSchemaFlight>);
-
-impl Drop for RequestSchemaFlightCompletion {
-    fn drop(&mut self) {
-        self.0.complete();
-    }
-}
-
 /// Resolved API client setup for a single request attempt.
 ///
 /// Keeping this as a single bundle ensures prewarm and normal request paths
@@ -455,27 +274,6 @@ struct CurrentClientSetup {
     api_provider: ApiProvider,
     api_auth: SharedAuthProvider,
     agent_identity_telemetry: Option<AgentIdentityTelemetry>,
-}
-
-/// Privacy-safe identity for the auth state accepted by an immutable sampling request.
-///
-/// The digest never leaves process memory and contains no recoverable credentials. The
-/// generation catches same-manager credential replacement, while the identity digest keeps
-/// account-scoped request state from crossing an auth-manager replacement or reset.
-#[derive(Clone, Copy, Eq, PartialEq, serde::Serialize)]
-pub(crate) struct RequestAuthSnapshot {
-    generation: Option<u64>,
-    identity_digest: [u8; 32],
-}
-
-impl std::fmt::Debug for RequestAuthSnapshot {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RequestAuthSnapshot")
-            .field("generation", &self.generation)
-            .field("identity", &"redacted")
-            .finish()
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -513,8 +311,8 @@ pub struct ModelClient {
 /// The session establishes a Responses WebSocket connection lazily and reuses it across multiple
 /// requests within the turn. It also caches per-turn state:
 ///
-/// - A compact proof of the last request, so subsequent calls can reuse incremental websocket
-///   payloads without retaining the full request.
+/// - The last full request, so subsequent calls can reuse incremental websocket request payloads
+///   only when the current request is an incremental extension of the previous one.
 /// - The `x-codex-turn-state` sticky-routing token, which must be replayed for all requests within
 ///   the same turn.
 ///
@@ -544,84 +342,64 @@ struct LastResponse {
     items_added: Vec<ResponseItem>,
 }
 
+const WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION: u16 = 1;
+const WEBSOCKET_HISTORY_HASH_DOMAIN: &[u8] = b"codex.websocket.history.v1";
 const WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN: &[u8] = b"codex.websocket.request-properties.v1";
-const REQUEST_AUTH_IDENTITY_DOMAIN: &[u8] = b"codex.request-auth-identity.v1";
-const REQUEST_AUTH_CAPTURE_ATTEMPTS: usize = 4;
 
-type CanonicalPrefixHash = PromptHistoryCanonicalHash;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CanonicalPrefixHash {
+    item_count: usize,
+    digest: [u8; 32],
+}
 
-fn update_identity_digest(hasher: &mut Sha256, value: Option<&str>) {
-    match value {
-        Some(value) => {
-            hasher.update([1]);
-            hasher.update((value.len() as u64).to_be_bytes());
-            hasher.update(value.as_bytes());
+impl CanonicalPrefixHash {
+    fn empty() -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(WEBSOCKET_HISTORY_HASH_DOMAIN);
+        hasher.update(WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION.to_be_bytes());
+        Self {
+            item_count: 0,
+            digest: hasher.finalize().into(),
         }
-        None => hasher.update([0]),
+    }
+
+    fn from_items(items: &[ResponseItem]) -> serde_json::Result<Self> {
+        let mut prefix = Self::empty();
+        prefix.extend_items(items)?;
+        Ok(prefix)
+    }
+
+    fn extend_items(&mut self, items: &[ResponseItem]) -> serde_json::Result<()> {
+        for item in items {
+            let mut normalized = item.clone();
+            normalized.clear_internal_chat_message_metadata_passthrough();
+            let serialized = serde_json::to_vec(&normalized)?;
+            let mut hasher = Sha256::new();
+            hasher.update(WEBSOCKET_HISTORY_HASH_DOMAIN);
+            hasher.update(self.digest);
+            hasher.update((serialized.len() as u64).to_be_bytes());
+            hasher.update(serialized);
+            self.digest = hasher.finalize().into();
+            self.item_count = self.item_count.saturating_add(1);
+        }
+        Ok(())
     }
 }
 
-fn request_auth_identity_digest(
-    auth: Option<&CodexAuth>,
-    agent_identity_telemetry: Option<&AgentIdentityTelemetry>,
-) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(REQUEST_AUTH_IDENTITY_DOMAIN);
-    let Some(auth) = auth else {
-        hasher.update([0]);
-        return hasher.finalize().into();
-    };
-    hasher.update([1]);
-    hasher.update(format!("{:?}", auth.auth_mode()).as_bytes());
-    let account_id = auth.get_account_id();
-    let chatgpt_user_id = auth.get_chatgpt_user_id();
-    update_identity_digest(&mut hasher, account_id.as_deref());
-    update_identity_digest(&mut hasher, chatgpt_user_id.as_deref());
-    hasher.update([u8::from(auth.is_workspace_account())]);
-    hasher.update([u8::from(auth.is_fedramp_account())]);
-    if matches!(
-        auth.auth_mode(),
-        AuthMode::ApiKey | AuthMode::PersonalAccessToken
-    ) {
-        let credential = auth.get_token().ok();
-        update_identity_digest(&mut hasher, credential.as_deref());
-    }
-    if let Some(agent_identity) = agent_identity_telemetry {
-        update_identity_digest(&mut hasher, Some(agent_identity.agent_id.as_str()));
-        update_identity_digest(&mut hasher, Some(agent_identity.task_id.as_str()));
-    } else {
-        update_identity_digest(&mut hasher, None);
-        update_identity_digest(&mut hasher, None);
-    }
-    hasher.finalize().into()
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 struct WebsocketHistoryBaseline {
     /// Monotonic diagnostic identity for the immutable request prefix. Equality
     /// of this generation is never used as proof of model-visible equivalence.
     generation: u64,
-    mutation_revision: Option<u64>,
-    rewrite_revision: Option<u64>,
     request_prefix: CanonicalPrefixHash,
     request_properties_fingerprint: [u8; 32],
-    history_policy_identity: PromptHistoryPolicyIdentity,
-    previous_response_id: Option<String>,
-}
-
-#[derive(Debug)]
-struct IncrementalProof {
-    previous_response_id: String,
-    input: Vec<ResponseItem>,
-    current_prefix: CanonicalPrefixHash,
-    mutation_revision: Option<u64>,
-    rewrite_revision: Option<u64>,
+    normalization_policy_version: u16,
 }
 
 #[derive(Debug, Default)]
 struct WebsocketSession {
     connection: Option<ApiWebSocketConnection>,
-    connection_auth_snapshot: Option<RequestAuthSnapshot>,
+    last_request: Option<ResponsesApiRequest>,
     last_request_history: Option<WebsocketHistoryBaseline>,
     next_history_generation: u64,
     last_response_rx: Option<oneshot::Receiver<LastResponse>>,
@@ -629,84 +407,81 @@ struct WebsocketSession {
     connection_reused: StdMutex<bool>,
 }
 
-#[derive(serde::Serialize)]
-struct BorrowedResponsesRequestProperties<'a> {
-    model: &'a String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    instructions: &'a String,
-    input: &'a [ResponseItem],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<&'a Vec<serde_json::Value>>,
-    tool_choice: &'a String,
-    parallel_tool_calls: bool,
-    reasoning: Option<&'a Reasoning>,
-    store: bool,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    stream_options: Option<&'a StreamOptions>,
-    include: &'a Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    service_tier: Option<&'a String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_cache_key: Option<&'a String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    text: Option<&'a TextControls>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    client_metadata: Option<&'a HashMap<String, String>>,
-}
-
 fn responses_request_properties_fingerprint(
     request: &ResponsesApiRequest,
-    auth_snapshot: &RequestAuthSnapshot,
-    history_policy_identity: PromptHistoryPolicyIdentity,
-    use_responses_lite: bool,
 ) -> serde_json::Result<[u8; 32]> {
-    // Input is compared through the canonical history proof, while delivery-only
-    // stream options and client metadata do not affect previous_response_id reuse.
-    let ResponsesApiRequest {
-        model,
-        instructions,
-        input: _,
-        tools,
-        tool_choice,
-        parallel_tool_calls,
-        reasoning,
-        store,
-        stream,
-        stream_options: _,
-        include,
-        service_tier,
-        prompt_cache_key,
-        text,
-        client_metadata: _,
-    } = request;
-    let properties = BorrowedResponsesRequestProperties {
-        model,
-        instructions,
-        input: &[],
-        tools: tools.as_ref(),
-        tool_choice,
-        parallel_tool_calls: *parallel_tool_calls,
-        reasoning: reasoning.as_ref(),
-        store: *store,
-        stream: *stream,
-        stream_options: None,
-        include,
-        service_tier: service_tier.as_ref(),
-        prompt_cache_key: prompt_cache_key.as_ref(),
-        text: text.as_ref(),
-        client_metadata: None,
-    };
+    // Keep this aligned with `responses_request_properties_match`: input is
+    // compared through the normalized prefix chain, while delivery-only stream
+    // options and client metadata do not affect previous_response_id reuse.
+    let mut properties = request.clone();
+    properties.input.clear();
+    properties.stream_options = None;
+    properties.client_metadata = None;
     let serialized = serde_json::to_vec(&properties)?;
-    let static_identity =
-        serde_json::to_vec(&(auth_snapshot, history_policy_identity, use_responses_lite))?;
     let mut hasher = Sha256::new();
     hasher.update(WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN);
-    hasher.update((static_identity.len() as u64).to_be_bytes());
-    hasher.update(static_identity);
+    hasher.update(WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION.to_be_bytes());
     hasher.update((serialized.len() as u64).to_be_bytes());
     hasher.update(serialized);
     Ok(hasher.finalize().into())
+}
+
+// This is intentionally not a `PartialEq` implementation: request equality includes `input` and
+// `client_metadata`, while websocket reuse compares the input separately and ignores metadata.
+// Keep the destructuring exhaustive so new request fields require an explicit reuse decision.
+fn responses_request_properties_match(
+    previous: &ResponsesApiRequest,
+    current: &ResponsesApiRequest,
+) -> bool {
+    let ResponsesApiRequest {
+        model: previous_model,
+        instructions: previous_instructions,
+        input: _,
+        tools: previous_tools,
+        tool_choice: previous_tool_choice,
+        parallel_tool_calls: previous_parallel_tool_calls,
+        reasoning: previous_reasoning,
+        store: previous_store,
+        stream: previous_stream,
+        stream_options: _,
+        include: previous_include,
+        service_tier: previous_service_tier,
+        prompt_cache_key: previous_prompt_cache_key,
+        text: previous_text,
+        client_metadata: _,
+    } = previous;
+    let ResponsesApiRequest {
+        model: current_model,
+        instructions: current_instructions,
+        input: _,
+        tools: current_tools,
+        tool_choice: current_tool_choice,
+        parallel_tool_calls: current_parallel_tool_calls,
+        reasoning: current_reasoning,
+        store: current_store,
+        stream: current_stream,
+        stream_options: _,
+        include: current_include,
+        service_tier: current_service_tier,
+        prompt_cache_key: current_prompt_cache_key,
+        text: current_text,
+        client_metadata: _,
+    } = current;
+
+    previous_model == current_model
+        && previous_instructions == current_instructions
+        && previous_tools == current_tools
+        && previous_tool_choice == current_tool_choice
+        && previous_parallel_tool_calls == current_parallel_tool_calls
+        && previous_reasoning == current_reasoning
+        && previous_store == current_store
+        && previous_stream == current_stream
+        // Stream options control delivery for this response, not the context
+        // referenced by `previous_response_id`.
+        && previous_include == current_include
+        && previous_service_tier == current_service_tier
+        && previous_prompt_cache_key == current_prompt_cache_key
+        && previous_text == current_text
 }
 
 impl WebsocketSession {
@@ -802,7 +577,7 @@ impl ModelClient {
                 disable_websockets: AtomicBool::new(false),
                 agent_identity_session_fallback: AgentIdentitySessionFallback::default(),
                 cached_websocket_session: StdMutex::new(WebsocketSession::default()),
-                request_schema_cache: RequestSchemaSerializationCache::default(),
+                request_schema_cache: StdMutex::new(RequestSchemaSerializationCache::default()),
             }),
             agent_identity_policy,
             prompt_cache_key_override: None,
@@ -914,7 +689,6 @@ impl ModelClient {
             &client_setup.api_provider,
             prompt,
             model_info,
-            ResponsesRequestKind::Compact,
             settings.effort,
             settings.summary,
             settings.service_tier,
@@ -1177,13 +951,12 @@ impl ModelClient {
     }
 
     fn request_schema_cache_key(
-        tool_product_fingerprint: [u8; 32],
         prompt: &Prompt,
         verbosity: Option<VerbosityConfig>,
         use_responses_lite: bool,
     ) -> serde_json::Result<RequestSchemaCacheKey> {
         let serialized = serde_json::to_vec(&(
-            tool_product_fingerprint,
+            prompt.tools.as_slice(),
             &prompt.output_schema,
             prompt.output_schema_strict,
             format!("{verbosity:?}"),
@@ -1200,13 +973,11 @@ impl ModelClient {
         &self,
         prompt: &Prompt,
         verbosity: Option<VerbosityConfig>,
-        mode: ToolWireMode,
+        use_responses_lite: bool,
     ) -> Result<RequestSchemaCacheValue> {
-        let product = prompt.tools.wire_product(mode)?;
-        let use_responses_lite = matches!(mode, ToolWireMode::ResponsesLite);
         if !crate::latency_switches::stage3_persistence_history_enabled() {
             return Ok(RequestSchemaCacheValue {
-                tools: product.value(),
+                tools: create_tools_json_for_responses_api(&prompt.tools)?,
                 text: create_text_param_for_request(
                     verbosity,
                     &prompt.output_schema,
@@ -1214,23 +985,39 @@ impl ModelClient {
                 ),
             });
         }
-        let key = Self::request_schema_cache_key(
-            product.fingerprint(),
-            prompt,
-            verbosity,
-            use_responses_lite,
-        )?;
-        let value =
-            self.state
+        let key = Self::request_schema_cache_key(prompt, verbosity, use_responses_lite)?;
+        {
+            let mut cache = self
+                .state
                 .request_schema_cache
-                .get_or_insert_with(key, || RequestSchemaCacheValue {
-                    tools: product.value(),
-                    text: create_text_param_for_request(
-                        verbosity,
-                        &prompt.output_schema,
-                        prompt.output_schema_strict,
-                    ),
-                });
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(value) = cache.get(key) {
+                trace!("request schema serialization cache hit");
+                return Ok(value);
+            }
+            cache.record_miss();
+        }
+
+        let value = RequestSchemaCacheValue {
+            tools: create_tools_json_for_responses_api(&prompt.tools)?,
+            text: create_text_param_for_request(
+                verbosity,
+                &prompt.output_schema,
+                prompt.output_schema_strict,
+            ),
+        };
+        let mut cache = self
+            .state
+            .request_schema_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(value) = cache.get(key) {
+            // Another request populated the same immutable entry while this
+            // request serialized outside the lock.
+            return Ok(value);
+        }
+        cache.insert(key, value.clone());
         Ok(value)
     }
 
@@ -1240,7 +1027,6 @@ impl ModelClient {
         provider: &codex_api::Provider,
         prompt: &Prompt,
         model_info: &ModelInfo,
-        request_kind: ResponsesRequestKind,
         effort: Option<ReasoningEffortConfig>,
         summary: ReasoningSummaryConfig,
         service_tier: Option<String>,
@@ -1264,32 +1050,29 @@ impl ModelClient {
             }
             None
         };
-        let RequestSchemaCacheValue { tools, text } = self.request_schema_components(
-            prompt,
-            verbosity,
-            request_kind.tool_wire_mode(model_info.use_responses_lite),
-        )?;
-        let (instructions, tools) = match tools {
-            ToolWireValue::AdditionalTools(additional_tools) => {
-                let mut prefix = vec![additional_tools.as_ref().clone()];
-                if !prompt.base_instructions.text.is_empty() {
-                    prefix.push(ResponseItem::Message {
-                        id: None,
-                        role: "developer".to_string(),
-                        content: vec![ContentItem::InputText {
-                            text: prompt.base_instructions.text.clone(),
-                        }],
-                        phase: None,
-                        internal_chat_message_metadata_passthrough: None,
-                    });
-                }
-                input.splice(0..0, prefix);
-                (String::new(), None)
+        let RequestSchemaCacheValue { tools, text } =
+            self.request_schema_components(prompt, verbosity, model_info.use_responses_lite)?;
+        let (instructions, tools) = if model_info.use_responses_lite {
+            let mut prefix = vec![ResponseItem::AdditionalTools {
+                id: None,
+                role: "developer".to_string(),
+                tools,
+            }];
+            if !prompt.base_instructions.text.is_empty() {
+                prefix.push(ResponseItem::Message {
+                    id: None,
+                    role: "developer".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: prompt.base_instructions.text.clone(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                });
             }
-            ToolWireValue::TopLevel(tools) => (
-                prompt.base_instructions.text.clone(),
-                Some(tools.as_ref().to_vec()),
-            ),
+            input.splice(0..0, prefix);
+            (String::new(), None)
+        } else {
+            (prompt.base_instructions.text.clone(), Some(tools))
         };
         let stream_options = (self.state.concurrent_reasoning_summaries_enabled && is_openai)
             .then_some(StreamOptions {
@@ -1368,65 +1151,6 @@ impl ModelClient {
             api_auth: resolved_auth.auth,
             agent_identity_telemetry: resolved_auth.agent_identity_telemetry,
         })
-    }
-
-    fn current_auth_generation(&self) -> Option<u64> {
-        let auth_manager = self.state.provider.auth_manager()?;
-        let receiver = auth_manager.auth_change_receiver();
-        let generation = *receiver.borrow();
-        Some(generation)
-    }
-
-    fn request_auth_snapshot_for_setup(
-        &self,
-        setup: &CurrentClientSetup,
-        generation: Option<u64>,
-    ) -> RequestAuthSnapshot {
-        RequestAuthSnapshot {
-            generation,
-            identity_digest: request_auth_identity_digest(
-                setup.auth.as_ref(),
-                setup.agent_identity_telemetry.as_ref(),
-            ),
-        }
-    }
-
-    async fn capture_request_auth_snapshot(&self) -> Result<RequestAuthSnapshot> {
-        for _ in 0..REQUEST_AUTH_CAPTURE_ATTEMPTS {
-            let generation_before = self.current_auth_generation();
-            let setup = self.current_client_setup().await?;
-            let generation_after = self.current_auth_generation();
-            if generation_before == generation_after {
-                return Ok(self.request_auth_snapshot_for_setup(&setup, generation_after));
-            }
-        }
-        Err(CodexErr::Stream(
-            "request auth state did not stabilize before sampling".to_string(),
-            None,
-        ))
-    }
-
-    async fn current_client_setup_for(
-        &self,
-        expected: &RequestAuthSnapshot,
-        allow_newer_generation: bool,
-    ) -> Result<CurrentClientSetup> {
-        let setup = self.current_client_setup().await?;
-        let current = self.request_auth_snapshot_for_setup(&setup, self.current_auth_generation());
-        let generation_matches = current.generation == expected.generation
-            || (allow_newer_generation
-                && current
-                    .generation
-                    .zip(expected.generation)
-                    .is_some_and(|(current, expected)| current >= expected));
-        if !generation_matches || current.identity_digest != expected.identity_digest {
-            return Err(CodexErr::Stream(
-                "authentication changed after the immutable sampling snapshot was captured"
-                    .to_string(),
-                None,
-            ));
-        }
-        Ok(setup)
     }
 
     fn build_api_transport(
@@ -1581,10 +1305,6 @@ impl Drop for ModelClientSession {
 }
 
 impl ModelClientSession {
-    pub(crate) async fn capture_request_auth_snapshot(&self) -> Result<RequestAuthSnapshot> {
-        self.client.capture_request_auth_snapshot().await
-    }
-
     pub(crate) fn set_turn_timing(&mut self, turn_timing: Arc<TurnTimingState>) {
         self.turn_timing = Some(turn_timing);
     }
@@ -1595,7 +1315,6 @@ impl ModelClientSession {
 
     fn reset_websocket_session(&mut self) {
         self.websocket_session.connection = None;
-        self.websocket_session.connection_auth_snapshot = None;
         self.invalidate_incremental_history("websocket reset");
         self.websocket_session
             .set_connection_reused(/*connection_reused*/ false);
@@ -1614,6 +1333,7 @@ impl ModelClientSession {
                 "invalidating websocket incremental history"
             );
         }
+        self.websocket_session.last_request = None;
         self.websocket_session.last_request_history = None;
         self.websocket_session.last_response_rx = None;
         self.websocket_session.last_response_from_untraced_warmup = false;
@@ -1624,23 +1344,9 @@ impl ModelClientSession {
             .max(1);
     }
 
-    fn remember_request_history(
-        &mut self,
-        request: &ResponsesApiRequest,
-        auth_snapshot: &RequestAuthSnapshot,
-        history_policy_identity: PromptHistoryPolicyIdentity,
-        use_responses_lite: bool,
-        request_prefix: serde_json::Result<CanonicalPrefixHash>,
-        mutation_revision: Option<u64>,
-        rewrite_revision: Option<u64>,
-        previous_response_id: Option<String>,
-    ) {
-        let request_properties_fingerprint = responses_request_properties_fingerprint(
-            request,
-            auth_snapshot,
-            history_policy_identity,
-            use_responses_lite,
-        );
+    fn remember_request_history(&mut self, request: &ResponsesApiRequest) {
+        let request_prefix = CanonicalPrefixHash::from_items(&request.input);
+        let request_properties_fingerprint = responses_request_properties_fingerprint(request);
         self.websocket_session.next_history_generation = self
             .websocket_session
             .next_history_generation
@@ -1652,12 +1358,10 @@ impl ModelClientSession {
                 (Ok(request_prefix), Ok(request_properties_fingerprint)) => {
                     Some(WebsocketHistoryBaseline {
                         generation,
-                        mutation_revision,
-                        rewrite_revision,
                         request_prefix,
                         request_properties_fingerprint,
-                        history_policy_identity,
-                        previous_response_id,
+                        normalization_policy_version:
+                            WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION,
                     })
                 }
                 (request_prefix, request_properties_fingerprint) => {
@@ -1665,7 +1369,7 @@ impl ModelClientSession {
                         history_generation = generation,
                         prefix_hash_error = ?request_prefix.err(),
                         properties_hash_error = ?request_properties_fingerprint.err(),
-                        "websocket history proof unavailable; forcing a full next request"
+                        "websocket history hashing unavailable; retaining full-comparison fallback"
                     );
                     None
                 }
@@ -1708,96 +1412,149 @@ impl ModelClientSession {
         }
     }
 
-    /// Produces a complete proof that the current request is an append-only
-    /// extension of the last request and its completed provider response.
-    fn get_incremental_proof(
+    /// Checks whether the current request is an incremental extension of the previous request.
+    /// We only reuse an incremental input delta when non-input request fields are unchanged and
+    /// `input` is a strict extension of the previous known input. Server-returned output items
+    /// are treated as part of the baseline so we do not resend them.
+    fn get_incremental_items(
         &self,
         request: &ResponsesApiRequest,
-        history: Option<&PromptHistorySnapshot>,
-        auth_snapshot: &RequestAuthSnapshot,
-        history_policy_identity: PromptHistoryPolicyIdentity,
-        use_responses_lite: bool,
-        last_response: &LastResponse,
+        last_response: Option<&LastResponse>,
         allow_empty_delta: bool,
-    ) -> Option<IncrementalProof> {
-        let baseline = self.websocket_session.last_request_history.as_ref()?;
-        let baseline_reused_previous_response = baseline.previous_response_id.is_some();
-        let current_properties_fingerprint = responses_request_properties_fingerprint(
-            request,
-            auth_snapshot,
-            history_policy_identity,
-            use_responses_lite,
-        )
-        .ok()?;
-        if current_properties_fingerprint != baseline.request_properties_fingerprint {
-            trace!(
-                history_generation = baseline.generation,
-                "incremental request failed, request-property fingerprint didn't match"
-            );
-            return None;
-        }
-        if last_response.response_id.is_empty() {
-            trace!("incremental request failed, no previous response id");
+    ) -> Option<Vec<ResponseItem>> {
+        let previous_request = self.websocket_session.last_request.as_ref()?;
+        if !responses_request_properties_match(previous_request, request) {
+            trace!("incremental request failed, websocket reuse properties didn't match");
             return None;
         }
 
-        let (input, current_prefix, mutation_revision, rewrite_revision) = if let Some(history) =
-            history
-            && let (Some(mutation_revision), Some(rewrite_revision)) =
-                (baseline.mutation_revision, baseline.rewrite_revision)
-            && let Some(PromptHistoryIncrementalProof {
-                suffix,
-                current_prefix,
-                mutation_revision,
-                rewrite_revision,
-            }) = history.incremental_proof(
-                mutation_revision,
-                rewrite_revision,
-                baseline.request_prefix,
-                baseline.history_policy_identity,
-                &last_response.items_added,
-            ) {
-            (
-                suffix,
-                current_prefix,
-                Some(mutation_revision),
-                Some(rewrite_revision),
-            )
-        } else {
+        if !crate::latency_switches::stage3_persistence_history_enabled() {
+            return Self::get_incremental_items_full_compare(
+                previous_request,
+                request,
+                last_response,
+                allow_empty_delta,
+            );
+        }
+
+        if let Some(baseline) = self.websocket_session.last_request_history.as_ref()
+            && baseline.normalization_policy_version
+                == WEBSOCKET_HISTORY_NORMALIZATION_POLICY_VERSION
+        {
+            let Ok(current_properties_fingerprint) =
+                responses_request_properties_fingerprint(request)
+            else {
+                trace!("incremental request fingerprint unavailable; using full comparison");
+                return Self::get_incremental_items_full_compare(
+                    previous_request,
+                    request,
+                    last_response,
+                    allow_empty_delta,
+                );
+            };
+            if current_properties_fingerprint != baseline.request_properties_fingerprint {
+                trace!(
+                    history_generation = baseline.generation,
+                    "incremental request failed, request-property fingerprint didn't match"
+                );
+                return None;
+            }
+
             let mut expected_prefix = baseline.request_prefix;
-            expected_prefix
-                .extend_items(&last_response.items_added)
-                .ok()?;
-            let (candidate_prefix, input) =
-                request.input.split_at_checked(expected_prefix.item_count)?;
-            if CanonicalPrefixHash::from_items(candidate_prefix).ok()? != expected_prefix {
+            if let Some(response) = last_response
+                && let Err(err) = expected_prefix.extend_items(&response.items_added)
+            {
+                trace!(
+                    ?err,
+                    "response-prefix hashing unavailable; using full comparison"
+                );
+                return Self::get_incremental_items_full_compare(
+                    previous_request,
+                    request,
+                    last_response,
+                    allow_empty_delta,
+                );
+            }
+            let Some((request_items_to_compare, incremental_items)) =
+                request.input.split_at_checked(expected_prefix.item_count)
+            else {
+                trace!("incremental request failed, incompatible request length");
+                return None;
+            };
+            let request_prefix = match CanonicalPrefixHash::from_items(request_items_to_compare) {
+                Ok(request_prefix) => request_prefix,
+                Err(err) => {
+                    trace!(
+                        ?err,
+                        "candidate-prefix hashing unavailable; using full comparison"
+                    );
+                    return Self::get_incremental_items_full_compare(
+                        previous_request,
+                        request,
+                        last_response,
+                        allow_empty_delta,
+                    );
+                }
+            };
+            if request_prefix != expected_prefix {
                 trace!(
                     history_generation = baseline.generation,
                     "incremental request failed, normalized prefix digest didn't match"
                 );
                 return None;
             }
-            let mut current_prefix = expected_prefix;
-            current_prefix.extend_items(input).ok()?;
-            (input.to_vec(), current_prefix, None, None)
-        };
+            if !allow_empty_delta && incremental_items.is_empty() {
+                return None;
+            }
+            return Some(incremental_items.to_vec());
+        }
 
-        if !allow_empty_delta && input.is_empty() {
+        Self::get_incremental_items_full_compare(
+            previous_request,
+            request,
+            last_response,
+            allow_empty_delta,
+        )
+    }
+
+    /// Correctness fallback for missing/unknown hash state. This retains the
+    /// prior full materialization and normalized comparison contract.
+    fn get_incremental_items_full_compare(
+        previous_request: &ResponsesApiRequest,
+        request: &ResponsesApiRequest,
+        last_response: Option<&LastResponse>,
+        allow_empty_delta: bool,
+    ) -> Option<Vec<ResponseItem>> {
+        // To compare the inputs, we concatenate the previous request items with the response items,
+        // then compare that against the equivalent slice of request items, ignoring metadata. If
+        // they match, we can consider the remaining items the incremental request.
+        let mut previous_items = previous_request.input.clone();
+        if let Some(response) = last_response {
+            previous_items.extend_from_slice(&response.items_added);
+        }
+        previous_items
+            .iter_mut()
+            .for_each(ResponseItem::clear_internal_chat_message_metadata_passthrough);
+
+        let Some((request_items_to_compare, incremental_items)) =
+            request.input.split_at_checked(previous_items.len())
+        else {
+            trace!("incremental request failed, incompatible request length");
+            return None;
+        };
+        let mut request_prefix = request_items_to_compare.to_vec();
+        request_prefix
+            .iter_mut()
+            .for_each(ResponseItem::clear_internal_chat_message_metadata_passthrough);
+
+        if previous_items != request_prefix {
+            trace!("incremental request failed, items didn't match");
             return None;
         }
-        Some(IncrementalProof {
-            previous_response_id: last_response.response_id.clone(),
-            input,
-            current_prefix,
-            mutation_revision,
-            rewrite_revision,
-        })
-        .inspect(|_| {
-            trace!(
-                history_generation = baseline.generation,
-                baseline_reused_previous_response, "verified websocket incremental proof"
-            );
-        })
+        if !allow_empty_delta && incremental_items.is_empty() {
+            return None;
+        }
+        Some(incremental_items.to_vec())
     }
 
     fn get_last_response(&mut self) -> Option<LastResponse> {
@@ -1810,44 +1567,37 @@ impl ModelClientSession {
             })
     }
 
-    fn prepare_incremental_websocket_request(
+    fn prepare_websocket_request(
         &mut self,
         payload: ResponseCreateWsRequest,
         request: &ResponsesApiRequest,
-        history: Option<&PromptHistorySnapshot>,
-        auth_snapshot: &RequestAuthSnapshot,
-        history_policy_identity: PromptHistoryPolicyIdentity,
-        use_responses_lite: bool,
-        last_response: &LastResponse,
-    ) -> std::result::Result<(ResponsesWsRequest, bool, IncrementalProof), ResponseCreateWsRequest>
-    {
+    ) -> (ResponsesWsRequest, bool) {
+        let Some(last_response) = self.get_last_response() else {
+            return (ResponsesWsRequest::ResponseCreate(payload), false);
+        };
         let previous_response_id_from_untraced_warmup =
             self.websocket_session.last_response_from_untraced_warmup;
-        let Some(mut proof) = self.get_incremental_proof(
+        let Some(incremental_items) = self.get_incremental_items(
             request,
-            history,
-            auth_snapshot,
-            history_policy_identity,
-            use_responses_lite,
-            last_response,
+            Some(&last_response),
             /*allow_empty_delta*/ true,
         ) else {
-            return Err(payload);
+            return (ResponsesWsRequest::ResponseCreate(payload), false);
         };
-        format_response_input_for_request(&mut proof.input, use_responses_lite);
-        if let Some(baseline) = self.websocket_session.last_request_history.as_mut() {
-            baseline.previous_response_id = Some(proof.previous_response_id.clone());
+
+        if last_response.response_id.is_empty() {
+            trace!("incremental request failed, no previous response id");
+            return (ResponsesWsRequest::ResponseCreate(payload), false);
         }
 
-        Ok((
+        (
             ResponsesWsRequest::ResponseCreate(ResponseCreateWsRequest {
-                previous_response_id: Some(proof.previous_response_id.clone()),
-                input: proof.input.clone(),
+                previous_response_id: Some(last_response.response_id),
+                input: incremental_items,
                 ..payload
             }),
             previous_response_id_from_untraced_warmup,
-            proof,
-        ))
+        )
     }
 
     /// Opportunistically preconnects a websocket for this turn-scoped client session.
@@ -2001,7 +1751,6 @@ impl ModelClientSession {
     async fn stream_responses_api(
         &self,
         prompt: &Prompt,
-        auth_snapshot: &RequestAuthSnapshot,
         model_info: &ModelInfo,
         session_telemetry: &SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
@@ -2016,11 +1765,7 @@ impl ModelClientSession {
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            let client_setup = self
-                .client
-                .current_client_setup_for(auth_snapshot, pending_retry.retry_after_unauthorized)
-                .await?;
-            let request_provider = client_setup.api_provider.clone();
+            let client_setup = self.client.current_client_setup().await?;
             let transport = self
                 .client
                 .build_api_transport(&client_setup.api_provider, RESPONSES_ENDPOINT)?;
@@ -2050,10 +1795,9 @@ impl ModelClientSession {
                 .as_ref()
                 .map(|timing| timing.begin_local_phase(TurnLocalPhase::Serialization));
             let mut request = self.client.build_responses_request(
-                &request_provider,
+                &client_setup.api_provider,
                 prompt,
                 model_info,
-                ResponsesRequestKind::Streaming,
                 effort.clone(),
                 summary,
                 service_tier.clone(),
@@ -2140,8 +1884,6 @@ impl ModelClientSession {
     async fn stream_responses_websocket(
         &mut self,
         prompt: &Prompt,
-        history: Option<&PromptHistorySnapshot>,
-        auth_snapshot: &RequestAuthSnapshot,
         model_info: &ModelInfo,
         session_telemetry: &SessionTelemetry,
         effort: Option<ReasoningEffortConfig>,
@@ -2153,27 +1895,13 @@ impl ModelClientSession {
         inference_trace: &InferenceTraceContext,
     ) -> Result<WebsocketStreamOutcome> {
         let auth_manager = self.client.state.provider.auth_manager();
-        let history_policy_identity = history
-            .map(PromptHistorySnapshot::policy_identity)
-            .unwrap_or_else(|| {
-                PromptHistoryPolicyIdentity::for_input_modalities(&model_info.input_modalities)
-            });
 
         let mut auth_recovery = auth_manager
             .as_ref()
             .map(AuthManager::unauthorized_recovery);
         let mut pending_retry = PendingUnauthorizedRetry::default();
         loop {
-            if self.websocket_session.connection.is_some()
-                && self.websocket_session.connection_auth_snapshot.as_ref() != Some(auth_snapshot)
-            {
-                self.reset_websocket_session();
-            }
-            let client_setup = self
-                .client
-                .current_client_setup_for(auth_snapshot, pending_retry.retry_after_unauthorized)
-                .await?;
-            let request_provider = client_setup.api_provider.clone();
+            let client_setup = self.client.current_client_setup().await?;
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),
                 client_setup.api_auth.as_ref(),
@@ -2184,11 +1912,10 @@ impl ModelClientSession {
                 .turn_timing
                 .as_ref()
                 .map(|timing| timing.begin_local_phase(TurnLocalPhase::Serialization));
-            let mut request = self.client.build_responses_request(
-                &request_provider,
+            let request = self.client.build_responses_request(
+                &client_setup.api_provider,
                 prompt,
                 model_info,
-                ResponsesRequestKind::Streaming,
                 effort.clone(),
                 summary,
                 service_tier.clone(),
@@ -2200,10 +1927,6 @@ impl ModelClientSession {
             } else {
                 session_telemetry_for_request(session_telemetry, &request)
             };
-            // The caller supplies model-visible history exclusively through the frozen
-            // snapshot. Responses Lite may still place stable tool-schema control items in
-            // `request.input`, so the serialized request itself is not necessarily empty.
-            let snapshot_input_is_exclusive = prompt.input.is_empty();
             let mut client_metadata = self
                 .client
                 .build_ws_client_metadata(responses_metadata, model_info.use_responses_lite);
@@ -2212,7 +1935,7 @@ impl ModelClientSession {
             }
             let mut ws_payload = ResponseCreateWsRequest {
                 client_metadata: response_create_client_metadata(
-                    Some(client_metadata.clone()),
+                    Some(client_metadata),
                     request_trace.as_ref(),
                 ),
                 ..ResponseCreateWsRequest::from(&request)
@@ -2235,9 +1958,7 @@ impl ModelClientSession {
                 })
                 .await
             {
-                Ok(_) => {
-                    self.websocket_session.connection_auth_snapshot = Some(*auth_snapshot);
-                }
+                Ok(_) => {}
                 Err(ApiError::Transport(TransportError::Http { status, .. }))
                     if status == StatusCode::UPGRADE_REQUIRED =>
                 {
@@ -2260,98 +1981,8 @@ impl ModelClientSession {
                 Err(err) => return Err(self.client.state.provider.map_api_error(err)),
             }
 
-            let last_response = self.get_last_response();
-            let direct_incremental = match last_response.as_ref() {
-                Some(last_response) => self.prepare_incremental_websocket_request(
-                    ws_payload,
-                    &request,
-                    history,
-                    auth_snapshot,
-                    history_policy_identity,
-                    model_info.use_responses_lite,
-                    last_response,
-                ),
-                None => Err(ws_payload),
-            };
-            let (
-                mut ws_request,
-                previous_response_id_from_untraced_warmup,
-                request_prefix,
-                mutation_revision,
-                rewrite_revision,
-                previous_response_id,
-            ) = match direct_incremental {
-                Ok((ws_request, from_untraced_warmup, proof)) => (
-                    ws_request,
-                    from_untraced_warmup,
-                    Ok(proof.current_prefix),
-                    proof.mutation_revision,
-                    proof.rewrite_revision,
-                    Some(proof.previous_response_id),
-                ),
-                Err(mut ws_payload) => {
-                    if let Some(history) = history {
-                        let mut full_prompt = prompt.clone();
-                        full_prompt.input = history.materialize();
-                        request = self.client.build_responses_request(
-                            &request_provider,
-                            &full_prompt,
-                            model_info,
-                            ResponsesRequestKind::Streaming,
-                            effort.clone(),
-                            summary,
-                            service_tier.clone(),
-                            responses_metadata,
-                        )?;
-                        ws_payload = ResponseCreateWsRequest {
-                            client_metadata: response_create_client_metadata(
-                                Some(client_metadata.clone()),
-                                request_trace.as_ref(),
-                            ),
-                            ..ResponseCreateWsRequest::from(&request)
-                        };
-                        if warmup {
-                            ws_payload.generate = Some(false);
-                        }
-                    }
-                    let legacy_incremental = match last_response.as_ref() {
-                        Some(last_response) => self.prepare_incremental_websocket_request(
-                            ws_payload,
-                            &request,
-                            /*history*/ None,
-                            auth_snapshot,
-                            history_policy_identity,
-                            model_info.use_responses_lite,
-                            last_response,
-                        ),
-                        None => Err(ws_payload),
-                    };
-                    match legacy_incremental {
-                        Ok((ws_request, from_untraced_warmup, proof)) => (
-                            ws_request,
-                            from_untraced_warmup,
-                            Ok(proof.current_prefix),
-                            None,
-                            None,
-                            Some(proof.previous_response_id),
-                        ),
-                        Err(ws_payload) => {
-                            let snapshot_identity = history.filter(|_| snapshot_input_is_exclusive);
-                            (
-                                ResponsesWsRequest::ResponseCreate(ws_payload),
-                                false,
-                                snapshot_identity.map_or_else(
-                                    || CanonicalPrefixHash::from_items(&request.input),
-                                    |history| Ok(history.canonical_prefix()),
-                                ),
-                                snapshot_identity.map(PromptHistorySnapshot::mutation_revision),
-                                snapshot_identity.map(PromptHistorySnapshot::rewrite_revision),
-                                None,
-                            )
-                        }
-                    }
-                }
-            };
+            let (mut ws_request, previous_response_id_from_untraced_warmup) =
+                self.prepare_websocket_request(ws_payload, &request);
             let inference_trace_attempt = if warmup {
                 // Prewarm sends `generate=false`; it is connection setup, not a
                 // model inference attempt that should appear in rollout traces.
@@ -2372,16 +2003,8 @@ impl ModelClientSession {
             } else {
                 inference_trace_attempt.record_started(&ws_request);
             }
-            self.remember_request_history(
-                &request,
-                auth_snapshot,
-                history_policy_identity,
-                model_info.use_responses_lite,
-                request_prefix,
-                mutation_revision,
-                rewrite_revision,
-                previous_response_id,
-            );
+            self.remember_request_history(&request);
+            self.websocket_session.last_request = Some(request);
             self.websocket_session.last_response_from_untraced_warmup = warmup;
             let websocket_connection =
                 self.websocket_session.connection.as_ref().ok_or_else(|| {
@@ -2389,16 +2012,11 @@ impl ModelClientSession {
                         "websocket connection is unavailable".to_string(),
                     ))
                 })?;
-            let timing_turn_id = session_telemetry
-                .timing_correlation_enabled()
-                .then(|| responses_metadata.turn_id.clone())
-                .flatten();
             let stream_result = websocket_connection
                 .stream_request(
                     ws_request,
                     self.websocket_session.connection_reused(),
                     Some(Arc::clone(&self.turn_state)),
-                    timing_turn_id,
                 )
                 .await
                 .map_err(|err| {
@@ -2472,17 +2090,14 @@ impl ModelClientSession {
         if !self.client.responses_websocket_enabled() {
             return Ok(());
         }
-        if self.websocket_session.last_request_history.is_some() {
+        if self.websocket_session.last_request.is_some() {
             return Ok(());
         }
 
-        let auth_snapshot = self.capture_request_auth_snapshot().await?;
         let disabled_trace = InferenceTraceContext::disabled();
         match self
             .stream_responses_websocket(
                 prompt,
-                /*history*/ None,
-                &auth_snapshot,
                 model_info,
                 session_telemetry,
                 effort,
@@ -2534,65 +2149,6 @@ impl ModelClientSession {
         responses_metadata: &CodexResponsesMetadata,
         inference_trace: &InferenceTraceContext,
     ) -> Result<ResponseStream> {
-        let auth_snapshot = self.capture_request_auth_snapshot().await?;
-        self.stream_inner(
-            prompt,
-            /*history*/ None,
-            &auth_snapshot,
-            model_info,
-            session_telemetry,
-            effort,
-            summary,
-            service_tier,
-            responses_metadata,
-            inference_trace,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn stream_with_history_snapshot(
-        &mut self,
-        prompt: &Prompt,
-        history: &PromptHistorySnapshot,
-        auth_snapshot: &RequestAuthSnapshot,
-        model_info: &ModelInfo,
-        session_telemetry: &SessionTelemetry,
-        effort: Option<ReasoningEffortConfig>,
-        summary: ReasoningSummaryConfig,
-        service_tier: Option<String>,
-        responses_metadata: &CodexResponsesMetadata,
-        inference_trace: &InferenceTraceContext,
-    ) -> Result<ResponseStream> {
-        self.stream_inner(
-            prompt,
-            Some(history),
-            auth_snapshot,
-            model_info,
-            session_telemetry,
-            effort,
-            summary,
-            service_tier,
-            responses_metadata,
-            inference_trace,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn stream_inner(
-        &mut self,
-        prompt: &Prompt,
-        history: Option<&PromptHistorySnapshot>,
-        auth_snapshot: &RequestAuthSnapshot,
-        model_info: &ModelInfo,
-        session_telemetry: &SessionTelemetry,
-        effort: Option<ReasoningEffortConfig>,
-        summary: ReasoningSummaryConfig,
-        service_tier: Option<String>,
-        responses_metadata: &CodexResponsesMetadata,
-        inference_trace: &InferenceTraceContext,
-    ) -> Result<ResponseStream> {
         let wire_api = self.client.state.provider.info().wire_api;
         match wire_api {
             WireApi::Responses => {
@@ -2601,8 +2157,6 @@ impl ModelClientSession {
                     match self
                         .stream_responses_websocket(
                             prompt,
-                            history,
-                            auth_snapshot,
                             model_info,
                             session_telemetry,
                             effort.clone(),
@@ -2622,35 +2176,17 @@ impl ModelClientSession {
                     }
                 }
 
-                if let Some(history) = history {
-                    let mut full_prompt = prompt.clone();
-                    full_prompt.input = history.materialize();
-                    self.stream_responses_api(
-                        &full_prompt,
-                        auth_snapshot,
-                        model_info,
-                        session_telemetry,
-                        effort,
-                        summary,
-                        service_tier,
-                        responses_metadata,
-                        inference_trace,
-                    )
-                    .await
-                } else {
-                    self.stream_responses_api(
-                        prompt,
-                        auth_snapshot,
-                        model_info,
-                        session_telemetry,
-                        effort,
-                        summary,
-                        service_tier,
-                        responses_metadata,
-                        inference_trace,
-                    )
-                    .await
-                }
+                self.stream_responses_api(
+                    prompt,
+                    model_info,
+                    session_telemetry,
+                    effort,
+                    summary,
+                    service_tier,
+                    responses_metadata,
+                    inference_trace,
+                )
+                .await
             }
         }
     }
@@ -3261,10 +2797,9 @@ impl WebsocketTelemetry for ApiTelemetry {
         &self,
         result: &std::result::Result<Option<std::result::Result<Message, Error>>, ApiError>,
         duration: Duration,
-        turn_id: Option<&str>,
     ) {
         self.session_telemetry
-            .record_websocket_event_for_turn(result, duration, turn_id);
+            .record_websocket_event(result, duration);
     }
 }
 

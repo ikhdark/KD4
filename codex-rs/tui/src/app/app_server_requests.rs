@@ -67,7 +67,7 @@ pub(crate) enum ResolvedAppServerRequest {
     },
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub(super) struct PendingAppServerRequests {
     exec_approvals: HashMap<String, AppServerRequestId>,
     file_change_approvals: HashMap<String, AppServerRequestId>,
@@ -174,20 +174,6 @@ impl PendingAppServerRequests {
                 })
             }
         }
-    }
-
-    pub(super) fn resolution<T>(
-        &self,
-        op: T,
-    ) -> Result<Option<AppServerRequestResolution>, String>
-    where
-        T: Into<AppCommand>,
-    {
-        // Resolution construction is intentionally non-destructive. The TUI
-        // commits the removal only after the bounded client queue accepts the
-        // reply, so a saturated or closed transport cannot orphan an approval.
-        let mut snapshot = self.clone();
-        snapshot.take_resolution(op)
     }
 
     pub(super) fn take_resolution<T>(
@@ -415,7 +401,7 @@ impl PendingAppServerRequests {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingUserInputRequest {
     item_id: String,
     request_id: AppServerRequestId,
@@ -488,31 +474,17 @@ mod tests {
 
         assert_eq!(pending.note_server_request(&request), None);
 
-        let op = Op::ExecApproval {
-            id: "approval-1".to_string(),
-            turn_id: None,
-            decision: CommandExecutionApprovalDecision::Accept,
-        };
-        let preview = pending
-            .resolution(&op)
-            .expect("resolution preview should serialize")
-            .expect("request should remain pending while delivery is attempted");
-        assert_eq!(preview.request_id, AppServerRequestId::Integer(41));
-
         let resolution = pending
-            .take_resolution(&op)
+            .take_resolution(&Op::ExecApproval {
+                id: "approval-1".to_string(),
+                turn_id: None,
+                decision: CommandExecutionApprovalDecision::Accept,
+            })
             .expect("resolution should serialize")
             .expect("request should be pending");
 
         assert_eq!(resolution.request_id, AppServerRequestId::Integer(41));
         assert_eq!(resolution.result, json!({ "decision": "accept" }));
-        assert_eq!(
-            pending
-                .take_resolution(&op)
-                .expect("second resolution should serialize"),
-            None,
-            "request should be removed only by the explicit commit"
-        );
     }
 
     #[test]

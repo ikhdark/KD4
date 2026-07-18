@@ -383,9 +383,10 @@ pub(crate) struct ThreadRequestProcessor {
     pub(super) config: Arc<Config>,
     pub(super) config_manager: ConfigManager,
     pub(super) thread_store: Arc<dyn ThreadStore>,
-    pub(super) thread_lifecycle: Arc<ThreadLifecycleCoordinator>,
+    pub(super) pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
     pub(super) thread_state_manager: ThreadStateManager,
     pub(super) thread_watch_manager: ThreadWatchManager,
+    pub(super) thread_list_state_permit: Arc<Semaphore>,
     pub(super) thread_goal_processor: ThreadGoalRequestProcessor,
     pub(super) state_db: Option<StateDbHandle>,
     pub(super) log_db: Option<LogDbLayer>,
@@ -415,9 +416,10 @@ impl ThreadRequestProcessor {
         config: Arc<Config>,
         config_manager: ConfigManager,
         thread_store: Arc<dyn ThreadStore>,
-        thread_lifecycle: Arc<ThreadLifecycleCoordinator>,
+        pending_thread_unloads: Arc<Mutex<HashSet<ThreadId>>>,
         thread_state_manager: ThreadStateManager,
         thread_watch_manager: ThreadWatchManager,
+        thread_list_state_permit: Arc<Semaphore>,
         thread_goal_processor: ThreadGoalRequestProcessor,
         state_db: Option<StateDbHandle>,
         log_db: Option<LogDbLayer>,
@@ -432,9 +434,10 @@ impl ThreadRequestProcessor {
             config,
             config_manager,
             thread_store,
-            thread_lifecycle,
+            pending_thread_unloads,
             thread_state_manager,
             thread_watch_manager,
+            thread_list_state_permit,
             thread_goal_processor,
             state_db,
             log_db,
@@ -786,6 +789,17 @@ impl ThreadRequestProcessor {
 
         Ok((thread_id, thread))
     }
+    pub(super) async fn acquire_thread_list_state_permit(
+        &self,
+    ) -> Result<SemaphorePermit<'_>, JSONRPCErrorError> {
+        self.thread_list_state_permit
+            .acquire()
+            .await
+            .map_err(|err| {
+                internal_error(format!("failed to acquire thread list state permit: {err}"))
+            })
+    }
+
     async fn set_app_server_client_info(
         thread: &CodexThread,
         app_server_client_name: Option<String>,
@@ -806,7 +820,7 @@ impl ThreadRequestProcessor {
     }
 
     async fn finalize_thread_teardown(&self, thread_id: ThreadId) {
-        self.thread_lifecycle.clear_unloading(thread_id).await;
+        self.pending_thread_unloads.lock().await.remove(&thread_id);
         self.outgoing
             .cancel_requests_for_thread(thread_id, /*error*/ None)
             .await;
@@ -874,8 +888,9 @@ impl ThreadRequestProcessor {
             thread_manager: Arc::clone(&self.thread_manager),
             thread_state_manager: self.thread_state_manager.clone(),
             outgoing: Arc::clone(&self.outgoing),
-            thread_lifecycle: Arc::clone(&self.thread_lifecycle),
+            pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
             thread_watch_manager: self.thread_watch_manager.clone(),
+            thread_list_state_permit: self.thread_list_state_permit.clone(),
             fallback_model_provider: self.config.model_provider_id.clone(),
             codex_home: self.config.codex_home.to_path_buf(),
             skills_watcher: Arc::clone(&self.skills_watcher),
@@ -975,8 +990,9 @@ impl ThreadRequestProcessor {
             thread_manager: Arc::clone(&self.thread_manager),
             thread_state_manager: self.thread_state_manager.clone(),
             outgoing: Arc::clone(&self.outgoing),
-            thread_lifecycle: Arc::clone(&self.thread_lifecycle),
+            pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
             thread_watch_manager: self.thread_watch_manager.clone(),
+            thread_list_state_permit: self.thread_list_state_permit.clone(),
             fallback_model_provider: self.config.model_provider_id.clone(),
             codex_home: self.config.codex_home.to_path_buf(),
             skills_watcher: Arc::clone(&self.skills_watcher),
@@ -1391,21 +1407,19 @@ impl ThreadRequestProcessor {
         &self,
         params: ThreadArchiveParams,
     ) -> Result<(ThreadArchiveResponse, Vec<String>), JSONRPCErrorError> {
-        let thread_id = ThreadId::from_string(&params.thread_id)
-            .map_err(|err| invalid_request(format!("invalid session id: {err}")))?;
-        let thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
-        let _lifecycle_guards = self
-            .thread_lifecycle
-            .lock_threads(thread_ids.iter().copied())
-            .await;
-        self.thread_archive_response(thread_id, thread_ids).await
+        let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
+        self.thread_archive_response(params).await
     }
 
     async fn thread_archive_response(
         &self,
-        thread_id: ThreadId,
-        thread_ids: Vec<ThreadId>,
+        params: ThreadArchiveParams,
     ) -> Result<(ThreadArchiveResponse, Vec<String>), JSONRPCErrorError> {
+        let thread_id = ThreadId::from_string(&params.thread_id)
+            .map_err(|err| invalid_request(format!("invalid session id: {err}")))?;
+
+        let thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
+
         let mut archive_thread_ids = Vec::new();
         match self
             .thread_store
@@ -1554,7 +1568,7 @@ impl ThreadRequestProcessor {
             return Err(invalid_request("thread name must not be empty"));
         };
 
-        let _lifecycle_guard = self.thread_lifecycle.lock_thread(thread_id).await;
+        let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
         self.thread_manager
             .update_thread_metadata(
                 thread_id,
@@ -1584,7 +1598,6 @@ impl ThreadRequestProcessor {
         let thread_id = ThreadId::from_string(&thread_id)
             .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
 
-        let _lifecycle_guard = self.thread_lifecycle.lock_thread(thread_id).await;
         self.thread_manager
             .update_thread_metadata(
                 thread_id,
@@ -1666,7 +1679,7 @@ impl ThreadRequestProcessor {
         };
 
         let updated_thread = {
-            let _lifecycle_guard = self.thread_lifecycle.lock_thread(thread_uuid).await;
+            let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
             self.thread_manager
                 .update_thread_metadata(thread_uuid, patch, /*include_archived*/ true)
                 .await
@@ -1712,17 +1725,18 @@ impl ThreadRequestProcessor {
         &self,
         params: ThreadUnarchiveParams,
     ) -> Result<(ThreadUnarchiveResponse, ThreadUnarchivedNotification), JSONRPCErrorError> {
-        let thread_id = ThreadId::from_string(&params.thread_id)
-            .map_err(|err| invalid_request(format!("invalid session id: {err}")))?;
-        let _lifecycle_guard = self.thread_lifecycle.lock_thread(thread_id).await;
-        let (response, thread_id) = self.thread_unarchive_response(thread_id).await?;
+        let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
+        let (response, thread_id) = self.thread_unarchive_response(params).await?;
         Ok((response, ThreadUnarchivedNotification { thread_id }))
     }
 
     async fn thread_unarchive_response(
         &self,
-        thread_id: ThreadId,
+        params: ThreadUnarchiveParams,
     ) -> Result<(ThreadUnarchiveResponse, String), JSONRPCErrorError> {
+        let thread_id = ThreadId::from_string(&params.thread_id)
+            .map_err(|err| invalid_request(format!("invalid session id: {err}")))?;
+
         let fallback_provider = self.config.model_provider_id.clone();
         let stored_thread = self
             .thread_store
@@ -2615,7 +2629,7 @@ impl ThreadRequestProcessor {
         thread_id: ThreadId,
         connection_ids: Vec<ConnectionId>,
     ) {
-        let mut parent_recipient_snapshot = None;
+        let mut raw_events_enabled = false;
         if let Ok(thread) = self.thread_manager.get_thread(thread_id).await {
             let config_snapshot = thread.config_snapshot().await;
             let loaded_thread = build_thread_from_snapshot(
@@ -2626,18 +2640,17 @@ impl ThreadRequestProcessor {
             );
             self.thread_watch_manager.upsert_thread(loaded_thread).await;
             if let Some(parent_thread_id) = config_snapshot.parent_thread_id {
-                parent_recipient_snapshot = Some(
-                    self.thread_state_manager
-                        .recipient_snapshot(parent_thread_id)
-                        .await,
-                );
+                raw_events_enabled = self
+                    .thread_state_manager
+                    .thread_state(parent_thread_id)
+                    .await
+                    .lock()
+                    .await
+                    .experimental_raw_events;
             }
         }
 
         for connection_id in connection_ids {
-            let raw_events_enabled = parent_recipient_snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.raw_events_enabled_for(connection_id));
             log_listener_attach_result(
                 self.ensure_conversation_listener(thread_id, connection_id, raw_events_enabled)
                     .await,
@@ -2656,9 +2669,12 @@ impl ThreadRequestProcessor {
         app_server_client_version: Option<String>,
         supports_openai_form_elicitation: bool,
     ) -> Result<(), JSONRPCErrorError> {
-        let lifecycle_thread_id = ThreadId::from_string(&params.thread_id).ok();
-        if let Some(thread_id) = lifecycle_thread_id
-            && self.thread_lifecycle.is_unloading(thread_id).await
+        if let Ok(thread_id) = ThreadId::from_string(&params.thread_id)
+            && self
+                .pending_thread_unloads
+                .lock()
+                .await
+                .contains(&thread_id)
         {
             self.outgoing
                 .send_error(
@@ -2683,10 +2699,12 @@ impl ThreadRequestProcessor {
         let redact_resume_payloads =
             should_redact_thread_resume_payloads(app_server_client_name.as_deref());
 
-        let _lifecycle_guard = if let Some(thread_id) = lifecycle_thread_id {
-            Some(self.thread_lifecycle.lock_thread(thread_id).await)
-        } else {
-            None
+        let _thread_list_state_permit = match self.acquire_thread_list_state_permit().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.outgoing.send_error(request_id, error).await;
+                return Ok(());
+            }
         };
         let stored_thread_from_running_probe = match self
             .resume_running_thread(

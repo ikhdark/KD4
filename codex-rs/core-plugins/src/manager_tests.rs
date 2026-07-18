@@ -1075,53 +1075,6 @@ plugins = true
     assert_eq!(outcome, PluginLoadOutcome::default());
 }
 
-#[test]
-fn remote_installed_cache_rejects_stale_old_identity_publication() {
-    let codex_home = TempDir::new().unwrap();
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
-    let old_auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let old_identity = remote_plugin_auth_identity(Some(&old_auth));
-    let (old_generation, _) =
-        manager.activate_remote_installed_plugins_auth_identity(&old_identity);
-
-    assert!(!manager.clear_remote_installed_plugins_cache_for_auth(/*auth*/ None));
-    let new_identity = remote_plugin_auth_identity(/*auth*/ None);
-    let new_generation = manager
-        .remote_installed_plugins_cache_generation_for_identity(&new_identity)
-        .expect("new identity should be active");
-    let new_plugins = vec![remote_installed_plugin("github")];
-    assert_eq!(
-        manager.write_remote_installed_plugins_cache_if_current(
-            new_generation,
-            &new_identity,
-            new_plugins.clone(),
-        ),
-        Some(true)
-    );
-
-    assert_eq!(
-        manager.write_remote_installed_plugins_cache_if_current(
-            old_generation,
-            &old_identity,
-            vec![remote_installed_linear_plugin()],
-        ),
-        None
-    );
-    assert_eq!(
-        manager.clear_remote_installed_plugins_cache_if_current(
-            old_generation,
-            &old_identity,
-        ),
-        None
-    );
-    let cache = manager
-        .remote_installed_plugins_cache
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(cache.auth_identity.as_ref(), Some(&new_identity));
-    assert_eq!(cache.plugins.as_ref(), Some(&new_plugins));
-}
-
 #[tokio::test]
 async fn installed_plugin_telemetry_metadata_collects_capabilities() {
     let codex_home = TempDir::new().unwrap();
@@ -2609,109 +2562,6 @@ fn loaded_plugins_cache_invalidation_rejects_stale_load_completion() {
     );
 
     assert_eq!(manager.cached_loaded_plugins(&cache_key), None);
-}
-
-#[test]
-fn loaded_plugins_cache_uses_keyed_singleflight_and_retains_multiple_entries() {
-    let codex_home = TempDir::new().unwrap();
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
-    let key_a = PluginLoadCacheKey {
-        configured_plugins: HashMap::new(),
-        skill_config_rules: SkillConfigRules::default(),
-        remote_global_catalog_active: false,
-    };
-    let key_b = PluginLoadCacheKey {
-        remote_global_catalog_active: true,
-        ..key_a.clone()
-    };
-
-    let (generation_a, flight_a1) = manager.loaded_plugins_flight(&key_a);
-    let (_, flight_a2) = manager.loaded_plugins_flight(&key_a);
-    let (generation_b, flight_b) = manager.loaded_plugins_flight(&key_b);
-    assert!(Arc::ptr_eq(&flight_a1, &flight_a2));
-    assert!(!Arc::ptr_eq(&flight_a1, &flight_b));
-
-    manager.cache_loaded_plugins_if_current(
-        generation_a,
-        key_a.clone(),
-        Vec::new(),
-        PluginSkillSnapshots::for_plugin_load(),
-    );
-    manager.cache_loaded_plugins_if_current(
-        generation_b,
-        key_b.clone(),
-        Vec::new(),
-        PluginSkillSnapshots::for_plugin_load(),
-    );
-
-    assert_eq!(manager.cached_loaded_plugins(&key_a), Some(Vec::new()));
-    assert_eq!(manager.cached_loaded_plugins(&key_b), Some(Vec::new()));
-    assert_eq!(manager.cached_loaded_plugins(&key_a), Some(Vec::new()));
-}
-
-#[test]
-fn keyed_flight_registries_prune_canceled_unique_keys() {
-    let codex_home = TempDir::new().unwrap();
-    let manager = PluginsManager::new(codex_home.path().to_path_buf());
-    let loaded_key_a = PluginLoadCacheKey {
-        configured_plugins: HashMap::new(),
-        skill_config_rules: SkillConfigRules::default(),
-        remote_global_catalog_active: false,
-    };
-    let loaded_key_b = PluginLoadCacheKey {
-        remote_global_catalog_active: true,
-        ..loaded_key_a.clone()
-    };
-    let (_, canceled_loaded) = manager.loaded_plugins_flight(&loaded_key_a);
-    drop(canceled_loaded);
-    let (_, _active_loaded) = manager.loaded_plugins_flight(&loaded_key_b);
-    assert_eq!(
-        manager
-            .loaded_plugins_cache
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .flights
-            .len(),
-        1
-    );
-
-    let config_a = PluginsConfigInput::new(
-        ConfigLayerStack::default(),
-        /*plugins_enabled*/ true,
-        /*remote_plugin_enabled*/ true,
-        "https://a.example.test/".to_string(),
-    );
-    let mut config_b = config_a.clone();
-    config_b.chatgpt_base_url = "https://b.example.test/".to_string();
-    let featured_key_a = featured_plugin_ids_cache_key(&config_a, /*auth*/ None);
-    let featured_key_b = featured_plugin_ids_cache_key(&config_b, /*auth*/ None);
-    let canceled_featured = manager.featured_plugin_ids_flight(&featured_key_a);
-    drop(canceled_featured);
-    let _active_featured = manager.featured_plugin_ids_flight(&featured_key_b);
-    assert_eq!(
-        manager
-            .featured_plugin_ids_cache
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .flights
-            .len(),
-        1
-    );
-
-    let recommended_key_a = recommended_plugins_cache_key(&config_a, /*auth*/ None);
-    let recommended_key_b = recommended_plugins_cache_key(&config_b, /*auth*/ None);
-    let (_, canceled_recommended) = manager.recommended_plugins_flight(&recommended_key_a);
-    drop(canceled_recommended);
-    let (_, _active_recommended) = manager.recommended_plugins_flight(&recommended_key_b);
-    assert_eq!(
-        manager
-            .recommended_plugins_cache
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .flights
-            .len(),
-        1
-    );
 }
 
 #[tokio::test]
@@ -5021,162 +4871,6 @@ plugins = true
 }
 
 #[tokio::test]
-async fn featured_plugin_ids_cache_retains_a_b_a_entries() {
-    let tmp = tempfile::tempdir().unwrap();
-    write_file(
-        &tmp.path().join(CONFIG_TOML_FILE),
-        r#"[features]
-plugins = true
-"#,
-    );
-    let server_a = MockServer::start().await;
-    let server_b = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/backend-api/plugins/featured"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"["plugin-a"]"#))
-        .expect(1)
-        .mount(&server_a)
-        .await;
-    Mock::given(method("GET"))
-        .and(path("/backend-api/plugins/featured"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(r#"["plugin-b"]"#))
-        .expect(1)
-        .mount(&server_b)
-        .await;
-
-    let mut config_a = load_config(tmp.path(), tmp.path()).await;
-    config_a.chatgpt_base_url = format!("{}/backend-api/", server_a.uri());
-    let mut config_b = config_a.clone();
-    config_b.chatgpt_base_url = format!("{}/backend-api/", server_b.uri());
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
-
-    assert_eq!(
-        manager
-            .featured_plugin_ids_for_config(&config_a, /*auth*/ None)
-            .await
-            .unwrap(),
-        vec!["plugin-a".to_string()]
-    );
-    assert_eq!(
-        manager
-            .featured_plugin_ids_for_config(&config_b, /*auth*/ None)
-            .await
-            .unwrap(),
-        vec!["plugin-b".to_string()]
-    );
-    assert_eq!(
-        manager
-            .featured_plugin_ids_for_config(&config_a, /*auth*/ None)
-            .await
-            .unwrap(),
-        vec!["plugin-a".to_string()]
-    );
-}
-
-#[tokio::test]
-async fn featured_plugin_ids_cache_coalesces_same_key_misses() {
-    let tmp = tempfile::tempdir().unwrap();
-    write_file(
-        &tmp.path().join(CONFIG_TOML_FILE),
-        r#"[features]
-plugins = true
-"#,
-    );
-    let server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/backend-api/plugins/featured"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_string(r#"["plugin-a"]"#)
-                .set_delay(Duration::from_millis(100)),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let mut config = load_config(tmp.path(), tmp.path()).await;
-    config.chatgpt_base_url = format!("{}/backend-api/", server.uri());
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
-
-    let (left, right) = tokio::join!(
-        manager.featured_plugin_ids_for_config(&config, /*auth*/ None),
-        manager.featured_plugin_ids_for_config(&config, /*auth*/ None),
-    );
-    assert_eq!(left.unwrap(), vec!["plugin-a".to_string()]);
-    assert_eq!(right.unwrap(), vec!["plugin-a".to_string()]);
-}
-
-#[test]
-fn remote_list_cache_keys_include_auth_identity_and_reject_stale_publication() {
-    let tmp = tempfile::tempdir().unwrap();
-    let manager = PluginsManager::new(tmp.path().to_path_buf());
-    let config = PluginsConfigInput::new(
-        ConfigLayerStack::default(),
-        /*plugins_enabled*/ true,
-        /*remote_plugin_enabled*/ true,
-        "https://example.test/backend-api/".to_string(),
-    );
-    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    assert_ne!(
-        featured_plugin_ids_cache_key(&config, /*auth*/ None),
-        featured_plugin_ids_cache_key(&config, Some(&auth))
-    );
-    assert_ne!(
-        recommended_plugins_cache_key(&config, /*auth*/ None),
-        recommended_plugins_cache_key(&config, Some(&auth))
-    );
-
-    let mut config_b = config.clone();
-    config_b.chatgpt_base_url = "https://other.example.test/backend-api/".to_string();
-    let recommended_key_a = recommended_plugins_cache_key(&config, Some(&auth));
-    let recommended_key_b = recommended_plugins_cache_key(&config_b, Some(&auth));
-    let (generation_a, flight_a1) = manager.recommended_plugins_flight(&recommended_key_a);
-    let (_, flight_a2) = manager.recommended_plugins_flight(&recommended_key_a);
-    let (generation_b, flight_b) = manager.recommended_plugins_flight(&recommended_key_b);
-    assert!(Arc::ptr_eq(&flight_a1, &flight_a2));
-    assert!(!Arc::ptr_eq(&flight_a1, &flight_b));
-    let result = RecommendedPluginsFlightResult {
-        mode: RecommendedPluginsMode::Endpoint {
-            plugins: Vec::new(),
-        },
-        cacheable: true,
-    };
-    assert!(manager.publish_recommended_plugins_flight(
-        generation_a,
-        &recommended_key_a,
-        &flight_a1,
-        &result,
-    ));
-    assert!(manager.publish_recommended_plugins_flight(
-        generation_b,
-        &recommended_key_b,
-        &flight_b,
-        &result,
-    ));
-    assert_eq!(
-        manager.cached_recommended_plugins_mode(&recommended_key_a),
-        Some(result.mode.clone())
-    );
-    assert_eq!(
-        manager.cached_recommended_plugins_mode(&recommended_key_b),
-        Some(result.mode.clone())
-    );
-    assert_eq!(
-        manager.cached_recommended_plugins_mode(&recommended_key_a),
-        Some(result.mode.clone())
-    );
-
-    let key = featured_plugin_ids_cache_key(&config, Some(&auth));
-    let generation = manager.featured_plugin_ids_generation();
-    manager.clear_featured_plugin_ids_cache();
-    assert!(!manager.write_featured_plugin_ids_cache_if_current(
-        generation,
-        key,
-        vec!["stale".to_string()],
-    ));
-}
-
-#[tokio::test]
 async fn remote_plugin_caches_refresh_warms_recommended_plugins_cache() {
     let tmp = tempfile::tempdir().unwrap();
     write_file(
@@ -5202,7 +4896,7 @@ plugins = true
     config.chatgpt_base_url = server.uri();
     let manager = std::sync::Arc::new(PluginsManager::new(tmp.path().to_path_buf()));
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let cache_key = recommended_plugins_cache_key(&config, Some(&auth));
+    let cache_key = recommended_plugins_cache_key(&config);
 
     manager.maybe_start_remote_plugin_caches_refresh(
         &config,
@@ -5354,18 +5048,8 @@ plugins = true
     let manager = PluginsManager::new(tmp.path().to_path_buf());
     let mut installed_linear = remote_installed_plugin("linear");
     installed_linear.id = "plugin_linear".to_string();
+    manager.write_remote_installed_plugins_cache(vec![installed_linear]);
     let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let auth_identity = remote_plugin_auth_identity(Some(&auth));
-    let (generation, _) =
-        manager.activate_remote_installed_plugins_auth_identity(&auth_identity);
-    assert_eq!(
-        manager.write_remote_installed_plugins_cache_if_current(
-            generation,
-            &auth_identity,
-            vec![installed_linear],
-        ),
-        Some(true)
-    );
     let disabled_tools = [ToolSuggestDisabledTool::plugin(
         "github@openai-curated-remote",
     )];

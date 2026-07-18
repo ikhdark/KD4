@@ -416,9 +416,8 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
             tools: HashMap::new(),
         },
     ));
-    catalog.register(McpServerRegistration::from_compatibility(
+    catalog.register(McpServerRegistration::from_config(
         CODEX_APPS_MCP_SERVER_NAME.to_string(),
-        CODEX_APPS_COMPATIBILITY_REGISTRATION_ID,
         codex_apps_mcp_server_config(
             &config.chatgpt_base_url,
             config.apps_mcp_product_sku.as_deref(),
@@ -436,7 +435,6 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
     let codex_apps = effective
         .get(CODEX_APPS_MCP_SERVER_NAME)
         .expect("codex apps server should exist");
-    assert!(codex_apps.is_host_owned_codex_apps());
 
     let sample = sample
         .configured_config()
@@ -466,31 +464,4 @@ async fn effective_mcp_servers_preserve_runtime_servers() {
         }
         other => panic!("expected streamable http transport, got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn reserved_name_from_config_is_not_host_owned_codex_apps() {
-    let codex_home = tempfile::tempdir().expect("tempdir");
-    let mut config = test_mcp_config(codex_home.path().to_path_buf());
-    config.apps_enabled = true;
-    let auth = CodexAuth::create_dummy_chatgpt_auth_for_testing();
-    let effective = effective_mcp_servers_from_configured(
-        HashMap::from([(
-            CODEX_APPS_MCP_SERVER_NAME.to_string(),
-            codex_apps_mcp_server_config(
-                &config.chatgpt_base_url,
-                config.apps_mcp_product_sku.as_deref(),
-                /*originator*/ None,
-            ),
-        )]),
-        &config,
-        Some(&auth),
-    );
-
-    assert!(
-        !effective
-            .get(CODEX_APPS_MCP_SERVER_NAME)
-            .expect("reserved user registration")
-            .is_host_owned_codex_apps()
-    );
 }

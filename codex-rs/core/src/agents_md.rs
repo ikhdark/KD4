@@ -29,10 +29,7 @@ use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
-use sha2::Digest;
-use sha2::Sha256;
 use std::io;
-use std::sync::Arc;
 use toml::Value as TomlValue;
 use tracing::error;
 
@@ -44,24 +41,6 @@ pub const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
 /// When both user and project AGENTS.md docs are present, they will be
 /// concatenated with the following separator.
 const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
-const MAX_AGENTS_MD_DEPENDENCIES: usize = 4_096;
-
-pub(crate) struct ProjectInstructionsSnapshot {
-    pub(crate) loaded: Option<LoadedAgentsMd>,
-    pub(crate) dependencies: Option<Vec<AgentsMdEnvironmentDependencies>>,
-}
-
-#[derive(Clone)]
-pub(crate) struct AgentsMdEnvironmentDependencies {
-    pub(crate) filesystem: Arc<dyn ExecutorFileSystem>,
-    pub(crate) specs: Vec<AgentsMdDependencySpec>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AgentsMdDependencySpec {
-    pub(crate) path: PathUri,
-    pub(crate) hash_contents: bool,
-}
 
 /// Loads project AGENTS.md content and combines it with host-provided user
 /// instructions.
@@ -70,21 +49,10 @@ pub(crate) async fn load_project_instructions(
     user_instructions: Option<UserInstructions>,
     environments: &TurnEnvironmentSnapshot,
 ) -> Option<LoadedAgentsMd> {
-    load_project_instructions_snapshot(config, user_instructions, environments)
-        .await
-        .loaded
-}
-
-pub(crate) async fn load_project_instructions_snapshot(
-    config: &Config,
-    user_instructions: Option<UserInstructions>,
-    environments: &TurnEnvironmentSnapshot,
-) -> ProjectInstructionsSnapshot {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
-    let mut dependencies = Some(Vec::with_capacity(environments.turn_environments.len()));
     for turn_environment in &environments.turn_environments {
         let filesystem = turn_environment.environment.get_filesystem();
-        match read_agents_md_snapshot(
+        match read_agents_md(
             config,
             filesystem.as_ref(),
             &turn_environment.environment_id,
@@ -92,21 +60,9 @@ pub(crate) async fn load_project_instructions_snapshot(
         )
         .await
         {
-            Ok(snapshot) => {
-                if let Some(docs) = snapshot.loaded {
-                    loaded.entries.extend(docs.entries);
-                }
-                match (&mut dependencies, snapshot.dependencies) {
-                    (Some(all), Some(specs)) => all.push(AgentsMdEnvironmentDependencies {
-                        filesystem,
-                        specs,
-                    }),
-                    (dependencies, None) => *dependencies = None,
-                    (None, _) => {}
-                }
-            }
+            Ok(Some(docs)) => loaded.entries.extend(docs.entries),
+            Ok(None) => {}
             Err(e) => {
-                dependencies = None;
                 error!(
                     environment_id = turn_environment.environment_id,
                     "error trying to find AGENTS.md docs: {e:#}"
@@ -115,16 +71,7 @@ pub(crate) async fn load_project_instructions_snapshot(
         }
     }
 
-    loaded.recompose();
-    ProjectInstructionsSnapshot {
-        loaded: (!loaded.is_empty()).then_some(loaded),
-        dependencies,
-    }
-}
-
-struct AgentsMdReadSnapshot {
-    loaded: Option<LoadedAgentsMd>,
-    dependencies: Option<Vec<AgentsMdDependencySpec>>,
+    (!loaded.is_empty()).then_some(loaded)
 }
 
 /// Attempt to locate and load AGENTS.md documentation.
@@ -139,32 +86,21 @@ async fn read_agents_md(
     environment_id: &str,
     cwd: &PathUri,
 ) -> io::Result<Option<LoadedAgentsMd>> {
-    Ok(read_agents_md_snapshot(config, fs, environment_id, cwd)
-        .await?
-        .loaded)
-}
-
-async fn read_agents_md_snapshot(
-    config: &Config,
-    fs: &dyn ExecutorFileSystem,
-    environment_id: &str,
-    cwd: &PathUri,
-) -> io::Result<AgentsMdReadSnapshot> {
     let max_total = config.project_doc_max_bytes;
 
     if max_total == 0 {
-        return Ok(AgentsMdReadSnapshot {
-            loaded: None,
-            dependencies: Some(Vec::new()),
-        });
+        return Ok(None);
     }
 
-    let discovery = discover_agents_md_paths(config, cwd, fs).await?;
+    let paths = agents_md_paths(config, cwd, fs).await?;
+    if paths.is_empty() {
+        return Ok(None);
+    }
 
     let mut remaining: u64 = max_total as u64;
     let mut loaded = LoadedAgentsMd::default();
 
-    for p in discovery.paths {
+    for p in paths {
         if remaining == 0 {
             break;
         }
@@ -201,16 +137,11 @@ async fn read_agents_md_snapshot(
         }
     }
 
-    loaded.recompose();
-    Ok(AgentsMdReadSnapshot {
-        loaded: (!loaded.is_empty()).then_some(loaded),
-        dependencies: discovery.dependencies,
-    })
-}
-
-struct AgentsMdPathDiscovery {
-    paths: Vec<PathUri>,
-    dependencies: Option<Vec<AgentsMdDependencySpec>>,
+    if loaded.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(loaded))
+    }
 }
 
 /// Discovers AGENTS.md files from the project root to the current working
@@ -220,94 +151,8 @@ async fn agents_md_paths(
     cwd: &PathUri,
     fs: &dyn ExecutorFileSystem,
 ) -> io::Result<Vec<PathUri>> {
-    Ok(discover_agents_md_paths(config, cwd, fs).await?.paths)
-}
-
-async fn discover_agents_md_paths(
-    config: &Config,
-    cwd: &PathUri,
-    fs: &dyn ExecutorFileSystem,
-) -> io::Result<AgentsMdPathDiscovery> {
     let dir = cwd.clone();
-    let project_root_markers = effective_project_root_markers(config);
-    let project_root = find_nearest_ancestor_with_markers(
-        fs,
-        &dir,
-        project_root_markers.clone(),
-        FindUpErrorPolicy::Propagate,
-        /*sandbox*/ None,
-    )
-    .await?;
-    let search_dirs = if let Some(root) = project_root.as_ref() {
-        let mut dirs = Vec::new();
-        let mut cursor = dir.clone();
-        loop {
-            dirs.push(cursor.clone());
-            if &cursor == root {
-                break;
-            }
-            let Some(parent) = cursor.parent() else {
-                break;
-            };
-            cursor = parent;
-        }
-        dirs.reverse();
-        dirs
-    } else {
-        vec![dir.clone()]
-    };
 
-    let mut found = Vec::new();
-    let mut dependencies = Vec::new();
-    let marker_search_end = project_root.as_ref();
-    let mut marker_cursor = Some(dir.clone());
-    while let Some(directory) = marker_cursor {
-        for marker in &project_root_markers {
-            let path = directory
-                .join(marker)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-            dependencies.push(AgentsMdDependencySpec {
-                path,
-                hash_contents: false,
-            });
-        }
-        if marker_search_end == Some(&directory) {
-            break;
-        }
-        marker_cursor = directory.parent();
-    }
-    let candidate_filenames = candidate_filenames(config);
-    for directory in search_dirs {
-        for name in &candidate_filenames {
-            let candidate = directory
-                .join(name)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-            dependencies.push(AgentsMdDependencySpec {
-                path: candidate.clone(),
-                hash_contents: false,
-            });
-            match fs.get_metadata(&candidate, /*sandbox*/ None).await {
-                Ok(metadata) if metadata.is_file => {
-                    if let Some(dependency) = dependencies.last_mut() {
-                        dependency.hash_contents = true;
-                    }
-                    found.push(candidate);
-                    break;
-                }
-                Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
-            }
-        }
-    }
-    let dependencies = normalize_dependencies(dependencies);
-    Ok(AgentsMdPathDiscovery {
-        paths: found,
-        dependencies,
-    })
-}
-
-pub(crate) fn effective_project_root_markers(config: &Config) -> Vec<String> {
     let mut merged = TomlValue::Table(toml::map::Map::new());
     for layer in config.config_layer_stack.get_layers(
         ConfigLayerStackOrdering::LowestPrecedenceFirst,
@@ -318,28 +163,60 @@ pub(crate) fn effective_project_root_markers(config: &Config) -> Vec<String> {
         }
         merge_toml_values(&mut merged, &layer.config);
     }
-    match project_root_markers_from_config(&merged) {
+    let project_root_markers = match project_root_markers_from_config(&merged) {
         Ok(Some(markers)) => markers,
         Ok(None) => default_project_root_markers(),
         Err(err) => {
             tracing::warn!("invalid project_root_markers: {err}");
             default_project_root_markers()
         }
-    }
-}
-
-fn normalize_dependencies(
-    mut dependencies: Vec<AgentsMdDependencySpec>,
-) -> Option<Vec<AgentsMdDependencySpec>> {
-    dependencies.sort_by_cached_key(|dependency| dependency.path.to_string());
-    dependencies.dedup_by(|left, right| {
-        if left.path != right.path {
-            return false;
+    };
+    let project_root = find_nearest_ancestor_with_markers(
+        fs,
+        &dir,
+        project_root_markers,
+        FindUpErrorPolicy::Propagate,
+        /*sandbox*/ None,
+    )
+    .await?;
+    let search_dirs = if let Some(root) = project_root {
+        let mut dirs = Vec::new();
+        let mut cursor = dir.clone();
+        loop {
+            dirs.push(cursor.clone());
+            if cursor == root {
+                break;
+            }
+            let Some(parent) = cursor.parent() else {
+                break;
+            };
+            cursor = parent;
         }
-        right.hash_contents |= left.hash_contents;
-        true
-    });
-    (dependencies.len() <= MAX_AGENTS_MD_DEPENDENCIES).then_some(dependencies)
+        dirs.reverse();
+        dirs
+    } else {
+        vec![dir]
+    };
+
+    let mut found = Vec::new();
+    let candidate_filenames = candidate_filenames(config);
+    for directory in search_dirs {
+        for name in &candidate_filenames {
+            let candidate = directory
+                .join(name)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+            match fs.get_metadata(&candidate, /*sandbox*/ None).await {
+                Ok(metadata) if metadata.is_file => {
+                    found.push(candidate);
+                    break;
+                }
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn candidate_filenames(config: &Config) -> Vec<&str> {
@@ -360,73 +237,36 @@ fn candidate_filenames(config: &Config) -> Vec<&str> {
 
 /// Model-visible instructions loaded from AGENTS.md files and internal
 /// guidance.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoadedAgentsMd {
     /// Host-provided user instructions.
     user_instructions: Option<UserInstructions>,
 
     /// Ordered instructions and their provenance.
     entries: Vec<InstructionEntry>,
-
-    /// Model-visible composed bytes, retained once for the lifetime of this snapshot.
-    composed_text: Arc<str>,
-
-    /// SHA-256 of `composed_text`, used by fixed-point planning without serializing it again.
-    semantic_digest: [u8; 32],
-}
-
-impl Default for LoadedAgentsMd {
-    fn default() -> Self {
-        Self {
-            user_instructions: None,
-            entries: Vec::new(),
-            composed_text: Arc::from(""),
-            semantic_digest: Sha256::digest([]).into(),
-        }
-    }
 }
 
 impl LoadedAgentsMd {
-    #[cfg(test)]
-    fn from_parts_for_testing(
-        user_instructions: Option<UserInstructions>,
-        entries: Vec<InstructionEntry>,
-    ) -> Self {
-        let mut loaded = Self {
-            user_instructions,
-            entries,
-            ..Self::default()
-        };
-        loaded.recompose();
-        loaded
-    }
-
     /// Creates loaded instructions containing one user-level AGENTS.md entry.
     pub fn new_user(contents: String, path: AbsolutePathBuf) -> Self {
         if contents.trim().is_empty() {
             return Self::default();
         }
-        let mut loaded = Self {
+        Self {
             user_instructions: Some(UserInstructions {
                 text: contents,
                 source: path,
             }),
             entries: Vec::new(),
-            ..Self::default()
-        };
-        loaded.recompose();
-        loaded
+        }
     }
 
     fn from_user_instructions(user_instructions: Option<UserInstructions>) -> Self {
-        let mut loaded = Self {
+        Self {
             user_instructions: user_instructions
                 .filter(|instructions| !instructions.text.trim().is_empty()),
             entries: Vec::new(),
-            ..Self::default()
-        };
-        loaded.recompose();
-        loaded
+        }
     }
 
     /// Creates source-less user instructions for tests.
@@ -438,16 +278,13 @@ impl LoadedAgentsMd {
         if contents.trim().is_empty() {
             return Self::default();
         }
-        let mut loaded = Self {
+        Self {
             user_instructions: None,
             entries: vec![InstructionEntry {
                 contents,
                 provenance: InstructionProvenance::Internal,
             }],
-            ..Self::default()
-        };
-        loaded.recompose();
-        loaded
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -460,20 +297,6 @@ impl LoadedAgentsMd {
 
     /// Returns the concatenated model-visible instruction text.
     pub fn text(&self) -> String {
-        self.composed_text.to_string()
-    }
-
-    pub(crate) fn semantic_digest(&self) -> &[u8; 32] {
-        &self.semantic_digest
-    }
-
-    fn recompose(&mut self) {
-        let text = self.compose_text();
-        self.semantic_digest = Sha256::digest(text.as_bytes()).into();
-        self.composed_text = Arc::from(text);
-    }
-
-    fn compose_text(&self) -> String {
         if self.has_multiple_project_environments() {
             self.environment_labeled_text()
         } else {

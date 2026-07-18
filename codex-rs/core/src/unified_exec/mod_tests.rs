@@ -153,7 +153,6 @@ async fn exec_command_with_tty(
         output_closed,
         output_closed_notify,
         cancellation_token,
-        recovery_evidence: _,
     } = process.output_handles();
     let deadline = started_at + Duration::from_millis(yield_time_ms);
     let collected = UnifiedExecProcessManager::collect_output_until_deadline(
@@ -164,7 +163,6 @@ async fn exec_command_with_tty(
         &cancellation_token,
         Some(session.subscribe_elicitation_pause_state()),
         deadline,
-        process_manager::CollectionMode::AfterQuietPeriod(Duration::from_millis(100)),
     )
     .await;
     let wall_time = Instant::now().saturating_duration_since(started_at);
@@ -199,12 +197,10 @@ async fn exec_command_with_tty(
         max_output_tokens: None,
         process_id: response_process_id,
         exit_code,
-        timed_out: false,
         original_token_count: Some(approx_token_count(&text)),
         hook_command: Some(cmd.to_string()),
         raw_output_artifact: None,
         repair_notice: None,
-        analysis: Default::default(),
     })
 }
 
@@ -230,9 +226,6 @@ impl BlockingTerminateExecProcess {
     async fn read(&self) -> Result<ReadResponse, codex_exec_server::ExecServerError> {
         Ok(ReadResponse {
             chunks: Vec::new(),
-            output_gaps: Vec::new(),
-            earliest_retained_seq: Some(1),
-            complete: Some(true),
             next_seq: 1,
             exited: false,
             exit_code: None,
@@ -343,8 +336,14 @@ fn push_chunk_preserves_prefix_and_suffix() {
 
     let first = snapshot.first().expect("expected at least one chunk");
     assert_eq!(first.first(), Some(&b'a'));
-    assert!(snapshot.len() <= 2);
-    assert!(snapshot.concat().ends_with(b"bc"));
+    assert!(snapshot.iter().any(|chunk| chunk.as_slice() == b"b"));
+    assert_eq!(
+        snapshot
+            .last()
+            .expect("expected at least one chunk")
+            .as_slice(),
+        b"c"
+    );
 }
 
 #[test]
@@ -875,7 +874,6 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
         output_closed,
         output_closed_notify,
         cancellation_token,
-        recovery_evidence: _,
     } = process.output_handles();
     let collected = UnifiedExecProcessManager::collect_output_until_deadline(
         &output_buffer,
@@ -885,7 +883,6 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
         &cancellation_token,
         /*pause_state*/ None,
         Instant::now() + Duration::from_millis(2_500),
-        process_manager::CollectionMode::UntilDeadline,
     )
     .await;
 

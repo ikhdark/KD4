@@ -14,7 +14,6 @@ pub(crate) mod registry;
 pub(crate) mod router;
 pub(crate) mod runtimes;
 pub(crate) mod sandboxing;
-mod schema_bundle;
 pub(crate) mod shell_output_summary;
 pub(crate) mod spec_plan;
 pub(crate) mod tool_dispatch_trace;
@@ -30,9 +29,6 @@ use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::truncate_text;
 pub use router::ToolRouter;
-pub(crate) use schema_bundle::ToolSchemaBundle;
-pub(crate) use schema_bundle::ToolWireMode;
-pub(crate) use schema_bundle::ToolWireValue;
 use shell_output_summary::ShellOutputSummaryOptions;
 use shell_output_summary::summarize_shell_output_for_model;
 

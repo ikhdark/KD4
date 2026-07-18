@@ -329,7 +329,6 @@ mod connectors;
 mod constructor;
 use self::connectors::ConnectorsState;
 mod exec_state;
-mod first_terminal_frame;
 use self::exec_state::RunningCommand;
 use self::exec_state::UnifiedExecProcessSummary;
 use self::exec_state::UnifiedExecWaitState;
@@ -337,7 +336,6 @@ use self::exec_state::UnifiedExecWaitStreak;
 use self::exec_state::command_execution_command_and_parsed;
 use self::exec_state::is_standard_tool_call;
 use self::exec_state::is_unified_exec_source;
-use self::first_terminal_frame::FirstTerminalFrameTracker;
 mod goal_status;
 use self::goal_status::GoalStatusState;
 #[cfg(test)]
@@ -548,7 +546,6 @@ pub(crate) struct ChatWidget {
     has_codex_backend_auth: bool,
     model_catalog: Arc<ModelCatalog>,
     session_telemetry: SessionTelemetry,
-    first_terminal_frame: FirstTerminalFrameTracker,
     session_header: SessionHeader,
     initial_user_message: Option<UserMessage>,
     status_account_display: Option<StatusAccountDisplay>,
@@ -1814,7 +1811,6 @@ impl ChatWidget {
         T: Into<AppCommand>,
     {
         let op: AppCommand = op.into();
-        let is_user_turn = matches!(&op, AppCommand::UserTurn { .. });
         self.prepare_local_op_submission(&op);
         if op.is_review() && !self.bottom_pane.is_task_running() {
             self.bottom_pane.set_task_running(/*running*/ true);
@@ -1823,9 +1819,6 @@ impl ChatWidget {
             CodexOpTarget::Direct(codex_op_tx) => {
                 crate::session_log::log_outbound_op(&op);
                 if let Err(e) = codex_op_tx.send(op) {
-                    if is_user_turn {
-                        self.first_terminal_frame.cancel_pending_submission();
-                    }
                     tracing::error!("failed to submit op: {e}");
                     return false;
                 }
@@ -1847,17 +1840,6 @@ impl ChatWidget {
     }
 
     pub(crate) fn prepare_local_op_submission(&mut self, op: &AppCommand) {
-        if (self.session_telemetry.timing_correlation_enabled()
-            || tracing::enabled!(target: "codex_tui::latency", tracing::Level::DEBUG))
-            && matches!(op, AppCommand::UserTurn { .. })
-            && let Some(correlation_id) = self.first_terminal_frame.arm_submission()
-        {
-            tracing::debug!(
-                target: "codex_tui::latency",
-                correlation_id,
-                "user turn submitted for terminal-frame correlation"
-            );
-        }
         if let AppCommand::Interrupt { behavior } = op
             && self.turn_lifecycle.agent_turn_running
         {
@@ -1872,58 +1854,6 @@ impl ChatWidget {
             }
             self.clear_active_stream_tail();
             self.request_redraw();
-        }
-    }
-
-    pub(crate) fn note_first_assistant_output(&mut self, turn_id: &str, has_content: bool) {
-        if has_content
-            && self.turn_lifecycle.last_turn_id.as_deref() == Some(turn_id)
-            && let Some(correlation_id) = self.first_terminal_frame.on_first_output(turn_id)
-        {
-            tracing::debug!(
-                target: "codex_tui::latency",
-                correlation_id,
-                turn_id,
-                "first assistant output observed for terminal-frame correlation"
-            );
-        }
-    }
-
-    pub(crate) fn note_active_first_assistant_output(&mut self, has_content: bool) {
-        if !has_content {
-            return;
-        }
-        let turn_id = self
-            .turn_lifecycle
-            .last_turn_id
-            .as_deref()
-            .unwrap_or_default();
-        let Some(correlation_id) = self.first_terminal_frame.on_first_output(turn_id) else {
-            return;
-        };
-        tracing::debug!(
-            target: "codex_tui::latency",
-            correlation_id,
-            turn_id,
-            "first assistant output observed for terminal-frame correlation"
-        );
-    }
-
-    pub(crate) fn on_terminal_frame_rendered(&mut self) {
-        let rendered_at = Instant::now();
-        while let Some((correlation_id, turn_id, duration)) = self
-            .first_terminal_frame
-            .take_rendered_duration(rendered_at)
-        {
-            self.session_telemetry
-                .record_tui_submit_to_first_terminal_frame(&turn_id, duration);
-            tracing::debug!(
-                target: "codex_tui::latency",
-                correlation_id,
-                turn_id,
-                duration_ms = duration.as_millis(),
-                "first terminal frame rendered for submitted turn"
-            );
         }
     }
 

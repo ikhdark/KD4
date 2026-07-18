@@ -9,8 +9,6 @@ use codex_protocol::protocol::SessionSource;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::time::Duration;
 use tempfile::TempDir;
 fn write_index(path: &Path, lines: &[SessionIndexEntry]) -> std::io::Result<()> {
     let mut out = String::new();
@@ -54,108 +52,6 @@ fn write_rollout_with_metadata(path: &Path, thread_id: ThreadId) -> std::io::Res
     };
     let body = serde_json::to_string(&line).map_err(std::io::Error::other)?;
     std::fs::write(path, format!("{body}\n"))
-}
-
-#[tokio::test]
-async fn session_index_locks_are_shared_per_canonical_path_only() -> std::io::Result<()> {
-    let temp = TempDir::new()?;
-    let home_a = temp.path().join("a");
-    let home_b = temp.path().join("b");
-    std::fs::create_dir_all(&home_a)?;
-    std::fs::create_dir_all(&home_b)?;
-
-    let path_a = canonical_session_index_path(&home_a).await?;
-    let aliased_path_a = canonical_session_index_path(&home_a.join(".")).await?;
-    let path_b = canonical_session_index_path(&home_b).await?;
-    let lock_a = session_index_lock(&path_a).await;
-    let aliased_lock_a = session_index_lock(&aliased_path_a).await;
-    let lock_b = session_index_lock(&path_b).await;
-
-    assert!(Arc::ptr_eq(&lock_a, &aliased_lock_a));
-    assert!(!Arc::ptr_eq(&lock_a, &lock_b));
-
-    let guard_a = lock_a.write_owned().await;
-    let entry_a = SessionIndexEntry {
-        id: ThreadId::new(),
-        thread_name: "same path".to_string(),
-        updated_at: "2024-01-01T00:00:00Z".to_string(),
-    };
-    let mut append_a = Box::pin(append_session_index_entry(&home_a, &entry_a));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(25), append_a.as_mut())
-            .await
-            .is_err()
-    );
-
-    let entry_b = SessionIndexEntry {
-        id: ThreadId::new(),
-        thread_name: "different path".to_string(),
-        updated_at: "2024-01-01T00:00:00Z".to_string(),
-    };
-    tokio::time::timeout(
-        Duration::from_secs(1),
-        append_session_index_entry(&home_b, &entry_b),
-    )
-    .await
-    .map_err(std::io::Error::other)??;
-
-    drop(guard_a);
-    tokio::time::timeout(Duration::from_secs(1), append_a)
-        .await
-        .map_err(std::io::Error::other)??;
-    Ok(())
-}
-
-#[tokio::test]
-async fn append_remove_and_read_keep_the_index_consistent() -> std::io::Result<()> {
-    let temp = TempDir::new()?;
-    let removed_id = ThreadId::new();
-    let retained_id = ThreadId::new();
-    let first = SessionIndexEntry {
-        id: removed_id,
-        thread_name: "first".to_string(),
-        updated_at: "2024-01-01T00:00:00Z".to_string(),
-    };
-    let retained = SessionIndexEntry {
-        id: retained_id,
-        thread_name: "retained".to_string(),
-        updated_at: "2024-01-02T00:00:00Z".to_string(),
-    };
-    let latest = SessionIndexEntry {
-        id: removed_id,
-        thread_name: "latest".to_string(),
-        updated_at: "2024-01-03T00:00:00Z".to_string(),
-    };
-
-    append_session_index_entry(temp.path(), &first).await?;
-    append_session_index_entry(temp.path(), &retained).await?;
-    append_session_index_entry(temp.path(), &latest).await?;
-    assert_eq!(
-        find_thread_name_by_id(temp.path(), &removed_id).await?,
-        Some("latest".to_string())
-    );
-
-    remove_thread_name_entries(temp.path(), removed_id).await?;
-
-    assert_eq!(find_thread_name_by_id(temp.path(), &removed_id).await?, None);
-    let mut ids = HashSet::new();
-    ids.insert(removed_id);
-    ids.insert(retained_id);
-    let mut expected = HashMap::new();
-    expected.insert(retained_id, "retained".to_string());
-    assert_eq!(find_thread_names_by_ids(temp.path(), &ids).await?, expected);
-
-    let contents = std::fs::read_to_string(session_index_path(temp.path()))?;
-    let entries = contents
-        .lines()
-        .map(serde_json::from_str::<SessionIndexEntry>)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(std::io::Error::other)?;
-    assert_eq!(entries, vec![retained]);
-    assert!(!session_index_path(temp.path())
-        .with_extension("jsonl.tmp")
-        .exists());
-    Ok(())
 }
 
 #[test]

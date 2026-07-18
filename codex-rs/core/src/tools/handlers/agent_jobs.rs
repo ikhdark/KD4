@@ -281,7 +281,7 @@ async fn run_agent_job_loop(
             progressed = true;
         }
 
-        let finished = find_finished_threads(session.clone(), &mut active_items).await;
+        let finished = find_finished_threads(session.clone(), &active_items).await;
         if finished.is_empty() {
             let progress = db.get_agent_job_progress(job_id.as_str()).await?;
             if cancel_requested {
@@ -426,10 +426,10 @@ async fn recover_running_items(
 
 async fn find_finished_threads(
     session: Arc<Session>,
-    active_items: &mut HashMap<ThreadId, ActiveJobItem>,
+    active_items: &HashMap<ThreadId, ActiveJobItem>,
 ) -> Vec<(ThreadId, String)> {
     let mut finished = Vec::new();
-    for (thread_id, item) in active_items.iter_mut() {
+    for (thread_id, item) in active_items {
         let status = active_item_status(session.as_ref(), *thread_id, item).await;
         if is_final(&status) {
             finished.push((*thread_id, item.item_id.clone()));
@@ -441,29 +441,20 @@ async fn find_finished_threads(
 async fn active_item_status(
     session: &Session,
     thread_id: ThreadId,
-    item: &mut ActiveJobItem,
+    item: &ActiveJobItem,
 ) -> AgentStatus {
-    if let Some(status) = take_changed_status(item) {
-        return status;
+    if let Some(status_rx) = item.status_rx.as_ref()
+        && status_rx.has_changed().is_ok()
+    {
+        return status_rx.borrow().clone();
     }
     session.services.agent_control.get_status(thread_id).await
-}
-
-fn take_changed_status(item: &mut ActiveJobItem) -> Option<AgentStatus> {
-    let status_rx = item.status_rx.as_mut()?;
-    if !matches!(status_rx.has_changed(), Ok(true)) {
-        return None;
-    }
-    Some(status_rx.borrow_and_update().clone())
 }
 
 async fn wait_for_status_change(active_items: &HashMap<ThreadId, ActiveJobItem>) {
     let mut waiters = FuturesUnordered::new();
     for item in active_items.values() {
         if let Some(status_rx) = item.status_rx.as_ref() {
-            if status_rx.has_changed().is_err() {
-                continue;
-            }
             let mut status_rx = status_rx.clone();
             waiters.push(async move {
                 let _ = status_rx.changed().await;

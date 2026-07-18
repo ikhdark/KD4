@@ -24,7 +24,6 @@ use tracing::warn;
 
 use crate::codex_thread::BackgroundTerminalInfo;
 use crate::config::Config;
-use crate::config::ThreadStoreConfig;
 use crate::context::ContextualUserFragment;
 use crate::hook_runtime::inspect_pending_input;
 use crate::hook_runtime::record_additional_contexts;
@@ -57,6 +56,7 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
+use codex_protocol::protocol::WarningEvent;
 
 use codex_features::Feature;
 use codex_protocol::error::CodexErr;
@@ -138,18 +138,6 @@ fn emit_turn_network_proxy_metric(
         TURN_NETWORK_PROXY_METRIC,
         /*inc*/ 1,
         &[("active", active), tmp_mem],
-    );
-}
-
-fn emit_turn_tool_call_metric(
-    session_telemetry: &SessionTelemetry,
-    tool_call_count: u32,
-    tmp_mem: (&str, &str),
-) {
-    session_telemetry.histogram(
-        TURN_TOOL_CALL_METRIC,
-        i64::from(tool_call_count),
-        &[tmp_mem],
     );
 }
 
@@ -497,14 +485,10 @@ impl Session {
         let worker_abort_handle = worker_handle.abort_handle();
         let supervisor_session = Arc::clone(self);
         let supervisor_turn_id = turn_context.sub_id.clone();
-        let supervisor_turn_config = Arc::clone(&turn_context.config);
         let supervisor_handle = tokio::spawn(
             async move {
-                let worker_result = worker_handle.await;
                 supervisor_session
-                    .schedule_rollout_compression_after_first_task(supervisor_turn_config.as_ref());
-                supervisor_session
-                    .on_task_finished(&supervisor_turn_id, worker_result)
+                    .on_task_finished(&supervisor_turn_id, worker_handle.await)
                     .await;
             }
             .instrument(task_span.clone()),
@@ -525,29 +509,6 @@ impl Session {
         turn.terminal = Some(terminal);
         drop(active);
         let _ = start_tx.send(());
-    }
-
-    fn schedule_rollout_compression_after_first_task(&self, config: &Config) {
-        if !self
-            .features()
-            .enabled(Feature::LocalThreadStoreCompression)
-            || !matches!(
-                &config.experimental_thread_store,
-                ThreadStoreConfig::Local
-            )
-            || self
-                .rollout_compression_scheduled
-                .compare_exchange(
-                    false,
-                    true,
-                    std::sync::atomic::Ordering::AcqRel,
-                    std::sync::atomic::Ordering::Acquire,
-                )
-                .is_err()
-        {
-            return;
-        }
-        codex_rollout::spawn_rollout_compression_worker(config.codex_home.to_path_buf());
     }
 
     async fn on_task_finished(
@@ -781,6 +742,9 @@ impl Session {
         {
             self.record_conversation_items(turn_context.as_ref(), std::slice::from_ref(&marker))
                 .await;
+            if let Err(err) = self.flush_rollout().await {
+                warn!("failed to flush interrupted-turn marker before terminal event: {err}");
+            }
         }
 
         let (last_agent_message, abort_reason) = match &finalization.outcome {
@@ -831,11 +795,14 @@ impl Session {
             }
         }
 
-        let (turn_had_memory_citation, token_usage_at_turn_start) = {
+        let (turn_had_memory_citation, turn_tool_calls, token_usage_at_turn_start) = {
             let ts = finalization.turn_state.lock().await;
-            (ts.has_memory_citation, ts.token_usage_at_turn_start.clone())
+            (
+                ts.has_memory_citation,
+                ts.tool_calls,
+                ts.token_usage_at_turn_start.clone(),
+            )
         };
-        let turn_tool_calls = turn_context.turn_timing_state.tool_call_count();
         // Emit token usage metrics.
         {
             // TODO(jif): drop this
@@ -867,7 +834,11 @@ impl Session {
                 network_proxy_active,
                 tmp_mem,
             );
-            emit_turn_tool_call_metric(&self.services.session_telemetry, turn_tool_calls, tmp_mem);
+            self.services.session_telemetry.histogram(
+                TURN_TOOL_CALL_METRIC,
+                i64::try_from(turn_tool_calls).unwrap_or(i64::MAX),
+                &[tmp_mem],
+            );
             let total_token_usage = self.total_token_usage().await.unwrap_or_default();
             let turn_token_usage = TokenUsage {
                 input_tokens: (total_token_usage.input_tokens
@@ -980,6 +951,19 @@ impl Session {
             .await;
         }
 
+        if let Err(err) = self.flush_rollout().await {
+            warn!("failed to flush rollout before completing turn: {err}");
+            self.send_event(
+                turn_context.as_ref(),
+                EventMsg::Warning(WarningEvent {
+                    message: format!(
+                        "Failed to save the conversation transcript; Codex will continue retrying. Error: {err}"
+                    ),
+                }),
+            )
+            .await;
+        }
+
         let timing_snapshot = turn_context.turn_timing_state.complete_snapshot();
         if let Some(duration) = timing_snapshot.inclusive_duration() {
             turn_context
@@ -1040,8 +1024,8 @@ impl Session {
         if cleared_active_turn {
             self.emit_thread_idle_lifecycle_if_idle().await;
         }
-        // Ordered append receipts place all regular items and this terminal event in JSONL order.
-        // This is the turn's single durability barrier and therefore includes the terminal receipt.
+        // Regular items were flushed before this terminal event was appended; buffering
+        // thread writers may not flush it without another explicit barrier.
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after emitting terminal turn event: {err}");
         }

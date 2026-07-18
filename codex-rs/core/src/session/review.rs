@@ -27,7 +27,7 @@ pub(super) async fn spawn_review_thread(
     let available_models = sess
         .services
         .models_manager
-        .list_models_snapshot(
+        .list_models(
             RefreshStrategy::OnlineIfUncached,
             config.http_client_factory(),
         )
@@ -88,11 +88,6 @@ pub(super) async fn spawn_review_thread(
 
     let per_turn_config = Arc::new(per_turn_config);
     let review_turn_id = sub_id.to_string();
-    let git_workspace_snapshot = sess
-        .services
-        .turn_environments
-        .git_workspace_snapshot(&parent_turn_context.environments)
-        .await;
     let turn_metadata_state = Arc::new(TurnMetadataState::new(
         sess.session_id().to_string(),
         sess.thread_id().to_string(),
@@ -107,8 +102,6 @@ pub(super) async fn spawn_review_thread(
         parent_turn_context.windows_sandbox_level,
         parent_turn_context.network.is_some(),
     ));
-    turn_metadata_state
-        .set_git_workspace_source(git_workspace_snapshot.primary_local_metadata_source());
 
     let extension_data = Arc::new(codex_extension_api::ExtensionData::new(
         review_turn_id.clone(),

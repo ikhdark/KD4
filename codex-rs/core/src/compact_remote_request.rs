@@ -57,11 +57,7 @@ pub(super) async fn run_remote_compact_attempt(
                     .saturating_sub(estimated_deleted_tokens.min(max_local_deleted_tokens))
             });
     }
-    let trace_input_history = if compaction_trace.is_enabled() {
-        history.raw_items().to_vec()
-    } else {
-        Vec::new()
-    };
+    let trace_input_history = history.raw_items().to_vec();
     let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
     let tool_router = built_tools(
         sess.as_ref(),
@@ -71,7 +67,7 @@ pub(super) async fn run_remote_compact_attempt(
     .await?;
     let prompt = Prompt {
         input: prompt_input,
-        tools: Arc::clone(tool_router.model_visible_schema_bundle()),
+        tools: tool_router.model_visible_specs(),
         parallel_tool_calls: turn_context.model_info.supports_parallel_tool_calls,
         base_instructions,
         output_schema: None,

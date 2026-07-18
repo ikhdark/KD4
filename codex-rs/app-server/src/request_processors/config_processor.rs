@@ -32,8 +32,6 @@ use codex_app_server_protocol::NewThreadModelDefaults;
 use codex_app_server_protocol::SandboxMode;
 use codex_app_server_protocol::WindowsSandboxSetupMode;
 use codex_config::ConfigRequirementsToml;
-use codex_config::ConfigLayerSource;
-use codex_config::ConfigLayerStackOrdering;
 use codex_config::HookEventsToml;
 use codex_config::HookHandlerConfig as CoreHookHandlerConfig;
 use codex_config::ManagedHooksRequirementsToml;
@@ -48,7 +46,6 @@ use codex_plugin::PluginId;
 use codex_protocol::config_types::WebSearchMode;
 use serde_json::json;
 use std::path::PathBuf;
-use tokio::sync::Mutex;
 
 const SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT: &[&str] = &[
     "auth_elicitation",
@@ -65,46 +62,6 @@ pub(crate) struct ConfigRequestProcessor {
     config_manager: ConfigManager,
     thread_manager: Arc<ThreadManager>,
     analytics_events_client: AnalyticsEventsClient,
-    user_config_reload: Arc<Mutex<UserConfigReloadState>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct UserConfigFingerprint {
-    layers: Vec<(ConfigLayerSource, String, Option<String>)>,
-    runtime_features: Vec<bool>,
-}
-
-#[derive(Debug)]
-struct UserConfigReloadState {
-    fingerprint: UserConfigFingerprint,
-}
-
-impl UserConfigFingerprint {
-    fn from_config(config: &codex_core::config::Config) -> Self {
-        Self {
-            layers: config
-                .config_layer_stack
-                .get_user_layers(
-                    ConfigLayerStackOrdering::LowestPrecedenceFirst,
-                    /*include_disabled*/ true,
-                )
-                .into_iter()
-                .map(|layer| {
-                    (
-                        layer.name.clone(),
-                        layer.version.clone(),
-                        layer.disabled_reason.clone(),
-                    )
-                })
-                .collect(),
-            runtime_features: SUPPORTED_EXPERIMENTAL_FEATURE_ENABLEMENT
-                .iter()
-                .filter_map(|key| {
-                    feature_for_key(key).map(|feature| config.features.enabled(feature))
-                })
-                .collect(),
-        }
-    }
 }
 
 impl ConfigRequestProcessor {
@@ -113,16 +70,12 @@ impl ConfigRequestProcessor {
         config_manager: ConfigManager,
         thread_manager: Arc<ThreadManager>,
         analytics_events_client: AnalyticsEventsClient,
-        initial_config: &codex_core::config::Config,
     ) -> Self {
         Self {
             outgoing,
             config_manager,
             thread_manager,
             analytics_events_client,
-            user_config_reload: Arc::new(Mutex::new(UserConfigReloadState {
-                fingerprint: UserConfigFingerprint::from_config(initial_config),
-            })),
         }
     }
 
@@ -181,7 +134,7 @@ impl ConfigRequestProcessor {
         &self,
         params: ConfigBatchWriteParams,
     ) -> Result<ClientResponsePayload, JSONRPCErrorError> {
-        self.batch_write_inner(params)
+        self.handle_config_mutation_result(self.batch_write_inner(params).await)
             .await
             .map(ClientResponsePayload::ConfigBatchWrite)
     }
@@ -191,7 +144,9 @@ impl ConfigRequestProcessor {
         request_id: ConnectionRequestId,
         params: ExperimentalFeatureEnablementSetParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let response = self.set_experimental_feature_enablement(params).await?;
+        let response = self
+            .handle_config_mutation_result(self.set_experimental_feature_enablement(params).await)
+            .await?;
         self.outgoing
             .send_response_as(
                 request_id,
@@ -276,15 +231,7 @@ impl ConfigRequestProcessor {
             .map_err(map_error)?;
         self.emit_plugin_toggle_events(pending_changes).await;
         if reload_user_config {
-            if let Err(err) = self.reload_user_config().await {
-                self.handle_config_mutation().await;
-                tracing::warn!(
-                    "failed to rebuild user config for runtime refresh: {}",
-                    err.message
-                );
-            }
-        } else {
-            self.handle_config_mutation().await;
+            self.reload_user_config().await;
         }
         Ok(response)
     }
@@ -320,41 +267,30 @@ impl ConfigRequestProcessor {
             )
             .map_err(|_| internal_error("failed to update feature enablement"))?;
 
-        self.reload_user_config().await?;
+        self.load_latest_config(/*fallback_cwd*/ None).await?;
+        self.reload_user_config().await;
 
         Ok(ExperimentalFeatureEnablementSetResponse { enablement })
     }
 
-    async fn reload_user_config(&self) -> Result<(), JSONRPCErrorError> {
-        // Serialize the complete process-wide reload so concurrent writes load and publish one
-        // snapshot, rather than each rebuilding and invalidating shared state independently.
-        let mut reload_state = self.user_config_reload.lock().await;
-        let next_config = self.load_latest_config(/*fallback_cwd*/ None).await?;
-        let next_fingerprint = UserConfigFingerprint::from_config(&next_config);
-        if reload_state.fingerprint == next_fingerprint {
-            return Ok(());
-        }
-
-        // These services are process-scoped. Invalidate each exactly once before any session
-        // rebuilds hooks or MCP projections from the new user layer.
-        self.thread_manager.plugins_manager().clear_cache();
-        self.thread_manager.skills_service().clear_cache();
-
-        let next_config = Arc::new(next_config);
-        let mut thread_ids = self.thread_manager.list_thread_ids().await;
-        thread_ids.sort_by_key(|thread_id| thread_id.to_string());
+    async fn reload_user_config(&self) {
+        let next_config = match self.load_latest_config(/*fallback_cwd*/ None).await {
+            Ok(config) => config,
+            Err(err) => {
+                tracing::warn!(
+                    "failed to rebuild user config for runtime refresh: {}",
+                    err.message
+                );
+                return;
+            }
+        };
+        let thread_ids = self.thread_manager.list_thread_ids().await;
         for thread_id in thread_ids {
             let Ok(thread) = self.thread_manager.get_thread(thread_id).await else {
                 continue;
             };
-            thread
-                .refresh_runtime_config_from_process_reload(Arc::clone(&next_config))
-                .await;
+            thread.refresh_runtime_config(next_config.clone()).await;
         }
-        crate::mcp_refresh::queue_best_effort_refresh_from_current_configs(&self.thread_manager)
-            .await;
-        reload_state.fingerprint = next_fingerprint;
-        Ok(())
     }
 
     async fn emit_plugin_toggle_events(

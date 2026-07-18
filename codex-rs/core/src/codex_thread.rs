@@ -650,19 +650,6 @@ impl CodexThread {
         self.codex.session.refresh_runtime_config(next_config).await;
     }
 
-    /// Apply a process-coordinated user-config snapshot after the caller has invalidated shared
-    /// plugin and skill caches. The shared snapshot is only used to derive this thread's minimal
-    /// user-layer overlay; session-static settings remain unchanged.
-    pub async fn refresh_runtime_config_from_process_reload(
-        &self,
-        next_config: Arc<crate::config::Config>,
-    ) -> bool {
-        self.codex
-            .session
-            .refresh_runtime_config_from_process_reload(next_config)
-            .await
-    }
-
     pub async fn environment_selections(&self) -> Vec<TurnEnvironmentSelection> {
         self.codex.thread_environment_selections().await
     }
@@ -684,16 +671,6 @@ impl CodexThread {
         server: &str,
         uri: &str,
     ) -> anyhow::Result<serde_json::Value> {
-        Ok(codex_mcp::resource_read_result_to_value(
-            self.read_mcp_resource_typed(server, uri).await?,
-        )?)
-    }
-
-    pub async fn read_mcp_resource_typed(
-        &self,
-        server: &str,
-        uri: &str,
-    ) -> anyhow::Result<codex_mcp::McpResourceReadResult> {
         let result = self
             .current_mcp_runtime()
             .await
@@ -701,7 +678,7 @@ impl CodexThread {
             .read_resource(server, ReadResourceRequestParams::new(uri))
             .await?;
 
-        codex_mcp::resource_read_result_from_rmcp(result)
+        Ok(serde_json::to_value(result)?)
     }
 
     pub async fn call_mcp_tool(

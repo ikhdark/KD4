@@ -293,7 +293,6 @@ fn resolved_local_environments<const N: usize>(
     environments: [(&str, AbsolutePathBuf); N],
 ) -> TurnEnvironmentSnapshot {
     TurnEnvironmentSnapshot {
-        generation: 0,
         turn_environments: environments
             .into_iter()
             .map(|(environment_id, cwd)| {
@@ -334,9 +333,9 @@ fn foreign_agents_md_uses_environment_native_paths() {
         )
     };
     let source_path = cwd.join("AGENTS.md").expect("AGENTS.md URI");
-    let loaded = LoadedAgentsMd::from_parts_for_testing(
-        None,
-        vec![InstructionEntry {
+    let loaded = LoadedAgentsMd {
+        user_instructions: None,
+        entries: vec![InstructionEntry {
             contents: "remote instructions".to_string(),
             provenance: InstructionProvenance::Project {
                 source_path: source_path.clone(),
@@ -344,7 +343,7 @@ fn foreign_agents_md_uses_environment_native_paths() {
                 cwd,
             },
         }],
-    );
+    };
 
     assert_eq!(
         loaded.contextual_user_fragment().render(),
@@ -367,9 +366,9 @@ fn multi_environment_agents_md_renders_mixed_path_conventions() {
     let windows_source = windows_cwd
         .join("AGENTS.md")
         .expect("Windows AGENTS.md URI");
-    let loaded = LoadedAgentsMd::from_parts_for_testing(
-        None,
-        vec![
+    let loaded = LoadedAgentsMd {
+        user_instructions: None,
+        entries: vec![
             InstructionEntry {
                 contents: "POSIX instructions".to_string(),
                 provenance: InstructionProvenance::Project {
@@ -387,7 +386,7 @@ fn multi_environment_agents_md_renders_mixed_path_conventions() {
                 },
             },
         ],
-    );
+    };
 
     assert_eq!(
         loaded.contextual_user_fragment().render(),
@@ -524,20 +523,20 @@ fn empty_loaded_instructions_are_empty() {
 
 #[test]
 fn loaded_instructions_with_only_empty_or_whitespace_entries_are_empty() {
-    let empty = LoadedAgentsMd::from_parts_for_testing(
-        None,
-        vec![InstructionEntry {
+    let empty = LoadedAgentsMd {
+        user_instructions: None,
+        entries: vec![InstructionEntry {
             contents: String::new(),
             provenance: InstructionProvenance::Internal,
         }],
-    );
-    let whitespace = LoadedAgentsMd::from_parts_for_testing(
-        None,
-        vec![InstructionEntry {
+    };
+    let whitespace = LoadedAgentsMd {
+        user_instructions: None,
+        entries: vec![InstructionEntry {
             contents: " \n\t".to_string(),
             provenance: InstructionProvenance::Internal,
         }],
-    );
+    };
 
     assert!(empty.is_empty());
     assert!(whitespace.is_empty());
@@ -602,9 +601,9 @@ async fn total_byte_limit_truncates_later_project_docs() {
     config.cwd = nested.abs();
 
     let loaded = load_agents_md(&config).await.expect("project instructions");
-    let expected = LoadedAgentsMd::from_parts_for_testing(
-        None,
-        vec![
+    let expected = LoadedAgentsMd {
+        user_instructions: None,
+        entries: vec![
             InstructionEntry {
                 contents: "root".to_string(),
                 provenance: project_provenance(
@@ -617,7 +616,7 @@ async fn total_byte_limit_truncates_later_project_docs() {
                 provenance: project_provenance(config.cwd.join("AGENTS.md"), config.cwd.clone()),
             },
         ],
-    );
+    };
 
     assert_eq!(loaded, expected);
     assert_eq!(loaded.text(), "root\n\nabc");
@@ -1140,9 +1139,9 @@ async fn concatenates_root_and_cwd_docs() {
     let loaded = load_agents_md(&cfg).await.expect("doc expected");
     let root_agents = repo.path().join("AGENTS.md").abs();
     let crate_agents = cfg.cwd.join("AGENTS.md");
-    let expected = LoadedAgentsMd::from_parts_for_testing(
-        None,
-        vec![
+    let expected = LoadedAgentsMd {
+        user_instructions: None,
+        entries: vec![
             InstructionEntry {
                 contents: "root doc".to_string(),
                 provenance: project_provenance(root_agents.clone(), cfg.cwd.clone()),
@@ -1152,7 +1151,7 @@ async fn concatenates_root_and_cwd_docs() {
                 provenance: project_provenance(crate_agents.clone(), cfg.cwd.clone()),
             },
         ],
-    );
+    };
 
     assert_eq!(loaded, expected);
     assert_eq!(loaded.text(), "root doc\n\ncrate doc");
@@ -1276,16 +1275,16 @@ async fn instruction_sources_include_global_before_agents_md_docs() {
     let loaded = load_agents_md(&cfg).await.expect("instructions expected");
     let project_agents = cfg.cwd.join("AGENTS.md");
 
-    let expected = LoadedAgentsMd::from_parts_for_testing(
-        Some(UserInstructions {
+    let expected = LoadedAgentsMd {
+        user_instructions: Some(UserInstructions {
             text: "global doc".to_string(),
             source: global_agents.clone(),
         }),
-        vec![InstructionEntry {
+        entries: vec![InstructionEntry {
             contents: "project doc".to_string(),
             provenance: project_provenance(project_agents.clone(), cfg.cwd.clone()),
         }],
-    );
+    };
     assert_eq!(loaded, expected);
     assert_eq!(
         loaded.sources().collect::<Vec<_>>(),

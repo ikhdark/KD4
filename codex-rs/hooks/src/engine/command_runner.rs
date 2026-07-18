@@ -50,7 +50,7 @@ pub(crate) async fn run_command(
     shell: &CommandShell,
     handler: &ConfiguredHandler,
     configured_order: usize,
-    input_json: &[u8],
+    input_json: &str,
     cwd: &Path,
 ) -> CommandRunResult {
     let started_at = chrono::Utc::now().timestamp();
@@ -82,7 +82,7 @@ pub(crate) async fn run_command(
     };
 
     if let Some(mut stdin) = child.stdin.take()
-        && let Err(err) = stdin.write_all(input_json).await
+        && let Err(err) = stdin.write_all(input_json.as_bytes()).await
     {
         let _ = child.kill().await;
         return finish_command_run(

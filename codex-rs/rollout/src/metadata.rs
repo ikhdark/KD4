@@ -28,20 +28,11 @@ use std::path::PathBuf;
 use tracing::info;
 use tracing::warn;
 
-#[cfg(not(test))]
 const BACKFILL_BATCH_SIZE: usize = 200;
-#[cfg(test)]
-const BACKFILL_BATCH_SIZE: usize = 2;
 #[cfg(not(test))]
-pub(crate) const BACKFILL_LEASE_SECONDS: i64 = 900;
+const BACKFILL_LEASE_SECONDS: i64 = 900;
 #[cfg(test)]
-pub(crate) const BACKFILL_LEASE_SECONDS: i64 = 1;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BackfillRunOutcome {
-    Complete,
-    Deferred,
-}
+const BACKFILL_LEASE_SECONDS: i64 = 1;
 
 pub(crate) fn builder_from_session_meta(
     session_meta: &SessionMetaLine,
@@ -150,7 +141,7 @@ pub(crate) async fn backfill_sessions(
     codex_home: &Path,
     default_provider: &str,
 ) {
-    let _ = backfill_sessions_with_lease(
+    backfill_sessions_with_lease(
         runtime,
         codex_home,
         default_provider,
@@ -164,7 +155,7 @@ pub(crate) async fn backfill_sessions_with_lease(
     codex_home: &Path,
     default_provider: &str,
     backfill_lease_seconds: i64,
-) -> BackfillRunOutcome {
+) {
     let metric_client = codex_otel::global();
     let timer = metric_client
         .as_ref()
@@ -180,7 +171,7 @@ pub(crate) async fn backfill_sessions_with_lease(
         }
     };
     if backfill_state.status == BackfillStatus::Complete {
-        return BackfillRunOutcome::Complete;
+        return;
     }
     let claimed = match runtime.try_claim_backfill(backfill_lease_seconds).await {
         Ok(claimed) => claimed,
@@ -189,7 +180,7 @@ pub(crate) async fn backfill_sessions_with_lease(
                 "failed to claim backfill worker at {}: {err}",
                 codex_home.display()
             );
-            return BackfillRunOutcome::Deferred;
+            return;
         }
     };
     if !claimed {
@@ -197,7 +188,7 @@ pub(crate) async fn backfill_sessions_with_lease(
             "state db backfill already running at {}; skipping duplicate worker",
             codex_home.display()
         );
-        return BackfillRunOutcome::Deferred;
+        return;
     }
     let mut backfill_state = match runtime.get_backfill_state().await {
         Ok(state) => state,
@@ -250,6 +241,7 @@ pub(crate) async fn backfill_sessions_with_lease(
     if let Some(last_watermark) = backfill_state.last_watermark.as_deref() {
         rollout_paths.retain(|entry| entry.watermark.as_str() > last_watermark);
     }
+
     let mut stats = BackfillStats {
         scanned: 0,
         upserted: 0,
@@ -273,21 +265,9 @@ pub(crate) async fn backfill_sessions_with_lease(
                     let mut metadata = outcome.metadata;
                     metadata.cwd = normalize_cwd_for_state_db(&metadata.cwd);
                     let memory_mode = outcome.memory_mode.unwrap_or_else(|| "enabled".to_string());
-                    let mut preserve_existing_projection = false;
                     if let Ok(Some(existing_metadata)) = runtime.get_thread(metadata.id).await {
-                        if existing_metadata.updated_at >= metadata.updated_at {
-                            // Live writes are flushed before their metadata patch is applied. If
-                            // that patch is already as new as this filesystem snapshot, keep it so
-                            // background history indexing cannot replace current-session state
-                            // with an older view of the same rollout.
-                            let rollout_path = metadata.rollout_path;
-                            metadata = existing_metadata;
-                            metadata.rollout_path = rollout_path;
-                            preserve_existing_projection = true;
-                        } else {
-                            metadata.prefer_existing_git_info(&existing_metadata);
-                            metadata.prefer_existing_explicit_title(&existing_metadata);
-                        }
+                        metadata.prefer_existing_git_info(&existing_metadata);
+                        metadata.prefer_existing_explicit_title(&existing_metadata);
                     }
                     if rollout.archived && metadata.archived_at.is_none() {
                         let fallback_archived_at = metadata.updated_at;
@@ -299,10 +279,9 @@ pub(crate) async fn backfill_sessions_with_lease(
                         stats.failed = stats.failed.saturating_add(1);
                         warn!("failed to upsert rollout {}: {err}", rollout.path.display());
                     } else {
-                        if !preserve_existing_projection
-                            && let Err(err) = runtime
-                                .set_thread_memory_mode(metadata.id, memory_mode.as_str())
-                                .await
+                        if let Err(err) = runtime
+                            .set_thread_memory_mode(metadata.id, memory_mode.as_str())
+                            .await
                         {
                             stats.failed = stats.failed.saturating_add(1);
                             warn!(
@@ -337,9 +316,8 @@ pub(crate) async fn backfill_sessions_with_lease(
                 last_watermark = Some(last_entry.watermark.clone());
             }
         }
-        tokio::task::yield_now().await;
     }
-    let outcome = if let Err(err) = runtime
+    if let Err(err) = runtime
         .mark_backfill_complete(last_watermark.as_deref())
         .await
     {
@@ -347,10 +325,7 @@ pub(crate) async fn backfill_sessions_with_lease(
             "failed to mark backfill complete at {}: {err}",
             codex_home.display()
         );
-        BackfillRunOutcome::Deferred
-    } else {
-        BackfillRunOutcome::Complete
-    };
+    }
 
     info!(
         "state db backfill scanned={}, upserted={}, failed={}",
@@ -378,7 +353,6 @@ pub(crate) async fn backfill_sessions_with_lease(
         };
         let _ = timer.record(&[("status", status)]);
     }
-    outcome
 }
 
 #[derive(Debug, Clone)]

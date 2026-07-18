@@ -3,7 +3,6 @@ use crate::error_code::invalid_request;
 use crate::outgoing_message::ClientRequestResult;
 use crate::outgoing_message::ThreadScopedOutgoingMessageSender;
 use crate::request_processors::populate_thread_turns_from_history;
-use crate::request_processors::thread_lifecycle::ThreadLifecycleCoordinator;
 use crate::request_processors::thread_from_stored_thread;
 use crate::request_processors::thread_settings_from_core_snapshot;
 use crate::server_request_error::is_turn_transition_server_request_error;
@@ -144,7 +143,7 @@ pub(crate) async fn apply_bespoke_event_handling(
     outgoing: ThreadScopedOutgoingMessageSender,
     thread_state: Arc<tokio::sync::Mutex<ThreadState>>,
     thread_watch_manager: ThreadWatchManager,
-    thread_lifecycle: Arc<ThreadLifecycleCoordinator>,
+    thread_list_state_permit: Arc<tokio::sync::Semaphore>,
     fallback_model_provider: String,
 ) {
     let Event {
@@ -1070,7 +1069,20 @@ pub(crate) async fn apply_bespoke_event_handling(
             };
 
             if let Some(request_id) = pending {
-                let _lifecycle_guard = thread_lifecycle.lock_thread(conversation_id).await;
+                let _thread_list_state_permit = match thread_list_state_permit.acquire().await {
+                    Ok(permit) => permit,
+                    Err(err) => {
+                        outgoing
+                            .send_error(
+                                request_id,
+                                internal_error(format!(
+                                    "failed to acquire thread list state permit: {err}"
+                                )),
+                            )
+                            .await;
+                        return;
+                    }
+                };
                 let fallback_cwd = conversation.config_snapshot().await.cwd().clone();
                 let stored_thread = match conversation
                     .read_thread(
@@ -2115,8 +2127,7 @@ mod tests {
             .ok_or_else(|| anyhow!("should send one message"))?;
         match envelope {
             OutgoingEnvelope::Broadcast { message } => Ok(message),
-            OutgoingEnvelope::ToConnection { message, .. }
-            | OutgoingEnvelope::ToSnapshotAcceptedConnection { message, .. } => Ok(message),
+            OutgoingEnvelope::ToConnection { message, .. } => Ok(message),
         }
     }
 
@@ -2296,7 +2307,7 @@ mod tests {
                 self.outgoing.clone(),
                 self.thread_state.clone(),
                 self.thread_watch_manager.clone(),
-                Arc::new(ThreadLifecycleCoordinator::default()),
+                Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
                 "test-provider".to_string(),
             )
             .await;
@@ -3255,7 +3266,7 @@ mod tests {
             outgoing,
             thread_state,
             thread_watch_manager,
-            Arc::new(ThreadLifecycleCoordinator::default()),
+            Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
             "test-provider".to_string(),
         )
         .await;
@@ -3329,7 +3340,7 @@ mod tests {
             outgoing,
             new_thread_state(),
             thread_watch_manager.clone(),
-            Arc::new(ThreadLifecycleCoordinator::default()),
+            Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
             "test-provider".to_string(),
         )
         .await;
@@ -3418,7 +3429,7 @@ mod tests {
             outgoing,
             new_thread_state(),
             ThreadWatchManager::new(),
-            Arc::new(ThreadLifecycleCoordinator::default()),
+            Arc::new(tokio::sync::Semaphore::new(/*permits*/ 1)),
             "test-provider".to_string(),
         )
         .await;

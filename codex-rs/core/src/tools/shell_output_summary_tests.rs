@@ -33,8 +33,6 @@ fn large_success_output_keeps_head_tail_and_warning_lines() {
     assert!(summary.contains("line 0"));
     assert!(summary.contains("useful warning"));
     assert!(summary.contains("line 699"));
-    assert!(summary.contains("- omitted_lines:"));
-    assert!(summary.contains("- omitted_bytes:"));
     assert!(summary.len() <= SUMMARY_MAX_BYTES + "[summary capped]".len() + 1);
     assert!(summary.lines().count() <= SUMMARY_MAX_LINES + 1);
 }
@@ -121,50 +119,11 @@ fn disabled_summarizer_returns_unchanged_signal() {
 fn oversized_single_line_retains_bounded_head_and_tail() {
     let output = format!("HEAD{}TAIL", "x".repeat(DEFAULT_SUMMARY_AFTER_BYTES + 1024));
 
-    let reduction = reduce_shell_output_for_model(&output, 0, false, options(None, false)).unwrap();
-    let summary = reduction.summary;
+    let summary =
+        summarize_shell_output_for_model(&output, 0, false, options(None, false)).unwrap();
 
     assert!(summary.contains("HEAD"));
     assert!(summary.contains("TAIL"));
     assert!(summary.contains("[line truncated]"));
-    assert!(reduction.omitted_bytes > 0);
-    assert_eq!(reduction.omitted_lines, 0);
     assert!(summary.len() <= SUMMARY_MAX_BYTES + "\n[summary capped]".len());
-}
-
-#[test]
-fn reducer_cap_counts_only_source_lines_the_builder_accepts() {
-    let mut lines = (0..1_000)
-        .map(|index| format!("ordinary line {index:04}"))
-        .collect::<Vec<_>>();
-    for index in (10..730).step_by(15).take(MAX_FOCUS_MATCHES) {
-        lines[index] = format!("error: focused failure {index:04}");
-    }
-    let output = lines.join("\n");
-
-    let reduction = reduce_shell_output_for_model(&output, 1, false, options(None, false)).unwrap();
-    assert!(reduction.summary.contains("[summary capped]"));
-    let retained_indexes = reduction
-        .summary
-        .lines()
-        .filter_map(|line| line.get(..5)?.trim().parse::<usize>().ok())
-        .map(|number| number - 1)
-        .collect::<Vec<_>>();
-    let source_lines = output.split_inclusive('\n').collect::<Vec<_>>();
-    let retained_bytes = retained_indexes
-        .iter()
-        .map(|index| source_lines[*index].len())
-        .sum::<usize>();
-
-    assert_eq!(
-        reduction.omitted_lines,
-        output
-            .lines()
-            .count()
-            .saturating_sub(retained_indexes.len())
-    );
-    assert_eq!(
-        reduction.omitted_bytes,
-        output.len().saturating_sub(retained_bytes)
-    );
 }

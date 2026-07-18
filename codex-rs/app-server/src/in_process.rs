@@ -25,10 +25,11 @@
 //!
 //! # Backpressure
 //!
-//! Request admission remains bounded, while control notifications and server
-//! request replies wait for queue acceptance. Reliable lifecycle/transcript
-//! events are delivered losslessly; only centrally classified best-effort
-//! progress may be dropped under saturation.
+//! Command submission uses `try_send` and can return `WouldBlock`, while event
+//! fanout may drop notifications under saturation. Server requests are never
+//! silently abandoned: if they cannot be queued they are failed back into
+//! `MessageProcessor` with overload or internal errors so approval flows do
+//! not hang indefinitely.
 //!
 //! # Relationship to `codex-app-server-client`
 //!
@@ -44,7 +45,6 @@ use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -75,7 +75,6 @@ use codex_app_server_protocol::JSONRPCErrorError;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result;
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::ServerNotificationDeliveryClass;
 use codex_app_server_protocol::ServerRequest;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
@@ -93,7 +92,6 @@ pub use codex_state::log_db::LogDbLayer;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use tokio_util::sync::CancellationToken;
 use toml::Value as TomlValue;
 use tracing::warn;
 
@@ -103,6 +101,15 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_IN_PROCESS_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
 
 type PendingClientRequestResponse = std::result::Result<Result, JSONRPCErrorError>;
+
+fn server_notification_requires_delivery(notification: &ServerNotification) -> bool {
+    matches!(
+        notification,
+        ServerNotification::TurnCompleted(_)
+            | ServerNotification::ThreadSettingsUpdated(_)
+            | ServerNotification::ExternalAgentConfigImportCompleted(_)
+    )
+}
 
 /// Input needed to start an in-process app-server runtime.
 ///
@@ -209,41 +216,25 @@ impl InProcessClientSender {
         })
     }
 
-    pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
-        self.send_control_message(InProcessClientMessage::Notification { notification })
-            .await
+    pub fn notify(&self, notification: ClientNotification) -> IoResult<()> {
+        self.try_send_client_message(InProcessClientMessage::Notification { notification })
     }
 
-    pub async fn respond_to_server_request(
-        &self,
-        request_id: RequestId,
-        result: Result,
-    ) -> IoResult<()> {
-        self.send_control_message(InProcessClientMessage::ServerRequestResponse {
+    pub fn respond_to_server_request(&self, request_id: RequestId, result: Result) -> IoResult<()> {
+        self.try_send_client_message(InProcessClientMessage::ServerRequestResponse {
             request_id,
             result,
         })
-        .await
     }
 
-    pub async fn fail_server_request(
+    pub fn fail_server_request(
         &self,
         request_id: RequestId,
         error: JSONRPCErrorError,
     ) -> IoResult<()> {
-        self.send_control_message(InProcessClientMessage::ServerRequestError {
+        self.try_send_client_message(InProcessClientMessage::ServerRequestError {
             request_id,
             error,
-        })
-        .await
-    }
-
-    async fn send_control_message(&self, message: InProcessClientMessage) -> IoResult<()> {
-        self.client_tx.send(message).await.map_err(|_| {
-            IoError::new(
-                ErrorKind::BrokenPipe,
-                "in-process app-server runtime is closed",
-            )
         })
     }
 
@@ -290,10 +281,9 @@ impl InProcessClientHandle {
     /// Sends a typed client notification into the in-process runtime.
     ///
     /// Notifications do not have an application-level response. Transport
-    /// errors indicate a closed runtime. Control notifications wait for bounded
-    /// queue acceptance so interrupts cannot be lost under saturation.
-    pub async fn notify(&self, notification: ClientNotification) -> IoResult<()> {
-        self.client.notify(notification).await
+    /// errors indicate queue saturation or closed runtime.
+    pub fn notify(&self, notification: ClientNotification) -> IoResult<()> {
+        self.client.notify(notification)
     }
 
     /// Resolves a pending [`ServerRequest`](InProcessServerEvent::ServerRequest).
@@ -301,26 +291,20 @@ impl InProcessClientHandle {
     /// This should be used only with request IDs received from the current
     /// runtime event stream; sending arbitrary IDs has no effect on app-server
     /// state and can mask a stuck approval flow in the caller.
-    pub async fn respond_to_server_request(
-        &self,
-        request_id: RequestId,
-        result: Result,
-    ) -> IoResult<()> {
-        self.client
-            .respond_to_server_request(request_id, result)
-            .await
+    pub fn respond_to_server_request(&self, request_id: RequestId, result: Result) -> IoResult<()> {
+        self.client.respond_to_server_request(request_id, result)
     }
 
     /// Rejects a pending [`ServerRequest`](InProcessServerEvent::ServerRequest).
     ///
     /// Use this when the embedder cannot satisfy a server request; leaving
     /// requests unanswered can stall turn progress.
-    pub async fn fail_server_request(
+    pub fn fail_server_request(
         &self,
         request_id: RequestId,
         error: JSONRPCErrorError,
     ) -> IoResult<()> {
-        self.client.fail_server_request(request_id, error).await
+        self.client.fail_server_request(request_id, error)
     }
 
     /// Receives the next server event from the in-process runtime.
@@ -392,7 +376,7 @@ pub async fn start(mut args: InProcessStartArgs) -> IoResult<InProcessClientHand
             format!("in-process initialize failed: {}", error.message),
         ));
     }
-    client.notify(ClientNotification::Initialized).await?;
+    client.notify(ClientNotification::Initialized)?;
 
     Ok(client)
 }
@@ -546,85 +530,8 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
             processor.drain_background_tasks().await;
             processor.shutdown_threads().await;
         });
-        let pending_request_responses = Arc::new(Mutex::new(HashMap::<
-            RequestId,
-            oneshot::Sender<PendingClientRequestResponse>,
-        >::new()));
-        let writer_closed = CancellationToken::new();
-        let writer_pending_request_responses = Arc::clone(&pending_request_responses);
-        let writer_closed_task = writer_closed.clone();
-        let mut writer_handle = tokio::spawn(async move {
-            while let Some(queued_message) = writer_rx.recv().await {
-                let outgoing_message = queued_message.message;
-                match outgoing_message {
-                    OutgoingMessage::Response(response) => {
-                        let response_tx = writer_pending_request_responses
-                            .lock()
-                            .unwrap_or_else(|err| err.into_inner())
-                            .remove(&response.id);
-                        if let Some(response_tx) = response_tx {
-                            let _ = response_tx.send(Ok(response.result));
-                        } else {
-                            warn!(
-                                request_id = ?response.id,
-                                "dropping unmatched in-process response"
-                            );
-                        }
-                    }
-                    OutgoingMessage::Error(error) => {
-                        let response_tx = writer_pending_request_responses
-                            .lock()
-                            .unwrap_or_else(|err| err.into_inner())
-                            .remove(&error.id);
-                        if let Some(response_tx) = response_tx {
-                            let _ = response_tx.send(Err(error.error));
-                        } else {
-                            warn!(
-                                request_id = ?error.id,
-                                "dropping unmatched in-process error response"
-                            );
-                        }
-                    }
-                    OutgoingMessage::Request(request) => {
-                        if event_tx
-                            .send(InProcessServerEvent::ServerRequest(request))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    OutgoingMessage::AppServerNotification(notification) => {
-                        if notification.delivery_class()
-                            != ServerNotificationDeliveryClass::BestEffort
-                        {
-                            if event_tx
-                                .send(InProcessServerEvent::ServerNotification(notification))
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        } else if let Err(send_error) = event_tx
-                            .try_send(InProcessServerEvent::ServerNotification(notification))
-                        {
-                            match send_error {
-                                mpsc::error::TrySendError::Full(_) => {
-                                    warn!(
-                                        "dropping best-effort in-process server notification (queue full)"
-                                    );
-                                }
-                                mpsc::error::TrySendError::Closed(_) => break,
-                            }
-                        }
-                    }
-                }
-                if let Some(write_complete_tx) = queued_message.write_complete_tx {
-                    let _ = write_complete_tx.send(());
-                }
-            }
-            writer_closed_task.cancel();
-        });
+        let mut pending_request_responses =
+            HashMap::<RequestId, oneshot::Sender<PendingClientRequestResponse>>::new();
         let mut shutdown_ack = None;
 
         loop {
@@ -634,30 +541,23 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                         Some(InProcessClientMessage::Request { request, response_tx }) => {
                             let request = *request;
                             let request_id = request.id().clone();
-                            {
-                                let mut pending_request_responses = pending_request_responses
-                                    .lock()
-                                    .unwrap_or_else(|err| err.into_inner());
-                                match pending_request_responses.entry(request_id.clone()) {
-                                    Entry::Vacant(entry) => {
-                                        entry.insert(response_tx);
-                                    }
-                                    Entry::Occupied(_) => {
-                                        let _ = response_tx.send(Err(invalid_request(format!(
-                                            "duplicate request id: {request_id:?}"
-                                        ))));
-                                        continue;
-                                    }
+                            match pending_request_responses.entry(request_id.clone()) {
+                                Entry::Vacant(entry) => {
+                                    entry.insert(response_tx);
+                                }
+                                Entry::Occupied(_) => {
+                                    let _ = response_tx.send(Err(invalid_request(format!(
+                                        "duplicate request id: {request_id:?}"
+                                    ))));
+                                    continue;
                                 }
                             }
 
                             match processor_tx.try_send(ProcessorCommand::Request(Box::new(request))) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
-                                    if let Some(response_tx) = pending_request_responses
-                                        .lock()
-                                        .unwrap_or_else(|err| err.into_inner())
-                                        .remove(&request_id)
+                                    if let Some(response_tx) =
+                                        pending_request_responses.remove(&request_id)
                                     {
                                         let _ = response_tx.send(Err(JSONRPCErrorError {
                                             code: OVERLOADED_ERROR_CODE,
@@ -668,10 +568,8 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                                     }
                                 }
                                 Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    if let Some(response_tx) = pending_request_responses
-                                        .lock()
-                                        .unwrap_or_else(|err| err.into_inner())
-                                        .remove(&request_id)
+                                    if let Some(response_tx) =
+                                        pending_request_responses.remove(&request_id)
                                     {
                                         let _ = response_tx.send(Err(internal_error(
                                             "in-process app-server request processor is closed",
@@ -682,12 +580,14 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                             }
                         }
                         Some(InProcessClientMessage::Notification { notification }) => {
-                            if processor_tx
-                                .send(ProcessorCommand::Notification(notification))
-                                .await
-                                .is_err()
-                            {
-                                break;
+                            match processor_tx.try_send(ProcessorCommand::Notification(notification)) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    warn!("dropping in-process client notification (queue full)");
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    break;
+                                }
                             }
                         }
                         Some(InProcessClientMessage::ServerRequestResponse { request_id, result }) => {
@@ -709,10 +609,95 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
                         }
                     }
                 }
-                _ = writer_closed.cancelled() => break,
+                queued_message = writer_rx.recv() => {
+                    let Some(queued_message) = queued_message else {
+                        break;
+                    };
+                    let outgoing_message = queued_message.message;
+                    match outgoing_message {
+                        OutgoingMessage::Response(response) => {
+                            if let Some(response_tx) = pending_request_responses.remove(&response.id) {
+                                let _ = response_tx.send(Ok(response.result));
+                            } else {
+                                warn!(
+                                    request_id = ?response.id,
+                                    "dropping unmatched in-process response"
+                                );
+                            }
+                        }
+                        OutgoingMessage::Error(error) => {
+                            if let Some(response_tx) = pending_request_responses.remove(&error.id) {
+                                let _ = response_tx.send(Err(error.error));
+                            } else {
+                                warn!(
+                                    request_id = ?error.id,
+                                    "dropping unmatched in-process error response"
+                                );
+                            }
+                        }
+                        OutgoingMessage::Request(request) => {
+                            // Send directly to avoid cloning; on failure the
+                            // original value is returned inside the error.
+                            if let Err(send_error) = event_tx
+                                .try_send(InProcessServerEvent::ServerRequest(request))
+                            {
+                                let (error, inner) = match send_error {
+                                    mpsc::error::TrySendError::Full(inner) => (
+                                        JSONRPCErrorError {
+                                            code: OVERLOADED_ERROR_CODE,
+                                            message:
+                                                "in-process server request queue is full".to_string(),
+                                            data: None,
+                                        },
+                                        inner,
+                                    ),
+                                    mpsc::error::TrySendError::Closed(inner) => (
+                                        internal_error(
+                                            "in-process server request consumer is closed",
+                                        ),
+                                        inner,
+                                    ),
+                                };
+                                let request_id = match inner {
+                                    InProcessServerEvent::ServerRequest(req) => req.id().clone(),
+                                    _ => unreachable!("we just sent a ServerRequest variant"),
+                                };
+                                outgoing_message_sender
+                                    .notify_client_error(request_id, error)
+                                    .await;
+                            }
+                        }
+                        OutgoingMessage::AppServerNotification(notification) => {
+                            if server_notification_requires_delivery(&notification) {
+                                if event_tx
+                                    .send(InProcessServerEvent::ServerNotification(notification))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            } else if let Err(send_error) =
+                                event_tx.try_send(InProcessServerEvent::ServerNotification(notification))
+                            {
+                                match send_error {
+                                    mpsc::error::TrySendError::Full(_) => {
+                                        warn!("dropping in-process server notification (queue full)");
+                                    }
+                                    mpsc::error::TrySendError::Closed(_) => {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(write_complete_tx) = queued_message.write_complete_tx {
+                        let _ = write_complete_tx.send(());
+                    }
+                }
             }
         }
 
+        drop(writer_rx);
         drop(processor_tx);
         outgoing_message_sender
             .cancel_all_requests(Some(internal_error(
@@ -722,13 +707,6 @@ async fn start_uninitialized(args: InProcessStartArgs) -> IoResult<InProcessClie
         // Drop the runtime's last sender before awaiting the router task so
         // `outgoing_rx.recv()` can observe channel closure and exit cleanly.
         drop(outgoing_message_sender);
-        writer_handle.abort();
-        let _ = writer_handle.await;
-        let pending_request_responses = std::mem::take(
-            &mut *pending_request_responses
-                .lock()
-                .unwrap_or_else(|err| err.into_inner()),
-        );
         for (_, response_tx) in pending_request_responses {
             let _ = response_tx.send(Err(internal_error(
                 "in-process app-server runtime is shutting down",
@@ -912,9 +890,9 @@ mod tests {
     }
 
     #[test]
-    fn centralized_delivery_class_covers_terminal_server_notifications() {
-        assert_eq!(
-            ServerNotification::TurnCompleted(TurnCompletedNotification {
+    fn guaranteed_delivery_helpers_cover_terminal_server_notifications() {
+        assert!(server_notification_requires_delivery(
+            &ServerNotification::TurnCompleted(TurnCompletedNotification {
                 thread_id: "thread-1".to_string(),
                 completion: None,
                 timing: None,
@@ -929,18 +907,14 @@ mod tests {
                     duration_ms: None,
                 },
             })
-            .delivery_class(),
-            ServerNotificationDeliveryClass::Reliable
-        );
-        assert_eq!(
-            ServerNotification::ExternalAgentConfigImportCompleted(
+        ));
+        assert!(server_notification_requires_delivery(
+            &ServerNotification::ExternalAgentConfigImportCompleted(
                 ExternalAgentConfigImportCompletedNotification {
                     import_id: "import".to_string(),
                     item_type_results: Vec::new(),
                 },
             )
-            .delivery_class(),
-            ServerNotificationDeliveryClass::Reliable
-        );
+        ));
     }
 }

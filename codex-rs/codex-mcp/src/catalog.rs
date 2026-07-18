@@ -364,12 +364,6 @@ impl ResolvedMcpCatalog {
         self.servers.get(name)
     }
 
-    pub fn servers(&self) -> impl Iterator<Item = (&str, &ResolvedMcpServer)> {
-        self.servers
-            .iter()
-            .map(|(name, server)| (name.as_str(), server))
-    }
-
     pub fn configured_servers(&self) -> HashMap<String, McpServerConfig> {
         self.servers
             .iter()

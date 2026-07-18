@@ -24,144 +24,6 @@ use crate::replay_bundle;
 use crate::writer::TraceWriter;
 
 #[test]
-fn malformed_write_stdin_response_preserves_legacy_diagnostic() {
-    let error = super::parse_terminal_response_payload_legacy_compatible(
-        json!({}),
-        &TerminalOperationKind::WriteStdin,
-        "raw_payload:test",
-    )
-    .err()
-    .expect("malformed response must fail");
-
-    assert_eq!(
-        error.to_string(),
-        "parse write_stdin terminal response raw_payload:test as protocol payload \
-         (missing field `stdout`) or dispatch payload"
-    );
-    assert_eq!(
-        format!("{error:#}"),
-        "parse write_stdin terminal response raw_payload:test as protocol payload \
-         (missing field `stdout`) or dispatch payload: missing field `type`"
-    );
-}
-
-#[test]
-fn missing_write_stdin_arguments_preserve_legacy_context() {
-    let payload: super::DispatchedToolTraceRequestPayload = serde_json::from_value(json!({
-        "tool_name": "write_stdin",
-        "payload": { "type": "function" }
-    }))
-    .expect("typed dispatch envelope");
-    let error = super::parse_dispatch_terminal_request(payload)
-        .err()
-        .expect("missing arguments must fail");
-
-    assert_eq!(
-        error.to_string(),
-        "write_stdin dispatch payload omitted function arguments"
-    );
-}
-
-#[test]
-fn malformed_terminal_runtime_start_preserves_legacy_diagnostic() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let writer = create_started_writer(&temp)?;
-    start_turn(&writer, "turn-1")?;
-    append_write_stdin_tool_started(&writer)?;
-
-    let value = json!({});
-    let legacy_error = serde_json::from_value::<super::ExecCommandBeginPayload>(value.clone())
-        .err()
-        .expect("legacy projection must reject the same runtime start");
-    let runtime_payload = writer.write_json_payload(RawPayloadKind::ToolRuntimeEvent, &value)?;
-    let raw_payload_id = runtime_payload.raw_payload_id.clone();
-    writer.append_with_context(
-        trace_context("turn-1"),
-        RawTraceEventPayload::ToolCallRuntimeStarted {
-            tool_call_id: "tool-stdin".to_string(),
-            runtime_payload,
-        },
-    )?;
-
-    let error = replay_bundle(temp.path()).expect_err("malformed runtime start must fail replay");
-    assert_eq!(
-        error.to_string(),
-        format!("parse terminal runtime start payload {raw_payload_id}")
-    );
-    assert_eq!(
-        format!("{error:#}"),
-        format!("parse terminal runtime start payload {raw_payload_id}: {legacy_error}")
-    );
-    Ok(())
-}
-
-#[test]
-fn malformed_write_stdin_response_preserves_legacy_diagnostic_in_replay() -> anyhow::Result<()> {
-    let temp = TempDir::new()?;
-    let writer = create_started_writer(&temp)?;
-    start_turn(&writer, "turn-1")?;
-    append_write_stdin_tool_started(&writer)?;
-
-    let runtime_start = writer.write_json_payload(
-        RawPayloadKind::ToolRuntimeEvent,
-        &json!({
-            "call_id": "tool-stdin",
-            "process_id": "pty-1",
-            "turn_id": "turn-1",
-            "command": ["bash"],
-            "cwd": "/repo",
-            "interaction_input": "echo hi\n"
-        }),
-    )?;
-    writer.append_with_context(
-        trace_context("turn-1"),
-        RawTraceEventPayload::ToolCallRuntimeStarted {
-            tool_call_id: "tool-stdin".to_string(),
-            runtime_payload: runtime_start,
-        },
-    )?;
-
-    let value = json!({});
-    let runtime_end = writer.write_json_payload(RawPayloadKind::ToolRuntimeEvent, &value)?;
-    let expected = super::parse_terminal_response_payload_legacy_compatible(
-        value,
-        &TerminalOperationKind::WriteStdin,
-        &runtime_end.raw_payload_id,
-    )
-    .err()
-    .expect("legacy response projection must reject the same payload");
-    writer.append_with_context(
-        trace_context("turn-1"),
-        RawTraceEventPayload::ToolCallRuntimeEnded {
-            tool_call_id: "tool-stdin".to_string(),
-            status: ExecutionStatus::Completed,
-            runtime_payload: runtime_end,
-        },
-    )?;
-
-    let error = replay_bundle(temp.path()).expect_err("malformed runtime end must fail replay");
-    assert_eq!(error.to_string(), expected.to_string());
-    assert_eq!(format!("{error:#}"), format!("{expected:#}"));
-    Ok(())
-}
-
-fn append_write_stdin_tool_started(writer: &TraceWriter) -> anyhow::Result<()> {
-    writer.append_with_context(
-        trace_context("turn-1"),
-        RawTraceEventPayload::ToolCallStarted {
-            tool_call_id: "tool-stdin".to_string(),
-            model_visible_call_id: None,
-            code_mode_runtime_tool_id: None,
-            requester: crate::raw_event::RawToolCallRequester::Model,
-            kind: ToolCallKind::WriteStdin,
-            summary: generic_summary("write_stdin"),
-            invocation_payload: None,
-        },
-    )?;
-    Ok(())
-}
-
-#[test]
 fn exec_tool_reduces_to_terminal_operation_and_session() -> anyhow::Result<()> {
     let temp = TempDir::new()?;
     let writer = create_started_writer(&temp)?;
@@ -418,27 +280,6 @@ fn write_stdin_operation_reuses_existing_terminal_session() -> anyhow::Result<()
             runtime_payload: stdin_payload,
         },
     )?;
-    let stdin_end_payload = writer.write_json_payload(
-        RawPayloadKind::ToolRuntimeEvent,
-        &json!({
-            "call_id": "tool-stdin",
-            "process_id": "pty-1",
-            "turn_id": "turn-1",
-            "stdout": "hi\n",
-            "stderr": "",
-            "exit_code": 0,
-            "formatted_output": "hi\n",
-            "status": "completed"
-        }),
-    )?;
-    let stdin_runtime_end = writer.append_with_context(
-        trace_context("turn-1"),
-        RawTraceEventPayload::ToolCallRuntimeEnded {
-            tool_call_id: "tool-stdin".to_string(),
-            status: ExecutionStatus::Completed,
-            runtime_payload: stdin_end_payload,
-        },
-    )?;
 
     let rollout = replay_bundle(temp.path())?;
     let startup_operation_id = "terminal_operation:1".to_string();
@@ -458,25 +299,18 @@ fn write_stdin_operation_reuses_existing_terminal_session() -> anyhow::Result<()
             execution: ExecutionWindow {
                 started_at_unix_ms: stdin_runtime_start.wall_time_unix_ms,
                 started_seq: stdin_runtime_start.seq,
-                ended_at_unix_ms: Some(stdin_runtime_end.wall_time_unix_ms),
-                ended_seq: Some(stdin_runtime_end.seq),
-                status: ExecutionStatus::Completed,
+                ended_at_unix_ms: None,
+                ended_seq: None,
+                status: ExecutionStatus::Running,
             },
             request: TerminalRequest::WriteStdin {
                 stdin: "echo hi\n".to_string(),
                 yield_time_ms: None,
                 max_output_tokens: None,
             },
-            result: Some(TerminalResult {
-                exit_code: Some(0),
-                stdout: "hi\n".to_string(),
-                stderr: String::new(),
-                formatted_output: Some("hi\n".to_string()),
-                original_token_count: None,
-                chunk_id: None,
-            }),
+            result: None,
             model_observations: Vec::new(),
-            raw_payload_ids: vec!["raw_payload:2".to_string(), "raw_payload:3".to_string()],
+            raw_payload_ids: vec!["raw_payload:2".to_string()],
         },
     );
 

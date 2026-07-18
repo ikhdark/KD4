@@ -17,7 +17,6 @@ use crate::sandboxing::execute_env;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::flat_tool_name;
-use crate::tools::hook_names::HookToolName;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
 use crate::tools::runtimes::RuntimePathPrepends;
@@ -197,10 +196,6 @@ impl Approvable<ShellRequest> for ShellRuntime {
 
     fn exec_approval_requirement(&self, req: &ShellRequest) -> Option<ExecApprovalRequirement> {
         Some(req.exec_approval_requirement.clone())
-    }
-
-    fn permission_request_hook_name(&self, _req: &ShellRequest) -> Option<HookToolName> {
-        Some(HookToolName::bash())
     }
 
     fn permission_request_payload(&self, req: &ShellRequest) -> Option<PermissionRequestPayload> {

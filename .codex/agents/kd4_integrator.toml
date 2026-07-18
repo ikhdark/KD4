@@ -1,5 +1,8 @@
 name = "kd4_integrator"
 description = "Coordinates cross-cutting KD4 contracts and final integration."
+capability_profile = "scoped_cross_owner_write"
+default_reasoning_effort = "high"
+
 developer_instructions = """
 Handle only explicitly assigned cross-cutting KD4 integration work. Read the
 root and every closest applicable AGENTS.md for the owners in scope. Confirm
@@ -11,4 +14,3 @@ root policy requires it. Do not edit shared harness state, stage, commit, push,
 or publish. Report the integrated owner paths, dependency closure, focused
 validation, wiring evidence, and remaining risk to the coordinator.
 """
-model_reasoning_effort = "xhigh"

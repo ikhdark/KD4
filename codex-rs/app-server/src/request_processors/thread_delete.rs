@@ -9,18 +9,12 @@ impl ThreadRequestProcessor {
         request_id: ConnectionRequestId,
         params: ThreadDeleteParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
-        let thread_id = ThreadId::from_string(&params.thread_id)
-            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
-        let thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
-        let _lifecycle_guards = self
-            .thread_lifecycle
-            .lock_threads(thread_ids.iter().copied())
-            .await;
         let mut deleted_thread_ids = Vec::new();
-        let result = self
-            .thread_delete_response(thread_id, thread_ids, &mut deleted_thread_ids)
-            .await;
-        drop(_lifecycle_guards);
+        let result = {
+            let _thread_list_state_permit = self.acquire_thread_list_state_permit().await?;
+            self.thread_delete_response(params, &mut deleted_thread_ids)
+                .await
+        };
         match result {
             Ok(response) => {
                 self.outgoing
@@ -36,10 +30,14 @@ impl ThreadRequestProcessor {
 
     async fn thread_delete_response(
         &self,
-        thread_id: ThreadId,
-        thread_ids: Vec<ThreadId>,
+        params: ThreadDeleteParams,
         deleted_thread_ids: &mut Vec<String>,
     ) -> Result<ThreadDeleteResponse, JSONRPCErrorError> {
+        let thread_id = ThreadId::from_string(&params.thread_id)
+            .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
+
+        let thread_ids = self.state_db_spawn_subtree_thread_ids(thread_id).await?;
+
         self.validate_root_thread_delete(thread_id, thread_ids.len() > 1)
             .await?;
         for thread_id_to_delete in thread_ids.iter().copied() {

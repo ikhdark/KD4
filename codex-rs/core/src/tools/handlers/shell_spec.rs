@@ -89,7 +89,7 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         (
             "max_output_tokens".to_string(),
             JsonSchema::number(Some(
-                "Output token budget. Defaults adaptively to 8000 tokens for success and 10000 for failures, timeouts, and high-signal diagnostics; larger requests may be capped by policy.".to_string(),
+                "Output token budget. Defaults adaptively to 4000 tokens for success, 8000 for failure/timeout, and up to 10000 for high-signal diagnostics; larger requests may be capped by policy.".to_string(),
             )),
         ),
     ]);
@@ -164,7 +164,7 @@ pub fn create_write_stdin_tool() -> ToolSpec {
         (
             "max_output_tokens".to_string(),
             JsonSchema::number(Some(
-                "Output token budget. Defaults adaptively to 8000 tokens for success and 10000 for failures, timeouts, and high-signal diagnostics; larger requests may be capped by policy.".to_string(),
+                "Output token budget. Defaults adaptively to 4000 tokens for success, 8000 for failure/timeout, and up to 10000 for high-signal diagnostics; larger requests may be capped by policy.".to_string(),
             )),
         ),
     ]);
@@ -238,7 +238,7 @@ pub fn create_shell_command_tool(options: CommandToolOptions) -> ToolSpec {
         (
             "timeout_ms".to_string(),
             JsonSchema::number(Some(
-                "Maximum command runtime. Defaults to 1200000 ms (20 minutes).".to_string(),
+                "Maximum command runtime. Defaults to 10000 ms.".to_string(),
             )),
         ),
     ]);
@@ -328,21 +328,13 @@ fn unified_exec_output_schema() -> Value {
     json!({
         "type": "object",
         "properties": {
-            "outcome": {
+            "chunk_id": {
                 "type": "string",
-                "enum": [
-                    "completed_success",
-                    "completed_failure",
-                    "running",
-                    "timed_out",
-                    "cancelled",
-                    "launch_failed"
-                ],
-                "description": "Stable semantic process outcome for this call."
+                "description": "Chunk identifier included when the response reports one."
             },
-            "timed_out": {
-                "type": "boolean",
-                "description": "True only when execution actually reached its timeout."
+            "wall_time_seconds": {
+                "type": "number",
+                "description": "Elapsed wall time spent waiting for output in seconds."
             },
             "exit_code": {
                 "type": "number",
@@ -377,7 +369,7 @@ fn unified_exec_output_schema() -> Value {
                 "description": "Command output text, possibly truncated."
             }
         },
-        "required": ["outcome", "timed_out", "output"],
+        "required": ["wall_time_seconds", "output"],
         "additionalProperties": false
     })
 }

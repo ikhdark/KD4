@@ -1,6 +1,6 @@
 # Repository policy
 
-Shared policy revision: `2026-07-16`.
+Shared policy revision: `2026-07-13`.
 
 ## Synchronization contract
 
@@ -42,12 +42,10 @@ exceptions outside that block.
 - Known top-level instruction scopes include `.codex/AGENTS.md`,
   `codex-rs/AGENTS.md`, and `scripts/AGENTS.md`; further nested files apply
   only where present.
-- `.codex/AGENTS.md` owns workspace source/state policy, and
-  `.codex/README.md` owns workspace routing. `.codex/config.toml` owns optional
-  repo-local runtime configuration, `.codex/environments` owns worktree
-  setup/state, and `.codex/skills` owns fork-local skills. The
-  `.codex/skills/kd4-harness` skill owns the optional durable task-context
-  contract; `.codex/harness/runs` contains ignored local task state only.
+- `.codex/AGENTS.md` and `.codex/README.md` own workspace policy and routing.
+  `.codex/config.toml` owns optional repo-local runtime configuration,
+  `.codex/environments` owns worktree setup/state, and `.codex/skills` owns
+  fork-local skills and validation workflows.
 - [`SOURCEMAP.md`](SOURCEMAP.md) owns the high-level directory map, runtime
   entrypoints, Rust-domain routing, build/package/publish paths, generated
   contracts, and cross-cutting change routes.
@@ -250,12 +248,9 @@ risk section when there is no unresolved risk.
 
 ## Tool use
 
-- Use `search_source` and `read_file_span` when available for bounded,
-  citation-friendly repository source lookup and targeted span reads. Use `rg`
-  or `rg --files` for regular-expression searches, exhaustive or closure
-  searches, file discovery, and advanced filtering. Use `fd`, `ast-grep`,
-  `jq`, `yq`, or another purpose-built tool only when it materially simplifies
-  the task.
+- Use `rg` or `rg --files` for normal text and file discovery. Use `fd`,
+  `ast-grep`, `jq`, `yq`, or another purpose-built tool only when it materially
+  simplifies the task.
 - Prefer repository-owned recipes such as `just`, configured formatters,
   generators, and focused test commands over improvised equivalents.
 - Use `apply_patch` for manual edits. Use an owning formatter or generator for

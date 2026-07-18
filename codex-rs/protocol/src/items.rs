@@ -330,18 +330,9 @@ pub struct ImageGenerationItem {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
-pub struct OrderedFileChange {
-    pub path: PathBuf,
-    pub change: FileChange,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, TS, JsonSchema, PartialEq)]
 pub struct FileChangeItem {
     pub id: String,
     pub changes: HashMap<PathBuf, FileChange>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub ordered_changes: Option<Vec<OrderedFileChange>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub status: Option<PatchApplyStatus>,
@@ -690,46 +681,6 @@ mod tests {
                 text: "Retry with tests.".to_string(),
                 hook_run_id: "hook-run-1".to_string(),
             }
-        );
-    }
-
-    #[test]
-    fn file_change_item_preserves_legacy_payloads_and_repeated_ordered_paths() {
-        let legacy: FileChangeItem = serde_json::from_value(serde_json::json!({
-            "id": "patch-1",
-            "changes": {
-                "same.txt": { "type": "add", "content": "two" }
-            }
-        }))
-        .expect("legacy file-change item");
-        assert!(legacy.ordered_changes.is_none());
-
-        let mut item = legacy;
-        item.ordered_changes = Some(vec![
-            OrderedFileChange {
-                path: PathBuf::from("same.txt"),
-                change: FileChange::Add {
-                    content: "one".to_string(),
-                },
-            },
-            OrderedFileChange {
-                path: PathBuf::from("same.txt"),
-                change: FileChange::Add {
-                    content: "two".to_string(),
-                },
-            },
-        ]);
-        let value = serde_json::to_value(item).expect("ordered file-change item");
-        assert_eq!(
-            value["ordered_changes"]
-                .as_array()
-                .expect("ordered changes")
-                .len(),
-            2
-        );
-        assert_eq!(
-            value["ordered_changes"][0]["path"],
-            value["ordered_changes"][1]["path"]
         );
     }
 }

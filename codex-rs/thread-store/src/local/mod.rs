@@ -13,7 +13,6 @@ mod update_thread_metadata;
 mod test_support;
 
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::StateDbHandle;
@@ -24,7 +23,6 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::AppendThreadItemsParams;
-use crate::AppendThreadItemsReceipt;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
@@ -256,14 +254,6 @@ impl ThreadStore for LocalThreadStore {
         Box::pin(async move { live_writer::append_items(self, params).await })
     }
 
-    fn append_persisted_items<'a>(
-        &'a self,
-        thread_id: ThreadId,
-        items: &'a [RolloutItem],
-    ) -> ThreadStoreFuture<'a, AppendThreadItemsReceipt> {
-        Box::pin(async move { live_writer::append_persisted_items(self, thread_id, items).await })
-    }
-
     fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()> {
         Box::pin(async move { live_writer::persist_thread(self, thread_id).await })
     }
@@ -409,9 +399,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_thread_indexes_sqlite_while_raw_appends_remain_history_only() {
-        // Current-thread discovery is direct and does not depend on historical backfill. Raw
-        // appends remain history-only; LiveThread still owns append-derived metadata updates.
+    async fn raw_append_items_does_not_update_sqlite_metadata() {
+        // This pins the ThreadStore contract: raw appends are history-only. Callers that need
+        // metadata updates must use LiveThread or call update_thread_metadata explicitly.
         let home = TempDir::new().expect("temp dir");
         let config = test_config(home.path());
         let runtime = codex_state::StateRuntime::init(
@@ -427,17 +417,6 @@ mod tests {
             .create_thread(create_thread_params(thread_id))
             .await
             .expect("create live thread");
-        let rollout_path = store
-            .live_rollout_path(thread_id)
-            .await
-            .expect("live rollout path");
-        let created = runtime
-            .get_thread(thread_id)
-            .await
-            .expect("sqlite metadata read")
-            .expect("current thread should be indexed directly");
-        assert_eq!(created.rollout_path, rollout_path);
-        assert_eq!(created.model_provider, "test-provider");
         store
             .append_items(AppendThreadItemsParams {
                 thread_id,
@@ -447,12 +426,13 @@ mod tests {
             .expect("append raw item");
         store.flush_thread(thread_id).await.expect("flush thread");
 
-        let after_raw_append = runtime
-            .get_thread(thread_id)
-            .await
-            .expect("sqlite metadata read")
-            .expect("current thread metadata");
-        assert_eq!(after_raw_append.preview, None);
+        assert_eq!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .expect("sqlite metadata read"),
+            None
+        );
     }
 
     #[tokio::test]
@@ -488,44 +468,6 @@ mod tests {
         );
         assert_eq!(metadata.preview.as_deref(), Some("observed append"));
         assert_eq!(metadata.title, "observed append");
-    }
-
-    #[tokio::test]
-    async fn sqlite_metadata_never_precedes_jsonl_append_receipt() {
-        let home = TempDir::new().expect("temp dir");
-        let config = test_config(home.path());
-        let runtime = codex_state::StateRuntime::init(
-            config.sqlite_home.clone(),
-            config.default_model_provider_id.clone(),
-        )
-        .await
-        .expect("state db should initialize");
-        let store = Arc::new(LocalThreadStore::new(config, Some(runtime.clone())));
-        let thread_id = ThreadId::default();
-        let live_thread = LiveThread::create(store, create_thread_params(thread_id))
-            .await
-            .expect("create live thread");
-        let rollout_path = live_thread
-            .local_rollout_path()
-            .await
-            .expect("rollout path lookup")
-            .expect("local rollout path");
-
-        live_thread
-            .append_items(&[user_message_item("receipt ordered")])
-            .await
-            .expect("append receipt and metadata update");
-
-        let jsonl = tokio::fs::read_to_string(&rollout_path)
-            .await
-            .expect("receipt must make JSONL readable without a durability barrier");
-        assert!(jsonl.contains("receipt ordered"));
-        let metadata = runtime
-            .get_thread(thread_id)
-            .await
-            .expect("sqlite metadata read")
-            .expect("sqlite metadata");
-        assert_eq!(metadata.preview.as_deref(), Some("receipt ordered"));
     }
 
     #[tokio::test]
@@ -937,19 +879,7 @@ mod tests {
             .await
             .expect("shutdown initial writer");
 
-        let runtime = codex_state::StateRuntime::init(
-            config.sqlite_home.clone(),
-            config.default_model_provider_id.clone(),
-        )
-        .await
-        .expect("state db should initialize");
-        assert_eq!(
-            codex_rollout::state_db::readiness(runtime.as_ref())
-                .await
-                .expect("state db readiness"),
-            codex_rollout::state_db::StateDbReadiness::WriteReady
-        );
-        let resumed_store = LocalThreadStore::new(config, Some(runtime.clone()));
+        let resumed_store = LocalThreadStore::new(config, /*state_db*/ None);
         resumed_store
             .resume_thread(ResumeThreadParams {
                 thread_id,
@@ -960,12 +890,6 @@ mod tests {
             })
             .await
             .expect("resume live thread");
-        let resumed_metadata = runtime
-            .get_thread(thread_id)
-            .await
-            .expect("sqlite metadata read")
-            .expect("resumed thread should be indexed directly");
-        assert_eq!(resumed_metadata.rollout_path, rollout_path);
         resumed_store
             .append_items(AppendThreadItemsParams {
                 thread_id,

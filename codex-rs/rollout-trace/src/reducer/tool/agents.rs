@@ -10,9 +10,7 @@ use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::SubAgentActivityEvent;
 use codex_protocol::protocol::SubAgentActivityKind;
 use serde::Deserialize;
-use serde::Deserializer;
-use serde::de::DeserializeOwned;
-use serde::de::IgnoredAny;
+use serde_json::Value;
 
 use super::super::TraceReducer;
 use crate::model::ConversationItem;
@@ -64,104 +62,12 @@ struct AgentMessageInvocationArgs {
     message: String,
 }
 
-#[derive(Deserialize)]
-struct AgentInvocationEnvelope {
-    payload: AgentInvocationPayload,
-}
-
-#[derive(Deserialize)]
-struct AgentInvocationPayload {
-    arguments: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum AgentRuntimeEndPayload<T> {
-    Legacy(SubAgentActivityEvent),
-    Current(CurrentAgentRuntimeEndPayload<T>),
-}
-
-#[derive(Deserialize)]
-struct CurrentAgentRuntimeEndPayload<T> {
-    #[serde(default, deserialize_with = "deserialize_field_presence")]
-    agent_thread_id: FieldPresence,
-    #[serde(flatten)]
-    payload: T,
-}
-
-#[derive(Default)]
-struct FieldPresence(bool);
-
-fn deserialize_field_presence<'de, D>(deserializer: D) -> Result<FieldPresence, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    IgnoredAny::deserialize(deserializer)?;
-    Ok(FieldPresence(true))
-}
-
-impl<T> CurrentAgentRuntimeEndPayload<T> {
-    fn into_payload(self) -> T {
-        debug_assert!(!self.agent_thread_id.0);
-        self.payload
-    }
-}
-
-fn parse_agent_runtime_end_payload_legacy_compatible<T: DeserializeOwned>(
-    value: serde_json::Value,
-) -> Result<AgentRuntimeEndPayload<T>, serde_json::Error> {
-    if value.get("agent_thread_id").is_some() {
-        serde_json::from_value(value).map(AgentRuntimeEndPayload::Legacy)
-    } else {
-        serde_json::from_value(value).map(|payload| {
-            AgentRuntimeEndPayload::Current(CurrentAgentRuntimeEndPayload {
-                agent_thread_id: FieldPresence::default(),
-                payload,
-            })
-        })
-    }
-}
-
-fn legacy_agent_invocation_arguments(
-    invocation: &serde_json::Value,
-    tool_call_id: &str,
-) -> Result<String> {
-    invocation
-        .get("payload")
-        .and_then(|payload| payload.get("arguments"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .with_context(|| {
-            format!("agent activity tool call {tool_call_id} missing function arguments")
-        })
-}
-
 /// Builds the stable edge id for the spawn relationship between two threads.
 pub(in crate::reducer) fn spawn_edge_id(parent_thread_id: &str, child_thread_id: &str) -> String {
     format!("edge:spawn:{parent_thread_id}:{child_thread_id}")
 }
 
 impl TraceReducer {
-    fn read_agent_runtime_end_payload<T: DeserializeOwned>(
-        &self,
-        runtime_payload: &RawPayloadRef,
-    ) -> Result<AgentRuntimeEndPayload<T>> {
-        match self.read_payload::<AgentRuntimeEndPayload<T>>(runtime_payload) {
-            Ok(AgentRuntimeEndPayload::Current(payload)) if payload.agent_thread_id.0 => {
-                let value = self.read_payload_json(runtime_payload)?;
-                Ok(parse_agent_runtime_end_payload_legacy_compatible(value)?)
-            }
-            Ok(payload) => Ok(payload),
-            Err(_) => {
-                // Successful current/legacy payloads stay single-decode. On malformed input,
-                // replay the legacy marker-based selector so callers retain its precise serde
-                // error instead of the generic untagged-enum diagnostic.
-                let value = self.read_payload_json(runtime_payload)?;
-                Ok(parse_agent_runtime_end_payload_legacy_compatible(value)?)
-            }
-        }
-    }
-
     /// Starts a multi-agent edge from a runtime begin payload, when the tool kind supports one.
     pub(super) fn start_agent_interaction_from_runtime(
         &mut self,
@@ -178,7 +84,7 @@ impl TraceReducer {
         match kind {
             ToolCallKind::AssignAgentTask => {
                 let payload: CollabAgentInteractionBeginEvent =
-                    self.read_payload_with_legacy_value_errors(runtime_payload)?;
+                    serde_json::from_value(self.read_payload_json(runtime_payload)?)?;
                 self.queue_message_agent_interaction(
                     tool_call_id,
                     InteractionEdgeKind::AssignAgentTask,
@@ -189,7 +95,7 @@ impl TraceReducer {
             }
             ToolCallKind::SendMessage => {
                 let payload: CollabAgentInteractionBeginEvent =
-                    self.read_payload_with_legacy_value_errors(runtime_payload)?;
+                    serde_json::from_value(self.read_payload_json(runtime_payload)?)?;
                 self.queue_message_agent_interaction(
                     tool_call_id,
                     InteractionEdgeKind::SendMessage,
@@ -200,7 +106,7 @@ impl TraceReducer {
             }
             ToolCallKind::CloseAgent => {
                 let payload: CollabCloseBeginEvent =
-                    self.read_payload_with_legacy_value_errors(runtime_payload)?;
+                    serde_json::from_value(self.read_payload_json(runtime_payload)?)?;
                 self.upsert_close_agent_interaction(
                     tool_call_id,
                     payload.receiver_thread_id.to_string(),
@@ -227,82 +133,44 @@ impl TraceReducer {
         runtime_payload: &RawPayloadRef,
     ) -> Result<()> {
         let kind = self.rollout.tool_calls[tool_call_id].kind.clone();
+        let runtime_payload_json = self.read_payload_json(runtime_payload)?;
+        if runtime_payload_json.get("agent_thread_id").is_some() {
+            let payload: SubAgentActivityEvent = serde_json::from_value(runtime_payload_json)?;
+            return self.end_sub_agent_activity(wall_time_unix_ms, tool_call_id, &kind, &payload);
+        }
         match kind {
             ToolCallKind::SpawnAgent => {
-                match self
-                    .read_agent_runtime_end_payload::<CollabAgentSpawnEndEvent>(runtime_payload)?
-                {
-                    AgentRuntimeEndPayload::Legacy(payload) => self.end_sub_agent_activity(
-                        wall_time_unix_ms,
-                        tool_call_id,
-                        &kind,
-                        &payload,
-                    ),
-                    AgentRuntimeEndPayload::Current(payload) => {
-                        let payload = payload.into_payload();
-                        self.end_spawn_agent_interaction(wall_time_unix_ms, tool_call_id, &payload)
-                    }
-                }
+                let payload: CollabAgentSpawnEndEvent =
+                    serde_json::from_value(runtime_payload_json)?;
+                self.end_spawn_agent_interaction(wall_time_unix_ms, tool_call_id, &payload)
             }
             ToolCallKind::AssignAgentTask => {
-                match self.read_agent_runtime_end_payload::<CollabAgentInteractionEndEvent>(
-                    runtime_payload,
-                )? {
-                    AgentRuntimeEndPayload::Legacy(payload) => self.end_sub_agent_activity(
-                        wall_time_unix_ms,
-                        tool_call_id,
-                        &kind,
-                        &payload,
-                    ),
-                    AgentRuntimeEndPayload::Current(payload) => {
-                        let payload = payload.into_payload();
-                        self.end_message_agent_interaction(
-                            wall_time_unix_ms,
-                            tool_call_id,
-                            InteractionEdgeKind::AssignAgentTask,
-                            &payload,
-                        )
-                    }
-                }
+                let payload: CollabAgentInteractionEndEvent =
+                    serde_json::from_value(runtime_payload_json)?;
+                self.end_message_agent_interaction(
+                    wall_time_unix_ms,
+                    tool_call_id,
+                    InteractionEdgeKind::AssignAgentTask,
+                    &payload,
+                )
             }
             ToolCallKind::SendMessage => {
-                match self.read_agent_runtime_end_payload::<CollabAgentInteractionEndEvent>(
-                    runtime_payload,
-                )? {
-                    AgentRuntimeEndPayload::Legacy(payload) => self.end_sub_agent_activity(
-                        wall_time_unix_ms,
-                        tool_call_id,
-                        &kind,
-                        &payload,
-                    ),
-                    AgentRuntimeEndPayload::Current(payload) => {
-                        let payload = payload.into_payload();
-                        self.end_message_agent_interaction(
-                            wall_time_unix_ms,
-                            tool_call_id,
-                            InteractionEdgeKind::SendMessage,
-                            &payload,
-                        )
-                    }
-                }
+                let payload: CollabAgentInteractionEndEvent =
+                    serde_json::from_value(runtime_payload_json)?;
+                self.end_message_agent_interaction(
+                    wall_time_unix_ms,
+                    tool_call_id,
+                    InteractionEdgeKind::SendMessage,
+                    &payload,
+                )
             }
             ToolCallKind::CloseAgent => {
-                match self.read_agent_runtime_end_payload::<CollabCloseEndEvent>(runtime_payload)? {
-                    AgentRuntimeEndPayload::Legacy(payload) => self.end_sub_agent_activity(
-                        wall_time_unix_ms,
-                        tool_call_id,
-                        &kind,
-                        &payload,
-                    ),
-                    AgentRuntimeEndPayload::Current(payload) => {
-                        let payload = payload.into_payload();
-                        self.upsert_close_agent_interaction(
-                            tool_call_id,
-                            payload.receiver_thread_id.to_string(),
-                            Some(wall_time_unix_ms),
-                        )
-                    }
-                }
+                let payload: CollabCloseEndEvent = serde_json::from_value(runtime_payload_json)?;
+                self.upsert_close_agent_interaction(
+                    tool_call_id,
+                    payload.receiver_thread_id.to_string(),
+                    Some(wall_time_unix_ms),
+                )
             }
             ToolCallKind::ExecCommand
             | ToolCallKind::WriteStdin
@@ -311,14 +179,7 @@ impl TraceReducer {
             | ToolCallKind::Web
             | ToolCallKind::ImageGeneration
             | ToolCallKind::WaitAgent
-            | ToolCallKind::Other { .. } => {
-                let runtime_payload_json = self.read_payload_json(runtime_payload)?;
-                if runtime_payload_json.get("agent_thread_id").is_none() {
-                    return Ok(());
-                }
-                let payload: SubAgentActivityEvent = serde_json::from_value(runtime_payload_json)?;
-                self.end_sub_agent_activity(wall_time_unix_ms, tool_call_id, &kind, &payload)
-            }
+            | ToolCallKind::Other { .. } => Ok(()),
         }
     }
 
@@ -432,18 +293,15 @@ impl TraceReducer {
                     "agent activity tool call {tool_call_id} referenced missing invocation payload {invocation_payload_id}"
                 )
             })?;
-        let arguments = match self.read_payload::<AgentInvocationEnvelope>(invocation_payload) {
-            Ok(invocation) => invocation.payload.arguments.with_context(|| {
+        let invocation = self.read_payload_json(invocation_payload)?;
+        let arguments = invocation
+            .get("payload")
+            .and_then(|payload| payload.get("arguments"))
+            .and_then(Value::as_str)
+            .with_context(|| {
                 format!("agent activity tool call {tool_call_id} missing function arguments")
-            })?,
-            Err(_) => {
-                // Preserve the legacy loose-envelope diagnostic on malformed payloads while
-                // keeping valid invocations on the typed, single-decode path.
-                let invocation = self.read_payload_json(invocation_payload)?;
-                legacy_agent_invocation_arguments(&invocation, tool_call_id)?
-            }
-        };
-        let args: AgentMessageInvocationArgs = serde_json::from_str(&arguments)
+            })?;
+        let args: AgentMessageInvocationArgs = serde_json::from_str(arguments)
             .with_context(|| format!("parse agent activity tool call {tool_call_id} arguments"))?;
         Ok(args.message)
     }

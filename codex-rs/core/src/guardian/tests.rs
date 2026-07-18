@@ -77,7 +77,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 fn fixed_guardian_parent_session_id() -> ThreadId {
@@ -1484,7 +1483,6 @@ async fn guardian_request_model_for_auto_review(
         Some("Sandbox denied outbound git push to github.com.".to_string()),
         guardian_output_schema(),
         /*external_cancel*/ None,
-        Instant::now() + GUARDIAN_REVIEW_TIMEOUT,
         /*max_attempts*/ 1,
     )
     .await;
@@ -1729,7 +1727,6 @@ async fn guardian_review_request_layout_matches_model_visible_request_snapshot()
         Some("Sandbox denied outbound git push to github.com.".to_string()),
         guardian_output_schema(),
         /*external_cancel*/ None,
-        Instant::now() + GUARDIAN_REVIEW_TIMEOUT,
         /*max_attempts*/ 1,
     )
     .await;
@@ -1932,7 +1929,6 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
         Some("First retry reason".to_string()),
         guardian_output_schema(),
         /*external_cancel*/ None,
-        Instant::now() + GUARDIAN_REVIEW_TIMEOUT,
         /*max_attempts*/ 1,
     )
     .await;
@@ -1980,7 +1976,6 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
         Some("Second retry reason".to_string()),
         guardian_output_schema(),
         /*external_cancel*/ None,
-        Instant::now() + GUARDIAN_REVIEW_TIMEOUT,
         /*max_attempts*/ 1,
     )
     .await;
@@ -2024,7 +2019,6 @@ async fn guardian_reuses_prompt_cache_key_and_appends_prior_reviews() -> anyhow:
         Some("Third retry reason".to_string()),
         guardian_output_schema(),
         /*external_cancel*/ None,
-        Instant::now() + GUARDIAN_REVIEW_TIMEOUT,
         /*max_attempts*/ 1,
     )
     .await;
@@ -2217,7 +2211,6 @@ async fn guardian_reused_trunk_ignores_stale_prior_turn_completion() -> anyhow::
         /*retry_reason*/ None,
         guardian_output_schema(),
         /*external_cancel*/ None,
-        Instant::now() + GUARDIAN_REVIEW_TIMEOUT,
         /*max_attempts*/ 1,
     )
     .await;
@@ -2259,7 +2252,6 @@ async fn guardian_reused_trunk_ignores_stale_prior_turn_completion() -> anyhow::
         /*retry_reason*/ None,
         guardian_output_schema(),
         /*external_cancel*/ None,
-        Instant::now() + GUARDIAN_REVIEW_TIMEOUT,
         /*max_attempts*/ 1,
     )
     .await;
@@ -2431,7 +2423,6 @@ async fn guardian_review_retries_transient_session_failure_then_approves() -> an
         /*retry_reason*/ None,
         guardian_output_schema(),
         /*external_cancel*/ None,
-        Instant::now() + GUARDIAN_REVIEW_TIMEOUT,
         /*max_attempts*/ 3,
     )
     .await;
@@ -2523,7 +2514,6 @@ async fn guardian_review_retries_two_parse_failures_then_approves() -> anyhow::R
         /*retry_reason*/ None,
         guardian_output_schema(),
         /*external_cancel*/ None,
-        Instant::now() + GUARDIAN_REVIEW_TIMEOUT,
         /*max_attempts*/ 3,
     )
     .await;

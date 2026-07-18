@@ -801,26 +801,17 @@ impl App {
     ) -> Result<bool> {
         let Some(resolution) = self
             .pending_app_server_requests
-            .resolution(op)
+            .take_resolution(op)
             .map_err(|err| color_eyre::eyre::eyre!(err))?
         else {
             return Ok(false);
         };
-        let request_id = resolution.request_id.clone();
 
         match app_server
             .resolve_server_request(resolution.request_id, resolution.result)
             .await
         {
             Ok(()) => {
-                let committed = self
-                    .pending_app_server_requests
-                    .take_resolution(op)
-                    .map_err(|err| color_eyre::eyre::eyre!(err))?;
-                debug_assert_eq!(
-                    committed.as_ref().map(|value| &value.request_id),
-                    Some(&request_id)
-                );
                 if ThreadEventStore::op_can_change_pending_replay_state(op) {
                     self.note_thread_outbound_op(thread_id, op).await;
                     self.refresh_pending_thread_approvals().await;

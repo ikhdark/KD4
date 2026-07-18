@@ -1,12 +1,9 @@
 use super::*;
-use codex_exec_server::LOCAL_FS;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::SearchToolCallParams;
-use codex_utils_path_uri::PathUri;
 use core_test_support::assert_regex_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
-use tempfile::tempdir;
 
 #[test]
 fn custom_tool_calls_should_roundtrip_as_custom_outputs() {
@@ -27,107 +24,6 @@ fn custom_tool_calls_should_roundtrip_as_custom_outputs() {
         }
         other => panic!("expected CustomToolCallOutput, got {other:?}"),
     }
-}
-
-#[tokio::test]
-async fn apply_patch_output_returns_ordered_structured_result() {
-    let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("structured.txt");
-    let path_uri = PathUri::from_host_native_path(&path).expect("absolute test path");
-    let action = codex_apply_patch::ApplyPatchAction::new_add_for_test(
-        &path_uri,
-        "structured\n".to_string(),
-    );
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let delta = action
-        .execute(
-            &mut stdout,
-            &mut stderr,
-            LOCAL_FS.as_ref(),
-            /*sandbox*/ None,
-        )
-        .await
-        .expect("execute patch");
-    let output = ApplyPatchToolOutput::from_execution(
-        "Success. Updated files.".to_string(),
-        true,
-        &action,
-        &delta,
-    );
-    let payload = ToolPayload::Custom {
-        input: action.patch.clone(),
-    };
-    let result = output.code_mode_result(&payload);
-
-    assert_eq!(result["status"], "completed");
-    assert_eq!(result["exact"], true);
-    assert_eq!(result["operations"].as_array().map(Vec::len), Some(1));
-    assert_eq!(result["committed_delta"].as_array().map(Vec::len), Some(1));
-    assert_eq!(result["operations"][0]["operation"], "add");
-    assert_eq!(result["committed_delta"][0]["operation"], "add");
-    assert_eq!(
-        output.post_tool_use_response("call-1", &payload),
-        Some(result.clone())
-    );
-
-    let response = output.to_response_item("call-1", &payload);
-    let ResponseInputItem::CustomToolCallOutput { output, .. } = response else {
-        panic!("expected custom tool output");
-    };
-    assert_eq!(output.success, Some(true));
-    assert_eq!(
-        output.body.to_text().as_deref(),
-        Some("Success. Updated files.")
-    );
-
-    let partial = ApplyPatchToolOutput::from_execution(
-        "Failed after a committed prefix.".to_string(),
-        false,
-        &action,
-        &delta,
-    );
-    assert_eq!(partial.code_mode_result(&payload)["status"], "partial");
-    assert!(!partial.success_for_logging());
-}
-
-#[test]
-fn apply_patch_output_distinguishes_no_op_and_failed() {
-    let dir = tempdir().expect("tempdir");
-    let path =
-        PathUri::from_host_native_path(&dir.path().join("status.txt")).expect("absolute test path");
-    let action = codex_apply_patch::ApplyPatchAction::new_add_for_test(&path, "new".to_string());
-    let empty = codex_apply_patch::AppliedPatchDelta::default();
-
-    let no_op =
-        ApplyPatchToolOutput::from_execution("No changes.".to_string(), true, &action, &empty);
-    let failed =
-        ApplyPatchToolOutput::from_execution("Failed.".to_string(), false, &action, &empty);
-    assert_eq!(
-        no_op.code_mode_result(&ToolPayload::Custom {
-            input: String::new()
-        })["status"],
-        "no_op"
-    );
-    assert_eq!(
-        failed.code_mode_result(&ToolPayload::Custom {
-            input: String::new()
-        })["status"],
-        "failed"
-    );
-    assert!(no_op.success_for_logging());
-    assert!(!failed.success_for_logging());
-}
-
-#[test]
-fn apply_patch_output_treats_empty_inexact_failure_as_partial() {
-    assert_eq!(
-        apply_patch_status(
-            /*execution_succeeded*/ false, /*delta_is_empty*/ true,
-            /*delta_is_exact*/ false,
-        ),
-        "partial"
-    );
 }
 
 #[test]
@@ -537,12 +433,10 @@ fn exec_command_tool_output_formats_truncated_response() {
         max_output_tokens: Some(4),
         process_id: None,
         exit_code: Some(0),
-        timed_out: false,
         original_token_count: Some(10),
         hook_command: None,
         raw_output_artifact: None,
         repair_notice: None,
-        analysis: Default::default(),
     }
     .to_response_item("call-42", &payload);
 
@@ -561,7 +455,7 @@ fn exec_command_tool_output_formats_truncated_response() {
                     \nProcess\ exited\ with\ code\ 0
                     \nOriginal\ token\ count:\ 10
                     \nOutput:
-                    \n.*\[\+\d+B/\d+L\].*
+                    \n.*tokens\ truncated.*
                     $"#,
                 &text,
             );
@@ -592,7 +486,6 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
         max_output_tokens: None,
         process_id: None,
         exit_code: Some(1),
-        timed_out: false,
         original_token_count: Some(20_000),
         hook_command: Some("cargo test".to_string()),
         raw_output_artifact: Some(RawOutputArtifact::Stored {
@@ -600,7 +493,6 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
             bytes: raw_output.len() as u64,
         }),
         repair_notice: Some("Command preflight applied one repair".to_string()),
-        analysis: Default::default(),
     };
 
     let response = output.response_text();
@@ -618,94 +510,9 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
         artifact_path.to_string_lossy().as_ref()
     );
     assert_eq!(code_mode["raw_output_artifact_bytes"], raw_output.len());
-    assert_eq!(code_mode["outcome"], "completed_failure");
-    assert_eq!(code_mode["timed_out"], false);
-    assert!(code_mode.get("chunk_id").is_none());
-    assert!(code_mode.get("wall_time_seconds").is_none());
-    let mut replay = output.clone();
-    replay.chunk_id = "different-transport-chunk".to_string();
-    replay.wall_time = std::time::Duration::from_secs(99);
-    assert_eq!(
-        code_mode,
-        replay.code_mode_result(&ToolPayload::Function {
-            arguments: "{}".to_string(),
-        })
-    );
-    assert!(!output.success_for_logging());
-    let response_item = output.to_response_item(
-        "call-summary",
-        &ToolPayload::Function {
-            arguments: "{}".to_string(),
-        },
-    );
-    assert!(matches!(
-        response_item,
-        ResponseInputItem::FunctionCallOutput { output, .. }
-            if output.success == Some(false)
-    ));
-
-    let mut running = output.clone();
-    running.process_id = Some(42);
-    running.exit_code = None;
-    assert_eq!(running.outcome(), crate::exec::ExecCommandOutcome::Running);
-    assert!(!running.timed_out);
-    running.timed_out = true;
-    assert_eq!(running.outcome(), crate::exec::ExecCommandOutcome::TimedOut);
     assert!(
         code_mode["output"]
             .as_str()
             .is_some_and(|value| value.contains("Shell output summary:"))
     );
-}
-
-#[test]
-fn exec_command_tool_output_clones_share_cached_analysis() {
-    let payload = ToolPayload::Function {
-        arguments: "{}".to_string(),
-    };
-    let output = ExecCommandToolOutput {
-        event_call_id: "call-cache".to_string(),
-        chunk_id: "chunk-cache".to_string(),
-        wall_time: std::time::Duration::from_millis(5),
-        raw_output: b"alpha beta gamma delta".to_vec(),
-        truncation_policy: TruncationPolicy::Tokens(10_000),
-        max_output_tokens: Some(3),
-        process_id: None,
-        exit_code: Some(0),
-        timed_out: false,
-        original_token_count: Some(4),
-        hook_command: Some("echo alpha".to_string()),
-        raw_output_artifact: None,
-        repair_notice: None,
-        analysis: Default::default(),
-    };
-    let cloned = output.clone();
-
-    let hook_response = output.post_tool_use_response("call-cache", &payload);
-    let preview = output.log_preview();
-    let response = output.to_response_item("call-cache", &payload);
-    let code_mode = output.code_mode_result(&payload);
-
-    assert!(std::sync::Arc::ptr_eq(&output.analysis, &cloned.analysis));
-    assert_eq!(
-        output.decoded_output().as_ptr(),
-        cloned.decoded_output().as_ptr()
-    );
-    assert_eq!(output.hook_output().as_ptr(), cloned.hook_output().as_ptr());
-    assert_eq!(
-        output.model_output().as_ptr(),
-        cloned.model_output().as_ptr()
-    );
-    assert_eq!(
-        output.response_text().as_ptr(),
-        cloned.response_text().as_ptr()
-    );
-    assert_eq!(output.preview().as_ptr(), cloned.preview().as_ptr());
-    assert_eq!(
-        hook_response,
-        cloned.post_tool_use_response("call-cache", &payload)
-    );
-    assert_eq!(preview, cloned.log_preview());
-    assert_eq!(response, cloned.to_response_item("call-cache", &payload));
-    assert_eq!(code_mode, cloned.code_mode_result(&payload));
 }

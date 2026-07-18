@@ -7,8 +7,6 @@ use std::sync::atomic::AtomicBool;
 use crate::attestation::app_server_attestation_provider;
 use crate::config_manager::ConfigManager;
 use crate::connection_rpc_gate::ConnectionRpcGate;
-use crate::connection_rpc_gate::RpcAdmissionError;
-use crate::connection_rpc_gate::rpc_overloaded_error;
 use crate::current_time::app_server_time_provider;
 use crate::error_code::invalid_request;
 use crate::extensions::ThreadExtensionDependencies;
@@ -43,12 +41,10 @@ use crate::request_processors::ThreadRequestProcessor;
 use crate::request_processors::TurnRequestProcessor;
 use crate::request_processors::WindowsSandboxRequestProcessor;
 use crate::request_serialization::QueuedInitializedRequest;
-use crate::request_serialization::RequestEnqueueResult;
 use crate::request_serialization::RequestSerializationQueueKey;
 use crate::request_serialization::RequestSerializationQueues;
 use crate::skills_watcher::SkillsWatcher;
 use crate::thread_state::ConnectionCapabilities;
-use crate::thread_state::ResolvedDeliveryFilter;
 use crate::thread_state::ThreadStateManager;
 use crate::transport::AppServerTransport;
 use crate::transport::RemoteControlHandle;
@@ -79,6 +75,8 @@ use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::StateDbHandle;
 use codex_state::log_db::LogDbLayer;
+use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio::time::Duration;
@@ -308,11 +306,10 @@ impl MessageProcessor {
             .set_analytics_events_client(analytics_events_client.clone());
         let skills_watcher = SkillsWatcher::new(thread_manager.skills_service(), outgoing.clone());
 
-        let thread_lifecycle = Arc::new(
-            crate::request_processors::thread_lifecycle::ThreadLifecycleCoordinator::default(),
-        );
+        let pending_thread_unloads = Arc::new(Mutex::new(HashSet::new()));
         let thread_watch_manager =
             crate::thread_status::ThreadWatchManager::new_with_outgoing(outgoing.clone());
+        let thread_list_state_permit = Arc::new(Semaphore::new(/*permits*/ 1));
         let workspace_settings_cache =
             Arc::new(workspace_settings::WorkspaceSettingsCache::default());
         let app_list_shutdown_token = CancellationToken::new();
@@ -404,9 +401,10 @@ impl MessageProcessor {
             Arc::clone(&config),
             config_manager.clone(),
             Arc::clone(&thread_store),
-            Arc::clone(&thread_lifecycle),
+            Arc::clone(&pending_thread_unloads),
             thread_state_manager.clone(),
             thread_watch_manager.clone(),
+            Arc::clone(&thread_list_state_permit),
             thread_goal_processor.clone(),
             state_db.clone(),
             log_db,
@@ -421,9 +419,10 @@ impl MessageProcessor {
             arg0_paths.clone(),
             Arc::clone(&config),
             config_manager.clone(),
-            thread_lifecycle,
+            pending_thread_unloads,
             thread_state_manager,
             thread_watch_manager,
+            thread_list_state_permit,
             Arc::clone(&skills_watcher),
         );
         if matches!(plugin_startup_tasks, crate::PluginStartupTasks::Start) {
@@ -443,7 +442,6 @@ impl MessageProcessor {
             config_manager.clone(),
             thread_manager.clone(),
             analytics_events_client.clone(),
-            config.as_ref(),
         );
         let external_agent_config_processor =
             ExternalAgentConfigRequestProcessor::new(ExternalAgentConfigRequestProcessorArgs {
@@ -650,18 +648,12 @@ impl MessageProcessor {
         &self,
         connection_id: ConnectionId,
         request_attestation: bool,
-        experimental_api_enabled: bool,
-        opted_out_notification_methods: HashSet<String>,
     ) {
         self.thread_processor
             .connection_initialized(
                 connection_id,
                 ConnectionCapabilities {
                     request_attestation,
-                    delivery_filter: ResolvedDeliveryFilter::new(
-                        experimental_api_enabled,
-                        opted_out_notification_methods,
-                    ),
                 },
             )
             .await;
@@ -777,10 +769,6 @@ impl MessageProcessor {
                         connection_id,
                         ConnectionCapabilities {
                             request_attestation: session.request_attestation(),
-                            delivery_filter: ResolvedDeliveryFilter::new(
-                                session.experimental_api_enabled(),
-                                session.opted_out_notification_methods(),
-                            ),
                         },
                     )
                     .await;
@@ -828,7 +816,7 @@ impl MessageProcessor {
         let rpc_gate = Arc::clone(&session.rpc_gate);
         let processor = Arc::clone(self);
         let span = request_context.span();
-        let request = match QueuedInitializedRequest::try_new(
+        let request = QueuedInitializedRequest::new(
             rpc_gate,
             async move {
                 let processor_for_request = Arc::clone(&processor);
@@ -847,22 +835,13 @@ impl MessageProcessor {
                 }
             }
             .instrument(span),
-        ) {
-            Ok(request) => request,
-            Err(RpcAdmissionError::Closed) => return Ok(()),
-            Err(RpcAdmissionError::Overloaded) => return Err(rpc_overloaded_error()),
-        };
+        );
 
         if let Some(scope) = serialization_scope {
             let (key, access) = RequestSerializationQueueKey::from_scope(connection_id, scope);
-            if self
-                .request_serialization_queues
+            self.request_serialization_queues
                 .enqueue(key, access, request)
-                .await
-                == RequestEnqueueResult::Overloaded
-            {
-                return Err(rpc_overloaded_error());
-            }
+                .await;
         } else {
             tokio::spawn(async move {
                 request.run().await;

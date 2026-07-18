@@ -14,25 +14,12 @@ pub(crate) enum McpServerLaunch {
 #[derive(Debug, Clone)]
 pub struct EffectiveMcpServer {
     launch: McpServerLaunch,
-    host_owned_codex_apps: bool,
 }
 
 impl EffectiveMcpServer {
     pub fn configured(config: McpServerConfig) -> Self {
         Self {
             launch: McpServerLaunch::Configured(Box::new(config)),
-            host_owned_codex_apps: false,
-        }
-    }
-
-    /// Marks the resolved built-in ChatGPT Apps registration.
-    ///
-    /// Callers must only use this after validating the winning catalog source;
-    /// the reserved server name alone is not sufficient provenance.
-    pub fn host_owned_codex_apps(config: McpServerConfig) -> Self {
-        Self {
-            launch: McpServerLaunch::Configured(Box::new(config)),
-            host_owned_codex_apps: true,
         }
     }
 
@@ -56,10 +43,6 @@ impl EffectiveMcpServer {
         match &self.launch {
             McpServerLaunch::Configured(config) => config.required,
         }
-    }
-
-    pub fn is_host_owned_codex_apps(&self) -> bool {
-        self.host_owned_codex_apps
     }
 }
 
@@ -98,7 +81,6 @@ pub(crate) struct McpServerMetadata {
     pub supports_parallel_tool_calls: bool,
     pub default_tools_approval_mode: Option<AppToolApproval>,
     pub tool_approval_modes: HashMap<String, AppToolApproval>,
-    pub host_owned_codex_apps: bool,
 }
 
 impl McpServerMetadata {
@@ -129,7 +111,6 @@ impl From<&EffectiveMcpServer> for McpServerMetadata {
                             .map(|approval_mode| (name.clone(), approval_mode))
                     })
                     .collect(),
-                host_owned_codex_apps: server.is_host_owned_codex_apps(),
             },
         }
     }

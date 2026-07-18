@@ -4,7 +4,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
-use super::mcp_projection::McpProjectionCoordinator;
 use crate::SkillsService;
 use crate::agent::AgentControl;
 use crate::agents_md_manager::AgentsMdManager;
@@ -57,14 +56,12 @@ pub(crate) struct SessionServices {
     pub(crate) mcp_connection_manager: Arc<ArcSwap<McpConnectionManager>>,
     /// The latest atomically published MCP config and manager pair.
     pub(crate) mcp_runtime: ArcSwapOption<McpRuntimeSnapshot>,
-    /// The app-server compatibility policy to apply to both current and future MCP runtimes.
-    pub(crate) mcp_elicitations_auto_deny: AtomicBool,
     /// Aggregate generation for model-visible planning state. Every invalidating
     /// publication must advance this value before a pending turn may replan.
     pub(crate) planning_generation: AtomicU64,
-    /// Keeps candidate construction off-lock and admits only the newest runtime publication.
-    pub(crate) mcp_projection: McpProjectionCoordinator,
-    pub(crate) mcp_startup_cancellation_token: std::sync::Mutex<CancellationToken>,
+    /// Serializes environment-driven runtime rebuilds.
+    pub(crate) mcp_projection_lock: Mutex<()>,
+    pub(crate) mcp_startup_cancellation_token: Mutex<CancellationToken>,
     pub(crate) unified_exec_manager: UnifiedExecProcessManager,
     pub(crate) command_execution: CommandExecutionLedger,
     pub(crate) task_evidence: TaskEvidenceLedger,
@@ -92,7 +89,7 @@ pub(crate) struct SessionServices {
     pub(crate) mcp_manager: Arc<McpManager>,
     pub(crate) extensions: Arc<ExtensionRegistry<crate::config::Config>>,
     pub(crate) session_extension_data: ExtensionData,
-    pub(crate) thread_extension_data: Arc<ExtensionData>,
+    pub(crate) thread_extension_data: ExtensionData,
     pub(crate) supports_openai_form_elicitation: AtomicBool,
     /// Raw capability selections for this thread. Each model step resolves them against its
     /// current executor environments before using them.
@@ -145,7 +142,6 @@ impl SessionServices {
         manager: McpConnectionManager,
     ) -> Arc<McpRuntimeSnapshot> {
         let manager = Arc::new(manager);
-        manager.set_elicitations_auto_deny(self.mcp_elicitations_auto_deny.load(Ordering::Acquire));
         // Publish the manager for legacy resource clients first. Once the paired snapshot is
         // visible, every model-scoped consumer observes this exact manager.
         self.mcp_connection_manager.store(Arc::clone(&manager));
@@ -157,29 +153,8 @@ impl SessionServices {
             available_environment_ids,
         ));
         self.mcp_runtime.store(Some(Arc::clone(&runtime)));
-        // Close the publication race with an app-server update that arrived after the first
-        // policy read but before the runtime became visible.
-        runtime
-            .manager()
-            .set_elicitations_auto_deny(self.mcp_elicitations_auto_deny.load(Ordering::Acquire));
         self.bump_planning_generation();
         runtime
-    }
-
-    pub(crate) fn publish_mcp_runtime_snapshot(&self, runtime: Arc<McpRuntimeSnapshot>) {
-        runtime.manager().set_elicitations_auto_deny(
-            self.mcp_elicitations_auto_deny.load(Ordering::Acquire),
-        );
-        self.mcp_runtime.store(Some(runtime));
-        self.bump_planning_generation();
-    }
-
-    pub(crate) fn set_mcp_elicitations_auto_deny(&self, auto_deny: bool) {
-        self.mcp_elicitations_auto_deny
-            .store(auto_deny, Ordering::Release);
-        if let Some(runtime) = self.mcp_runtime.load_full() {
-            runtime.manager().set_elicitations_auto_deny(auto_deny);
-        }
     }
 
     pub(crate) fn planning_generation(&self) -> u64 {

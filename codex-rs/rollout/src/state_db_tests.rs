@@ -47,13 +47,20 @@ fn cursor_to_anchor_preserves_recency_tie_breaker() {
 }
 
 #[tokio::test]
-async fn try_init_returns_write_ready_while_concurrent_backfill_is_stuck() -> anyhow::Result<()> {
+async fn try_init_waits_for_concurrent_startup_backfill() -> anyhow::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let runtime =
         codex_state::StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
             .await?;
     let claimed = runtime.try_claim_backfill(/*lease_seconds*/ 60).await?;
     assert!(claimed);
+    let runtime_for_completion = runtime.clone();
+    let complete_backfill = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        runtime_for_completion
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+    });
 
     let initialized = try_init_with_roots_and_backfill_lease(
         home.path().to_path_buf(),
@@ -62,66 +69,41 @@ async fn try_init_returns_write_ready_while_concurrent_backfill_is_stuck() -> an
         /*backfill_lease_seconds*/ 60,
     )
     .await?;
+    complete_backfill.await??;
     assert_eq!(
-        readiness(initialized.as_ref()).await?,
-        StateDbReadiness::WriteReady
-    );
-
-    let thread_id = ThreadId::new();
-    let builder = codex_state::ThreadMetadataBuilder::new(
-        thread_id,
-        home.path().join("sessions/current.jsonl"),
-        Utc::now(),
-        SessionSource::Cli,
-    );
-    initialized
-        .upsert_thread(&builder.build("test-provider"))
-        .await?;
-    assert!(initialized.get_thread(thread_id).await?.is_some());
-
-    runtime
-        .mark_backfill_complete(/*last_watermark*/ None)
-        .await?;
-    assert_eq!(
-        readiness(initialized.as_ref()).await?,
-        StateDbReadiness::HistoricalIndexComplete
+        initialized.get_backfill_state().await?.status,
+        codex_state::BackfillStatus::Complete
     );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn try_init_backfills_existing_rollout_in_background() -> anyhow::Result<()> {
+async fn try_init_times_out_waiting_for_stuck_startup_backfill() -> anyhow::Result<()> {
     let home = TempDir::new().expect("temp dir");
-    let thread_id = ThreadId::new();
-    let rollout_path = write_rollout_with_user_message(home.path(), thread_id, "background")?;
+    let runtime =
+        codex_state::StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+            .await?;
+    let claimed = runtime.try_claim_backfill(/*lease_seconds*/ 60).await?;
+    assert!(claimed);
 
-    let initialized = try_init_with_roots(
+    let result = try_init_with_roots_and_backfill_lease(
         home.path().to_path_buf(),
         home.path().to_path_buf(),
         "test-provider".to_string(),
+        /*backfill_lease_seconds*/ 60,
     )
-    .await?;
+    .await;
+    let err = match result {
+        Ok(_) => panic!("state db init should not wait forever for incomplete backfill"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("timed out waiting for state db backfill"),
+        "unexpected error: {err}"
+    );
 
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        if readiness(initialized.as_ref()).await?
-            == StateDbReadiness::HistoricalIndexComplete
-        {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "historical backfill did not complete"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-
-    let metadata = initialized
-        .get_thread(thread_id)
-        .await?
-        .expect("background backfill should index rollout");
-    assert_eq!(metadata.rollout_path, rollout_path);
     Ok(())
 }
 

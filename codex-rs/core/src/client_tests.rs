@@ -5,10 +5,6 @@ use super::LastResponse;
 use super::ModelClient;
 use super::PendingUnauthorizedRetry;
 use super::Prompt;
-use super::RequestAuthSnapshot;
-use super::RequestSchemaCacheKey;
-use super::RequestSchemaCacheValue;
-use super::RequestSchemaSerializationCache;
 use super::UnauthorizedRecoveryExecution;
 use super::X_CODEX_INSTALLATION_ID_HEADER;
 use super::X_CODEX_PARENT_THREAD_ID_HEADER;
@@ -18,13 +14,9 @@ use super::X_OPENAI_SUBAGENT_HEADER;
 use crate::AttestationContext;
 use crate::AttestationProvider;
 use crate::GenerateAttestationFuture;
-use crate::context_manager::ContextManager;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::test_support::TestCodexResponsesRequestKind;
 use crate::test_support::responses_metadata as test_responses_metadata;
-use crate::tools::ToolSchemaBundle;
-use crate::tools::ToolWireMode;
-use crate::tools::ToolWireValue;
 use codex_api::AgentIdentityTelemetry;
 use codex_api::ApiError;
 use codex_api::ResponseEvent;
@@ -36,9 +28,6 @@ use codex_login::AuthCredentialsStoreMode;
 use codex_login::AuthKeyringBackendKind;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
-use codex_login::ExternalAuth;
-use codex_login::ExternalAuthFuture;
-use codex_login::ExternalAuthRefreshContext;
 use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_model_provider::BearerAuthProvider;
 use codex_model_provider::SharedModelProvider;
@@ -52,12 +41,10 @@ use codex_protocol::ThreadId;
 use codex_protocol::auth::AuthMode;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::ImageDetail;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::openai_models::default_input_modalities;
 use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
@@ -69,23 +56,13 @@ use codex_rollout_trace::RawTraceEventPayload;
 use codex_rollout_trace::RolloutTrace;
 use codex_rollout_trace::TraceWriter;
 use codex_rollout_trace::replay_bundle;
-use codex_utils_output_truncation::TruncationPolicy;
-use core_test_support::responses::ev_assistant_message;
-use core_test_support::responses::ev_completed;
-use core_test_support::responses::ev_response_created;
-use core_test_support::responses::start_websocket_server;
-use core_test_support::skip_if_no_network;
 use futures::StreamExt;
 use pretty_assertions::assert_eq;
-use serde_json::Value;
 use serde_json::json;
-use sha2::Digest;
-use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::Barrier;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -138,46 +115,6 @@ fn test_model_client_with_thread_id(
     )
 }
 
-fn test_model_client_with_auth_manager(auth_manager: Arc<AuthManager>) -> ModelClient {
-    ModelClient::new(
-        Some(auth_manager),
-        AgentIdentityAuthPolicy::JwtOnly,
-        ThreadId::new(),
-        ModelProviderInfo::create_openai_provider(/*base_url*/ None),
-        SessionSource::Cli,
-        "test_originator".to_string(),
-        /*model_verbosity*/ None,
-        /*enable_request_compression*/ false,
-        /*include_timing_metrics*/ false,
-        /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
-        /*concurrent_reasoning_summaries_enabled*/ false,
-        /*attestation_provider*/ None,
-        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-    )
-}
-
-struct MutableExternalAuth {
-    auth: Mutex<CodexAuth>,
-}
-
-impl MutableExternalAuth {
-    fn replace(&self, auth: CodexAuth) {
-        *self.auth.lock().unwrap() = auth;
-    }
-}
-
-impl ExternalAuth for MutableExternalAuth {
-    fn resolve(&self) -> ExternalAuthFuture<'_, CodexAuth> {
-        let auth = self.auth.lock().unwrap().clone();
-        Box::pin(async move { Ok(auth) })
-    }
-
-    fn refresh(&self, _context: ExternalAuthRefreshContext) -> ExternalAuthFuture<'_, CodexAuth> {
-        self.resolve()
-    }
-}
-
 fn history_test_item(text: &str, turn_id: Option<&str>) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -214,19 +151,6 @@ fn history_test_request(input: Vec<ResponseItem>) -> ResponsesApiRequest {
     }
 }
 
-fn no_auth_snapshot() -> RequestAuthSnapshot {
-    RequestAuthSnapshot {
-        generation: None,
-        identity_digest: super::request_auth_identity_digest(None, None),
-    }
-}
-
-fn default_history_policy() -> crate::context_manager::PromptHistoryPolicyIdentity {
-    crate::context_manager::PromptHistoryPolicyIdentity::for_input_modalities(
-        &default_input_modalities(),
-    )
-}
-
 #[test]
 fn websocket_prefix_hash_ignores_internal_metadata_only() {
     let first = CanonicalPrefixHash::from_items(&[history_test_item("same", Some("turn-a"))])
@@ -242,20 +166,12 @@ fn websocket_prefix_hash_ignores_internal_metadata_only() {
 }
 
 #[test]
-fn websocket_incremental_history_uses_compact_digest_and_fails_closed_without_it() {
+fn websocket_incremental_history_uses_digest_and_preserves_full_compare_fallback() {
     let client = test_model_client(SessionSource::Cli);
     let mut session = client.new_session();
     let original = history_test_request(vec![history_test_item("user", Some("turn-a"))]);
-    session.remember_request_history(
-        &original,
-        &no_auth_snapshot(),
-        default_history_policy(),
-        /*use_responses_lite*/ false,
-        CanonicalPrefixHash::from_items(&original.input),
-        None,
-        None,
-        None,
-    );
+    session.remember_request_history(&original);
+    session.websocket_session.last_request = Some(original.clone());
     let response = LastResponse {
         response_id: "response-1".to_string(),
         items_added: vec![history_test_item("assistant", Some("turn-a"))],
@@ -266,99 +182,24 @@ fn websocket_incremental_history_uses_compact_digest_and_fails_closed_without_it
     extended.input.push(delta.clone());
 
     assert_eq!(
-        session
-            .get_incremental_proof(
-                &extended,
-                None,
-                &no_auth_snapshot(),
-                default_history_policy(),
-                /*use_responses_lite*/ false,
-                &response,
-                false,
-            )
-            .map(|proof| proof.input),
+        session.get_incremental_items(&extended, Some(&response), false),
         Some(vec![delta.clone()])
     );
 
     let mut changed_prefix = extended.clone();
     changed_prefix.input[0] = history_test_item("changed", Some("turn-a"));
     assert_eq!(
-        session
-            .get_incremental_proof(
-                &changed_prefix,
-                None,
-                &no_auth_snapshot(),
-                default_history_policy(),
-                /*use_responses_lite*/ false,
-                &response,
-                false,
-            )
-            .map(|proof| proof.input),
+        session.get_incremental_items(&changed_prefix, Some(&response), false),
         None
     );
 
-    // Missing proof state is uncertainty and forces a full request.
+    // Missing hash state is uncertainty, not failure: retain the canonical
+    // full-materialization/full-comparison behavior.
     session.websocket_session.last_request_history = None;
     assert_eq!(
-        session
-            .get_incremental_proof(
-                &extended,
-                None,
-                &no_auth_snapshot(),
-                default_history_policy(),
-                /*use_responses_lite*/ false,
-                &response,
-                false,
-            )
-            .map(|proof| proof.input),
-        None
+        session.get_incremental_items(&extended, Some(&response), false),
+        Some(vec![delta])
     );
-}
-
-#[test]
-fn websocket_incremental_history_uses_snapshot_proof_without_current_full_input() {
-    let client = test_model_client(SessionSource::Cli);
-    let mut session = client.new_session();
-    let original_item = history_test_item("user", Some("turn-a"));
-    let mut history = ContextManager::new();
-    history.record_items([&original_item], TruncationPolicy::Tokens(10_000));
-    let baseline = history.prompt_snapshot(&default_input_modalities());
-    let original = history_test_request(baseline.materialize());
-    session.remember_request_history(
-        &original,
-        &no_auth_snapshot(),
-        baseline.policy_identity(),
-        /*use_responses_lite*/ false,
-        Ok(baseline.canonical_prefix()),
-        Some(baseline.mutation_revision()),
-        Some(baseline.rewrite_revision()),
-        None,
-    );
-
-    let response_item = history_test_item("assistant", Some("turn-a"));
-    let delta = history_test_item("next", Some("turn-b"));
-    history.record_items([&response_item, &delta], TruncationPolicy::Tokens(10_000));
-    let current = history.prompt_snapshot(&default_input_modalities());
-    let static_request = history_test_request(Vec::new());
-    let response = LastResponse {
-        response_id: "response-1".to_string(),
-        items_added: vec![response_item],
-    };
-
-    let proof = session
-        .get_incremental_proof(
-            &static_request,
-            Some(&current),
-            &no_auth_snapshot(),
-            current.policy_identity(),
-            /*use_responses_lite*/ false,
-            &response,
-            false,
-        )
-        .expect("snapshot chain should prove the suffix");
-    assert_eq!(proof.input, vec![delta]);
-    assert_eq!(proof.current_prefix, current.canonical_prefix());
-    assert_eq!(proof.mutation_revision, Some(current.mutation_revision()));
 }
 
 #[test]
@@ -366,703 +207,15 @@ fn websocket_incremental_history_invalidates_without_dropping_transport_contract
     let client = test_model_client(SessionSource::Cli);
     let mut session = client.new_session();
     let request = history_test_request(vec![history_test_item("user", None)]);
-    session.remember_request_history(
-        &request,
-        &no_auth_snapshot(),
-        default_history_policy(),
-        /*use_responses_lite*/ false,
-        CanonicalPrefixHash::from_items(&request.input),
-        None,
-        None,
-        None,
-    );
+    session.remember_request_history(&request);
+    session.websocket_session.last_request = Some(request);
     let generation_before = session.websocket_session.next_history_generation;
 
     session.invalidate_incremental_history("test history replacement");
 
+    assert!(session.websocket_session.last_request.is_none());
     assert!(session.websocket_session.last_request_history.is_none());
     assert!(session.websocket_session.next_history_generation > generation_before);
-}
-
-fn legacy_responses_request_properties_fingerprint(
-    request: &ResponsesApiRequest,
-    auth_snapshot: &RequestAuthSnapshot,
-    history_policy_identity: crate::context_manager::PromptHistoryPolicyIdentity,
-    use_responses_lite: bool,
-) -> serde_json::Result<[u8; 32]> {
-    let mut properties = request.clone();
-    properties.input.clear();
-    properties.stream_options = None;
-    properties.client_metadata = None;
-    let serialized = serde_json::to_vec(&properties)?;
-    let static_identity =
-        serde_json::to_vec(&(auth_snapshot, history_policy_identity, use_responses_lite))?;
-    let mut hasher = Sha256::new();
-    hasher.update(super::WEBSOCKET_REQUEST_FINGERPRINT_DOMAIN);
-    hasher.update((static_identity.len() as u64).to_be_bytes());
-    hasher.update(static_identity);
-    hasher.update((serialized.len() as u64).to_be_bytes());
-    hasher.update(serialized);
-    Ok(hasher.finalize().into())
-}
-
-#[test]
-fn borrowed_request_properties_fingerprint_matches_clone_and_clear_for_every_field() {
-    let mut request = history_test_request(vec![history_test_item("input", Some("turn-a"))]);
-    request.model = "model-a".to_string();
-    request.instructions = "instructions-a".to_string();
-    request.tools = Some(vec![json!({"type": "function", "name": "tool-a"})]);
-    request.tool_choice = "required".to_string();
-    request.parallel_tool_calls = false;
-    request.reasoning = Some(codex_api::Reasoning {
-        effort: None,
-        summary: None,
-        context: Some(codex_api::ReasoningContext::AllTurns),
-    });
-    request.store = false;
-    request.stream = false;
-    request.stream_options = Some(codex_api::StreamOptions {
-        reasoning_summary_delivery: codex_api::ReasoningSummaryDelivery::SequentialCutoff,
-    });
-    request.include = vec!["reasoning.encrypted_content".to_string()];
-    request.service_tier = Some("priority".to_string());
-    request.prompt_cache_key = Some("cache-key".to_string());
-    request.text = Some(codex_api::TextControls::default());
-    request.client_metadata = Some(std::collections::HashMap::from([(
-        "client".to_string(),
-        "metadata".to_string(),
-    )]));
-
-    let mut cases = vec![request.clone()];
-    let mut changed = request.clone();
-    changed.model = "model-b".to_string();
-    cases.push(changed);
-    let mut changed = request.clone();
-    changed.instructions = "instructions-b".to_string();
-    cases.push(changed);
-    let mut changed = request.clone();
-    changed.tools = Some(vec![json!({"type": "function", "name": "tool-b"})]);
-    cases.push(changed);
-    let mut changed = request.clone();
-    changed.tool_choice = "auto".to_string();
-    cases.push(changed);
-    let mut changed = request.clone();
-    changed.parallel_tool_calls = true;
-    cases.push(changed);
-    let mut changed = request.clone();
-    changed.reasoning = None;
-    cases.push(changed);
-    let mut changed = request.clone();
-    changed.store = true;
-    cases.push(changed);
-    let mut changed = request.clone();
-    changed.stream = true;
-    cases.push(changed);
-    let mut changed = request.clone();
-    changed.include.clear();
-    cases.push(changed);
-    let mut changed = request.clone();
-    changed.service_tier = None;
-    cases.push(changed);
-    let mut changed = request.clone();
-    changed.prompt_cache_key = None;
-    cases.push(changed);
-    let mut changed = request.clone();
-    changed.text = None;
-    cases.push(changed);
-    let mut changed = request.clone();
-    changed.input.push(history_test_item("ignored input", None));
-    cases.push(changed);
-    let mut changed = request.clone();
-    changed.stream_options = None;
-    cases.push(changed);
-    let mut changed = request;
-    changed.client_metadata = None;
-    cases.push(changed);
-
-    for (index, request) in cases.iter().enumerate() {
-        assert_eq!(
-            super::responses_request_properties_fingerprint(
-                request,
-                &no_auth_snapshot(),
-                default_history_policy(),
-                /*use_responses_lite*/ false,
-            )
-            .expect("borrowed fingerprint should serialize"),
-            legacy_responses_request_properties_fingerprint(
-                request,
-                &no_auth_snapshot(),
-                default_history_policy(),
-                /*use_responses_lite*/ false,
-            )
-            .expect("legacy fingerprint should serialize"),
-            "request case {index}"
-        );
-    }
-}
-
-#[test]
-fn request_properties_fingerprint_binds_text_only_history_to_modality_policy() {
-    let request = history_test_request(Vec::new());
-    let auth = no_auth_snapshot();
-    let image_capable = crate::context_manager::PromptHistoryPolicyIdentity::for_input_modalities(
-        &default_input_modalities(),
-    );
-    let text_only = crate::context_manager::PromptHistoryPolicyIdentity::for_input_modalities(&[
-        codex_protocol::openai_models::InputModality::Text,
-    ]);
-
-    assert_ne!(
-        super::responses_request_properties_fingerprint(
-            &request,
-            &auth,
-            image_capable,
-            /*use_responses_lite*/ false,
-        )
-        .expect("image-capable fingerprint"),
-        super::responses_request_properties_fingerprint(
-            &request, &auth, text_only, /*use_responses_lite*/ false,
-        )
-        .expect("text-only fingerprint"),
-    );
-}
-
-#[test]
-fn request_properties_fingerprint_binds_responses_lite_formatting_policy() {
-    let request = history_test_request(Vec::new());
-    let auth = no_auth_snapshot();
-    let policy = default_history_policy();
-
-    assert_ne!(
-        super::responses_request_properties_fingerprint(
-            &request, &auth, policy, /*use_responses_lite*/ false,
-        )
-        .expect("standard Responses fingerprint"),
-        super::responses_request_properties_fingerprint(
-            &request, &auth, policy, /*use_responses_lite*/ true,
-        )
-        .expect("Responses Lite fingerprint"),
-    );
-}
-
-#[tokio::test]
-async fn immutable_auth_snapshot_rejects_same_mode_capture_to_send_change() -> anyhow::Result<()> {
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("key-a"));
-    let external = Arc::new(MutableExternalAuth {
-        auth: Mutex::new(CodexAuth::from_api_key("key-a")),
-    });
-    let external_auth: Arc<dyn ExternalAuth> = external.clone();
-    auth_manager.set_external_auth(external_auth).await?;
-    let mut session = test_model_client_with_auth_manager(Arc::clone(&auth_manager)).new_session();
-    let captured = session.capture_request_auth_snapshot().await?;
-    let request = history_test_request(vec![history_test_item("user", None)]);
-    session.remember_request_history(
-        &request,
-        &captured,
-        default_history_policy(),
-        /*use_responses_lite*/ false,
-        CanonicalPrefixHash::from_items(&request.input),
-        None,
-        None,
-        None,
-    );
-
-    external.replace(CodexAuth::from_api_key("key-b"));
-    auth_manager.reload().await;
-    let error = match session
-        .client
-        .current_client_setup_for(&captured, /*allow_newer_generation*/ false)
-        .await
-    {
-        Ok(_) => panic!("same-mode credential replacement must fail closed"),
-        Err(error) => error,
-    };
-
-    assert!(error.to_string().contains("authentication changed"));
-    let current = session.capture_request_auth_snapshot().await?;
-    let response = LastResponse {
-        response_id: "response-before-auth-change".to_string(),
-        items_added: Vec::new(),
-    };
-    assert!(
-        session
-            .get_incremental_proof(
-                &request,
-                None,
-                &current,
-                default_history_policy(),
-                /*use_responses_lite*/ false,
-                &response,
-                true,
-            )
-            .is_none(),
-        "websocket previous_response_id reuse must be invalidated"
-    );
-    let debug = format!("{captured:?}");
-    assert!(!debug.contains("key-a"));
-    assert!(!debug.contains("key-b"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn immutable_auth_snapshot_rejects_same_mode_account_change() -> anyhow::Result<()> {
-    let initial = CodexAuth::from_external_chatgpt_tokens(
-        TEST_CHATGPT_ID_TOKEN,
-        "account-before",
-        Some("pro"),
-    )?;
-    let auth_manager = AuthManager::from_auth_for_testing(initial.clone());
-    let external = Arc::new(MutableExternalAuth {
-        auth: Mutex::new(initial),
-    });
-    let external_auth: Arc<dyn ExternalAuth> = external.clone();
-    auth_manager.set_external_auth(external_auth).await?;
-    let session = test_model_client_with_auth_manager(Arc::clone(&auth_manager)).new_session();
-    let captured = session.capture_request_auth_snapshot().await?;
-
-    external.replace(CodexAuth::from_external_chatgpt_tokens(
-        TEST_CHATGPT_ID_TOKEN,
-        "account-after",
-        Some("pro"),
-    )?);
-    auth_manager.reload().await;
-    let error = match session
-        .client
-        .current_client_setup_for(&captured, /*allow_newer_generation*/ false)
-        .await
-    {
-        Ok(_) => panic!("same-mode account replacement must fail closed"),
-        Err(error) => error,
-    };
-
-    assert!(error.to_string().contains("authentication changed"));
-    let debug = format!("{captured:?}");
-    assert!(!debug.contains("account-before"));
-    assert!(!debug.contains("account-after"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn production_history_stream_http_fallback_materializes_the_frozen_snapshot()
--> anyhow::Result<()> {
-    let server = MockServer::start().await;
-    let sse = [
-        json!({"type":"response.created","response":{"id":"resp-http"}}),
-        json!({
-            "type":"response.completed",
-            "response":{
-                "id":"resp-http",
-                "usage":{
-                    "input_tokens":0,
-                    "input_tokens_details":null,
-                    "output_tokens":0,
-                    "output_tokens_details":null,
-                    "total_tokens":0
-                }
-            }
-        }),
-    ]
-    .into_iter()
-    .map(|event| format!("data: {event}\n\n"))
-    .collect::<String>();
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("content-type", "text/event-stream")
-                .set_body_string(sse),
-        )
-        .expect(1)
-        .mount(&server)
-        .await;
-
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test-key"));
-    let mut provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
-    provider.base_url = Some(format!("{}/v1", server.uri()));
-    provider.supports_websockets = false;
-    let client = ModelClient::new(
-        Some(auth_manager),
-        AgentIdentityAuthPolicy::JwtOnly,
-        ThreadId::new(),
-        provider,
-        SessionSource::Cli,
-        "test_originator".to_string(),
-        /*model_verbosity*/ None,
-        /*enable_request_compression*/ false,
-        /*include_timing_metrics*/ false,
-        /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
-        /*concurrent_reasoning_summaries_enabled*/ false,
-        /*attestation_provider*/ None,
-        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-    );
-    let responses_metadata = test_responses_metadata_for_client(
-        &client,
-        /*turn_id*/ None,
-        format!("{}:0", client.state.thread_id),
-        /*parent_thread_id*/ None,
-        TestCodexResponsesRequestKind::Turn,
-    );
-    let mut session = client.new_session();
-    let auth_snapshot = session.capture_request_auth_snapshot().await?;
-    let mut history = ContextManager::new();
-    let first = history_test_item("first", None);
-    let second = history_test_item("second", None);
-    history.record_items([&first, &second], TruncationPolicy::Tokens(10_000));
-    let history = history.prompt_snapshot(&default_input_modalities());
-    let prompt = Prompt {
-        base_instructions: BaseInstructions {
-            text: "base instructions".to_string(),
-        },
-        ..Default::default()
-    };
-    let model_info = test_model_info();
-    let telemetry = test_session_telemetry();
-    let inference_trace = InferenceTraceContext::disabled();
-
-    let mut stream = session
-        .stream_with_history_snapshot(
-            &prompt,
-            &history,
-            &auth_snapshot,
-            &model_info,
-            &telemetry,
-            None,
-            codex_protocol::config_types::ReasoningSummary::None,
-            None,
-            &responses_metadata,
-            &inference_trace,
-        )
-        .await?;
-    while stream.next().await.is_some() {}
-
-    let requests = server.received_requests().await.unwrap_or_default();
-    let body: Value =
-        serde_json::from_slice(&requests.first().expect("HTTP fallback request").body)?;
-    assert_eq!(body["input"].as_array().map(Vec::len), Some(2));
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn production_history_stream_invalidates_previous_response_on_modality_change()
--> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_websocket_server(vec![vec![
-        vec![
-            ev_response_created("resp-1"),
-            ev_assistant_message("msg-1", "first done"),
-            ev_completed("resp-1"),
-        ],
-        vec![ev_response_created("resp-2"), ev_completed("resp-2")],
-    ]])
-    .await;
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test-key"));
-    let mut provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
-    provider.base_url = Some(format!("{}/v1", server.uri()));
-    provider.supports_websockets = true;
-    let client = ModelClient::new(
-        Some(auth_manager),
-        AgentIdentityAuthPolicy::JwtOnly,
-        ThreadId::new(),
-        provider,
-        SessionSource::Cli,
-        "test_originator".to_string(),
-        /*model_verbosity*/ None,
-        /*enable_request_compression*/ false,
-        /*include_timing_metrics*/ false,
-        /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
-        /*concurrent_reasoning_summaries_enabled*/ false,
-        /*attestation_provider*/ None,
-        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-    );
-    let responses_metadata = test_responses_metadata_for_client(
-        &client,
-        /*turn_id*/ None,
-        format!("{}:0", client.state.thread_id),
-        /*parent_thread_id*/ None,
-        TestCodexResponsesRequestKind::Turn,
-    );
-    let mut session = client.new_session();
-    let auth_snapshot = session.capture_request_auth_snapshot().await?;
-    let mut history = ContextManager::new();
-    let first = history_test_item("first", None);
-    history.record_items([&first], TruncationPolicy::Tokens(10_000));
-    let prompt = Prompt {
-        base_instructions: BaseInstructions {
-            text: "base instructions".to_string(),
-        },
-        ..Default::default()
-    };
-    let image_capable_model = test_model_info();
-    let telemetry = test_session_telemetry();
-    let inference_trace = InferenceTraceContext::disabled();
-    let image_capable_history = history.prompt_snapshot(&image_capable_model.input_modalities);
-    let mut first_stream = session
-        .stream_with_history_snapshot(
-            &prompt,
-            &image_capable_history,
-            &auth_snapshot,
-            &image_capable_model,
-            &telemetry,
-            None,
-            codex_protocol::config_types::ReasoningSummary::None,
-            None,
-            &responses_metadata,
-            &inference_trace,
-        )
-        .await?;
-    while let Some(event) = first_stream.next().await {
-        event?;
-    }
-
-    let assistant = ResponseItem::Message {
-        id: Some("msg-1".to_string()),
-        role: "assistant".to_string(),
-        content: vec![ContentItem::OutputText {
-            text: "first done".to_string(),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let second = history_test_item("second", None);
-    history.record_items([&assistant, &second], TruncationPolicy::Tokens(10_000));
-    let mut text_only_model = image_capable_model.clone();
-    text_only_model.input_modalities = vec![codex_protocol::openai_models::InputModality::Text];
-    let text_only_history = history.prompt_snapshot(&text_only_model.input_modalities);
-    assert_ne!(
-        image_capable_history.policy_identity(),
-        text_only_history.policy_identity()
-    );
-    let mut second_stream = session
-        .stream_with_history_snapshot(
-            &prompt,
-            &text_only_history,
-            &auth_snapshot,
-            &text_only_model,
-            &telemetry,
-            None,
-            codex_protocol::config_types::ReasoningSummary::None,
-            None,
-            &responses_metadata,
-            &inference_trace,
-        )
-        .await?;
-    while let Some(event) = second_stream.next().await {
-        event?;
-    }
-    assert_eq!(text_only_history.materialization_count(), 1);
-
-    let connection = server.single_connection();
-    let second_request = connection
-        .get(1)
-        .expect("missing text-only request")
-        .body_json();
-    assert_eq!(second_request.get("previous_response_id"), None);
-    assert_eq!(
-        second_request
-            .get("input")
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(3)
-    );
-    server.shutdown().await;
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn production_responses_lite_history_continuation_formats_delta_without_materializing_history()
--> anyhow::Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    let server = start_websocket_server(vec![vec![
-        vec![
-            ev_response_created("resp-lite-1"),
-            ev_completed("resp-lite-1"),
-        ],
-        vec![
-            ev_response_created("resp-lite-2"),
-            ev_completed("resp-lite-2"),
-        ],
-    ]])
-    .await;
-    let auth_manager = AuthManager::from_auth_for_testing(CodexAuth::from_api_key("test-key"));
-    let mut provider = ModelProviderInfo::create_openai_provider(/*base_url*/ None);
-    provider.base_url = Some(format!("{}/v1", server.uri()));
-    provider.supports_websockets = true;
-    let client = ModelClient::new(
-        Some(auth_manager),
-        AgentIdentityAuthPolicy::JwtOnly,
-        ThreadId::new(),
-        provider,
-        SessionSource::Cli,
-        "test_originator".to_string(),
-        /*model_verbosity*/ None,
-        /*enable_request_compression*/ false,
-        /*include_timing_metrics*/ false,
-        /*beta_features_header*/ None,
-        /*item_ids_enabled*/ false,
-        /*concurrent_reasoning_summaries_enabled*/ false,
-        /*attestation_provider*/ None,
-        HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
-    );
-    let responses_metadata = test_responses_metadata_for_client(
-        &client,
-        /*turn_id*/ None,
-        format!("{}:0", client.state.thread_id),
-        /*parent_thread_id*/ None,
-        TestCodexResponsesRequestKind::Turn,
-    );
-    let mut session = client.new_session();
-    let auth_snapshot = session.capture_request_auth_snapshot().await?;
-    let mut history = ContextManager::new();
-    let first = history_test_item("first", None);
-    history.record_items([&first], TruncationPolicy::Tokens(10_000));
-    let prompt = Prompt {
-        base_instructions: BaseInstructions {
-            text: "base instructions".to_string(),
-        },
-        ..Default::default()
-    };
-    let mut model_info = test_model_info();
-    model_info.use_responses_lite = true;
-    let telemetry = test_session_telemetry();
-    let inference_trace = InferenceTraceContext::disabled();
-    let first_history = history.prompt_snapshot(&model_info.input_modalities);
-    let mut first_stream = session
-        .stream_with_history_snapshot(
-            &prompt,
-            &first_history,
-            &auth_snapshot,
-            &model_info,
-            &telemetry,
-            None,
-            codex_protocol::config_types::ReasoningSummary::None,
-            None,
-            &responses_metadata,
-            &inference_trace,
-        )
-        .await?;
-    while let Some(event) = first_stream.next().await {
-        event?;
-    }
-    assert_eq!(first_history.materialization_count(), 1);
-
-    let image = ResponseItem::Message {
-        id: None,
-        role: "user".to_string(),
-        content: vec![ContentItem::InputImage {
-            image_url: "https://example.com/image.png".to_string(),
-            detail: Some(ImageDetail::Original),
-        }],
-        phase: None,
-        internal_chat_message_metadata_passthrough: None,
-    };
-    history.record_items([&image], TruncationPolicy::Tokens(10_000));
-    let second_history = history.prompt_snapshot(&model_info.input_modalities);
-    let setup = session.client.current_client_setup().await?;
-    let direct_request = session.client.build_responses_request(
-        &setup.api_provider,
-        &prompt,
-        &model_info,
-        super::ResponsesRequestKind::Streaming,
-        None,
-        codex_protocol::config_types::ReasoningSummary::None,
-        None,
-        &responses_metadata,
-    )?;
-    let baseline = session
-        .websocket_session
-        .last_request_history
-        .clone()
-        .expect("first Responses Lite request history baseline");
-    assert_eq!(
-        baseline.mutation_revision,
-        Some(first_history.mutation_revision()),
-        "Responses Lite baseline must retain the logical history revision"
-    );
-    assert_eq!(
-        baseline.rewrite_revision,
-        Some(first_history.rewrite_revision()),
-        "Responses Lite baseline must retain the logical rewrite revision"
-    );
-    assert_eq!(
-        baseline.request_properties_fingerprint,
-        super::responses_request_properties_fingerprint(
-            &direct_request,
-            &auth_snapshot,
-            second_history.policy_identity(),
-            /*use_responses_lite*/ true,
-        )?,
-        "Responses Lite request properties must remain stable"
-    );
-    second_history
-        .incremental_proof(
-            baseline
-                .mutation_revision
-                .expect("baseline mutation revision"),
-            baseline
-                .rewrite_revision
-                .expect("baseline rewrite revision"),
-            baseline.request_prefix,
-            baseline.history_policy_identity,
-            &[],
-        )
-        .expect("logical Responses Lite snapshot should prove its suffix");
-    let direct_proof = session
-        .get_incremental_proof(
-            &direct_request,
-            Some(&second_history),
-            &auth_snapshot,
-            second_history.policy_identity(),
-            /*use_responses_lite*/ true,
-            &LastResponse {
-                response_id: "resp-lite-1".to_string(),
-                items_added: Vec::new(),
-            },
-            /*allow_empty_delta*/ true,
-        )
-        .expect("logical Responses Lite history should prove without materialization");
-    assert_eq!(direct_proof.input, vec![image.clone()]);
-    let mut second_stream = session
-        .stream_with_history_snapshot(
-            &prompt,
-            &second_history,
-            &auth_snapshot,
-            &model_info,
-            &telemetry,
-            None,
-            codex_protocol::config_types::ReasoningSummary::None,
-            None,
-            &responses_metadata,
-            &inference_trace,
-        )
-        .await?;
-    while let Some(event) = second_stream.next().await {
-        event?;
-    }
-
-    let connection = server.single_connection();
-    let second_request = connection
-        .get(1)
-        .expect("missing Responses Lite continuation")
-        .body_json();
-    assert_eq!(
-        second_request
-            .get("previous_response_id")
-            .and_then(Value::as_str),
-        Some("resp-lite-1")
-    );
-    let input = second_request
-        .get("input")
-        .and_then(Value::as_array)
-        .expect("Responses Lite delta input");
-    assert_eq!(input.len(), 1);
-    assert_eq!(input[0]["content"][0].get("detail"), None);
-    assert_eq!(second_history.materialization_count(), 0);
-    server.shutdown().await;
-    Ok(())
 }
 
 #[test]
@@ -1074,15 +227,15 @@ fn request_schema_serialization_cache_is_keyed_by_model_visible_schema() {
     };
 
     client
-        .request_schema_components(&prompt, None, ToolWireMode::Responses)
+        .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
         .expect("first serialization should succeed");
     client
-        .request_schema_components(&prompt, None, ToolWireMode::Responses)
+        .request_schema_components(&prompt, None, /*use_responses_lite*/ false)
         .expect("cached serialization should succeed");
     let mut changed = prompt;
     changed.output_schema = Some(json!({"type": "array"}));
     client
-        .request_schema_components(&changed, None, ToolWireMode::Responses)
+        .request_schema_components(&changed, None, /*use_responses_lite*/ false)
         .expect("changed schema should serialize independently");
 
     let cache = client
@@ -1093,91 +246,6 @@ fn request_schema_serialization_cache_is_keyed_by_model_visible_schema() {
     assert_eq!(cache.hits, 1);
     assert_eq!(cache.misses, 2);
     assert_eq!(cache.entries.len(), 2);
-}
-
-#[test]
-fn request_schema_serialization_cache_runs_one_same_key_factory() {
-    let cache = Arc::new(RequestSchemaSerializationCache::default());
-    let calls = Arc::new(AtomicUsize::new(0));
-    let start = Arc::new(Barrier::new(9));
-    let key = RequestSchemaCacheKey([7; 32]);
-    let mut threads = Vec::new();
-
-    for _ in 0..8 {
-        let cache = Arc::clone(&cache);
-        let calls = Arc::clone(&calls);
-        let start = Arc::clone(&start);
-        threads.push(std::thread::spawn(move || {
-            start.wait();
-            cache.get_or_insert_with(key, || {
-                calls.fetch_add(1, Ordering::SeqCst);
-                std::thread::sleep(Duration::from_millis(50));
-                RequestSchemaCacheValue {
-                    tools: ToolWireValue::TopLevel(Arc::<[serde_json::Value]>::from([])),
-                    text: None,
-                }
-            })
-        }));
-    }
-    start.wait();
-
-    for thread in threads {
-        thread.join().expect("request-schema worker");
-    }
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    let state = cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(state.entries.len(), 1);
-    assert!(state.flights.is_empty());
-}
-
-#[test]
-fn provider_schema_serialization_failure_stays_at_request_boundary_and_retries() {
-    for mode in [
-        ToolWireMode::Responses,
-        ToolWireMode::Compact,
-        ToolWireMode::ResponsesLite,
-    ] {
-        let client = test_model_client(SessionSource::Cli);
-        let tools = Arc::new(ToolSchemaBundle::new(Vec::new()));
-        tools.fail_next_wire_serialization(mode);
-        let prompt = Prompt {
-            tools: Arc::clone(&tools),
-            ..Prompt::default()
-        };
-
-        let error = client
-            .request_schema_components(&prompt, None, mode)
-            .expect_err("the injected provider-boundary serialization should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("injected tool-schema serialization failure")
-        );
-        {
-            let cache = client
-                .state
-                .request_schema_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(cache.misses, 0);
-            assert!(cache.entries.is_empty());
-            assert!(cache.flights.is_empty());
-        }
-
-        client
-            .request_schema_components(&prompt, None, mode)
-            .expect("a later request should retry and cache a successful product");
-        let cache = client
-            .state
-            .request_schema_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(cache.misses, 1);
-        assert_eq!(cache.entries.len(), 1);
-        assert!(cache.flights.is_empty());
-    }
 }
 
 #[tokio::test]

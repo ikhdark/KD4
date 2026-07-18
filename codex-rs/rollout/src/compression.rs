@@ -24,8 +24,8 @@ static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Starts a best-effort background job that compresses cold local rollout files.
 ///
 /// The worker is fire-and-forget: failures are logged, startup is not blocked,
-/// a run marker prevents overlap, and a persistent next-eligible timestamp
-/// prevents too-frequent compression runs from the same local store.
+/// and a run marker under `codex_home` prevents overlapping or too-frequent
+/// compression runs from the same local store.
 pub fn spawn_rollout_compression_worker(codex_home: PathBuf) {
     worker::spawn(codex_home)
 }
@@ -234,7 +234,6 @@ mod worker {
     use std::time::Duration;
     use std::time::Instant;
     use std::time::SystemTime;
-    use std::time::UNIX_EPOCH;
 
     use tracing::debug;
     use tracing::info;
@@ -253,11 +252,9 @@ mod worker {
     const COMPRESSION_LEVEL: i32 = 3;
     const MIN_ROLLOUT_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
     const RUN_MARKER_STALE_AFTER: Duration = Duration::from_secs(6 * 60 * 60);
-    const RUN_INTERVAL: Duration = RUN_MARKER_STALE_AFTER;
     const TEMP_FILE_STALE_AFTER: Duration = RUN_MARKER_STALE_AFTER;
     const WORKER_MAX_RUNTIME: Duration = Duration::from_secs(5 * 60 * 60);
     const RUN_MARKER_FILE_NAME: &str = "rollout-compression.lock";
-    const NEXT_ELIGIBLE_FILE_NAME: &str = "rollout-compression.next";
     const MAX_CONCURRENT_COMPRESSION_JOBS: usize = 2;
 
     #[derive(Default)]
@@ -310,6 +307,10 @@ mod worker {
                 remove_on_drop: true,
             }
         }
+
+        pub(super) fn persist(mut self) {
+            self.remove_on_drop = false;
+        }
     }
 
     impl Drop for CompressionRunMarker {
@@ -356,19 +357,6 @@ mod worker {
             }
         };
 
-        let now = SystemTime::now();
-        if read_next_eligible_time(codex_home.as_path())
-            .is_some_and(|next_eligible| next_eligible.duration_since(now).is_ok())
-        {
-            metrics::run("skipped_not_eligible");
-            debug!(
-                "rollout compression worker is not yet eligible for {}",
-                codex_home.display()
-            );
-            return Ok(());
-        }
-        write_next_eligible_time(codex_home.as_path(), now + RUN_INTERVAL)?;
-
         metrics::run("started");
         let started_at = Instant::now();
         let result = async {
@@ -400,32 +388,8 @@ mod worker {
         );
         metrics::run("completed");
         metrics::run_duration("completed", started_at.elapsed());
-        drop(marker);
+        marker.persist();
         Ok(())
-    }
-
-    pub(super) fn read_next_eligible_time(codex_home: &Path) -> Option<SystemTime> {
-        let seconds = std::fs::read_to_string(
-            codex_home.join(".tmp").join(NEXT_ELIGIBLE_FILE_NAME),
-        )
-        .ok()?
-        .trim()
-        .parse::<u64>()
-        .ok()?;
-        UNIX_EPOCH.checked_add(Duration::from_secs(seconds))
-    }
-
-    pub(super) fn write_next_eligible_time(
-        codex_home: &Path,
-        next_eligible: SystemTime,
-    ) -> io::Result<()> {
-        let marker_dir = codex_home.join(".tmp");
-        std::fs::create_dir_all(marker_dir.as_path())?;
-        let seconds = next_eligible
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        std::fs::write(marker_dir.join(NEXT_ELIGIBLE_FILE_NAME), seconds.to_string())
     }
 
     fn create_run_marker_file(path: &Path) -> io::Result<()> {

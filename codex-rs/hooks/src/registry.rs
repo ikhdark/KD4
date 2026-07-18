@@ -5,8 +5,6 @@ use tokio::process::Command;
 use crate::engine::ClaudeHooksEngine;
 use crate::engine::CommandShell;
 use crate::engine::HookListEntry;
-use crate::engine::dispatcher::HookMatchContext;
-use crate::engine::dispatcher::PreparedHookPlan;
 use crate::events::compact::PostCompactRequest;
 use crate::events::compact::PreCompactOutcome;
 use crate::events::compact::PreCompactRequest;
@@ -87,10 +85,6 @@ impl Hooks {
         self.engine.warnings()
     }
 
-    pub fn prepare(&self, context: HookMatchContext<'_>) -> PreparedHookPlan {
-        self.engine.prepare(context)
-    }
-
     fn hooks_for_event(&self, hook_event: &HookEvent) -> &[Hook] {
         match hook_event {
             HookEvent::AfterAgent { .. } => &self.after_agent,
@@ -148,27 +142,8 @@ impl Hooks {
         self.engine.run_session_start(request, turn_id).await
     }
 
-    pub async fn run_session_start_with_plan(
-        &self,
-        plan: PreparedHookPlan,
-        request: SessionStartRequest,
-        turn_id: Option<String>,
-    ) -> SessionStartOutcome {
-        self.engine
-            .run_session_start_with_plan(plan, request, turn_id)
-            .await
-    }
-
     pub async fn run_pre_tool_use(&self, request: PreToolUseRequest) -> PreToolUseOutcome {
         self.engine.run_pre_tool_use(request).await
-    }
-
-    pub async fn run_pre_tool_use_with_plan(
-        &self,
-        plan: PreparedHookPlan,
-        request: PreToolUseRequest,
-    ) -> PreToolUseOutcome {
-        self.engine.run_pre_tool_use_with_plan(plan, request).await
     }
 
     pub async fn run_permission_request(
@@ -178,26 +153,8 @@ impl Hooks {
         self.engine.run_permission_request(request).await
     }
 
-    pub async fn run_permission_request_with_plan(
-        &self,
-        plan: PreparedHookPlan,
-        request: PermissionRequestRequest,
-    ) -> PermissionRequestOutcome {
-        self.engine
-            .run_permission_request_with_plan(plan, request)
-            .await
-    }
-
     pub async fn run_post_tool_use(&self, request: PostToolUseRequest) -> PostToolUseOutcome {
         self.engine.run_post_tool_use(request).await
-    }
-
-    pub async fn run_post_tool_use_with_plan(
-        &self,
-        plan: PreparedHookPlan,
-        request: PostToolUseRequest,
-    ) -> PostToolUseOutcome {
-        self.engine.run_post_tool_use_with_plan(plan, request).await
     }
 
     pub fn preview_pre_compact(
@@ -211,14 +168,6 @@ impl Hooks {
         self.engine.run_pre_compact(request).await
     }
 
-    pub async fn run_pre_compact_with_plan(
-        &self,
-        plan: PreparedHookPlan,
-        request: PreCompactRequest,
-    ) -> PreCompactOutcome {
-        self.engine.run_pre_compact_with_plan(plan, request).await
-    }
-
     pub fn preview_post_compact(
         &self,
         request: &PostCompactRequest,
@@ -228,14 +177,6 @@ impl Hooks {
 
     pub async fn run_post_compact(&self, request: PostCompactRequest) -> StatelessHookOutcome {
         self.engine.run_post_compact(request).await
-    }
-
-    pub async fn run_post_compact_with_plan(
-        &self,
-        plan: PreparedHookPlan,
-        request: PostCompactRequest,
-    ) -> StatelessHookOutcome {
-        self.engine.run_post_compact_with_plan(plan, request).await
     }
 
     pub fn preview_user_prompt_submit(
@@ -252,16 +193,6 @@ impl Hooks {
         self.engine.run_user_prompt_submit(request).await
     }
 
-    pub async fn run_user_prompt_submit_with_plan(
-        &self,
-        plan: PreparedHookPlan,
-        request: UserPromptSubmitRequest,
-    ) -> UserPromptSubmitOutcome {
-        self.engine
-            .run_user_prompt_submit_with_plan(plan, request)
-            .await
-    }
-
     pub fn preview_stop(
         &self,
         request: &StopRequest,
@@ -271,14 +202,6 @@ impl Hooks {
 
     pub async fn run_stop(&self, request: StopRequest) -> StopOutcome {
         self.engine.run_stop(request).await
-    }
-
-    pub async fn run_stop_with_plan(
-        &self,
-        plan: PreparedHookPlan,
-        request: StopRequest,
-    ) -> StopOutcome {
-        self.engine.run_stop_with_plan(plan, request).await
     }
 }
 

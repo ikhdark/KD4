@@ -1,15 +1,13 @@
 use super::CHANNEL_CAPACITY;
 use super::ConnectionOrigin;
 use super::TransportEvent;
-use super::forward_parsed_incoming_message;
+use super::forward_incoming_message;
 use super::next_connection_id;
-use super::parse_incoming_message;
 use super::serialize_outgoing_message;
 use crate::outgoing_message::QueuedOutgoingMessage;
 use codex_app_server_protocol::InitializeParams;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCRequest;
-use serde::Deserialize;
 use std::io::ErrorKind;
 use std::io::Result as IoResult;
 use tokio::io;
@@ -51,19 +49,16 @@ pub async fn start_stdio_connection(
         loop {
             match lines.next_line().await {
                 Ok(Some(line)) => {
-                    let Some(message) = parse_incoming_message(&line) else {
-                        continue;
-                    };
-                    if let Some(client_name) = stdio_initialize_client_name(&message)
+                    if let Some(client_name) = stdio_initialize_client_name(&line)
                         && let Some(initialize_client_name_tx) = initialize_client_name_tx.take()
                     {
                         let _ = initialize_client_name_tx.send(client_name);
                     }
-                    if !forward_parsed_incoming_message(
+                    if !forward_incoming_message(
                         &transport_event_tx_for_reader,
                         &writer_tx_for_reader,
                         connection_id,
-                        message,
+                        &line,
                     )
                     .await
                     {
@@ -111,143 +106,14 @@ pub async fn start_stdio_connection(
     Ok(())
 }
 
-fn stdio_initialize_client_name(message: &JSONRPCMessage) -> Option<String> {
+fn stdio_initialize_client_name(line: &str) -> Option<String> {
+    let message = serde_json::from_str::<JSONRPCMessage>(line).ok()?;
     let JSONRPCMessage::Request(JSONRPCRequest { method, params, .. }) = message else {
         return None;
     };
     if method != "initialize" {
         return None;
     }
-    let params = InitializeParams::deserialize(params.as_ref()?).ok()?;
+    let params = serde_json::from_value::<InitializeParams>(params?).ok()?;
     Some(params.client_info.name)
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::outgoing_message::ConnectionId;
-    use codex_app_server_protocol::JSONRPCMessage;
-    use pretty_assertions::assert_eq;
-    use serde_json::json;
-    use tokio::sync::mpsc;
-
-    use super::TransportEvent;
-    use super::forward_parsed_incoming_message;
-    use super::parse_incoming_message;
-    use super::stdio_initialize_client_name;
-
-    #[test]
-    fn initialize_client_name_is_read_from_the_borrowed_message() {
-        let message: JSONRPCMessage = serde_json::from_value(json!({
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "clientInfo": {
-                    "name": "test-client",
-                    "version": "1.0.0"
-                },
-                "capabilities": {},
-                "unknownNestedField": { "preserved": true }
-            }
-        }))
-        .expect("initialize request should deserialize");
-        let before = message.clone();
-
-        assert_eq!(
-            stdio_initialize_client_name(&message),
-            Some("test-client".to_string())
-        );
-        assert_eq!(message, before);
-    }
-
-    #[test]
-    fn non_initialize_messages_do_not_produce_a_client_name() {
-        let message: JSONRPCMessage = serde_json::from_value(json!({
-            "method": "initialized",
-            "params": { "unknownNestedField": true }
-        }))
-        .expect("notification should deserialize");
-
-        assert_eq!(stdio_initialize_client_name(&message), None);
-    }
-
-    #[tokio::test]
-    async fn parsed_messages_forward_once_with_unknown_nested_data_intact() {
-        let request_params = json!({
-            "known": true,
-            "unknownNested": { "array": [1, { "deep": "request" }] }
-        });
-        let response_result = json!({
-            "known": true,
-            "unknownNested": { "array": [2, { "deep": "response" }] }
-        });
-        let error_data = json!({
-            "known": true,
-            "unknownNested": { "array": [3, { "deep": "error" }] }
-        });
-        let payloads = [
-            json!({
-                "id": 1,
-                "method": "example/request",
-                "params": request_params,
-                "unknownTopLevel": "ignored"
-            }),
-            json!({
-                "id": 2,
-                "result": response_result,
-                "unknownTopLevel": "ignored"
-            }),
-            json!({
-                "id": 3,
-                "error": {
-                    "code": -32000,
-                    "message": "example error",
-                    "data": error_data
-                },
-                "unknownTopLevel": "ignored"
-            }),
-        ];
-        let (transport_event_tx, mut transport_event_rx) = mpsc::channel(payloads.len());
-        let (writer_tx, _writer_rx) = mpsc::channel(1);
-        let connection_id = ConnectionId(42);
-
-        for (payload_index, payload) in payloads.into_iter().enumerate() {
-            let message = parse_incoming_message(&payload.to_string())
-                .expect("JSON-RPC payload should parse once");
-            let expected = message.clone();
-            assert!(
-                forward_parsed_incoming_message(
-                    &transport_event_tx,
-                    &writer_tx,
-                    connection_id,
-                    message,
-                )
-                .await
-            );
-
-            let TransportEvent::IncomingMessage {
-                connection_id: forwarded_connection_id,
-                message: forwarded,
-            } = transport_event_rx
-                .recv()
-                .await
-                .expect("forwarded transport event")
-            else {
-                panic!("expected incoming-message transport event");
-            };
-            assert_eq!(forwarded_connection_id, connection_id);
-            assert_eq!(forwarded, expected);
-            match (payload_index, &forwarded) {
-                (0, JSONRPCMessage::Request(request)) => {
-                    assert_eq!(request.params.as_ref(), Some(&request_params));
-                }
-                (1, JSONRPCMessage::Response(response)) => {
-                    assert_eq!(&response.result, &response_result);
-                }
-                (2, JSONRPCMessage::Error(error)) => {
-                    assert_eq!(error.error.data.as_ref(), Some(&error_data));
-                }
-                _ => panic!("forwarded JSON-RPC variant changed"),
-            }
-        }
-    }
 }

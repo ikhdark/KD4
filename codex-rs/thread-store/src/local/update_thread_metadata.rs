@@ -1635,10 +1635,6 @@ mod tests {
         )
         .await
         .expect("state db should initialize");
-        runtime
-            .mark_backfill_complete(/*last_watermark*/ None)
-            .await
-            .expect("completed index for state-db filter test");
         let store = LocalThreadStore::new(config, Some(runtime.clone()));
         let uuid = Uuid::from_u128(316);
         let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");

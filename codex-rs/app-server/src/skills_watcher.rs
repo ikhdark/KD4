@@ -6,7 +6,6 @@ use crate::outgoing_message::OutgoingMessageSender;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::SkillsChangedNotification;
 use codex_core::ThreadManager;
-use codex_core::ThreadConfigSnapshot;
 use codex_core::config::Config;
 use codex_core::skills::SkillsLoadInput;
 use codex_core::skills::SkillsService;
@@ -16,6 +15,7 @@ use codex_file_watcher::Receiver;
 use codex_file_watcher::ThrottledWatchReceiver;
 use codex_file_watcher::WatchPath;
 use codex_file_watcher::WatchRegistration;
+use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio_util::sync::CancellationToken;
 use tokio_util::sync::DropGuard;
@@ -81,9 +81,9 @@ impl SkillsWatcher {
         &self,
         config: &Config,
         thread_manager: &ThreadManager,
-        config_snapshot: &ThreadConfigSnapshot,
+        environments: &[TurnEnvironmentSelection],
     ) -> WatchRegistration {
-        let Some(environment_selection) = config_snapshot.environment_selections().first() else {
+        let Some(environment_selection) = environments.first() else {
             return WatchRegistration::default();
         };
         let Some(environment) = thread_manager
@@ -99,27 +99,17 @@ impl SkillsWatcher {
         if environment.is_remote() {
             return WatchRegistration::default();
         }
-        let discovery_cwd = match environment_selection.cwd.to_abs_path() {
-            Ok(cwd) => cwd,
-            Err(err) => {
-                warn!(
-                    "failed to register skills watcher for non-local cwd `{}`: {err}",
-                    environment_selection.cwd
-                );
-                return WatchRegistration::default();
-            }
-        };
 
         let plugins_input = config.plugins_config_input();
         let plugins_manager = thread_manager.plugins_manager();
         let plugin_outcome = plugins_manager.plugins_for_config(&plugins_input).await;
         let skills_input = SkillsLoadInput::new(
-            discovery_cwd.clone(),
+            config.cwd.clone(),
             plugin_outcome.effective_plugin_skill_roots(),
             config.config_layer_stack.clone(),
             config.bundled_skills_enabled(),
         );
-        let mut roots = thread_manager
+        let roots = thread_manager
             .skills_service()
             .skill_roots_for_config(&skills_input, Some(environment.get_filesystem()))
             .await
@@ -130,29 +120,7 @@ impl SkillsWatcher {
                 path: root.path.into_path_buf(),
                 recursive: true,
             })
-            .collect::<Vec<_>>();
-        let project_root_markers =
-            codex_core::skills::loader::project_root_markers_from_stack(
-                &config.config_layer_stack,
-            );
-        for ancestor in discovery_cwd.ancestors() {
-            // Register missing discovery paths too. FileWatcher falls back to an existing ancestor
-            // and migrates the watch as path components are created.
-            roots.push(WatchPath {
-                path: ancestor.join(".agents").join("skills").into_path_buf(),
-                recursive: true,
-            });
-            roots.extend(project_root_markers.iter().map(|marker| WatchPath {
-                path: ancestor.join(marker).into_path_buf(),
-                recursive: false,
-            }));
-        }
-        roots.sort_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then_with(|| left.recursive.cmp(&right.recursive))
-        });
-        roots.dedup();
+            .collect();
         self.subscriber.register_paths(roots)
     }
 
@@ -173,10 +141,10 @@ impl SkillsWatcher {
                     _ = shutdown_token.cancelled() => break,
                     event = rx.recv() => event,
                 };
-                let Some(event) = event else {
+                if event.is_none() {
                     break;
-                };
-                skills_service.invalidate_paths(&event.paths);
+                }
+                skills_service.clear_cache();
                 outgoing
                     .send_server_notification(ServerNotification::SkillsChanged(
                         SkillsChangedNotification {},

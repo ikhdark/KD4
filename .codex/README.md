@@ -9,25 +9,23 @@ default.
 | Need | Authoritative file |
 | --- | --- |
 | Edit anything under `.codex` | [`AGENTS.md`](AGENTS.md) |
-| Configure KD4 subagent roles, limits, and reasoning | [`config.toml`](config.toml) and [`agents/`](agents/) |
 | Prepare ignored files for a Codex worktree | [`environments/README.md`](environments/README.md) |
-| Preserve task context, evidence, an eval, audit, or handoff | [`skills/kd4-harness/SKILL.md`](skills/kd4-harness/SKILL.md) |
+| Plan or preserve evidence for a durable task | [`harness/README.md`](harness/README.md) |
 | Implement or change KD4 repository behavior | [`../AGENTS.md`](../AGENTS.md) |
-| Resolve ambiguous or cross-cutting source ownership | [`../SOURCEMAP.md`](../SOURCEMAP.md) |
+| Follow the optional durable-artifact lifecycle | [`harness/workflow.md`](harness/workflow.md) |
+| Create, audit, or run durable harness artifacts | [`skills/kd4-harness/SKILL.md`](skills/kd4-harness/SKILL.md) |
 
-Use the smallest relevant surface. The harness skill owns the optional artifact
-format and its context-loading routes. It creates only the files a task needs
-under ignored `.codex/harness/runs/`; there are no standing harness templates to
-load. Routine work does not need a run directory.
+Use the smallest relevant surface. Routine work does not need a harness run
+directory, and the harness skill should load only when durable workflow state or
+harness maintenance is actually requested.
 
 ## Source And State Boundary
 
-Durable policy, agent roles, environment source, and fork-local skills are
-reviewable source.
-Generated runs, verification output, app backups, patched-app trees, and Wiring
-Guard sessions are local state; the exact boundary is owned by
+Durable policy, templates, environment source, and fork-local skills are
+reviewable source. Generated runs, verification output, app backups, patched-app
+trees, and Wiring Guard sessions are local state; the exact boundary is owned by
 [`AGENTS.md`](AGENTS.md).
 
-Project-local runtime configuration lives in `.codex/config.toml`. Project
-subagent definitions live in `.codex/agents/` and inherit the parent model and
-permission mode unless their agent file overrides a supported setting.
+Project-local runtime configuration may be added as `.codex/config.toml` only
+when this checkout needs an explicit setting. Its absence is intentional and is
+not a missing setup step.

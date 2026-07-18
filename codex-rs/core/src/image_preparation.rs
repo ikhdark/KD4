@@ -75,64 +75,6 @@ pub(crate) fn prepare_response_items(items: &mut [ResponseItem]) {
     }
 }
 
-pub(crate) fn response_items_need_preparation(items: &[ResponseItem]) -> bool {
-    items.iter().any(|item| match item {
-        ResponseItem::Message { content, .. } => content.iter().any(|item| match item {
-            ContentItem::InputImage { image_url, .. } => {
-                is_remote_image_url(image_url) || is_data_url(image_url)
-            }
-            ContentItem::InputText { .. } | ContentItem::OutputText { .. } => false,
-        }),
-        ResponseItem::FunctionCallOutput { output, .. }
-        | ResponseItem::CustomToolCallOutput { output, .. } => {
-            output.content_items().is_some_and(|content| {
-                content.iter().any(|item| match item {
-                    FunctionCallOutputContentItem::InputImage { image_url, .. } => {
-                        is_remote_image_url(image_url) || is_data_url(image_url)
-                    }
-                    FunctionCallOutputContentItem::InputText { .. }
-                    | FunctionCallOutputContentItem::EncryptedContent { .. } => false,
-                })
-            })
-        }
-        _ => false,
-    })
-}
-
-/// Prepares an owned vector off the async executor and publishes only the complete result.
-pub(crate) async fn prepare_response_items_owned(
-    items: Vec<ResponseItem>,
-) -> Result<Vec<ResponseItem>, tokio::task::JoinError> {
-    if !response_items_need_preparation(&items) {
-        return Ok(items);
-    }
-    prepare_response_items_owned_with(items, prepare_response_items).await
-}
-
-async fn prepare_response_items_owned_with(
-    mut items: Vec<ResponseItem>,
-    prepare: impl FnOnce(&mut [ResponseItem]) + Send + 'static,
-) -> Result<Vec<ResponseItem>, tokio::task::JoinError> {
-    await_response_items_preparation(tokio::task::spawn_blocking(move || {
-        prepare(&mut items);
-        items
-    }))
-    .await
-}
-
-async fn await_response_items_preparation(
-    task: tokio::task::JoinHandle<Vec<ResponseItem>>,
-) -> Result<Vec<ResponseItem>, tokio::task::JoinError> {
-    match task.await {
-        Ok(items) => Ok(items),
-        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-        Err(error) => {
-            warn!(%error, "image preparation task was cancelled");
-            Err(error)
-        }
-    }
-}
-
 fn prepare_message_content(items: &mut [ContentItem]) {
     for item in items {
         if let ContentItem::InputImage { image_url, detail } = item

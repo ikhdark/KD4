@@ -168,8 +168,6 @@ pub struct ReadParams {
     pub process_id: ProcessId,
     pub after_seq: Option<u64>,
     pub max_bytes: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_chunks: Option<usize>,
     pub wait_ms: Option<u64>,
 }
 
@@ -181,25 +179,10 @@ pub struct ProcessOutputChunk {
     pub chunk: ByteChunk,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OutputGap {
-    pub first_missing_seq: u64,
-    pub last_missing_seq: u64,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadResponse {
     pub chunks: Vec<ProcessOutputChunk>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub output_gaps: Vec<OutputGap>,
-    /// First output sequence still replayable, or `next_seq` when none is retained.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub earliest_retained_seq: Option<u64>,
-    /// Whether this page reached the retained-output snapshot boundary.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub complete: Option<bool>,
     pub next_seq: u64,
     pub exited: bool,
     pub exit_code: Option<i32>,
@@ -587,17 +570,13 @@ mod tests {
     use super::ExecParams;
     use super::FsReadFileParams;
     use super::HttpRequestParams;
-    use super::OutputGap;
     use super::ProcessId;
-    use super::ReadParams;
-    use super::ReadResponse;
     use super::ShellInfo;
     use codex_file_system::FileSystemSandboxContext;
     use codex_network_proxy::ManagedNetworkSandboxContext;
     use codex_protocol::models::PermissionProfile;
     use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
-    use serde::Deserialize;
     use std::collections::HashMap;
 
     #[test]
@@ -743,126 +722,5 @@ mod tests {
         .expect("legacy exited notification should deserialize");
 
         assert_eq!(notification.sandbox_denied, None);
-    }
-
-    #[test]
-    fn read_protocol_is_compatible_in_both_directions() {
-        let old_response = serde_json::json!({
-            "chunks": [],
-            "nextSeq": 1,
-            "exited": false,
-            "exitCode": null,
-            "closed": false,
-            "failure": null,
-            "sandboxDenied": false,
-        });
-        let decoded: ReadResponse =
-            serde_json::from_value(old_response).expect("new client decodes old response");
-        assert!(decoded.output_gaps.is_empty());
-        assert_eq!(decoded.earliest_retained_seq, None);
-        assert_eq!(decoded.complete, None);
-
-        let new_response = ReadResponse {
-            chunks: Vec::new(),
-            output_gaps: vec![
-                OutputGap {
-                    first_missing_seq: 2,
-                    last_missing_seq: 4,
-                },
-                OutputGap {
-                    first_missing_seq: 8,
-                    last_missing_seq: 9,
-                },
-            ],
-            earliest_retained_seq: Some(5),
-            complete: Some(true),
-            next_seq: 10,
-            exited: false,
-            exit_code: None,
-            closed: false,
-            failure: None,
-            sandbox_denied: false,
-        };
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct OldReadResponse {
-            next_seq: u64,
-            closed: bool,
-        }
-        let old_client: OldReadResponse = serde_json::from_value(
-            serde_json::to_value(&new_response).expect("serialize new response"),
-        )
-        .expect("old client ignores new recovery fields");
-        assert_eq!(old_client.next_seq, 10);
-        assert!(!old_client.closed);
-        let encoded = serde_json::to_value(new_response).expect("serialize recovery contract");
-        assert_eq!(encoded["earliestRetainedSeq"], 5);
-        assert_eq!(encoded["complete"], true);
-
-        let old_request = serde_json::json!({
-            "processId": "proc-old",
-            "afterSeq": null,
-            "maxBytes": 65536,
-            "waitMs": 0,
-        });
-        let decoded: ReadParams =
-            serde_json::from_value(old_request).expect("new server decodes old request");
-        assert_eq!(decoded.max_chunks, None);
-
-        #[derive(Deserialize)]
-        #[serde(rename_all = "camelCase")]
-        struct OldReadParams {
-            process_id: ProcessId,
-            max_bytes: Option<usize>,
-        }
-        let new_request = ReadParams {
-            process_id: ProcessId::from("proc-new"),
-            after_seq: Some(3),
-            max_bytes: Some(65_536),
-            max_chunks: Some(128),
-            wait_ms: Some(0),
-        };
-        let old_server: OldReadParams = serde_json::from_value(
-            serde_json::to_value(new_request).expect("serialize new request"),
-        )
-        .expect("old server ignores maxChunks");
-        assert_eq!(old_server.process_id, ProcessId::from("proc-new"));
-        assert_eq!(old_server.max_bytes, Some(65_536));
-    }
-
-    #[test]
-    fn read_protocol_omits_empty_optional_fields_and_ignores_unknown_fields() {
-        let params = ReadParams {
-            process_id: ProcessId::from("proc-defaults"),
-            after_seq: None,
-            max_bytes: None,
-            max_chunks: None,
-            wait_ms: None,
-        };
-        let serialized = serde_json::to_value(params).expect("serialize read params");
-        assert!(serialized.get("maxChunks").is_none());
-
-        let response = ReadResponse {
-            chunks: Vec::new(),
-            output_gaps: Vec::new(),
-            earliest_retained_seq: None,
-            complete: None,
-            next_seq: 1,
-            exited: false,
-            exit_code: None,
-            closed: false,
-            failure: None,
-            sandbox_denied: false,
-        };
-        let serialized = serde_json::to_value(response).expect("serialize read response");
-        assert!(serialized.get("outputGaps").is_none());
-        assert!(serialized.get("earliestRetainedSeq").is_none());
-        assert!(serialized.get("complete").is_none());
-
-        let mut with_unknown = serialized;
-        with_unknown["futureField"] = serde_json::json!({"ignored": true});
-        let decoded: ReadResponse =
-            serde_json::from_value(with_unknown).expect("unknown response fields are ignored");
-        assert!(decoded.output_gaps.is_empty());
     }
 }

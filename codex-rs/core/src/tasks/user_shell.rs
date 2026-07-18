@@ -253,8 +253,6 @@ pub(crate) async fn execute_user_shell_command(
                 stdout: StreamOutput::new(String::new()),
                 stderr: StreamOutput::new(aborted_message.clone()),
                 aggregated_output: StreamOutput::new(aborted_message.clone()),
-                aggregated_output_bytes: Some(aborted_message.as_bytes().to_vec()),
-                output_complete: true,
                 duration: Duration::ZERO,
                 timed_out: false,
             };
@@ -329,8 +327,6 @@ pub(crate) async fn execute_user_shell_command(
                 stdout: StreamOutput::new(String::new()),
                 stderr: StreamOutput::new(message.clone()),
                 aggregated_output: StreamOutput::new(message.clone()),
-                aggregated_output_bytes: Some(message.as_bytes().to_vec()),
-                output_complete: true,
                 duration: Duration::ZERO,
                 timed_out: false,
             };

@@ -196,16 +196,12 @@ impl AccountRequestProcessor {
         thread_manager: &Arc<ThreadManager>,
         auth: Option<CodexAuth>,
     ) {
-        let plugins_manager = thread_manager.plugins_manager();
-        plugins_manager.set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
-        plugins_manager.clear_featured_plugin_ids_cache();
-        plugins_manager.clear_recommended_plugins_cache();
-        if plugins_manager.clear_remote_installed_plugins_cache_for_auth(auth.as_ref()) {
-            Self::spawn_effective_plugins_changed_task(
-                Arc::clone(thread_manager),
-                config_manager.clone(),
-            );
-        }
+        thread_manager
+            .plugins_manager()
+            .set_auth_mode(auth.as_ref().map(CodexAuth::api_auth_mode));
+        thread_manager
+            .plugins_manager()
+            .clear_recommended_plugins_cache();
 
         match config_manager
             .load_latest_config(/*fallback_cwd*/ None)
@@ -240,9 +236,7 @@ impl AccountRequestProcessor {
         config_manager: ConfigManager,
     ) {
         tokio::spawn(async move {
-            thread_manager
-                .plugins_manager()
-                .clear_effective_plugins_cache();
+            thread_manager.plugins_manager().clear_cache();
             thread_manager.skills_service().clear_cache();
             if thread_manager.list_thread_ids().await.is_empty() {
                 return;

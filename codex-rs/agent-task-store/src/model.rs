@@ -14,11 +14,18 @@ use crate::StoreError;
 use crate::StoreResult;
 use crate::WakeEventId;
 use crate::normalize_repo_scopes;
+use crate::scope::repository_identity;
 
 pub const DEFAULT_OBSERVATION_LIMIT: usize = 20;
 pub const MAX_OBSERVATION_LIMIT: usize = 100;
 pub const MAX_WAKE_EVENTS_PER_ROOT: usize = 256;
 pub const MAX_WAKE_EVENTS_PER_READ: usize = 50;
+pub const DEFAULT_BINDING_LIMIT: usize = 100;
+pub const MAX_BINDING_LIMIT: usize = 256;
+pub const DEFAULT_MUTATION_EVIDENCE_LIMIT: usize = 20;
+pub const MAX_MUTATION_EVIDENCE_LIMIT: usize = 100;
+pub const DEFAULT_SNAPSHOT_CHUNK_BYTES: usize = 64 * 1024;
+pub const MAX_SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -144,6 +151,7 @@ impl AssignmentDraft {
         Ok(Assignment {
             assignment_id: AssignmentId::new(),
             root_session_id: self.root_session_id,
+            repository_id: repository_identity(repo_root)?.id,
             role: self.role,
             capability_profile: self.capability_profile,
             objective: self.objective,
@@ -165,6 +173,10 @@ impl AssignmentDraft {
 pub struct Assignment {
     pub assignment_id: AssignmentId,
     pub root_session_id: String,
+    /// Stable hash of the canonical repository root. The private absolute root is stored
+    /// separately and is never included in task-facing assignment JSON.
+    #[serde(default)]
+    pub repository_id: String,
     pub role: AgentRole,
     pub capability_profile: CapabilityProfile,
     pub objective: String,
@@ -303,6 +315,16 @@ pub enum ValidationCallStatus {
     Cancelled,
 }
 
+impl ValidationCallStatus {
+    pub fn is_terminal(self) -> bool {
+        self != Self::Running
+    }
+
+    pub fn is_success(self) -> bool {
+        self == Self::Succeeded
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ValidationCall {
     pub call_id: String,
@@ -404,7 +426,11 @@ impl GateKind {
 
 impl std::fmt::Display for GateKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}", serde_json::to_value(self).unwrap_or_default())
+        write!(
+            formatter,
+            "{}",
+            serde_json::to_value(self).unwrap_or_default()
+        )
     }
 }
 
@@ -469,11 +495,54 @@ pub struct MutationEvidence {
     pub pre_write_hash: Option<String>,
     pub pre_write_existed: bool,
     pub final_hash: Option<String>,
+    #[serde(default)]
+    pub final_write_existed: Option<bool>,
     pub mutation_event_ids: Vec<MutationEventId>,
     pub attribution_confidence: AttributionConfidence,
     pub snapshot_retained: bool,
     pub first_observed_at: DateTime<Utc>,
     pub finalized_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationSnapshotVersion {
+    PreWrite,
+    Final,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MutationSnapshotChunk {
+    pub assignment_id: AssignmentId,
+    pub attempt_id: AttemptId,
+    pub path: String,
+    pub version: MutationSnapshotVersion,
+    pub existed: bool,
+    pub offset: u64,
+    pub total_bytes: u64,
+    pub bytes: Vec<u8>,
+    pub next_offset: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTaskBindingDraft {
+    pub assignment_id: AssignmentId,
+    pub attempt_id: AttemptId,
+    pub agent_path: String,
+    pub task_name: String,
+    pub thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentTaskBinding {
+    pub assignment_id: AssignmentId,
+    pub attempt_id: AttemptId,
+    pub root_session_id: String,
+    pub agent_path: String,
+    pub task_name: String,
+    pub thread_id: Option<String>,
+    pub bound_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -660,8 +729,10 @@ fn validate_role_relation(
                     "integrators require an integration relation".to_string(),
                 ));
             };
+            let unique_targets: HashSet<_> = relation.target_assignment_ids.iter().collect();
             if relation.kind != RelationKind::Integration
                 || relation.target_assignment_ids.is_empty()
+                || unique_targets.len() != relation.target_assignment_ids.len()
                 || !relation_targets_are_dependencies(relation)
             {
                 return Err(StoreError::InvalidAssignment(

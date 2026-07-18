@@ -338,19 +338,6 @@ pub enum LaunchErrorKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct ExactOutputArtifactV2 {
-    pub sha256: String,
-    pub path: PathBuf,
-    pub bytes: u64,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct OutputOmissionV2 {
-    pub bytes: u64,
-    pub lines: u64,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CommandResultV2 {
     pub schema_version: u64,
     pub invocation_id: String,
@@ -367,10 +354,6 @@ pub struct CommandResultV2 {
     pub log_state: LogState,
     pub log_path: Option<PathBuf>,
     pub diagnostic: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exact_output_artifact: Option<ExactOutputArtifactV2>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub diagnostic_omission: Option<OutputOmissionV2>,
     pub cached: bool,
     pub flaky: bool,
     pub baseline: Option<String>,

@@ -10,8 +10,6 @@ use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::multi_agents_common::*;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::registry::CoreToolRuntime;
-use crate::tools::registry::ToolCallAdmission;
-use crate::tools::registry::ToolConflictKey;
 use crate::tools::registry::ToolExecutor;
 use codex_protocol::AgentPath;
 use codex_protocol::items::CollabAgentTool;

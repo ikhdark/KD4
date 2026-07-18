@@ -3,25 +3,18 @@ use std::os::unix::process::ExitStatusExt;
 
 use std::collections::HashMap;
 use std::io;
-use std::io::SeekFrom;
 #[cfg(target_os = "windows")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitStatus;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use async_channel::Sender;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
-use tokio::io::AsyncSeekExt;
-use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
-use tokio::sync::Mutex as TokioMutex;
-use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::sandboxing::ExecOptions;
@@ -30,7 +23,6 @@ use crate::sandboxing::SandboxPermissions;
 use crate::spawn::SpawnChildRequest;
 use crate::spawn::StdioPolicy;
 use crate::spawn::spawn_child_async;
-use crate::unified_exec::head_tail_buffer::HeadTailBuffer;
 use codex_network_proxy::NetworkProxy;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
@@ -62,48 +54,8 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
 use codex_utils_pty::process_group::kill_child_process_group;
-use serde::Serialize;
 
-pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ExecCommandOutcome {
-    CompletedSuccess,
-    CompletedFailure,
-    Running,
-    TimedOut,
-    Cancelled,
-    LaunchFailed,
-}
-
-impl ExecCommandOutcome {
-    pub(crate) fn from_process_facts(
-        process_id: Option<i32>,
-        exit_code: Option<i32>,
-        timed_out: bool,
-        cancelled: bool,
-        launch_failed: bool,
-    ) -> Self {
-        if launch_failed {
-            Self::LaunchFailed
-        } else if cancelled {
-            Self::Cancelled
-        } else if timed_out {
-            Self::TimedOut
-        } else if process_id.is_some() {
-            Self::Running
-        } else if exit_code == Some(0) {
-            Self::CompletedSuccess
-        } else {
-            Self::CompletedFailure
-        }
-    }
-
-    pub(crate) fn is_success(self) -> bool {
-        matches!(self, Self::CompletedSuccess | Self::Running)
-    }
-}
+pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
 
 // Hardcode these since it does not seem worth including the libc crate just
 // for these.
@@ -135,7 +87,6 @@ pub(crate) const MAX_EXEC_OUTPUT_DELTAS_PER_CALL: usize = 10_000;
 // That would cause the `read_capped` tasks to block on `read()`
 // indefinitely, effectively hanging the whole agent.
 pub const IO_DRAIN_TIMEOUT_MS: u64 = 2_000; // 2 s should be plenty for local pipes
-const IO_DRAIN_INCOMPLETE_MARKER: &[u8] = b"\n[output incomplete: stdout/stderr drain timed out]\n";
 
 #[derive(Debug)]
 pub struct ExecParams {
@@ -161,9 +112,6 @@ pub enum ExecCapturePolicy {
     /// Trusted internal helpers can buffer the full child output in memory
     /// without the shell-oriented output cap or exec-expiration behavior.
     FullBuffer,
-    /// Proof-bearing validation keeps exact output while still honoring the
-    /// command's timeout or cancellation contract.
-    Verification,
 }
 
 fn select_process_exec_tool_sandbox_type(
@@ -322,7 +270,7 @@ impl ExecCapturePolicy {
     fn retained_bytes_cap(self) -> Option<usize> {
         match self {
             Self::ShellTool => Some(EXEC_OUTPUT_MAX_BYTES),
-            Self::FullBuffer | Self::Verification => None,
+            Self::FullBuffer => None,
         }
     }
 
@@ -332,7 +280,7 @@ impl ExecCapturePolicy {
 
     fn uses_expiration(self) -> bool {
         match self {
-            Self::ShellTool | Self::Verification => true,
+            Self::ShellTool => true,
             Self::FullBuffer => false,
         }
     }
@@ -343,42 +291,6 @@ pub struct StdoutStream {
     pub sub_id: String,
     pub call_id: String,
     pub tx_event: Sender<Event>,
-}
-
-struct OutputEventDelivery {
-    tx: Option<mpsc::UnboundedSender<Event>>,
-    task: JoinHandle<()>,
-}
-
-impl OutputEventDelivery {
-    fn spawn(tx_event: Sender<Event>) -> Self {
-        // `read_output` already caps each call at
-        // `MAX_EXEC_OUTPUT_DELTAS_PER_CALL`, so this staging queue is bounded
-        // by that producer-side limit without making pipe draining wait for a
-        // saturated presentation channel.
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                let _ = tx_event.send(event).await;
-            }
-        });
-        Self { tx: Some(tx), task }
-    }
-
-    fn enqueue(&self, event: Event) -> bool {
-        self.tx.as_ref().is_some_and(|tx| tx.send(event).is_ok())
-    }
-
-    async fn finish(mut self) -> io::Result<()> {
-        self.tx.take();
-        (&mut self.task).await.map_err(io::Error::other)
-    }
-}
-
-impl Drop for OutputEventDelivery {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -847,8 +759,6 @@ async fn exec_windows_sandbox(
         stderr,
         aggregated_output,
         timed_out: capture.timed_out,
-        io_drain_incomplete: false,
-        retained_bytes_cap: capture_policy.retained_bytes_cap(),
     })
 }
 
@@ -880,22 +790,12 @@ fn finalize_exec_result(
 
             let stdout = raw_output.stdout.from_utf8_lossy();
             let stderr = raw_output.stderr.from_utf8_lossy();
-            let mut aggregated_output = raw_output.aggregated_output;
-            if raw_output.io_drain_incomplete {
-                aggregated_output.text = insert_io_drain_incomplete_marker(
-                    aggregated_output.text,
-                    raw_output.retained_bytes_cap,
-                );
-            }
-            let aggregated_output_bytes = Some(aggregated_output.text.clone());
-            let aggregated_output = aggregated_output.from_utf8_lossy();
+            let aggregated_output = raw_output.aggregated_output.from_utf8_lossy();
             let exec_output = ExecToolCallOutput {
                 exit_code,
                 stdout,
                 stderr,
                 aggregated_output,
-                aggregated_output_bytes,
-                output_complete: !raw_output.io_drain_incomplete,
                 duration,
                 timed_out,
             };
@@ -929,109 +829,16 @@ struct RawExecToolCallOutput {
     pub stderr: StreamOutput<Vec<u8>>,
     pub aggregated_output: StreamOutput<Vec<u8>>,
     pub timed_out: bool,
-    pub io_drain_incomplete: bool,
-    pub retained_bytes_cap: Option<usize>,
 }
 
-#[derive(Debug)]
-enum SequencedOutputStorage {
-    Full(Vec<u8>),
-    Capped(HeadTailBuffer),
-}
-
-#[derive(Debug)]
-struct SequencedOutputCapture {
-    next_sequence: u64,
-    storage: SequencedOutputStorage,
-}
-
-#[derive(Debug)]
-struct SequencedOutputChunk {
-    stream: ExecOutputStream,
-    bytes: Vec<u8>,
-}
-
-impl SequencedOutputCapture {
-    fn new(max_bytes: Option<usize>) -> Self {
-        let storage = max_bytes.map_or_else(
-            || SequencedOutputStorage::Full(Vec::new()),
-            |max_bytes| SequencedOutputStorage::Capped(HeadTailBuffer::new(max_bytes)),
-        );
-        Self {
-            next_sequence: 0,
-            storage,
-        }
+#[inline]
+fn append_capped(dst: &mut Vec<u8>, src: &[u8], max_bytes: usize) {
+    if dst.len() >= max_bytes {
+        return;
     }
-
-    fn push(&mut self, stream: ExecOutputStream, chunk: &[u8]) {
-        let stream = match stream {
-            ExecOutputStream::Stdout => "stdout",
-            ExecOutputStream::Stderr => "stderr",
-        };
-        let header = format!(
-            "\n[command output: stream={stream} sequence={}]\n",
-            self.next_sequence
-        );
-        self.next_sequence = self.next_sequence.saturating_add(1);
-        match &mut self.storage {
-            SequencedOutputStorage::Full(output) => {
-                output.extend_from_slice(header.as_bytes());
-                output.extend_from_slice(chunk);
-            }
-            SequencedOutputStorage::Capped(output) => {
-                output.push_chunk(header.into_bytes());
-                output.push_chunk(chunk.to_vec());
-            }
-        }
-    }
-
-    fn render(&self) -> Vec<u8> {
-        match &self.storage {
-            SequencedOutputStorage::Full(output) => output.clone(),
-            SequencedOutputStorage::Capped(output) => output.render_bytes(),
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.next_sequence == 0
-    }
-}
-
-async fn collect_sequenced_output(
-    mut chunks: mpsc::UnboundedReceiver<SequencedOutputChunk>,
-    max_bytes: Option<usize>,
-) -> SequencedOutputCapture {
-    let mut output = SequencedOutputCapture::new(max_bytes);
-    while let Some(chunk) = chunks.recv().await {
-        output.push(chunk.stream, &chunk.bytes);
-    }
-    output
-}
-
-fn insert_io_drain_incomplete_marker(mut data: Vec<u8>, max_bytes: Option<usize>) -> Vec<u8> {
-    let Some(max_bytes) = max_bytes else {
-        data.extend_from_slice(IO_DRAIN_INCOMPLETE_MARKER);
-        return data;
-    };
-    if max_bytes == 0 {
-        return Vec::new();
-    }
-    if IO_DRAIN_INCOMPLETE_MARKER.len() >= max_bytes {
-        return IO_DRAIN_INCOMPLETE_MARKER[..max_bytes].to_vec();
-    }
-
-    let data_budget = max_bytes.saturating_sub(IO_DRAIN_INCOMPLETE_MARKER.len());
-    if data.len() <= data_budget {
-        data.extend_from_slice(IO_DRAIN_INCOMPLETE_MARKER);
-        return data;
-    }
-    let head_len = data_budget / 2;
-    let tail_len = data_budget.saturating_sub(head_len);
-    let mut rendered = Vec::with_capacity(max_bytes);
-    rendered.extend_from_slice(&data[..head_len]);
-    rendered.extend_from_slice(IO_DRAIN_INCOMPLETE_MARKER);
-    rendered.extend_from_slice(&data[data.len().saturating_sub(tail_len)..]);
-    rendered
+    let remaining = max_bytes.saturating_sub(dst.len());
+    let take = remaining.min(src.len());
+    dst.extend_from_slice(&src[..take]);
 }
 
 fn aggregate_output(
@@ -1173,26 +980,17 @@ async fn consume_output(
     })?;
 
     let retained_bytes_cap = capture_policy.retained_bytes_cap();
-    let fallback_bytes_cap = retained_bytes_cap.unwrap_or(EXEC_OUTPUT_MAX_BYTES);
-    let stdout_output = Arc::new(TokioMutex::new(HeadTailBuffer::new(fallback_bytes_cap)));
-    let stderr_output = Arc::new(TokioMutex::new(HeadTailBuffer::new(fallback_bytes_cap)));
-    let (sequenced_tx, sequenced_rx) = mpsc::unbounded_channel();
-    let sequenced_handle = tokio::spawn(collect_sequenced_output(sequenced_rx, retained_bytes_cap));
     let stdout_handle = tokio::spawn(read_output(
         BufReader::new(stdout_reader),
         stdout_stream.clone(),
         /*is_stderr*/ false,
-        Arc::clone(&stdout_output),
-        retained_bytes_cap.is_none(),
-        Some(sequenced_tx.clone()),
+        retained_bytes_cap,
     ));
     let stderr_handle = tokio::spawn(read_output(
         BufReader::new(stderr_reader),
         stdout_stream.clone(),
         /*is_stderr*/ true,
-        Arc::clone(&stderr_output),
-        retained_bytes_cap.is_none(),
-        Some(sequenced_tx),
+        retained_bytes_cap,
     ));
 
     let expiration_wait = async {
@@ -1260,76 +1058,35 @@ async fn consume_output(
         }
     };
 
-    let mut stdout_handle = stdout_handle;
-    let mut stderr_handle = stderr_handle;
-    let drain_deadline = tokio::time::sleep(capture_policy.io_drain_timeout());
-    tokio::pin!(drain_deadline);
-    let mut stdout_result = None;
-    let mut stderr_result = None;
-    let io_drain_incomplete = loop {
-        if stdout_result.is_some() && stderr_result.is_some() {
-            break false;
-        }
-        tokio::select! {
-            result = &mut stdout_handle, if stdout_result.is_none() => {
-                stdout_result = Some(result);
+    // We need mutable bindings so we can `abort()` them on timeout.
+    use tokio::task::JoinHandle;
+
+    async fn await_output(
+        handle: &mut JoinHandle<std::io::Result<StreamOutput<Vec<u8>>>>,
+        timeout: Duration,
+    ) -> std::io::Result<StreamOutput<Vec<u8>>> {
+        match tokio::time::timeout(timeout, &mut *handle).await {
+            Ok(join_res) => match join_res {
+                Ok(io_res) => io_res,
+                Err(join_err) => Err(std::io::Error::other(join_err)),
+            },
+            Err(_elapsed) => {
+                // Timeout: abort the task to avoid hanging on open pipes.
+                handle.abort();
+                Ok(StreamOutput {
+                    text: Vec::new(),
+                    truncated_after_lines: None,
+                })
             }
-            result = &mut stderr_handle, if stderr_result.is_none() => {
-                stderr_result = Some(result);
-            }
-            _ = &mut drain_deadline => {
-                break true;
-            }
-        }
-    };
-    if io_drain_incomplete {
-        if stdout_result.is_none() {
-            stdout_handle.abort();
-            let _ = stdout_handle.await;
-        }
-        if stderr_result.is_none() {
-            stderr_handle.abort();
-            let _ = stderr_handle.await;
         }
     }
-    let completed_output = |result: Option<
-        std::result::Result<std::io::Result<Option<Vec<u8>>>, tokio::task::JoinError>,
-    >|
-     -> std::io::Result<Option<Vec<u8>>> {
-        match result {
-            Some(result) => result.map_err(std::io::Error::other)?,
-            None => Ok(None),
-        }
-    };
-    let stdout_completed = completed_output(stdout_result)?;
-    let stderr_completed = completed_output(stderr_result)?;
-    let stdout_fallback = stdout_output.lock().await.render_bytes();
-    let stderr_fallback = stderr_output.lock().await.render_bytes();
-    let stdout = StreamOutput {
-        text: if io_drain_incomplete {
-            stdout_fallback
-        } else {
-            stdout_completed.unwrap_or(stdout_fallback)
-        },
-        truncated_after_lines: None,
-    };
-    let stderr = StreamOutput {
-        text: if io_drain_incomplete {
-            stderr_fallback
-        } else {
-            stderr_completed.unwrap_or(stderr_fallback)
-        },
-        truncated_after_lines: None,
-    };
-    let sequenced_output = sequenced_handle.await.map_err(io::Error::other)?;
-    let aggregated_output = if sequenced_output.is_empty() {
-        aggregate_output(&stdout, &stderr, retained_bytes_cap)
-    } else {
-        StreamOutput {
-            text: sequenced_output.render(),
-            truncated_after_lines: None,
-        }
-    };
+
+    let mut stdout_handle = stdout_handle;
+    let mut stderr_handle = stderr_handle;
+
+    let stdout = await_output(&mut stdout_handle, capture_policy.io_drain_timeout()).await?;
+    let stderr = await_output(&mut stderr_handle, capture_policy.io_drain_timeout()).await?;
+    let aggregated_output = aggregate_output(&stdout, &stderr, retained_bytes_cap);
 
     Ok(RawExecToolCallOutput {
         exit_status,
@@ -1337,8 +1094,6 @@ async fn consume_output(
         stderr,
         aggregated_output,
         timed_out,
-        io_drain_incomplete,
-        retained_bytes_cap,
     })
 }
 
@@ -1346,20 +1101,15 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
     stream: Option<StdoutStream>,
     is_stderr: bool,
-    retained_output: Arc<TokioMutex<HeadTailBuffer>>,
-    retain_full_output: bool,
-    sequenced_output: Option<mpsc::UnboundedSender<SequencedOutputChunk>>,
-) -> io::Result<Option<Vec<u8>>> {
-    let mut full_output = if retain_full_output {
-        Some(tokio::fs::File::from_std(tempfile::tempfile()?))
-    } else {
-        None
-    };
+    max_bytes: Option<usize>,
+) -> io::Result<StreamOutput<Vec<u8>>> {
+    let mut buf = Vec::with_capacity(
+        max_bytes.map_or(AGGREGATE_BUFFER_INITIAL_CAPACITY, |max_bytes| {
+            AGGREGATE_BUFFER_INITIAL_CAPACITY.min(max_bytes)
+        }),
+    );
     let mut tmp = [0u8; READ_CHUNK_SIZE];
     let mut emitted_deltas: usize = 0;
-    let event_delivery = stream
-        .as_ref()
-        .map(|stream| OutputEventDelivery::spawn(stream.tx_event.clone()));
 
     loop {
         let n = reader.read(&mut tmp).await?;
@@ -1367,25 +1117,10 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
             break;
         }
 
-        let chunk = tmp[..n].to_vec();
-        retained_output.lock().await.push_chunk(chunk.clone());
-        if let Some(sequenced_output) = &sequenced_output {
-            let _ = sequenced_output.send(SequencedOutputChunk {
-                stream: if is_stderr {
-                    ExecOutputStream::Stderr
-                } else {
-                    ExecOutputStream::Stdout
-                },
-                bytes: chunk.clone(),
-            });
-        }
-        if let Some(full_output) = full_output.as_mut() {
-            full_output.write_all(&chunk).await?;
-        }
-
         if let Some(stream) = &stream
             && emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
         {
+            let chunk = tmp[..n].to_vec();
             let msg = EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
                 call_id: stream.call_id.clone(),
                 stream: if is_stderr {
@@ -1399,28 +1134,23 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
                 id: stream.sub_id.clone(),
                 msg,
             };
-            if event_delivery
-                .as_ref()
-                .is_some_and(|event_delivery| event_delivery.enqueue(event))
-            {
-                emitted_deltas += 1;
-            }
+            #[allow(clippy::let_unit_value)]
+            let _ = stream.tx_event.send(event).await;
+            emitted_deltas += 1;
+        }
+
+        if let Some(max_bytes) = max_bytes {
+            append_capped(&mut buf, &tmp[..n], max_bytes);
+        } else {
+            buf.extend_from_slice(&tmp[..n]);
         }
         // Continue reading to EOF to avoid back-pressure
     }
 
-    if let Some(event_delivery) = event_delivery {
-        event_delivery.finish().await?;
-    }
-
-    let Some(mut full_output) = full_output else {
-        return Ok(None);
-    };
-    full_output.flush().await?;
-    full_output.seek(SeekFrom::Start(0)).await?;
-    let mut contents = Vec::with_capacity(AGGREGATE_BUFFER_INITIAL_CAPACITY);
-    full_output.read_to_end(&mut contents).await?;
-    Ok(Some(contents))
+    Ok(StreamOutput {
+        text: buf,
+        truncated_after_lines: None,
+    })
 }
 
 #[cfg(unix)]

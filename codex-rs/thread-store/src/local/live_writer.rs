@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadMemoryMode;
 use codex_rollout::RolloutConfig;
@@ -13,7 +12,6 @@ use tracing::warn;
 use super::LocalThreadStore;
 use super::create_thread;
 use crate::AppendThreadItemsParams;
-use crate::AppendThreadItemsReceipt;
 use crate::CreateThreadParams;
 use crate::ReadThreadParams;
 use crate::ResumeThreadParams;
@@ -104,17 +102,6 @@ pub(super) async fn resume_thread(
         .map_err(|err| ThreadStoreError::Internal {
             message: format!("failed to resume local thread recorder: {err}"),
         })?;
-    let state_db = store.state_db().await;
-    codex_rollout::state_db::reconcile_rollout(
-        state_db.as_deref(),
-        recorder.rollout_path(),
-        config.model_provider_id.as_str(),
-        /*builder*/ None,
-        &[],
-        /*archived_only*/ None,
-        /*new_thread_memory_mode*/ None,
-    )
-    .await;
     store
         .insert_live_recorder(params.thread_id, recorder, history_mode)
         .await
@@ -140,30 +127,9 @@ pub(super) async fn append_items(
         .record_canonical_items(persisted_items.as_slice())
         .await
         .map_err(thread_store_io_error)?;
-    // Raw store appends are history-only and do not participate in LiveThread's metadata receipt
-    // sequence, so retain an explicit barrier without consuming an ordered projection receipt.
+    // LiveThread applies metadata immediately after append_items returns. Wait for the local
+    // writer so SQLite never gets ahead of JSONL for accepted live appends.
     recorder.flush().await.map_err(thread_store_io_error)
-}
-
-pub(super) async fn append_persisted_items(
-    store: &LocalThreadStore,
-    thread_id: ThreadId,
-    items: &[RolloutItem],
-) -> ThreadStoreResult<AppendThreadItemsReceipt> {
-    if items.is_empty() {
-        return Err(ThreadStoreError::InvalidRequest {
-            message: "cannot append an empty persisted rollout batch".to_string(),
-        });
-    }
-    let recorder = store.live_recorder(thread_id).await?;
-    let receipt = recorder
-        .append_and_ack(items)
-        .await
-        .map_err(thread_store_io_error)?;
-    // The ordered writer receipt means every byte in this accepted batch was written before
-    // LiveThread applies its coalesced metadata patch, so SQLite can never get ahead of JSONL.
-    // Durability is intentionally deferred to an explicit barrier (terminal, flush, or shutdown).
-    Ok(AppendThreadItemsReceipt::new(receipt.sequence()))
 }
 
 pub(super) async fn persist_thread(
@@ -200,20 +166,6 @@ pub(super) async fn shutdown_thread(
     let rollout_path = recorder.rollout_path().to_path_buf();
     recorder.shutdown().await.map_err(thread_store_io_error)?;
     sync_materialized_rollout_path(store, thread_id).await?;
-    if codex_rollout::existing_rollout_path(rollout_path.as_path())
-        .await
-        .is_none()
-        && let Some(state_db) = store.state_db().await
-    {
-        state_db
-            .delete_thread(thread_id)
-            .await
-            .map_err(|err| ThreadStoreError::Internal {
-                message: format!(
-                    "failed to remove unmaterialized thread metadata for {thread_id}: {err}"
-                ),
-            })?;
-    }
     if let Some(metrics) = codex_otel::global()
         && let Ok(metadata) = tokio::fs::metadata(rollout_path).await
     {
@@ -275,16 +227,6 @@ async fn sync_materialized_rollout_path(
                     message: format!("failed to read thread metadata for {thread_id}: {err}"),
                 })?
         else {
-            codex_rollout::state_db::reconcile_rollout(
-                Some(state_db.as_ref()),
-                rollout_path.as_path(),
-                store.config.default_model_provider_id.as_str(),
-                /*builder*/ None,
-                &[],
-                /*archived_only*/ Some(false),
-                /*new_thread_memory_mode*/ None,
-            )
-            .await;
             return Ok(());
         };
         if metadata.rollout_path != rollout_path {

@@ -106,16 +106,29 @@ pub async fn plan_skill_injections(
     };
 
     for skill in mentioned_skills {
-        if let Some(contents) = loaded_skills.and_then(|outcome| outcome.body_for_skill(skill)) {
-            push_successful_injection(&mut plan, skill, contents.to_string());
-            continue;
-        }
         let fs = loaded_skills
             .and_then(|outcome| outcome.file_system_for_skill(skill))
             .unwrap_or_else(|| Arc::clone(&LOCAL_FS));
         let path = PathUri::from_abs_path(&skill.path_to_skills_md);
         match fs.read_file_text(&path, /*sandbox*/ None).await {
-            Ok(contents) => push_successful_injection(&mut plan, skill, contents),
+            Ok(contents) => {
+                plan.metrics.push(SkillInjectionMetric {
+                    skill_name: skill.name.clone(),
+                    status: "ok",
+                });
+                plan.invocations.push(SkillInvocation {
+                    skill_name: skill.name.clone(),
+                    skill_scope: skill.scope,
+                    skill_path: skill.path_to_skills_md.to_path_buf(),
+                    plugin_id: skill.plugin_id.clone(),
+                    invocation_type: InvocationType::Explicit,
+                });
+                plan.injections.items.push(SkillInjection {
+                    name: skill.name.clone(),
+                    path: skill.path_to_skills_md.to_string_lossy().into_owned(),
+                    contents,
+                });
+            }
             Err(err) => {
                 plan.metrics.push(SkillInjectionMetric {
                     skill_name: skill.name.clone(),
@@ -132,29 +145,6 @@ pub async fn plan_skill_injections(
     }
 
     plan
-}
-
-fn push_successful_injection(
-    plan: &mut PlannedSkillInjections,
-    skill: &SkillMetadata,
-    contents: String,
-) {
-    plan.metrics.push(SkillInjectionMetric {
-        skill_name: skill.name.clone(),
-        status: "ok",
-    });
-    plan.invocations.push(SkillInvocation {
-        skill_name: skill.name.clone(),
-        skill_scope: skill.scope,
-        skill_path: skill.path_to_skills_md.to_path_buf(),
-        plugin_id: skill.plugin_id.clone(),
-        invocation_type: InvocationType::Explicit,
-    });
-    plan.injections.items.push(SkillInjection {
-        name: skill.name.clone(),
-        path: skill.path_to_skills_md.to_string_lossy().into_owned(),
-        contents,
-    });
 }
 
 /// Apply the observability portion of a previously resolved skill plan exactly once.

@@ -1,5 +1,9 @@
 name = "kd4_reviewer"
 description = "Read-only preflight reviewer for completed KD4 worker changes."
+capability_profile = "read_search_diff"
+default_reasoning_effort = "high"
+sandbox_mode = "read-only"
+
 developer_instructions = """
 Operate read-only as the static review lane between source workers and serialized
 validation. Read the root and closest applicable AGENTS.md, the assigned audit
@@ -13,5 +17,3 @@ state when no blocker is found, recommend the smallest coherent correction,
 and give the coordinator one focused KDS command that would prove the item.
 Do not stage, commit, push, publish, or perform unrelated cleanup.
 """
-model_reasoning_effort = "xhigh"
-sandbox_mode = "read-only"

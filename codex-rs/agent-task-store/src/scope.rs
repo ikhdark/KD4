@@ -1,5 +1,7 @@
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::HashSet;
 use std::path::Component;
 use std::path::Path;
@@ -7,6 +9,33 @@ use std::path::PathBuf;
 
 use crate::StoreError;
 use crate::StoreResult;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RepositoryIdentity {
+    pub id: String,
+    pub canonical_root: PathBuf,
+    pub canonical_path: String,
+}
+
+pub(crate) fn repository_identity(repo_root: &Path) -> StoreResult<RepositoryIdentity> {
+    let canonical_root = std::fs::canonicalize(repo_root).map_err(|error| {
+        StoreError::InvalidScope(format!(
+            "repository root {} cannot be canonicalized: {error}",
+            repo_root.display()
+        ))
+    })?;
+    let canonical_path = canonical_root.to_string_lossy().into_owned();
+    let identity_input = if cfg!(windows) {
+        canonical_path.to_lowercase()
+    } else {
+        canonical_path.clone()
+    };
+    Ok(RepositoryIdentity {
+        id: format!("{:x}", Sha256::digest(identity_input.as_bytes())),
+        canonical_root,
+        canonical_path,
+    })
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct RepoScope {
@@ -27,13 +56,11 @@ impl RepoScope {
     }
 }
 
-pub fn normalize_repo_scopes(repo_root: &Path, scopes: &[RepoScope]) -> StoreResult<Vec<RepoScope>> {
-    let canonical_root = std::fs::canonicalize(repo_root).map_err(|error| {
-        StoreError::InvalidScope(format!(
-            "repository root {} cannot be canonicalized: {error}",
-            repo_root.display()
-        ))
-    })?;
+pub fn normalize_repo_scopes(
+    repo_root: &Path,
+    scopes: &[RepoScope],
+) -> StoreResult<Vec<RepoScope>> {
+    let canonical_root = repository_identity(repo_root)?.canonical_root;
     let mut normalized = Vec::with_capacity(scopes.len());
     let mut seen = HashSet::with_capacity(scopes.len());
 
@@ -60,12 +87,7 @@ pub fn normalize_repo_scopes(repo_root: &Path, scopes: &[RepoScope]) -> StoreRes
 }
 
 pub(crate) fn normalize_repo_path(repo_root: &Path, path: &str) -> StoreResult<String> {
-    let canonical_root = std::fs::canonicalize(repo_root).map_err(|error| {
-        StoreError::InvalidScope(format!(
-            "repository root {} cannot be canonicalized: {error}",
-            repo_root.display()
-        ))
-    })?;
+    let canonical_root = repository_identity(repo_root)?.canonical_root;
     let normalized = normalize_lexically(path)?;
     ensure_canonical_containment(&canonical_root, &normalized)?;
     Ok(normalized)
@@ -73,7 +95,9 @@ pub(crate) fn normalize_repo_path(repo_root: &Path, path: &str) -> StoreResult<S
 
 fn normalize_lexically(path: &str) -> StoreResult<String> {
     if path.trim().is_empty() {
-        return Err(StoreError::InvalidScope("scope path cannot be empty".to_string()));
+        return Err(StoreError::InvalidScope(
+            "scope path cannot be empty".to_string(),
+        ));
     }
     let candidate = Path::new(path);
     if candidate.is_absolute() {
@@ -104,7 +128,9 @@ fn normalize_lexically(path: &str) -> StoreResult<String> {
         }
     }
     if components.is_empty() {
-        return Err(StoreError::InvalidScope("scope path cannot be empty".to_string()));
+        return Err(StoreError::InvalidScope(
+            "scope path cannot be empty".to_string(),
+        ));
     }
     Ok(components.join("/"))
 }

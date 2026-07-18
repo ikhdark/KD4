@@ -10,7 +10,6 @@ use crate::network_policy_decision::denied_network_policy_message;
 use crate::session::session::Session;
 use crate::tools::sandboxing::PermissionRequestPayload;
 use crate::tools::sandboxing::ToolError;
-use codex_hooks::HookMatchContext;
 use codex_hooks::PermissionRequestDecision;
 use codex_network_proxy::BlockedRequest;
 use codex_network_proxy::BlockedRequestObserver;
@@ -598,26 +597,14 @@ impl NetworkApprovalService {
         let command = owner_call
             .as_ref()
             .map_or_else(|| prompt_command.join(" "), |call| call.command.clone());
-        let hook_tool_name = crate::tools::hook_names::HookToolName::bash();
-        let permission_plan = session
-            .hooks()
-            .prepare(HookMatchContext::PermissionRequest {
-                canonical_tool_name: hook_tool_name.name(),
-                matcher_aliases: hook_tool_name.matcher_aliases(),
-            });
-        let permission_request_decision = if permission_plan.is_empty() {
-            None
-        } else {
-            run_permission_request_hooks(
-                &session,
-                &turn_context,
-                permission_plan,
-                &guardian_approval_id,
-                PermissionRequestPayload::bash(command, Some(format!("network-access {target}"))),
-            )
-            .await
-        };
-        if let Some(permission_request_decision) = permission_request_decision {
+        if let Some(permission_request_decision) = run_permission_request_hooks(
+            &session,
+            &turn_context,
+            &guardian_approval_id,
+            PermissionRequestPayload::bash(command, Some(format!("network-access {target}"))),
+        )
+        .await
+        {
             match permission_request_decision {
                 PermissionRequestDecision::Allow => {
                     pending

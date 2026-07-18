@@ -22,8 +22,6 @@ async fn formats_basic_record() {
         stdout: StreamOutput::new("hi".to_string()),
         stderr: StreamOutput::new(String::new()),
         aggregated_output: StreamOutput::new("hi".to_string()),
-        aggregated_output_bytes: None,
-        output_complete: true,
         duration: Duration::from_secs(1),
         timed_out: false,
     };
@@ -48,8 +46,6 @@ async fn uses_aggregated_output_over_streams() {
         stdout: StreamOutput::new("stdout-only".to_string()),
         stderr: StreamOutput::new("stderr-only".to_string()),
         aggregated_output: StreamOutput::new("combined output wins".to_string()),
-        aggregated_output_bytes: None,
-        output_complete: true,
         duration: Duration::from_millis(120),
         timed_out: false,
     };

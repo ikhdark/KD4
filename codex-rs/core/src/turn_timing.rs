@@ -1,13 +1,12 @@
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicU8;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use codex_analytics::TurnProfile;
+use codex_otel::TURN_TTFM_DURATION_METRIC;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::TurnTiming;
@@ -23,9 +22,6 @@ use crate::stream_events_utils::raw_assistant_output_text_from_item;
 
 const NANOS_PER_MILLISECOND: u128 = 1_000_000;
 const TIMING_SCHEMA_VERSION: u16 = 1;
-const MODEL_OUTPUT_SETTLED: u8 = 1 << 0;
-const VISIBLE_OUTPUT_SETTLED: u8 = 1 << 1;
-const AGENT_MESSAGE_SETTLED: u8 = 1 << 2;
 
 pub(crate) async fn record_turn_ttft_metric(turn_context: &TurnContext, event: &ResponseEvent) {
     let Some(duration) = turn_context
@@ -34,9 +30,7 @@ pub(crate) async fn record_turn_ttft_metric(turn_context: &TurnContext, event: &
     else {
         return;
     };
-    turn_context
-        .session_telemetry
-        .record_turn_ttft(&turn_context.sub_id, duration);
+    turn_context.session_telemetry.record_turn_ttft(duration);
 }
 
 pub(crate) async fn record_turn_ttfm_metric(turn_context: &TurnContext, item: &TurnItem) {
@@ -48,7 +42,7 @@ pub(crate) async fn record_turn_ttfm_metric(turn_context: &TurnContext, item: &T
     };
     turn_context
         .session_telemetry
-        .record_turn_ttfm(&turn_context.sub_id, duration);
+        .record_duration(TURN_TTFM_DURATION_METRIC, duration, &[]);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,7 +88,6 @@ impl TurnClock for SystemTurnClock {
 pub(crate) struct TurnTimingState {
     clock: Arc<dyn TurnClock>,
     state: StdMutex<TurnTimingStateInner>,
-    milestone_mask: AtomicU8,
 }
 
 impl Default for TurnTimingState {
@@ -504,62 +497,11 @@ pub(crate) struct TurnTimingGuard {
     active: bool,
 }
 
-/// Owns the wait/processing timing transition for one response stream request.
-///
-/// Dropping or explicitly finishing this guard closes the currently active phase exactly once.
-#[must_use]
-pub(crate) struct ModelStreamTimingGuard {
-    timing: Option<Arc<TurnTimingState>>,
-    active: Option<TurnTimingGuard>,
-    finalized: bool,
-}
-
-impl ModelStreamTimingGuard {
-    pub(crate) fn new(timing: Option<&Arc<TurnTimingState>>) -> Self {
-        Self {
-            timing: timing.cloned(),
-            active: None,
-            finalized: false,
-        }
-    }
-
-    pub(crate) fn begin_wait(&mut self) {
-        self.transition(GuardKind::ModelStreamWait);
-    }
-
-    pub(crate) fn begin_processing(&mut self) {
-        self.transition(GuardKind::ModelStreamProcessing);
-    }
-
-    pub(crate) fn finish(&mut self) {
-        if self.finalized {
-            return;
-        }
-        self.active.take();
-        self.finalized = true;
-    }
-
-    fn transition(&mut self, kind: GuardKind) {
-        if self.finalized {
-            return;
-        }
-        self.active.take();
-        self.active = self.timing.as_ref().map(|timing| timing.begin_guard(kind));
-    }
-}
-
-impl Drop for ModelStreamTimingGuard {
-    fn drop(&mut self) {
-        self.finish();
-    }
-}
-
 impl TurnTimingState {
     fn new(clock: Arc<dyn TurnClock>) -> Self {
         Self {
             clock,
             state: StdMutex::new(TurnTimingStateInner::default()),
-            milestone_mask: AtomicU8::new(0),
         }
     }
 
@@ -570,9 +512,7 @@ impl TurnTimingState {
 
     pub(crate) fn mark_turn_started(&self) -> i64 {
         let sample = self.clock.sample();
-        let mut state = self.state();
-        state.start(sample);
-        self.milestone_mask.store(0, Ordering::Release);
+        self.state().start(sample);
         sample.time.wall_unix_ms
     }
 
@@ -609,10 +549,6 @@ impl TurnTimingState {
         state.counters.tool_call_count = state.counters.tool_call_count.saturating_add(1);
     }
 
-    pub(crate) fn tool_call_count(&self) -> u32 {
-        self.state().counters.tool_call_count
-    }
-
     pub(crate) fn begin_tool_blocking(self: &Arc<Self>) -> TurnTimingGuard {
         self.begin_guard(GuardKind::LegacyToolBlocking)
     }
@@ -626,12 +562,10 @@ impl TurnTimingState {
         self.begin_guard(GuardKind::ModelRequestWait)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn begin_model_stream_wait(self: &Arc<Self>) -> TurnTimingGuard {
         self.begin_guard(GuardKind::ModelStreamWait)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn begin_model_stream_processing(self: &Arc<Self>) -> TurnTimingGuard {
         self.begin_guard(GuardKind::ModelStreamProcessing)
     }
@@ -675,79 +609,38 @@ impl TurnTimingState {
         &self,
         event: &ResponseEvent,
     ) -> Option<Duration> {
-        let (visible_duration, publish) = self.commit_response_event_milestones(event);
-        self.publish_milestones(publish);
-        visible_duration
-    }
-
-    fn commit_response_event_milestones(&self, event: &ResponseEvent) -> (Option<Duration>, u8) {
         let records_model_output = response_event_records_model_output(event);
         let records_visible_output = response_event_records_visible_output(event);
         if !records_model_output && !records_visible_output {
-            return (None, 0);
-        }
-        let settled = self.milestone_mask.load(Ordering::Acquire);
-        let needs_model = records_model_output && settled & MODEL_OUTPUT_SETTLED == 0;
-        let needs_visible = records_visible_output && settled & VISIBLE_OUTPUT_SETTLED == 0;
-        if !needs_model && !needs_visible {
-            return (None, 0);
+            return None;
         }
         let sample = self.clock.sample();
         let mut state = self.state();
         state.advance(sample.time.monotonic_ns);
-        let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns) else {
-            return (None, 0);
-        };
+        let elapsed_ns = state.elapsed_since_start(sample.time.monotonic_ns)?;
         if records_model_output && state.milestones.first_model_output_ns.is_none() {
             state.milestones.first_model_output_ns = Some(elapsed_ns);
         }
-        let visible_duration =
-            if records_visible_output && state.milestones.first_visible_output_ns.is_none() {
-                state.milestones.first_visible_output_ns = Some(elapsed_ns);
-                Some(duration_from_nanos(elapsed_ns))
-            } else {
-                None
-            };
-        let mut publish = 0;
-        if needs_model && state.milestones.first_model_output_ns.is_some() {
-            publish |= MODEL_OUTPUT_SETTLED;
+        if !records_visible_output || state.milestones.first_visible_output_ns.is_some() {
+            return None;
         }
-        if needs_visible && state.milestones.first_visible_output_ns.is_some() {
-            publish |= VISIBLE_OUTPUT_SETTLED;
-        }
-        (visible_duration, publish)
+        state.milestones.first_visible_output_ns = Some(elapsed_ns);
+        Some(duration_from_nanos(elapsed_ns))
     }
 
     pub(crate) fn record_ttfm_for_turn_item(&self, item: &TurnItem) -> Option<Duration> {
-        let (duration, publish) = self.commit_agent_message_milestone(item);
-        self.publish_milestones(publish);
-        duration
-    }
-
-    fn commit_agent_message_milestone(&self, item: &TurnItem) -> (Option<Duration>, u8) {
         if !matches!(item, TurnItem::AgentMessage(_)) {
-            return (None, 0);
-        }
-        if self.milestone_mask.load(Ordering::Acquire) & AGENT_MESSAGE_SETTLED != 0 {
-            return (None, 0);
+            return None;
         }
         let sample = self.clock.sample();
         let mut state = self.state();
         state.advance(sample.time.monotonic_ns);
         if state.milestones.first_agent_message_ns.is_some() {
-            return (None, AGENT_MESSAGE_SETTLED);
+            return None;
         }
-        let Some(elapsed_ns) = state.elapsed_since_start(sample.time.monotonic_ns) else {
-            return (None, 0);
-        };
+        let elapsed_ns = state.elapsed_since_start(sample.time.monotonic_ns)?;
         state.milestones.first_agent_message_ns = Some(elapsed_ns);
-        (Some(duration_from_nanos(elapsed_ns)), AGENT_MESSAGE_SETTLED)
-    }
-
-    fn publish_milestones(&self, publish: u8) {
-        if publish != 0 {
-            self.milestone_mask.fetch_or(publish, Ordering::Release);
-        }
+        Some(duration_from_nanos(elapsed_ns))
     }
 
     fn begin_guard(self: &Arc<Self>, kind: GuardKind) -> TurnTimingGuard {

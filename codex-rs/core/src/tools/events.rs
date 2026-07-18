@@ -1,10 +1,8 @@
-use crate::apply_patch::convert_applied_patch_delta_to_protocol_ordered;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::sandboxing::ToolError;
-use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
@@ -12,7 +10,6 @@ use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::items::CommandExecutionItem;
 use codex_protocol::items::CommandExecutionStatus;
 use codex_protocol::items::FileChangeItem;
-use codex_protocol::items::OrderedFileChange;
 use codex_protocol::items::TurnItem;
 use codex_protocol::parse_command::ParsedCommand;
 use codex_protocol::protocol::EventMsg;
@@ -36,7 +33,6 @@ pub(crate) struct ToolEventCtx<'a> {
     pub turn: &'a TurnContext,
     pub call_id: &'a str,
     pub turn_diff_tracker: Option<&'a SharedTurnDiffTracker>,
-    pub record_task_evidence: bool,
 }
 
 impl<'a> ToolEventCtx<'a> {
@@ -51,13 +47,7 @@ impl<'a> ToolEventCtx<'a> {
             turn,
             call_id,
             turn_diff_tracker,
-            record_task_evidence: true,
         }
-    }
-
-    pub fn with_task_evidence(mut self, record_task_evidence: bool) -> Self {
-        self.record_task_evidence = record_task_evidence;
-        self
     }
 }
 
@@ -144,7 +134,6 @@ pub(crate) enum ToolEmitter {
     },
     ApplyPatch {
         changes: HashMap<PathBuf, FileChange>,
-        ordered_changes: Vec<OrderedFileChange>,
         auto_approved: bool,
         environment_id: Option<String>,
     },
@@ -156,27 +145,6 @@ pub(crate) enum ToolEmitter {
         process_id: Option<String>,
         environment_id: String,
     },
-}
-
-fn ordered_patch_paths(changes: &[OrderedFileChange]) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    for change in changes {
-        paths.push(change.path.clone());
-        if let FileChange::Update {
-            move_path: Some(move_path),
-            ..
-        } = &change.change
-        {
-            paths.push(move_path.clone());
-        }
-    }
-    paths
-}
-
-fn committed_ordered_patch_changes(delta: Option<&AppliedPatchDelta>) -> Vec<OrderedFileChange> {
-    delta
-        .map(convert_applied_patch_delta_to_protocol_ordered)
-        .unwrap_or_default()
 }
 
 impl ToolEmitter {
@@ -198,13 +166,11 @@ impl ToolEmitter {
 
     pub fn apply_patch_for_environment(
         changes: HashMap<PathBuf, FileChange>,
-        ordered_changes: Vec<OrderedFileChange>,
         auto_approved: bool,
         environment_id: String,
     ) -> Self {
         Self::ApplyPatch {
             changes,
-            ordered_changes,
             auto_approved,
             environment_id: Some(environment_id),
         }
@@ -259,13 +225,12 @@ impl ToolEmitter {
             (
                 Self::ApplyPatch {
                     changes,
-                    ordered_changes,
                     auto_approved,
                     ..
                 },
                 ToolEventStage::Begin,
             ) => {
-                let paths = ordered_patch_paths(ordered_changes);
+                let paths = changes.keys().cloned().collect::<Vec<_>>();
                 if let Some(cwd) = ctx
                     .turn
                     .environments
@@ -284,7 +249,6 @@ impl ToolEmitter {
                         &TurnItem::FileChange(FileChangeItem {
                             id: ctx.call_id.to_string(),
                             changes: changes.clone(),
-                            ordered_changes: Some(ordered_changes.clone()),
                             status: None,
                             auto_approved: Some(*auto_approved),
                             stdout: None,
@@ -294,7 +258,11 @@ impl ToolEmitter {
                     .await;
             }
             (
-                Self::ApplyPatch { environment_id, .. },
+                Self::ApplyPatch {
+                    changes,
+                    environment_id,
+                    ..
+                },
                 ToolEventStage::Success {
                     output,
                     applied_patch_delta,
@@ -310,7 +278,7 @@ impl ToolEmitter {
                     .unwrap_or(TurnDiffTrackerUpdate::Invalidate);
                 emit_patch_end(
                     ctx,
-                    committed_ordered_patch_changes(applied_patch_delta),
+                    changes.clone(),
                     output.stdout.text.clone(),
                     output.stderr.text.clone(),
                     status,
@@ -319,12 +287,12 @@ impl ToolEmitter {
                 .await;
             }
             (
-                Self::ApplyPatch { .. },
+                Self::ApplyPatch { changes, .. },
                 ToolEventStage::Failure(ToolEventFailure::Output(output)),
             ) => {
                 emit_patch_end(
                     ctx,
-                    Vec::new(),
+                    changes.clone(),
                     output.stdout.text.clone(),
                     output.stderr.text.clone(),
                     if output.exit_code == 0 {
@@ -337,12 +305,12 @@ impl ToolEmitter {
                 .await;
             }
             (
-                Self::ApplyPatch { .. },
+                Self::ApplyPatch { changes, .. },
                 ToolEventStage::Failure(ToolEventFailure::Message(message)),
             ) => {
                 emit_patch_end(
                     ctx,
-                    Vec::new(),
+                    changes.clone(),
                     String::new(),
                     (*message).to_string(),
                     PatchApplyStatus::Failed,
@@ -351,7 +319,11 @@ impl ToolEmitter {
                 .await;
             }
             (
-                Self::ApplyPatch { environment_id, .. },
+                Self::ApplyPatch {
+                    changes,
+                    environment_id,
+                    ..
+                },
                 ToolEventStage::Failure(ToolEventFailure::Rejected {
                     message,
                     applied_patch_delta,
@@ -359,7 +331,7 @@ impl ToolEmitter {
             ) => {
                 emit_patch_end(
                     ctx,
-                    committed_ordered_patch_changes(applied_patch_delta),
+                    changes.clone(),
                     String::new(),
                     (*message).to_string(),
                     PatchApplyStatus::Declined,
@@ -543,13 +515,11 @@ async fn emit_exec_stage(
 ) {
     match stage {
         ToolEventStage::Begin => {
-            if ctx.record_task_evidence {
-                ctx.session
-                    .services
-                    .task_evidence
-                    .record_command_intent(ctx.call_id, exec_input.command, exec_input.cwd)
-                    .await;
-            }
+            ctx.session
+                .services
+                .task_evidence
+                .record_command_intent(ctx.call_id, exec_input.command)
+                .await;
             emit_exec_command_begin(
                 ctx,
                 exec_input.command,
@@ -618,50 +588,32 @@ async fn emit_exec_end(
     exec_input: ExecCommandInput<'_>,
     exec_result: ExecCommandResult,
 ) {
-    let command_for_classification = exec_input.command.to_vec();
-    let possible_mutation = tokio::task::spawn_blocking(move || {
-        crate::turn_diff_tracker::command_may_mutate(&command_for_classification)
-    })
-    .await
-    .unwrap_or(true);
-    let mutation_observation = if ctx.record_task_evidence {
-        ctx.session
-            .services
-            .task_evidence
-            .record_command(
-                ctx.call_id,
-                exec_input.command,
-                exec_input.cwd,
-                exec_result.exit_code,
-                exec_result.timed_out,
-                u64::try_from(exec_result.duration.as_millis()).unwrap_or(u64::MAX),
-                possible_mutation,
-            )
-            .await
-    } else {
-        Some(crate::task_evidence::MutationObservation::Unchanged)
-    };
-    let tracker_observation = mutation_observation.unwrap_or(if possible_mutation {
-        crate::task_evidence::MutationObservation::Unknown
-    } else {
-        crate::task_evidence::MutationObservation::Unchanged
-    });
+    let possible_mutation = crate::turn_diff_tracker::command_may_mutate(exec_input.command);
     if let Some(tracker) = ctx.turn_diff_tracker {
         let native_cwd = exec_input.cwd.to_abs_path().ok();
-        tracker
-            .lock()
-            .await
-            .record_exec_command_end_at_with_observation(
-                exec_input.command,
-                exec_result.exit_code,
-                exec_result.timed_out,
-                exec_input.environment_id,
-                native_cwd
-                    .as_ref()
-                    .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
-                tracker_observation,
-            );
+        tracker.lock().await.record_exec_command_end_at(
+            exec_input.command,
+            exec_result.exit_code,
+            exec_result.timed_out,
+            exec_input.environment_id,
+            native_cwd
+                .as_ref()
+                .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
+        );
     }
+    ctx.session
+        .services
+        .task_evidence
+        .record_command(
+            ctx.call_id,
+            exec_input.command,
+            exec_input.cwd,
+            exec_result.exit_code,
+            exec_result.timed_out,
+            u64::try_from(exec_result.duration.as_millis()).unwrap_or(u64::MAX),
+            possible_mutation,
+        )
+        .await;
 
     ctx.session
         .emit_turn_item_completed(
@@ -688,17 +640,12 @@ async fn emit_exec_end(
 
 async fn emit_patch_end(
     ctx: ToolEventCtx<'_>,
-    ordered_changes: Vec<OrderedFileChange>,
+    changes: HashMap<PathBuf, FileChange>,
     stdout: String,
     stderr: String,
     status: PatchApplyStatus,
     tracker_update: TurnDiffTrackerUpdate<'_>,
 ) {
-    let changes = ordered_changes
-        .iter()
-        .cloned()
-        .map(|change| (change.path, change.change))
-        .collect();
     let outcome = match &status {
         PatchApplyStatus::Completed => "completed",
         PatchApplyStatus::Failed => "failed",
@@ -715,7 +662,6 @@ async fn emit_patch_end(
             TurnItem::FileChange(FileChangeItem {
                 id: ctx.call_id.to_string(),
                 changes,
-                ordered_changes: Some(ordered_changes),
                 status: Some(status),
                 auto_approved: None,
                 stdout: Some(stdout),
@@ -725,38 +671,30 @@ async fn emit_patch_end(
         .await;
 
     if let Some(tracker) = ctx.turn_diff_tracker {
-        let completed_update = match tracker_update {
-            TurnDiffTrackerUpdate::Track {
-                environment_id,
-                delta,
-            } => {
-                TurnDiffTracker::track_delta_async(
-                    std::sync::Arc::clone(tracker),
-                    environment_id.unwrap_or_default(),
-                    delta.clone(),
-                )
-                .await
-            }
-            TurnDiffTrackerUpdate::Invalidate => {
-                let mut guard = tracker.lock().await;
-                let had_unified_diff = guard.has_unified_diff();
-                guard.record_unknown_mutation();
-                Some(crate::turn_diff_tracker::CompletedTurnDiffUpdate {
-                    had_unified_diff,
-                    unified_diff: None,
-                })
-            }
-            TurnDiffTrackerUpdate::None => None,
+        let (should_emit_turn_diff, unified_diff) = {
+            let mut guard = tracker.lock().await;
+            let had_unified_diff = guard.has_unified_diff();
+            let tracker_changed = match tracker_update {
+                TurnDiffTrackerUpdate::Track {
+                    environment_id,
+                    delta,
+                } => {
+                    guard.track_delta(environment_id.as_deref().unwrap_or_default(), delta);
+                    true
+                }
+                TurnDiffTrackerUpdate::Invalidate => {
+                    guard.record_unknown_mutation();
+                    true
+                }
+                TurnDiffTrackerUpdate::None => false,
+            };
+            let unified_diff = guard.get_unified_diff();
+            (
+                tracker_changed && (had_unified_diff || unified_diff.is_some()),
+                unified_diff.unwrap_or_default(),
+            )
         };
-
-        if let Some(completed_update) = completed_update
-            && (completed_update.had_unified_diff || completed_update.unified_diff.is_some())
-        {
-            let unified_diff = completed_update
-                .unified_diff
-                .as_deref()
-                .unwrap_or_default()
-                .to_owned();
+        if should_emit_turn_diff {
             ctx.session
                 .send_event(ctx.turn, EventMsg::TurnDiff(TurnDiffEvent { unified_diff }))
                 .await;
@@ -804,7 +742,6 @@ mod tests {
 
         ToolEmitter::ApplyPatch {
             changes: HashMap::new(),
-            ordered_changes: Vec::new(),
             auto_approved: false,
             environment_id: None,
         }
@@ -817,20 +754,17 @@ mod tests {
         .expect_err("failed patch");
 
         let completed = rx_event.recv().await.expect("item completed event");
-        let EventMsg::ItemCompleted(event) = completed.msg else {
-            panic!("expected item completed event");
-        };
-        let TurnItem::FileChange(file_change) = event.item else {
-            panic!("expected file change item");
-        };
-        assert_eq!(file_change.status, Some(expected_status));
-        assert_eq!(file_change.changes.len(), 1);
-        let ordered = file_change
-            .ordered_changes
-            .expect("committed ordered delta must be authoritative");
-        assert_eq!(ordered.len(), 1);
-        assert!(ordered[0].path.ends_with("out/dest.txt"));
-        assert!(matches!(ordered[0].change, FileChange::Add { .. }));
+        assert!(matches!(
+            completed.msg,
+            EventMsg::ItemCompleted(event)
+                if matches!(
+                    &event.item,
+                    TurnItem::FileChange(FileChangeItem {
+                        status: Some(status),
+                        ..
+                    }) if status == &expected_status
+                )
+        ));
 
         let unified_diff = loop {
             let event = tokio::time::timeout(Duration::from_secs(1), rx_event.recv())
@@ -897,7 +831,7 @@ mod tests {
 
             emit_patch_end(
                 ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", Some(&tracker)),
-                Vec::new(),
+                HashMap::new(),
                 String::new(),
                 String::new(),
                 PatchApplyStatus::Completed,
@@ -946,7 +880,7 @@ mod tests {
 
         emit_patch_end(
             ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", Some(&tracker)),
-            Vec::new(),
+            HashMap::new(),
             String::new(),
             String::new(),
             PatchApplyStatus::Completed,

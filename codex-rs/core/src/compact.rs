@@ -17,7 +17,6 @@ use crate::session::PreviousTurnSettings;
 use crate::session::session::Session;
 use crate::session::turn::get_last_assistant_message_from_turn;
 use crate::session::turn_context::TurnContext;
-use crate::turn_timing::ModelStreamTimingGuard;
 use crate::util::backoff;
 use codex_analytics::CodexCompactionEvent;
 use codex_analytics::CompactionImplementation;
@@ -353,7 +352,7 @@ async fn run_compact_task_inner_impl(
     };
     let compacted_item = CompactedItem {
         message: summary_text.clone(),
-        replacement_history: None,
+        replacement_history: Some(new_history.clone()),
         window_number: Some(window_number),
         first_window_id: Some(window_ids.first_window_id.to_string()),
         previous_window_id: window_ids.previous_window_id.map(|id| id.to_string()),
@@ -684,17 +683,20 @@ async fn drain_to_completed(
         .await;
     drop(model_request_timing_guard);
     let mut stream = stream_result?;
-    let mut stream_timing = ModelStreamTimingGuard::new(Some(&turn_context.turn_timing_state));
     loop {
-        stream_timing.begin_wait();
+        let model_stream_wait_timing_guard =
+            turn_context.turn_timing_state.begin_model_stream_wait();
         let maybe_event = stream.next().await;
-        stream_timing.begin_processing();
+        drop(model_stream_wait_timing_guard);
         let Some(event) = maybe_event else {
             return Err(CodexErr::Stream(
                 "stream closed before response.completed".into(),
                 None,
             ));
         };
+        let _model_stream_processing_timing_guard = turn_context
+            .turn_timing_state
+            .begin_model_stream_processing();
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
                 sess.record_conversation_items(turn_context, std::slice::from_ref(&item))

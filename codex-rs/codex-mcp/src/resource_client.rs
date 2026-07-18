@@ -21,7 +21,7 @@ pub struct McpResourcePage {
 }
 
 /// Contents returned after reading one MCP resource.
-#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct McpResourceReadResult {
     /// Text or blob content returned for the requested resource.
     pub contents: Vec<ResourceContent>,
@@ -105,7 +105,12 @@ impl McpResourceClient {
             .load_full()
             .read_resource(server, ReadResourceRequestParams::new(uri.to_string()))
             .await?;
-        resource_read_result_from_rmcp(result)
+        let contents = result
+            .contents
+            .into_iter()
+            .map(resource_content_from_rmcp)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(McpResourceReadResult { contents })
     }
 }
 
@@ -114,120 +119,8 @@ fn resource_from_rmcp(resource: rmcp::model::Resource) -> Result<Resource> {
     Resource::from_mcp_value(value).context("failed to convert MCP resource")
 }
 
-pub fn resource_content_from_rmcp(
-    content: rmcp::model::ResourceContents,
-) -> Result<ResourceContent> {
-    Ok(match content {
-        rmcp::model::ResourceContents::TextResourceContents {
-            uri,
-            mime_type,
-            text,
-            meta,
-        } => ResourceContent::Text {
-            uri,
-            mime_type,
-            text,
-            meta: meta.map(|meta| serde_json::Value::Object(meta.0)),
-        },
-        rmcp::model::ResourceContents::BlobResourceContents {
-            uri,
-            mime_type,
-            blob,
-            meta,
-        } => ResourceContent::Blob {
-            uri,
-            mime_type,
-            blob,
-            meta: meta.map(|meta| serde_json::Value::Object(meta.0)),
-        },
-    })
-}
-
-/// Converts an rmcp read result into the canonical Codex resource result without JSON bridging.
-pub fn resource_read_result_from_rmcp(
-    result: rmcp::model::ReadResourceResult,
-) -> Result<McpResourceReadResult> {
-    let contents = result
-        .contents
-        .into_iter()
-        .map(resource_content_from_rmcp)
-        .collect::<Result<Vec<_>>>()?;
-    Ok(McpResourceReadResult { contents })
-}
-
-/// Serializes the typed resource result for the retained `Value` compatibility API.
-pub fn resource_read_result_to_value(
-    result: McpResourceReadResult,
-) -> std::result::Result<serde_json::Value, serde_json::Error> {
-    serde_json::to_value(result)
-}
-
-#[cfg(test)]
-mod tests {
-    use codex_protocol::mcp::ResourceContent;
-    use pretty_assertions::assert_eq;
-    use rmcp::model::Meta;
-    use rmcp::model::ReadResourceResult;
-    use rmcp::model::ResourceContents;
-    use serde_json::json;
-
-    use super::McpResourceReadResult;
-    use super::resource_read_result_from_rmcp;
-    use super::resource_read_result_to_value;
-
-    #[test]
-    fn typed_resource_read_preserves_legacy_value_wrapper_shape() {
-        let text_meta = Meta(serde_json::Map::from_iter([
-            ("nested".to_string(), json!({ "kind": "text" })),
-            ("count".to_string(), json!(1)),
-        ]));
-        let blob_meta = Meta(serde_json::Map::from_iter([
-            ("nested".to_string(), json!({ "kind": "blob" })),
-            ("count".to_string(), json!(2)),
-        ]));
-        let rmcp_result = ReadResourceResult::new(vec![
-            ResourceContents::TextResourceContents {
-                uri: "file:///text".to_string(),
-                mime_type: Some("text/plain".to_string()),
-                text: "hello".to_string(),
-                meta: Some(text_meta),
-            },
-            ResourceContents::BlobResourceContents {
-                uri: "file:///blob".to_string(),
-                mime_type: None,
-                blob: "aGVsbG8=".to_string(),
-                meta: Some(blob_meta),
-            },
-        ]);
-        let legacy_value = serde_json::to_value(&rmcp_result).unwrap();
-
-        let typed = resource_read_result_from_rmcp(rmcp_result).unwrap();
-
-        assert_eq!(
-            typed,
-            McpResourceReadResult {
-                contents: vec![
-                    ResourceContent::Text {
-                        uri: "file:///text".to_string(),
-                        mime_type: Some("text/plain".to_string()),
-                        text: "hello".to_string(),
-                        meta: Some(json!({
-                            "nested": { "kind": "text" },
-                            "count": 1
-                        })),
-                    },
-                    ResourceContent::Blob {
-                        uri: "file:///blob".to_string(),
-                        mime_type: None,
-                        blob: "aGVsbG8=".to_string(),
-                        meta: Some(json!({
-                            "nested": { "kind": "blob" },
-                            "count": 2
-                        })),
-                    },
-                ],
-            }
-        );
-        assert_eq!(resource_read_result_to_value(typed).unwrap(), legacy_value);
-    }
+fn resource_content_from_rmcp(content: rmcp::model::ResourceContents) -> Result<ResourceContent> {
+    let value =
+        serde_json::to_value(content).context("failed to serialize MCP resource content")?;
+    serde_json::from_value(value).context("failed to convert MCP resource content")
 }

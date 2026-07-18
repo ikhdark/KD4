@@ -203,29 +203,15 @@ async fn forward_incoming_message(
     connection_id: ConnectionId,
     payload: &str,
 ) -> bool {
-    let Some(message) = parse_incoming_message(payload) else {
-        return true;
-    };
-    forward_parsed_incoming_message(transport_event_tx, writer, connection_id, message).await
-}
-
-fn parse_incoming_message(payload: &str) -> Option<JSONRPCMessage> {
-    match serde_json::from_str(payload) {
-        Ok(message) => Some(message),
+    match serde_json::from_str::<JSONRPCMessage>(payload) {
+        Ok(message) => {
+            enqueue_incoming_message(transport_event_tx, writer, connection_id, message).await
+        }
         Err(err) => {
             error!("Failed to deserialize JSONRPCMessage: {err}");
-            None
+            true
         }
     }
-}
-
-async fn forward_parsed_incoming_message(
-    transport_event_tx: &mpsc::Sender<TransportEvent>,
-    writer: &mpsc::Sender<QueuedOutgoingMessage>,
-    connection_id: ConnectionId,
-    message: JSONRPCMessage,
-) -> bool {
-    enqueue_incoming_message(transport_event_tx, writer, connection_id, message).await
 }
 
 async fn enqueue_incoming_message(

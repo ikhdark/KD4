@@ -2,16 +2,6 @@ use super::*;
 use crate::session::step_context::StepContext;
 use pretty_assertions::assert_eq;
 
-fn shared_function_call(call_id: &str) -> SharedToolCall {
-    SharedToolCall::new(crate::tools::router::ToolCall {
-        tool_name: codex_tools::ToolName::plain("test_tool"),
-        call_id: call_id.to_string(),
-        payload: ToolPayload::Function {
-            arguments: "{}".to_string(),
-        },
-    })
-}
-
 struct TestHandler {
     tool_name: codex_tools::ToolName,
 }
@@ -38,62 +28,6 @@ impl ToolExecutor<ToolInvocation> for TestHandler {
 }
 
 impl CoreToolRuntime for TestHandler {}
-
-struct HookPayloadCountingHandler {
-    tool_name: codex_tools::ToolName,
-    pre_payload_calls: Arc<std::sync::atomic::AtomicUsize>,
-    post_payload_calls: Arc<std::sync::atomic::AtomicUsize>,
-    handle_calls: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl ToolExecutor<ToolInvocation> for HookPayloadCountingHandler {
-    fn tool_name(&self) -> codex_tools::ToolName {
-        self.tool_name.clone()
-    }
-
-    fn spec(&self) -> codex_tools::ToolSpec {
-        test_spec(&self.tool_name)
-    }
-
-    fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        self.handle_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Box::pin(async {
-            Ok(
-                Box::new(crate::tools::context::FunctionToolOutput::from_text(
-                    "ok".to_string(),
-                    Some(true),
-                )) as Box<dyn crate::tools::context::ToolOutput>,
-            )
-        })
-    }
-}
-
-impl CoreToolRuntime for HookPayloadCountingHandler {
-    fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
-        self.pre_payload_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(PreToolUsePayload {
-            tool_name: function_hook_tool_name(invocation),
-            tool_input: serde_json::json!({ "materialized": "pre" }),
-        })
-    }
-
-    fn post_tool_use_payload(
-        &self,
-        invocation: &ToolInvocation,
-        _result: &dyn ToolOutput,
-    ) -> Option<PostToolUsePayload> {
-        self.post_payload_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Some(PostToolUsePayload {
-            tool_name: function_hook_tool_name(invocation),
-            tool_use_id: invocation.call_id.clone(),
-            tool_input: serde_json::json!({ "materialized": "post-input" }),
-            tool_response: serde_json::json!({ "materialized": "post-response" }),
-        })
-    }
-}
 
 #[derive(Clone)]
 enum LifecycleTestResult {
@@ -387,8 +321,11 @@ async fn write_stdin_does_not_expose_default_pre_tool_use_payload() {
 
 #[test]
 fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
-    let mut result = AnyToolResult {
-        call: shared_function_call("call-1"),
+    let result = AnyToolResult {
+        call_id: "call-1".to_string(),
+        payload: ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
         result: Box::new(PostToolUseFeedbackOutput {
             original: Box::new(codex_tools::JsonToolOutput::new(
                 serde_json::json!({ "typed": true }),
@@ -398,9 +335,8 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
                 /*success*/ None,
             ),
         }),
-        projection: None,
+        post_tool_use_payload: None,
     };
-    result.project_after_hooks(&crate::tools::context::ToolCallSource::Direct);
 
     assert_eq!(
         result.into_response(),
@@ -412,8 +348,11 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
         }
     );
 
-    let mut result = AnyToolResult {
-        call: shared_function_call("call-1"),
+    let result = AnyToolResult {
+        call_id: "call-1".to_string(),
+        payload: ToolPayload::Function {
+            arguments: "{}".to_string(),
+        },
         result: Box::new(PostToolUseFeedbackOutput {
             original: Box::new(codex_tools::JsonToolOutput::new(
                 serde_json::json!({ "typed": true }),
@@ -423,92 +362,12 @@ fn post_tool_use_feedback_output_keeps_code_mode_result_typed() {
                 /*success*/ None,
             ),
         }),
-        projection: None,
+        post_tool_use_payload: None,
     };
-    result.project_after_hooks(&crate::tools::context::ToolCallSource::CodeMode {
-        cell_id: "cell-1".to_string(),
-        runtime_tool_call_id: "runtime-call-1".to_string(),
-    });
 
     assert_eq!(
         result.code_mode_result(),
         serde_json::json!({ "typed": true })
-    );
-}
-
-struct ProjectionCountingOutput {
-    direct_calls: Arc<std::sync::atomic::AtomicUsize>,
-    code_mode_calls: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl ToolOutput for ProjectionCountingOutput {
-    fn log_preview(&self) -> String {
-        "counting".to_string()
-    }
-
-    fn success_for_logging(&self) -> bool {
-        true
-    }
-
-    fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
-        self.direct_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        crate::tools::context::FunctionToolOutput::from_text("direct".to_string(), Some(true))
-            .to_response_item(call_id, payload)
-    }
-
-    fn code_mode_result(&self, _payload: &ToolPayload) -> Value {
-        self.code_mode_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        serde_json::json!({ "mode": "code" })
-    }
-}
-
-#[test]
-fn projected_tool_results_are_consumed_without_reprojection() {
-    let direct_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let code_mode_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut direct = AnyToolResult {
-        call: shared_function_call("direct-call"),
-        result: Box::new(ProjectionCountingOutput {
-            direct_calls: Arc::clone(&direct_calls),
-            code_mode_calls: Arc::clone(&code_mode_calls),
-        }),
-        projection: None,
-    };
-    direct.project_after_hooks(&crate::tools::context::ToolCallSource::Direct);
-    let response = direct.into_response();
-
-    assert!(matches!(
-        response,
-        ResponseInputItem::FunctionCallOutput { .. }
-    ));
-    assert_eq!(direct_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
-    assert_eq!(
-        code_mode_calls.load(std::sync::atomic::Ordering::Relaxed),
-        0
-    );
-
-    let mut code_mode = AnyToolResult {
-        call: shared_function_call("code-call"),
-        result: Box::new(ProjectionCountingOutput {
-            direct_calls: Arc::clone(&direct_calls),
-            code_mode_calls: Arc::clone(&code_mode_calls),
-        }),
-        projection: None,
-    };
-    code_mode.project_after_hooks(&crate::tools::context::ToolCallSource::CodeMode {
-        cell_id: "cell-2".to_string(),
-        runtime_tool_call_id: "runtime-call-2".to_string(),
-    });
-    assert_eq!(
-        code_mode.code_mode_result(),
-        serde_json::json!({ "mode": "code" })
-    );
-    assert_eq!(direct_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
-    assert_eq!(
-        code_mode_calls.load(std::sync::atomic::Ordering::Relaxed),
-        1
     );
 }
 
@@ -589,43 +448,6 @@ async fn dispatch_notifies_tool_lifecycle_contributors() -> anyhow::Result<()> {
         .drain(..)
         .collect::<Vec<_>>();
     assert_eq!(expected, actual);
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn dispatch_skips_hook_payload_materialization_for_empty_plans() -> anyhow::Result<()> {
-    let (session, turn) = crate::session::tests::make_session_and_context().await;
-    let tool_name = codex_tools::ToolName::plain("count_hook_payloads");
-    let pre_payload_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let post_payload_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let handle_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let handler = Arc::new(HookPayloadCountingHandler {
-        tool_name: tool_name.clone(),
-        pre_payload_calls: Arc::clone(&pre_payload_calls),
-        post_payload_calls: Arc::clone(&post_payload_calls),
-        handle_calls: Arc::clone(&handle_calls),
-    }) as Arc<dyn CoreToolRuntime>;
-    let registry = ToolRegistry::new(HashMap::from([(tool_name.clone(), handler)]));
-
-    registry
-        .dispatch_any(test_invocation(
-            Arc::new(session),
-            Arc::new(turn),
-            "call-1",
-            tool_name,
-        ))
-        .await?;
-
-    assert_eq!(handle_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
-    assert_eq!(
-        pre_payload_calls.load(std::sync::atomic::Ordering::Relaxed),
-        0
-    );
-    assert_eq!(
-        post_payload_calls.load(std::sync::atomic::Ordering::Relaxed),
-        0
-    );
 
     Ok(())
 }

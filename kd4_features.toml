@@ -205,17 +205,17 @@ config_keys = []
 [[features.evidence]]
 kind = "entrypoint"
 path = "codex-rs/core/src/tools/handlers/command_preflight.rs"
-contains = "pub(crate) async fn preflight_invocation_with_equivalent_repair_async("
+contains = "pub(crate) fn preflight_invocation_with_equivalent_repair("
 
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tools/handlers/shell/shell_command.rs"
-contains = "preflight_invocation_with_equivalent_repair_async("
+contains = "preflight_invocation_with_equivalent_repair("
 
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tools/handlers/unified_exec/exec_command.rs"
-contains = "preflight_invocation_with_equivalent_repair_async("
+contains = "preflight_invocation_with_equivalent_repair("
 
 [[features.evidence]]
 kind = "test"
@@ -469,7 +469,7 @@ contains = "tool_search_cache_rebuilds_when_deferred_sources_change"
 [[features]]
 id = "source-tools"
 version = 1
-status = "enabled"
+status = "disabled"
 capability_kind = "runtime"
 owner = "codex-rs/file-search"
 summary = "Feature-gated structured source search and bounded file-span reads."
@@ -549,13 +549,13 @@ config_keys = []
 
 [[features.evidence]]
 kind = "entrypoint"
-path = ".codex/skills/kd4-harness/SKILL.md"
-contains = "name: kd4-harness"
+path = ".codex/harness/workflow.md"
+contains = "# KD4 Harness Workflow"
 
 [[features.evidence]]
 kind = "registration"
-path = ".codex/skills/kd4-harness/agents/openai.yaml"
-contains = "default_prompt: \"Use $kd4-harness"
+path = ".codex/skills/kd4-harness/SKILL.md"
+contains = ".codex/harness/workflow.md"
 
 [[features]]
 id = "task-evidence-completion-gate"

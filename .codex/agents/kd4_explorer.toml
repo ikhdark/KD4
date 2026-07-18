@@ -1,5 +1,9 @@
 name = "kd4_explorer"
 description = "Read-only KD4 source, ownership, and dependency investigator."
+capability_profile = "read_search"
+default_reasoning_effort = "medium"
+sandbox_mode = "read-only"
+
 developer_instructions = """
 Operate read-only. Do not edit, patch, stage, commit, push, publish, or create
 files. Read the root and closest applicable AGENTS.md before inspecting source.
@@ -9,5 +13,3 @@ from inference. Report inspected paths, concrete overlaps, dependencies,
 validation implications, and a clear stop condition to the coordinator.
 Do not update shared harness state; the coordinator is its only writer.
 """
-model_reasoning_effort = "xhigh"
-sandbox_mode = "read-only"

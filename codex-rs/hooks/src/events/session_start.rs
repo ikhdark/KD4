@@ -1,5 +1,4 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::HookCompletedEvent;
@@ -15,7 +14,6 @@ use crate::engine::CommandShell;
 use crate::engine::ConfiguredHandler;
 use crate::engine::command_runner::CommandRunResult;
 use crate::engine::dispatcher;
-use crate::engine::dispatcher::HookMatchContext;
 use crate::engine::output_parser;
 use crate::schema::NullableString;
 use crate::schema::SessionStartCommandInput;
@@ -48,19 +46,6 @@ pub struct SessionStartRequest {
     pub model: String,
     pub permission_mode: String,
     pub target: StartHookTarget,
-}
-
-impl SessionStartRequest {
-    pub(crate) fn match_context(&self) -> HookMatchContext<'_> {
-        match &self.target {
-            StartHookTarget::SessionStart { source } => HookMatchContext::SessionStart {
-                source: source.as_str(),
-            },
-            StartHookTarget::SubagentStart { agent_type, .. } => {
-                HookMatchContext::SubagentStart { agent_type }
-            }
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -131,15 +116,6 @@ pub(crate) async fn run(
         request.target.event_name(),
         Some(request.target.matcher_input()),
     );
-    run_prepared(matched, shell, request, turn_id).await
-}
-
-pub(crate) async fn run_prepared(
-    matched: Vec<Arc<ConfiguredHandler>>,
-    shell: &CommandShell,
-    request: SessionStartRequest,
-    turn_id: Option<String>,
-) -> SessionStartOutcome {
     if matched.is_empty() {
         return SessionStartOutcome {
             hook_events: Vec::new(),
@@ -472,45 +448,6 @@ mod tests {
                 text: "hook returned invalid session start JSON output".to_string(),
             }]
         );
-    }
-
-    #[test]
-    fn invalid_json_shapes_preserve_final_failure_diagnostic() {
-        for stdout in [
-            "[]",
-            r#"{"unknownField":true}"#,
-            r#"{"hookSpecificOutput":{}}"#,
-            r#"{"continue":"yes"}"#,
-        ] {
-            let parsed = parse_completed(
-                &handler(),
-                run_result(Some(0), stdout, ""),
-                /*turn_id*/ None,
-            );
-
-            assert_eq!(
-                parsed.data,
-                SessionStartHandlerData {
-                    should_stop: false,
-                    stop_reason: None,
-                    additional_contexts_for_model: Vec::new(),
-                },
-                "stdout: {stdout}"
-            );
-            assert_eq!(
-                parsed.completed.run.status,
-                HookRunStatus::Failed,
-                "stdout: {stdout}"
-            );
-            assert_eq!(
-                parsed.completed.run.entries,
-                vec![HookOutputEntry {
-                    kind: HookOutputEntryKind::Error,
-                    text: "hook returned invalid session start JSON output".to_string(),
-                }],
-                "stdout: {stdout}"
-            );
-        }
     }
 
     #[test]

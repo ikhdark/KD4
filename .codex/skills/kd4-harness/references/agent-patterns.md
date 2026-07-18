@@ -8,23 +8,8 @@ subagents, delegation, or parallel agent work.
 - Default to a single responsible agent.
 - Give each subagent a bounded task and expected output.
 - Do not allow recursive delegation unless explicitly needed.
-- Reload shared tracker or run state before assignment and integration.
-- Avoid overlapping edits. One owner integrates final changes and updates
-  shared state.
+- Avoid overlapping edits. One owner integrates final changes.
 - Require each agent to report inspected scope and evidence.
-
-## Overlap Gate
-
-Before parallel work, compare owner paths, shared types or protocols,
-configuration, generated artifacts, ordering dependencies, and validation
-resources. Different filenames do not prove independence.
-
-- Parallelize work only when no shared write owner or unfinished dependency was
-  found.
-- Coordinate work with an explicit owner split and integration order when a
-  shared contract or validation resource remains.
-- Keep work blocked when it depends on an unfinished or competing owner.
-- Inspect further instead of guessing when evidence is insufficient.
 
 ## Patterns
 
@@ -56,7 +41,6 @@ Each assignment should include:
 - files or directories to inspect;
 - expected output;
 - validation expectation;
-- shared-state or overlap constraints;
 - stop condition.
 
 ## Integration Rule

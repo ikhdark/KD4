@@ -22,7 +22,6 @@ use crate::responses_retry::handle_retryable_response_stream_error;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
-use crate::turn_timing::ModelStreamTimingGuard;
 use crate::turn_timing::TurnTimingState;
 use codex_analytics::CompactionImplementation;
 use codex_analytics::CompactionPhase;
@@ -299,7 +298,7 @@ async fn run_remote_compact_task_inner_impl(
     };
     let compacted_item = CompactedItem {
         message: String::new(),
-        replacement_history: None,
+        replacement_history: Some(new_history.clone()),
         window_number: Some(new_window_number),
         first_window_id: Some(new_window_ids.first_window_id.to_string()),
         previous_window_id: new_window_ids.previous_window_id.map(|id| id.to_string()),
@@ -392,14 +391,16 @@ async fn collect_compaction_output(
     let mut compaction_output = None;
     let mut saw_completed = false;
     let mut completed_token_usage = None;
-    let mut stream_timing = ModelStreamTimingGuard::new(timing_state);
     loop {
-        stream_timing.begin_wait();
+        let model_stream_wait_timing_guard =
+            timing_state.map(super::turn_timing::TurnTimingState::begin_model_stream_wait);
         let next_event = stream.next().await;
-        stream_timing.begin_processing();
+        drop(model_stream_wait_timing_guard);
         let Some(event) = next_event else {
             break;
         };
+        let _model_stream_processing_timing_guard =
+            timing_state.map(super::turn_timing::TurnTimingState::begin_model_stream_processing);
         match event? {
             ResponseEvent::OutputItemDone(item) => {
                 output_item_count += 1;
@@ -418,7 +419,6 @@ async fn collect_compaction_output(
             _ => {}
         }
     }
-    stream_timing.finish();
 
     if !saw_completed {
         return Err(CodexErr::Stream(
@@ -449,7 +449,9 @@ fn build_v2_compacted_history(
     let retained = prompt_input
         .iter()
         .filter(|item| is_retained_for_remote_compaction_v2(item))
-        .filter(|item| should_keep_compacted_history_item(item));
+        .filter(|item| should_keep_compacted_history_item(item))
+        .cloned()
+        .collect::<Vec<_>>();
     let mut retained =
         truncate_retained_messages_for_remote_compaction(retained, RETAINED_MESSAGE_TOKEN_BUDGET);
     let retained_image_count = retained
@@ -479,23 +481,23 @@ fn retained_input_image_count(item: &ResponseItem) -> usize {
         .count()
 }
 
-fn truncate_retained_messages_for_remote_compaction<'a>(
-    items: impl DoubleEndedIterator<Item = &'a ResponseItem>,
+fn truncate_retained_messages_for_remote_compaction(
+    items: Vec<ResponseItem>,
     max_tokens: usize,
 ) -> Vec<ResponseItem> {
     let mut remaining = max_tokens;
-    let mut truncated_reversed = Vec::new();
-    for item in items.rev() {
+    let mut truncated_reversed = Vec::with_capacity(items.len());
+    for item in items.into_iter().rev() {
         if remaining == 0 {
             continue;
         }
 
         let token_count = message_text_token_count(&item).max(1);
         if token_count <= remaining {
-            truncated_reversed.push(item.clone());
+            truncated_reversed.push(item);
             remaining = remaining.saturating_sub(token_count);
         } else if let Some(truncated_item) =
-            truncate_message_text_to_token_budget(item.clone(), /*max_tokens*/ remaining)
+            truncate_message_text_to_token_budget(item, /*max_tokens*/ remaining)
         {
             truncated_reversed.push(truncated_item);
             remaining = 0;
@@ -712,10 +714,8 @@ mod tests {
             new.clone(),
         ];
 
-        let truncated = truncate_retained_messages_for_remote_compaction(
-            retained.iter(),
-            /*max_tokens*/ 3,
-        );
+        let truncated =
+            truncate_retained_messages_for_remote_compaction(retained, /*max_tokens*/ 3);
 
         assert_eq!(
             truncated,
@@ -747,11 +747,8 @@ mod tests {
             internal_chat_message_metadata_passthrough: None,
         };
 
-        let retained = [item];
-        let truncated = truncate_retained_messages_for_remote_compaction(
-            retained.iter(),
-            /*max_tokens*/ 3,
-        );
+        let truncated =
+            truncate_retained_messages_for_remote_compaction(vec![item], /*max_tokens*/ 3);
 
         assert_eq!(
             truncated,
@@ -795,10 +792,8 @@ mod tests {
             newest.clone(),
         ];
 
-        let truncated = truncate_retained_messages_for_remote_compaction(
-            retained.iter(),
-            /*max_tokens*/ 2,
-        );
+        let truncated =
+            truncate_retained_messages_for_remote_compaction(retained, /*max_tokens*/ 2);
 
         assert_eq!(truncated, vec![image_only_message, newest]);
     }
@@ -818,10 +813,8 @@ mod tests {
         let newest = message("user", "new", /*phase*/ None);
         let retained = vec![image_only_message, newest.clone()];
 
-        let truncated = truncate_retained_messages_for_remote_compaction(
-            retained.iter(),
-            /*max_tokens*/ 1,
-        );
+        let truncated =
+            truncate_retained_messages_for_remote_compaction(retained, /*max_tokens*/ 1);
 
         assert_eq!(truncated, vec![newest]);
     }

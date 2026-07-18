@@ -20,7 +20,6 @@ use codex_config::TomlValue;
 use codex_plugin::PluginHookSource;
 use codex_plugin::PluginId;
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::HookEventName;
 use codex_protocol::protocol::HookOutputEntry;
 use codex_protocol::protocol::HookOutputEntryKind;
 use codex_protocol::protocol::HookRunStatus;
@@ -1506,110 +1505,4 @@ fn plugin_hook_load_warnings_are_startup_warnings() {
     );
 
     assert_eq!(engine.warnings(), &["failed plugin hook".to_string()]);
-}
-
-#[test]
-fn discovery_invalid_supported_matcher_warns_once_and_skips_entire_group() {
-    let temp = tempdir().expect("create temp dir");
-    let plugin_root =
-        AbsolutePathBuf::try_from(temp.path().join("demo-plugin")).expect("plugin root");
-    let plugin_data_root =
-        AbsolutePathBuf::try_from(temp.path().join("plugin-data")).expect("plugin data root");
-    let source_path = plugin_root.join("hooks/hooks.json");
-    let plugin_hook_sources = vec![PluginHookSource {
-        plugin_id: PluginId::parse("demo-plugin@test-marketplace").expect("plugin id"),
-        plugin_root,
-        plugin_data_root,
-        source_path: source_path.clone(),
-        source_relative_path: "hooks/hooks.json".to_string(),
-        hooks: HookEventsToml {
-            pre_tool_use: vec![
-                MatcherGroup {
-                    matcher: Some("[".to_string()),
-                    hooks: vec![
-                        HookHandlerConfig::Command {
-                            command: "invalid-first".to_string(),
-                            command_windows: None,
-                            timeout_sec: Some(5),
-                            r#async: false,
-                            status_message: None,
-                        },
-                        HookHandlerConfig::Command {
-                            command: "invalid-second".to_string(),
-                            command_windows: None,
-                            timeout_sec: Some(5),
-                            r#async: false,
-                            status_message: None,
-                        },
-                    ],
-                },
-                MatcherGroup {
-                    matcher: Some("Bash".to_string()),
-                    hooks: vec![HookHandlerConfig::Command {
-                        command: "valid-pre-tool".to_string(),
-                        command_windows: None,
-                        timeout_sec: Some(5),
-                        r#async: false,
-                        status_message: None,
-                    }],
-                },
-            ],
-            stop: vec![MatcherGroup {
-                matcher: Some("[".to_string()),
-                hooks: vec![HookHandlerConfig::Command {
-                    command: "valid-stop".to_string(),
-                    command_windows: None,
-                    timeout_sec: Some(5),
-                    r#async: false,
-                    status_message: None,
-                }],
-            }],
-            ..Default::default()
-        },
-    }];
-
-    let discovered = super::discovery::discover_handlers(
-        /*config_layer_stack*/ None,
-        plugin_hook_sources,
-        Vec::new(),
-        /*bypass_hook_trust*/ true,
-    );
-
-    assert_eq!(discovered.warnings.len(), 1);
-    assert!(discovered.warnings[0].contains("invalid matcher \"[\""));
-    assert!(discovered.warnings[0].contains(&source_path.display().to_string()));
-    assert_eq!(
-        discovered
-            .handlers
-            .iter()
-            .map(|handler| (
-                handler.event_name,
-                handler.matcher.as_deref(),
-                handler.command.as_str(),
-            ))
-            .collect::<Vec<_>>(),
-        vec![
-            (HookEventName::PreToolUse, Some("Bash"), "valid-pre-tool"),
-            (HookEventName::Stop, None, "valid-stop"),
-        ]
-    );
-    assert_eq!(
-        discovered
-            .hook_entries
-            .iter()
-            .map(|entry| (
-                entry.event_name,
-                entry.matcher.as_deref(),
-                entry.command.as_deref(),
-            ))
-            .collect::<Vec<_>>(),
-        vec![
-            (
-                HookEventName::PreToolUse,
-                Some("Bash"),
-                Some("valid-pre-tool"),
-            ),
-            (HookEventName::Stop, None, Some("valid-stop")),
-        ]
-    );
 }

@@ -1,18 +1,9 @@
 use super::process::UnifiedExecProcess;
-use super::process::merge_recovery_gap;
-use super::process::recovery_incomplete_detail;
-use super::head_tail_buffer::HeadTailBuffer;
-use super::process::OutputHandles;
-use crate::tools::command_output_artifact::RawOutputArtifact;
-use crate::tools::command_output_artifact::RawOutputArtifactWritePositions;
-use crate::tools::command_output_artifact::RawOutputArtifactWriteQueue;
-use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::unified_exec::UnifiedExecError;
 use codex_exec_server::ExecProcess;
 use codex_exec_server::ExecProcessEventReceiver;
 use codex_exec_server::ExecProcessFuture;
 use codex_exec_server::ExecServerError;
-use codex_exec_server::OutputGap;
 use codex_exec_server::ProcessId;
 use codex_exec_server::ProcessSignal;
 use codex_exec_server::ReadResponse;
@@ -20,41 +11,21 @@ use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteResponse;
 use codex_exec_server::WriteStatus;
 use pretty_assertions::assert_eq;
-use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
-use tokio::sync::Notify;
 use tokio::sync::Mutex;
-use tokio::sync::Semaphore;
-use tokio::sync::broadcast;
-use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tokio_util::sync::CancellationToken;
 
 struct MockExecProcess {
     process_id: ProcessId,
     write_response: WriteResponse,
     read_responses: Mutex<VecDeque<ReadResponse>>,
-    read_calls: Mutex<Vec<(Option<u64>, Option<usize>, Option<usize>, Option<u64>)>>,
     terminate_error: Option<String>,
     wake_tx: watch::Sender<u64>,
 }
 
 impl MockExecProcess {
-    async fn read_with_limits(
-        &self,
-        after_seq: Option<u64>,
-        max_bytes: Option<usize>,
-        max_chunks: Option<usize>,
-        wait_ms: Option<u64>,
-    ) -> Result<ReadResponse, ExecServerError> {
-        self.read_calls
-            .lock()
-            .await
-            .push((after_seq, max_bytes, max_chunks, wait_ms));
+    async fn read(&self) -> Result<ReadResponse, ExecServerError> {
         Ok(self
             .read_responses
             .lock()
@@ -62,9 +33,6 @@ impl MockExecProcess {
             .pop_front()
             .unwrap_or(ReadResponse {
                 chunks: Vec::new(),
-                output_gaps: Vec::new(),
-                earliest_retained_seq: Some(1),
-                complete: Some(true),
                 next_seq: 1,
                 exited: false,
                 exit_code: None,
@@ -97,25 +65,11 @@ impl ExecProcess for MockExecProcess {
 
     fn read(
         &self,
-        after_seq: Option<u64>,
-        max_bytes: Option<usize>,
-        wait_ms: Option<u64>,
+        _after_seq: Option<u64>,
+        _max_bytes: Option<usize>,
+        _wait_ms: Option<u64>,
     ) -> ExecProcessFuture<'_, ReadResponse> {
-        Box::pin(MockExecProcess::read_with_limits(
-            self, after_seq, max_bytes, None, wait_ms,
-        ))
-    }
-
-    fn read_with_limits(
-        &self,
-        after_seq: Option<u64>,
-        max_bytes: Option<usize>,
-        max_chunks: Option<usize>,
-        wait_ms: Option<u64>,
-    ) -> ExecProcessFuture<'_, ReadResponse> {
-        Box::pin(MockExecProcess::read_with_limits(
-            self, after_seq, max_bytes, max_chunks, wait_ms,
-        ))
+        Box::pin(MockExecProcess::read(self))
     }
 
     fn write(&self, _chunk: Vec<u8>) -> ExecProcessFuture<'_, WriteResponse> {
@@ -143,7 +97,6 @@ async fn remote_process(
                 status: write_status,
             },
             read_responses: Mutex::new(VecDeque::new()),
-            read_calls: Mutex::new(Vec::new()),
             terminate_error,
             wake_tx,
         }),
@@ -152,160 +105,6 @@ async fn remote_process(
     UnifiedExecProcess::from_exec_server_started(started, None)
         .await
         .expect("remote process should start")
-}
-
-#[tokio::test]
-async fn tail_only_recovery_gap_is_observed_from_the_wake_channel() {
-    let (wake_tx, _wake_rx) = watch::channel(0);
-    let mock = Arc::new(MockExecProcess {
-        process_id: "gap-process".to_string().into(),
-        write_response: WriteResponse {
-            status: WriteStatus::Accepted,
-        },
-        read_responses: Mutex::new(VecDeque::from([ReadResponse {
-            chunks: Vec::new(),
-            output_gaps: vec![OutputGap {
-                first_missing_seq: 1,
-                last_missing_seq: 2,
-            }],
-            earliest_retained_seq: Some(3),
-            complete: Some(true),
-            next_seq: 3,
-            exited: false,
-            exit_code: None,
-            closed: false,
-            failure: None,
-            sandbox_denied: false,
-        }])),
-        read_calls: Mutex::new(Vec::new()),
-        terminate_error: None,
-        wake_tx,
-    });
-    let process = UnifiedExecProcess::from_exec_server_started(
-        StartedExecProcess {
-            process: Arc::clone(&mock) as Arc<dyn ExecProcess>,
-        },
-        None,
-    )
-    .await
-    .expect("remote process should start");
-
-    mock.wake_tx.send(2).expect("wake recovery reader");
-
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let rendered = process
-                .output_handles()
-                .output_buffer
-                .lock()
-                .await
-                .render_bytes();
-            if String::from_utf8_lossy(&rendered).contains("missing sequences 1-2") {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("tail-only recovery gap should become durable evidence");
-}
-
-#[tokio::test]
-async fn recovery_pages_use_explicit_completeness_and_preserve_whole_stream_bytes() {
-    let (wake_tx, _wake_rx) = watch::channel(0);
-    let first = vec![b'a'; 60 * 1024];
-    let second = [vec![0_u8, 0xff, b'Z'], vec![b'b'; 8 * 1024]].concat();
-    let expected = [first.clone(), second.clone()].concat();
-    let mock = Arc::new(MockExecProcess {
-        process_id: "paged-process".to_string().into(),
-        write_response: WriteResponse {
-            status: WriteStatus::Accepted,
-        },
-        read_responses: Mutex::new(VecDeque::from([
-            ReadResponse {
-                chunks: vec![codex_exec_server::ProcessOutputChunk {
-                    seq: 1,
-                    stream: codex_exec_server::ExecOutputStream::Stdout,
-                    chunk: first.into(),
-                }],
-                output_gaps: Vec::new(),
-                earliest_retained_seq: Some(1),
-                complete: Some(false),
-                next_seq: 2,
-                exited: false,
-                exit_code: None,
-                closed: false,
-                failure: None,
-                sandbox_denied: false,
-            },
-            ReadResponse {
-                chunks: vec![codex_exec_server::ProcessOutputChunk {
-                    seq: 2,
-                    stream: codex_exec_server::ExecOutputStream::Stdout,
-                    chunk: second.into(),
-                }],
-                output_gaps: Vec::new(),
-                earliest_retained_seq: Some(1),
-                complete: Some(true),
-                next_seq: 3,
-                exited: false,
-                exit_code: None,
-                closed: false,
-                failure: None,
-                sandbox_denied: false,
-            },
-        ])),
-        read_calls: Mutex::new(Vec::new()),
-        terminate_error: None,
-        wake_tx,
-    });
-    let process = UnifiedExecProcess::from_exec_server_started(
-        StartedExecProcess {
-            process: Arc::clone(&mock) as Arc<dyn ExecProcess>,
-        },
-        None,
-    )
-    .await
-    .expect("remote process should start");
-
-    mock.wake_tx.send(2).expect("wake recovery reader");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let rendered = process
-                .output_handles()
-                .output_buffer
-                .lock()
-                .await
-                .render_bytes();
-            if rendered.len() >= expected.len() {
-                assert_eq!(rendered, expected);
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("paged recovery should complete");
-
-    let expected_page_max_bytes = 64 * 1024;
-    let expected_page_max_chunks = 128;
-    assert_eq!(
-        *mock.read_calls.lock().await,
-        vec![
-            (
-                Some(0),
-                Some(expected_page_max_bytes),
-                Some(expected_page_max_chunks),
-                Some(0),
-            ),
-            (
-                Some(1),
-                Some(expected_page_max_bytes),
-                Some(expected_page_max_chunks),
-                Some(0),
-            ),
-        ]
-    );
 }
 
 #[tokio::test]
@@ -372,193 +171,4 @@ async fn remote_terminate_confirmed_updates_state_on_success_only() {
         .expect("terminate should succeed");
 
     assert!(process.has_exited());
-}
-
-#[tokio::test]
-async fn slow_artifact_writer_does_not_delay_local_output_drain() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let artifact = create_raw_output_artifact(temp.path(), "thread", b"").await;
-    let RawOutputArtifact::Stored { path, .. } = &artifact else {
-        panic!("expected stored artifact");
-    };
-    let path = path.clone();
-    let artifact_state = Arc::new(Mutex::new(artifact));
-    let io_gate = Arc::new(Semaphore::new(0));
-    let artifact_queue = RawOutputArtifactWriteQueue::spawn_with_io_gate(
-        Some(Arc::clone(&artifact_state)),
-        Arc::clone(&io_gate),
-    )
-    .expect("artifact queue");
-    let artifact_observer = artifact_queue.observer();
-
-    let output_buffer = Arc::new(Mutex::new(HeadTailBuffer::new(64 * 1024)));
-    let output_notify = Arc::new(Notify::new());
-    let output_closed = Arc::new(AtomicBool::new(false));
-    let output_closed_notify = Arc::new(Notify::new());
-    let output_handles = OutputHandles {
-        output_buffer: Arc::clone(&output_buffer),
-        output_notify,
-        output_closed: Arc::clone(&output_closed),
-        output_closed_notify: Arc::clone(&output_closed_notify),
-        cancellation_token: CancellationToken::new(),
-        recovery_evidence: Arc::new(std::sync::Mutex::new(Default::default())),
-    };
-    let (output_tx, mut output_rx) = broadcast::channel(64);
-    let (stdout_tx, stdout_rx) = mpsc::channel(1);
-    let (stderr_tx, stderr_rx) = mpsc::channel(1);
-    drop(stderr_tx);
-    let output_task = UnifiedExecProcess::spawn_local_output_task_with_artifact_queue(
-        stdout_rx,
-        stderr_rx,
-        output_handles,
-        output_tx,
-        Some(artifact_queue),
-    );
-
-    stdout_tx.send(b"first\n".to_vec()).await.expect("send first");
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(1), output_rx.recv())
-            .await
-            .expect("first published output should not wait for artifact I/O")
-            .expect("published output"),
-        b"first\n"
-    );
-
-    let mut expected = b"first\n".to_vec();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        for index in 0..32 {
-            let chunk = format!("chunk-{index:02}\n").into_bytes();
-            expected.extend_from_slice(&chunk);
-            stdout_tx.send(chunk).await.expect("send chunk");
-        }
-        drop(stdout_tx);
-        loop {
-            let notified = output_closed_notify.notified();
-            if output_closed.load(Ordering::Acquire) {
-                break;
-            }
-            notified.await;
-        }
-    })
-    .await
-    .expect("process output should drain while artifact I/O is blocked");
-
-    assert_eq!(output_buffer.lock().await.to_bytes(), expected);
-    assert_eq!(
-        artifact_observer.positions(),
-        RawOutputArtifactWritePositions {
-            observed: expected.len() as u64,
-            queued: expected.len() as u64,
-            committed: 0,
-            finalized: 0,
-        }
-    );
-
-    io_gate.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(1), output_task)
-        .await
-        .expect("artifact writer should finalize")
-        .expect("output task should complete");
-    artifact_observer.wait_until_done().await;
-    assert_eq!(
-        artifact_observer.positions(),
-        RawOutputArtifactWritePositions {
-            observed: expected.len() as u64,
-            queued: expected.len() as u64,
-            committed: expected.len() as u64,
-            finalized: expected.len() as u64,
-        }
-    );
-    assert_eq!(tokio::fs::read(path).await.expect("read artifact"), expected);
-}
-
-#[test]
-fn recovery_gaps_merge_only_when_adjacent_or_overlapping() {
-    let recovered = BTreeSet::new();
-    let mut gaps = Vec::new();
-
-    assert!(merge_recovery_gap(
-        &mut gaps,
-        OutputGap {
-            first_missing_seq: 2,
-            last_missing_seq: 3,
-        },
-        &recovered,
-    ));
-    assert!(merge_recovery_gap(
-        &mut gaps,
-        OutputGap {
-            first_missing_seq: 4,
-            last_missing_seq: 5,
-        },
-        &recovered,
-    ));
-    assert!(merge_recovery_gap(
-        &mut gaps,
-        OutputGap {
-            first_missing_seq: 9,
-            last_missing_seq: 10,
-        },
-        &recovered,
-    ));
-
-    assert_eq!(
-        gaps,
-        vec![
-            OutputGap {
-                first_missing_seq: 2,
-                last_missing_seq: 5,
-            },
-            OutputGap {
-                first_missing_seq: 9,
-                last_missing_seq: 10,
-            },
-        ]
-    );
-}
-
-#[test]
-fn recovery_gap_rejects_recovered_output_and_preserves_existing_ranges() {
-    let recovered = BTreeSet::from([4]);
-    let mut gaps = vec![OutputGap {
-        first_missing_seq: 8,
-        last_missing_seq: 9,
-    }];
-
-    assert!(!merge_recovery_gap(
-        &mut gaps,
-        OutputGap {
-            first_missing_seq: 3,
-            last_missing_seq: 5,
-        },
-        &recovered,
-    ));
-    assert_eq!(
-        gaps,
-        vec![OutputGap {
-            first_missing_seq: 8,
-            last_missing_seq: 9,
-        }]
-    );
-}
-
-#[test]
-fn recovery_detail_preserves_disjoint_ranges_without_widening_them() {
-    let gaps = vec![
-        OutputGap {
-            first_missing_seq: 2,
-            last_missing_seq: 4,
-        },
-        OutputGap {
-            first_missing_seq: 8,
-            last_missing_seq: 9,
-        },
-    ];
-    let reasons = BTreeSet::from(["recovery page limit was exhausted".to_string()]);
-
-    let detail = recovery_incomplete_detail(&gaps, &reasons);
-
-    assert!(detail.contains("2-4, 8-9"));
-    assert!(!detail.contains("2-9"));
-    assert!(detail.contains("page limit"));
 }

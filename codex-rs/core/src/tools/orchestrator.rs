@@ -30,7 +30,6 @@ use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::default_exec_approval_requirement;
 use crate::tools::sandboxing::sandbox_override_for_first_attempt;
 use crate::tools::sandboxing::unsandboxed_execution_allowed;
-use codex_hooks::HookMatchContext;
 use codex_hooks::PermissionRequestDecision;
 use codex_otel::ToolDecisionSource;
 use codex_protocol::error::CodexErr;
@@ -537,51 +536,38 @@ impl ToolOrchestrator {
         T: ToolRuntime<Rq, Out>,
     {
         if evaluate_permission_request_hooks
-            && let Some(hook_tool_name) = tool.permission_request_hook_name(req)
+            && let Some(permission_request) = tool.permission_request_payload(req)
         {
-            let permission_plan =
-                approval_ctx
-                    .session
-                    .hooks()
-                    .prepare(HookMatchContext::PermissionRequest {
-                        canonical_tool_name: hook_tool_name.name(),
-                        matcher_aliases: hook_tool_name.matcher_aliases(),
-                    });
-            if !permission_plan.is_empty()
-                && let Some(permission_request) = tool.permission_request_payload(req)
+            let tool_name = flat_tool_name(&tool_ctx.tool_name);
+            match run_permission_request_hooks(
+                approval_ctx.session,
+                approval_ctx.turn,
+                permission_request_run_id,
+                permission_request,
+            )
+            .await
             {
-                let tool_name = flat_tool_name(&tool_ctx.tool_name);
-                match run_permission_request_hooks(
-                    approval_ctx.session,
-                    approval_ctx.turn,
-                    permission_plan,
-                    permission_request_run_id,
-                    permission_request,
-                )
-                .await
-                {
-                    Some(PermissionRequestDecision::Allow) => {
-                        let decision = ReviewDecision::Approved;
-                        otel.tool_decision(
-                            tool_name.as_ref(),
-                            &tool_ctx.call_id,
-                            &decision,
-                            ToolDecisionSource::Config,
-                        );
-                        return Ok(decision);
-                    }
-                    Some(PermissionRequestDecision::Deny { message }) => {
-                        let decision = ReviewDecision::Denied;
-                        otel.tool_decision(
-                            tool_name.as_ref(),
-                            &tool_ctx.call_id,
-                            &decision,
-                            ToolDecisionSource::Config,
-                        );
-                        return Err(ToolError::Rejected(message));
-                    }
-                    None => {}
+                Some(PermissionRequestDecision::Allow) => {
+                    let decision = ReviewDecision::Approved;
+                    otel.tool_decision(
+                        tool_name.as_ref(),
+                        &tool_ctx.call_id,
+                        &decision,
+                        ToolDecisionSource::Config,
+                    );
+                    return Ok(decision);
                 }
+                Some(PermissionRequestDecision::Deny { message }) => {
+                    let decision = ReviewDecision::Denied;
+                    otel.tool_decision(
+                        tool_name.as_ref(),
+                        &tool_ctx.call_id,
+                        &decision,
+                        ToolDecisionSource::Config,
+                    );
+                    return Err(ToolError::Rejected(message));
+                }
+                None => {}
             }
         }
 

@@ -16,11 +16,15 @@ Durable files include, when present:
 
 - `.codex/.gitignore`
 - `.codex/AGENTS.md`
-- `.codex/agents/**`
-- `.codex/config.toml`
 - `.codex/environments/README.md`
 - `.codex/environments/setup.py`
-- `.codex/skills/**`
+- `.codex/harness/README.md`
+- `.codex/harness/context-modes.md`
+- `.codex/harness/workflow.md`
+- `.codex/harness/templates/**`
+- `.codex/skills/**/SKILL.md`
+- `.codex/skills/**/openai.yaml`
+- `.codex/skills/**/references/**`
 
 Generated or local runtime state includes:
 
@@ -31,11 +35,6 @@ Generated or local runtime state includes:
 - `.codex/app-asar-work/**`, except durable instructions explicitly kept there
 - `.codex/codex-desktop-patched/**`
 - `.codex/wiring-guard/**`
-
-The durable harness contract lives in
-`.codex/skills/kd4-harness`. `.codex/harness/runs/**` contains only local task
-state created from that contract; do not add standing policy or template source
-under `.codex/harness`.
 
 Do not hand-edit generated or runtime-state files unless the task is explicitly
 to inspect, repair, or reset that local state. Do not treat state or cache files
@@ -63,16 +62,9 @@ editing a skill:
 - read the whole `SKILL.md` first;
 - keep the frontmatter name and description accurate;
 - avoid broad behavioral claims that the repo cannot validate;
-- keep instructions actionable, progressively disclosed, and scoped to this
-  checkout;
-- keep links to bundled references valid instead of depending on deleted
-  workspace docs or templates;
-- update neighboring metadata, such as `agents/openai.yaml`, only when the
-  skill contract actually changes.
-
-For a changed skill contract, run the installed skill validator and check its
-local reference links. Forward-test only when active instructions permit
-subagents and the behavior is complex enough to justify it.
+- keep instructions actionable and scoped to this checkout;
+- update neighboring metadata, such as `openai.yaml`, only when the skill
+  contract actually changes.
 
 Do not move workflow guidance into a skill when it should apply to the directory
 itself; add or update the closest `AGENTS.md` instead.

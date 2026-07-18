@@ -444,7 +444,6 @@ mod tests {
                 process_id: process_id.clone(),
                 after_seq: None,
                 max_bytes: None,
-                max_chunks: None,
                 wait_ms: Some(5_000),
             },
         )

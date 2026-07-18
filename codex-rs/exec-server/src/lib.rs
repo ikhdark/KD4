@@ -133,7 +133,6 @@ pub use protocol::HttpRequestParams;
 pub use protocol::HttpRequestResponse;
 pub use protocol::InitializeParams;
 pub use protocol::InitializeResponse;
-pub use protocol::OutputGap;
 pub use protocol::ProcessOutputChunk;
 pub use protocol::ProcessSignal;
 pub use protocol::ReadParams;

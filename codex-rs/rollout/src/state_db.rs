@@ -19,32 +19,27 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
+use tracing::info;
 use tracing::warn;
 
 /// Core-facing handle to the SQLite-backed state runtime.
 pub type StateDbHandle = Arc<codex_state::StateRuntime>;
 
 #[cfg(not(test))]
-const HISTORICAL_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+const STARTUP_BACKFILL_POLL_INTERVAL: Duration = Duration::from_secs(1);
 #[cfg(test)]
-const HISTORICAL_BACKFILL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
-
-/// Readiness of the local SQLite thread index.
-///
-/// A successfully opened runtime is immediately [`WriteReady`](Self::WriteReady).
-/// Historical rollout discovery continues independently until the persisted
-/// backfill state reaches [`HistoricalIndexComplete`](Self::HistoricalIndexComplete).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StateDbReadiness {
-    WriteReady,
-    HistoricalIndexComplete,
-}
+const STARTUP_BACKFILL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(not(test))]
+const STARTUP_BACKFILL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const STARTUP_BACKFILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Initialize the state runtime for thread state persistence.
 ///
 /// This is the process entry point for local state: it opens the SQLite-backed
-/// runtime, starts bounded historical rollout indexing as background work, and
-/// returns the write-ready handle without waiting for that indexing to finish.
+/// runtime, applies rollout metadata backfills as needed, and returns the
+/// initialized handle.
 pub async fn init(config: &impl RolloutConfigView) -> Option<StateDbHandle> {
     let config = RolloutConfig::from_view(config);
     match try_init_with_roots(
@@ -121,51 +116,88 @@ async fn try_init_with_roots_inner(
                     sqlite_home.display()
                 )
             })?;
-    spawn_historical_backfill(
-        Arc::clone(&runtime),
-        codex_home,
-        default_model_provider_id,
+    let backfill_gate_started = Instant::now();
+    let backfill_gate_result = wait_for_backfill_gate(
+        runtime.as_ref(),
+        codex_home.as_path(),
+        default_model_provider_id.as_str(),
         backfill_lease_seconds,
+    )
+    .await;
+    codex_state::record_backfill_gate(
+        /*telemetry*/ None,
+        backfill_gate_started.elapsed(),
+        &backfill_gate_result,
     );
+    if let Err(err) = backfill_gate_result {
+        runtime.close().await;
+        return Err(err);
+    }
     Ok(runtime)
 }
 
-fn spawn_historical_backfill(
-    runtime: StateDbHandle,
-    codex_home: PathBuf,
-    default_model_provider_id: String,
+async fn wait_for_backfill_gate(
+    runtime: &codex_state::StateRuntime,
+    codex_home: &Path,
+    default_model_provider_id: &str,
     backfill_lease_seconds: Option<i64>,
-) {
-    tokio::spawn(async move {
-        loop {
-            let outcome = match backfill_lease_seconds {
-                Some(backfill_lease_seconds) => {
-                    metadata::backfill_sessions_with_lease(
-                        runtime.as_ref(),
-                        codex_home.as_path(),
-                        default_model_provider_id.as_str(),
-                        backfill_lease_seconds,
-                    )
-                    .await
-                }
-                None => {
-                    metadata::backfill_sessions_with_lease(
-                        runtime.as_ref(),
-                        codex_home.as_path(),
-                        default_model_provider_id.as_str(),
-                        metadata::BACKFILL_LEASE_SECONDS,
-                    )
-                    .await
-                }
-            };
-            match outcome {
-                metadata::BackfillRunOutcome::Complete => return,
-                metadata::BackfillRunOutcome::Deferred => {
-                    tokio::time::sleep(HISTORICAL_BACKFILL_RETRY_INTERVAL).await;
-                }
-            }
+) -> anyhow::Result<()> {
+    let wait_started = Instant::now();
+    let mut reported_wait = false;
+    loop {
+        let backfill_state = runtime.get_backfill_state().await.map_err(|err| {
+            anyhow::anyhow!(
+                "failed to read backfill state at {}: {err}",
+                codex_home.display()
+            )
+        })?;
+        if backfill_state.status == codex_state::BackfillStatus::Complete {
+            return Ok(());
         }
-    });
+
+        if let Some(backfill_lease_seconds) = backfill_lease_seconds {
+            metadata::backfill_sessions_with_lease(
+                runtime,
+                codex_home,
+                default_model_provider_id,
+                backfill_lease_seconds,
+            )
+            .await;
+        } else {
+            metadata::backfill_sessions(runtime, codex_home, default_model_provider_id).await;
+        }
+        let backfill_state = runtime.get_backfill_state().await.map_err(|err| {
+            anyhow::anyhow!(
+                "failed to read backfill state at {} after startup backfill: {err}",
+                codex_home.display()
+            )
+        })?;
+        if backfill_state.status == codex_state::BackfillStatus::Complete {
+            return Ok(());
+        }
+        if wait_started.elapsed() >= STARTUP_BACKFILL_WAIT_TIMEOUT {
+            return Err(anyhow::anyhow!(
+                "timed out waiting for state db backfill at {} after {:?} (status: {})",
+                codex_home.display(),
+                STARTUP_BACKFILL_WAIT_TIMEOUT,
+                backfill_state.status.as_str()
+            ));
+        }
+
+        let message = format!(
+            "state db backfill is {} at {}; waiting up to {:?} before retrying startup initialization",
+            backfill_state.status.as_str(),
+            codex_home.display(),
+            STARTUP_BACKFILL_WAIT_TIMEOUT,
+        );
+        if reported_wait {
+            info!("{message}");
+        } else {
+            emit_startup_warning(&message);
+            reported_wait = true;
+        }
+        tokio::time::sleep(STARTUP_BACKFILL_POLL_INTERVAL).await;
+    }
 }
 
 fn emit_startup_warning(message: &str) {
@@ -178,19 +210,7 @@ fn emit_startup_warning(message: &str) {
     }
 }
 
-/// Return the explicit readiness state for an open local state runtime.
-pub async fn readiness(
-    runtime: &codex_state::StateRuntime,
-) -> anyhow::Result<StateDbReadiness> {
-    let backfill_state = runtime.get_backfill_state().await?;
-    Ok(if backfill_state.status == codex_state::BackfillStatus::Complete {
-        StateDbReadiness::HistoricalIndexComplete
-    } else {
-        StateDbReadiness::WriteReady
-    })
-}
-
-/// Open the DB if it exists and its historical index has already completed.
+/// Open the DB if it exists and its startup backfill has already completed.
 ///
 /// Unlike [`init`], this helper does not run rollout backfill. It is for
 /// optional local reads from non-owning contexts such as remote app-server mode.
@@ -220,7 +240,7 @@ pub async fn get_state_db(config: &impl RolloutConfigView) -> Option<StateDbHand
             return None;
         }
     };
-    require_historical_index_complete(runtime, config.sqlite_home()).await
+    require_backfill_complete(runtime, config.sqlite_home()).await
 }
 
 /// Build a SQLite telemetry recorder backed by an OTEL metrics client.
@@ -231,16 +251,17 @@ pub fn sqlite_telemetry_recorder(
     sqlite_metrics::recorder(metrics, originator)
 }
 
-async fn require_historical_index_complete(
+async fn require_backfill_complete(
     runtime: StateDbHandle,
     codex_home: &Path,
 ) -> Option<StateDbHandle> {
-    match readiness(runtime.as_ref()).await {
-        Ok(StateDbReadiness::HistoricalIndexComplete) => Some(runtime),
-        Ok(StateDbReadiness::WriteReady) => {
+    match runtime.get_backfill_state().await {
+        Ok(state) if state.status == codex_state::BackfillStatus::Complete => Some(runtime),
+        Ok(state) => {
             warn!(
-                "state db historical index is incomplete at {}; non-owning reads remain unavailable",
-                codex_home.display()
+                "state db backfill not complete at {} (status: {})",
+                codex_home.display(),
+                state.status.as_str()
             );
             codex_state::record_fallback(
                 "get_state_db",
@@ -534,42 +555,6 @@ pub async fn reconcile_rollout(
         warn!(
             "state db reconcile_rollout memory_mode update failed {}: {err}",
             rollout_path.display()
-        );
-    }
-}
-
-/// Index a newly opened current thread directly without waiting for historical
-/// rollout discovery. The rollout path may not be materialized yet.
-pub async fn index_current_thread(
-    context: Option<&codex_state::StateRuntime>,
-    builder: &ThreadMetadataBuilder,
-    default_provider: &str,
-    memory_mode: &str,
-) {
-    let Some(ctx) = context else {
-        return;
-    };
-    let mut builder = builder.clone();
-    builder.cwd = normalize_cwd_for_state_db(&builder.cwd);
-    let mut metadata = builder.build(default_provider);
-    if let Ok(Some(existing_metadata)) = ctx.get_thread(metadata.id).await {
-        metadata.prefer_existing_git_info(&existing_metadata);
-        metadata.prefer_existing_explicit_title(&existing_metadata);
-    }
-    if let Err(err) = ctx.upsert_thread(&metadata).await {
-        warn!(
-            "state db direct current-thread index failed for {}: {err}",
-            metadata.rollout_path.display()
-        );
-        return;
-    }
-    if let Err(err) = ctx
-        .set_thread_memory_mode(metadata.id, memory_mode)
-        .await
-    {
-        warn!(
-            "state db direct current-thread memory mode update failed for {}: {err}",
-            metadata.rollout_path.display()
         );
     }
 }

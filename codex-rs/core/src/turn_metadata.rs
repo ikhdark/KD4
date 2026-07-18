@@ -9,7 +9,6 @@ use std::sync::atomic::Ordering;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
-use crate::git_workspace::GitWorkspaceMetadataSource;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::TurnMetadataWorkspace;
@@ -86,7 +85,7 @@ pub async fn detached_memory_responses_metadata(
 #[derive(Clone, Debug)]
 pub(crate) struct TurnMetadataState {
     cwd: AbsolutePathBuf,
-    git_workspace: Arc<RwLock<GitWorkspaceSourceState>>,
+    repo_root: Option<String>,
     session_id: String,
     thread_id: String,
     forked_from_thread_id: Option<ThreadId>,
@@ -101,13 +100,6 @@ pub(crate) struct TurnMetadataState {
     responsesapi_client_metadata: Arc<RwLock<BTreeMap<String, String>>>,
     user_input_requested_during_turn: Arc<AtomicBool>,
     enrichment_task: Arc<Mutex<Option<JoinHandle<()>>>>,
-}
-
-#[derive(Clone, Debug, Default)]
-enum GitWorkspaceSourceState {
-    #[default]
-    Unresolved,
-    Resolved(Option<GitWorkspaceMetadataSource>),
 }
 
 impl TurnMetadataState {
@@ -125,6 +117,7 @@ impl TurnMetadataState {
         windows_sandbox_level: WindowsSandboxLevel,
         enforce_managed_network: bool,
     ) -> Self {
+        let repo_root = get_git_repo_root(&cwd).map(|root| root.to_string_lossy().into_owned());
         let sandbox = Some(
             permission_profile_sandbox_tag(
                 permission_profile,
@@ -135,7 +128,7 @@ impl TurnMetadataState {
         );
         Self {
             cwd,
-            git_workspace: Arc::new(RwLock::new(GitWorkspaceSourceState::Unresolved)),
+            repo_root,
             session_id,
             thread_id,
             forked_from_thread_id,
@@ -221,14 +214,6 @@ impl TurnMetadataState {
             filter_extra_metadata(responsesapi_client_metadata);
     }
 
-    pub(crate) fn set_git_workspace_source(&self, source: Option<GitWorkspaceMetadataSource>) {
-        *self
-            .git_workspace
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            GitWorkspaceSourceState::Resolved(source);
-    }
-
     pub(crate) fn workspace_kind(&self) -> Option<String> {
         self.responsesapi_client_metadata
             .read()
@@ -285,20 +270,9 @@ impl TurnMetadataState {
     }
 
     pub(crate) fn spawn_git_enrichment_task(&self) {
-        let source_state = self
-            .git_workspace
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let source = match source_state {
-            GitWorkspaceSourceState::Unresolved => {
-                GitWorkspaceMetadataSource::discover_local(self.cwd.clone())
-            }
-            GitWorkspaceSourceState::Resolved(source) => source,
-        };
-        let Some(source) = source else {
+        if self.repo_root.is_none() {
             return;
-        };
+        }
 
         let mut task_guard = self
             .enrichment_task
@@ -310,8 +284,10 @@ impl TurnMetadataState {
 
         let state = self.clone();
         *task_guard = Some(tokio::spawn(async move {
-            let workspace_git_metadata = state.fetch_workspace_git_metadata(&source).await;
-            let repo_root = source.repo_root().to_string_lossy().into_owned();
+            let workspace_git_metadata = state.fetch_workspace_git_metadata().await;
+            let Some(repo_root) = state.repo_root.clone() else {
+                return;
+            };
 
             if workspace_git_metadata.is_empty() {
                 return;
@@ -336,15 +312,18 @@ impl TurnMetadataState {
         }
     }
 
-    async fn fetch_workspace_git_metadata(
-        &self,
-        source: &GitWorkspaceMetadataSource,
-    ) -> WorkspaceGitMetadata {
-        let metadata = source.metadata().await;
+    async fn fetch_workspace_git_metadata(&self) -> WorkspaceGitMetadata {
+        let (head_commit_hash, associated_remote_urls, has_changes) = tokio::join!(
+            get_head_commit_hash(&self.cwd),
+            get_git_remote_urls_assume_git_repo(&self.cwd),
+            get_has_changes(&self.cwd),
+        );
+        let latest_git_commit_hash = head_commit_hash.map(|sha| sha.0);
+
         WorkspaceGitMetadata {
-            associated_remote_urls: metadata.associated_remote_urls,
-            latest_git_commit_hash: metadata.latest_git_commit_hash,
-            has_changes: metadata.has_changes,
+            associated_remote_urls,
+            latest_git_commit_hash,
+            has_changes,
         }
     }
 }

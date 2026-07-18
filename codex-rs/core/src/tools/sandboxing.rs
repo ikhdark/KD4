@@ -351,10 +351,6 @@ pub(crate) trait Approvable<Req> {
 
     /// Return hook input for approval-time policy hooks when this runtime wants
     /// hook evaluation to run before guardian or user approval.
-    fn permission_request_hook_name(&self, _req: &Req) -> Option<HookToolName> {
-        None
-    }
-
     fn permission_request_payload(&self, _req: &Req) -> Option<PermissionRequestPayload> {
         None
     }

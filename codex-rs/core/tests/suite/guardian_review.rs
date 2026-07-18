@@ -33,7 +33,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guardian_session_is_created_on_first_review_and_reuses_its_prewarm() -> Result<()> {
+async fn guardian_session_prewarms_and_is_reused_for_first_review() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let tool_args = json!({
@@ -43,21 +43,17 @@ async fn guardian_session_is_created_on_first_review_and_reuses_its_prewarm() ->
     })
     .to_string();
     let server = start_websocket_server(vec![
-        vec![
-            vec![ev_response_created("warm-1"), ev_completed("warm-1")],
-            vec![
-                ev_response_created("approval-request"),
-                ev_function_call("approval-call", "exec_command", &tool_args),
-                ev_completed("approval-request"),
-            ],
-        ],
-        vec![
-            vec![ev_response_created("warm-2"), ev_completed("warm-2")],
-            vec![
-                ev_response_created("guardian-review"),
-                ev_completed("guardian-review"),
-            ],
-        ],
+        vec![vec![ev_response_created("warm-1"), ev_completed("warm-1")]],
+        vec![vec![ev_response_created("warm-2"), ev_completed("warm-2")]],
+        vec![vec![
+            ev_response_created("approval-request"),
+            ev_function_call("approval-call", "exec_command", &tool_args),
+            ev_completed("approval-request"),
+        ]],
+        vec![vec![
+            ev_response_created("guardian-review"),
+            ev_completed("guardian-review"),
+        ]],
     ])
     .await;
     let mut builder = test_codex().with_config(|config| {
@@ -66,17 +62,24 @@ async fn guardian_session_is_created_on_first_review_and_reuses_its_prewarm() ->
     });
 
     let test = builder.build_with_websocket_server(&server).await?;
-    let parent_prewarm = tokio::time::timeout(
-        Duration::from_secs(5),
-        server.wait_for_request(/*connection_index*/ 0, /*request_index*/ 0),
-    )
-    .await?
-    .body_json();
-    assert_ne!(
-        parent_prewarm["client_metadata"]["x-openai-subagent"].as_str(),
-        Some("guardian")
-    );
-    assert_eq!(server.handshakes().len(), 1);
+    let (first, second) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            server.wait_for_request(/*connection_index*/ 0, /*request_index*/ 0),
+            server.wait_for_request(/*connection_index*/ 1, /*request_index*/ 0)
+        )
+    })
+    .await?;
+    let prewarm_requests = [first.body_json(), second.body_json()];
+    let guardian_prewarm = prewarm_requests
+        .iter()
+        .find(|request| {
+            request["client_metadata"]["x-openai-subagent"].as_str() == Some("guardian")
+        })
+        .expect("guardian startup prewarm request");
+    assert_eq!(guardian_prewarm["generate"].as_bool(), Some(false));
+    let guardian_thread_id = guardian_prewarm["client_metadata"]["thread_id"]
+        .as_str()
+        .expect("guardian thread id");
 
     test.codex
         .submit(
@@ -87,24 +90,12 @@ async fn guardian_session_is_created_on_first_review_and_reuses_its_prewarm() ->
             .into(),
         )
         .await?;
-    let (guardian_prewarm, guardian_review) =
-        tokio::time::timeout(Duration::from_secs(5), async {
-            tokio::join!(
-                server.wait_for_request(/*connection_index*/ 1, /*request_index*/ 0),
-                server.wait_for_request(/*connection_index*/ 1, /*request_index*/ 1)
-            )
-        })
-        .await?;
-    let guardian_prewarm = guardian_prewarm.body_json();
-    let guardian_review = guardian_review.body_json();
-    assert_eq!(
-        guardian_prewarm["client_metadata"]["x-openai-subagent"].as_str(),
-        Some("guardian")
-    );
-    assert_eq!(guardian_prewarm["generate"].as_bool(), Some(false));
-    let guardian_thread_id = guardian_prewarm["client_metadata"]["thread_id"]
-        .as_str()
-        .expect("guardian thread id");
+    let guardian_review = tokio::time::timeout(
+        Duration::from_secs(5),
+        server.wait_for_request(/*connection_index*/ 3, /*request_index*/ 0),
+    )
+    .await?
+    .body_json();
     assert_eq!(
         guardian_review["client_metadata"]["x-openai-subagent"].as_str(),
         Some("guardian")

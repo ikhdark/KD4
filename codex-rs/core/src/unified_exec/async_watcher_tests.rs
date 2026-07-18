@@ -88,10 +88,10 @@ fn finalization_does_not_duplicate_existing_loss_markers() {
 
 #[tokio::test]
 async fn final_loss_markers_survive_head_tail_eviction_without_duplication() {
-    let transcript = Arc::new(Mutex::new(HeadTailBuffer::new(256)));
+    let transcript = Arc::new(Mutex::new(HeadTailBuffer::new(16)));
     {
         let mut guard = transcript.lock().await;
-        guard.push_chunk(vec![b'a'; 256]);
+        guard.push_chunk(vec![b'a'; 16]);
         guard.record_lagged_chunks(7);
         guard.push_chunk(vec![b'b'; 64]);
     }
@@ -100,7 +100,7 @@ async fn final_loss_markers_survive_head_tail_eviction_without_duplication() {
 
     assert_eq!(
         aggregated
-            .matches("byte(s) omitted from the middle")
+            .matches("64 byte(s) omitted from the middle")
             .count(),
         1
     );

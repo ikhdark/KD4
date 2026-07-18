@@ -1,5 +1,4 @@
 use crate::context_manager::truncate_function_output_payload;
-use crate::exec::ExecCommandOutcome;
 use crate::original_image_detail::sanitize_original_image_detail;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -9,7 +8,7 @@ use crate::tools::TELEMETRY_PREVIEW_MAX_LINES;
 use crate::tools::TELEMETRY_PREVIEW_TRUNCATION_NOTICE;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::shell_output_summary::ShellOutputSummaryOptions;
-use crate::tools::shell_output_summary::reduce_shell_output_for_model_with_budget;
+use crate::tools::shell_output_summary::summarize_shell_output_for_model;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::OutputBudgetClass;
 use crate::unified_exec::resolve_adaptive_max_tokens;
@@ -22,13 +21,11 @@ use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_tools::LoadableToolSpec;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -146,11 +143,7 @@ impl McpToolOutput {
         //
         // The text is serialized again inside the Responses payload, so allow
         // a small buffer for JSON escaping and wrapper overhead.
-        truncate_function_output_payload(
-            &payload,
-            self.truncation_policy * 1.2,
-            /*preserve_bounded_shell_evidence*/ false,
-        )
+        truncate_function_output_payload(&payload, self.truncation_policy * 1.2)
     }
 }
 
@@ -248,133 +241,11 @@ impl ToolOutput for FunctionToolOutput {
 
 pub struct ApplyPatchToolOutput {
     pub text: String,
-    result: Option<JsonValue>,
-    success: bool,
 }
 
 impl ApplyPatchToolOutput {
     pub fn from_text(text: String) -> Self {
-        Self {
-            text,
-            result: None,
-            success: true,
-        }
-    }
-
-    pub fn from_execution(
-        text: String,
-        execution_succeeded: bool,
-        action: &codex_apply_patch::ApplyPatchAction,
-        delta: &codex_apply_patch::AppliedPatchDelta,
-    ) -> Self {
-        let status = apply_patch_status(execution_succeeded, delta.is_empty(), delta.is_exact());
-        let operations = action
-            .operations()
-            .iter()
-            .map(|operation| {
-                let (kind, move_path) = match operation.change() {
-                    codex_apply_patch::ApplyPatchFileChange::Add { .. } => ("add", None),
-                    codex_apply_patch::ApplyPatchFileChange::Delete { .. } => ("delete", None),
-                    codex_apply_patch::ApplyPatchFileChange::Update { move_path, .. } => (
-                        "update",
-                        move_path
-                            .as_ref()
-                            .map(codex_utils_path_uri::PathUri::inferred_native_path_string),
-                    ),
-                };
-                let destination_fingerprint = operation
-                    .move_destination()
-                    .map(|(_, fingerprint)| fingerprint.stable_id());
-                serde_json::json!({
-                    "path": operation.path().inferred_native_path_string(),
-                    "operation": kind,
-                    "move_path": move_path,
-                    "expected_old_fingerprint": operation.expected_old_fingerprint().stable_id(),
-                    "expected_move_destination_fingerprint": destination_fingerprint,
-                    "new_fingerprint": operation.new_fingerprint().stable_id(),
-                })
-            })
-            .collect::<Vec<_>>();
-        let committed_delta = delta
-            .changes()
-            .iter()
-            .map(|change| match &change.change {
-                codex_apply_patch::AppliedPatchFileChange::Add {
-                    content,
-                    overwritten_content,
-                } => serde_json::json!({
-                    "path": change.path.display().to_string(),
-                    "operation": "add",
-                    "old_content": overwritten_content,
-                    "new_content": content,
-                    "old_fingerprint": codex_apply_patch::patch_content_fingerprint(
-                        overwritten_content.as_deref().map(str::as_bytes),
-                    ),
-                    "new_fingerprint": codex_apply_patch::patch_content_fingerprint(
-                        Some(content.as_bytes()),
-                    ),
-                }),
-                codex_apply_patch::AppliedPatchFileChange::Delete { content } => {
-                    serde_json::json!({
-                        "path": change.path.display().to_string(),
-                        "operation": "delete",
-                        "old_content": content,
-                        "new_content": JsonValue::Null,
-                        "old_fingerprint": codex_apply_patch::patch_content_fingerprint(
-                            Some(content.as_bytes()),
-                        ),
-                        "new_fingerprint": codex_apply_patch::patch_content_fingerprint(None),
-                    })
-                }
-                codex_apply_patch::AppliedPatchFileChange::Update {
-                    move_path,
-                    old_content,
-                    overwritten_move_content,
-                    new_content,
-                } => serde_json::json!({
-                    "path": change.path.display().to_string(),
-                    "operation": "update",
-                    "move_path": move_path.as_ref().map(|path| path.display().to_string()),
-                    "old_content": old_content,
-                    "overwritten_move_content": overwritten_move_content,
-                    "new_content": new_content,
-                    "old_fingerprint": codex_apply_patch::patch_content_fingerprint(
-                        Some(old_content.as_bytes()),
-                    ),
-                    "overwritten_move_fingerprint": codex_apply_patch::patch_content_fingerprint(
-                        overwritten_move_content.as_deref().map(str::as_bytes),
-                    ),
-                    "new_fingerprint": codex_apply_patch::patch_content_fingerprint(
-                        Some(new_content.as_bytes()),
-                    ),
-                }),
-            })
-            .collect::<Vec<_>>();
-        let result = serde_json::json!({
-            "status": status,
-            "exact": delta.is_exact(),
-            "operations": operations,
-            "committed_delta": committed_delta,
-            "summary": text,
-        });
-        Self {
-            text,
-            result: Some(result),
-            success: execution_succeeded,
-        }
-    }
-}
-
-fn apply_patch_status(
-    execution_succeeded: bool,
-    delta_is_empty: bool,
-    delta_is_exact: bool,
-) -> &'static str {
-    match (execution_succeeded, delta_is_empty, delta_is_exact) {
-        (true, true, true) => "no_op",
-        (true, _, _) => "completed",
-        (false, true, true) => "failed",
-        (false, _, _) => "partial",
+        Self { text }
     }
 }
 
@@ -384,7 +255,7 @@ impl ToolOutput for ApplyPatchToolOutput {
     }
 
     fn success_for_logging(&self) -> bool {
-        self.success
+        true
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -394,22 +265,16 @@ impl ToolOutput for ApplyPatchToolOutput {
             vec![FunctionCallOutputContentItem::InputText {
                 text: self.text.clone(),
             }],
-            Some(self.success),
+            Some(true),
         )
     }
 
     fn post_tool_use_response(&self, _call_id: &str, _payload: &ToolPayload) -> Option<JsonValue> {
-        Some(
-            self.result
-                .clone()
-                .unwrap_or_else(|| JsonValue::String(self.text.clone())),
-        )
+        Some(JsonValue::String(self.text.clone()))
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        self.result
-            .clone()
-            .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()))
+        JsonValue::Object(serde_json::Map::new())
     }
 }
 
@@ -446,17 +311,7 @@ impl ToolOutput for AbortedToolOutput {
     }
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct ExecCommandOutputAnalysis {
-    decoded_output: OnceLock<String>,
-    model_output_max_tokens: OnceLock<usize>,
-    hook_output: OnceLock<String>,
-    model_output: OnceLock<String>,
-    response_text: OnceLock<String>,
-    preview: OnceLock<String>,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExecCommandToolOutput {
     pub event_call_id: String,
     pub chunk_id: String,
@@ -467,39 +322,19 @@ pub struct ExecCommandToolOutput {
     pub max_output_tokens: Option<usize>,
     pub process_id: Option<i32>,
     pub exit_code: Option<i32>,
-    pub timed_out: bool,
     pub original_token_count: Option<usize>,
     pub hook_command: Option<String>,
     pub raw_output_artifact: Option<RawOutputArtifact>,
     pub repair_notice: Option<String>,
-    pub(crate) analysis: Arc<ExecCommandOutputAnalysis>,
-}
-
-impl PartialEq for ExecCommandToolOutput {
-    fn eq(&self, other: &Self) -> bool {
-        self.event_call_id == other.event_call_id
-            && self.chunk_id == other.chunk_id
-            && self.wall_time == other.wall_time
-            && self.raw_output == other.raw_output
-            && self.truncation_policy == other.truncation_policy
-            && self.max_output_tokens == other.max_output_tokens
-            && self.process_id == other.process_id
-            && self.exit_code == other.exit_code
-            && self.timed_out == other.timed_out
-            && self.original_token_count == other.original_token_count
-            && self.hook_command == other.hook_command
-            && self.raw_output_artifact == other.raw_output_artifact
-            && self.repair_notice == other.repair_notice
-    }
 }
 
 impl ToolOutput for ExecCommandToolOutput {
     fn log_preview(&self) -> String {
-        self.preview().to_string()
+        telemetry_preview(&self.response_text())
     }
 
     fn success_for_logging(&self) -> bool {
-        self.outcome().is_success()
+        true
     }
 
     fn to_response_item(&self, call_id: &str, payload: &ToolPayload) -> ResponseInputItem {
@@ -507,9 +342,9 @@ impl ToolOutput for ExecCommandToolOutput {
             call_id,
             payload,
             vec![FunctionCallOutputContentItem::InputText {
-                text: self.response_text().to_string(),
+                text: self.response_text(),
             }],
-            Some(self.outcome().is_success()),
+            Some(true),
         )
     }
 
@@ -532,14 +367,17 @@ impl ToolOutput for ExecCommandToolOutput {
             return None;
         }
 
-        Some(JsonValue::String(self.hook_output().to_string()))
+        Some(JsonValue::String(
+            self.truncated_output(self.model_output_max_tokens()),
+        ))
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
         #[derive(Serialize)]
         struct UnifiedExecCodeModeResult {
-            outcome: ExecCommandOutcome,
-            timed_out: bool,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            chunk_id: Option<String>,
+            wall_time_seconds: f64,
             #[serde(skip_serializing_if = "Option::is_none")]
             exit_code: Option<i32>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -579,8 +417,8 @@ impl ToolOutput for ExecCommandToolOutput {
             };
 
         let result = UnifiedExecCodeModeResult {
-            outcome: self.outcome(),
-            timed_out: self.timed_out,
+            chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
+            wall_time_seconds: self.wall_time.as_secs_f64(),
             exit_code: self.exit_code,
             session_id: self.process_id,
             original_token_count: self.original_token_count,
@@ -588,7 +426,7 @@ impl ToolOutput for ExecCommandToolOutput {
             raw_output_artifact_bytes,
             raw_output_artifact_error,
             repair: self.repair_notice.clone(),
-            output: self.model_output().to_string(),
+            output: self.model_output(self.model_output_max_tokens()),
         };
 
         serde_json::to_value(result).unwrap_or_else(|err| {
@@ -598,113 +436,77 @@ impl ToolOutput for ExecCommandToolOutput {
 }
 
 impl ExecCommandToolOutput {
-    pub(crate) fn outcome(&self) -> ExecCommandOutcome {
-        ExecCommandOutcome::from_process_facts(
-            self.process_id,
-            self.exit_code,
-            self.timed_out,
-            /*cancelled*/ false,
-            /*launch_failed*/ false,
-        )
-    }
-
-    fn decoded_output(&self) -> &str {
-        self.analysis
-            .decoded_output
-            .get_or_init(|| String::from_utf8_lossy(&self.raw_output).into_owned())
-    }
-
     fn model_output_max_tokens(&self) -> usize {
-        *self.analysis.model_output_max_tokens.get_or_init(|| {
-            let class = if self.process_id.is_some() || self.exit_code != Some(0) {
-                OutputBudgetClass::FailureOrTimeout
-            } else {
-                OutputBudgetClass::Success
-            };
-            resolve_adaptive_max_tokens(
-                self.max_output_tokens,
-                class,
-                self.hook_command.as_deref(),
-                self.decoded_output(),
-            )
-            .min(self.truncation_policy.token_budget())
-        })
+        let raw = String::from_utf8_lossy(&self.raw_output);
+        let class = if self.process_id.is_some() || self.exit_code != Some(0) {
+            OutputBudgetClass::FailureOrTimeout
+        } else {
+            OutputBudgetClass::Success
+        };
+        resolve_adaptive_max_tokens(
+            self.max_output_tokens,
+            class,
+            self.hook_command.as_deref(),
+            raw.as_ref(),
+        )
+        .min(self.truncation_policy.token_budget())
     }
 
     pub(crate) fn truncated_output(&self, max_tokens: usize) -> String {
-        formatted_truncate_text(self.decoded_output(), TruncationPolicy::Tokens(max_tokens))
+        let text = String::from_utf8_lossy(&self.raw_output).to_string();
+        formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens))
     }
 
-    fn hook_output(&self) -> &str {
-        self.analysis.hook_output.get_or_init(|| {
-            formatted_truncate_text(
-                self.decoded_output(),
-                TruncationPolicy::Tokens(self.model_output_max_tokens()),
-            )
-        })
+    fn model_output(&self, max_tokens: usize) -> String {
+        let raw = String::from_utf8_lossy(&self.raw_output);
+        let summarized = summarize_shell_output_for_model(
+            raw.as_ref(),
+            self.exit_code.unwrap_or_default(),
+            /*timed_out*/ self.process_id.is_some(),
+            ShellOutputSummaryOptions {
+                enabled: true,
+                turn_cost_guard: false,
+                command_text: self.hook_command.as_deref(),
+            },
+        );
+        let content = summarized.as_deref().unwrap_or(raw.as_ref());
+        formatted_truncate_text(content, TruncationPolicy::Tokens(max_tokens))
     }
 
-    fn model_output(&self) -> &str {
-        self.analysis.model_output.get_or_init(|| {
-            let raw = self.decoded_output();
-            let max_tokens = self.model_output_max_tokens();
-            let summarized = reduce_shell_output_for_model_with_budget(
-                raw,
-                self.exit_code.unwrap_or_default(),
-                self.timed_out,
-                ShellOutputSummaryOptions {
-                    enabled: true,
-                    turn_cost_guard: false,
-                    command_text: self.hook_command.as_deref(),
-                },
-                approx_bytes_for_tokens(max_tokens),
-            );
-            summarized.map_or_else(|| raw.to_string(), |reduction| reduction.summary)
-        })
-    }
+    fn response_text(&self) -> String {
+        let mut sections = Vec::new();
 
-    fn response_text(&self) -> &str {
-        self.analysis.response_text.get_or_init(|| {
-            let mut sections = Vec::new();
+        if !self.chunk_id.is_empty() {
+            sections.push(format!("Chunk ID: {}", self.chunk_id));
+        }
 
-            if !self.chunk_id.is_empty() {
-                sections.push(format!("Chunk ID: {}", self.chunk_id));
-            }
+        let wall_time_seconds = self.wall_time.as_secs_f64();
+        sections.push(format!("Wall time: {wall_time_seconds:.4} seconds"));
 
-            let wall_time_seconds = self.wall_time.as_secs_f64();
-            sections.push(format!("Wall time: {wall_time_seconds:.4} seconds"));
+        if let Some(exit_code) = self.exit_code {
+            sections.push(format!("Process exited with code {exit_code}"));
+        }
 
-            if let Some(exit_code) = self.exit_code {
-                sections.push(format!("Process exited with code {exit_code}"));
-            }
+        if let Some(process_id) = &self.process_id {
+            sections.push(format!("Process running with session ID {process_id}"));
+        }
 
-            if let Some(process_id) = &self.process_id {
-                sections.push(format!("Process running with session ID {process_id}"));
-            }
+        if let Some(original_token_count) = self.original_token_count {
+            sections.push(format!("Original token count: {original_token_count}"));
+        }
 
-            if let Some(original_token_count) = self.original_token_count {
-                sections.push(format!("Original token count: {original_token_count}"));
-            }
+        if let Some(repair_notice) = &self.repair_notice {
+            sections.push(repair_notice.clone());
+        }
 
-            if let Some(repair_notice) = &self.repair_notice {
-                sections.push(repair_notice.clone());
-            }
+        if let Some(raw_output_artifact) = &self.raw_output_artifact {
+            sections.push(raw_output_artifact.render_for_model());
+        }
 
-            if let Some(raw_output_artifact) = &self.raw_output_artifact {
-                sections.push(raw_output_artifact.render_for_model());
-            }
+        sections.push("Output:".to_string());
+        sections.push(self.model_output(self.model_output_max_tokens()));
 
-            sections.push("Output:".to_string());
-            sections.push(self.model_output().to_string());
-
-            sections.join("\n")
-        })
-    }
-
-    fn preview(&self) -> &str {
-        self.analysis
-            .preview
-            .get_or_init(|| telemetry_preview(self.response_text()))
+        sections.join("\n")
     }
 }
 

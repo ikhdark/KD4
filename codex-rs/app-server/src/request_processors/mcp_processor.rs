@@ -400,7 +400,7 @@ impl McpRequestProcessor {
             let request_id = request_id.clone();
 
             tokio::spawn(async move {
-                let result = thread.read_mcp_resource_typed(&server, &uri).await;
+                let result = thread.read_mcp_resource(&server, &uri).await;
                 Self::send_mcp_resource_read_response(outgoing, request_id, result).await;
             });
             return Ok(());
@@ -429,7 +429,7 @@ impl McpRequestProcessor {
                 &uri,
             )
             .await
-            .and_then(codex_mcp::resource_read_result_from_rmcp);
+            .and_then(|result| serde_json::to_value(result).map_err(anyhow::Error::from));
             Self::send_mcp_resource_read_response(outgoing, request_id, result).await;
         });
         Ok(())
@@ -438,12 +438,16 @@ impl McpRequestProcessor {
     async fn send_mcp_resource_read_response(
         outgoing: Arc<OutgoingMessageSender>,
         request_id: ConnectionRequestId,
-        result: anyhow::Result<codex_mcp::McpResourceReadResult>,
+        result: anyhow::Result<serde_json::Value>,
     ) {
         let result = result
             .map_err(|error| internal_error(format!("{error:#}")))
-            .map(|result| McpResourceReadResponse {
-                contents: result.contents,
+            .and_then(|result| {
+                serde_json::from_value::<McpResourceReadResponse>(result).map_err(|error| {
+                    internal_error(format!(
+                        "failed to deserialize MCP resource read response: {error}"
+                    ))
+                })
             });
         outgoing.send_result(request_id, result).await;
     }

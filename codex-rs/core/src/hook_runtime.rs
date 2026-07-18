@@ -5,7 +5,6 @@ use std::time::Duration;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::HookRunFact;
 use codex_analytics::build_track_events_context;
-use codex_hooks::HookMatchContext;
 use codex_hooks::PermissionRequestDecision;
 use codex_hooks::PermissionRequestOutcome;
 use codex_hooks::PermissionRequestRequest;
@@ -13,7 +12,6 @@ use codex_hooks::PostToolUseOutcome;
 use codex_hooks::PostToolUseRequest;
 use codex_hooks::PreToolUseOutcome;
 use codex_hooks::PreToolUseRequest;
-use codex_hooks::PreparedHookPlan;
 use codex_hooks::SessionStartOutcome;
 use codex_hooks::StartHookTarget;
 use codex_hooks::StopHookTarget;
@@ -43,7 +41,6 @@ use tracing::instrument;
 
 use crate::context::ContextualUserFragment;
 use crate::context::HookAdditionalContext;
-use crate::context_manager::PromptHistorySnapshot;
 use crate::event_mapping::parse_turn_item;
 use crate::session::TurnInput;
 use crate::session::session::Session;
@@ -130,20 +127,6 @@ pub(crate) async fn run_pending_session_start_hooks(
                 source: session_start_source,
             },
         };
-        let hooks = sess.hooks();
-        let plan = match &target {
-            StartHookTarget::SessionStart { source } => {
-                hooks.prepare(HookMatchContext::SessionStart {
-                    source: source.as_str(),
-                })
-            }
-            StartHookTarget::SubagentStart { agent_type, .. } => {
-                hooks.prepare(HookMatchContext::SubagentStart { agent_type })
-            }
-        };
-        if plan.is_empty() {
-            continue;
-        }
         let request = codex_hooks::SessionStartRequest {
             session_id: sess.session_id().into(),
             #[allow(deprecated)]
@@ -153,12 +136,13 @@ pub(crate) async fn run_pending_session_start_hooks(
             permission_mode: hook_permission_mode(turn_context),
             target,
         };
-        let preview_runs = plan.preview();
+        let hooks = sess.hooks();
+        let preview_runs = hooks.preview_session_start(&request);
         if run_context_injecting_hook(
             sess,
             turn_context,
             preview_runs,
-            hooks.run_session_start_with_plan(plan, request, Some(turn_context.sub_id.clone())),
+            hooks.run_session_start(request, Some(turn_context.sub_id.clone())),
         )
         .await
         .record_additional_contexts(sess, turn_context)
@@ -179,16 +163,10 @@ pub(crate) async fn run_pending_session_start_hooks(
 pub(crate) async fn run_pre_tool_use_hooks(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    plan: PreparedHookPlan,
     tool_use_id: String,
     tool_name: &HookToolName,
     tool_input: &Value,
 ) -> PreToolUseHookResult {
-    if plan.is_empty() {
-        return PreToolUseHookResult::Continue {
-            updated_input: None,
-        };
-    }
     let request = PreToolUseRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -204,7 +182,7 @@ pub(crate) async fn run_pre_tool_use_hooks(
         tool_input: tool_input.clone(),
     };
     let hooks = sess.hooks();
-    let preview_runs = plan.preview_for_tool_use(&request.tool_use_id);
+    let preview_runs = hooks.preview_pre_tool_use(&request);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
     let PreToolUseOutcome {
@@ -213,7 +191,7 @@ pub(crate) async fn run_pre_tool_use_hooks(
         block_reason,
         additional_contexts,
         updated_input,
-    } = hooks.run_pre_tool_use_with_plan(plan, request).await;
+    } = hooks.run_pre_tool_use(request).await;
     emit_hook_completed_events(sess, turn_context, hook_events).await;
     record_additional_contexts(sess, turn_context, additional_contexts).await;
 
@@ -247,13 +225,9 @@ pub(crate) async fn run_pre_tool_use_hooks(
 pub(crate) async fn run_permission_request_hooks(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    plan: PreparedHookPlan,
     run_id_suffix: &str,
     payload: PermissionRequestPayload,
 ) -> Option<PermissionRequestDecision> {
-    if plan.is_empty() {
-        return None;
-    }
     let request = PermissionRequestRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -269,13 +243,13 @@ pub(crate) async fn run_permission_request_hooks(
         tool_input: payload.tool_input,
     };
     let hooks = sess.hooks();
-    let preview_runs = plan.preview_for_tool_use(&request.run_id_suffix);
+    let preview_runs = hooks.preview_permission_request(&request);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
     let PermissionRequestOutcome {
         hook_events,
         decision,
-    } = hooks.run_permission_request_with_plan(plan, request).await;
+    } = hooks.run_permission_request(request).await;
     emit_hook_completed_events(sess, turn_context, hook_events).await;
 
     decision
@@ -290,21 +264,12 @@ pub(crate) async fn run_permission_request_hooks(
 pub(crate) async fn run_post_tool_use_hooks(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    plan: PreparedHookPlan,
     tool_use_id: String,
     tool_name: String,
     matcher_aliases: Vec<String>,
     tool_input: Value,
     tool_response: Value,
 ) -> PostToolUseOutcome {
-    if plan.is_empty() {
-        return PostToolUseOutcome {
-            hook_events: Vec::new(),
-            should_block: false,
-            additional_contexts: Vec::new(),
-            feedback_message: None,
-        };
-    }
     let request = PostToolUseRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -321,10 +286,10 @@ pub(crate) async fn run_post_tool_use_hooks(
         tool_response,
     };
     let hooks = sess.hooks();
-    let preview_runs = plan.preview_for_tool_use(&request.tool_use_id);
+    let preview_runs = hooks.preview_post_tool_use(&request);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
-    let outcome = hooks.run_post_tool_use_with_plan(plan, request).await;
+    let outcome = hooks.run_post_tool_use(request).await;
     emit_hook_completed_events(sess, turn_context, outcome.hook_events.clone()).await;
     outcome
 }
@@ -338,20 +303,13 @@ pub(crate) async fn run_turn_stop_hooks(
 ) -> StopOutcome {
     // Resolve the stop hook kind from the session source before building the
     // request. Root turns run Stop; thread-spawned child turns run SubagentStop.
-    let hooks = sess.hooks();
-    let (plan, target, transcript_path) = match &turn_context.session_source {
+    let (target, transcript_path) = match &turn_context.session_source {
         SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
             agent_role,
             parent_thread_id,
             ..
         }) => {
             let context = subagent_hook_context(sess, agent_role);
-            let plan = hooks.prepare(HookMatchContext::SubagentStop {
-                agent_type: &context.agent_type,
-            });
-            if plan.is_empty() {
-                return StopOutcome::default();
-            }
             let agent_transcript_path = sess.hook_transcript_path().await;
             let parent_transcript_path = match sess
                 .services
@@ -374,7 +332,6 @@ pub(crate) async fn run_turn_stop_hooks(
                 }
             };
             (
-                plan,
                 StopHookTarget::SubagentStop {
                     agent_id: context.agent_id,
                     agent_type: context.agent_type,
@@ -386,17 +343,7 @@ pub(crate) async fn run_turn_stop_hooks(
         // Internal/synthetic subagents do not expose user-configured lifecycle
         // hooks, so there is no Stop or SubagentStop request to dispatch.
         SessionSource::SubAgent(_) => return StopOutcome::default(),
-        _ => {
-            let plan = hooks.prepare(HookMatchContext::Stop);
-            if plan.is_empty() {
-                return StopOutcome::default();
-            }
-            (
-                plan,
-                StopHookTarget::Stop,
-                sess.hook_transcript_path().await,
-            )
-        }
+        _ => (StopHookTarget::Stop, sess.hook_transcript_path().await),
     };
     let request = codex_hooks::StopRequest {
         session_id: sess.session_id().into(),
@@ -410,9 +357,10 @@ pub(crate) async fn run_turn_stop_hooks(
         last_assistant_message,
         target,
     };
-    emit_hook_started_events(sess, turn_context, plan.preview()).await;
+    let hooks = sess.hooks();
+    emit_hook_started_events(sess, turn_context, hooks.preview_stop(&request)).await;
 
-    let mut outcome = hooks.run_stop_with_plan(plan, request).await;
+    let mut outcome = hooks.run_stop(request).await;
     emit_hook_completed_events(sess, turn_context, std::mem::take(&mut outcome.hook_events)).await;
     outcome
 }
@@ -422,12 +370,6 @@ pub(crate) async fn run_pre_compact_hooks(
     turn_context: &Arc<TurnContext>,
     trigger: CompactionTrigger,
 ) -> PreCompactHookOutcome {
-    let trigger = compaction_trigger_label(trigger).to_string();
-    let hooks = sess.hooks();
-    let plan = hooks.prepare(HookMatchContext::PreCompact { trigger: &trigger });
-    if plan.is_empty() {
-        return PreCompactHookOutcome::Continue;
-    }
     let request = codex_hooks::PreCompactRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -436,12 +378,12 @@ pub(crate) async fn run_pre_compact_hooks(
         cwd: turn_context.cwd.clone(),
         transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
-        trigger,
+        trigger: compaction_trigger_label(trigger).to_string(),
     };
-    let preview_runs = plan.preview();
+    let preview_runs = sess.hooks().preview_pre_compact(&request);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
-    let outcome = hooks.run_pre_compact_with_plan(plan, request).await;
+    let outcome = sess.hooks().run_pre_compact(request).await;
     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
     if outcome.should_stop {
         PreCompactHookOutcome::Stopped
@@ -465,12 +407,6 @@ pub(crate) async fn run_post_compact_hooks(
     turn_context: &Arc<TurnContext>,
     trigger: CompactionTrigger,
 ) -> PostCompactHookOutcome {
-    let trigger = compaction_trigger_label(trigger).to_string();
-    let hooks = sess.hooks();
-    let plan = hooks.prepare(HookMatchContext::PostCompact { trigger: &trigger });
-    if plan.is_empty() {
-        return PostCompactHookOutcome::Continue;
-    }
     let request = codex_hooks::PostCompactRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
@@ -479,12 +415,12 @@ pub(crate) async fn run_post_compact_hooks(
         cwd: turn_context.cwd.clone(),
         transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
-        trigger,
+        trigger: compaction_trigger_label(trigger).to_string(),
     };
-    let preview_runs = plan.preview();
+    let preview_runs = sess.hooks().preview_post_compact(&request);
     emit_hook_started_events(sess, turn_context, preview_runs).await;
 
-    let outcome = hooks.run_post_compact_with_plan(plan, request).await;
+    let outcome = sess.hooks().run_post_compact(request).await;
     emit_hook_completed_events(sess, turn_context, outcome.hook_events).await;
     if outcome.should_stop {
         PostCompactHookOutcome::Stopped
@@ -497,10 +433,9 @@ pub(crate) async fn run_post_compact_hooks(
 pub(crate) async fn run_legacy_after_agent_hook(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
-    history: &PromptHistorySnapshot,
+    input: &[ResponseItem],
     last_assistant_message: Option<String>,
 ) -> bool {
-    let input = history.materialize();
     let mut abort_message = None;
     let input_messages = input
         .iter()
@@ -569,14 +504,6 @@ pub(crate) async fn inspect_pending_input(
 ) -> HookRuntimeOutcome {
     match pending_input_item {
         TurnInput::UserInput { content, .. } => {
-            let hooks = sess.hooks();
-            let plan = hooks.prepare(HookMatchContext::UserPromptSubmit);
-            if plan.is_empty() {
-                return HookRuntimeOutcome {
-                    should_stop: false,
-                    additional_contexts: Vec::new(),
-                };
-            }
             let request = UserPromptSubmitRequest {
                 session_id: sess.session_id().into(),
                 turn_id: turn_context.sub_id.clone(),
@@ -588,12 +515,13 @@ pub(crate) async fn inspect_pending_input(
                 permission_mode: hook_permission_mode(turn_context),
                 prompt: UserMessageItem::new(content).message(),
             };
-            let preview_runs = plan.preview();
+            let hooks = sess.hooks();
+            let preview_runs = hooks.preview_user_prompt_submit(&request);
             run_context_injecting_hook(
                 sess,
                 turn_context,
                 preview_runs,
-                hooks.run_user_prompt_submit_with_plan(plan, request),
+                hooks.run_user_prompt_submit(request),
             )
             .await
         }

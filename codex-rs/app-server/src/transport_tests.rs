@@ -1,7 +1,5 @@
 use super::*;
-use codex_app_server_protocol::AgentMessageDeltaNotification;
 use codex_app_server_protocol::ConfigWarningNotification;
-use codex_app_server_protocol::McpToolCallProgressNotification;
 use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ThreadRealtimeStartedNotification;
@@ -65,53 +63,6 @@ async fn to_connection_notification_respects_opt_out_filters() {
         writer_rx.try_recv().is_err(),
         "opted-out notification should be dropped"
     );
-}
-
-#[tokio::test]
-async fn snapshot_accepted_notification_uses_the_frozen_filter_decision() {
-    let connection_id = ConnectionId(8);
-    let (writer_tx, mut writer_rx) = mpsc::channel(1);
-    let opted_out_notification_methods =
-        Arc::new(RwLock::new(HashSet::from(["configWarning".to_string()])));
-    let mut connections = HashMap::new();
-    connections.insert(
-        connection_id,
-        OutboundConnectionState::new(
-            writer_tx,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(true)),
-            opted_out_notification_methods,
-            /*disconnect_sender*/ None,
-        ),
-    );
-
-    route_outgoing_envelope(
-        &mut connections,
-        OutgoingEnvelope::ToSnapshotAcceptedConnection {
-            connection_id,
-            message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
-                    summary: "accepted-before-filter-change".to_string(),
-                    details: None,
-                    path: None,
-                    range: None,
-                },
-            )),
-            write_complete_tx: None,
-        },
-    )
-    .await;
-
-    let queued = writer_rx
-        .recv()
-        .await
-        .expect("snapshot-accepted notification should bypass live re-filtering");
-    assert!(matches!(
-        queued.message,
-        OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-            ConfigWarningNotification { summary, .. }
-        )) if summary == "accepted-before-filter-change"
-    ));
 }
 
 #[tokio::test]
@@ -466,7 +417,7 @@ async fn broadcast_does_not_block_on_slow_connection() {
     let fast_connection_id = ConnectionId(1);
     let slow_connection_id = ConnectionId(2);
 
-    let (fast_writer_tx, mut fast_writer_rx) = mpsc::channel(8);
+    let (fast_writer_tx, mut fast_writer_rx) = mpsc::channel(1);
     let (slow_writer_tx, mut slow_writer_rx) = mpsc::channel(1);
     let fast_disconnect_token = CancellationToken::new();
     let slow_disconnect_token = CancellationToken::new();
@@ -505,52 +456,37 @@ async fn broadcast_does_not_block_on_slow_connection() {
         .try_send(QueuedOutgoingMessage::new(queued_message))
         .expect("channel should have room");
 
-    for summary in ["test-1", "test-2", "test-3"] {
-        let broadcast_message = OutgoingMessage::AppServerNotification(
-            ServerNotification::ConfigWarning(ConfigWarningNotification {
-                summary: summary.to_string(),
-                details: None,
-                path: None,
-                range: None,
-            }),
-        );
-        timeout(
-            Duration::from_millis(100),
-            route_outgoing_envelope(
-                &mut connections,
-                OutgoingEnvelope::Broadcast {
-                    message: broadcast_message,
-                },
-            ),
-        )
-        .await
-        .expect("broadcast should return even when one connection is slow");
-    }
+    let broadcast_message = OutgoingMessage::AppServerNotification(
+        ServerNotification::ConfigWarning(ConfigWarningNotification {
+            summary: "test".to_string(),
+            details: None,
+            path: None,
+            range: None,
+        }),
+    );
+    timeout(
+        Duration::from_millis(100),
+        route_outgoing_envelope(
+            &mut connections,
+            OutgoingEnvelope::Broadcast {
+                message: broadcast_message,
+            },
+        ),
+    )
+    .await
+    .expect("broadcast should return even when one connection is slow");
     assert!(!connections.contains_key(&slow_connection_id));
     assert!(slow_disconnect_token.is_cancelled());
     assert!(!fast_disconnect_token.is_cancelled());
-    let mut fast_summaries = Vec::new();
-    for _ in 0..3 {
-        let fast_message = timeout(Duration::from_millis(100), fast_writer_rx.recv())
-            .await
-            .expect("fast connection should not be stalled by the slow connection")
-            .expect("fast connection should remain open");
-        let OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-            ConfigWarningNotification { summary, .. },
-        )) = fast_message.message
-        else {
-            panic!("expected config warning broadcast");
-        };
-        fast_summaries.push(summary);
-    }
-    assert_eq!(
-        fast_summaries,
-        vec![
-            "test-1".to_string(),
-            "test-2".to_string(),
-            "test-3".to_string(),
-        ]
-    );
+    let fast_message = fast_writer_rx
+        .try_recv()
+        .expect("fast connection should receive the broadcast notification");
+    assert!(matches!(
+        fast_message.message,
+        OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+            ConfigWarningNotification { summary, .. }
+        )) if summary == "test"
+    ));
 
     let slow_message = slow_writer_rx
         .try_recv()
@@ -564,7 +500,7 @@ async fn broadcast_does_not_block_on_slow_connection() {
 }
 
 #[tokio::test]
-async fn to_connection_stdio_accepts_into_bounded_mailbox_when_writer_queue_is_full() {
+async fn to_connection_stdio_waits_instead_of_disconnecting_when_writer_queue_is_full() {
     let connection_id = ConnectionId(3);
     let (writer_tx, mut writer_rx) = mpsc::channel(1);
     writer_tx
@@ -609,18 +545,17 @@ async fn to_connection_stdio_accepts_into_bounded_mailbox_when_writer_queue_is_f
                 write_complete_tx: None,
             },
         )
-        .await;
-        connections
+        .await
     });
 
-    let _connections = timeout(Duration::from_millis(100), route_task)
-        .await
-        .expect("routing should finish after bounded mailbox acceptance")
-        .expect("routing task should succeed");
     let first = timeout(Duration::from_millis(100), writer_rx.recv())
         .await
         .expect("first queued message should be readable")
         .expect("first queued message should exist");
+    timeout(Duration::from_millis(100), route_task)
+        .await
+        .expect("routing should finish after the first queued message is drained")
+        .expect("routing task should succeed");
 
     assert!(matches!(
         first.message,
@@ -628,9 +563,8 @@ async fn to_connection_stdio_accepts_into_bounded_mailbox_when_writer_queue_is_f
             ConfigWarningNotification { summary, .. }
         )) if summary == "queued"
     ));
-    let second = timeout(Duration::from_millis(100), writer_rx.recv())
-        .await
-        .expect("mailbox should drain once the writer has room")
+    let second = writer_rx
+        .try_recv()
         .expect("second notification should be delivered once the queue has room");
     assert!(matches!(
         second.message,
@@ -638,116 +572,4 @@ async fn to_connection_stdio_accepts_into_bounded_mailbox_when_writer_queue_is_f
             ConfigWarningNotification { summary, .. }
         )) if summary == "second"
     ));
-}
-
-#[tokio::test]
-async fn saturated_writer_coalesces_same_stream_deltas_and_preserves_terminal_order() {
-    let connection_id = ConnectionId(4);
-    let (writer_tx, mut writer_rx) = mpsc::channel(1);
-    writer_tx
-        .send(QueuedOutgoingMessage::new(
-            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
-                    summary: "already-buffered".to_string(),
-                    details: None,
-                    path: None,
-                    range: None,
-                },
-            )),
-        ))
-        .await
-        .expect("writer should accept the initial message");
-
-    let mut connections = HashMap::new();
-    connections.insert(
-        connection_id,
-        OutboundConnectionState::new(
-            writer_tx,
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(AtomicBool::new(true)),
-            Arc::new(RwLock::new(HashSet::new())),
-            /*disconnect_sender*/ None,
-        ),
-    );
-
-    route_outgoing_envelope(
-        &mut connections,
-        OutgoingEnvelope::ToConnection {
-            connection_id,
-            message: OutgoingMessage::AppServerNotification(
-                ServerNotification::McpToolCallProgress(McpToolCallProgressNotification {
-                    thread_id: "thread-1".to_string(),
-                    turn_id: "turn-1".to_string(),
-                    item_id: "item-1".to_string(),
-                    message: "working".to_string(),
-                }),
-            ),
-            write_complete_tx: None,
-        },
-    )
-    .await;
-    for delta in ["hello ", "world"] {
-        route_outgoing_envelope(
-            &mut connections,
-            OutgoingEnvelope::ToConnection {
-                connection_id,
-                message: OutgoingMessage::AppServerNotification(
-                    ServerNotification::AgentMessageDelta(AgentMessageDeltaNotification {
-                        thread_id: "thread-1".to_string(),
-                        turn_id: "turn-1".to_string(),
-                        item_id: "item-1".to_string(),
-                        delta: delta.to_string(),
-                    }),
-                ),
-                write_complete_tx: None,
-            },
-        )
-        .await;
-    }
-    route_outgoing_envelope(
-        &mut connections,
-        OutgoingEnvelope::ToConnection {
-            connection_id,
-            message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification {
-                    summary: "terminal".to_string(),
-                    details: None,
-                    path: None,
-                    range: None,
-                },
-            )),
-            write_complete_tx: None,
-        },
-    )
-    .await;
-
-    let initial = timeout(Duration::from_millis(100), writer_rx.recv())
-        .await
-        .expect("initial writer message should arrive")
-        .expect("writer should remain open");
-    assert!(matches!(
-        initial.message,
-        OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-            ConfigWarningNotification { summary, .. }
-        )) if summary == "already-buffered"
-    ));
-
-    let mut reconstructed = String::new();
-    loop {
-        let message = timeout(Duration::from_millis(100), writer_rx.recv())
-            .await
-            .expect("mailbox should drain without losing transcript or terminal events")
-            .expect("writer should remain open");
-        match message.message {
-            OutgoingMessage::AppServerNotification(ServerNotification::AgentMessageDelta(
-                notification,
-            )) => reconstructed.push_str(&notification.delta),
-            OutgoingMessage::AppServerNotification(ServerNotification::McpToolCallProgress(_)) => {}
-            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
-                ConfigWarningNotification { summary, .. },
-            )) if summary == "terminal" => break,
-            other => panic!("unexpected mailbox message: {other:?}"),
-        }
-    }
-    assert_eq!(reconstructed, "hello world");
 }

@@ -10,7 +10,6 @@ use std::path::PathBuf;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::bail;
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::bundle::MANIFEST_FILE_NAME;
@@ -137,7 +136,7 @@ struct TraceReducer {
 }
 
 impl TraceReducer {
-    fn read_payload<T: DeserializeOwned>(&self, payload: &RawPayloadRef) -> Result<T> {
+    fn read_payload_json(&self, payload: &RawPayloadRef) -> Result<Value> {
         // Reducers keep raw bodies out of the graph, but typed replay sometimes
         // needs a small subset of fields to build semantic objects.
         let payload_path = self.bundle_dir.join(&payload.path);
@@ -145,23 +144,6 @@ impl TraceReducer {
             .with_context(|| format!("open payload {}", payload.raw_payload_id))?;
         serde_json::from_reader(file)
             .with_context(|| format!("parse payload {}", payload.raw_payload_id))
-    }
-
-    fn read_payload_with_legacy_value_errors<T: DeserializeOwned>(
-        &self,
-        payload: &RawPayloadRef,
-    ) -> Result<T> {
-        match self.read_payload(payload) {
-            Ok(payload) => Ok(payload),
-            Err(_) => {
-                let value = self.read_payload_json(payload)?;
-                Ok(serde_json::from_value(value)?)
-            }
-        }
-    }
-
-    fn read_payload_json(&self, payload: &RawPayloadRef) -> Result<Value> {
-        self.read_payload(payload)
     }
 
     fn apply_event(&mut self, event: RawTraceEvent) -> Result<()> {

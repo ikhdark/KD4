@@ -221,47 +221,6 @@ fn builder_from_items_falls_back_to_filename() {
 }
 
 #[tokio::test]
-async fn backfill_sessions_processes_multiple_bounded_batches() {
-    let dir = tempdir().expect("tempdir");
-    let codex_home = dir.path().to_path_buf();
-    let thread_uuids = [Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)];
-    for (index, thread_uuid) in thread_uuids.iter().copied().enumerate() {
-        let second = 56 + index;
-        write_rollout_in_sessions(
-            codex_home.as_path(),
-            format!("2026-01-27T12-34-{second:02}").as_str(),
-            format!("2026-01-27T12:34:{second:02}Z").as_str(),
-            thread_uuid,
-            /*git*/ None,
-        );
-    }
-
-    let runtime = codex_state::StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-        .await
-        .expect("initialize runtime");
-    backfill_sessions(runtime.as_ref(), codex_home.as_path(), "test-provider").await;
-
-    for thread_uuid in thread_uuids {
-        let thread_id = ThreadId::from_string(&thread_uuid.to_string()).expect("thread id");
-        assert!(
-            runtime
-                .get_thread(thread_id)
-                .await
-                .expect("get thread")
-                .is_some()
-        );
-    }
-    assert_eq!(
-        runtime
-            .get_backfill_state()
-            .await
-            .expect("get completed backfill state")
-            .status,
-        BackfillStatus::Complete
-    );
-}
-
-#[tokio::test]
 async fn backfill_sessions_resumes_from_watermark_and_marks_complete() {
     let dir = tempdir().expect("tempdir");
     let codex_home = dir.path().to_path_buf();
@@ -375,66 +334,6 @@ async fn backfill_sessions_preserves_existing_git_branch_and_fills_missing_git_f
     assert_eq!(
         persisted.git_origin_url.as_deref(),
         Some("git@example.com:openai/codex.git")
-    );
-}
-
-#[tokio::test]
-async fn backfill_sessions_does_not_replace_newer_current_thread_projection() {
-    let dir = tempdir().expect("tempdir");
-    let codex_home = dir.path().to_path_buf();
-    let thread_uuid = Uuid::new_v4();
-    let rollout_path = write_rollout_in_sessions(
-        codex_home.as_path(),
-        "2026-01-27T12-34-56",
-        "2026-01-27T12:34:56Z",
-        thread_uuid,
-        /*git*/ None,
-    );
-    let runtime = codex_state::StateRuntime::init(codex_home.clone(), "test-provider".to_string())
-        .await
-        .expect("initialize runtime");
-    let thread_id = ThreadId::from_string(&thread_uuid.to_string()).expect("thread id");
-    let mut current = extract_metadata_from_rollout(&rollout_path, "test-provider")
-        .await
-        .expect("extract")
-        .metadata;
-    current.updated_at = Utc::now() + chrono::Duration::days(1);
-    current.preview = Some("current preview".to_string());
-    current.first_user_message = Some("current first message".to_string());
-    current.title = "current title".to_string();
-    current.model = Some("current-model".to_string());
-    current.tokens_used = 42;
-    runtime
-        .upsert_thread(&current)
-        .await
-        .expect("current metadata upsert");
-    runtime
-        .set_thread_memory_mode(thread_id, "disabled")
-        .await
-        .expect("current memory mode");
-
-    backfill_sessions(runtime.as_ref(), codex_home.as_path(), "test-provider").await;
-
-    let persisted = runtime
-        .get_thread(thread_id)
-        .await
-        .expect("get thread")
-        .expect("thread exists");
-    assert_eq!(persisted.preview.as_deref(), Some("current preview"));
-    assert_eq!(
-        persisted.first_user_message.as_deref(),
-        Some("current first message")
-    );
-    assert_eq!(persisted.title, "current title");
-    assert_eq!(persisted.model.as_deref(), Some("current-model"));
-    assert_eq!(persisted.tokens_used, 42);
-    assert_eq!(
-        runtime
-            .get_thread_memory_mode(thread_id)
-            .await
-            .expect("get memory mode")
-            .as_deref(),
-        Some("disabled")
     );
 }
 

@@ -794,7 +794,7 @@ async fn handle_responses_span_records_response_kind_and_tool_name() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn record_responses_preserves_non_delta_spans_and_coalesces_stream_deltas() {
+async fn record_responses_sets_span_fields_for_response_events() {
     let buffer: &'static Mutex<Vec<u8>> = Box::leak(Box::new(Mutex::new(Vec::new())));
     let subscriber = tracing_subscriber::fmt()
         .with_level(true)
@@ -823,12 +823,6 @@ async fn record_responses_preserves_non_delta_spans_and_coalesces_stream_deltas(
         ev_output_text_delta("delta"),
         ev_reasoning_summary_text_delta("summary-delta"),
         ev_reasoning_text_delta("raw-delta"),
-        serde_json::json!({
-            "type": "response.custom_tool_call_input.delta",
-            "item_id": "call-1",
-            "call_id": "call-1",
-            "delta": "{\"key\":"
-        }),
         ev_function_call("call-1", "fn", "{\"key\":\"value\"}"),
         ev_assistant_message("msg-1", "agent"),
         ev_reasoning_item("reasoning-1", &["summary"], &[]),
@@ -882,7 +876,9 @@ async fn record_responses_preserves_non_delta_spans_and_coalesces_stream_deltas(
         ("function_call", Some("output_item_added"), Some("fn")),
         ("message_from_assistant", Some("output_item_done"), None),
         ("reasoning", Some("output_item_done"), None),
-        ("tool_input_delta", None, None),
+        ("text_delta", None, None),
+        ("reasoning_summary_delta", None, None),
+        ("reasoning_content_delta", None, None),
         ("completed", None, None),
     ];
 
@@ -904,20 +900,6 @@ async fn record_responses_preserves_non_delta_spans_and_coalesces_stream_deltas(
                         .is_none_or(|tool_name_field| line.contains(tool_name_field))
             }),
             "missing span fields for {name}\nlogs:\n{logs}"
-        );
-    }
-
-    for coalesced in [
-        "text_delta",
-        "reasoning_summary_delta",
-        "reasoning_content_delta",
-    ] {
-        let otel_name = format!("otel.name=\"{coalesced}\"");
-        assert!(
-            !logs
-                .lines()
-                .any(|line| line.contains("handle_responses{") && line.contains(&otel_name)),
-            "unexpected child span for coalesced {coalesced}\nlogs:\n{logs}"
         );
     }
 }

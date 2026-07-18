@@ -1,12 +1,10 @@
 use codex_protocol::ThreadId;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::ThreadHistoryMode;
 use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 
 use crate::AppendThreadItemsParams;
-use crate::AppendThreadItemsReceipt;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
 use crate::DeleteThreadParams;
@@ -55,18 +53,6 @@ pub trait ThreadStore: Any + Send + Sync {
     /// Implementations should apply the shared rollout persistence policy before writing durable
     /// replay history and before updating any implementation-owned projections.
     fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()>;
-
-    /// Appends items that have already passed the shared rollout persistence policy.
-    ///
-    /// The returned receipt must use a nonzero sequence that increases in the exact replay order
-    /// for each live-thread writer lifetime. LiveThread consumes those receipts in sequence before
-    /// applying append-derived metadata projections.
-    ///
-    fn append_persisted_items<'a>(
-        &'a self,
-        thread_id: ThreadId,
-        items: &'a [RolloutItem],
-    ) -> ThreadStoreFuture<'a, AppendThreadItemsReceipt>;
 
     /// Materializes the thread if persistence is lazy, then persists all queued items.
     fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;

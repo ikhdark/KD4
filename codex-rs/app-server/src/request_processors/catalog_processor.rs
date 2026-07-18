@@ -578,19 +578,16 @@ impl CatalogRequestProcessor {
         params: SkillsExtraRootsSetParams,
     ) -> Result<SkillsExtraRootsSetResponse, JSONRPCErrorError> {
         let SkillsExtraRootsSetParams { extra_roots } = params;
-        let changed = self
-            .thread_manager
+        self.skills_watcher
+            .register_runtime_extra_roots(&extra_roots);
+        self.thread_manager
             .skills_service()
-            .set_extra_roots(extra_roots.clone());
-        if changed {
-            self.skills_watcher
-                .register_runtime_extra_roots(&extra_roots);
-            self.outgoing
-                .send_server_notification(ServerNotification::SkillsChanged(
-                    codex_app_server_protocol::SkillsChangedNotification {},
-                ))
-                .await;
-        }
+            .set_extra_roots(extra_roots);
+        self.outgoing
+            .send_server_notification(ServerNotification::SkillsChanged(
+                codex_app_server_protocol::SkillsChangedNotification {},
+            ))
+            .await;
         Ok(SkillsExtraRootsSetResponse {})
     }
 

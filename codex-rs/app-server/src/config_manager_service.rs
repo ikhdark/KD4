@@ -1,13 +1,6 @@
 use crate::config_layer::config_layer_metadata_to_api;
 use crate::config_layer::config_layer_to_api;
 use crate::config_manager::ConfigManager;
-use codex_app_server_protocol::AnalyticsConfig as ApiAnalyticsConfig;
-use codex_app_server_protocol::AppConfig as ApiAppConfig;
-use codex_app_server_protocol::AppToolApproval as ApiAppToolApproval;
-use codex_app_server_protocol::AppToolConfig as ApiAppToolConfig;
-use codex_app_server_protocol::AppToolsConfig as ApiAppToolsConfig;
-use codex_app_server_protocol::AppsConfig as ApiAppsConfig;
-use codex_app_server_protocol::AppsDefaultConfig as ApiAppsDefaultConfig;
 use codex_app_server_protocol::Config as ApiConfig;
 use codex_app_server_protocol::ConfigBatchWriteParams;
 use codex_app_server_protocol::ConfigReadParams;
@@ -15,13 +8,9 @@ use codex_app_server_protocol::ConfigReadResponse;
 use codex_app_server_protocol::ConfigValueWriteParams;
 use codex_app_server_protocol::ConfigWriteErrorCode;
 use codex_app_server_protocol::ConfigWriteResponse;
-use codex_app_server_protocol::ForcedChatgptWorkspaceIds as ApiForcedWorkspaceIds;
 use codex_app_server_protocol::MergeStrategy;
 use codex_app_server_protocol::OverriddenMetadata;
-use codex_app_server_protocol::SandboxWorkspaceWrite as ApiSandboxWorkspaceWrite;
-use codex_app_server_protocol::ToolsV2 as ApiToolsV2;
 use codex_app_server_protocol::WriteStatus;
-use codex_config::AppToolApproval as CoreAppToolApproval;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::ConfigLayerEntry;
 use codex_config::ConfigLayerMetadata;
@@ -30,16 +19,7 @@ use codex_config::ConfigLayerStack;
 use codex_config::ConfigLayerStackOrdering;
 use codex_config::ConfigRequirementsToml;
 use codex_config::config_toml::ConfigToml;
-use codex_config::config_toml::ForcedChatgptWorkspaceIds as CoreForcedWorkspaceIds;
-use codex_config::config_toml::ToolsToml;
 use codex_config::merge_toml_values;
-use codex_config::types::AnalyticsConfigToml;
-use codex_config::types::AppConfig as CoreAppConfig;
-use codex_config::types::AppToolConfig as CoreAppToolConfig;
-use codex_config::types::AppToolsConfig as CoreAppToolsConfig;
-use codex_config::types::AppsConfigToml;
-use codex_config::types::AppsDefaultConfig as CoreAppsDefaultConfig;
-use codex_config::types::SandboxWorkspaceWrite as CoreSandboxWorkspaceWrite;
 use codex_core::config::deserialize_config_toml_with_base;
 use codex_core::config::edit::ConfigEdit;
 use codex_core::config::edit::ConfigEditsBuilder;
@@ -51,7 +31,6 @@ use codex_core::path_utils::write_atomically;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value as JsonValue;
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -128,349 +107,6 @@ impl ConfigManagerError {
     }
 }
 
-fn api_sandbox_workspace_write(value: CoreSandboxWorkspaceWrite) -> ApiSandboxWorkspaceWrite {
-    let CoreSandboxWorkspaceWrite {
-        writable_roots,
-        network_access,
-        exclude_tmpdir_env_var,
-        exclude_slash_tmp,
-    } = value;
-
-    ApiSandboxWorkspaceWrite {
-        writable_roots: writable_roots
-            .into_iter()
-            .map(AbsolutePathBuf::into_path_buf)
-            .collect(),
-        network_access,
-        exclude_tmpdir_env_var,
-        exclude_slash_tmp,
-    }
-}
-
-fn api_forced_workspace_ids(value: CoreForcedWorkspaceIds) -> ApiForcedWorkspaceIds {
-    match value {
-        CoreForcedWorkspaceIds::Single(value) => ApiForcedWorkspaceIds::Single(value),
-        CoreForcedWorkspaceIds::Multiple(values) => ApiForcedWorkspaceIds::Multiple(values),
-    }
-}
-
-fn api_tools(value: ToolsToml) -> ApiToolsV2 {
-    let ToolsToml {
-        web_search,
-        experimental_request_user_input: _,
-    } = value;
-    ApiToolsV2 { web_search }
-}
-
-fn api_analytics(value: AnalyticsConfigToml) -> ApiAnalyticsConfig {
-    let AnalyticsConfigToml { enabled } = value;
-    ApiAnalyticsConfig {
-        enabled,
-        additional: HashMap::new(),
-    }
-}
-
-fn api_app_tool_approval(value: CoreAppToolApproval) -> ApiAppToolApproval {
-    match value {
-        CoreAppToolApproval::Auto => ApiAppToolApproval::Auto,
-        CoreAppToolApproval::Prompt => ApiAppToolApproval::Prompt,
-        CoreAppToolApproval::Writes => ApiAppToolApproval::Writes,
-        CoreAppToolApproval::Approve => ApiAppToolApproval::Approve,
-    }
-}
-
-fn api_app_tool(value: CoreAppToolConfig) -> ApiAppToolConfig {
-    let CoreAppToolConfig {
-        enabled,
-        approval_mode,
-    } = value;
-    ApiAppToolConfig {
-        enabled,
-        approval_mode: approval_mode.map(api_app_tool_approval),
-    }
-}
-
-fn api_app_tools(value: CoreAppToolsConfig) -> ApiAppToolsConfig {
-    let CoreAppToolsConfig { tools } = value;
-    ApiAppToolsConfig {
-        tools: tools
-            .into_iter()
-            .map(|(name, config)| (name, api_app_tool(config)))
-            .collect(),
-    }
-}
-
-fn api_app(value: CoreAppConfig) -> ApiAppConfig {
-    let CoreAppConfig {
-        enabled,
-        approvals_reviewer,
-        destructive_enabled,
-        open_world_enabled,
-        default_tools_approval_mode,
-        default_tools_enabled,
-        tools,
-    } = value;
-
-    ApiAppConfig {
-        enabled,
-        approvals_reviewer: approvals_reviewer.map(Into::into),
-        destructive_enabled,
-        open_world_enabled,
-        default_tools_approval_mode: default_tools_approval_mode.map(api_app_tool_approval),
-        default_tools_enabled,
-        tools: tools.map(api_app_tools),
-    }
-}
-
-fn api_apps_default(value: CoreAppsDefaultConfig) -> ApiAppsDefaultConfig {
-    let CoreAppsDefaultConfig {
-        enabled,
-        approvals_reviewer,
-        destructive_enabled,
-        open_world_enabled,
-        default_tools_approval_mode,
-    } = value;
-
-    ApiAppsDefaultConfig {
-        enabled,
-        approvals_reviewer: approvals_reviewer.map(Into::into),
-        destructive_enabled,
-        open_world_enabled,
-        default_tools_approval_mode: default_tools_approval_mode.map(api_app_tool_approval),
-    }
-}
-
-fn api_apps(value: AppsConfigToml) -> ApiAppsConfig {
-    let AppsConfigToml { default, apps } = value;
-    ApiAppsConfig {
-        default: default.map(api_apps_default),
-        apps: apps
-            .into_iter()
-            .map(|(id, config)| (id, api_app(config)))
-            .collect(),
-    }
-}
-
-pub(crate) fn api_config_from_config_toml(
-    config: ConfigToml,
-) -> Result<ApiConfig, serde_json::Error> {
-    let ConfigToml {
-        model,
-        review_model,
-        model_provider,
-        model_context_window,
-        model_auto_compact_token_limit,
-        model_auto_compact_token_limit_scope,
-        approval_policy,
-        approvals_reviewer,
-        auto_review,
-        shell_environment_policy,
-        allow_login_shell,
-        sandbox_mode,
-        sandbox_workspace_write,
-        default_permissions,
-        permissions,
-        notify,
-        instructions,
-        developer_instructions,
-        include_permissions_instructions,
-        include_apps_instructions,
-        include_collaboration_mode_instructions,
-        include_environment_context,
-        model_instructions_file,
-        compact_prompt,
-        forced_chatgpt_workspace_id,
-        forced_login_method,
-        cli_auth_credentials_store,
-        mcp_servers,
-        mcp_oauth_credentials_store,
-        mcp_oauth_callback_port,
-        mcp_oauth_callback_url,
-        model_providers,
-        project_doc_max_bytes,
-        project_doc_fallback_filenames,
-        tool_output_token_limit,
-        background_terminal_max_timeout,
-        js_repl_node_path,
-        js_repl_node_module_dirs,
-        profile,
-        profiles,
-        history,
-        sqlite_home,
-        log_dir,
-        debug,
-        file_opener,
-        tui,
-        hide_agent_reasoning,
-        show_raw_agent_reasoning,
-        model_reasoning_effort,
-        plan_mode_reasoning_effort,
-        model_reasoning_summary,
-        model_verbosity,
-        model_supports_reasoning_summaries,
-        model_catalog_json,
-        personality,
-        service_tier,
-        chatgpt_base_url,
-        apps_mcp_product_sku,
-        orchestrator,
-        openai_base_url,
-        audio,
-        experimental_realtime_ws_base_url,
-        experimental_realtime_webrtc_call_base_url,
-        experimental_realtime_ws_model,
-        realtime,
-        experimental_realtime_ws_backend_prompt,
-        experimental_realtime_ws_startup_context,
-        experimental_realtime_start_instructions,
-        experimental_thread_config_endpoint,
-        experimental_thread_store_endpoint,
-        experimental_thread_store,
-        projects,
-        web_search,
-        tools,
-        tool_suggest,
-        agents,
-        memories,
-        skills,
-        hooks,
-        plugins,
-        marketplaces,
-        features,
-        suppress_unstable_features_warning,
-        ghost_snapshot,
-        project_root_markers,
-        check_for_update_on_startup,
-        disable_paste_burst,
-        analytics,
-        feedback,
-        apps,
-        desktop,
-        otel,
-        windows,
-        notice,
-        experimental_compact_prompt_file,
-        experimental_use_unified_exec_tool,
-        oss_provider,
-    } = config;
-
-    let mut additional = HashMap::new();
-    macro_rules! additional {
-        ($($field:ident),* $(,)?) => {
-            $(
-                additional.insert(
-                    stringify!($field).to_owned(),
-                    serde_json::to_value($field)?,
-                );
-            )*
-        };
-    }
-
-    additional!(
-        auto_review,
-        shell_environment_policy,
-        allow_login_shell,
-        default_permissions,
-        permissions,
-        notify,
-        include_permissions_instructions,
-        include_apps_instructions,
-        include_collaboration_mode_instructions,
-        include_environment_context,
-        model_instructions_file,
-        cli_auth_credentials_store,
-        mcp_servers,
-        mcp_oauth_credentials_store,
-        mcp_oauth_callback_port,
-        mcp_oauth_callback_url,
-        model_providers,
-        project_doc_max_bytes,
-        project_doc_fallback_filenames,
-        tool_output_token_limit,
-        background_terminal_max_timeout,
-        js_repl_node_path,
-        js_repl_node_module_dirs,
-        profile,
-        profiles,
-        history,
-        sqlite_home,
-        log_dir,
-        debug,
-        file_opener,
-        tui,
-        hide_agent_reasoning,
-        show_raw_agent_reasoning,
-        plan_mode_reasoning_effort,
-        model_supports_reasoning_summaries,
-        model_catalog_json,
-        personality,
-        chatgpt_base_url,
-        apps_mcp_product_sku,
-        orchestrator,
-        openai_base_url,
-        audio,
-        experimental_realtime_ws_base_url,
-        experimental_realtime_webrtc_call_base_url,
-        experimental_realtime_ws_model,
-        realtime,
-        experimental_realtime_ws_backend_prompt,
-        experimental_realtime_ws_startup_context,
-        experimental_realtime_start_instructions,
-        experimental_thread_config_endpoint,
-        experimental_thread_store_endpoint,
-        experimental_thread_store,
-        projects,
-        tool_suggest,
-        agents,
-        memories,
-        skills,
-        hooks,
-        plugins,
-        marketplaces,
-        features,
-        suppress_unstable_features_warning,
-        ghost_snapshot,
-        project_root_markers,
-        check_for_update_on_startup,
-        disable_paste_burst,
-        feedback,
-        otel,
-        windows,
-        notice,
-        experimental_compact_prompt_file,
-        experimental_use_unified_exec_tool,
-        oss_provider,
-    );
-
-    Ok(ApiConfig {
-        model,
-        review_model,
-        model_context_window,
-        model_auto_compact_token_limit,
-        model_auto_compact_token_limit_scope,
-        model_provider,
-        approval_policy: approval_policy.map(Into::into),
-        approvals_reviewer: approvals_reviewer.map(Into::into),
-        sandbox_mode: sandbox_mode.map(Into::into),
-        sandbox_workspace_write: sandbox_workspace_write.map(api_sandbox_workspace_write),
-        forced_chatgpt_workspace_id: forced_chatgpt_workspace_id.map(api_forced_workspace_ids),
-        forced_login_method,
-        web_search,
-        tools: tools.map(api_tools),
-        instructions,
-        developer_instructions,
-        compact_prompt,
-        model_reasoning_effort,
-        model_reasoning_summary,
-        model_verbosity,
-        service_tier,
-        analytics: analytics.map(api_analytics),
-        apps: apps.map(api_apps),
-        desktop,
-        additional,
-    })
-}
-
 impl ConfigManager {
     pub(crate) async fn read(
         &self,
@@ -495,8 +131,10 @@ impl ConfigManager {
             .try_into()
             .map_err(|err| ConfigManagerError::toml("invalid configuration", err))?;
 
-        let config = api_config_from_config_toml(effective_config_toml)
+        let json_value = serde_json::to_value(&effective_config_toml)
             .map_err(|err| ConfigManagerError::json("failed to serialize configuration", err))?;
+        let config: ApiConfig = serde_json::from_value(json_value)
+            .map_err(|err| ConfigManagerError::json("failed to deserialize configuration", err))?;
 
         Ok(ConfigReadResponse {
             config,
@@ -655,6 +293,12 @@ impl ConfigManager {
             parsed_segments.push(segments);
         }
 
+        validate_config(&user_config).map_err(|err| {
+            ConfigManagerError::write(
+                ConfigWriteErrorCode::ConfigValidationError,
+                format!("Invalid configuration: {err}"),
+            )
+        })?;
         let user_config_toml =
             deserialize_config_toml_with_base(user_config.clone(), self.codex_home()).map_err(
                 |err| {
@@ -676,7 +320,7 @@ impl ConfigManager {
         })?;
         let updated_layers = layers.with_user_config(&provided_path, user_config.clone());
         let effective = updated_layers.effective_config();
-        deserialize_config_toml_with_base(effective.clone(), self.codex_home()).map_err(|err| {
+        validate_config(&effective).map_err(|err| {
             ConfigManagerError::write(
                 ConfigWriteErrorCode::ConfigValidationError,
                 format!("Invalid configuration: {err}"),
@@ -949,6 +593,11 @@ fn toml_value_to_value(value: &TomlValue) -> anyhow::Result<toml_edit::Value> {
             Ok(toml_edit::Value::InlineTable(inline))
         }
     }
+}
+
+fn validate_config(value: &TomlValue) -> Result<(), toml::de::Error> {
+    let _: ConfigToml = value.clone().try_into()?;
+    Ok(())
 }
 
 fn paths_match(expected: impl AsRef<Path>, provided: impl AsRef<Path>) -> bool {

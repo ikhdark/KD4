@@ -176,6 +176,7 @@ pub(crate) struct ThreadState {
     pub(crate) turn_summary: TurnSummary,
     pub(crate) last_terminal_turn_id: Option<String>,
     pub(crate) cancel_tx: Option<oneshot::Sender<()>>,
+    pub(crate) experimental_raw_events: bool,
     pub(crate) listener_generation: u64,
     last_thread_settings: Option<ThreadSettings>,
     listener_command_tx: Option<mpsc::UnboundedSender<ThreadListenerCommand>>,
@@ -222,8 +223,8 @@ impl ThreadState {
         self.watch_registration = WatchRegistration::default();
     }
 
-    pub(crate) fn replace_watch_registration(&mut self, registration: WatchRegistration) {
-        self.watch_registration = registration;
+    pub(crate) fn set_experimental_raw_events(&mut self, enabled: bool) {
+        self.experimental_raw_events = enabled;
     }
 
     pub(crate) fn listener_command_tx(
@@ -385,85 +386,9 @@ mod tests {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct ResolvedDeliveryFilter {
-    pub(crate) experimental_api_enabled: bool,
-    pub(crate) opted_out_notification_methods: Arc<HashSet<String>>,
-}
-
-impl ResolvedDeliveryFilter {
-    pub(crate) fn new(
-        experimental_api_enabled: bool,
-        opted_out_notification_methods: HashSet<String>,
-    ) -> Self {
-        Self {
-            experimental_api_enabled,
-            opted_out_notification_methods: Arc::new(opted_out_notification_methods),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RecipientDescriptor {
-    pub(crate) connection_id: ConnectionId,
-    pub(crate) filter_revision: u64,
-    pub(crate) delivery_filter: ResolvedDeliveryFilter,
-    pub(crate) raw_events_enabled: bool,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(crate) struct RecipientSnapshot {
-    pub(crate) revision: u64,
-    descriptors: Arc<[RecipientDescriptor]>,
-    connection_ids: Arc<[ConnectionId]>,
-}
-
-impl RecipientSnapshot {
-    #[cfg(test)]
-    pub(crate) fn permissive(connection_ids: Vec<ConnectionId>) -> Self {
-        let descriptors = connection_ids
-            .iter()
-            .copied()
-            .map(|connection_id| RecipientDescriptor {
-                connection_id,
-                filter_revision: 0,
-                delivery_filter: ResolvedDeliveryFilter {
-                    experimental_api_enabled: true,
-                    opted_out_notification_methods: Arc::default(),
-                },
-                raw_events_enabled: true,
-            })
-            .collect::<Vec<_>>()
-            .into();
-        Self {
-            revision: 0,
-            descriptors,
-            connection_ids: connection_ids.into(),
-        }
-    }
-
-    pub(crate) fn descriptors(&self) -> &[RecipientDescriptor] {
-        &self.descriptors
-    }
-
-    pub(crate) fn connection_ids(&self) -> &[ConnectionId] {
-        &self.connection_ids
-    }
-
-    pub(crate) fn raw_events_enabled_for(&self, connection_id: ConnectionId) -> bool {
-        self.descriptors
-            .iter()
-            .find(|descriptor| descriptor.connection_id == connection_id)
-            .is_some_and(|descriptor| descriptor.raw_events_enabled)
-    }
-}
-
 struct ThreadEntry {
     state: Arc<Mutex<ThreadState>>,
     connection_ids: HashSet<ConnectionId>,
-    raw_event_connection_ids: HashSet<ConnectionId>,
-    recipient_filter_revisions: HashMap<ConnectionId, u64>,
-    recipient_snapshot: RecipientSnapshot,
     has_connections_watcher: watch::Sender<bool>,
 }
 
@@ -472,9 +397,6 @@ impl Default for ThreadEntry {
         Self {
             state: Arc::new(Mutex::new(ThreadState::default())),
             connection_ids: HashSet::new(),
-            raw_event_connection_ids: HashSet::new(),
-            recipient_filter_revisions: HashMap::new(),
-            recipient_snapshot: RecipientSnapshot::default(),
             has_connections_watcher: watch::channel(false).0,
         }
     }
@@ -488,87 +410,18 @@ impl ThreadEntry {
             prev != *current
         });
     }
-
-    fn rebuild_recipient_snapshot(
-        &mut self,
-        live_connections: &HashMap<ConnectionId, LiveConnection>,
-    ) {
-        let descriptors = self
-            .connection_ids
-            .iter()
-            .filter_map(|connection_id| {
-                let connection = live_connections.get(connection_id)?;
-                Some(RecipientDescriptor {
-                    connection_id: *connection_id,
-                    filter_revision: self
-                        .recipient_filter_revisions
-                        .get(connection_id)
-                        .copied()
-                        .unwrap_or(connection.filter_revision),
-                    delivery_filter: connection.capabilities.delivery_filter.clone(),
-                    raw_events_enabled: self.raw_event_connection_ids.contains(connection_id),
-                })
-            })
-            .collect::<Vec<_>>();
-        let connection_ids = descriptors
-            .iter()
-            .map(|descriptor| descriptor.connection_id)
-            .collect::<Vec<_>>();
-        self.recipient_snapshot = RecipientSnapshot {
-            revision: self.recipient_snapshot.revision.wrapping_add(1),
-            descriptors: descriptors.into(),
-            connection_ids: connection_ids.into(),
-        };
-    }
-
-    fn initialize_recipient_filter_revision(
-        &mut self,
-        connection_id: ConnectionId,
-        connection_filter_revision: u64,
-    ) {
-        self.recipient_filter_revisions
-            .entry(connection_id)
-            .or_insert(connection_filter_revision);
-    }
-
-    fn bump_recipient_filter_revision(&mut self, connection_id: ConnectionId) {
-        let revision = self
-            .recipient_filter_revisions
-            .entry(connection_id)
-            .or_default();
-        *revision = revision.wrapping_add(1);
-    }
 }
 
 #[derive(Default)]
 struct ThreadStateManagerInner {
-    live_connections: HashMap<ConnectionId, LiveConnection>,
+    live_connections: HashMap<ConnectionId, ConnectionCapabilities>,
     threads: HashMap<ThreadId, ThreadEntry>,
     thread_ids_by_connection: HashMap<ConnectionId, HashSet<ThreadId>>,
 }
 
-impl ThreadStateManagerInner {
-    fn rebuild_recipient_snapshot(&mut self, thread_id: ThreadId) {
-        let Self {
-            live_connections,
-            threads,
-            ..
-        } = self;
-        if let Some(thread_entry) = threads.get_mut(&thread_id) {
-            thread_entry.rebuild_recipient_snapshot(live_connections);
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct ConnectionCapabilities {
     pub(crate) request_attestation: bool,
-    pub(crate) delivery_filter: ResolvedDeliveryFilter,
-}
-
-struct LiveConnection {
-    capabilities: ConnectionCapabilities,
-    filter_revision: u64,
 }
 
 #[derive(Clone, Default)]
@@ -590,36 +443,11 @@ impl ThreadStateManager {
         connection_id: ConnectionId,
         capabilities: ConnectionCapabilities,
     ) {
-        let mut state = self.state.lock().await;
-        let previous = state.live_connections.get(&connection_id);
-        let filter_changed = previous.is_none_or(|previous| {
-            previous.capabilities.delivery_filter != capabilities.delivery_filter
-        });
-        let filter_revision = previous.map_or(0, |previous| {
-            previous
-                .filter_revision
-                .wrapping_add(u64::from(filter_changed))
-        });
-        state.live_connections.insert(
-            connection_id,
-            LiveConnection {
-                capabilities,
-                filter_revision,
-            },
-        );
-        if filter_changed {
-            let thread_ids = state
-                .thread_ids_by_connection
-                .get(&connection_id)
-                .cloned()
-                .unwrap_or_default();
-            for thread_id in thread_ids {
-                if let Some(thread_entry) = state.threads.get_mut(&thread_id) {
-                    thread_entry.bump_recipient_filter_revision(connection_id);
-                }
-                state.rebuild_recipient_snapshot(thread_id);
-            }
-        }
+        self.state
+            .lock()
+            .await
+            .live_connections
+            .insert(connection_id, capabilities);
     }
 
     pub(crate) async fn first_attestation_capable_connection_for_thread(
@@ -636,7 +464,6 @@ impl ThreadStateManager {
                 state
                     .live_connections
                     .get(connection_id)?
-                    .capabilities
                     .request_attestation
                     .then_some(*connection_id)
             })
@@ -661,19 +488,11 @@ impl ThreadStateManager {
     }
 
     pub(crate) async fn subscribed_connection_ids(&self, thread_id: ThreadId) -> Vec<ConnectionId> {
-        self.recipient_snapshot(thread_id)
-            .await
-            .connection_ids()
-            .to_vec()
-    }
-
-    pub(crate) async fn recipient_snapshot(&self, thread_id: ThreadId) -> RecipientSnapshot {
-        self.state
-            .lock()
-            .await
+        let state = self.state.lock().await;
+        state
             .threads
             .get(&thread_id)
-            .map(|thread_entry| thread_entry.recipient_snapshot.clone())
+            .map(|thread_entry| thread_entry.connection_ids.iter().copied().collect())
             .unwrap_or_default()
     }
 
@@ -790,13 +609,8 @@ impl ThreadStateManager {
             }
             if let Some(thread_entry) = state.threads.get_mut(&thread_id) {
                 thread_entry.connection_ids.remove(&connection_id);
-                thread_entry.raw_event_connection_ids.remove(&connection_id);
-                thread_entry
-                    .recipient_filter_revisions
-                    .remove(&connection_id);
                 thread_entry.update_has_connections();
             }
-            state.rebuild_recipient_snapshot(thread_id);
         };
 
         true
@@ -818,27 +632,26 @@ impl ThreadStateManager {
         connection_id: ConnectionId,
         experimental_raw_events: bool,
     ) -> Option<Arc<Mutex<ThreadState>>> {
-        let mut state = self.state.lock().await;
-        let connection_filter_revision =
-            state.live_connections.get(&connection_id)?.filter_revision;
-        state
-            .thread_ids_by_connection
-            .entry(connection_id)
-            .or_default()
-            .insert(thread_id);
-        let thread_entry = state.threads.entry(thread_id).or_default();
-        let membership_changed = thread_entry.connection_ids.insert(connection_id);
-        thread_entry
-            .initialize_recipient_filter_revision(connection_id, connection_filter_revision);
-        let raw_filter_changed =
-            experimental_raw_events && thread_entry.raw_event_connection_ids.insert(connection_id);
-        if raw_filter_changed && !membership_changed {
-            thread_entry.bump_recipient_filter_revision(connection_id);
-        }
-        thread_entry.update_has_connections();
-        let thread_state = thread_entry.state.clone();
-        if membership_changed || raw_filter_changed {
-            state.rebuild_recipient_snapshot(thread_id);
+        let thread_state = {
+            let mut state = self.state.lock().await;
+            if !state.live_connections.contains_key(&connection_id) {
+                return None;
+            }
+            state
+                .thread_ids_by_connection
+                .entry(connection_id)
+                .or_default()
+                .insert(thread_id);
+            let thread_entry = state.threads.entry(thread_id).or_default();
+            thread_entry.connection_ids.insert(connection_id);
+            thread_entry.update_has_connections();
+            thread_entry.state.clone()
+        };
+        {
+            let mut thread_state_guard = thread_state.lock().await;
+            if experimental_raw_events {
+                thread_state_guard.set_experimental_raw_events(/*enabled*/ true);
+            }
         }
         Some(thread_state)
     }
@@ -849,26 +662,17 @@ impl ThreadStateManager {
         connection_id: ConnectionId,
     ) -> bool {
         let mut state = self.state.lock().await;
-        let Some(connection_filter_revision) = state
-            .live_connections
-            .get(&connection_id)
-            .map(|connection| connection.filter_revision)
-        else {
+        if !state.live_connections.contains_key(&connection_id) {
             return false;
-        };
+        }
         state
             .thread_ids_by_connection
             .entry(connection_id)
             .or_default()
             .insert(thread_id);
         let thread_entry = state.threads.entry(thread_id).or_default();
-        let membership_changed = thread_entry.connection_ids.insert(connection_id);
-        thread_entry
-            .initialize_recipient_filter_revision(connection_id, connection_filter_revision);
+        thread_entry.connection_ids.insert(connection_id);
         thread_entry.update_has_connections();
-        if membership_changed {
-            state.rebuild_recipient_snapshot(thread_id);
-        }
         true
     }
 
@@ -883,13 +687,8 @@ impl ThreadStateManager {
             for thread_id in &thread_ids {
                 if let Some(thread_entry) = state.threads.get_mut(thread_id) {
                     thread_entry.connection_ids.remove(&connection_id);
-                    thread_entry.raw_event_connection_ids.remove(&connection_id);
-                    thread_entry
-                        .recipient_filter_revisions
-                        .remove(&connection_id);
                     thread_entry.update_has_connections();
                 }
-                state.rebuild_recipient_snapshot(*thread_id);
             }
             thread_ids
                 .into_iter()
@@ -912,124 +711,5 @@ impl ThreadStateManager {
             .threads
             .get(&thread_id)
             .map(|thread_entry| thread_entry.has_connections_watcher.subscribe())
-    }
-}
-
-#[cfg(test)]
-mod recipient_snapshot_tests {
-    use super::*;
-
-    fn descriptor(
-        snapshot: &RecipientSnapshot,
-        connection_id: ConnectionId,
-    ) -> &RecipientDescriptor {
-        snapshot
-            .descriptors()
-            .iter()
-            .find(|descriptor| descriptor.connection_id == connection_id)
-            .expect("recipient descriptor")
-    }
-
-    #[tokio::test]
-    async fn snapshot_revisions_track_filter_and_raw_changes() {
-        let manager = ThreadStateManager::new();
-        let thread_id = ThreadId::new();
-        let connection_id = ConnectionId(1);
-        let initial_filter =
-            ResolvedDeliveryFilter::new(false, HashSet::from(["thread/ignored".to_string()]));
-        manager
-            .connection_initialized(
-                connection_id,
-                ConnectionCapabilities {
-                    request_attestation: false,
-                    delivery_filter: initial_filter.clone(),
-                },
-            )
-            .await;
-        manager
-            .try_ensure_connection_subscribed(thread_id, connection_id, false)
-            .await
-            .expect("subscription");
-
-        let initial = manager.recipient_snapshot(thread_id).await;
-        let initial_descriptor = descriptor(&initial, connection_id);
-        assert!(!initial_descriptor.raw_events_enabled);
-        assert_eq!(initial_descriptor.delivery_filter, initial_filter);
-
-        manager
-            .try_ensure_connection_subscribed(thread_id, connection_id, true)
-            .await
-            .expect("raw subscription upgrade");
-        let raw_enabled = manager.recipient_snapshot(thread_id).await;
-        let raw_descriptor = descriptor(&raw_enabled, connection_id);
-        assert!(raw_enabled.revision > initial.revision);
-        assert!(raw_descriptor.filter_revision > initial_descriptor.filter_revision);
-        assert!(raw_descriptor.raw_events_enabled);
-        assert!(!descriptor(&initial, connection_id).raw_events_enabled);
-
-        let updated_filter = ResolvedDeliveryFilter::new(true, HashSet::new());
-        manager
-            .connection_initialized(
-                connection_id,
-                ConnectionCapabilities {
-                    request_attestation: false,
-                    delivery_filter: updated_filter.clone(),
-                },
-            )
-            .await;
-        let updated = manager.recipient_snapshot(thread_id).await;
-        let updated_descriptor = descriptor(&updated, connection_id);
-        assert!(updated.revision > raw_enabled.revision);
-        assert!(updated_descriptor.filter_revision > raw_descriptor.filter_revision);
-        assert_eq!(updated_descriptor.delivery_filter, updated_filter);
-
-        manager
-            .try_ensure_connection_subscribed(thread_id, connection_id, false)
-            .await
-            .expect("false does not downgrade raw delivery");
-        assert_eq!(manager.recipient_snapshot(thread_id).await, updated);
-    }
-
-    #[tokio::test]
-    async fn snapshot_keeps_per_connection_raw_state_and_removes_departed_recipients() {
-        let manager = ThreadStateManager::new();
-        let thread_id = ThreadId::new();
-        let raw_connection = ConnectionId(1);
-        let filtered_connection = ConnectionId(2);
-        for connection_id in [raw_connection, filtered_connection] {
-            manager
-                .connection_initialized(connection_id, ConnectionCapabilities::default())
-                .await;
-        }
-        manager
-            .try_ensure_connection_subscribed(thread_id, raw_connection, true)
-            .await
-            .expect("raw subscription");
-        manager
-            .try_ensure_connection_subscribed(thread_id, filtered_connection, false)
-            .await
-            .expect("filtered subscription");
-
-        let both = manager.recipient_snapshot(thread_id).await;
-        assert!(descriptor(&both, raw_connection).raw_events_enabled);
-        assert!(!descriptor(&both, filtered_connection).raw_events_enabled);
-
-        assert!(
-            manager
-                .unsubscribe_connection_from_thread(thread_id, raw_connection)
-                .await
-        );
-        let one = manager.recipient_snapshot(thread_id).await;
-        assert_eq!(one.descriptors().len(), 1);
-        assert_eq!(one.descriptors()[0].connection_id, filtered_connection);
-
-        manager.remove_connection(filtered_connection).await;
-        assert!(
-            manager
-                .recipient_snapshot(thread_id)
-                .await
-                .descriptors()
-                .is_empty()
-        );
     }
 }

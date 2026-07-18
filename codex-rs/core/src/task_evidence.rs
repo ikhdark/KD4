@@ -1,7 +1,6 @@
 use chrono::DateTime;
 use chrono::Duration as ChronoDuration;
 use chrono::Utc;
-use codex_git_utils::GitInfo;
 use codex_git_utils::collect_git_info;
 use codex_protocol::ThreadId;
 use codex_protocol::plan_tool::PlanItemArg;
@@ -20,20 +19,13 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io;
 use std::io::Write;
-use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
-use tokio::sync::Notify;
-use tokio::sync::OnceCell;
-use tokio::time::Duration;
-use tokio_util::sync::CancellationToken;
+use tokio::sync::Semaphore;
 use tracing::warn;
 
 const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 2;
@@ -50,54 +42,10 @@ pub(crate) struct TaskEvidenceLedger {
     evidence_path: Option<PathBuf>,
     repo_root: Option<PathBuf>,
     trusted_wiring_guard_root: Option<PathBuf>,
-    deferred_start: Option<DeferredTaskEvidenceStart>,
-    initialization: OnceCell<()>,
-    document: Arc<Mutex<Option<TaskEvidenceDocument>>>,
-    persistence: Option<Arc<TaskEvidencePersistence>>,
-    active_validation: StdMutex<Option<ActiveTaskEvidenceValidation>>,
-    mutation_generation: AtomicU64,
+    document: Mutex<Option<TaskEvidenceDocument>>,
+    persistence_gate: Semaphore,
+    last_persisted_revision: AtomicU64,
     wiring_ledger_starts: Mutex<BTreeMap<String, WiringLedgerFingerprint>>,
-    command_mutation_starts: Mutex<BTreeMap<String, CommandMutationStart>>,
-    unknown_command_reconciliation: Mutex<()>,
-    #[cfg(test)]
-    unknown_reconciliation_count: AtomicU64,
-}
-
-struct TaskEvidencePersistence {
-    path: PathBuf,
-    document: Arc<Mutex<Option<TaskEvidenceDocument>>>,
-    enabled: AtomicBool,
-    state: Mutex<TaskEvidencePersistenceState>,
-    completed: Notify,
-    #[cfg(test)]
-    serialization_count: AtomicU64,
-    #[cfg(test)]
-    write_count: AtomicU64,
-    #[cfg(test)]
-    interrupt_next_write_before_replace: AtomicBool,
-}
-
-#[derive(Debug, Default)]
-struct TaskEvidencePersistenceState {
-    requested_revision: u64,
-    persisted_revision: u64,
-    failed_revision: Option<u64>,
-    writer_running: bool,
-}
-
-#[derive(Clone)]
-struct ActiveTaskEvidenceValidation {
-    evidence_generation: u64,
-    cancellation_token: CancellationToken,
-}
-
-#[derive(Clone)]
-struct DeferredTaskEvidenceStart {
-    thread_id: String,
-    started_at: String,
-    cwd: String,
-    repository_root: String,
-    git: Option<GitInfo>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -108,57 +56,10 @@ struct WiringLedgerFingerprint {
 }
 
 #[derive(Debug, Clone)]
-struct CommandMutationStart {
-    epoch: u64,
-    artifact_paths: BTreeSet<String>,
-    target_snapshots: BTreeMap<String, FileHashSnapshot>,
-    coverage: MutationCoverage,
-    fingerprint: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum MutationObservation {
-    Unchanged,
-    Changed,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum MutationCoverage {
-    Complete,
-    Incomplete,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum ValidationConclusion {
-    Passed,
-    Failed,
-}
-
-#[derive(Debug, Clone)]
 pub(crate) struct TaskEvidenceValidationStart {
     epoch: u64,
-    workspace_generation: String,
-    evidence_generation: u64,
-    hash_generation: String,
-    spec_generation: String,
-    cancellation_token: CancellationToken,
     file_snapshots: BTreeMap<String, FileHashSnapshot>,
     artifact_snapshots: BTreeMap<String, FileHashSnapshot>,
-    automatic_claim_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AutomaticVerifyLocalRequest {
-    pub(crate) changed_paths: Vec<String>,
-    pub(crate) evidence_generation: u64,
-    pub(crate) claim_id: String,
-}
-
-impl TaskEvidenceValidationStart {
-    pub(crate) fn cancellation_token(&self) -> CancellationToken {
-        self.cancellation_token.clone()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,7 +69,7 @@ enum PersistOutcome {
     Failed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TaskEvidenceDocument {
     schema_version: u32,
     #[serde(default)]
@@ -197,8 +98,6 @@ struct TaskEvidenceDocument {
     desktop_activation_receipt: Option<DesktopActivationReceipt>,
     #[serde(default)]
     automatic_plan_attempt_epoch: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    automatic_plan_attempt_claim_id: Option<String>,
     repair_turns_used: u8,
     #[serde(default = "initial_receipt_sequence")]
     next_edit_receipt_sequence: u64,
@@ -206,12 +105,10 @@ struct TaskEvidenceDocument {
     next_command_receipt_sequence: u64,
     #[serde(default = "initial_receipt_sequence")]
     next_validation_receipt_sequence: u64,
-    #[serde(default = "initial_receipt_sequence")]
-    next_automatic_validation_claim_sequence: u64,
     completion: Option<TaskCompletionGate>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct TaskStartState {
     cwd: String,
     repository_root: String,
@@ -235,7 +132,7 @@ struct EvidencePlanStep {
     validation_receipt_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EditIntent {
     call_id: String,
     step_id: Option<String>,
@@ -245,7 +142,7 @@ struct EditIntent {
     files: Vec<FileHashSnapshot>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EditReceipt {
     id: String,
     call_id: String,
@@ -256,7 +153,7 @@ struct EditReceipt {
     files: Vec<FileHashTransition>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct FileHashTransition {
     path: String,
     before_sha1: Option<String>,
@@ -278,7 +175,7 @@ struct FileHashSnapshot {
     read_error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CommandReceipt {
     id: String,
     recorded_at: String,
@@ -290,17 +187,9 @@ struct CommandReceipt {
     timed_out: bool,
     duration_ms: u64,
     possible_mutation: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    observation: Option<MutationObservation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    coverage: Option<MutationCoverage>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    changed_paths: Vec<String>,
-    #[serde(default)]
-    reconciliation_attempted: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ValidationReceipt {
     id: String,
     recorded_at: String,
@@ -310,30 +199,9 @@ struct ValidationReceipt {
     verdict: Option<String>,
     tool_success: bool,
     proof_bearing: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    workspace_generation: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    evidence_generation: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    automatic_claim_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    hash_generation: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    spec_generation: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    conclusion: Option<ValidationConclusion>,
     active_files: Vec<FileHashSnapshot>,
     stale_reasons: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    exact_output_artifacts: Vec<ValidationOutputArtifact>,
     payload: Option<Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ValidationOutputArtifact {
-    sha256: String,
-    path: String,
-    bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -347,7 +215,7 @@ struct GeneratedArtifactRequirement {
     validation_receipt_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EvidenceRisk {
     id: String,
     description: String,
@@ -357,7 +225,7 @@ struct EvidenceRisk {
     epoch: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EpochReceipt {
     receipt_id: String,
     epoch: u64,
@@ -366,7 +234,7 @@ struct EpochReceipt {
     wiring_proof: Option<WiringProof>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct WiringProof {
     schema_id: String,
     schema_version: String,
@@ -377,7 +245,7 @@ struct WiringProof {
     proof_graph_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DesktopActivationReceipt {
     epoch: u64,
     recorded_at: String,
@@ -386,188 +254,8 @@ struct DesktopActivationReceipt {
     runtime_evidence: String,
 }
 
-impl TaskEvidencePersistence {
-    fn new(path: PathBuf, document: Arc<Mutex<Option<TaskEvidenceDocument>>>) -> Self {
-        Self {
-            path,
-            document,
-            enabled: AtomicBool::new(true),
-            state: Mutex::new(TaskEvidencePersistenceState::default()),
-            completed: Notify::new(),
-            #[cfg(test)]
-            serialization_count: AtomicU64::new(0),
-            #[cfg(test)]
-            write_count: AtomicU64::new(0),
-            #[cfg(test)]
-            interrupt_next_write_before_replace: AtomicBool::new(false),
-        }
-    }
-
-    async fn enqueue(self: &Arc<Self>, revision: u64) {
-        if !self.enabled.load(Ordering::Acquire) {
-            return;
-        }
-        let should_spawn = {
-            let mut state = self.state.lock().await;
-            state.requested_revision = state.requested_revision.max(revision);
-            if state
-                .failed_revision
-                .is_some_and(|failed| revision >= failed)
-            {
-                state.failed_revision = None;
-            }
-            if state.persisted_revision >= revision || state.writer_running {
-                false
-            } else {
-                state.writer_running = true;
-                true
-            }
-        };
-        if should_spawn {
-            tokio::spawn(Self::run(Arc::clone(self)));
-        }
-    }
-
-    async fn wait_for_revision(self: &Arc<Self>, revision: u64) -> PersistOutcome {
-        self.enqueue(revision).await;
-        loop {
-            if !self.enabled.load(Ordering::Acquire) {
-                return PersistOutcome::Failed;
-            }
-            let notified = self.completed.notified();
-            let current_revision = self
-                .document
-                .lock()
-                .await
-                .as_ref()
-                .map(|document| document.revision);
-            if current_revision != Some(revision) {
-                return PersistOutcome::Superseded;
-            }
-            {
-                let state = self.state.lock().await;
-                if state.persisted_revision == revision {
-                    return PersistOutcome::Persisted;
-                }
-                if state.persisted_revision > revision {
-                    return PersistOutcome::Superseded;
-                }
-                if state.failed_revision == Some(revision) && !state.writer_running {
-                    return PersistOutcome::Failed;
-                }
-            }
-            let _ = tokio::time::timeout(Duration::from_millis(50), notified).await;
-        }
-    }
-
-    async fn run(persistence: Arc<Self>) {
-        loop {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-            let requested_revision = persistence.state.lock().await.requested_revision;
-            let snapshot = {
-                let guard = persistence.document.lock().await;
-                guard.as_ref().cloned()
-            };
-            let Some(snapshot) = snapshot else {
-                persistence.finish_failure(requested_revision).await;
-                return;
-            };
-            if snapshot.revision < requested_revision {
-                tokio::task::yield_now().await;
-                continue;
-            }
-            {
-                let mut state = persistence.state.lock().await;
-                state.requested_revision = state.requested_revision.max(snapshot.revision);
-                if state.requested_revision != snapshot.revision {
-                    continue;
-                }
-            }
-            #[cfg(test)]
-            persistence
-                .serialization_count
-                .fetch_add(1, Ordering::Relaxed);
-            let bytes = match serde_json::to_vec_pretty(&snapshot) {
-                Ok(bytes) => bytes,
-                Err(err) => {
-                    warn!("failed to serialize KD4 task evidence: {err}");
-                    persistence.finish_failure(snapshot.revision).await;
-                    return;
-                }
-            };
-            let current_revision = persistence
-                .document
-                .lock()
-                .await
-                .as_ref()
-                .map(|document| document.revision);
-            let requested_revision = persistence.state.lock().await.requested_revision;
-            if current_revision != Some(snapshot.revision)
-                || requested_revision != snapshot.revision
-            {
-                continue;
-            }
-            let write_path = persistence.path.clone();
-            #[cfg(test)]
-            let interrupt_before_replace = persistence
-                .interrupt_next_write_before_replace
-                .swap(false, Ordering::AcqRel);
-            #[cfg(not(test))]
-            let interrupt_before_replace = false;
-            match tokio::task::spawn_blocking(move || {
-                atomic_write_evidence(&write_path, &bytes, interrupt_before_replace)
-            })
-            .await
-            {
-                Ok(Ok(())) => {
-                    #[cfg(test)]
-                    persistence.write_count.fetch_add(1, Ordering::Relaxed);
-                    let mut state = persistence.state.lock().await;
-                    state.persisted_revision = snapshot.revision;
-                    state.failed_revision = None;
-                    if state.requested_revision == snapshot.revision {
-                        state.writer_running = false;
-                        drop(state);
-                        persistence.completed.notify_waiters();
-                        return;
-                    }
-                    drop(state);
-                    persistence.completed.notify_waiters();
-                }
-                Ok(Err(err)) => {
-                    warn!("failed to persist KD4 task evidence: {err}");
-                    persistence.finish_failure(snapshot.revision).await;
-                    return;
-                }
-                Err(err) => {
-                    warn!("KD4 task-evidence persistence task failed: {err}");
-                    persistence.finish_failure(snapshot.revision).await;
-                    return;
-                }
-            }
-        }
-    }
-
-    async fn finish_failure(&self, revision: u64) {
-        let mut state = self.state.lock().await;
-        state.failed_revision = Some(state.requested_revision.max(revision));
-        state.writer_running = false;
-        drop(state);
-        self.completed.notify_waiters();
-    }
-}
-
 impl TaskEvidenceLedger {
     pub(crate) async fn load_or_new(codex_home: PathBuf, thread_id: ThreadId, cwd: &Path) -> Self {
-        let ledger = Self::deferred(codex_home, thread_id, cwd).await;
-        ledger.ensure_initialized().await;
-        if let Some(revision) = ledger.current_revision().await {
-            let _ = ledger.persist_revision(revision).await;
-        }
-        ledger
-    }
-
-    pub(crate) async fn deferred(codex_home: PathBuf, thread_id: ThreadId, cwd: &Path) -> Self {
         let Some(repo_root) = find_kd4_repo_root(cwd) else {
             return Self::disabled();
         };
@@ -575,34 +263,102 @@ impl TaskEvidenceLedger {
             .join("task-evidence")
             .join(format!("{thread_id}.json"));
         let trusted_wiring_guard_root = find_trusted_wiring_guard_root(&codex_home);
-        let deferred_start = DeferredTaskEvidenceStart {
-            thread_id: thread_id.to_string(),
-            started_at: timestamp(),
-            cwd: cwd.to_string_lossy().into_owned(),
-            repository_root: repo_root.to_string_lossy().into_owned(),
-            git: collect_git_info(&repo_root).await,
+        let now = timestamp();
+        let thread_id_text = thread_id.to_string();
+        let repository_root = repo_root.to_string_lossy().into_owned();
+
+        let existing =
+            load_existing_document(&evidence_path, &thread_id_text, &repository_root).await;
+        let mut storage_failure_reason = None;
+        let existing = match existing {
+            ExistingDocument::Loaded(document) => Some(*document),
+            ExistingDocument::Missing => None,
+            ExistingDocument::Rejected { kind, reason } => {
+                let quarantine = quarantine_evidence_file(&evidence_path, kind).await;
+                match quarantine {
+                    Ok(path) => warn!(
+                        "preserved rejected KD4 task evidence at {}: {reason}",
+                        path.display()
+                    ),
+                    Err(err) => {
+                        let failure = format!(
+                            "rejected task evidence could not be quarantined ({reason}; quarantine failed: {err})"
+                        );
+                        warn!(
+                            "refusing to overwrite rejected KD4 task evidence at {}: {failure}",
+                            evidence_path.display()
+                        );
+                        storage_failure_reason = Some(failure);
+                    }
+                }
+                None
+            }
         };
-        let document = Arc::new(Mutex::new(None));
-        let persistence = Arc::new(TaskEvidencePersistence::new(
-            evidence_path.clone(),
-            Arc::clone(&document),
-        ));
-        Self {
-            evidence_path: Some(evidence_path),
+        let document = if let Some(mut document) = existing {
+            migrate_document(&mut document);
+            document.updated_at = now;
+            document.revision = document.revision.saturating_add(1);
+            document
+        } else {
+            let git = collect_git_info(&repo_root).await;
+            TaskEvidenceDocument {
+                schema_version: TASK_EVIDENCE_SCHEMA_VERSION,
+                revision: 1,
+                thread_id: thread_id_text,
+                started_at: now.clone(),
+                updated_at: now,
+                start: TaskStartState {
+                    cwd: cwd.to_string_lossy().into_owned(),
+                    repository_root,
+                    commit_hash: git
+                        .as_ref()
+                        .and_then(|info| info.commit_hash.as_ref())
+                        .map(|sha| sha.0.clone()),
+                    branch: git.as_ref().and_then(|info| info.branch.clone()),
+                    repository_url: git.and_then(|info| info.repository_url),
+                },
+                evidence_epoch: 0,
+                last_mutation_at: None,
+                plan: Vec::new(),
+                active_step_id: None,
+                edit_intents: Vec::new(),
+                edit_receipts: Vec::new(),
+                command_receipts: Vec::new(),
+                validation_receipts: Vec::new(),
+                generated_artifact_requirements: Vec::new(),
+                generated_artifact_hashes: BTreeMap::new(),
+                latest_generated_artifact_hashes: BTreeMap::new(),
+                latest_file_hashes: BTreeMap::new(),
+                risks: storage_failure_reason
+                    .as_deref()
+                    .map(|reason| vec![task_evidence_storage_risk(reason, 0)])
+                    .unwrap_or_default(),
+                verify_plan_epoch: None,
+                validation_epoch: None,
+                wiring_receipt: None,
+                desktop_activation_receipt: None,
+                automatic_plan_attempt_epoch: None,
+                repair_turns_used: 0,
+                next_edit_receipt_sequence: initial_receipt_sequence(),
+                next_command_receipt_sequence: initial_receipt_sequence(),
+                next_validation_receipt_sequence: initial_receipt_sequence(),
+                completion: None,
+            }
+        };
+        let writable_evidence_path = storage_failure_reason.is_none().then_some(evidence_path);
+        let ledger = Self {
+            evidence_path: writable_evidence_path,
             repo_root: Some(repo_root),
             trusted_wiring_guard_root,
-            deferred_start: Some(deferred_start),
-            initialization: OnceCell::new(),
-            document,
-            persistence: Some(persistence),
-            active_validation: StdMutex::new(None),
-            mutation_generation: AtomicU64::new(0),
+            document: Mutex::new(Some(document.clone())),
+            persistence_gate: Semaphore::new(1),
+            last_persisted_revision: AtomicU64::new(0),
             wiring_ledger_starts: Mutex::new(BTreeMap::new()),
-            command_mutation_starts: Mutex::new(BTreeMap::new()),
-            unknown_command_reconciliation: Mutex::new(()),
-            #[cfg(test)]
-            unknown_reconciliation_count: AtomicU64::new(0),
+        };
+        if storage_failure_reason.is_none() {
+            let _ = ledger.persist_document(&document).await;
         }
+        ledger
     }
 
     pub(crate) fn disabled() -> Self {
@@ -610,189 +366,20 @@ impl TaskEvidenceLedger {
             evidence_path: None,
             repo_root: None,
             trusted_wiring_guard_root: None,
-            deferred_start: None,
-            initialization: OnceCell::new(),
-            document: Arc::new(Mutex::new(None)),
-            persistence: None,
-            active_validation: StdMutex::new(None),
-            mutation_generation: AtomicU64::new(0),
+            document: Mutex::new(None),
+            persistence_gate: Semaphore::new(1),
+            last_persisted_revision: AtomicU64::new(0),
             wiring_ledger_starts: Mutex::new(BTreeMap::new()),
-            command_mutation_starts: Mutex::new(BTreeMap::new()),
-            unknown_command_reconciliation: Mutex::new(()),
-            #[cfg(test)]
-            unknown_reconciliation_count: AtomicU64::new(0),
         }
-    }
-
-    async fn ensure_initialized(&self) {
-        let Some(start) = self.deferred_start.as_ref() else {
-            return;
-        };
-        self.initialization
-            .get_or_init(|| async {
-                let Some(evidence_path) = self.evidence_path.as_ref() else {
-                    return;
-                };
-                let now = timestamp();
-                let mut storage_failure_reason = None;
-                let existing = match load_existing_document(
-                    evidence_path,
-                    &start.thread_id,
-                    &start.repository_root,
-                )
-                .await
-                {
-                    ExistingDocument::Loaded(document) => Some(*document),
-                    ExistingDocument::Missing => None,
-                    ExistingDocument::Rejected { kind, reason } => {
-                        match quarantine_evidence_file(evidence_path, kind).await {
-                            Ok(path) => warn!(
-                                "preserved rejected KD4 task evidence at {}: {reason}",
-                                path.display()
-                            ),
-                            Err(err) => {
-                                let failure = format!(
-                                    "rejected task evidence could not be quarantined ({reason}; quarantine failed: {err})"
-                                );
-                                warn!(
-                                    "refusing to overwrite rejected KD4 task evidence at {}: {failure}",
-                                    evidence_path.display()
-                                );
-                                storage_failure_reason = Some(failure);
-                                if let Some(persistence) = self.persistence.as_ref() {
-                                    persistence.enabled.store(false, Ordering::Release);
-                                }
-                            }
-                        }
-                        None
-                    }
-                };
-                let document = if let Some(mut document) = existing {
-                    migrate_document(&mut document);
-                    document.updated_at = now;
-                    document.revision = document.revision.saturating_add(1);
-                    document
-                } else {
-                    TaskEvidenceDocument {
-                        schema_version: TASK_EVIDENCE_SCHEMA_VERSION,
-                        revision: 1,
-                        thread_id: start.thread_id.clone(),
-                        started_at: start.started_at.clone(),
-                        updated_at: now,
-                        start: TaskStartState {
-                            cwd: start.cwd.clone(),
-                            repository_root: start.repository_root.clone(),
-                            commit_hash: start
-                                .git
-                                .as_ref()
-                                .and_then(|info| info.commit_hash.as_ref())
-                                .map(|sha| sha.0.clone()),
-                            branch: start.git.as_ref().and_then(|info| info.branch.clone()),
-                            repository_url: start
-                                .git
-                                .as_ref()
-                                .and_then(|info| info.repository_url.clone()),
-                        },
-                        evidence_epoch: 0,
-                        last_mutation_at: None,
-                        plan: Vec::new(),
-                        active_step_id: None,
-                        edit_intents: Vec::new(),
-                        edit_receipts: Vec::new(),
-                        command_receipts: Vec::new(),
-                        validation_receipts: Vec::new(),
-                        generated_artifact_requirements: Vec::new(),
-                        generated_artifact_hashes: BTreeMap::new(),
-                        latest_generated_artifact_hashes: BTreeMap::new(),
-                        latest_file_hashes: BTreeMap::new(),
-                        risks: storage_failure_reason
-                            .as_deref()
-                            .map(|reason| vec![task_evidence_storage_risk(reason, 0)])
-                            .unwrap_or_default(),
-                        verify_plan_epoch: None,
-                        validation_epoch: None,
-                        wiring_receipt: None,
-                        desktop_activation_receipt: None,
-                        automatic_plan_attempt_epoch: None,
-                        automatic_plan_attempt_claim_id: None,
-                        repair_turns_used: 0,
-                        next_edit_receipt_sequence: initial_receipt_sequence(),
-                        next_command_receipt_sequence: initial_receipt_sequence(),
-                        next_validation_receipt_sequence: initial_receipt_sequence(),
-                        next_automatic_validation_claim_sequence: initial_receipt_sequence(),
-                        completion: None,
-                    }
-                };
-                *self.document.lock().await = Some(document);
-            })
-            .await;
-    }
-
-    async fn ensure_existing_document_loaded(&self) {
-        if self.document.lock().await.is_some() {
-            return;
-        }
-        let Some(evidence_path) = self.evidence_path.as_ref() else {
-            return;
-        };
-        let should_initialize = match tokio::fs::try_exists(evidence_path).await {
-            Ok(exists) => exists,
-            Err(err) => {
-                warn!(
-                    "failed to inspect deferred KD4 task evidence at {}: {err}",
-                    evidence_path.display()
-                );
-                true
-            }
-        };
-        if should_initialize {
-            self.ensure_initialized().await;
-        }
-    }
-
-    async fn is_initialized(&self) -> bool {
-        self.document.lock().await.is_some()
-    }
-
-    async fn current_revision(&self) -> Option<u64> {
-        self.document
-            .lock()
-            .await
-            .as_ref()
-            .map(|document| document.revision)
     }
 
     pub(crate) async fn begin_verify_local_validation(
         &self,
     ) -> Option<TaskEvidenceValidationStart> {
-        self.begin_verify_local_validation_for_claim(None).await
-    }
-
-    pub(crate) async fn begin_verify_local_validation_for_automatic_request(
-        &self,
-        request: &AutomaticVerifyLocalRequest,
-    ) -> Option<TaskEvidenceValidationStart> {
-        self.begin_verify_local_validation_for_claim(Some(request))
-            .await
-    }
-
-    async fn begin_verify_local_validation_for_claim(
-        &self,
-        automatic_request: Option<&AutomaticVerifyLocalRequest>,
-    ) -> Option<TaskEvidenceValidationStart> {
-        self.ensure_initialized().await;
         let repo_root = self.repo_root.as_ref()?;
-        let (epoch, workspace_generation, spec_generation, mut file_paths, artifact_paths) = {
+        let (epoch, mut file_paths, artifact_paths) = {
             let guard = self.document.lock().await;
             let document = guard.as_ref()?;
-            if automatic_request.is_some_and(|request| {
-                document.evidence_epoch != request.evidence_generation
-                    || document.automatic_plan_attempt_epoch != Some(request.evidence_generation)
-                    || document.automatic_plan_attempt_claim_id.as_deref()
-                        != Some(request.claim_id.as_str())
-            }) {
-                return None;
-            }
             let mut file_paths = document
                 .latest_file_hashes
                 .keys()
@@ -806,13 +393,7 @@ impl TaskEvidenceLedger {
                 .iter()
                 .filter_map(|requirement| requirement.path.clone())
                 .collect::<BTreeSet<_>>();
-            (
-                document.evidence_epoch,
-                task_evidence_workspace_generation(document),
-                task_evidence_spec_generation(document),
-                file_paths,
-                artifact_paths,
-            )
+            (document.evidence_epoch, file_paths, artifact_paths)
         };
         file_paths.extend(git_dirty_paths(repo_root).await);
         let mut file_snapshots = BTreeMap::new();
@@ -823,46 +404,10 @@ impl TaskEvidenceLedger {
         for path in artifact_paths {
             artifact_snapshots.insert(path.clone(), snapshot_file(repo_root, &path).await);
         }
-        let hash_generation =
-            task_evidence_hash_generation(file_snapshots.values(), artifact_snapshots.values());
-        {
-            let guard = self.document.lock().await;
-            let document = guard.as_ref()?;
-            if automatic_request.is_some_and(|request| {
-                document.evidence_epoch != request.evidence_generation
-                    || document.automatic_plan_attempt_epoch != Some(request.evidence_generation)
-                    || document.automatic_plan_attempt_claim_id.as_deref()
-                        != Some(request.claim_id.as_str())
-            }) || document.evidence_epoch != epoch
-                || task_evidence_workspace_generation(document) != workspace_generation
-                || task_evidence_spec_generation(document) != spec_generation
-            {
-                return None;
-            }
-        }
-        let cancellation_token = CancellationToken::new();
-        {
-            let mut active = self
-                .active_validation
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(previous) = active.replace(ActiveTaskEvidenceValidation {
-                evidence_generation: epoch,
-                cancellation_token: cancellation_token.clone(),
-            }) {
-                previous.cancellation_token.cancel();
-            }
-        }
         Some(TaskEvidenceValidationStart {
             epoch,
-            workspace_generation,
-            evidence_generation: epoch,
-            hash_generation,
-            spec_generation,
-            cancellation_token,
             file_snapshots,
             artifact_snapshots,
-            automatic_claim_id: automatic_request.map(|request| request.claim_id.clone()),
         })
     }
 
@@ -870,14 +415,10 @@ impl TaskEvidenceLedger {
         let Some(_) = self.repo_root else {
             return update.clone();
         };
-        self.ensure_initialized().await;
-        let Some((response, revision, changed)) = self
+        let Some((response, snapshot)) = self
             .update_document(|document| {
-                let previous_plan = document.plan.clone();
-                let previous_requirements = document.generated_artifact_requirements.clone();
-                let previous_risks = document.risks.clone();
-                let previous_active_step_id = document.active_step_id.clone();
-                let previous = previous_plan
+                let previous = document
+                    .plan
                     .iter()
                     .cloned()
                     .map(|step| (step.id.clone(), step))
@@ -932,29 +473,18 @@ impl TaskEvidenceLedger {
                 rebuild_declared_requirements_and_risks(document);
                 sync_plan_structure_state(document, &duplicate_explicit_ids);
                 promote_steps_with_fresh_evidence(document);
-                let changed = previous_plan != document.plan
-                    || previous_requirements != document.generated_artifact_requirements
-                    || previous_risks != document.risks
-                    || previous_active_step_id != document.active_step_id;
-                if changed {
-                    document.updated_at = timestamp();
-                    document.completion = None;
+                document.updated_at = timestamp();
+                document.completion = None;
+                UpdatePlanArgs {
+                    explanation: update.explanation.clone(),
+                    plan: document.plan.iter().map(plan_item_from_evidence).collect(),
                 }
-                (
-                    UpdatePlanArgs {
-                        explanation: update.explanation.clone(),
-                        plan: document.plan.iter().map(plan_item_from_evidence).collect(),
-                    },
-                    changed,
-                )
             })
             .await
         else {
             return update.clone();
         };
-        if changed {
-            self.queue_persistence(revision).await;
-        }
+        self.persist_document(&snapshot).await;
         response
     }
 
@@ -962,7 +492,6 @@ impl TaskEvidenceLedger {
         let Some(repo_root) = self.repo_root.as_ref() else {
             return;
         };
-        self.ensure_initialized().await;
         let mut files = Vec::with_capacity(paths.len());
         for path in paths {
             let normalized = normalize_input_path(repo_root, Some(cwd), path);
@@ -971,7 +500,7 @@ impl TaskEvidenceLedger {
         files.sort_by(|left, right| left.path.cmp(&right.path));
         files.dedup_by(|left, right| left.path == right.path);
 
-        let Some((_, revision, changed)) = self
+        let Some((_, snapshot)) = self
             .update_document(|document| {
                 document
                     .edit_intents
@@ -986,15 +515,12 @@ impl TaskEvidenceLedger {
                 });
                 trim_to_last(&mut document.edit_intents, MAX_EDIT_RECEIPTS);
                 document.updated_at = timestamp();
-                ((), true)
             })
             .await
         else {
             return;
         };
-        if changed {
-            self.queue_persistence(revision).await;
-        }
+        self.persist_document(&snapshot).await;
     }
 
     pub(crate) async fn record_edit_result(&self, call_id: &str, outcome: &str) {
@@ -1035,7 +561,7 @@ impl TaskEvidenceLedger {
         }
         let edit_succeeded = edit_outcome_succeeded(outcome);
 
-        let Some((_, revision, changed)) = self
+        let Some((_, snapshot)) = self
             .update_document(|document| {
                 if let Some(stored) = document
                     .edit_intents
@@ -1115,87 +641,18 @@ impl TaskEvidenceLedger {
                     trim_to_last(&mut document.edit_receipts, MAX_EDIT_RECEIPTS);
                 }
                 document.updated_at = timestamp();
-                ((), true)
             })
             .await
         else {
             return;
         };
-        if changed {
-            self.queue_persistence(revision).await;
-        }
+        self.persist_document(&snapshot).await;
     }
 
-    async fn capture_command_mutation_start(
-        &self,
-        command: &[String],
-        cwd: &PathUri,
-    ) -> CommandMutationStart {
-        self.ensure_existing_document_loaded().await;
-        let (epoch, artifact_paths) = {
-            let guard = self.document.lock().await;
-            guard.as_ref().map_or((0, BTreeSet::new()), |document| {
-                (document.evidence_epoch, registered_artifact_paths(document))
-            })
-        };
-        let Some(repo_root) = self.repo_root.as_ref() else {
-            return CommandMutationStart {
-                epoch,
-                artifact_paths,
-                target_snapshots: BTreeMap::new(),
-                coverage: MutationCoverage::Incomplete,
-                fingerprint: None,
-            };
-        };
-        let cwd = cwd
-            .to_abs_path()
-            .ok()
-            .map(|path| path.as_path().to_path_buf());
-        let target_paths = match cwd.as_deref() {
-            Some(cwd) => command_write_paths(repo_root, cwd, command, &artifact_paths).await,
-            None => None,
-        };
-        let mut coverage = if target_paths.is_some() {
-            MutationCoverage::Complete
-        } else {
-            MutationCoverage::Incomplete
-        };
-        let mut target_snapshots = BTreeMap::new();
-        for path in target_paths.unwrap_or_default() {
-            target_snapshots.insert(path.clone(), snapshot_file(repo_root, &path).await);
-        }
-        let fingerprint = if coverage == MutationCoverage::Complete {
-            capture_stable_mutation_fingerprint(repo_root, &artifact_paths).await
-        } else {
-            None
-        };
-        if fingerprint.is_none() {
-            coverage = MutationCoverage::Incomplete;
-        }
-        CommandMutationStart {
-            epoch,
-            artifact_paths,
-            target_snapshots,
-            coverage,
-            fingerprint,
-        }
-    }
-
-    pub(crate) async fn record_command_intent(
-        &self,
-        call_id: &str,
-        command: &[String],
-        cwd: &PathUri,
-    ) {
+    pub(crate) async fn record_command_intent(&self, call_id: &str, command: &[String]) {
         let Some(repo_root) = self.repo_root.as_ref() else {
             return;
         };
-        let mutation_start = self.capture_command_mutation_start(command, cwd).await;
-        self.command_mutation_starts
-            .lock()
-            .await
-            .insert(call_id.to_string(), mutation_start);
-
         let Some(trusted_launcher) = trusted_wiring_guard_check_invocation(
             command,
             self.trusted_wiring_guard_root.as_deref(),
@@ -1224,41 +681,11 @@ impl TaskEvidenceLedger {
         timed_out: bool,
         duration_ms: u64,
         possible_mutation: bool,
-    ) -> Option<MutationObservation> {
+    ) {
         let Some(repo_root) = self.repo_root.as_ref() else {
-            return None;
-        };
-        let mutation_start = self.command_mutation_starts.lock().await.remove(call_id);
-        let (candidate_observation, candidate_coverage) = match mutation_start.as_ref() {
-            Some(start) if start.coverage == MutationCoverage::Complete => {
-                match capture_stable_mutation_fingerprint(repo_root, &start.artifact_paths).await {
-                    Some(after) => (
-                        if start.fingerprint.as_ref() == Some(&after) {
-                            MutationObservation::Unchanged
-                        } else {
-                            MutationObservation::Changed
-                        },
-                        MutationCoverage::Complete,
-                    ),
-                    None => (MutationObservation::Unknown, MutationCoverage::Incomplete),
-                }
-            }
-            _ => (MutationObservation::Unknown, MutationCoverage::Incomplete),
+            return;
         };
         let wiring_ledger_start = self.wiring_ledger_starts.lock().await.remove(call_id);
-        let mut command_after_snapshots = BTreeMap::new();
-        let mut command_changed_paths = Vec::new();
-        if candidate_observation == MutationObservation::Changed
-            && let Some(start) = mutation_start.as_ref()
-        {
-            for (path, before) in &start.target_snapshots {
-                let after = snapshot_file(repo_root, path).await;
-                if &after != before {
-                    command_changed_paths.push(path.clone());
-                }
-                command_after_snapshots.insert(path.clone(), after);
-            }
-        }
         let command_succeeded = exit_code == 0 && !timed_out;
         let trusted_launcher = trusted_wiring_guard_check_invocation(
             command,
@@ -1277,56 +704,28 @@ impl TaskEvidenceLedger {
         } else {
             None
         };
-        if possible_mutation || wiring_proof.is_some() || self.is_initialized().await {
-            self.ensure_initialized().await;
-        } else {
-            return Some(candidate_observation);
-        }
-        let Some((observation, revision, changed)) = self
+        let Some((_, snapshot)) = self
             .update_document(|document| {
-                let start_matches = mutation_start.as_ref().is_some_and(|start| {
-                    start.epoch == document.evidence_epoch
-                        && start.artifact_paths == registered_artifact_paths(document)
-                });
-                let observation = if start_matches {
-                    candidate_observation
-                } else {
-                    MutationObservation::Unknown
-                };
-                let coverage = if start_matches {
-                    candidate_coverage
-                } else {
-                    MutationCoverage::Incomplete
-                };
-                if observation == MutationObservation::Changed {
+                if possible_mutation {
                     invalidate_for_mutation(document);
-                }
-                if observation == MutationObservation::Changed {
-                    for snapshot in command_after_snapshots.values() {
-                        document
-                            .latest_file_hashes
-                            .insert(snapshot.path.clone(), snapshot.clone());
-                    }
+                    let epoch = document.evidence_epoch;
                     if let Some(active_step_id) = document.active_step_id.clone()
                         && let Some(step) = document
                             .plan
                             .iter_mut()
                             .find(|step| step.id == active_step_id)
                         && command_succeeded
-                        && observation == MutationObservation::Changed
                         && !matches!(step.status, StepStatus::Blocked | StepStatus::Skipped)
                     {
                         step.status = StepStatus::Implemented;
                     }
-                }
-                if observation == MutationObservation::Unknown {
-                    let epoch = document.evidence_epoch;
                     upsert_risk(
                         document,
                         EvidenceRisk {
                             id: format!("unknown-command-mutation-{epoch}"),
-                            description: "command mutation coverage was incomplete; observed-change evidence remains unresolved"
-                                .to_string(),
+                            description:
+                                "a command may have mutated files without exact path/hash attribution"
+                                    .to_string(),
                             source: "command".to_string(),
                             blocking: false,
                             resolved: false,
@@ -1349,16 +748,6 @@ impl TaskEvidenceLedger {
                     timed_out,
                     duration_ms,
                     possible_mutation,
-                    observation: Some(observation),
-                    coverage: Some(coverage),
-                    changed_paths: if observation == MutationObservation::Changed
-                        && command_succeeded
-                    {
-                        command_changed_paths.clone()
-                    } else {
-                        Vec::new()
-                    },
-                    reconciliation_attempted: false,
                 });
                 trim_to_last(&mut document.command_receipts, MAX_COMMAND_RECEIPTS);
                 if let Some(wiring_proof) = wiring_proof {
@@ -1372,16 +761,12 @@ impl TaskEvidenceLedger {
                 }
                 document.updated_at = timestamp();
                 document.completion = None;
-                (observation, true)
             })
             .await
         else {
-            return Some(candidate_observation);
+            return;
         };
-        if changed {
-            self.queue_persistence(revision).await;
-        }
-        Some(observation)
+        self.persist_document(&snapshot).await;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1391,13 +776,11 @@ impl TaskEvidenceLedger {
         verdict: Option<&str>,
         tool_success: bool,
         proof_bearing: bool,
-        contract_valid: bool,
         validation_start: Option<&TaskEvidenceValidationStart>,
         active_files: &[PathBuf],
         stale_reasons: &[String],
         payload: Option<&Value>,
     ) -> bool {
-        self.ensure_initialized().await;
         let Some(repo_root) = self.repo_root.as_ref() else {
             return false;
         };
@@ -1426,44 +809,13 @@ impl TaskEvidenceLedger {
                 && start.file_snapshots == validation_end_files
                 && start.artifact_snapshots == validation_end_artifacts
         });
-        let validation_end_hash_generation = task_evidence_hash_generation(
-            validation_end_files.values(),
-            validation_end_artifacts.values(),
-        );
-        let exact_output_artifacts = validation_output_artifacts(payload);
 
-        let Some((accepted_proof, revision, changed)) = self
+        let Some((accepted_proof, snapshot)) = self
             .update_document(|document| {
                 let run_matches_start = validation_start.is_some_and(|start| {
-                    start.epoch == document.evidence_epoch
-                        && start.evidence_generation == document.evidence_epoch
-                        && start.workspace_generation
-                            == task_evidence_workspace_generation(document)
-                        && start.spec_generation == task_evidence_spec_generation(document)
-                        && start.hash_generation == validation_end_hash_generation
-                        && !start.cancellation_token.is_cancelled()
-                        && snapshots_unchanged
+                    start.epoch == document.evidence_epoch && snapshots_unchanged
                 });
-                let conclusion = if run_matches_start && contract_valid {
-                    match verdict {
-                        Some("VERIFIED") if proof_bearing && tool_success => {
-                            Some(ValidationConclusion::Passed)
-                        }
-                        Some("FAILED" | "NEEDS_REGEN") => Some(ValidationConclusion::Failed),
-                        _ => None,
-                    }
-                } else {
-                    None
-                };
-                let existing_strength = strongest_conclusive_validation_strength(
-                    document,
-                    document.evidence_epoch,
-                );
-                let mode_strength = validation_mode_strength(mode);
-                let authoritative = conclusion.is_some()
-                    && existing_strength.is_none_or(|strength| mode_strength >= strength);
-                let accepted_proof =
-                    authoritative && conclusion == Some(ValidationConclusion::Passed);
+                let accepted_proof = proof_bearing && tool_success && run_matches_start;
                 let receipt_id =
                     next_receipt_id("validation", &mut document.next_validation_receipt_sequence);
                 document.validation_receipts.push(ValidationReceipt {
@@ -1475,29 +827,13 @@ impl TaskEvidenceLedger {
                     verdict: verdict.map(str::to_string),
                     tool_success,
                     proof_bearing,
-                    workspace_generation: validation_start
-                        .map(|start| start.workspace_generation.clone()),
-                    evidence_generation: validation_start
-                        .map(|start| start.evidence_generation),
-                    automatic_claim_id: validation_start
-                        .and_then(|start| start.automatic_claim_id.clone()),
-                    hash_generation: validation_start.map(|start| start.hash_generation.clone()),
-                    spec_generation: validation_start.map(|start| start.spec_generation.clone()),
-                    conclusion,
                     active_files: file_snapshots.clone(),
                     stale_reasons: stale_reasons.to_vec(),
-                    exact_output_artifacts: exact_output_artifacts.clone(),
                     payload: payload.cloned(),
                 });
-                trim_validation_receipts(document);
+                trim_to_last(&mut document.validation_receipts, MAX_VALIDATION_RECEIPTS);
 
-                if mode == "plan"
-                    && tool_success
-                    && run_matches_start
-                    && existing_strength.is_none_or(|strength| {
-                        strength <= validation_mode_strength("plan")
-                    })
-                {
+                if mode == "plan" && tool_success && run_matches_start {
                     document.verify_plan_epoch = Some(document.evidence_epoch);
                     rebuild_verifier_requirements(document, payload);
                 }
@@ -1540,37 +876,8 @@ impl TaskEvidenceLedger {
                         }
                     }
                     resolve_risks_by_source(document, "verify_local");
-                    resolve_risks_by_source(document, "command");
                     resolve_risks_by_source(document, "generated_artifact_freshness");
                     resolve_risks_by_source(document, "freshness");
-                } else if authoritative
-                    && conclusion == Some(ValidationConclusion::Failed)
-                {
-                    document.validation_epoch = None;
-                    document.automatic_plan_attempt_epoch = None;
-                    document.automatic_plan_attempt_claim_id = None;
-                    for step in &mut document.plan {
-                        step.validation_receipt_ids.clear();
-                    }
-                    for requirement in &mut document.generated_artifact_requirements {
-                        requirement.validation_receipt_ids.clear();
-                    }
-                    upsert_risk(
-                        document,
-                        EvidenceRisk {
-                            id: "verify-local-conclusive-failure".to_string(),
-                            description: format!(
-                                "verify_local {mode} validation conclusively failed for the current evidence epoch"
-                            ),
-                            source: "verify_local".to_string(),
-                            blocking: true,
-                            resolved: false,
-                            epoch: document.evidence_epoch,
-                        },
-                    );
-                } else if conclusion == Some(ValidationConclusion::Failed) {
-                    // A weaker conclusive result is retained as history but cannot
-                    // override the stronger current-epoch result.
                 } else if proof_bearing && tool_success && !run_matches_start {
                     upsert_risk(
                         document,
@@ -1616,16 +923,13 @@ impl TaskEvidenceLedger {
                 promote_steps_with_fresh_evidence(document);
                 document.updated_at = timestamp();
                 document.completion = None;
-                (accepted_proof, true)
+                accepted_proof
             })
             .await
         else {
             return false;
         };
-        if changed {
-            self.queue_persistence(revision).await;
-        }
-        self.clear_completed_validation(validation_start);
+        self.persist_document(&snapshot).await;
         accepted_proof
     }
 
@@ -1634,20 +938,18 @@ impl TaskEvidenceLedger {
         if gate.status == TaskCompletionStatus::Passed {
             return None;
         }
-        let (should_warn, revision, changed) = self
+        let (should_warn, snapshot) = self
             .update_document(|document| {
                 if document.repair_turns_used >= 1 {
-                    return (None, false);
+                    return None;
                 }
                 document.repair_turns_used += 1;
                 document.updated_at = timestamp();
-                (Some(()), true)
+                Some(())
             })
             .await?;
         should_warn?;
-        if changed {
-            self.queue_persistence(revision).await;
-        }
+        self.persist_document(&snapshot).await;
 
         let reasons = gate.reasons.iter().take(2).cloned().collect::<Vec<_>>();
         let reason_summary = if reasons.is_empty() {
@@ -1667,226 +969,56 @@ impl TaskEvidenceLedger {
         ))
     }
 
-    async fn reconcile_unknown_command_mutations(&self) {
-        let Some(repo_root) = self.repo_root.as_ref() else {
-            return;
-        };
-        let _reconciliation = self.unknown_command_reconciliation.lock().await;
-        let epoch = {
-            let guard = self.document.lock().await;
-            let Some(document) = guard.as_ref() else {
-                return;
-            };
-            let epoch = document.evidence_epoch;
-            if !document.command_receipts.iter().any(|receipt| {
-                receipt.epoch == epoch
-                    && receipt.observation == Some(MutationObservation::Unknown)
-                    && !receipt.reconciliation_attempted
-            }) {
-                return;
-            }
-            epoch
-        };
-        #[cfg(test)]
-        self.unknown_reconciliation_count
-            .fetch_add(1, Ordering::AcqRel);
-        let dirty_paths = git_dirty_paths(repo_root).await;
-        let mut snapshots = BTreeMap::new();
-        for path in &dirty_paths {
-            snapshots.insert(path.clone(), snapshot_file(repo_root, path).await);
-        }
-        let Some((_, revision, changed)) = self
+    pub(crate) async fn take_automatic_verify_plan_request(&self) -> Option<Vec<String>> {
+        let (changed_paths, snapshot) = self
             .update_document(|document| {
-                if document.evidence_epoch != epoch {
-                    return ((), false);
-                }
-                let mut changed = false;
-                for receipt in &mut document.command_receipts {
-                    if receipt.epoch == epoch
-                        && receipt.observation == Some(MutationObservation::Unknown)
-                        && !receipt.reconciliation_attempted
-                    {
-                        receipt.reconciliation_attempted = true;
-                        receipt.changed_paths = dirty_paths.iter().cloned().collect();
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    return ((), false);
-                }
-                for snapshot in snapshots.values() {
-                    document
-                        .latest_file_hashes
-                        .insert(snapshot.path.clone(), snapshot.clone());
-                }
-                document.updated_at = timestamp();
-                ((), true)
-            })
-            .await
-        else {
-            return;
-        };
-        if changed {
-            self.queue_persistence(revision).await;
-        }
-    }
-
-    pub(crate) async fn take_automatic_verify_plan_request(
-        &self,
-    ) -> Option<AutomaticVerifyLocalRequest> {
-        self.ensure_existing_document_loaded().await;
-        {
-            let guard = self.document.lock().await;
-            let document = guard.as_ref()?;
-            let epoch = document.evidence_epoch;
-            let has_mutation = automatic_validation_mutation_pending(document, epoch);
-            if !has_mutation
-                || document.verify_plan_epoch == Some(epoch)
-                || document.validation_epoch == Some(epoch)
-                || document.automatic_plan_attempt_epoch == Some(epoch)
-            {
-                return None;
-            }
-        }
-        self.wait_for_mutation_quiescence().await;
-        self.reconcile_unknown_command_mutations().await;
-        let (changed_paths, revision, changed) = self
-            .update_document(|document| {
-                let epoch = document.evidence_epoch;
-                let has_mutation = automatic_validation_mutation_pending(document, epoch);
+                let has_mutation = !document.edit_receipts.is_empty()
+                    || document
+                        .command_receipts
+                        .iter()
+                        .any(|receipt| receipt.possible_mutation);
                 if !has_mutation
-                    || document.verify_plan_epoch == Some(epoch)
-                    || document.validation_epoch == Some(epoch)
-                    || document.automatic_plan_attempt_epoch == Some(epoch)
+                    || document.verify_plan_epoch == Some(document.evidence_epoch)
+                    || document.automatic_plan_attempt_epoch == Some(document.evidence_epoch)
                 {
-                    return (None, false);
+                    return None;
                 }
-                let changed_paths = automatic_validation_changed_paths(document, epoch);
-                let claim_id = next_receipt_id(
-                    "automatic-validation",
-                    &mut document.next_automatic_validation_claim_sequence,
-                );
-                document.automatic_plan_attempt_epoch = Some(epoch);
-                document.automatic_plan_attempt_claim_id = Some(claim_id.clone());
+                document.automatic_plan_attempt_epoch = Some(document.evidence_epoch);
                 document.updated_at = timestamp();
-                (
-                    Some(AutomaticVerifyLocalRequest {
-                        changed_paths,
-                        evidence_generation: epoch,
-                        claim_id,
-                    }),
-                    true,
-                )
+                Some(document.latest_file_hashes.keys().cloned().collect())
             })
             .await?;
         let changed_paths = changed_paths?;
-        if changed {
-            self.queue_persistence(revision).await;
-        }
+        self.persist_document(&snapshot).await;
         Some(changed_paths)
     }
 
-    pub(crate) async fn release_automatic_verify_plan_request(
-        &self,
-        evidence_generation: u64,
-        claim_id: &str,
-    ) {
-        let Some((_, revision, changed)) = self
-            .update_document(|document| {
-                if document.evidence_epoch != evidence_generation
-                    || document.automatic_plan_attempt_epoch != Some(evidence_generation)
-                    || document.automatic_plan_attempt_claim_id.as_deref() != Some(claim_id)
-                {
-                    return ((), false);
-                }
-                document.automatic_plan_attempt_epoch = None;
-                document.automatic_plan_attempt_claim_id = None;
-                document.updated_at = timestamp();
-                ((), true)
-            })
-            .await
-        else {
-            return;
-        };
-        if changed {
-            self.queue_persistence(revision).await;
-        }
-    }
-
-    pub(crate) async fn finish_automatic_verify_local_request(
-        &self,
-        evidence_generation: u64,
-        claim_id: &str,
-    ) {
-        let Some((_, revision, changed)) = self
-            .update_document(|document| {
-                if document.evidence_epoch != evidence_generation
-                    || document.automatic_plan_attempt_epoch != Some(evidence_generation)
-                    || document.automatic_plan_attempt_claim_id.as_deref() != Some(claim_id)
-                {
-                    return ((), false);
-                }
-                let conclusive = document.validation_receipts.iter().rev().any(|receipt| {
-                    receipt.mode == "fast"
-                        && receipt.evidence_generation == Some(evidence_generation)
-                        && receipt.automatic_claim_id.as_deref() == Some(claim_id)
-                        && receipt.conclusion.is_some()
-                });
-                if conclusive {
-                    return ((), false);
-                }
-                document.automatic_plan_attempt_epoch = None;
-                document.automatic_plan_attempt_claim_id = None;
-                document.updated_at = timestamp();
-                ((), true)
-            })
-            .await
-        else {
-            return;
-        };
-        if changed {
-            self.queue_persistence(revision).await;
-        }
-    }
-
     pub(crate) async fn completion_gate(&self) -> Option<TaskCompletionGate> {
-        self.ensure_existing_document_loaded().await;
         let mut latest_gate = None;
-        let evidence_path = self
-            .persistence
-            .as_ref()
-            .is_some_and(|persistence| persistence.enabled.load(Ordering::Acquire))
-            .then_some(self.evidence_path.as_deref())
-            .flatten();
         for _ in 0..8 {
             self.refresh_external_file_freshness().await;
-            let (gate, revision, _changed) = self
+            let (gate, snapshot) = self
                 .update_document(|document| {
                     if !task_is_tracked(document) {
-                        return (None, false);
+                        return None;
                     }
-                    let previous_plan = document.plan.clone();
                     promote_steps_with_fresh_evidence(document);
-                    let gate = derive_completion_gate(document, evidence_path);
-                    let changed = document.plan != previous_plan
-                        || document.completion.as_ref() != Some(&gate);
+                    let gate = derive_completion_gate(document, self.evidence_path.as_deref());
                     document.completion = Some(gate.clone());
-                    if changed {
-                        document.updated_at = timestamp();
-                    }
-                    (Some(gate), changed)
+                    document.updated_at = timestamp();
+                    Some(gate)
                 })
                 .await?;
             let gate = gate?;
             latest_gate = Some(gate.clone());
-            match self.persist_revision(revision).await {
+            match self.persist_document(&snapshot).await {
                 PersistOutcome::Persisted => return Some(gate),
                 PersistOutcome::Superseded => continue,
                 PersistOutcome::Failed => {
                     return Some(
                         self.demote_gate_for_persistence(
                             gate,
-                            Some(revision),
+                            Some(snapshot.revision),
                             "task-evidence persistence failed; completion is not durably recorded",
                         )
                         .await,
@@ -1899,7 +1031,7 @@ impl TaskEvidenceLedger {
             self.demote_gate_for_persistence(
                 gate,
                 None,
-                "evidence changed during finalization; no stable completion revision was persisted",
+                "task-evidence changed repeatedly while completion was being persisted; a stable completion snapshot was not recorded",
             )
             .await,
         )
@@ -1933,8 +1065,7 @@ impl TaskEvidenceLedger {
         binary_sha1: String,
         runtime_evidence: String,
     ) {
-        self.ensure_initialized().await;
-        let Some((_, revision, changed)) = self
+        let Some((_, snapshot)) = self
             .update_document(|document| {
                 document.desktop_activation_receipt = Some(DesktopActivationReceipt {
                     epoch: document.evidence_epoch,
@@ -1946,15 +1077,12 @@ impl TaskEvidenceLedger {
                 promote_steps_with_fresh_evidence(document);
                 document.updated_at = timestamp();
                 document.completion = None;
-                ((), true)
             })
             .await
         else {
             return;
         };
-        if changed {
-            self.queue_persistence(revision).await;
-        }
+        self.persist_document(&snapshot).await;
     }
 
     async fn refresh_external_file_freshness(&self) {
@@ -1994,7 +1122,7 @@ impl TaskEvidenceLedger {
             return;
         }
 
-        let Some((_, revision, changed)) = self
+        let Some((_, snapshot)) = self
             .update_document(|document| {
                 let changed = changed
                     .into_iter()
@@ -2011,7 +1139,7 @@ impl TaskEvidenceLedger {
                     .map(|(_, current)| current)
                     .collect::<Vec<_>>();
                 if changed.is_empty() && changed_artifacts.is_empty() {
-                    return ((), false);
+                    return;
                 }
                 invalidate_for_mutation(document);
                 let epoch = document.evidence_epoch;
@@ -2067,235 +1195,70 @@ impl TaskEvidenceLedger {
                     },
                 );
                 document.updated_at = timestamp();
-                ((), true)
             })
             .await
         else {
             return;
         };
-        if changed {
-            self.queue_persistence(revision).await;
-        }
+        self.persist_document(&snapshot).await;
     }
 
     async fn update_document<T>(
         &self,
-        update: impl FnOnce(&mut TaskEvidenceDocument) -> (T, bool),
-    ) -> Option<(T, u64, bool)> {
+        update: impl FnOnce(&mut TaskEvidenceDocument) -> T,
+    ) -> Option<(T, TaskEvidenceDocument)> {
         let mut guard = self.document.lock().await;
         let document = guard.as_mut()?;
-        let previous_revision = document.revision;
-        let previous_updated_at = document.updated_at.clone();
-        let previous_evidence_epoch = document.evidence_epoch;
-        let (result, changed) = update(document);
-        if !changed {
-            document.revision = previous_revision;
-            document.updated_at = previous_updated_at;
-            return Some((result, document.revision, false));
-        }
-        document.revision = previous_revision.saturating_add(1);
-        if document.evidence_epoch != previous_evidence_epoch {
-            self.mutation_generation.fetch_add(1, Ordering::AcqRel);
-            let mut active = self
-                .active_validation
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(validation) = active.as_ref()
-                && validation.evidence_generation == previous_evidence_epoch
-            {
-                validation.cancellation_token.cancel();
-                *active = None;
+        let result = update(document);
+        document.revision = document.revision.saturating_add(1);
+        Some((result, document.clone()))
+    }
+
+    async fn persist_document(&self, document: &TaskEvidenceDocument) -> PersistOutcome {
+        let Some(path) = self.evidence_path.as_ref() else {
+            return PersistOutcome::Persisted;
+        };
+        let bytes = match serde_json::to_vec_pretty(document) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                warn!("failed to serialize KD4 task evidence: {err}");
+                return PersistOutcome::Failed;
+            }
+        };
+        let _persistence_permit = match self.persistence_gate.acquire().await {
+            Ok(permit) => permit,
+            Err(err) => {
+                warn!("KD4 task-evidence persistence gate unexpectedly closed: {err}");
+                return PersistOutcome::Failed;
+            }
+        };
+        let last_persisted_revision = self.last_persisted_revision.load(Ordering::Acquire);
+        if last_persisted_revision != 0 {
+            if last_persisted_revision > document.revision {
+                return PersistOutcome::Superseded;
+            }
+            if last_persisted_revision == document.revision {
+                return PersistOutcome::Persisted;
             }
         }
-        Some((result, document.revision, true))
-    }
-
-    async fn queue_persistence(&self, revision: u64) {
-        if let Some(persistence) = self.persistence.as_ref() {
-            persistence.enqueue(revision).await;
-        }
-    }
-
-    async fn persist_revision(&self, revision: u64) -> PersistOutcome {
-        let Some(persistence) = self.persistence.as_ref() else {
-            return PersistOutcome::Failed;
-        };
-        persistence.wait_for_revision(revision).await
-    }
-
-    async fn wait_for_mutation_quiescence(&self) {
-        loop {
-            let generation = self.mutation_generation.load(Ordering::Acquire);
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            if self.mutation_generation.load(Ordering::Acquire) == generation {
-                return;
+        let write_path = path.clone();
+        match tokio::task::spawn_blocking(move || atomic_write_evidence(&write_path, &bytes)).await
+        {
+            Ok(Ok(())) => {
+                self.last_persisted_revision
+                    .store(document.revision, Ordering::Release);
+                PersistOutcome::Persisted
+            }
+            Ok(Err(err)) => {
+                warn!("failed to persist KD4 task evidence: {err}");
+                PersistOutcome::Failed
+            }
+            Err(err) => {
+                warn!("KD4 task-evidence persistence task failed: {err}");
+                PersistOutcome::Failed
             }
         }
     }
-
-    fn clear_completed_validation(&self, validation_start: Option<&TaskEvidenceValidationStart>) {
-        let Some(validation_start) = validation_start else {
-            return;
-        };
-        if validation_start.cancellation_token.is_cancelled() {
-            return;
-        }
-        let mut active = self
-            .active_validation
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if active.as_ref().is_some_and(|validation| {
-            validation.evidence_generation == validation_start.evidence_generation
-                && !validation.cancellation_token.is_cancelled()
-        }) {
-            *active = None;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn seed_automatic_validation_mutation_for_test(&self, changed_paths: &[&str]) {
-        self.ensure_initialized().await;
-        let Some(repo_root) = self.repo_root.as_ref() else {
-            return;
-        };
-        let changed_paths = changed_paths
-            .iter()
-            .map(|path| normalize_input_path(repo_root, Some(repo_root), Path::new(path)))
-            .collect::<BTreeSet<_>>();
-        let mut snapshots = BTreeMap::new();
-        for path in &changed_paths {
-            snapshots.insert(path.clone(), snapshot_file(repo_root, path).await);
-        }
-        let Some((_, revision, changed)) = self
-            .update_document(|document| {
-                invalidate_for_mutation(document);
-                let epoch = document.evidence_epoch;
-                for snapshot in snapshots.values() {
-                    document
-                        .latest_file_hashes
-                        .insert(snapshot.path.clone(), snapshot.clone());
-                }
-                let receipt_id =
-                    next_receipt_id("command", &mut document.next_command_receipt_sequence);
-                document.command_receipts.push(CommandReceipt {
-                    id: receipt_id,
-                    recorded_at: timestamp(),
-                    epoch,
-                    step_id: document.active_step_id.clone(),
-                    command: vec!["<automatic-validation-test-mutation>".to_string()],
-                    cwd: document.start.repository_root.clone(),
-                    exit_code: 0,
-                    timed_out: false,
-                    duration_ms: 0,
-                    possible_mutation: true,
-                    observation: Some(MutationObservation::Changed),
-                    coverage: Some(MutationCoverage::Complete),
-                    changed_paths: changed_paths.iter().cloned().collect(),
-                    reconciliation_attempted: true,
-                });
-                trim_to_last(&mut document.command_receipts, MAX_COMMAND_RECEIPTS);
-                document.updated_at = timestamp();
-                ((), true)
-            })
-            .await
-        else {
-            return;
-        };
-        if changed {
-            self.queue_persistence(revision).await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn validation_active_for_generation_for_test(
-        &self,
-        evidence_generation: u64,
-    ) -> bool {
-        self.active_validation
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-            .is_some_and(|validation| validation.evidence_generation == evidence_generation)
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn automatic_validation_receipts_for_test(
-        &self,
-        claim_id: &str,
-    ) -> Vec<(String, Vec<String>, bool)> {
-        self.document
-            .lock()
-            .await
-            .as_ref()
-            .map(|document| {
-                document
-                    .validation_receipts
-                    .iter()
-                    .filter(|receipt| receipt.automatic_claim_id.as_deref() == Some(claim_id))
-                    .map(|receipt| {
-                        (
-                            receipt.mode.clone(),
-                            receipt
-                                .active_files
-                                .iter()
-                                .map(|snapshot| snapshot.path.clone())
-                                .collect(),
-                            receipt.conclusion.is_some(),
-                        )
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-}
-
-fn task_evidence_workspace_generation(document: &TaskEvidenceDocument) -> String {
-    let mut hasher = Sha256::new();
-    hash_fingerprint_component(
-        &mut hasher,
-        b"repository-root",
-        document.start.repository_root.as_bytes(),
-    );
-    hash_fingerprint_component(
-        &mut hasher,
-        b"starting-commit",
-        document
-            .start
-            .commit_hash
-            .as_deref()
-            .unwrap_or("<none>")
-            .as_bytes(),
-    );
-    format!("{:x}", hasher.finalize())
-}
-
-fn task_evidence_spec_generation(document: &TaskEvidenceDocument) -> String {
-    let mut hasher = Sha256::new();
-    hash_fingerprint_component(
-        &mut hasher,
-        b"plan",
-        format!("{:?}", document.plan).as_bytes(),
-    );
-    hash_fingerprint_component(
-        &mut hasher,
-        b"generated-artifacts",
-        format!("{:?}", document.generated_artifact_requirements).as_bytes(),
-    );
-    format!("{:x}", hasher.finalize())
-}
-
-fn task_evidence_hash_generation<'a>(
-    files: impl IntoIterator<Item = &'a FileHashSnapshot>,
-    artifacts: impl IntoIterator<Item = &'a FileHashSnapshot>,
-) -> String {
-    let mut hasher = Sha256::new();
-    for snapshot in files {
-        hash_fingerprint_component(&mut hasher, b"file", format!("{snapshot:?}").as_bytes());
-    }
-    for snapshot in artifacts {
-        hash_fingerprint_component(&mut hasher, b"artifact", format!("{snapshot:?}").as_bytes());
-    }
-    format!("{:x}", hasher.finalize())
 }
 
 enum ExistingDocument {
@@ -2386,10 +1349,6 @@ async fn quarantine_evidence_file(path: &Path, kind: &str) -> io::Result<PathBuf
 
 fn migrate_document(document: &mut TaskEvidenceDocument) {
     document.schema_version = TASK_EVIDENCE_SCHEMA_VERSION;
-    // Automatic verifier runs are process-local. A persisted claim cannot still
-    // be active after resume, so make the current evidence generation retriable.
-    document.automatic_plan_attempt_epoch = None;
-    document.automatic_plan_attempt_claim_id = None;
     document.next_edit_receipt_sequence =
         document
             .next_edit_receipt_sequence
@@ -2417,14 +1376,6 @@ fn migrate_document(document: &mut TaskEvidenceDocument) {
                     .iter()
                     .map(|receipt| receipt.id.as_str()),
             ));
-    document.next_automatic_validation_claim_sequence = document
-        .next_automatic_validation_claim_sequence
-        .max(next_sequence_after_ids(
-            document
-                .validation_receipts
-                .iter()
-                .filter_map(|receipt| receipt.automatic_claim_id.as_deref()),
-        ));
     let (duplicate_edit_indices, _) = duplicate_receipt_indices(
         document
             .edit_receipts
@@ -2528,11 +1479,7 @@ fn duplicate_receipt_indices<'a>(
     (duplicate_indices, duplicate_ids)
 }
 
-fn atomic_write_evidence(
-    path: &Path,
-    bytes: &[u8],
-    interrupt_before_replace: bool,
-) -> io::Result<()> {
+fn atomic_write_evidence(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2541,24 +1488,8 @@ fn atomic_write_evidence(
     })?;
     std::fs::create_dir_all(parent)?;
     let mut temp = NamedTempFile::new_in(parent)?;
-    if interrupt_before_replace {
-        let interrupted_len = bytes.len().saturating_div(2).max(1).min(bytes.len());
-        temp.write_all(&bytes[..interrupted_len])?;
-    } else {
-        temp.write_all(bytes)?;
-    }
+    temp.write_all(bytes)?;
     temp.as_file_mut().sync_all()?;
-    if interrupt_before_replace {
-        let (_file, orphan_path) = temp.keep().map_err(|err| err.error)?;
-        return Err(io::Error::new(
-            io::ErrorKind::Interrupted,
-            format!(
-                "injected task-evidence writer interruption before replacing {} (orphaned {})",
-                path.display(),
-                orphan_path.display()
-            ),
-        ));
-    }
     let persisted = temp.persist(path).map_err(|err| err.error)?;
     persisted.sync_all()?;
     #[cfg(unix)]
@@ -2573,522 +1504,6 @@ fn find_kd4_repo_root(cwd: &Path) -> Option<PathBuf> {
                 && candidate.join("kd4_features.toml").is_file()
         })
         .map(Path::to_path_buf)
-}
-
-fn registered_artifact_paths(document: &TaskEvidenceDocument) -> BTreeSet<String> {
-    document
-        .generated_artifact_requirements
-        .iter()
-        .filter_map(|requirement| requirement.path.as_deref())
-        .map(normalize_evidence_path)
-        .collect()
-}
-
-fn normalize_evidence_path(path: &str) -> String {
-    path.replace('\\', "/").trim_start_matches("./").to_string()
-}
-
-async fn closed_write_targets(
-    repo_root: &Path,
-    cwd: &Path,
-    command: &[String],
-) -> Option<Vec<String>> {
-    let executable_path = tokio::fs::canonicalize(which::which(command.first()?).ok()?)
-        .await
-        .ok()?;
-    let canonical_root = tokio::fs::canonicalize(repo_root).await.ok()?;
-    let canonical_cwd = tokio::fs::canonicalize(cwd).await.ok()?;
-    if executable_path.starts_with(&canonical_root)
-        || executable_path.starts_with(&canonical_cwd)
-        || !is_trusted_system_executable(&executable_path)
-    {
-        return None;
-    }
-    let executable = executable_path.file_name()?.to_str()?.to_ascii_lowercase();
-    let executable = executable.strip_suffix(".exe").unwrap_or(&executable);
-    if executable == "true" || (cfg!(windows) && executable == "where") {
-        return (command.len() == 1).then(Vec::new);
-    }
-    if cfg!(windows)
-        && executable == "fsutil"
-        && command.len() == 5
-        && command[1].eq_ignore_ascii_case("file")
-        && command[2].eq_ignore_ascii_case("createnew")
-        && command[4].parse::<u64>().is_ok()
-        && is_literal_write_target(&command[3])
-    {
-        return Some(vec![command[3].clone()]);
-    }
-    if executable != "touch" {
-        return None;
-    }
-
-    let mut arguments = command.get(1..)?;
-    if arguments.first().is_some_and(|argument| argument == "--") {
-        arguments = &arguments[1..];
-    }
-    if arguments.is_empty()
-        || arguments
-            .iter()
-            .any(|argument| !is_literal_write_target(argument))
-    {
-        return None;
-    }
-    Some(arguments.to_vec())
-}
-
-fn is_literal_write_target(argument: &str) -> bool {
-    !argument.starts_with('-')
-        && !argument.chars().any(|character| {
-            matches!(
-                character,
-                '*' | '?' | '[' | ']' | '{' | '}' | '$' | '%' | '`'
-            )
-        })
-}
-
-#[cfg(unix)]
-fn is_trusted_system_executable(path: &Path) -> bool {
-    path.parent().is_some_and(|parent| {
-        matches!(
-            parent.to_str(),
-            Some("/usr/bin" | "/bin" | "/usr/sbin" | "/sbin")
-        )
-    })
-}
-
-#[cfg(windows)]
-fn is_trusted_system_executable(path: &Path) -> bool {
-    let normalized = path
-        .to_string_lossy()
-        .replace('/', "\\")
-        .to_ascii_lowercase();
-    [
-        std::env::var_os("ProgramFiles"),
-        std::env::var_os("ProgramFiles(x86)"),
-        std::env::var_os("SystemRoot"),
-    ]
-    .into_iter()
-    .flatten()
-    .map(PathBuf::from)
-    .filter_map(|root| std::fs::canonicalize(root).ok())
-    .map(|root| {
-        root.to_string_lossy()
-            .replace('/', "\\")
-            .trim_end_matches('\\')
-            .to_ascii_lowercase()
-    })
-    .any(|root| {
-        normalized == root
-            || normalized
-                .strip_prefix(&root)
-                .is_some_and(|suffix| suffix.starts_with('\\'))
-    })
-}
-
-async fn command_write_paths(
-    repo_root: &Path,
-    cwd: &Path,
-    command: &[String],
-    artifact_paths: &BTreeSet<String>,
-) -> Option<BTreeSet<String>> {
-    let Some(targets) = closed_write_targets(repo_root, cwd, command).await else {
-        return None;
-    };
-    let Some(canonical_root) = tokio::fs::canonicalize(repo_root).await.ok() else {
-        return None;
-    };
-    let Some(canonical_cwd) = tokio::fs::canonicalize(cwd).await.ok() else {
-        return None;
-    };
-    if !canonical_cwd.starts_with(&canonical_root) {
-        return None;
-    }
-
-    let mut paths = BTreeSet::new();
-    for target in targets {
-        let Some(target) = resolve_possible_target(&canonical_cwd, &target).await else {
-            return None;
-        };
-        if !target.starts_with(&canonical_root) {
-            return None;
-        }
-        if tokio::fs::metadata(&target)
-            .await
-            .is_ok_and(|metadata| metadata.is_dir())
-        {
-            return None;
-        }
-        let Some(relative) = target
-            .strip_prefix(&canonical_root)
-            .ok()
-            .and_then(Path::to_str)
-            .map(normalize_evidence_path)
-        else {
-            return None;
-        };
-        let Some(check_ignored) = run_fixed_git(
-            &canonical_root,
-            &["check-ignore", "-q", "--", relative.as_str()],
-        )
-        .await
-        else {
-            return None;
-        };
-        match check_ignored.code {
-            Some(0) if !artifact_paths.contains(&relative) => {
-                return None;
-            }
-            Some(0 | 1) => {}
-            _ => return None,
-        }
-        paths.insert(relative);
-    }
-    Some(paths)
-}
-
-async fn resolve_possible_target(cwd: &Path, target: &str) -> Option<PathBuf> {
-    let target = Path::new(target);
-    let combined = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        cwd.join(target)
-    };
-    let normalized = normalize_path_lexically(&combined)?;
-    let mut existing = normalized.as_path();
-    let mut suffix = Vec::new();
-    loop {
-        match tokio::fs::symlink_metadata(existing).await {
-            Ok(_) => break,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                suffix.push(existing.file_name()?.to_os_string());
-                existing = existing.parent()?;
-            }
-            Err(_) => return None,
-        }
-    }
-    let mut resolved = tokio::fs::canonicalize(existing).await.ok()?;
-    for component in suffix.into_iter().rev() {
-        resolved.push(component);
-    }
-    normalize_path_lexically(&resolved)
-}
-
-fn normalize_path_lexically(path: &Path) -> Option<PathBuf> {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return None;
-                }
-            }
-            Component::Normal(component) => normalized.push(component),
-        }
-    }
-    Some(normalized)
-}
-
-struct FixedGitOutput {
-    code: Option<i32>,
-    stdout: Vec<u8>,
-}
-
-async fn run_fixed_git(repo_root: &Path, args: &[&str]) -> Option<FixedGitOutput> {
-    let null_config = if cfg!(windows) { "NUL" } else { "/dev/null" };
-    let mut command = tokio::process::Command::new("git");
-    command
-        .current_dir(repo_root)
-        .kill_on_drop(true)
-        .args([
-            "--no-pager",
-            "-c",
-            "core.pager=cat",
-            "-c",
-            "pager.diff=false",
-            "-c",
-            "color.ui=false",
-            "-c",
-            "color.diff=false",
-            "-c",
-            "core.autocrlf=false",
-            "-c",
-            "core.eol=lf",
-            "-c",
-            "core.safecrlf=false",
-            "-c",
-            "core.filemode=true",
-            "-c",
-            "core.ignorecase=false",
-            "-c",
-            "core.precomposeunicode=false",
-            "-c",
-            "core.symlinks=true",
-            "-c",
-            "core.quotepath=false",
-            "-c",
-            "diff.external=",
-            "-c",
-            "diff.submodule=short",
-            "-c",
-            "diff.ignoreSubmodules=none",
-            "-c",
-            "diff.renames=false",
-            "-c",
-            "diff.indentHeuristic=false",
-            "-c",
-            "diff.algorithm=myers",
-            "-c",
-            "submodule.recurse=false",
-        ])
-        .arg("-c")
-        .arg(format!("core.attributesFile={null_config}"))
-        .arg("-c")
-        .arg(format!("core.excludesFile={null_config}"))
-        .arg("-c")
-        .arg(format!("diff.orderFile={null_config}"))
-        .args(args)
-        .env("LC_ALL", "C")
-        .env("LANG", "C")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_SYSTEM", null_config)
-        .env("GIT_CONFIG_GLOBAL", null_config)
-        .env("GIT_ATTR_NOSYSTEM", "1")
-        .env("GIT_CONFIG_COUNT", "0")
-        .env("GIT_PAGER", "cat")
-        .env("PAGER", "cat")
-        .env("NO_COLOR", "1")
-        .env_remove("GIT_EXTERNAL_DIFF")
-        .env_remove("GIT_DIFF_OPTS");
-    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
-        .await
-        .ok()?
-        .ok()?;
-    if !output.stderr.is_empty() {
-        return None;
-    }
-    Some(FixedGitOutput {
-        code: output.status.code(),
-        stdout: output.stdout,
-    })
-}
-
-async fn run_fixed_git_success(repo_root: &Path, args: &[&str]) -> Option<Vec<u8>> {
-    let output = run_fixed_git(repo_root, args).await?;
-    (output.code == Some(0)).then_some(output.stdout)
-}
-
-async fn capture_stable_mutation_fingerprint(
-    repo_root: &Path,
-    artifact_paths: &BTreeSet<String>,
-) -> Option<String> {
-    let first = capture_mutation_fingerprint(repo_root, artifact_paths).await?;
-    tokio::task::yield_now().await;
-    let second = capture_mutation_fingerprint(repo_root, artifact_paths).await?;
-    (first == second).then_some(first)
-}
-
-async fn capture_mutation_fingerprint(
-    repo_root: &Path,
-    artifact_paths: &BTreeSet<String>,
-) -> Option<String> {
-    let canonical_root = tokio::fs::canonicalize(repo_root).await.ok()?;
-    let worktree =
-        run_fixed_git_success(&canonical_root, &["rev-parse", "--show-toplevel"]).await?;
-    let worktree = std::str::from_utf8(trim_ascii_whitespace(&worktree)).ok()?;
-    let canonical_worktree = tokio::fs::canonicalize(worktree).await.ok()?;
-    if canonical_worktree != canonical_root {
-        return None;
-    }
-    let common_dir = run_fixed_git_success(
-        &canonical_root,
-        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-    )
-    .await?;
-    let common_dir = std::str::from_utf8(trim_ascii_whitespace(&common_dir)).ok()?;
-    let canonical_common_dir = tokio::fs::canonicalize(common_dir).await.ok()?;
-    let mut hasher = Sha256::new();
-    hash_fingerprint_component(
-        &mut hasher,
-        b"worktree",
-        canonical_worktree.to_str()?.as_bytes(),
-    );
-    hash_fingerprint_component(
-        &mut hasher,
-        b"common-dir",
-        canonical_common_dir.to_str()?.as_bytes(),
-    );
-
-    let head = run_fixed_git(
-        &canonical_root,
-        &["rev-parse", "--verify", "--quiet", "HEAD"],
-    )
-    .await?;
-    match head.code {
-        Some(0) => {
-            hash_fingerprint_component(&mut hasher, b"head", trim_ascii_whitespace(&head.stdout))
-        }
-        Some(1) if head.stdout.is_empty() => {
-            hash_fingerprint_component(&mut hasher, b"head", b"<unborn>")
-        }
-        _ => return None,
-    }
-
-    const DIFF_ARGS: &[&str] = &[
-        "diff",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-color",
-        "--binary",
-        "--full-index",
-        "--src-prefix=a/",
-        "--dst-prefix=b/",
-        "--unified=0",
-        "--diff-algorithm=myers",
-        "--no-renames",
-        "--no-indent-heuristic",
-        "--submodule=short",
-        "--ignore-submodules=none",
-        "--no-relative",
-    ];
-    let unstaged = run_fixed_git_success(&canonical_root, DIFF_ARGS).await?;
-    let mut staged_args = DIFF_ARGS.to_vec();
-    staged_args.push("--cached");
-    let staged = run_fixed_git_success(&canonical_root, &staged_args).await?;
-    hash_fingerprint_component(&mut hasher, b"unstaged-diff", &unstaged);
-    hash_fingerprint_component(&mut hasher, b"staged-diff", &staged);
-
-    let untracked = run_fixed_git_success(
-        &canonical_root,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    )
-    .await?;
-    let mut untracked_paths = untracked
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    untracked_paths.sort();
-    for path_bytes in untracked_paths {
-        let path_text = std::str::from_utf8(&path_bytes).ok()?;
-        let relative = safe_relative_evidence_path(path_text)?;
-        hash_fingerprint_component(&mut hasher, b"untracked-path", &path_bytes);
-        hash_file_state(&mut hasher, &canonical_root.join(relative)).await?;
-    }
-
-    for artifact_path in artifact_paths {
-        let relative = safe_relative_evidence_path(artifact_path)?;
-        hash_fingerprint_component(&mut hasher, b"artifact-path", artifact_path.as_bytes());
-        hash_file_state(&mut hasher, &canonical_root.join(relative)).await?;
-    }
-
-    Some(format!("{:x}", hasher.finalize()))
-}
-
-fn safe_relative_evidence_path(path: &str) -> Option<PathBuf> {
-    let path = Path::new(path);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return None;
-    }
-    Some(path.to_path_buf())
-}
-
-async fn hash_file_state(hasher: &mut Sha256, path: &Path) -> Option<()> {
-    let before = match tokio::fs::symlink_metadata(path).await {
-        Ok(metadata) => metadata,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            tokio::task::yield_now().await;
-            if !matches!(
-                tokio::fs::symlink_metadata(path).await,
-                Err(err) if err.kind() == io::ErrorKind::NotFound
-            ) {
-                return None;
-            }
-            hash_fingerprint_component(hasher, b"file-type", b"absent");
-            return Some(());
-        }
-        Err(_) => return None,
-    };
-    if before.file_type().is_symlink() {
-        let first_target = tokio::fs::read_link(path).await.ok()?;
-        tokio::task::yield_now().await;
-        let second_target = tokio::fs::read_link(path).await.ok()?;
-        let after = tokio::fs::symlink_metadata(path).await.ok()?;
-        if first_target != second_target || !same_file_metadata(&before, &after) {
-            return None;
-        }
-        hash_fingerprint_component(hasher, b"file-type", b"symlink");
-        hash_fingerprint_component(
-            hasher,
-            b"symlink-target",
-            &path_identity_bytes(first_target.as_os_str()),
-        );
-    } else if before.is_file() {
-        let first_contents = tokio::fs::read(path).await.ok()?;
-        let middle = tokio::fs::symlink_metadata(path).await.ok()?;
-        tokio::task::yield_now().await;
-        let second_contents = tokio::fs::read(path).await.ok()?;
-        let after = tokio::fs::symlink_metadata(path).await.ok()?;
-        if first_contents != second_contents
-            || !same_file_metadata(&before, &middle)
-            || !same_file_metadata(&middle, &after)
-        {
-            return None;
-        }
-        hash_fingerprint_component(hasher, b"file-type", b"file");
-        hash_fingerprint_component(hasher, b"file-content", &first_contents);
-    } else {
-        return None;
-    }
-    Some(())
-}
-
-fn same_file_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-    left.file_type().is_file() == right.file_type().is_file()
-        && left.file_type().is_symlink() == right.file_type().is_symlink()
-        && left.len() == right.len()
-        && left.modified().ok() == right.modified().ok()
-}
-
-#[cfg(unix)]
-fn path_identity_bytes(path: &std::ffi::OsStr) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    path.as_bytes().to_vec()
-}
-
-#[cfg(windows)]
-fn path_identity_bytes(path: &std::ffi::OsStr) -> Vec<u8> {
-    use std::os::windows::ffi::OsStrExt;
-    path.encode_wide()
-        .flat_map(u16::to_le_bytes)
-        .collect::<Vec<_>>()
-}
-
-fn hash_fingerprint_component(hasher: &mut Sha256, label: &[u8], value: &[u8]) {
-    hasher.update((label.len() as u64).to_le_bytes());
-    hasher.update(label);
-    hasher.update((value.len() as u64).to_le_bytes());
-    hasher.update(value);
-}
-
-fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
-    let start = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_whitespace())
-        .unwrap_or(bytes.len());
-    let end = bytes
-        .iter()
-        .rposition(|byte| !byte.is_ascii_whitespace())
-        .map_or(start, |index| index + 1);
-    &bytes[start..end]
 }
 
 async fn git_dirty_paths(repo_root: &Path) -> BTreeSet<String> {
@@ -3382,17 +1797,6 @@ fn promote_steps_with_fresh_evidence(document: &mut TaskEvidenceDocument) {
                 .any(|step| step.id == step_id && step.status == StepStatus::Passed);
         }
     }
-    let active_ids = document
-        .plan
-        .iter()
-        .filter(|step| step.status == StepStatus::InProgress)
-        .map(|step| step.id.clone())
-        .collect::<Vec<_>>();
-    document.active_step_id = if active_ids.len() == 1 {
-        active_ids.into_iter().next()
-    } else {
-        None
-    };
 }
 
 fn step_has_fresh_evidence(document: &TaskEvidenceDocument, index: usize) -> bool {
@@ -3482,33 +1886,6 @@ fn generated_artifact_is_fresh(document: &TaskEvidenceDocument, path: &str) -> b
         && latest.read_error.is_none()
         && baseline.sha1.is_some()
         && baseline.sha1 == latest.sha1
-}
-
-fn validation_output_artifacts(payload: Option<&Value>) -> Vec<ValidationOutputArtifact> {
-    payload
-        .and_then(|payload| payload.get("results"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|result| result.get("exact_output_artifact"))
-        .filter_map(|artifact| {
-            let sha256 = artifact.get("sha256")?.as_str()?;
-            if sha256.len() != 64
-                || !sha256
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                return None;
-            }
-            let path = artifact.get("path")?.as_str()?;
-            let bytes = artifact.get("bytes")?.as_u64()?;
-            Some(ValidationOutputArtifact {
-                sha256: sha256.to_string(),
-                path: path.to_string(),
-                bytes,
-            })
-        })
-        .collect()
 }
 
 fn verifier_requirement_satisfied(
@@ -3615,9 +1992,7 @@ fn derive_completion_gate(
             unresolved_steps.join(", ")
         ));
     }
-    if document.verify_plan_epoch != Some(document.evidence_epoch)
-        && document.validation_epoch != Some(document.evidence_epoch)
-    {
+    if document.verify_plan_epoch != Some(document.evidence_epoch) {
         partial.push("verify_local planning is missing or stale".to_string());
     }
     if document.validation_epoch != Some(document.evidence_epoch) {
@@ -3721,7 +2096,6 @@ fn invalidate_evidence(
     document.wiring_receipt = None;
     document.desktop_activation_receipt = None;
     document.automatic_plan_attempt_epoch = None;
-    document.automatic_plan_attempt_claim_id = None;
     if reset_repair_budget {
         document.repair_turns_used = 0;
     }
@@ -3743,95 +2117,11 @@ fn task_is_tracked(document: &TaskEvidenceDocument) -> bool {
         || document
             .command_receipts
             .iter()
-            .any(|receipt| match receipt.observation {
-                Some(MutationObservation::Changed | MutationObservation::Unknown) => true,
-                Some(MutationObservation::Unchanged) => false,
-                None => false,
-            })
+            .any(|receipt| receipt.possible_mutation)
         || document
             .risks
             .iter()
             .any(|risk| risk.source == "task_evidence_storage" && !risk.resolved)
-}
-
-fn automatic_validation_mutation_pending(document: &TaskEvidenceDocument, epoch: u64) -> bool {
-    document
-        .edit_receipts
-        .iter()
-        .any(|receipt| receipt.epoch == epoch)
-        || document.command_receipts.iter().any(|receipt| {
-            receipt.epoch == epoch
-                && matches!(
-                    receipt.observation,
-                    Some(MutationObservation::Changed | MutationObservation::Unknown)
-                )
-        })
-}
-
-fn automatic_validation_changed_paths(document: &TaskEvidenceDocument, epoch: u64) -> Vec<String> {
-    let mut paths = BTreeSet::new();
-    for receipt in document
-        .edit_receipts
-        .iter()
-        .filter(|receipt| receipt.epoch == epoch)
-    {
-        paths.extend(receipt.files.iter().map(|file| file.path.clone()));
-    }
-    for receipt in document
-        .command_receipts
-        .iter()
-        .filter(|receipt| receipt.epoch == epoch)
-    {
-        paths.extend(receipt.changed_paths.iter().cloned());
-    }
-    paths.into_iter().collect()
-}
-
-fn validation_mode_strength(mode: &str) -> u8 {
-    match mode {
-        "final" => 3,
-        "fast" => 2,
-        "plan" => 1,
-        _ => 0,
-    }
-}
-
-fn strongest_conclusive_validation_strength(
-    document: &TaskEvidenceDocument,
-    epoch: u64,
-) -> Option<u8> {
-    document
-        .validation_receipts
-        .iter()
-        .filter(|receipt| receipt.epoch == epoch && receipt.conclusion.is_some())
-        .map(|receipt| validation_mode_strength(&receipt.mode))
-        .max()
-}
-
-fn trim_validation_receipts(document: &mut TaskEvidenceDocument) {
-    if document.validation_receipts.len() <= MAX_VALIDATION_RECEIPTS {
-        return;
-    }
-    let retained_authoritative_id = document
-        .validation_receipts
-        .iter()
-        .enumerate()
-        .filter(|(_, receipt)| {
-            receipt.epoch == document.evidence_epoch && receipt.conclusion.is_some()
-        })
-        .max_by_key(|(index, receipt)| (validation_mode_strength(&receipt.mode), *index))
-        .map(|(_, receipt)| receipt.id.clone());
-
-    while document.validation_receipts.len() > MAX_VALIDATION_RECEIPTS {
-        let removal_index = retained_authoritative_id.as_ref().map_or(0, |retained_id| {
-            document
-                .validation_receipts
-                .iter()
-                .position(|receipt| &receipt.id != retained_id)
-                .unwrap_or(0)
-        });
-        document.validation_receipts.remove(removal_index);
-    }
 }
 
 fn step_requires_wiring(step: &EvidencePlanStep) -> bool {
@@ -4785,7 +3075,6 @@ mod tests {
                 Some("PLANNED"),
                 true,
                 false,
-                true,
                 Some(&plan_validation_start),
                 &[PathBuf::from("src/lib.rs")],
                 &[],
@@ -4800,7 +3089,6 @@ mod tests {
             .record_verify_local(
                 "final",
                 Some("VERIFIED"),
-                true,
                 true,
                 true,
                 Some(&final_validation_start),
@@ -4821,7 +3109,7 @@ mod tests {
             "--ledger".to_string(),
         ];
         ledger
-            .record_command_intent("wiring-1", &wiring_command, &cwd_uri)
+            .record_command_intent("wiring-1", &wiring_command)
             .await;
         let ledger_path = repo
             .join(".git")
@@ -4839,40 +3127,6 @@ mod tests {
         .expect("write ledger");
         ledger
             .record_command("wiring-1", &wiring_command, &cwd_uri, 0, false, 10, false)
-            .await;
-        let plan_validation_start = ledger
-            .begin_verify_local_validation()
-            .await
-            .expect("plan validation start after wiring");
-        ledger
-            .record_verify_local(
-                "plan",
-                Some("PLANNED"),
-                true,
-                false,
-                true,
-                Some(&plan_validation_start),
-                &[PathBuf::from("src/lib.rs")],
-                &[],
-                Some(&serde_json::json!({"planned": []})),
-            )
-            .await;
-        let final_validation_start = ledger
-            .begin_verify_local_validation()
-            .await
-            .expect("final validation start after wiring");
-        ledger
-            .record_verify_local(
-                "final",
-                Some("VERIFIED"),
-                true,
-                true,
-                true,
-                Some(&final_validation_start),
-                &[PathBuf::from("src/lib.rs")],
-                &[],
-                Some(&serde_json::json!({"verdict": "VERIFIED"})),
-            )
             .await;
         assert_eq!(
             ledger.completion_gate().await.expect("gate").status,
@@ -4949,10 +3203,7 @@ mod tests {
         ledger.record_edit_result("patch-1", "completed").await;
 
         assert_eq!(
-            ledger
-                .take_automatic_verify_plan_request()
-                .await
-                .map(|request| request.changed_paths),
+            ledger.take_automatic_verify_plan_request().await,
             Some(vec!["src/lib.rs".to_string()])
         );
         assert_eq!(ledger.take_automatic_verify_plan_request().await, None);
