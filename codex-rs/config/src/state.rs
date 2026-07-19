@@ -10,6 +10,8 @@ use crate::ConfigLayer;
 use crate::ConfigLayerMetadata;
 use crate::ConfigLayerSource;
 use crate::ProfileV2Name;
+use codex_features::feature_for_key;
+use codex_features::legacy_feature_keys;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
@@ -503,7 +505,9 @@ impl ConfigLayerStack {
             /*include_disabled*/ false,
         ) {
             let config = normalized_with_key_aliases(&layer.config, &[]);
-            record_origins(&config, &layer.metadata(), &mut path, &mut origins);
+            let metadata = layer.metadata();
+            record_origins(&config, &metadata, &mut path, &mut origins);
+            apply_feature_alias_overlay_origin(&config, &metadata, &mut origins);
         }
 
         origins
@@ -536,6 +540,33 @@ impl ConfigLayerStack {
             layers.reverse();
         }
         layers
+    }
+}
+
+fn apply_feature_alias_overlay_origin(
+    config: &TomlValue,
+    metadata: &ConfigLayerMetadata,
+    origins: &mut HashMap<String, ConfigLayerMetadata>,
+) {
+    let Some(features) = config.get("features").and_then(TomlValue::as_table) else {
+        return;
+    };
+
+    for legacy_key in legacy_feature_keys() {
+        if !features.contains_key(legacy_key) {
+            continue;
+        }
+        let Some(feature) = feature_for_key(legacy_key) else {
+            continue;
+        };
+        let canonical_key = feature.key();
+        if features.contains_key(canonical_key) {
+            continue;
+        }
+        let canonical_path = format!("features.{canonical_key}");
+        if origins.contains_key(&canonical_path) {
+            origins.insert(canonical_path, metadata.clone());
+        }
     }
 }
 

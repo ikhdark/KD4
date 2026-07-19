@@ -217,9 +217,16 @@ pub(crate) async fn backfill_sessions_with_lease(
     let sessions_root = codex_home.join(SESSIONS_SUBDIR);
     let archived_root = codex_home.join(ARCHIVED_SESSIONS_SUBDIR);
     let mut rollout_paths: Vec<BackfillRolloutPath> = Vec::new();
+    let mut unresolved_failures = false;
     for (root, archived) in [(sessions_root, false), (archived_root, true)] {
-        if !tokio::fs::try_exists(&root).await.unwrap_or(false) {
-            continue;
+        match tokio::fs::try_exists(&root).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(err) => {
+                unresolved_failures = true;
+                warn!("failed to inspect rollout root {}: {err}", root.display());
+                continue;
+            }
         }
         match collect_rollout_paths(&root).await {
             Ok(paths) => {
@@ -230,6 +237,7 @@ pub(crate) async fn backfill_sessions_with_lease(
                 }));
             }
             Err(err) => {
+                unresolved_failures = true;
                 warn!(
                     "failed to collect rollout paths under {}: {err}",
                     root.display()
@@ -247,11 +255,14 @@ pub(crate) async fn backfill_sessions_with_lease(
         upserted: 0,
         failed: 0,
     };
-    let mut last_watermark = backfill_state.last_watermark.clone();
+    let mut contiguous_watermark = backfill_state.last_watermark.clone();
+    let mut checkpointed_watermark = backfill_state.last_watermark.clone();
     for batch in rollout_paths.chunks(BACKFILL_BATCH_SIZE) {
         for rollout in batch {
             stats.scanned = stats.scanned.saturating_add(1);
-            match extract_metadata_from_rollout(&rollout.path, default_provider).await {
+            let succeeded = match extract_metadata_from_rollout(&rollout.path, default_provider)
+                .await
+            {
                 Ok(outcome) => {
                     if outcome.parse_errors > 0
                         && let Some(ref metric_client) = metric_client
@@ -276,55 +287,77 @@ pub(crate) async fn backfill_sessions_with_lease(
                             .or(Some(fallback_archived_at));
                     }
                     if let Err(err) = runtime.upsert_thread(&metadata).await {
-                        stats.failed = stats.failed.saturating_add(1);
                         warn!("failed to upsert rollout {}: {err}", rollout.path.display());
+                        false
                     } else {
                         if let Err(err) = runtime
                             .set_thread_memory_mode(metadata.id, memory_mode.as_str())
                             .await
                         {
-                            stats.failed = stats.failed.saturating_add(1);
                             warn!(
                                 "failed to restore memory mode for {}: {err}",
                                 rollout.path.display()
                             );
-                            continue;
+                            false
+                        } else {
+                            stats.upserted = stats.upserted.saturating_add(1);
+                            true
                         }
-                        stats.upserted = stats.upserted.saturating_add(1);
                     }
                 }
                 Err(err) => {
-                    stats.failed = stats.failed.saturating_add(1);
                     warn!(
                         "failed to extract rollout {}: {err}",
                         rollout.path.display()
                     );
+                    false
                 }
+            };
+            if succeeded {
+                if !unresolved_failures {
+                    contiguous_watermark = Some(rollout.watermark.clone());
+                }
+            } else {
+                stats.failed = stats.failed.saturating_add(1);
+                unresolved_failures = true;
             }
         }
 
-        if let Some(last_entry) = batch.last() {
-            if let Err(err) = runtime
-                .checkpoint_backfill(last_entry.watermark.as_str())
-                .await
-            {
+        if contiguous_watermark != checkpointed_watermark
+            && let Some(watermark) = contiguous_watermark.as_deref()
+        {
+            if let Err(err) = runtime.checkpoint_backfill(watermark).await {
+                unresolved_failures = true;
                 warn!(
                     "failed to checkpoint backfill at {}: {err}",
                     codex_home.display()
                 );
             } else {
-                last_watermark = Some(last_entry.watermark.clone());
+                checkpointed_watermark = contiguous_watermark.clone();
             }
         }
     }
-    if let Err(err) = runtime
-        .mark_backfill_complete(last_watermark.as_deref())
+    if unresolved_failures {
+        if let Err(err) = runtime.mark_backfill_pending().await {
+            warn!(
+                "failed to release incomplete backfill at {}: {err}",
+                codex_home.display()
+            );
+        }
+    } else if let Err(err) = runtime
+        .mark_backfill_complete(contiguous_watermark.as_deref())
         .await
     {
         warn!(
             "failed to mark backfill complete at {}: {err}",
             codex_home.display()
         );
+        if let Err(pending_err) = runtime.mark_backfill_pending().await {
+            warn!(
+                "failed to release backfill after completion error at {}: {pending_err}",
+                codex_home.display()
+            );
+        }
     }
 
     info!(

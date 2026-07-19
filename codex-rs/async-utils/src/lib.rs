@@ -9,6 +9,12 @@ pub enum CancelErr {
 pub trait OrCancelExt: Sized {
     type Output;
 
+    /// Returns when either this future completes or the token is cancelled.
+    ///
+    /// Cancellation is implemented by dropping the wrapped future, so the
+    /// wrapped operation must be cancellation-safe. Resource-owning operations
+    /// that require cleanup should handle cancellation internally and be
+    /// awaited until that cleanup completes instead of using this method.
     fn or_cancel(
         self,
         token: &CancellationToken,
@@ -24,6 +30,8 @@ where
 
     async fn or_cancel(self, token: &CancellationToken) -> Result<Self::Output, CancelErr> {
         tokio::select! {
+            biased;
+
             _ = token.cancelled() => Err(CancelErr::Cancelled),
             res = self => Ok(res),
         }
@@ -80,6 +88,16 @@ mod tests {
         }
         .or_cancel(&token)
         .await;
+
+        assert_eq!(Err(CancelErr::Cancelled), result);
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_when_both_are_ready() {
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let result = async { 5 }.or_cancel(&token).await;
 
         assert_eq!(Err(CancelErr::Cancelled), result);
     }

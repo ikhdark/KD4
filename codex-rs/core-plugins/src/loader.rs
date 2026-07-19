@@ -150,22 +150,15 @@ async fn load_plugins_from_layer_stack_with_scope(
     let mut configured_plugins: Vec<_> = configured_plugins.into_iter().collect();
     configured_plugins.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
 
+    let configured_plugin_ids = configured_plugins
+        .iter()
+        .filter_map(|(configured_name, _)| PluginId::parse(configured_name).ok())
+        .collect::<Vec<_>>();
+    store.migrate_legacy_plugin_data_roots(&configured_plugin_ids);
+
     let mut plugins = Vec::with_capacity(configured_plugins.len());
-    let mut seen_mcp_server_names = HashMap::<String, String>::new();
     for (configured_name, plugin) in configured_plugins {
         let loaded_plugin = load_plugin(configured_name.clone(), &plugin, store, &scope).await;
-        for name in loaded_plugin.mcp_servers.keys() {
-            if let Some(previous_plugin) =
-                seen_mcp_server_names.insert(name.clone(), configured_name.clone())
-            {
-                warn!(
-                    plugin = configured_name,
-                    previous_plugin,
-                    server = name,
-                    "skipping duplicate plugin MCP server name"
-                );
-            }
-        }
         plugins.push(loaded_plugin);
     }
 
@@ -209,7 +202,7 @@ fn merge_configured_plugins_with_remote_installed(
 ) -> HashMap<String, PluginConfig> {
     if remote_global_catalog_active {
         configured_plugins.retain(|plugin_key, _| match PluginId::parse(plugin_key) {
-            Ok(plugin_id) => plugin_id.marketplace_name != crate::OPENAI_CURATED_MARKETPLACE_NAME,
+            Ok(plugin_id) => plugin_id.marketplace_name() != crate::OPENAI_CURATED_MARKETPLACE_NAME,
             Err(_) => true,
         });
         configured_plugins.extend(extra_plugins);
@@ -221,13 +214,13 @@ fn merge_configured_plugins_with_remote_installed(
         let Ok(plugin_id) = PluginId::parse(plugin_key) else {
             continue;
         };
-        if !is_openai_curated_marketplace_name(&plugin_id.marketplace_name)
+        if !is_openai_curated_marketplace_name(plugin_id.marketplace_name())
             || store.active_plugin_version(&plugin_id).is_none()
         {
             continue;
         }
         local_curated_installed_plugin_keys
-            .entry(plugin_id.plugin_name)
+            .entry(plugin_id.plugin_name().to_string())
             .or_default()
             .push(plugin_key.clone());
     }
@@ -258,11 +251,11 @@ fn installed_plugin_name_for_marketplace(
     store: &PluginStore,
 ) -> Option<String> {
     let plugin_id = PluginId::parse(plugin_key).ok()?;
-    if plugin_id.marketplace_name != marketplace_name {
+    if plugin_id.marketplace_name() != marketplace_name {
         return None;
     }
     store.active_plugin_root(&plugin_id)?;
-    Some(plugin_id.plugin_name)
+    Some(plugin_id.plugin_name().to_string())
 }
 
 pub fn remote_installed_plugins_to_config(
@@ -348,12 +341,12 @@ pub fn refresh_curated_plugin_cache(
     for plugin_id in configured_curated_plugin_ids {
         let plugin_key = plugin_id.as_key();
         if !marketplace_plugin_keys.contains(&plugin_key) {
-            if !loaded_marketplace_names.contains(&plugin_id.marketplace_name) {
+            if !loaded_marketplace_names.contains(plugin_id.marketplace_name()) {
                 continue;
             }
             warn!(
-                plugin = %plugin_id.plugin_name,
-                marketplace = %plugin_id.marketplace_name,
+                plugin = %plugin_id.plugin_name(),
+                marketplace = %plugin_id.marketplace_name(),
                 "configured curated plugin no longer exists in curated marketplace during cache refresh"
             );
             if store.plugin_base_root(plugin_id).as_path().exists() {
@@ -484,7 +477,7 @@ fn refresh_non_curated_plugin_cache_with_mode(
     let mut configured_non_curated_plugin_ids = configured_plugin_keys
         .iter()
         .filter_map(|plugin_key| match PluginId::parse(plugin_key) {
-            Ok(plugin_id) if !is_openai_curated_marketplace_name(&plugin_id.marketplace_name) => {
+            Ok(plugin_id) if !is_openai_curated_marketplace_name(plugin_id.marketplace_name()) => {
                 Some(plugin_id)
             }
             Ok(_) => None,
@@ -573,8 +566,8 @@ fn refresh_non_curated_plugin_cache_with_mode(
         let Some((source, manifest_fallback_contents)) = plugin_sources.get(&plugin_key).cloned()
         else {
             warn!(
-                plugin = plugin_id.plugin_name,
-                marketplace = plugin_id.marketplace_name,
+                plugin = plugin_id.plugin_name(),
+                marketplace = plugin_id.marketplace_name(),
                 "configured non-curated plugin no longer exists in discovered marketplaces during cache refresh"
             );
             continue;
@@ -616,7 +609,7 @@ fn refresh_non_curated_plugin_cache_with_mode(
         match refresh_result {
             Ok(refreshed) => cache_refreshed |= refreshed,
             Err(message) => refresh_errors.push(NonCuratedCacheRefreshError {
-                marketplace_name: plugin_id.marketplace_name,
+                marketplace_name: plugin_id.marketplace_name().to_string(),
                 message,
             }),
         }
@@ -726,7 +719,7 @@ fn curated_plugin_ids_from_config_keys(
         "ignoring invalid configured plugin key during curated sync setup",
     )
     .into_iter()
-    .filter(|plugin_id| is_openai_curated_marketplace_name(&plugin_id.marketplace_name))
+    .filter(|plugin_id| is_openai_curated_marketplace_name(plugin_id.marketplace_name()))
     .collect::<Vec<_>>();
     configured_curated_plugin_ids.sort_unstable_by_key(PluginId::as_key);
     configured_curated_plugin_ids
@@ -1228,7 +1221,7 @@ pub async fn plugin_capability_summary_from_root(
 
     Some(PluginCapabilitySummary {
         config_name: plugin_id.as_key(),
-        display_name: plugin_id.plugin_name.clone(),
+        display_name: plugin_id.plugin_name().to_string(),
         description: None,
         has_skills,
         mcp_server_names,

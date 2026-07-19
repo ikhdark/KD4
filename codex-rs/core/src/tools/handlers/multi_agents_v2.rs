@@ -31,6 +31,12 @@ pub(crate) use interrupt_agent::Handler as InterruptAgentHandler;
 pub(crate) use list_agents::Handler as ListAgentsHandler;
 pub(crate) use send_message::Handler as SendMessageHandler;
 pub(crate) use spawn::Handler as SpawnAgentHandler;
+pub(crate) use task::AbandonAgentTaskHandler;
+pub(crate) use task::AmendAgentTaskHandler;
+pub(crate) use task::GetAgentTaskHandler;
+pub(crate) use task::SetAgentGateHandler;
+pub(crate) use task::SubmitAgentReceiptHandler;
+pub(crate) use task::WaiveAgentGateHandler;
 pub(crate) use wait::Handler as WaitAgentHandler;
 
 mod followup_task;
@@ -39,6 +45,7 @@ mod list_agents;
 mod message_tool;
 mod send_message;
 mod spawn;
+mod task;
 pub(crate) mod wait;
 
 pub(crate) async fn emit_sub_agent_activity(

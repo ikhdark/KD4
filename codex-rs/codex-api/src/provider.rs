@@ -14,7 +14,8 @@ use url::Url;
 /// transport-level retries for both unary and streaming calls.
 #[derive(Debug, Clone)]
 pub struct RetryConfig {
-    pub max_attempts: u64,
+    /// Maximum number of retries after the initial request.
+    pub max_retries: u64,
     pub base_delay: Duration,
     pub retry_429: bool,
     pub retry_5xx: bool,
@@ -24,7 +25,7 @@ pub struct RetryConfig {
 impl RetryConfig {
     pub fn to_policy(&self) -> RetryPolicy {
         RetryPolicy {
-            max_attempts: self.max_attempts,
+            max_retries: self.max_retries,
             base_delay: self.base_delay,
             retry_on: RetryOn {
                 retry_429: self.retry_429,

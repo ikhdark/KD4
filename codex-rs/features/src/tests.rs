@@ -6,6 +6,7 @@ use crate::Features;
 use crate::FeaturesToml;
 use crate::Stage;
 use crate::feature_for_key;
+use crate::legacy_feature_keys;
 use crate::unstable_features_warning_event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
@@ -291,15 +292,56 @@ fn image_generation_toggle_controls_extension_backed_generation() {
 }
 
 #[test]
-fn canonical_image_generation_toggle_wins_over_extension_alias() {
-    for (canonical, alias) in [(false, true), (true, false)] {
-        let entries = BTreeMap::from([
-            ("image_generation".to_string(), canonical),
-            ("imagegenext".to_string(), alias),
-        ]);
-        let mut features = Features::with_defaults();
-        features.apply_map(&entries);
-        assert_eq!(features.enabled(Feature::ImageGeneration), canonical);
+fn canonical_feature_toggles_win_over_every_legacy_alias_within_a_source() {
+    for alias in legacy_feature_keys() {
+        let feature = feature_for_key(alias).expect("legacy alias should resolve");
+        let canonical_key = feature.key();
+
+        for (canonical, legacy) in [(false, true), (true, false)] {
+            let entries = BTreeMap::from([
+                (canonical_key.to_string(), canonical),
+                (alias.to_string(), legacy),
+            ]);
+            let mut features = Features::with_defaults();
+            features.apply_map(&entries);
+
+            assert_eq!(
+                features.enabled(feature),
+                canonical,
+                "canonical feature `{canonical_key}` should win over alias `{alias}`"
+            );
+            assert!(
+                features
+                    .legacy_feature_usages()
+                    .any(|usage| usage.alias == alias && usage.feature == feature)
+            );
+        }
+
+        for (base_canonical, profile_legacy) in [(false, true), (true, false)] {
+            let base_features = FeaturesToml::from(BTreeMap::from([(
+                canonical_key.to_string(),
+                base_canonical,
+            )]));
+            let profile_features =
+                FeaturesToml::from(BTreeMap::from([(alias.to_string(), profile_legacy)]));
+            let features = Features::from_sources(
+                FeatureConfigSource {
+                    features: Some(&base_features),
+                    ..Default::default()
+                },
+                FeatureConfigSource {
+                    features: Some(&profile_features),
+                    ..Default::default()
+                },
+                FeatureOverrides::default(),
+            );
+
+            assert_eq!(
+                features.enabled(feature),
+                profile_legacy,
+                "profile alias `{alias}` should override base feature `{canonical_key}`"
+            );
+        }
     }
 }
 
@@ -799,6 +841,49 @@ code_mode = true
         "Under-development features enabled: code_mode, multi_agent_v2. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /tmp/config.toml.".to_string(),
         message
     );
+}
+
+#[test]
+fn unstable_warning_event_resolves_legacy_aliases_to_canonical_keys() {
+    for (alias, feature) in [
+        ("request_permissions", Feature::ExecPermissionApprovals),
+        ("telepathy", Feature::Chronicle),
+    ] {
+        let mut configured_features = Table::new();
+        configured_features.insert(alias.to_string(), TomlValue::Boolean(true));
+
+        let mut features = Features::with_defaults();
+        features.enable(feature);
+
+        let warning = unstable_features_warning_event(
+            Some(&configured_features),
+            /*suppress_unstable_features_warning*/ false,
+            &features,
+            "/tmp/config.toml",
+        )
+        .expect("warning event");
+        let EventMsg::Warning(WarningEvent { message }) = warning.msg else {
+            panic!("expected warning event");
+        };
+        let expected = format!(
+            "Under-development features enabled: {}. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in /tmp/config.toml.",
+            feature.key()
+        );
+        assert_eq!(message, expected);
+
+        configured_features.insert(feature.key().to_string(), TomlValue::Boolean(true));
+        let warning = unstable_features_warning_event(
+            Some(&configured_features),
+            /*suppress_unstable_features_warning*/ false,
+            &features,
+            "/tmp/config.toml",
+        )
+        .expect("warning event");
+        let EventMsg::Warning(WarningEvent { message }) = warning.msg else {
+            panic!("expected warning event");
+        };
+        assert_eq!(message, expected);
+    }
 }
 
 #[test]

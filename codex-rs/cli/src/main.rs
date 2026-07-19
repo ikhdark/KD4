@@ -78,6 +78,7 @@ use codex_core::config::find_codex_home;
 use codex_core::config::resolve_profile_v2_config_path;
 use codex_features::FEATURES;
 use codex_features::Stage;
+use codex_features::feature_for_key;
 use codex_features::is_known_feature_key;
 use codex_home::CodexHomeUserInstructionsProvider;
 use codex_login::AuthManager;
@@ -1894,12 +1895,13 @@ fn loader_overrides_for_profile(
 }
 
 fn maybe_print_under_development_feature_warning(codex_home: &std::path::Path, feature: &str) {
-    let Some(spec) = FEATURES.iter().find(|spec| spec.key == feature) else {
+    let Some(feature) = feature_for_key(feature) else {
         return;
     };
-    if !matches!(spec.stage, Stage::UnderDevelopment) {
+    if !matches!(feature.stage(), Stage::UnderDevelopment) {
         return;
     }
+    let feature = feature.key();
 
     let config_path = codex_home.join(codex_config::CONFIG_TOML_FILE);
     eprintln!(

@@ -1,6 +1,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use codex_exec_server_protocol::JSONRPCErrorError;
+use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::io;
@@ -43,12 +44,28 @@ use crate::rpc::invalid_request;
 use crate::rpc::not_found;
 
 pub const CODEX_FS_HELPER_ARG1: &str = "--codex-run-as-fs-helper";
+const FS_READ_FILE_BOUNDED_OPERATION: &str = "fs/readFileBounded";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FsHelperReadFileBoundedParams {
+    pub(crate) path: PathUri,
+    pub(crate) max_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FsHelperReadFileBoundedResponse {
+    pub(crate) data_base64: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "params")]
 pub(crate) enum FsHelperRequest {
     #[serde(rename = "fs/readFile")]
     ReadFile(FsReadFileParams),
+    #[serde(rename = "fs/readFileBounded")]
+    ReadFileBounded(FsHelperReadFileBoundedParams),
     #[serde(rename = "fs/writeFile")]
     WriteFile(FsWriteFileParams),
     #[serde(rename = "fs/createDirectory")]
@@ -79,6 +96,8 @@ pub(crate) enum FsHelperResponse {
 pub(crate) enum FsHelperPayload {
     #[serde(rename = "fs/readFile")]
     ReadFile(FsReadFileResponse),
+    #[serde(rename = "fs/readFileBounded")]
+    ReadFileBounded(FsHelperReadFileBoundedResponse),
     #[serde(rename = "fs/writeFile")]
     WriteFile(FsWriteFileResponse),
     #[serde(rename = "fs/createDirectory")]
@@ -101,6 +120,7 @@ impl FsHelperPayload {
     fn operation(&self) -> &'static str {
         match self {
             Self::ReadFile(_) => FS_READ_FILE_METHOD,
+            Self::ReadFileBounded(_) => FS_READ_FILE_BOUNDED_OPERATION,
             Self::WriteFile(_) => FS_WRITE_FILE_METHOD,
             Self::CreateDirectory(_) => FS_CREATE_DIRECTORY_METHOD,
             Self::GetMetadata(_) => FS_GET_METADATA_METHOD,
@@ -116,6 +136,18 @@ impl FsHelperPayload {
         match self {
             Self::ReadFile(response) => Ok(response),
             other => Err(unexpected_response(FS_READ_FILE_METHOD, other.operation())),
+        }
+    }
+
+    pub(crate) fn expect_read_file_bounded(
+        self,
+    ) -> Result<FsHelperReadFileBoundedResponse, JSONRPCErrorError> {
+        match self {
+            Self::ReadFileBounded(response) => Ok(response),
+            other => Err(unexpected_response(
+                FS_READ_FILE_BOUNDED_OPERATION,
+                other.operation(),
+            )),
         }
     }
 
@@ -211,6 +243,17 @@ pub(crate) async fn run_direct_request(
             Ok(FsHelperPayload::ReadFile(FsReadFileResponse {
                 data_base64: STANDARD.encode(data),
             }))
+        }
+        FsHelperRequest::ReadFileBounded(params) => {
+            let data = file_system
+                .read_file_bounded(&params.path, params.max_bytes, /*sandbox*/ None)
+                .await
+                .map_err(map_fs_error)?;
+            Ok(FsHelperPayload::ReadFileBounded(
+                FsHelperReadFileBoundedResponse {
+                    data_base64: data.map(|data| STANDARD.encode(data)),
+                },
+            ))
         }
         FsHelperRequest::WriteFile(params) => {
             let bytes = STANDARD.decode(params.data_base64).map_err(|err| {

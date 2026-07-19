@@ -616,7 +616,8 @@ impl RealtimeWebsocketClient {
         // The WebRTC call already exists; this loop only retries joining its sideband control
         // socket. Once joined, the returned connection is the same reader/writer state that the
         // ordinary websocket start path uses.
-        for attempt in 0..=self.provider.retry.max_attempts {
+        let mut attempt = 0;
+        loop {
             let result = self
                 .connect_webrtc_sideband_once(
                     config.clone(),
@@ -627,23 +628,21 @@ impl RealtimeWebsocketClient {
                 .await;
             match result {
                 Ok(connection) => return Ok(connection),
-                Err(err) if attempt < self.provider.retry.max_attempts => {
-                    let delay = backoff(self.provider.retry.base_delay, attempt + 1);
+                Err(err) if attempt < self.provider.retry.max_retries => {
+                    let retry_number = attempt + 1;
+                    let delay = backoff(self.provider.retry.base_delay, retry_number);
                     warn!(
-                        attempt = attempt + 1,
+                        attempt = retry_number,
                         call_id,
                         delay_ms = delay.as_millis(),
                         "realtime sideband websocket connect failed; retrying: {err}"
                     );
                     sleep(delay).await;
+                    attempt = retry_number;
                 }
                 Err(err) => return Err(err),
             }
         }
-
-        Err(ApiError::Stream(
-            "realtime sideband websocket retry loop exhausted".to_string(),
-        ))
     }
 
     async fn connect_webrtc_sideband_once(
@@ -1786,7 +1785,7 @@ mod tests {
             query_params: Some(HashMap::new()),
             headers: HeaderMap::new(),
             retry: crate::provider::RetryConfig {
-                max_attempts: 1,
+                max_retries: 1,
                 base_delay: Duration::from_millis(1),
                 retry_429: false,
                 retry_5xx: false,
@@ -2110,7 +2109,7 @@ mod tests {
             query_params: Some(HashMap::new()),
             headers: HeaderMap::new(),
             retry: crate::provider::RetryConfig {
-                max_attempts: 1,
+                max_retries: 1,
                 base_delay: Duration::from_millis(1),
                 retry_429: false,
                 retry_5xx: false,
@@ -2235,7 +2234,7 @@ mod tests {
             query_params: Some(HashMap::new()),
             headers: HeaderMap::new(),
             retry: crate::provider::RetryConfig {
-                max_attempts: 1,
+                max_retries: 1,
                 base_delay: Duration::from_millis(1),
                 retry_429: false,
                 retry_5xx: false,
@@ -2339,7 +2338,7 @@ mod tests {
             query_params: Some(HashMap::new()),
             headers: HeaderMap::new(),
             retry: crate::provider::RetryConfig {
-                max_attempts: 1,
+                max_retries: 1,
                 base_delay: Duration::from_millis(1),
                 retry_429: false,
                 retry_5xx: false,
@@ -2429,7 +2428,7 @@ mod tests {
             query_params: Some(HashMap::new()),
             headers: HeaderMap::new(),
             retry: crate::provider::RetryConfig {
-                max_attempts: 1,
+                max_retries: 1,
                 base_delay: Duration::from_millis(1),
                 retry_429: false,
                 retry_5xx: false,

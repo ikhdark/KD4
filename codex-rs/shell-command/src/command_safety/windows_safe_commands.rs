@@ -1,7 +1,7 @@
 use crate::command_safety::is_safe_command::is_safe_git_command;
+use crate::command_safety::is_trusted_powershell_host;
 use crate::command_safety::powershell_parser::PowershellParseOutcome;
 use crate::command_safety::powershell_parser::parse_with_powershell_ast;
-use std::path::Path;
 
 /// On Windows, we conservatively allow only clearly read-only PowerShell invocations
 /// that match a small safelist. Anything else (including direct CMD commands) is unsafe.
@@ -16,11 +16,12 @@ pub fn is_safe_command_windows(command: &[String]) -> bool {
     }
 }
 
-/// Returns each command sequence if the invocation starts with a PowerShell binary.
-/// For example, the tokens from `pwsh Get-ChildItem | Measure-Object` become two sequences.
+/// Returns each command sequence if the invocation starts with the trusted PowerShell host and
+/// explicitly disables profiles. For example,
+/// `pwsh -NoProfile -Command "Get-ChildItem | Measure-Object"` becomes two command sequences.
 fn try_parse_powershell_command_sequence(command: &[String]) -> Option<Vec<Vec<String>>> {
     let (exe, rest) = command.split_first()?;
-    if is_powershell_executable(exe) {
+    if is_trusted_powershell_host(exe) {
         parse_powershell_invocation(exe, rest)
     } else {
         None
@@ -35,11 +36,15 @@ fn parse_powershell_invocation(executable: &str, args: &[String]) -> Option<Vec<
     }
 
     let mut idx = 0;
+    let mut no_profile = false;
     while idx < args.len() {
         let arg = &args[idx];
         let lower = arg.to_ascii_lowercase();
         match lower.as_str() {
             "-command" | "/command" | "-c" => {
+                if !no_profile {
+                    return None;
+                }
                 let script = args.get(idx + 1)?;
                 if idx + 2 != args.len() {
                     // Reject if there is more than one token representing the actual command.
@@ -49,6 +54,9 @@ fn parse_powershell_invocation(executable: &str, args: &[String]) -> Option<Vec<
                 return parse_powershell_script(executable, script);
             }
             _ if lower.starts_with("-command:") || lower.starts_with("/command:") => {
+                if !no_profile {
+                    return None;
+                }
                 if idx + 1 != args.len() {
                     // Reject if there are more tokens after the command itself.
                     // Examples rejected here: "pwsh -Command:dir C:\\" and "powershell /Command:dir C:\\" with trailing args.
@@ -59,7 +67,12 @@ fn parse_powershell_invocation(executable: &str, args: &[String]) -> Option<Vec<
             }
 
             // Benign, no-arg flags we tolerate.
-            "-nologo" | "-noprofile" | "-noninteractive" | "-mta" | "-sta" => {
+            "-noprofile" => {
+                no_profile = true;
+                idx += 1;
+                continue;
+            }
+            "-nologo" | "-noninteractive" | "-mta" | "-sta" => {
                 idx += 1;
                 continue;
             }
@@ -77,13 +90,9 @@ fn parse_powershell_invocation(executable: &str, args: &[String]) -> Option<Vec<
                 return None;
             }
 
-            // If we hit non-flag tokens, treat the remainder as a command sequence.
-            // This happens if powershell is invoked without -Command, e.g.
-            // ["pwsh", "-NoLogo", "git", "-c", "core.pager=cat", "status"]
-            _ => {
-                let script = join_arguments_as_script(&args[idx..]);
-                return parse_powershell_script(executable, &script);
-            }
+            // PowerShell treats bare values as `-File`, not as `-Command` source. Do not
+            // reinterpret that invocation into a different execution mode for safelisting.
+            _ => return None,
         }
     }
 
@@ -101,43 +110,6 @@ fn parse_powershell_script(executable: &str, script: &str) -> Option<Vec<Vec<Str
     } else {
         None
     }
-}
-
-/// Returns true when the executable name is one of the supported PowerShell binaries.
-fn is_powershell_executable(exe: &str) -> bool {
-    let executable_name = Path::new(exe)
-        .file_name()
-        .and_then(|osstr| osstr.to_str())
-        .unwrap_or(exe)
-        .to_ascii_lowercase();
-
-    matches!(
-        executable_name.as_str(),
-        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe"
-    )
-}
-
-fn join_arguments_as_script(args: &[String]) -> String {
-    let mut words = Vec::with_capacity(args.len());
-    if let Some((first, rest)) = args.split_first() {
-        words.push(first.clone());
-        for arg in rest {
-            words.push(quote_argument(arg));
-        }
-    }
-    words.join(" ")
-}
-
-fn quote_argument(arg: &str) -> String {
-    if arg.is_empty() {
-        return "''".to_string();
-    }
-
-    if arg.chars().all(|ch| !ch.is_whitespace()) {
-        return arg.to_string();
-    }
-
-    format!("'{}'", arg.replace('\'', "''"))
 }
 
 /// Validates that a parsed PowerShell command stays within our read-only safelist.
@@ -233,11 +205,22 @@ mod tests {
         args.iter().map(ToString::to_string).collect()
     }
 
+    fn windows_powershell_path() -> String {
+        std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
     fn recognizes_safe_powershell_wrappers() {
         assert!(is_safe_command_windows(&vec_str(&[
             "powershell.exe",
             "-NoLogo",
+            "-NoProfile",
             "-Command",
             "Get-ChildItem -Path .",
         ])));
@@ -249,10 +232,16 @@ mod tests {
             "git status",
         ])));
 
-        assert!(is_safe_command_windows(&vec_str(&[
+        assert!(!is_safe_command_windows(&vec_str(&[
             "powershell.exe",
             "Get-Content",
             "Cargo.toml",
+        ])));
+
+        assert!(!is_safe_command_windows(&vec_str(&[
+            "powershell.exe",
+            "-Command",
+            "Get-ChildItem",
         ])));
 
         // pwsh parity
@@ -268,24 +257,34 @@ mod tests {
 
     #[test]
     fn accepts_full_path_powershell_invocations() {
-        if !cfg!(windows) {
-            // Windows only because on Linux path splitting doesn't handle `/` separators properly
-            return;
-        }
-
         if let Some(pwsh) = try_find_pwsh_executable_blocking() {
-            assert!(is_safe_command_windows(&[
-                pwsh.as_path().to_str().unwrap().into(),
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                "Get-ChildItem -Path .".to_string(),
-            ]));
+            let pwsh = pwsh.as_path().to_str().unwrap();
+            if is_trusted_powershell_host(pwsh) {
+                assert!(is_safe_command_windows(&[
+                    pwsh.into(),
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    "Get-ChildItem -Path .".to_string(),
+                ]));
+            }
         }
 
+        let powershell = windows_powershell_path();
         assert!(is_safe_command_windows(&vec_str(&[
-            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            powershell.as_str(),
+            "-NoProfile",
             "-Command",
             "Get-Content Cargo.toml",
+        ])));
+    }
+
+    #[test]
+    fn rejects_workspace_local_powershell_wrapper() {
+        assert!(!is_safe_command_windows(&vec_str(&[
+            r"C:\workspace\pwsh.exe",
+            "-NoProfile",
+            "-Command",
+            "Get-ChildItem",
         ])));
     }
 
@@ -315,18 +314,21 @@ mod tests {
 
         assert!(is_safe_command_windows(&[
             pwsh.clone(),
+            "-NoProfile".to_string(),
             "-Command".to_string(),
             "git show HEAD:foo.rs".to_string()
         ]));
 
         assert!(is_safe_command_windows(&[
             pwsh.clone(),
+            "-NoProfile".to_string(),
             "-Command".to_string(),
             "(Get-Content foo.rs -Raw)".to_string()
         ]));
 
         assert!(is_safe_command_windows(&[
             pwsh,
+            "-NoProfile".to_string(),
             "-Command".to_string(),
             "Get-Item foo.rs | Select-Object Length".to_string()
         ]));
@@ -555,12 +557,14 @@ mod tests {
     fn accepts_constant_expression_arguments() {
         assert!(is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "Get-Content 'foo bar'"
         ])));
 
         assert!(is_safe_command_windows(&vec_str(&[
             "powershell.exe",
+            "-NoProfile",
             "-Command",
             "Get-Content \"foo bar\""
         ])));

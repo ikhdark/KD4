@@ -701,6 +701,12 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
             last_message_file.clone(),
         )),
     };
+    if let Some(ExecCommand::Resume(args)) = command.as_ref()
+        && !args.last
+        && args.session_id.is_none()
+    {
+        anyhow::bail!("resume requires a session ID or name, or the --last flag");
+    }
     if oss {
         // We're in the oss section, so provider_id should be Some
         // Let's handle None case gracefully though just in case
@@ -804,43 +810,24 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     let (primary_thread_id, fallback_session_configured) = if let Some(ExecCommand::Resume(args)) =
         command.as_ref()
     {
-        if let Some(thread_id) =
-            resolve_resume_thread_id(&client, &config, state_db.as_ref(), args).await?
-        {
-            let response: ThreadResumeResponse = send_request_with_response(
-                &client,
-                ClientRequest::ThreadResume {
-                    request_id: request_ids.next(),
-                    params: thread_resume_params_from_config(
-                        &config,
-                        thread_id,
-                        resume_approvals_reviewer_override,
-                    ),
-                },
-                "thread/resume",
-            )
-            .await
+        let thread_id = resolve_resume_thread_id(&client, &config, state_db.as_ref(), args).await?;
+        let response: ThreadResumeResponse = send_request_with_response(
+            &client,
+            ClientRequest::ThreadResume {
+                request_id: request_ids.next(),
+                params: thread_resume_params_from_config(
+                    &config,
+                    thread_id,
+                    resume_approvals_reviewer_override,
+                ),
+            },
+            "thread/resume",
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        let session_configured = session_configured_from_thread_resume_response(&response, &config)
             .map_err(anyhow::Error::msg)?;
-            let session_configured =
-                session_configured_from_thread_resume_response(&response, &config)
-                    .map_err(anyhow::Error::msg)?;
-            (session_configured.thread_id, session_configured)
-        } else {
-            let response: ThreadStartResponse = send_request_with_response(
-                &client,
-                ClientRequest::ThreadStart {
-                    request_id: request_ids.next(),
-                    params: thread_start_params_from_config(&config),
-                },
-                "thread/start",
-            )
-            .await
-            .map_err(anyhow::Error::msg)?;
-            let session_configured =
-                session_configured_from_thread_start_response(&response, &config)
-                    .map_err(anyhow::Error::msg)?;
-            (session_configured.thread_id, session_configured)
-        }
+        (session_configured.thread_id, session_configured)
     } else {
         let response: ThreadStartResponse = send_request_with_response(
             &client,
@@ -957,6 +944,7 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
     // Track whether a fatal error was reported by the server so we can
     // exit with a non-zero status for automation-friendly signaling.
     let mut error_seen = false;
+    let mut terminal_notification_seen = false;
     let mut interrupt_channel_open = true;
     let primary_thread_id_for_requests = primary_thread_id.to_string();
     loop {
@@ -1005,13 +993,22 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
                 } else if let ServerNotification::TurnCompleted(payload) = &notification
                     && payload.thread_id == primary_thread_id_for_requests
                     && payload.turn.id == task_id
-                    && matches!(
+                {
+                    if matches!(
+                        payload.turn.status,
+                        codex_app_server_protocol::TurnStatus::Completed
+                            | codex_app_server_protocol::TurnStatus::Failed
+                            | codex_app_server_protocol::TurnStatus::Interrupted
+                    ) {
+                        terminal_notification_seen = true;
+                    }
+                    if matches!(
                         payload.turn.status,
                         codex_app_server_protocol::TurnStatus::Failed
                             | codex_app_server_protocol::TurnStatus::Interrupted
-                    )
-                {
-                    error_seen = true;
+                    ) {
+                        error_seen = true;
+                    }
                 }
 
                 maybe_backfill_turn_completed_items(
@@ -1052,10 +1049,21 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
         }
     }
 
+    let event_stream_error = (!terminal_notification_seen).then(|| {
+        "in-process app-server event stream closed before the turn reached a terminal state"
+            .to_string()
+    });
+    if let Some(message) = event_stream_error.as_ref() {
+        event_processor.process_event_stream_error(message.clone());
+    }
+
     if let Err(err) = client.shutdown().await {
         warn!("in-process app-server shutdown failed: {err}");
     }
-    event_processor.print_final_output();
+    event_processor.print_final_output()?;
+    if let Some(message) = event_stream_error {
+        anyhow::bail!(message);
+    }
     if error_seen {
         std::process::exit(1);
     }
@@ -1461,11 +1469,12 @@ async fn resolve_resume_thread_id(
     config: &Config,
     state_db: Option<&StateDbHandle>,
     args: &crate::cli::ResumeArgs,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<String> {
     let model_providers = resume_lookup_model_providers(config, args);
 
     if args.last {
         let mut cursor = None;
+        let mut cwd_filtered_out = false;
         loop {
             let response: ThreadListResponse = send_request_with_response(
                 client,
@@ -1493,22 +1502,37 @@ async fn resolve_resume_thread_id(
             for thread in response.data {
                 let latest_cwd = latest_thread_cwd(&thread).await;
                 if args.all || cwds_match(config.cwd.as_path(), latest_cwd.as_path()) {
-                    return Ok(Some(thread.id));
+                    return Ok(thread.id);
                 }
+                cwd_filtered_out = true;
             }
             let Some(next_cursor) = response.next_cursor else {
-                return Ok(None);
+                if cwd_filtered_out {
+                    anyhow::bail!(
+                        "resumable sessions were found for model provider `{}`, but none match the current working directory `{}`; use --all to ignore the working-directory filter",
+                        config.model_provider_id,
+                        config.cwd.display()
+                    );
+                }
+                if has_resumable_thread_for_any_provider(client).await? {
+                    anyhow::bail!(
+                        "resumable sessions were found, but none match model provider `{}`",
+                        config.model_provider_id
+                    );
+                }
+                anyhow::bail!("no resumable session found");
             };
             cursor = Some(next_cursor);
         }
     }
 
     let Some(session_id) = args.session_id.as_deref() else {
-        return Ok(None);
+        anyhow::bail!("resume requires a session ID or name, or the --last flag");
     };
     if Uuid::parse_str(session_id).is_ok() {
-        return Ok(Some(session_id.to_string()));
+        return Ok(session_id.to_string());
     }
+    let mut cwd_filtered_out = false;
     if let Some(state_db) = state_db {
         let cwd = (!args.all).then_some(config.cwd.as_path());
         let resolved = state_db
@@ -1521,14 +1545,16 @@ async fn resolve_resume_thread_id(
             )
             .await?;
         if let Some(thread) = resolved {
-            return Ok(Some(thread.id.to_string()));
+            return Ok(thread.id.to_string());
         }
         if let Some((_, session_meta)) =
             find_thread_meta_by_name_str(&config.codex_home, session_id, Some(state_db.as_ref()))
                 .await?
-            && (args.all || cwds_match(config.cwd.as_path(), &session_meta.meta.cwd))
         {
-            return Ok(Some(session_meta.meta.id.to_string()));
+            if args.all || cwds_match(config.cwd.as_path(), &session_meta.meta.cwd) {
+                return Ok(session_meta.meta.id.to_string());
+            }
+            cwd_filtered_out = true;
         }
     }
 
@@ -1563,14 +1589,50 @@ async fn resolve_resume_thread_id(
             }
             let latest_cwd = latest_thread_cwd(&thread).await;
             if args.all || cwds_match(config.cwd.as_path(), latest_cwd.as_path()) {
-                return Ok(Some(thread.id));
+                return Ok(thread.id);
             }
+            cwd_filtered_out = true;
         }
         let Some(next_cursor) = response.next_cursor else {
-            return Ok(None);
+            if cwd_filtered_out {
+                anyhow::bail!(
+                    "a resumable session named `{session_id}` was found, but it does not match the current working directory `{}`; use --all to ignore the working-directory filter",
+                    config.cwd.display()
+                );
+            }
+            anyhow::bail!("no resumable session named `{session_id}` found");
         };
         cursor = Some(next_cursor);
     }
+}
+
+async fn has_resumable_thread_for_any_provider(
+    client: &InProcessAppServerClient,
+) -> anyhow::Result<bool> {
+    let response: ThreadListResponse = send_request_with_response(
+        client,
+        ClientRequest::ThreadList {
+            request_id: RequestId::Integer(0),
+            params: ThreadListParams {
+                cursor: None,
+                limit: Some(1),
+                sort_key: Some(ThreadSortKey::UpdatedAt),
+                sort_direction: None,
+                model_providers: Some(Vec::new()),
+                source_kinds: Some(all_thread_source_kinds()),
+                archived: Some(false),
+                parent_thread_id: None,
+                ancestor_thread_id: None,
+                cwd: None,
+                use_state_db_only: false,
+                search_term: None,
+            },
+        },
+        "thread/list",
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    Ok(!response.data.is_empty())
 }
 
 fn resume_lookup_model_providers(

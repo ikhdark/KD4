@@ -1,3 +1,4 @@
+use chrono::Utc;
 use codex_agent_task_store::AgentReceipt;
 use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
@@ -8,19 +9,15 @@ use codex_agent_task_store::Assignment;
 use codex_agent_task_store::AssignmentDraft;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::Attempt;
-use codex_agent_task_store::AttemptId;
 use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::CriterionResult;
 use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::LocalAgentTaskStore;
-use codex_agent_task_store::ObservationKind;
 use codex_agent_task_store::ReceiptDraft;
-use codex_agent_task_store::RuntimeObservation;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::StoreResult;
 use codex_agent_task_store::ValidationCall;
-use codex_agent_task_store::WakeEventId;
-use codex_agent_task_store::WakeRead;
+use codex_agent_task_store::ValidationCallStatus;
 use codex_protocol::AgentPath;
 use codex_protocol::protocol::SessionSource;
 use codex_state::StateRuntime;
@@ -91,10 +88,6 @@ impl AgentTaskCoordinator {
                 .insert(binding.assignment_id, binding);
         }
         Ok(())
-    }
-
-    pub(crate) fn is_available(&self) -> bool {
-        self.store.get().is_some()
     }
 
     pub(crate) fn store(&self) -> Option<Arc<dyn AgentTaskStore>> {
@@ -178,20 +171,6 @@ impl AgentTaskCoordinator {
         self.refresh_binding(assignment_id).await
     }
 
-    pub(crate) async fn list_agent_task_bindings(
-        &self,
-        limit: Option<usize>,
-    ) -> StoreResult<Vec<AgentTaskBinding>> {
-        let bindings = self
-            .required_store()?
-            .list_agent_task_bindings(self.required_root_session_id()?, limit)
-            .await?;
-        for binding in &bindings {
-            self.remember_binding(binding.clone());
-        }
-        Ok(bindings)
-    }
-
     pub(crate) async fn refresh_binding(
         &self,
         assignment_id: AssignmentId,
@@ -206,30 +185,26 @@ impl AgentTaskCoordinator {
         Ok(binding)
     }
 
-    pub(crate) async fn append_observation(
+    pub(crate) async fn record_validation_call_for_source(
         &self,
-        attempt_id: AttemptId,
-        kind: ObservationKind,
-        summary: String,
-        call_id: Option<String>,
-    ) -> StoreResult<RuntimeObservation> {
+        session_source: &SessionSource,
+        call_id: String,
+        command_summary: String,
+        status: ValidationCallStatus,
+    ) -> StoreResult<bool> {
+        let Some(binding) = self.binding_for_source(session_source) else {
+            return Ok(false);
+        };
         self.required_store()?
-            .append_observation(attempt_id, kind, summary, call_id)
-            .await
-    }
-
-    pub(crate) async fn record_validation_call(&self, call: ValidationCall) -> StoreResult<()> {
-        self.required_store()?.record_validation_call(call).await
-    }
-
-    pub(crate) async fn read_wake_events(
-        &self,
-        after_event_id: Option<&str>,
-    ) -> StoreResult<WakeRead> {
-        let after_event_id = after_event_id.map(WakeEventId::parse).transpose()?;
-        self.required_store()?
-            .read_wake_events(self.required_root_session_id()?, after_event_id)
-            .await
+            .record_validation_call(ValidationCall {
+                call_id,
+                attempt_id: binding.attempt_id,
+                command_summary,
+                status,
+                recorded_at: Utc::now(),
+            })
+            .await?;
+        Ok(true)
     }
 
     pub(crate) async fn seal_missing_receipt(
@@ -242,8 +217,17 @@ impl AgentTaskCoordinator {
         };
         let store = self.required_store()?;
         let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
-        if task.receipt.is_some() || task.current_attempt.state != AttemptState::Active {
+        if task.current_attempt.attempt_id != binding.attempt_id
+            || task.receipt.is_some()
+            || task.current_attempt.state != AttemptState::Active
+        {
             return Ok(None);
+        }
+        if let Err(error) = store.finalize_pending_mutations(binding.attempt_id).await {
+            if binding_no_longer_needs_receipt(store.as_ref(), &binding).await? {
+                return Ok(None);
+            }
+            return Err(error);
         }
         let receipt = ReceiptDraft {
             status: AgentStatusClaim::NeedsMain,
@@ -266,25 +250,25 @@ impl AgentTaskCoordinator {
                 "main agent must inspect the task and decide the outcome".to_string(),
             ),
         };
-        store
+        match store
             .submit_agent_receipt(binding.attempt_id, receipt)
             .await
-            .map(Some)
+        {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(error) => {
+                if binding_no_longer_needs_receipt(store.as_ref(), &binding).await? {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     fn required_store(&self) -> StoreResult<Arc<dyn AgentTaskStore>> {
         self.store().ok_or_else(|| {
             StoreError::CorruptData(
                 "typed agent task store is unavailable for this legacy or uninitialized session"
-                    .to_string(),
-            )
-        })
-    }
-
-    fn required_root_session_id(&self) -> StoreResult<String> {
-        self.root_session_id().ok_or_else(|| {
-            StoreError::CorruptData(
-                "typed agent root session is unavailable for this legacy or uninitialized session"
                     .to_string(),
             )
         })
@@ -302,4 +286,14 @@ impl AgentTaskCoordinator {
             .by_assignment
             .insert(binding.assignment_id, binding);
     }
+}
+
+async fn binding_no_longer_needs_receipt(
+    store: &dyn AgentTaskStore,
+    binding: &AgentTaskBinding,
+) -> StoreResult<bool> {
+    let task = store.get_agent_task(binding.assignment_id, Some(0)).await?;
+    Ok(task.current_attempt.attempt_id != binding.attempt_id
+        || task.receipt.is_some()
+        || task.current_attempt.state != AttemptState::Active)
 }

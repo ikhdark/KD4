@@ -93,6 +93,7 @@ pub trait AgentTaskStore: Send + Sync {
 
     fn set_agent_gate(
         &self,
+        actor: TaskActor,
         assignment_id: AssignmentId,
         kind: GateKind,
         status: GateStatus,
@@ -127,6 +128,13 @@ pub trait AgentTaskStore: Send + Sync {
         repo_root: &'a Path,
         path: String,
     ) -> TaskStoreFuture<'a, MutationEvidence>;
+
+    /// Finalizes every mutation that was started for the active attempt, using the immutable
+    /// repository binding captured when its assignment was created.
+    fn finalize_pending_mutations(
+        &self,
+        attempt_id: AttemptId,
+    ) -> TaskStoreFuture<'_, Vec<MutationEvidence>>;
 
     fn list_mutation_evidence(
         &self,

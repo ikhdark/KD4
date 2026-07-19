@@ -260,7 +260,7 @@ impl ModelProviderInfo {
 
         let headers = self.build_header_map()?;
         let retry = ApiRetryConfig {
-            max_attempts: self.request_max_retries(),
+            max_retries: self.request_max_retries(),
             base_delay: Duration::from_millis(200),
             retry_429: false,
             retry_5xx: true,

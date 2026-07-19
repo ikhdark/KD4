@@ -10,7 +10,8 @@ use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_native_ancestor_with_markers;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
-use futures::future::join_all;
+use futures::StreamExt;
+use futures::stream;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
@@ -69,6 +70,8 @@ pub async fn get_git_repo_root_with_fs(
 /// Timeout for git commands to prevent freezing on large repositories
 const GIT_COMMAND_TIMEOUT: TokioDuration = TokioDuration::from_secs(5);
 const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+const UNTRACKED_DIFF_CONCURRENCY: usize = 8;
+const MAX_DIFF_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, TS)]
 pub struct GitInfo {
@@ -444,9 +447,19 @@ async fn run_git_command_with_timeout_from(
     cwd: &Path,
     fsmonitor: crate::FsmonitorOverride,
 ) -> Option<std::process::Output> {
-    let command_args = git_inspection_args(args, fsmonitor, None);
+    let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+    run_git_command_with_timeout_os_from(git, &args, cwd, fsmonitor).await
+}
+
+async fn run_git_command_with_timeout_os_from(
+    git: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    fsmonitor: crate::FsmonitorOverride,
+) -> Option<std::process::Output> {
+    let command_args = git_inspection_args_os(args, fsmonitor, None);
     let output = run_git_command_attempt(git, &command_args, cwd).await?;
-    let Some(retry_args) = safe_directory_retry_args(
+    let Some(retry_args) = safe_directory_retry_args_os(
         args,
         cwd,
         fsmonitor,
@@ -459,46 +472,50 @@ async fn run_git_command_with_timeout_from(
     run_git_command_attempt(git, &retry_args, cwd).await
 }
 
-fn safe_directory_retry_args(
-    args: &[&str],
+fn safe_directory_retry_args_os(
+    args: &[OsString],
     cwd: &Path,
     fsmonitor: crate::FsmonitorOverride,
     status_success: bool,
     stderr: &[u8],
 ) -> Option<Vec<OsString>> {
-    if !is_passive_git_inspection(args) || !is_dubious_ownership_stderr(status_success, stderr) {
+    if !is_passive_git_inspection_os(args) || !is_dubious_ownership_stderr(status_success, stderr) {
         return None;
     }
     let repo_root = get_git_repo_root(cwd)?;
-    Some(git_inspection_args(
+    Some(git_inspection_args_os(
         args,
         fsmonitor,
         Some(repo_root.as_path()),
     ))
 }
 
-fn is_passive_git_inspection(args: &[&str]) -> bool {
-    match args {
-        ["remote"] | ["remote", "-v"] | ["remote", "get-url", _] => true,
-        [command, ..] => matches!(
-            *command,
-            "branch"
-                | "diff"
-                | "for-each-ref"
-                | "log"
-                | "ls-files"
-                | "merge-base"
-                | "rev-list"
-                | "rev-parse"
-                | "status"
-                | "symbolic-ref"
-        ),
-        [] => false,
+fn is_passive_git_inspection_os(args: &[OsString]) -> bool {
+    let Some(command) = args.first().and_then(|arg| arg.to_str()) else {
+        return false;
+    };
+    if command == "remote" {
+        return matches!(args, [_])
+            || matches!(args, [_, option] if option == "-v")
+            || matches!(args, [_, subcommand, _] if subcommand == "get-url");
     }
+    matches!(
+        command,
+        "branch"
+            | "diff"
+            | "for-each-ref"
+            | "log"
+            | "ls-files"
+            | "merge-base"
+            | "rev-list"
+            | "rev-parse"
+            | "status"
+            | "symbolic-ref"
+    )
 }
 
-fn git_inspection_args(
-    args: &[&str],
+fn git_inspection_args_os(
+    args: &[OsString],
     fsmonitor: crate::FsmonitorOverride,
     safe_directory: Option<&Path>,
 ) -> Vec<OsString> {
@@ -507,15 +524,16 @@ fn git_inspection_args(
         OsString::from(format!("core.hooksPath={DISABLED_HOOKS_PATH}")),
         OsString::from("-c"),
         OsString::from(fsmonitor.git_config_arg()),
+        OsString::from("-c"),
+        OsString::from("core.quotePath=true"),
     ];
     if let Some(safe_directory) = safe_directory {
         command_args.push(OsString::from("-c"));
-        command_args.push(OsString::from(format!(
-            "safe.directory={}",
-            safe_directory.to_string_lossy()
-        )));
+        let mut safe_directory_arg = OsString::from("safe.directory=");
+        safe_directory_arg.push(safe_directory.as_os_str());
+        command_args.push(safe_directory_arg);
     }
-    command_args.extend(args.iter().map(OsString::from));
+    command_args.extend(args.iter().cloned());
     command_args
 }
 
@@ -586,7 +604,10 @@ async fn get_default_branch(cwd: &Path) -> Option<String> {
             && let Ok(sym) = String::from_utf8(symref_output.stdout)
         {
             let trimmed = sym.trim();
-            if let Some((_, name)) = trimmed.rsplit_once('/') {
+            if let Some(name) = trimmed.strip_prefix(&format!("refs/remotes/{remote}/"))
+                && !name.is_empty()
+                && name != "HEAD"
+            {
                 return Some(name.to_string());
             }
         }
@@ -684,6 +705,7 @@ async fn branch_ancestry(cwd: &Path) -> Option<Vec<String>> {
                 // Expect format like: "origin/feature"; extract the branch path after "remote/"
                 if let Some(stripped) = short.strip_prefix(&format!("{remote}/"))
                     && !stripped.is_empty()
+                    && stripped != "HEAD"
                     && !seen.contains(stripped)
                 {
                     seen.insert(stripped.to_string());
@@ -697,18 +719,21 @@ async fn branch_ancestry(cwd: &Path) -> Option<Vec<String>> {
     Some(ancestry)
 }
 
-// Helper for a single branch: return the remote SHA if present on any remote
-// and the distance (commits ahead of HEAD) for that branch. The first item is
-// None if the branch is not present on any remote. Returns None if distance
-// could not be computed due to git errors/timeouts.
-async fn branch_remote_and_distance(
+// Helper for a single branch: return its merge base with the first matching
+// remote ref and the number of local commits since that base. The first item
+// is None if the branch is not present on any remote. Returns None if Git could
+// not be queried because of process errors or timeouts.
+async fn branch_merge_base_and_distance(
     cwd: &Path,
     branch: &str,
     remotes: &[String],
 ) -> Option<(Option<GitSha>, usize)> {
-    // Try to find the first remote ref that exists for this branch (origin prioritized by caller).
-    let mut found_remote_sha: Option<GitSha> = None;
-    let mut found_remote_ref: Option<String> = None;
+    if branch == "HEAD" {
+        return Some((None, 0));
+    }
+
+    // Try the first remote ref that exists for this branch (origin prioritized
+    // by the caller) and shares history with HEAD.
     for remote in remotes {
         let remote_ref = format!("refs/remotes/{remote}/{branch}");
         let Some(verify_output) =
@@ -722,70 +747,49 @@ async fn branch_remote_and_distance(
         if !verify_output.status.success() {
             continue;
         }
-        let Ok(sha) = String::from_utf8(verify_output.stdout) else {
-            // Mirror previous behavior and skip the entire branch on parse failure.
+
+        let Some(merge_base_output) =
+            run_git_command_with_timeout(&["merge-base", "HEAD", &remote_ref], cwd).await
+        else {
             return None;
         };
-        found_remote_sha = Some(GitSha::new(sha.trim()));
-        found_remote_ref = Some(remote_ref);
-        break;
-    }
+        if !merge_base_output.status.success() {
+            continue;
+        }
+        let Ok(merge_base_text) = String::from_utf8(merge_base_output.stdout) else {
+            return None;
+        };
+        let merge_base = GitSha::new(merge_base_text.trim());
 
-    // Compute distance as the number of commits HEAD is ahead of the branch.
-    // Prefer local branch name if it exists; otherwise fall back to the remote ref (if any).
-    let count_output = if let Some(local_count) =
-        run_git_command_with_timeout(&["rev-list", "--count", &format!("{branch}..HEAD")], cwd)
-            .await
-    {
-        if local_count.status.success() {
-            local_count
-        } else if let Some(remote_ref) = &found_remote_ref {
-            match run_git_command_with_timeout(
-                &["rev-list", "--count", &format!("{remote_ref}..HEAD")],
-                cwd,
-            )
-            .await
-            {
-                Some(remote_count) => remote_count,
-                None => return None,
-            }
-        } else {
+        let range = format!("{}..HEAD", merge_base.0);
+        let Some(count_output) =
+            run_git_command_with_timeout(&["rev-list", "--count", &range], cwd).await
+        else {
+            return None;
+        };
+        if !count_output.status.success() {
             return None;
         }
-    } else if let Some(remote_ref) = &found_remote_ref {
-        match run_git_command_with_timeout(
-            &["rev-list", "--count", &format!("{remote_ref}..HEAD")],
-            cwd,
-        )
-        .await
-        {
-            Some(remote_count) => remote_count,
-            None => return None,
-        }
-    } else {
-        return None;
-    };
+        let Ok(distance_text) = String::from_utf8(count_output.stdout) else {
+            return None;
+        };
+        let Ok(distance) = distance_text.trim().parse::<usize>() else {
+            return None;
+        };
 
-    if !count_output.status.success() {
-        return None;
+        return Some((Some(merge_base), distance));
     }
-    let Ok(distance_str) = String::from_utf8(count_output.stdout) else {
-        return None;
-    };
-    let Ok(distance) = distance_str.trim().parse::<usize>() else {
-        return None;
-    };
 
-    Some((found_remote_sha, distance))
+    Some((None, 0))
 }
 
-// Finds the closest sha that exist on any of branches and also exists on any of the remotes.
+// Finds the closest merge base between HEAD and any matching remote branch.
 async fn find_closest_sha(cwd: &Path, branches: &[String], remotes: &[String]) -> Option<GitSha> {
     // A sha and how many commits away from HEAD it is.
     let mut closest_sha: Option<(GitSha, usize)> = None;
     for branch in branches {
         let Some((maybe_remote_sha, distance)) =
-            branch_remote_and_distance(cwd, branch, remotes).await
+            branch_merge_base_and_distance(cwd, branch, remotes).await
         else {
             continue;
         };
@@ -820,54 +824,83 @@ async fn diff_against_sha(cwd: &Path, sha: &GitSha) -> Option<String> {
     if !exit_ok {
         return None;
     }
+    if output.stdout.len() > MAX_DIFF_OUTPUT_BYTES {
+        return None;
+    }
     let mut diff = String::from_utf8(output.stdout).ok()?;
 
-    if let Some(untracked_output) = run_git_command_with_timeout_from(
+    let untracked_output = run_git_command_with_timeout_from(
         git,
-        &["ls-files", "--others", "--exclude-standard"],
+        &["ls-files", "-z", "--others", "--exclude-standard"],
         cwd,
         fsmonitor,
     )
-    .await
-        && untracked_output.status.success()
-    {
-        let untracked: Vec<String> = String::from_utf8(untracked_output.stdout)
-            .ok()?
-            .lines()
-            .map(str::to_string)
-            .filter(|s| !s.is_empty())
-            .collect();
+    .await?;
+    if !untracked_output.status.success() {
+        return None;
+    }
+    if untracked_output.stdout.len() > MAX_DIFF_OUTPUT_BYTES {
+        return None;
+    }
+    let untracked = parse_nul_terminated_paths(untracked_output.stdout)?;
 
-        if !untracked.is_empty() {
-            // Use platform-appropriate null device and guard paths with `--`.
-            let null_device: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
-            let futures_iter = untracked.into_iter().map(|file| async move {
-                let file_owned = file;
-                let args_vec: Vec<&str> = vec![
-                    "diff",
-                    "--no-textconv",
-                    "--no-ext-diff",
-                    "--binary",
-                    "--no-index",
-                    // -- ensures that filenames that start with - are not treated as options.
-                    "--",
-                    null_device,
-                    &file_owned,
-                ];
-                run_git_command_with_timeout_from(git, &args_vec, cwd, fsmonitor).await
-            });
-            let results = join_all(futures_iter).await;
-            for extra in results.into_iter().flatten() {
-                if extra.status.code().is_some_and(|c| c == 0 || c == 1)
-                    && let Ok(s) = String::from_utf8(extra.stdout)
-                {
-                    diff.push_str(&s);
-                }
+    if !untracked.is_empty() {
+        // Use platform-appropriate null device and guard paths with `--`.
+        let null_device = OsString::from(if cfg!(windows) { "NUL" } else { "/dev/null" });
+        let futures = untracked.into_iter().map(|file| {
+            let args = vec![
+                OsString::from("diff"),
+                OsString::from("--no-textconv"),
+                OsString::from("--no-ext-diff"),
+                OsString::from("--binary"),
+                OsString::from("--no-index"),
+                // -- ensures that filenames that start with - are not treated as options.
+                OsString::from("--"),
+                null_device.clone(),
+                file,
+            ];
+            async move { run_git_command_with_timeout_os_from(git, &args, cwd, fsmonitor).await }
+        });
+        let mut results = stream::iter(futures).buffered(UNTRACKED_DIFF_CONCURRENCY);
+        while let Some(extra) = results.next().await {
+            let extra = extra?;
+            if !extra
+                .status
+                .code()
+                .is_some_and(|code| code == 0 || code == 1)
+            {
+                return None;
             }
+            let new_len = diff.len().checked_add(extra.stdout.len())?;
+            if new_len > MAX_DIFF_OUTPUT_BYTES {
+                return None;
+            }
+            diff.push_str(&String::from_utf8(extra.stdout).ok()?);
         }
     }
 
     Some(diff)
+}
+
+fn parse_nul_terminated_paths(output: Vec<u8>) -> Option<Vec<OsString>> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(os_string_from_git_bytes)
+        .collect()
+}
+
+fn os_string_from_git_bytes(bytes: &[u8]) -> Option<OsString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        Some(OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes.to_vec()).ok().map(OsString::from)
+    }
 }
 
 /// Resolve the path that should be used for trust checks. Similar to
@@ -976,7 +1009,119 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::process::Command as StdCommand;
+
+    fn run_git(cwd: &Path, args: &[&str]) -> String {
+        let output = StdCommand::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("run git command");
+        assert!(
+            output.status.success(),
+            "git command failed: {args:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn os_args(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn init_repo_with_remote(temp: &tempfile::TempDir) -> (PathBuf, PathBuf, String, String) {
+        let repo = temp.path().join("repo");
+        let remote = temp.path().join("remote.git");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        run_git(&repo, &["init"]);
+        run_git(&repo, &["config", "core.autocrlf", "false"]);
+        run_git(&repo, &["config", "user.email", "test@example.com"]);
+        run_git(&repo, &["config", "user.name", "Test User"]);
+        std::fs::write(repo.join("tracked.txt"), "base\n").expect("write tracked file");
+        run_git(&repo, &["add", "tracked.txt"]);
+        run_git(&repo, &["commit", "-m", "base"]);
+        let branch = run_git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+        let base_sha = run_git(&repo, &["rev-parse", "HEAD"]);
+
+        run_git(temp.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        run_git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_git(&repo, &["push", "-u", "origin", &branch]);
+        run_git(
+            &remote,
+            &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
+        );
+
+        (repo, remote, branch, base_sha)
+    }
+
+    #[test]
+    fn nul_terminated_paths_preserve_embedded_whitespace() {
+        let paths = parse_nul_terminated_paths(b"tab\tname.txt\0line\nname.txt\0".to_vec())
+            .expect("parse paths");
+        assert_eq!(
+            paths,
+            vec![
+                OsString::from("tab\tname.txt"),
+                OsString::from("line\nname.txt")
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nul_terminated_paths_preserve_non_utf8_bytes() {
+        let paths =
+            parse_nul_terminated_paths(b"non-utf8-\xff.txt\0".to_vec()).expect("parse paths");
+        assert_eq!(paths[0].as_os_str().as_bytes(), b"non-utf8-\xff.txt");
+    }
+
+    #[tokio::test]
+    async fn diff_to_remote_includes_quoted_unicode_untracked_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, _remote, _branch, _base_sha) = init_repo_with_remote(&temp);
+        std::fs::write(repo.join("é.txt"), "quoted path contents\n").expect("write untracked file");
+
+        let state = git_diff_to_remote(&repo).await.expect("diff to remote");
+
+        assert!(state.diff.contains("\\303\\251.txt"));
+        assert!(state.diff.contains("+quoted path contents"));
+    }
+
+    #[tokio::test]
+    async fn diff_to_remote_uses_merge_base_after_remote_diverges() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (repo, remote, branch, base_sha) = init_repo_with_remote(&temp);
+        let writer = temp.path().join("writer");
+        run_git(
+            temp.path(),
+            &["clone", remote.to_str().unwrap(), writer.to_str().unwrap()],
+        );
+        run_git(&writer, &["config", "user.email", "test@example.com"]);
+        run_git(&writer, &["config", "user.name", "Test User"]);
+        std::fs::write(writer.join("remote-only.txt"), "remote only\n")
+            .expect("write remote-only file");
+        run_git(&writer, &["add", "remote-only.txt"]);
+        run_git(&writer, &["commit", "-m", "remote change"]);
+        run_git(&writer, &["push", "origin", &branch]);
+        run_git(&repo, &["fetch", "origin"]);
+
+        std::fs::write(repo.join("local-only.txt"), "local only\n").expect("write local-only file");
+        run_git(&repo, &["add", "local-only.txt"]);
+        run_git(&repo, &["commit", "-m", "local change"]);
+
+        let state = git_diff_to_remote(&repo).await.expect("diff to remote");
+
+        assert_eq!(state.sha, GitSha::new(&base_sha));
+        assert!(state.diff.contains("local-only.txt"));
+        assert!(!state.diff.contains("remote-only.txt"));
+    }
 
     #[test]
     fn canonicalize_git_remote_url_normalizes_github_variants() {
@@ -1035,14 +1180,12 @@ mod tests {
         let disabled_hooks = format!("core.hooksPath={DISABLED_HOOKS_PATH}");
         let safe_directory = format!("safe.directory={}", repo.path().to_string_lossy());
 
-        let initial = git_inspection_args(
-            &["status", "--porcelain"],
-            crate::FsmonitorOverride::Disabled,
-            None,
-        )
-        .into_iter()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
+        let initial_args = os_args(&["status", "--porcelain"]);
+        let initial =
+            git_inspection_args_os(&initial_args, crate::FsmonitorOverride::Disabled, None)
+                .into_iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
         assert_eq!(
             initial,
             vec![
@@ -1050,13 +1193,16 @@ mod tests {
                 disabled_hooks.as_str(),
                 "-c",
                 "core.fsmonitor=false",
+                "-c",
+                "core.quotePath=true",
                 "status",
                 "--porcelain",
             ]
         );
 
-        let retry = git_inspection_args(
-            &["status", "--porcelain"],
+        let retry_args = os_args(&["status", "--porcelain"]);
+        let retry = git_inspection_args_os(
+            &retry_args,
             crate::FsmonitorOverride::Disabled,
             Some(repo.path()),
         )
@@ -1070,6 +1216,8 @@ mod tests {
                 disabled_hooks.as_str(),
                 "-c",
                 "core.fsmonitor=false",
+                "-c",
+                "core.quotePath=true",
                 "-c",
                 safe_directory.as_str(),
                 "status",
@@ -1088,8 +1236,9 @@ mod tests {
             To add an exception for this directory, call:\n\n\
             \tgit config --global --add safe.directory C:/repo\n";
 
-        let retry = safe_directory_retry_args(
-            &["rev-parse", "HEAD"],
+        let inspect_args = os_args(&["rev-parse", "HEAD"]);
+        let retry = safe_directory_retry_args_os(
+            &inspect_args,
             &subdir,
             crate::FsmonitorOverride::Disabled,
             false,
@@ -1105,8 +1254,8 @@ mod tests {
 
         let outside = tempfile::tempdir().expect("create non-repo temp dir");
         assert!(
-            safe_directory_retry_args(
-                &["rev-parse", "HEAD"],
+            safe_directory_retry_args_os(
+                &inspect_args,
                 outside.path(),
                 crate::FsmonitorOverride::Disabled,
                 false,
@@ -1116,8 +1265,8 @@ mod tests {
             "do not add safe.directory when no repo root is discovered"
         );
         assert!(
-            safe_directory_retry_args(
-                &["rev-parse", "HEAD"],
+            safe_directory_retry_args_os(
+                &inspect_args,
                 &subdir,
                 crate::FsmonitorOverride::Disabled,
                 false,
@@ -1134,9 +1283,10 @@ mod tests {
             &["remote", "show", "origin"][..],
             &["submodule", "update", "--init"][..],
         ] {
+            let active_os_args = os_args(active_args);
             assert!(
-                safe_directory_retry_args(
-                    active_args,
+                safe_directory_retry_args_os(
+                    &active_os_args,
                     &subdir,
                     crate::FsmonitorOverride::Disabled,
                     false,
@@ -1237,7 +1387,9 @@ mod tests {
                 "config --null --get core.fsmonitor".to_string(),
                 "config --null --type=bool --fixed-value --get core.fsmonitor /tmp/fsmonitor-helper"
                     .to_string(),
-                format!("-c {disabled_hooks} -c core.fsmonitor=false status --porcelain"),
+                format!(
+                    "-c {disabled_hooks} -c core.fsmonitor=false -c core.quotePath=true status --porcelain"
+                ),
             ]
         );
     }

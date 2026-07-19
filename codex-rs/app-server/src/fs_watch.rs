@@ -1,3 +1,4 @@
+use crate::error_code::internal_error;
 use crate::error_code::invalid_request;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
@@ -29,7 +30,7 @@ const FS_CHANGED_NOTIFICATION_DEBOUNCE: Duration = Duration::from_millis(200);
 #[derive(Clone)]
 pub(crate) struct FsWatchManager {
     outgoing: Arc<OutgoingMessageSender>,
-    file_watcher: Arc<FileWatcher>,
+    file_watcher: Option<Arc<FileWatcher>>,
     state: Arc<AsyncMutex<FsWatchState>>,
 }
 
@@ -53,22 +54,27 @@ struct WatchKey {
 impl FsWatchManager {
     pub(crate) fn new(outgoing: Arc<OutgoingMessageSender>) -> Self {
         let file_watcher = match FileWatcher::new() {
-            Ok(file_watcher) => Arc::new(file_watcher),
+            Ok(file_watcher) => Some(Arc::new(file_watcher)),
             Err(err) => {
-                warn!("filesystem watch manager falling back to noop core watcher: {err}");
-                Arc::new(FileWatcher::noop())
+                warn!("filesystem watch manager unavailable: {err}");
+                None
             }
         };
-        Self::new_with_file_watcher(outgoing, file_watcher)
+        Self {
+            outgoing,
+            file_watcher,
+            state: Arc::new(AsyncMutex::new(FsWatchState::default())),
+        }
     }
 
+    #[cfg(test)]
     fn new_with_file_watcher(
         outgoing: Arc<OutgoingMessageSender>,
         file_watcher: Arc<FileWatcher>,
     ) -> Self {
         Self {
             outgoing,
-            file_watcher,
+            file_watcher: Some(file_watcher),
             state: Arc::new(AsyncMutex::new(FsWatchState::default())),
         }
     }
@@ -83,13 +89,19 @@ impl FsWatchManager {
             connection_id,
             watch_id: watch_id.clone(),
         };
+        let file_watcher = self
+            .file_watcher
+            .as_ref()
+            .ok_or_else(|| internal_error("filesystem watching is unavailable"))?;
         let outgoing = self.outgoing.clone();
-        let (subscriber, rx) = self.file_watcher.add_subscriber();
+        let (subscriber, rx) = file_watcher.add_subscriber();
         let watch_root = params.path.clone();
-        let registration = subscriber.register_paths(vec![WatchPath {
-            path: params.path.to_path_buf(),
-            recursive: false,
-        }]);
+        let registration = subscriber
+            .register_paths(vec![WatchPath {
+                path: params.path.to_path_buf(),
+                recursive: false,
+            }])
+            .map_err(|err| internal_error(format!("failed to register filesystem watch: {err}")))?;
         let (terminate_tx, terminate_rx) = oneshot::channel();
 
         match self.state.lock().await.entries.entry(watch_key) {
@@ -125,7 +137,11 @@ impl FsWatchManager {
                     .into_iter()
                     .map(|path| watch_root.join(path))
                     .collect::<Vec<_>>();
+                if event.rescan_required {
+                    changed_paths.push(watch_root.clone());
+                }
                 changed_paths.sort_by(|left, right| left.as_path().cmp(right.as_path()));
+                changed_paths.dedup();
                 if !changed_paths.is_empty() {
                     outgoing
                         .send_server_notification_to_connection_and_wait(
@@ -200,6 +216,41 @@ mod tests {
             )),
             Arc::new(FileWatcher::noop()),
         )
+    }
+
+    fn manager_without_watcher() -> FsWatchManager {
+        const OUTGOING_BUFFER: usize = 1;
+        let (tx, _rx) = mpsc::channel(OUTGOING_BUFFER);
+        FsWatchManager {
+            outgoing: Arc::new(OutgoingMessageSender::new(
+                tx,
+                codex_analytics::AnalyticsEventsClient::disabled(),
+            )),
+            file_watcher: None,
+            state: Arc::new(AsyncMutex::new(FsWatchState::default())),
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_fails_when_the_core_watcher_is_unavailable() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let head_path = temp_dir.path().join("HEAD");
+        std::fs::write(&head_path, "ref: refs/heads/main\n").expect("write HEAD");
+
+        let manager = manager_without_watcher();
+        let error = manager
+            .watch(
+                ConnectionId(1),
+                FsWatchParams {
+                    watch_id: "watch-head".to_string(),
+                    path: absolute_path(head_path),
+                },
+            )
+            .await
+            .expect_err("watch should fail");
+
+        assert_eq!(error.message, "filesystem watching is unavailable");
+        assert!(manager.state.lock().await.entries.is_empty());
     }
 
     #[tokio::test]

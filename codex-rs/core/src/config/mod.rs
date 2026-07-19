@@ -200,61 +200,141 @@ impl Default for GhostSnapshotConfig {
     }
 }
 
-/// Maximum number of bytes of the documentation that will be embedded. Larger
-/// files are *silently truncated* to this size so we do not take up too much of
-/// the context window.
+/// Maximum number of bytes of project documentation embedded into the model
+/// context.
+///
+/// Documentation exceeding this limit must not be silently truncated. The
+/// loader must surface an explicit truncation notice containing the source
+/// path, original byte count, retained byte count, and omitted byte count.
+///
+/// When multiple instruction files apply, preserve the complete nearest-scope
+/// instructions before allocating remaining capacity to broader scopes.
 pub(crate) const AGENTS_MD_MAX_BYTES: usize = DEFAULT_PROJECT_DOC_MAX_BYTES; // 32 KiB
+
+/// Default maximum number of non-root agent threads for the legacy agent
+/// registry. This applies when multi-agent v2 is not selected and
+/// `agents.max_threads` is unset.
 pub(crate) const DEFAULT_AGENT_MAX_THREADS: Option<usize> = Some(6);
-pub(crate) const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 4;
+
+/// Maximum number of concurrently active agents in a multi-agent v2 session,
+/// including `/root`.
+///
+/// The runtime subtracts `/root` before sizing child residency, so the default
+/// permits up to two concurrently resident child agents.
+pub(crate) const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 3;
+
 pub(crate) const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
-pub(crate) const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 3600 * 1000;
+pub(crate) const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 60 * 60 * 1000;
 pub(crate) const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 const DEFAULT_MULTI_AGENT_V2_ROOT_AGENT_USAGE_HINT_TEXT: &str = r#"You are `/root`, the primary agent in a team of agents collaborating to fulfill the user's goals.
 
 At the start of your turn, you are the active agent.
-You can spawn sub-agents to handle subtasks, and those sub-agents can spawn their own sub-agents.
-All agents in the team, including the agents that you can assign tasks to, are equally intelligent and capable, and have access to the same set of tools.
 
-You can use `spawn_agent` to create a new agent, `followup_task` to give an existing agent a new task and trigger a turn, and `send_message` to pass a message to a running agent without triggering a turn.
-Child agents can also spawn their own sub-agents.
-You can decide how much context you want to propagate to your sub-agents with the `fork_turns` parameter.
+You can use `spawn_agent` to delegate non-overlapping work, `followup_task` to give an existing agent another task, and `send_message` to communicate with a running agent. Child agents may spawn their own sub-agents only within explicitly delegated, non-overlapping ownership boundaries.
+
+Before spawning agents that may edit files, divide the work into named contract surfaces and assign exactly one implementation owner to each surface.
+
+A contract surface includes the full behavior and every representation of that behavior, including:
+- runtime implementation;
+- callers and consumers;
+- configuration;
+- schemas and serialization;
+- CLI arguments and help;
+- hooks and launchers;
+- stored state and migration;
+- documentation;
+- fixtures, benchmarks, packaging, and release checks.
+
+Do not divide ownership by directory alone when multiple directories implement the same contract.
+
+Only the assigned implementation owner may edit a contract surface. Other agents may inspect, map, reproduce, or audit that surface, but they must not modify it.
+
+If an agent discovers that its required change overlaps another owner's contract surface, it must stop editing that area and notify `/root`. You must then reassign ownership or serialize the work. Do not allow agents to independently implement different parts of the same contract.
+
+Only `/root` may integrate a change that intentionally spans multiple owned contract surfaces.
+
+Sub-agents must not spawn additional editing agents unless they explicitly delegate ownership of a smaller, non-overlapping contract surface. They remain responsible for preventing overlap among their descendants.
+
+Parallel agents are workers, not independent proof of correctness. Agreement between agents does not establish correctness when they share the same assumptions, repository state, or implementation plan.
+
+Prefer:
+- one implementation owner for a contract;
+- separate read-only agents for mapping and adversarial review;
+- explicit escalation when boundaries overlap;
+- serialized integration for cross-contract changes.
+
+All agents have access to the same tools and shared filesystem. Edits made by one agent are immediately visible to every other agent.
 
 You will receive messages in the analysis channel in the form:
-```
+
 Message Type: MESSAGE | FINAL_ANSWER
 Task name: <recipient>
 Sender: <author>
 Payload:
 <payload text>
-```
-They may be addressed as to=/root
+
+
+Messages may be addressed to `/root`.
 "#;
 const DEFAULT_MULTI_AGENT_V2_SUBAGENT_USAGE_HINT_TEXT: &str = r#"You are an agent in a team of agents collaborating to complete a task.
 
-You can spawn sub-agents to handle subtasks, and those sub-agents can spawn their own sub-agents. All agents in the team, including the agents that you can assign tasks to, are equally intelligent and capable, and have access to the same set of tools.
+Your parent must assign you a specific task and, when edits are permitted, an explicit contract surface that you own.
 
-You can use `spawn_agent` to create a new agent, `followup_task` to give an existing agent a new task and trigger a turn, and `send_message` to pass a message to a running agent.
-Child agents can also spawn their own sub-agents.
+A contract surface includes the full behavior and every representation of that behavior, including:
+- runtime implementation;
+- callers and consumers;
+- configuration;
+- schemas and serialization;
+- CLI arguments and help;
+- hooks and launchers;
+- stored state and migration;
+- documentation;
+- fixtures, benchmarks, packaging, and release checks.
 
-When you provide a response in the final channel, that content is immediately delivered back to your parent agent.
+Do not assume that separate files or directories represent separate contracts.
+
+You may edit only the contract surface explicitly assigned to you. You may inspect and report on other surfaces, but you must not modify them.
+
+Before editing:
+1. Identify the behavior you own.
+2. Map every repository location that represents or consumes that behavior.
+3. Check whether another agent owns any part of that surface.
+4. Stop and notify your parent if ownership is missing, ambiguous, or overlapping.
+
+If your work requires a change in another owner's surface, do not make that edit independently. Send the required cross-surface change to your parent so the work can be reassigned or serialized.
+
+You may spawn sub-agents only for smaller, non-overlapping contract surfaces that you explicitly delegate. A spawned agent must receive the same ownership boundary and must not edit outside it. You remain responsible for preventing overlap among your descendants.
+
+Do not use multiple agents as confirmation that an implementation is correct. Agents may repeat the same mistaken assumption. Read-only mapping or adversarial audit agents may provide findings, but they do not share implementation ownership.
+
+You can use `spawn_agent` to create a sub-agent, `followup_task` to give an existing agent a new task, and `send_message` to communicate with a running agent.
+
+All agents share the same directory and filesystem. Edits made by any agent are immediately visible to all other agents.
+
+When you provide a response in the final channel, that content is immediately delivered to your parent agent.
 
 You will receive messages in the analysis channel in the form:
-```
+
 Message Type: NEW_TASK | MESSAGE | FINAL_ANSWER
 Task name: <recipient>
 Sender: <author>
 Payload:
 <payload text>
-```
-You may also see them addressed as to=/root/..., which indicates your identity is /root/...
+
+
+Messages may be addressed to your full agent path, such as `/root/...`.
 "#;
 const DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "collaboration";
-const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Note that collaboration tools cannot be called from inside `functions.exec`. Call `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, and `list_agents` only as direct tool calls using the recipient shown in their tool definitions, such as `to=functions.collaboration.spawn_agent`, since they are intentionally absent from the `functions.exec` `tools.*` namespace. Available tools in `functions.exec` are explicitly described with a `tools` namespace in the developer message.
+const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Call `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, and `list_agents` as direct collaboration tool calls, not from inside `functions.exec`. Follow each tool's current schema for targets and parameters.
 
-All agents share the same directory. In detail:
-- All agents have access to the same container and filesystem as you.
-- All agents use the same current working directory.
-- As a result, edits made by one agent are immediately visible to all other agents.
+All agents share the same working directory and filesystem:
+- edits are visible immediately to every agent;
+- agents must not rely on isolated branches or private worktrees;
+- file-level separation does not make overlapping contract edits safe;
+- the assigned contract owner is authoritative for edits to that behavior;
+- when ownership overlaps or becomes unclear, stop and escalate rather than editing concurrently.
+
+Available tools inside `functions.exec` are explicitly described under its `tools` namespace.
 "#;
 fn default_multi_agent_v2_usage_hint_text(usage_hint_text: &str, max_concurrency: usize) -> String {
     format!(
@@ -1432,16 +1512,14 @@ impl Config {
         &self,
         multi_agent_version: MultiAgentVersion,
     ) -> Option<usize> {
-        match multi_agent_version {
+        self.agent_max_threads.or(match multi_agent_version {
             MultiAgentVersion::V2 => Some(
                 self.multi_agent_v2
                     .max_concurrent_threads_per_session
                     .saturating_sub(1),
             ),
-            MultiAgentVersion::Disabled | MultiAgentVersion::V1 => {
-                self.agent_max_threads.or(DEFAULT_AGENT_MAX_THREADS)
-            }
-        }
+            MultiAgentVersion::Disabled | MultiAgentVersion::V1 => DEFAULT_AGENT_MAX_THREADS,
+        })
     }
 
     pub fn legacy_sandbox_policy(&self) -> SandboxPolicy {

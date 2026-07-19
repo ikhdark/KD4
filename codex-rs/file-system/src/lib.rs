@@ -18,6 +18,7 @@ use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use futures::Stream;
+use futures::StreamExt;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::future::Future;
@@ -251,6 +252,21 @@ impl Stream for FileSystemReadStream {
     }
 }
 
+async fn collect_bounded_read(
+    mut stream: FileSystemReadStream,
+    max_bytes: usize,
+) -> FileSystemResult<Option<Vec<u8>>> {
+    let mut bytes = Vec::with_capacity(max_bytes.min(FILE_READ_CHUNK_SIZE));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+            return Ok(None);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(Some(bytes))
+}
+
 /// Abstract filesystem access used by components that may operate locally or via
 /// a remote environment.
 pub trait ExecutorFileSystem: Send + Sync {
@@ -273,6 +289,35 @@ pub trait ExecutorFileSystem: Send + Sync {
         path: &'a PathUri,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream>;
+
+    /// Reads a stable snapshot of at most `max_bytes`.
+    ///
+    /// Returns `None` if the file exceeds the limit or two bounded reads do not
+    /// return identical bytes. Implementations that can also inspect native file
+    /// metadata or identity should override this method to reject replacements
+    /// and changes observed during either read.
+    fn read_file_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            let Some(first) =
+                collect_bounded_read(self.read_file_stream(path, sandbox).await?, max_bytes)
+                    .await?
+            else {
+                return Ok(None);
+            };
+            let Some(second) =
+                collect_bounded_read(self.read_file_stream(path, sandbox).await?, max_bytes)
+                    .await?
+            else {
+                return Ok(None);
+            };
+            Ok((first == second).then_some(first))
+        })
+    }
 
     /// Reads a file and decodes it as UTF-8 text.
     fn read_file_text<'a>(

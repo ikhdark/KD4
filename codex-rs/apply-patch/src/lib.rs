@@ -688,6 +688,14 @@ async fn derive_new_contents_from_chunks(
         })
     })?;
 
+    if chunks.is_empty() {
+        let new_contents = original_contents.clone();
+        return Ok(AppliedPatch {
+            original_contents,
+            new_contents,
+        });
+    }
+
     let mut original_lines: Vec<String> = original_contents.split('\n').map(String::from).collect();
 
     // Drop the trailing empty element that results from the final newline so
@@ -740,10 +748,8 @@ fn compute_replacements(
         }
 
         if chunk.old_lines.is_empty() {
-            // Pure addition (no old lines). We'll add them at the end or just
-            // before the final empty line if one exists.
-            let insertion_idx = if original_lines.last().is_some_and(String::is_empty) {
-                original_lines.len() - 1
+            let insertion_idx = if chunk.change_context.is_some() {
+                line_index
             } else {
                 original_lines.len()
             };
@@ -1112,6 +1118,43 @@ mod tests {
         assert!(!src.exists());
         let contents = fs::read_to_string(&dest).unwrap();
         assert_eq!(contents, "line2\n");
+    }
+
+    #[tokio::test]
+    async fn test_rename_only_hunk_preserves_contents_exactly() {
+        let dir = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute test path");
+
+        for (name, contents) in [
+            ("no-final-newline", "contents without newline"),
+            ("multiple-final-newlines", "contents with newlines\n\n\n"),
+        ] {
+            let src_name = format!("{name}-src.txt");
+            let dest_name = format!("{name}-dest.txt");
+            let src = dir.path().join(&src_name);
+            let dest = dir.path().join(&dest_name);
+            fs::write(&src, contents).unwrap();
+            let patch = wrap_patch(&format!(
+                "*** Update File: {src_name}\n*** Move to: {dest_name}"
+            ));
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+
+            apply_patch(
+                &patch,
+                &cwd,
+                &mut stdout,
+                &mut stderr,
+                LOCAL_FS.as_ref(),
+                /*sandbox*/ None,
+            )
+            .await
+            .unwrap();
+
+            assert!(!src.exists());
+            assert_eq!(fs::read(&dest).unwrap(), contents.as_bytes());
+            assert!(stderr.is_empty());
+        }
     }
 
     #[cfg(unix)]

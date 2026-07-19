@@ -1,3 +1,4 @@
+use codex_agent_task_store::ValidationCallStatus;
 use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
@@ -33,6 +34,7 @@ use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::ExecCommandSource;
+use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_tools::ToolName;
 use codex_utils_path_uri::PathUri;
 
@@ -97,6 +99,68 @@ pub(super) async fn run_exec_like(
 }
 
 pub(super) async fn run_exec_like_with_exit_code(
+    args: RunExecLikeArgs,
+) -> Result<RunExecLikeResult, FunctionCallError> {
+    let coordinator = args
+        .session
+        .services
+        .agent_control
+        .task_coordinator()
+        .clone();
+    let session_source = args.turn.session_source.clone();
+    let typed_binding = coordinator.binding_for_source(&session_source);
+    if typed_binding.is_some()
+        && args.tool_name.name != "verify_local"
+        && !is_known_safe_command(&args.safety_command)
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "typed assignments may run only shell commands proven read-only; use apply_patch for scoped source changes or verify_local for repository validation"
+                .to_string(),
+        ));
+    }
+    if typed_binding.is_some()
+        && (args
+            .exec_params
+            .sandbox_permissions
+            .requests_sandbox_override()
+            || args.additional_permissions.is_some())
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "typed assignments cannot request shell sandbox overrides or additional permissions"
+                .to_string(),
+        ));
+    }
+    let call_id = args.call_id.clone();
+    let command_summary = args.hook_command.clone();
+    let result = run_exec_like_with_exit_code_inner(args).await;
+    if typed_binding.is_none() {
+        return result;
+    }
+    let status = match &result {
+        Ok(result) if result.exit_code == Some(0) => ValidationCallStatus::Succeeded,
+        Ok(_) => ValidationCallStatus::Failed,
+        Err(FunctionCallError::RespondToModel(message)) if message.contains("rejected by user") => {
+            ValidationCallStatus::Cancelled
+        }
+        Err(_) => ValidationCallStatus::Failed,
+    };
+    let record_result = coordinator
+        .record_validation_call_for_source(&session_source, call_id, command_summary, status)
+        .await;
+    match (result, record_result) {
+        (Ok(result), Ok(_)) => Ok(result),
+        (Ok(_), Err(error)) => Err(FunctionCallError::RespondToModel(format!(
+            "shell validation result could not be persisted for the typed assignment: {error}"
+        ))),
+        (Err(error), Ok(_)) => Err(error),
+        (Err(error), Err(record_error)) => {
+            tracing::warn!(%record_error, "failed to persist typed shell validation result");
+            Err(error)
+        }
+    }
+}
+
+async fn run_exec_like_with_exit_code_inner(
     args: RunExecLikeArgs,
 ) -> Result<RunExecLikeResult, FunctionCallError> {
     let RunExecLikeArgs {

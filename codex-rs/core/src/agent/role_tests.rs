@@ -142,6 +142,57 @@ async fn apply_role_returns_unavailable_for_invalid_user_role_toml() {
 }
 
 #[tokio::test]
+async fn apply_role_reports_independent_model_and_reasoning_locks() {
+    let cases = [
+        (
+            "instruction-only",
+            "developer_instructions = \"Stay focused\"",
+            false,
+            false,
+        ),
+        ("model-only", "model = \"role-model\"", true, false),
+        (
+            "effort-only",
+            "model_reasoning_effort = \"high\"",
+            false,
+            true,
+        ),
+        (
+            "model-and-effort",
+            "model = \"role-model\"\nmodel_reasoning_effort = \"high\"",
+            true,
+            true,
+        ),
+    ];
+
+    for (role_name, contents, expected_model, expected_reasoning_effort) in cases {
+        let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
+        let role_path = write_role_config(&home, &format!("{role_name}.toml"), contents).await;
+        config.agent_roles.insert(
+            role_name.to_string(),
+            AgentRoleConfig {
+                description: None,
+                config_file: Some(role_path),
+                nickname_candidates: None,
+            },
+        );
+
+        let locks = apply_role_to_config(&mut config, Some(role_name))
+            .await
+            .unwrap_or_else(|err| panic!("{role_name} role should apply: {err}"));
+
+        assert_eq!(
+            locks.model, expected_model,
+            "unexpected model lock for {role_name}"
+        );
+        assert_eq!(
+            locks.reasoning_effort, expected_reasoning_effort,
+            "unexpected reasoning lock for {role_name}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn apply_role_ignores_agent_metadata_fields_in_user_role_file() {
     let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
     let role_path = write_role_config(

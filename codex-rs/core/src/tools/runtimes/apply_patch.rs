@@ -3,6 +3,11 @@
 //! Assumes `apply_patch` verification/approval happened upstream. Reuses the
 //! selected turn environment filesystem for both local and remote turns, with
 //! sandboxing enforced by the explicit filesystem sandbox context.
+use crate::agent::task_capabilities::ExternalMutationIntent;
+use crate::agent::task_capabilities::TypedToolClass;
+use crate::agent::task_capabilities::TypedToolRequest;
+use crate::agent::task_capabilities::authorize_typed_tool;
+use crate::agent::task_capabilities::normalize_absolute_repo_path;
 use crate::exec::is_likely_sandbox_denied;
 use crate::session::turn_context::TurnEnvironment;
 use crate::tools::hook_names::HookToolName;
@@ -17,9 +22,12 @@ use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::with_cached_approval;
+use codex_agent_task_store::AttemptState;
+use codex_agent_task_store::AttributionConfidence;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::ApplyPatchAction;
 use codex_exec_server::FileSystemSandboxContext;
+use codex_git_utils::get_git_repo_root;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
@@ -56,6 +64,7 @@ pub struct ApplyPatchRequest {
 #[derive(Default)]
 pub struct ApplyPatchRuntime {
     committed_delta: AppliedPatchDelta,
+    typed_mutations_started: bool,
 }
 
 #[derive(Debug)]
@@ -71,6 +80,101 @@ impl ApplyPatchRuntime {
 
     pub fn committed_delta(&self) -> &AppliedPatchDelta {
         &self.committed_delta
+    }
+
+    async fn begin_typed_mutations(
+        &mut self,
+        req: &ApplyPatchRequest,
+        ctx: &ToolCtx,
+    ) -> Result<(), ToolError> {
+        if self.typed_mutations_started {
+            return Ok(());
+        }
+        let coordinator = ctx.session.services.agent_control.task_coordinator();
+        let Some(binding) = coordinator.binding_for_source(&ctx.turn.session_source) else {
+            self.typed_mutations_started = true;
+            return Ok(());
+        };
+        let task = coordinator
+            .get_agent_task(binding.assignment_id, Some(0))
+            .await
+            .map_err(|error| {
+                ToolError::Rejected(format!(
+                    "apply_patch: typed assignment state is unavailable: {error}"
+                ))
+            })?;
+        if task.current_attempt.attempt_id != binding.attempt_id
+            || task.current_attempt.state != AttemptState::Active
+        {
+            return Err(ToolError::Rejected(
+                "apply_patch: the bound typed assignment attempt is no longer active".to_string(),
+            ));
+        }
+
+        let cwd = req
+            .turn_environment
+            .cwd()
+            .to_abs_path()
+            .map_err(|error| {
+                ToolError::Rejected(format!(
+                    "apply_patch: typed assignments require a local filesystem environment: {error}"
+                ))
+            })?
+            .to_path_buf();
+        let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
+        let repo_paths = req
+            .file_paths
+            .iter()
+            .map(|path| {
+                path.to_abs_path()
+                    .map_err(|error| {
+                        ToolError::Rejected(format!(
+                            "apply_patch: typed mutation path is not local: {error}"
+                        ))
+                    })
+                    .and_then(|path| {
+                        normalize_absolute_repo_path(&repo_root, path.as_path()).map_err(|error| {
+                            ToolError::Rejected(format!(
+                                "apply_patch: typed mutation path is invalid: {error}"
+                            ))
+                        })
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let authorization = authorize_typed_tool(
+            &task.assignment,
+            &repo_root,
+            TypedToolRequest {
+                class: TypedToolClass::StructuredEdit,
+                external_mutation_intent: ExternalMutationIntent::MayMutate,
+                repo_paths: &repo_paths,
+            },
+        )
+        .map_err(|error| {
+            ToolError::Rejected(format!(
+                "apply_patch: typed assignment capability denied: {error}"
+            ))
+        })?;
+        let store = coordinator.store().ok_or_else(|| {
+            ToolError::Rejected("apply_patch: the typed task store is unavailable".to_string())
+        })?;
+        for path in authorization.normalized_repo_paths {
+            store
+                .begin_mutation(
+                    binding.attempt_id,
+                    &repo_root,
+                    path,
+                    AttributionConfidence::Definitive,
+                )
+                .await
+                .map_err(|error| {
+                    ToolError::Rejected(format!(
+                        "apply_patch: failed to capture typed mutation evidence: {error}"
+                    ))
+                })?;
+        }
+        self.typed_mutations_started = true;
+        Ok(())
     }
 
     fn build_guardian_review_request(
@@ -231,8 +335,9 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         &mut self,
         req: &ApplyPatchRequest,
         attempt: &SandboxAttempt<'_>,
-        _ctx: &ToolCtx,
+        ctx: &ToolCtx,
     ) -> Result<ApplyPatchRuntimeOutput, ToolError> {
+        self.begin_typed_mutations(req, ctx).await?;
         let started_at = Instant::now();
         let fs = req.turn_environment.environment.get_filesystem();
         let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);

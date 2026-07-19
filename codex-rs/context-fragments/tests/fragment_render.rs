@@ -25,49 +25,29 @@ impl ContextualUserFragment for TestFragment {
 }
 
 #[test]
-fn render_compacts_repeated_fragment_lines() {
-    let mut lines = vec!["important setup".to_string()];
-    lines.extend((0..20).map(|_| "same generated warning".to_string()));
-    lines.push("final rule".to_string());
-    let fragment = TestFragment {
-        body: lines.join("\n"),
-    };
+fn render_preserves_fragment_bodies_byte_for_byte() {
+    let cases = [
+        ("repeated braces", "}\n}"),
+        ("repeated closing tags", "</nested>\n</nested>"),
+        ("repeated short lines", "x\nx"),
+        ("repeated blank lines", "first\n\n\nlast"),
+        (
+            "code block content",
+            "```text\nsame source line\nsame source line\n```",
+        ),
+    ];
 
-    let rendered = fragment.render();
+    for (case, body) in cases {
+        let fragment = TestFragment {
+            body: body.to_string(),
+        };
 
-    assert!(rendered.starts_with("<test_context>"));
-    assert!(rendered.ends_with("</test_context>"));
-    assert!(rendered.contains("important setup"));
-    assert!(rendered.contains("final rule"));
-    assert!(rendered.contains("[context compaction: omitted 19 repeated lines]"));
-    assert_eq!(rendered.matches("same generated warning").count(), 1);
-}
-
-#[test]
-fn render_compaction_preserves_trailing_body_newline() {
-    let mut lines = vec!["important setup".to_string()];
-    lines.extend((0..8).map(|_| "same generated warning".to_string()));
-    let fragment = TestFragment {
-        body: format!("{}\n", lines.join("\n")),
-    };
-
-    let rendered = fragment.render();
-
-    assert!(rendered.contains(
-        "same generated warning\n[context compaction: omitted 7 repeated lines]\n</test_context>"
-    ));
-}
-
-#[test]
-fn render_compaction_preserves_repeated_blank_lines() {
-    let fragment = TestFragment {
-        body: "first\n\n\nlast".to_string(),
-    };
-
-    assert_eq!(
-        fragment.render(),
-        "<test_context>first\n\n\nlast</test_context>"
-    );
+        assert_eq!(
+            fragment.render(),
+            format!("<test_context>{body}</test_context>"),
+            "render changed {case}"
+        );
+    }
 }
 
 #[test]
@@ -105,6 +85,7 @@ fn additional_context_caps_entity_heavy_values_after_escaping() {
     let fragment = AdditionalContextUserFragment::new("browser".to_string(), "&".repeat(4_000));
 
     let rendered = fragment.render();
+    assert!(AdditionalContextUserFragment::matches_text(&rendered));
     let body = rendered
         .strip_prefix("<external_context source=\"browser\" kind=\"untrusted\">\n")
         .and_then(|body| body.strip_suffix("\n</external_context>"))
@@ -123,6 +104,28 @@ fn additional_context_caps_entity_heavy_values_after_escaping() {
 }
 
 #[test]
+fn additional_context_caps_oversized_source_labels_after_escaping() {
+    let fragment = AdditionalContextUserFragment::new("&".repeat(1_000), "value".to_string());
+
+    let rendered = fragment.render();
+    assert!(AdditionalContextUserFragment::matches_text(&rendered));
+    let source = rendered
+        .strip_prefix("<external_context source=\"")
+        .and_then(|rest| rest.split_once("\" kind=\"untrusted\">\n"))
+        .map(|(source, _)| source)
+        .expect("additional context source attribute should be intact");
+
+    assert!(source.len() <= 1_536);
+    assert!(source.contains("…source truncated…"));
+    assert_eq!(
+        source
+            .replace("&amp;", "")
+            .replace("…source truncated…", ""),
+        ""
+    );
+}
+
+#[test]
 fn additional_context_match_accepts_fixed_and_legacy_user_wrappers() {
     assert!(AdditionalContextUserFragment::matches_text(
         "<external_context source=\"path\" kind=\"untrusted\">\nvalue\n</external_context>"
@@ -135,6 +138,59 @@ fn additional_context_match_accepts_fixed_and_legacy_user_wrappers() {
     ));
     assert!(!AdditionalContextUserFragment::matches_text(
         "<external_context source=\"path\" kind=\"application\">\nvalue\n</external_context>"
+    ));
+}
+
+#[test]
+fn additional_context_match_rejects_malformed_explicit_wrappers() {
+    let malformed = [
+        (
+            "kind embedded inside source",
+            "<external_context source=\"x kind=\"untrusted\">\nvalue\n</external_context>",
+        ),
+        (
+            "missing kind closing quote",
+            "<external_context source=\"path\" kind=\"untrusted>\nvalue\n</external_context>",
+        ),
+        (
+            "duplicate source attribute",
+            "<external_context source=\"path\" source=\"other\" kind=\"untrusted\">\nvalue\n</external_context>",
+        ),
+        (
+            "malformed source attribute",
+            "<external_context source=path kind=\"untrusted\">\nvalue\n</external_context>",
+        ),
+        (
+            "trailing opening-tag bytes",
+            "<external_context source=\"path\" kind=\"untrusted\" unexpected>\nvalue\n</external_context>",
+        ),
+        (
+            "unescaped body markup",
+            "<external_context source=\"path\" kind=\"untrusted\">\n<raw> & value\n</external_context>",
+        ),
+    ];
+
+    for (case, text) in malformed {
+        assert!(
+            !AdditionalContextUserFragment::matches_text(text),
+            "matched malformed wrapper with {case}"
+        );
+    }
+
+    let oversized_source = format!(
+        "<external_context source=\"{}\" kind=\"untrusted\">\nvalue\n</external_context>",
+        "s".repeat(1_537)
+    );
+    assert!(!AdditionalContextUserFragment::matches_text(
+        &oversized_source
+    ));
+
+    let oversized_body = format!(
+        "<external_context source=\"path\" kind=\"untrusted\">\n{}\n</external_context>",
+        "v".repeat(4_001)
+    );
+    assert!(!AdditionalContextUserFragment::matches_text(
+        &oversized_body
     ));
 }
 

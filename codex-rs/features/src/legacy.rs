@@ -55,14 +55,16 @@ pub fn legacy_feature_keys() -> impl Iterator<Item = &'static str> {
     ALIASES.iter().map(|alias| alias.legacy_key)
 }
 
-pub(crate) fn feature_for_key(key: &str) -> Option<Feature> {
+pub(crate) fn feature_for_alias(key: &str) -> Option<Feature> {
     ALIASES
         .iter()
         .find(|alias| alias.legacy_key == key)
-        .map(|alias| {
-            log_alias(alias.legacy_key, alias.feature);
-            alias.feature
-        })
+        .map(|alias| alias.feature)
+}
+
+pub(crate) fn record_alias_usage(features: &mut Features, alias: &str, feature: Feature) {
+    log_alias(alias, feature);
+    features.record_legacy_usage(alias, feature);
 }
 
 #[derive(Debug, Default)]
@@ -89,8 +91,7 @@ fn set_if_some(
 ) {
     if let Some(enabled) = maybe_value {
         set_feature(features, feature, enabled);
-        log_alias(alias_key, feature);
-        features.record_legacy_usage(alias_key, feature);
+        record_alias_usage(features, alias_key, feature);
     }
 }
 

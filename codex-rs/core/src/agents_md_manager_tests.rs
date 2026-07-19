@@ -98,7 +98,12 @@ async fn names_and_limits_are_cache_dependencies() {
     manager.refresh(&config, &environments).await;
     let truncated = manager.get_loaded().await.expect("truncated load");
     assert!(!Arc::ptr_eq(&fallback, &truncated));
-    assert_eq!(truncated.text(), "fallback");
+    let truncated_text = truncated.text();
+    assert!(truncated_text.starts_with("fallback"));
+    assert!(truncated_text.contains(&root.path().join("WORKFLOW.md").display().to_string()));
+    assert!(truncated_text.contains("original byte count: 21"));
+    assert!(truncated_text.contains("retained byte count: 8"));
+    assert!(truncated_text.contains("omitted byte count: 13"));
 }
 
 #[tokio::test]

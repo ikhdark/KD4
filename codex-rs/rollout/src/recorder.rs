@@ -46,7 +46,6 @@ use super::list::ThreadSortKey;
 use super::list::ThreadsPage;
 use super::list::get_threads;
 use super::list::get_threads_in_root;
-use super::list::parse_cursor;
 use super::list::parse_timestamp_uuid_from_filename;
 use super::metadata;
 use super::session_index::find_thread_names_by_ids;
@@ -678,7 +677,6 @@ impl RolloutRecorder {
         filter_cwd: Option<&Path>,
     ) -> std::io::Result<Option<PathBuf>> {
         let codex_home = config.codex_home();
-        let cwd_filter = filter_cwd.map(Path::to_path_buf);
         let mut fallback_reason = state_db_ctx.is_none().then_some("db_unavailable");
         if state_db_ctx.is_some() {
             let mut db_cursor = cursor.cloned();
@@ -692,7 +690,7 @@ impl RolloutRecorder {
                     SortDirection::Desc,
                     allowed_sources,
                     model_providers,
-                    cwd_filter.as_ref().map(std::slice::from_ref),
+                    /*cwd_filters*/ None,
                     /*relation_filter*/ None,
                     /*archived*/ false,
                     /*search_term*/ None,
@@ -731,7 +729,7 @@ impl RolloutRecorder {
                 sort_key,
                 allowed_sources,
                 model_providers,
-                cwd_filter.as_ref().map(std::slice::from_ref),
+                /*cwd_filters*/ None,
                 default_provider,
             )
             .await?;
@@ -755,7 +753,7 @@ impl RolloutRecorder {
         config: &impl RolloutConfigView,
         params: RolloutRecorderParams,
     ) -> std::io::Result<Self> {
-        let (file, deferred_log_file_info, rollout_path, meta) = match params {
+        let (writer, deferred_log_file_info, rollout_path, meta) = match params {
             RolloutRecorderParams::Create {
                 session_id,
                 conversation_id,
@@ -815,8 +813,8 @@ impl RolloutRecorder {
                 (None, Some(log_file_info), path, Some(session_meta))
             }
             RolloutRecorderParams::Resume { path } => {
-                let (path, file) = open_rollout_for_append(path.as_path()).await?;
-                (Some(file), None, path, None)
+                let (path, writer) = open_rollout_for_append(path.as_path()).await?;
+                (Some(writer), None, path, None)
             }
         };
 
@@ -835,7 +833,7 @@ impl RolloutRecorder {
         let rollout_path_for_spawn = rollout_path.clone();
         let handle = tokio::task::spawn(async move {
             let result = rollout_writer(
-                file,
+                writer,
                 deferred_log_file_info,
                 rx,
                 meta,
@@ -1081,20 +1079,10 @@ fn truncate_fs_page(
         return page;
     }
     page.items.truncate(page_size);
-    page.next_cursor = page.items.last().and_then(|item| {
-        let file_name = item.path.file_name()?.to_str()?;
-        let (created_at, _id) = parse_timestamp_uuid_from_filename(file_name)?;
-        let cursor_token = match sort_key {
-            ThreadSortKey::CreatedAt => created_at.format(&Rfc3339).ok()?,
-            ThreadSortKey::UpdatedAt => item.updated_at.as_deref()?.to_string(),
-            ThreadSortKey::RecencyAt => item
-                .recency_at
-                .as_deref()
-                .or(item.updated_at.as_deref())?
-                .to_string(),
-        };
-        parse_cursor(cursor_token.as_str())
-    });
+    page.next_cursor = page
+        .items
+        .last()
+        .and_then(|item| cursor_from_thread_item(item, sort_key));
     page
 }
 
@@ -1469,13 +1457,10 @@ fn thread_item_sort_key(
 
 fn cursor_from_thread_item(item: &ThreadItem, sort_key: ThreadSortKey) -> Option<Cursor> {
     let (timestamp, id) = thread_item_sort_key(item, sort_key)?;
-    match sort_key {
-        ThreadSortKey::RecencyAt => Some(Cursor::with_thread_id(
-            timestamp,
-            ThreadId::from_string(&id.to_string()).ok()?,
-        )),
-        ThreadSortKey::CreatedAt | ThreadSortKey::UpdatedAt => Some(Cursor::new(timestamp)),
-    }
+    Some(Cursor::with_thread_id(
+        timestamp,
+        ThreadId::from_string(&id.to_string()).ok()?,
+    ))
 }
 
 struct LogFileInfo {
@@ -1521,8 +1506,29 @@ fn precompute_log_file_info(
     })
 }
 
-fn open_log_file(path: &Path) -> std::io::Result<File> {
-    let path = compression::materialize_rollout_for_append_blocking(path)?;
+struct LockedRolloutFile {
+    file: File,
+    append_lock: compression::RolloutAppendLock,
+}
+
+impl LockedRolloutFile {
+    fn into_jsonl_writer(self) -> JsonlWriter {
+        JsonlWriter {
+            file: tokio::fs::File::from_std(self.file),
+            _append_lock: self.append_lock,
+        }
+    }
+}
+
+fn open_log_file(path: &Path) -> std::io::Result<LockedRolloutFile> {
+    open_log_file_with_options(path, /*create*/ true).map(|(_, file)| file)
+}
+
+fn open_log_file_with_options(
+    path: &Path,
+    create: bool,
+) -> std::io::Result<(PathBuf, LockedRolloutFile)> {
+    let (path, append_lock) = compression::lock_rollout_for_append_blocking(path)?;
     let Some(parent) = path.parent() else {
         return Err(IoError::other(format!(
             "rollout path has no parent: {}",
@@ -1533,10 +1539,10 @@ fn open_log_file(path: &Path) -> std::io::Result<File> {
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .append(true)
-        .create(true)
-        .open(path)?;
+        .create(create)
+        .open(&path)?;
     ensure_rollout_is_newline_terminated(&mut file)?;
-    Ok(file)
+    Ok((path, LockedRolloutFile { file, append_lock }))
 }
 
 /// Mutable state owned by the background rollout writer.
@@ -1556,14 +1562,14 @@ struct RolloutWriterState {
 
 impl RolloutWriterState {
     fn new(
-        file: Option<tokio::fs::File>,
+        writer: Option<JsonlWriter>,
         deferred_log_file_info: Option<LogFileInfo>,
         meta: Option<SessionMeta>,
         cwd: PathBuf,
         rollout_path: PathBuf,
     ) -> Self {
         Self {
-            writer: file.map(|file| JsonlWriter { file }),
+            writer,
             deferred_log_file_info,
             pending_items: Vec::new(),
             meta,
@@ -1660,10 +1666,11 @@ impl RolloutWriterState {
             .as_ref()
             .map(|info| info.path.as_path())
             .unwrap_or(self.rollout_path.as_path());
-        let file = open_log_file(path)?;
-        self.writer = Some(JsonlWriter {
-            file: tokio::fs::File::from_std(file),
-        });
+        let path = path.to_path_buf();
+        let file = tokio::task::spawn_blocking(move || open_log_file(path.as_path()))
+            .await
+            .map_err(IoError::other)??;
+        self.writer = Some(file.into_jsonl_writer());
         self.deferred_log_file_info = None;
         Ok(())
     }
@@ -1713,14 +1720,15 @@ impl RolloutWriterState {
 }
 
 async fn rollout_writer(
-    file: Option<tokio::fs::File>,
+    writer: Option<JsonlWriter>,
     deferred_log_file_info: Option<LogFileInfo>,
     mut rx: mpsc::Receiver<RolloutCmd>,
     meta: Option<SessionMeta>,
     cwd: PathBuf,
     rollout_path: PathBuf,
 ) -> std::io::Result<()> {
-    let mut state = RolloutWriterState::new(file, deferred_log_file_info, meta, cwd, rollout_path);
+    let mut state =
+        RolloutWriterState::new(writer, deferred_log_file_info, meta, cwd, rollout_path);
 
     // Process rollout commands
     while let Some(cmd) = rx.recv().await {
@@ -1785,25 +1793,18 @@ pub async fn append_rollout_item_to_path(
     rollout_path: &Path,
     item: &RolloutItem,
 ) -> std::io::Result<()> {
-    let (_rollout_path, file) = open_rollout_for_append(rollout_path).await?;
-    let mut writer = JsonlWriter { file };
+    let (_rollout_path, mut writer) = open_rollout_for_append(rollout_path).await?;
     writer.write_rollout_item(item).await
 }
 
-async fn open_rollout_for_append(path: &Path) -> std::io::Result<(PathBuf, tokio::fs::File)> {
-    let path = compression::materialize_rollout_for_append(path).await?;
-    let path_for_open = path.clone();
-    let file = tokio::task::spawn_blocking(move || {
-        let mut file = File::options()
-            .read(true)
-            .append(true)
-            .open(path_for_open)?;
-        ensure_rollout_is_newline_terminated(&mut file)?;
-        Ok::<_, std::io::Error>(file)
+async fn open_rollout_for_append(path: &Path) -> std::io::Result<(PathBuf, JsonlWriter)> {
+    let path = path.to_path_buf();
+    let (path, file) = tokio::task::spawn_blocking(move || {
+        open_log_file_with_options(path.as_path(), /*create*/ false)
     })
     .await
     .map_err(IoError::other)??;
-    Ok((path, tokio::fs::File::from_std(file)))
+    Ok((path, file.into_jsonl_writer()))
 }
 
 fn ensure_rollout_is_newline_terminated(file: &mut File) -> std::io::Result<()> {
@@ -1823,6 +1824,7 @@ fn ensure_rollout_is_newline_terminated(file: &mut File) -> std::io::Result<()> 
 
 struct JsonlWriter {
     file: tokio::fs::File,
+    _append_lock: compression::RolloutAppendLock,
 }
 
 #[derive(serde::Serialize)]
@@ -1941,23 +1943,24 @@ async fn resume_candidate_matches_cwd(
     cwd: &Path,
     default_provider: &str,
 ) -> bool {
-    if cached_cwd.is_some_and(|session_cwd| cwd_matches(session_cwd, cwd)) {
-        return true;
+    let Ok((items, _, _)) = RolloutRecorder::load_rollout_items(rollout_path).await else {
+        return false;
+    };
+    if let Some(latest_turn_context_cwd) = items.iter().rev().find_map(|item| match item {
+        RolloutItem::TurnContext(turn_context) => Some(&turn_context.cwd),
+        RolloutItem::SessionMeta(_)
+        | RolloutItem::ResponseItem(_)
+        | RolloutItem::InterAgentCommunication(_)
+        | RolloutItem::InterAgentCommunicationMetadata { .. }
+        | RolloutItem::Compacted(_)
+        | RolloutItem::WorldState(_)
+        | RolloutItem::EventMsg(_) => None,
+    }) {
+        return cwd_matches(latest_turn_context_cwd.as_path(), cwd);
     }
 
-    if let Ok((items, _, _)) = RolloutRecorder::load_rollout_items(rollout_path).await
-        && let Some(latest_turn_context_cwd) = items.iter().rev().find_map(|item| match item {
-            RolloutItem::TurnContext(turn_context) => Some(&turn_context.cwd),
-            RolloutItem::SessionMeta(_)
-            | RolloutItem::ResponseItem(_)
-            | RolloutItem::InterAgentCommunication(_)
-            | RolloutItem::InterAgentCommunicationMetadata { .. }
-            | RolloutItem::Compacted(_)
-            | RolloutItem::WorldState(_)
-            | RolloutItem::EventMsg(_) => None,
-        })
-    {
-        return cwd_matches(latest_turn_context_cwd.as_path(), cwd);
+    if cached_cwd.is_some_and(|session_cwd| cwd_matches(session_cwd, cwd)) {
+        return true;
     }
 
     metadata::extract_metadata_from_rollout(rollout_path, default_provider)

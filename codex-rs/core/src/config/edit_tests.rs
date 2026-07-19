@@ -4,6 +4,7 @@ use codex_config::types::McpServerOAuthConfig;
 use codex_config::types::McpServerToolConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_config::types::SessionPickerViewMode;
+use codex_features::legacy_feature_keys;
 use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::openai_models::ReasoningEffort;
@@ -91,6 +92,66 @@ fn builder_with_edits_applies_custom_paths() {
 
     let contents = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE)).expect("read config");
     assert_eq!(contents, "enabled = true\n");
+}
+
+#[test]
+fn set_feature_enabled_migrates_every_legacy_alias_to_its_canonical_key() {
+    for alias in legacy_feature_keys() {
+        let feature = feature_for_key(alias).expect("legacy feature alias should resolve");
+        let canonical_key = feature.key();
+        let tmp = tempdir().expect("tmpdir");
+        let codex_home = tmp.path();
+        std::fs::write(
+            codex_home.join(CONFIG_TOML_FILE),
+            format!("[features]\n{canonical_key} = false\n{alias} = false\n"),
+        )
+        .expect("seed config");
+
+        ConfigEditsBuilder::new(codex_home)
+            .set_feature_enabled(alias, /*enabled*/ true)
+            .apply_blocking()
+            .expect("enable feature through alias");
+
+        let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE))
+            .expect("read enabled config");
+        let config: TomlValue = toml::from_str(&raw).expect("parse enabled config");
+        let features = config
+            .get("features")
+            .and_then(TomlValue::as_table)
+            .expect("features table");
+        assert_eq!(
+            features.get(alias),
+            None,
+            "alias `{alias}` should be removed"
+        );
+        assert_eq!(
+            features.get(canonical_key).and_then(TomlValue::as_bool),
+            Some(true),
+            "canonical feature `{canonical_key}` should be enabled"
+        );
+
+        ConfigEditsBuilder::new(codex_home)
+            .set_feature_enabled(alias, /*enabled*/ false)
+            .apply_blocking()
+            .expect("disable feature through alias");
+
+        let raw = std::fs::read_to_string(codex_home.join(CONFIG_TOML_FILE))
+            .expect("read disabled config");
+        let config: TomlValue = toml::from_str(&raw).expect("parse disabled config");
+        let features = config.get("features").and_then(TomlValue::as_table);
+        assert_eq!(
+            features.and_then(|features| features.get(alias)),
+            None,
+            "alias `{alias}` should remain removed"
+        );
+        assert_eq!(
+            features
+                .and_then(|features| features.get(canonical_key))
+                .and_then(TomlValue::as_bool),
+            feature.default_enabled().then_some(false),
+            "canonical feature `{canonical_key}` should reflect disabled persistence semantics"
+        );
+    }
 }
 
 #[test]

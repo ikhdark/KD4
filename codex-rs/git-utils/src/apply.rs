@@ -8,10 +8,12 @@
 
 use once_cell::sync::Lazy;
 use regex::Regex;
-use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+
+const DISABLED_HOOKS_PATH: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
 /// Parameters for invoking [`apply_git_patch`].
 #[derive(Debug, Clone)]
@@ -36,8 +38,9 @@ pub struct ApplyGitResult {
 
 /// Apply a unified diff to the target repository by shelling out to `git apply`.
 ///
-/// When [`ApplyGitRequest::preflight`] is `true`, this behaves like `git apply --check` and
-/// leaves the working tree untouched while still parsing the command output for diagnostics.
+/// Patch application uses a private index so successful changes remain unstaged and the caller's
+/// existing staged/unstaged separation is preserved. When [`ApplyGitRequest::preflight`] is
+/// `true`, the same three-way/index state is checked without modifying the working tree.
 pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
     let git_root = resolve_git_root(&req.cwd)?;
 
@@ -45,17 +48,6 @@ pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
     let (tmpdir, patch_path) = write_temp_patch(&req.diff)?;
     // Keep tmpdir alive until function end to ensure the file exists
     let _guard = tmpdir;
-
-    if req.revert && !req.preflight {
-        // Stage WT paths first to avoid index mismatch on revert.
-        stage_paths(&git_root, &req.diff)?;
-    }
-
-    // Build git args
-    let mut args: Vec<String> = vec!["apply".into(), "--3way".into()];
-    if req.revert {
-        args.push("-R".into());
-    }
 
     // Optional: additional git config via env knob (defaults OFF)
     let mut cfg_parts: Vec<String> = Vec::new();
@@ -69,18 +61,47 @@ pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
             cfg_parts.push(p.to_string());
         }
     }
+    cfg_parts.extend([
+        "-c".to_string(),
+        format!("core.hooksPath={DISABLED_HOOKS_PATH}"),
+        "-c".to_string(),
+        "core.fsmonitor=false".to_string(),
+    ]);
+
+    // `git apply --3way` implies `--index`. Use a private copy of the index that
+    // reflects the current worktree for the touched paths so the real index is
+    // never staged or otherwise reclassified by patch application.
+    let (_index_dir, temporary_index) =
+        prepare_temporary_index(&git_root, &patch_path, &req.diff, &cfg_parts)?;
+    let git_env = [
+        (
+            OsString::from("GIT_INDEX_FILE"),
+            temporary_index.into_os_string(),
+        ),
+        (OsString::from("GIT_LITERAL_PATHSPECS"), OsString::from("1")),
+    ];
+
+    // Build git args
+    let mut args: Vec<String> = vec!["apply".into(), "--3way".into()];
+    if req.revert {
+        args.push("-R".into());
+    }
 
     args.push(patch_path.to_string_lossy().to_string());
 
     // Optional preflight: dry-run only; do not modify working tree
     if req.preflight {
-        let mut check_args = vec!["apply".to_string(), "--check".to_string()];
+        let mut check_args = vec![
+            "apply".to_string(),
+            "--3way".to_string(),
+            "--check".to_string(),
+        ];
         if req.revert {
             check_args.push("-R".to_string());
         }
         check_args.push(patch_path.to_string_lossy().to_string());
         let rendered = render_command_for_log(&git_root, &cfg_parts, &check_args);
-        let (c_code, c_out, c_err) = run_git(&git_root, &cfg_parts, &check_args)?;
+        let (c_code, c_out, c_err) = run_git(&git_root, &cfg_parts, &check_args, Some(&git_env))?;
         let (mut applied_paths, mut skipped_paths, mut conflicted_paths) =
             parse_git_apply_output(&c_out, &c_err);
         applied_paths.sort();
@@ -89,8 +110,16 @@ pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
         skipped_paths.dedup();
         conflicted_paths.sort();
         conflicted_paths.dedup();
+        // Git's `--3way --check` performs the in-core merge but skips the
+        // write-out phase that normally turns recorded conflicts into a
+        // nonzero exit. Preserve the real apply result contract explicitly.
+        let exit_code = if c_code == 0 && !conflicted_paths.is_empty() {
+            1
+        } else {
+            c_code
+        };
         return Ok(ApplyGitResult {
-            exit_code: c_code,
+            exit_code,
             applied_paths,
             skipped_paths,
             conflicted_paths,
@@ -101,7 +130,7 @@ pub fn apply_git_patch(req: &ApplyGitRequest) -> io::Result<ApplyGitResult> {
     }
 
     let cmd_for_log = render_command_for_log(&git_root, &cfg_parts, &args);
-    let (code, stdout, stderr) = run_git(&git_root, &cfg_parts, &args)?;
+    let (code, stdout, stderr) = run_git(&git_root, &cfg_parts, &args, Some(&git_env))?;
 
     let (mut applied_paths, mut skipped_paths, mut conflicted_paths) =
         parse_git_apply_output(&stdout, &stderr);
@@ -137,8 +166,7 @@ fn resolve_git_root(cwd: &Path) -> io::Result<PathBuf> {
             String::from_utf8_lossy(&out.stderr)
         )));
     }
-    let root = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    Ok(PathBuf::from(root))
+    Ok(path_buf_from_git_bytes(trim_line_ending(&out.stdout)))
 }
 
 fn write_temp_patch(diff: &str) -> io::Result<(tempfile::TempDir, PathBuf)> {
@@ -148,7 +176,35 @@ fn write_temp_patch(diff: &str) -> io::Result<(tempfile::TempDir, PathBuf)> {
     Ok((dir, path))
 }
 
-fn run_git(cwd: &Path, git_cfg: &[String], args: &[String]) -> io::Result<(i32, String, String)> {
+fn run_git(
+    cwd: &Path,
+    git_cfg: &[String],
+    args: &[String],
+    env: Option<&[(OsString, OsString)]>,
+) -> io::Result<(i32, String, String)> {
+    let args = args.iter().map(OsString::from).collect::<Vec<_>>();
+    run_git_os(cwd, git_cfg, &args, env)
+}
+
+fn run_git_os(
+    cwd: &Path,
+    git_cfg: &[String],
+    args: &[OsString],
+    env: Option<&[(OsString, OsString)]>,
+) -> io::Result<(i32, String, String)> {
+    let out = run_git_output_os(cwd, git_cfg, args, env)?;
+    let code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    Ok((code, stdout, stderr))
+}
+
+fn run_git_output_os(
+    cwd: &Path,
+    git_cfg: &[String],
+    args: &[OsString],
+    env: Option<&[(OsString, OsString)]>,
+) -> io::Result<std::process::Output> {
     let mut cmd = std::process::Command::new("git");
     for p in git_cfg {
         cmd.arg(p);
@@ -156,11 +212,310 @@ fn run_git(cwd: &Path, git_cfg: &[String], args: &[String]) -> io::Result<(i32, 
     for a in args {
         cmd.arg(a);
     }
-    let out = cmd.current_dir(cwd).output()?;
+    if let Some(env) = env {
+        cmd.envs(env.iter().cloned());
+    }
+    cmd.current_dir(cwd).output()
+}
+
+fn prepare_temporary_index(
+    git_root: &Path,
+    patch_path: &Path,
+    diff: &str,
+    git_cfg: &[String],
+) -> io::Result<(tempfile::TempDir, PathBuf)> {
+    let index_dir = tempfile::tempdir()?;
+    let temporary_index = index_dir.path().join("index");
+    let source_index = resolve_index_path(git_root)?;
+    if source_index.is_file() {
+        std::fs::copy(&source_index, &temporary_index)?;
+    }
+
+    let paths = paths_for_temporary_index(git_root, patch_path, diff, git_cfg)?;
+    let git_env = [
+        (
+            OsString::from("GIT_INDEX_FILE"),
+            temporary_index.clone().into_os_string(),
+        ),
+        (OsString::from("GIT_LITERAL_PATHSPECS"), OsString::from("1")),
+    ];
+    let tracked_paths = tracked_paths_in_index(git_root, git_cfg, &paths, &git_env)?;
+    materialize_worktree_in_temporary_index(
+        git_root,
+        git_cfg,
+        &paths,
+        &tracked_paths,
+        &git_env,
+        index_dir.path(),
+    )?;
+
+    Ok((index_dir, temporary_index))
+}
+
+fn paths_for_temporary_index(
+    git_root: &Path,
+    patch_path: &Path,
+    diff: &str,
+    git_cfg: &[String],
+) -> io::Result<Vec<OsString>> {
+    let args = vec![
+        OsString::from("apply"),
+        OsString::from("--numstat"),
+        OsString::from("-z"),
+        patch_path.as_os_str().to_os_string(),
+    ];
+    let output = run_git_output_os(git_root, git_cfg, &args, None)?;
+    if output.status.success()
+        && let Some(paths) = parse_numstat_paths(&output.stdout)
+    {
+        return Ok(paths);
+    }
+
+    // Preserve the existing error contract for malformed patches: let the real
+    // `git apply` invocation return its exit status and diagnostics.
+    Ok(extract_paths_from_patch_os(diff))
+}
+
+fn parse_numstat_paths(output: &[u8]) -> Option<Vec<OsString>> {
+    let mut cursor = 0;
+    let mut paths = std::collections::BTreeSet::new();
+    while cursor < output.len() {
+        let _added = take_delimited(output, &mut cursor, b'\t')?;
+        let _deleted = take_delimited(output, &mut cursor, b'\t')?;
+        let first_path = take_delimited(output, &mut cursor, 0)?;
+        if first_path.is_empty() {
+            let old_path = take_delimited(output, &mut cursor, 0)?;
+            let new_path = take_delimited(output, &mut cursor, 0)?;
+            insert_safe_git_path(&mut paths, old_path);
+            insert_safe_git_path(&mut paths, new_path);
+        } else {
+            insert_safe_git_path(&mut paths, first_path);
+        }
+    }
+    Some(paths.into_iter().collect())
+}
+
+fn take_delimited<'a>(input: &'a [u8], cursor: &mut usize, delimiter: u8) -> Option<&'a [u8]> {
+    let start = *cursor;
+    let relative_end = input
+        .get(start..)?
+        .iter()
+        .position(|byte| *byte == delimiter)?;
+    let end = start.checked_add(relative_end)?;
+    *cursor = end.checked_add(1)?;
+    Some(&input[start..end])
+}
+
+fn insert_safe_git_path(paths: &mut std::collections::BTreeSet<OsString>, raw_path: &[u8]) {
+    let path = os_string_from_git_path_bytes(raw_path.to_vec());
+    if is_safe_relative_git_path(&path) {
+        paths.insert(path);
+    }
+}
+
+fn is_safe_relative_git_path(path: &OsString) -> bool {
+    !path.is_empty()
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn materialize_worktree_in_temporary_index(
+    git_root: &Path,
+    git_cfg: &[String],
+    paths: &[OsString],
+    tracked_paths: &std::collections::BTreeSet<OsString>,
+    env: &[(OsString, OsString)],
+    temp_dir: &Path,
+) -> io::Result<()> {
+    let mut worktree_patch = Vec::new();
+    let tracked = paths
+        .iter()
+        .filter(|path| tracked_paths.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !tracked.is_empty() {
+        let mut args = vec![
+            OsString::from("diff"),
+            OsString::from("--no-color"),
+            OsString::from("--no-renames"),
+            OsString::from("--binary"),
+            OsString::from("--full-index"),
+            OsString::from("--src-prefix=a/"),
+            OsString::from("--dst-prefix=b/"),
+            OsString::from("--no-textconv"),
+            OsString::from("--no-ext-diff"),
+            OsString::from("--"),
+        ];
+        args.extend(tracked);
+        let output = run_git_output_os(git_root, git_cfg, &args, Some(env))?;
+        if !output.status.success() {
+            return Err(git_output_error("diff worktree paths", &output));
+        }
+        worktree_patch.extend(output.stdout);
+    }
+
+    let canonical_git_root = std::fs::canonicalize(git_root)?;
+    let null_device = OsString::from(if cfg!(windows) { "NUL" } else { "/dev/null" });
+    for path in paths
+        .iter()
+        .filter(|path| !tracked_paths.contains(*path))
+        .filter(|path| existing_path_stays_within_root(git_root, &canonical_git_root, path))
+    {
+        let args = vec![
+            OsString::from("diff"),
+            OsString::from("--no-color"),
+            OsString::from("--no-renames"),
+            OsString::from("--binary"),
+            OsString::from("--full-index"),
+            OsString::from("--src-prefix=a/"),
+            OsString::from("--dst-prefix=b/"),
+            OsString::from("--no-textconv"),
+            OsString::from("--no-ext-diff"),
+            OsString::from("--no-index"),
+            OsString::from("--"),
+            null_device.clone(),
+            path.clone(),
+        ];
+        let output = run_git_output_os(git_root, git_cfg, &args, Some(env))?;
+        if !output
+            .status
+            .code()
+            .is_some_and(|code| code == 0 || code == 1)
+        {
+            return Err(git_output_error("diff untracked worktree path", &output));
+        }
+        worktree_patch.extend(output.stdout);
+    }
+
+    if worktree_patch.is_empty() {
+        return Ok(());
+    }
+    let worktree_patch_path = temp_dir.join("worktree.patch");
+    std::fs::write(&worktree_patch_path, worktree_patch)?;
+    let args = vec![
+        OsString::from("apply"),
+        OsString::from("--cached"),
+        OsString::from("--whitespace=nowarn"),
+        worktree_patch_path.into_os_string(),
+    ];
+    let mut internal_git_cfg = git_cfg.to_vec();
+    internal_git_cfg.extend(["-c".to_string(), "apply.directory=".to_string()]);
+    let output = run_git_output_os(git_root, &internal_git_cfg, &args, Some(env))?;
+    if !output.status.success() {
+        return Err(git_output_error(
+            "apply worktree state to temporary index",
+            &output,
+        ));
+    }
+
+    let mut refresh_args = vec![
+        OsString::from("update-index"),
+        OsString::from("--refresh"),
+        OsString::from("--"),
+    ];
+    refresh_args.extend(paths.iter().cloned());
+    let refresh = run_git_output_os(git_root, git_cfg, &refresh_args, Some(env))?;
+    if refresh.status.success() {
+        Ok(())
+    } else {
+        Err(git_output_error("refresh temporary git index", &refresh))
+    }
+}
+
+fn existing_path_stays_within_root(
+    git_root: &Path,
+    canonical_git_root: &Path,
+    path: &OsString,
+) -> bool {
+    let joined = git_root.join(path);
+    if std::fs::symlink_metadata(&joined).is_err() {
+        return false;
+    }
+    let Some(parent) = joined.parent() else {
+        return false;
+    };
+    std::fs::canonicalize(parent)
+        .is_ok_and(|canonical_parent| canonical_parent.starts_with(canonical_git_root))
+}
+
+fn git_output_error(action: &str, output: &std::process::Output) -> io::Error {
+    let code = output.status.code().unwrap_or(-1);
+    io::Error::other(format!(
+        "failed to {action} (exit {code}): {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn tracked_paths_in_index(
+    git_root: &Path,
+    git_cfg: &[String],
+    paths: &[OsString],
+    env: &[(OsString, OsString)],
+) -> io::Result<std::collections::BTreeSet<OsString>> {
+    if paths.is_empty() {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(git_cfg).args(["ls-files", "-z", "--"]);
+    cmd.args(paths)
+        .envs(env.iter().cloned())
+        .current_dir(git_root);
+    let out = cmd.output()?;
     let code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    Ok((code, stdout, stderr))
+    if code != 0 {
+        return Err(io::Error::other(format!(
+            "failed to inspect temporary git index (exit {code}): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| os_string_from_git_path_bytes(path.to_vec()))
+        .collect())
+}
+
+fn resolve_index_path(git_root: &Path) -> io::Result<PathBuf> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "index"])
+        .current_dir(git_root)
+        .output()?;
+    let code = out.status.code().unwrap_or(-1);
+    if code != 0 {
+        return Err(io::Error::other(format!(
+            "failed to resolve git index (exit {code}): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let raw = trim_line_ending(&out.stdout);
+    let path = path_buf_from_git_bytes(raw);
+    Ok(if path.is_absolute() {
+        path
+    } else {
+        git_root.join(path)
+    })
+}
+
+fn trim_line_ending(mut bytes: &[u8]) -> &[u8] {
+    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn path_buf_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        PathBuf::from(OsString::from_vec(bytes.to_vec()))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+    }
 }
 
 fn quote_shell(s: &str) -> String {
@@ -192,6 +547,13 @@ fn render_command_for_log(cwd: &Path, git_cfg: &[String], args: &[String]) -> St
 
 /// Collect every path referenced by the diff headers inside `diff --git` sections.
 pub fn extract_paths_from_patch(diff_text: &str) -> Vec<String> {
+    extract_paths_from_patch_os(diff_text)
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn extract_paths_from_patch_os(diff_text: &str) -> Vec<OsString> {
     let mut set = std::collections::BTreeSet::new();
     for raw_line in diff_text.lines() {
         let line = raw_line.trim();
@@ -201,24 +563,24 @@ pub fn extract_paths_from_patch(diff_text: &str) -> Vec<String> {
         let Some((a, b)) = parse_diff_git_paths(rest) else {
             continue;
         };
-        if let Some(a) = normalize_diff_path(&a, "a/") {
-            set.insert(a);
+        if let Some(a) = normalize_diff_path(&a, b"a/") {
+            insert_safe_git_path(&mut set, &a);
         }
-        if let Some(b) = normalize_diff_path(&b, "b/") {
-            set.insert(b);
+        if let Some(b) = normalize_diff_path(&b, b"b/") {
+            insert_safe_git_path(&mut set, &b);
         }
     }
     set.into_iter().collect()
 }
 
-fn parse_diff_git_paths(line: &str) -> Option<(String, String)> {
+fn parse_diff_git_paths(line: &str) -> Option<(Vec<u8>, Vec<u8>)> {
     let mut chars = line.chars().peekable();
     let first = read_diff_git_token(&mut chars)?;
     let second = read_diff_git_token(&mut chars)?;
     Some((first, second))
 }
 
-fn read_diff_git_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+fn read_diff_git_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<Vec<u8>> {
     while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
         chars.next();
     }
@@ -248,67 +610,69 @@ fn read_diff_git_token(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> 
         None
     } else {
         Some(match quote {
-            Some(_) => unescape_c_string(&out),
-            None => out,
+            Some(_) => unescape_c_bytes(&out),
+            None => out.into_bytes(),
         })
     }
 }
 
-fn normalize_diff_path(raw: &str, prefix: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+fn normalize_diff_path(raw: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
+    if raw.is_empty() {
         return None;
     }
-    if trimmed == "/dev/null" || trimmed == format!("{prefix}dev/null") {
+    if raw == b"/dev/null" || raw == [prefix, b"dev/null"].concat() {
         return None;
     }
-    let trimmed = trimmed.strip_prefix(prefix).unwrap_or(trimmed);
-    if trimmed.is_empty() {
+    let path = raw.strip_prefix(prefix).unwrap_or(raw);
+    if path.is_empty() {
         return None;
     }
-    Some(trimmed.to_string())
+    Some(path.to_vec())
 }
 
 fn unescape_c_string(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
+    String::from_utf8_lossy(&unescape_c_bytes(input)).into_owned()
+}
+
+fn unescape_c_bytes(input: &str) -> Vec<u8> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        index += 1;
+        if byte != b'\\' {
+            out.push(byte);
             continue;
         }
-        let Some(next) = chars.next() else {
-            out.push('\\');
+        if index == bytes.len() {
+            out.push(b'\\');
             break;
-        };
+        }
+        let next = bytes[index];
+        index += 1;
         match next {
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            't' => out.push('\t'),
-            'b' => out.push('\u{0008}'),
-            'f' => out.push('\u{000C}'),
-            'a' => out.push('\u{0007}'),
-            'v' => out.push('\u{000B}'),
-            '\\' => out.push('\\'),
-            '"' => out.push('"'),
-            '\'' => out.push('\''),
-            '0'..='7' => {
-                let mut value = next.to_digit(8).unwrap_or(0);
+            b'n' => out.push(b'\n'),
+            b'r' => out.push(b'\r'),
+            b't' => out.push(b'\t'),
+            b'b' => out.push(0x08),
+            b'f' => out.push(0x0c),
+            b'a' => out.push(0x07),
+            b'v' => out.push(0x0b),
+            b'\\' => out.push(b'\\'),
+            b'"' => out.push(b'"'),
+            b'\'' => out.push(b'\''),
+            b'0'..=b'7' => {
+                let mut value = u16::from(next - b'0');
                 for _ in 0..2 {
-                    match chars.peek() {
-                        Some('0'..='7') => {
-                            if let Some(digit) = chars.next() {
-                                value = value * 8 + digit.to_digit(8).unwrap_or(0);
-                            } else {
-                                break;
-                            }
-                        }
-                        _ => break,
+                    if index < bytes.len() && matches!(bytes[index], b'0'..=b'7') {
+                        value = value * 8 + u16::from(bytes[index] - b'0');
+                        index += 1;
+                    } else {
+                        break;
                     }
                 }
-                if let Some(ch) = std::char::from_u32(value) {
-                    out.push(ch);
-                }
+                out.push(u8::try_from(value).unwrap_or(b'?'));
             }
             other => out.push(other),
         }
@@ -316,10 +680,23 @@ fn unescape_c_string(input: &str) -> String {
     out
 }
 
+fn os_string_from_git_path_bytes(bytes: Vec<u8>) -> OsString {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+
+        OsString::from_vec(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        OsString::from(String::from_utf8_lossy(&bytes).into_owned())
+    }
+}
+
 /// Stage only the files that actually exist on disk for the given diff.
 pub fn stage_paths(git_root: &Path, diff: &str) -> io::Result<()> {
-    let paths = extract_paths_from_patch(diff);
-    let mut existing: Vec<String> = Vec::new();
+    let paths = extract_paths_from_patch_os(diff);
+    let mut existing: Vec<OsString> = Vec::new();
     for p in paths {
         let joined = git_root.join(&p);
         if std::fs::symlink_metadata(&joined).is_ok() {
@@ -330,15 +707,26 @@ pub fn stage_paths(git_root: &Path, diff: &str) -> io::Result<()> {
         return Ok(());
     }
     let mut cmd = std::process::Command::new("git");
-    cmd.arg("add");
+    cmd.arg("-c")
+        .arg(format!("core.hooksPath={DISABLED_HOOKS_PATH}"))
+        .args(["-c", "core.fsmonitor=false", "add"]);
     cmd.arg("--");
     for p in &existing {
-        cmd.arg(OsStr::new(p));
+        cmd.arg(p);
     }
-    let out = cmd.current_dir(git_root).output()?;
-    let _code = out.status.code().unwrap_or(-1);
-    // We do not hard fail staging; best-effort is OK. Return Ok even on non-zero.
-    Ok(())
+    let out = cmd
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .current_dir(git_root)
+        .output()?;
+    let code = out.status.code().unwrap_or(-1);
+    if code == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "git add failed (exit {code}): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
 }
 
 // ============ Parser ported from VS Code (TS) ============
@@ -360,21 +748,29 @@ pub fn parse_git_apply_output(
     let mut conflicted = std::collections::BTreeSet::new();
     let mut last_seen_path: Option<String> = None;
 
-    fn add(set: &mut std::collections::BTreeSet<String>, raw: &str) {
+    fn normalize_output_path(raw: &str) -> Option<String> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            return;
+            return None;
         }
         let first = trimmed.chars().next().unwrap_or('\0');
         let last = trimmed.chars().last().unwrap_or('\0');
-        let unquoted = if (first == '"' || first == '\'') && last == first && trimmed.len() >= 2 {
+        let normalized = if (first == '"' || first == '\'') && last == first && trimmed.len() >= 2 {
             unescape_c_string(&trimmed[1..trimmed.len() - 1])
         } else {
             trimmed.to_string()
         };
-        if !unquoted.is_empty() {
-            set.insert(unquoted);
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
         }
+    }
+
+    fn add(set: &mut std::collections::BTreeSet<String>, raw: &str) -> Option<String> {
+        let path = normalize_output_path(raw)?;
+        set.insert(path.clone());
+        Some(path)
     }
 
     static APPLIED_CLEAN: Lazy<Regex> =
@@ -447,7 +843,7 @@ pub fn parse_git_apply_output(
         // === "Checking patch <path>..." tracking ===
         if let Some(c) = CHECKING_PATCH.captures(line) {
             if let Some(m) = c.name("path") {
-                last_seen_path = Some(m.as_str().to_string());
+                last_seen_path = normalize_output_path(m.as_str());
             }
             continue;
         }
@@ -455,9 +851,7 @@ pub fn parse_git_apply_output(
         // === Status lines ===
         if let Some(c) = APPLIED_CLEAN.captures(line) {
             if let Some(m) = c.name("path") {
-                add(&mut applied, m.as_str());
-                let p = applied.iter().next_back().cloned();
-                if let Some(p) = p {
+                if let Some(p) = add(&mut applied, m.as_str()) {
                     conflicted.remove(&p);
                     skipped.remove(&p);
                     last_seen_path = Some(p);
@@ -467,9 +861,7 @@ pub fn parse_git_apply_output(
         }
         if let Some(c) = APPLIED_CONFLICTS.captures(line) {
             if let Some(m) = c.name("path") {
-                add(&mut conflicted, m.as_str());
-                let p = conflicted.iter().next_back().cloned();
-                if let Some(p) = p {
+                if let Some(p) = add(&mut conflicted, m.as_str()) {
                     applied.remove(&p);
                     skipped.remove(&p);
                     last_seen_path = Some(p);
@@ -479,9 +871,7 @@ pub fn parse_git_apply_output(
         }
         if let Some(c) = APPLYING_WITH_REJECTS.captures(line) {
             if let Some(m) = c.name("path") {
-                add(&mut conflicted, m.as_str());
-                let p = conflicted.iter().next_back().cloned();
-                if let Some(p) = p {
+                if let Some(p) = add(&mut conflicted, m.as_str()) {
                     applied.remove(&p);
                     skipped.remove(&p);
                     last_seen_path = Some(p);
@@ -493,9 +883,7 @@ pub fn parse_git_apply_output(
         // === “U <path>” after conflicts ===
         if let Some(c) = UNMERGED_LINE.captures(line) {
             if let Some(m) = c.name("path") {
-                add(&mut conflicted, m.as_str());
-                let p = conflicted.iter().next_back().cloned();
-                if let Some(p) = p {
+                if let Some(p) = add(&mut conflicted, m.as_str()) {
                     applied.remove(&p);
                     skipped.remove(&p);
                     last_seen_path = Some(p);
@@ -511,8 +899,7 @@ pub fn parse_git_apply_output(
                 .or_else(|| DOES_NOT_APPLY.captures(line))
                 && let Some(m) = c.name("path")
             {
-                add(&mut skipped, m.as_str());
-                last_seen_path = Some(m.as_str().to_string());
+                last_seen_path = add(&mut skipped, m.as_str());
             }
             continue;
         }
@@ -525,7 +912,7 @@ pub fn parse_git_apply_output(
         // === 3-way failed entirely; attribute to last_seen_path ===
         if THREE_WAY_FAILED.is_match(line) || LACKS_BLOB.is_match(line) {
             if let Some(p) = last_seen_path.clone() {
-                add(&mut skipped, &p);
+                skipped.insert(p.clone());
                 applied.remove(&p);
                 conflicted.remove(&p);
             }
@@ -546,9 +933,7 @@ pub fn parse_git_apply_output(
             .or_else(|| SKIPPED_PATCH.captures(line))
         {
             if let Some(m) = c.name("path") {
-                add(&mut skipped, m.as_str());
-                let p_now = skipped.iter().next_back().cloned();
-                if let Some(p) = p_now {
+                if let Some(p) = add(&mut skipped, m.as_str()) {
                     applied.remove(&p);
                     conflicted.remove(&p);
                     last_seen_path = Some(p);
@@ -560,9 +945,7 @@ pub fn parse_git_apply_output(
         // === Warnings that imply conflicts ===
         if let Some(c) = CANNOT_MERGE_BINARY_WARN.captures(line) {
             if let Some(m) = c.name("path") {
-                add(&mut conflicted, m.as_str());
-                let p = conflicted.iter().next_back().cloned();
-                if let Some(p) = p {
+                if let Some(p) = add(&mut conflicted, m.as_str()) {
                     applied.remove(&p);
                     skipped.remove(&p);
                     last_seen_path = Some(p);
@@ -655,12 +1038,145 @@ mod tests {
     }
 
     #[test]
+    fn extract_paths_decodes_octal_utf8_as_one_path() {
+        let diff = "diff --git \"a/\\303\\251.txt\" \"b/\\303\\251.txt\"\n--- \"a/\\303\\251.txt\"\n+++ \"b/\\303\\251.txt\"\n@@ -1 +1 @@\n-old\n+new\n";
+        let paths = extract_paths_from_patch(diff);
+        assert_eq!(paths, vec!["é.txt".to_string()]);
+    }
+
+    #[test]
     fn parse_output_unescapes_quoted_paths() {
         let stderr = "error: patch failed: \"hello\\tworld.txt\":1\n";
         let (applied, skipped, conflicted) = parse_git_apply_output("", stderr);
         assert_eq!(applied, Vec::<String>::new());
         assert_eq!(conflicted, Vec::<String>::new());
         assert_eq!(skipped, vec!["hello\tworld.txt".to_string()]);
+    }
+
+    #[test]
+    fn parse_output_decodes_octal_utf8_paths() {
+        let stderr = "error: patch failed: \"\\303\\251.txt\":1\n";
+        let (applied, skipped, conflicted) = parse_git_apply_output("", stderr);
+        assert_eq!(applied, Vec::<String>::new());
+        assert_eq!(conflicted, Vec::<String>::new());
+        assert_eq!(skipped, vec!["é.txt".to_string()]);
+    }
+
+    #[test]
+    fn parse_output_attributes_failure_to_the_just_parsed_path() {
+        let stderr = "Applied patch z.rs cleanly.\nApplied patch a.rs cleanly.\nFailed to perform three-way merge...\n";
+        let (applied, skipped, conflicted) = parse_git_apply_output("", stderr);
+        assert_eq!(applied, vec!["z.rs".to_string()]);
+        assert_eq!(skipped, vec!["a.rs".to_string()]);
+        assert_eq!(conflicted, Vec::<String>::new());
+    }
+
+    #[test]
+    fn apply_preserves_existing_index_and_leaves_patch_unstaged() {
+        let _g = env_lock().lock().unwrap();
+        let repo = init_repo();
+        let root = repo.path();
+
+        std::fs::write(root.join("patch.txt"), "before\n").unwrap();
+        std::fs::write(root.join("staged.txt"), "base staged\n").unwrap();
+        std::fs::write(root.join("unstaged.txt"), "base unstaged\n").unwrap();
+        let _ = run(root, &["git", "add", "."]);
+        let _ = run(root, &["git", "commit", "-m", "seed"]);
+
+        std::fs::write(root.join("patch.txt"), "after\n").unwrap();
+        let (_, diff, _) = run(root, &["git", "diff", "--full-index", "--", "patch.txt"]);
+        let _ = run(root, &["git", "restore", "patch.txt"]);
+
+        std::fs::write(root.join("staged.txt"), "prepared commit\n").unwrap();
+        let _ = run(root, &["git", "add", "staged.txt"]);
+        std::fs::write(root.join("unstaged.txt"), "local work\n").unwrap();
+        let (_, cached_before, _) = run(root, &["git", "diff", "--cached", "--binary"]);
+
+        let result = apply_git_patch(&ApplyGitRequest {
+            cwd: root.to_path_buf(),
+            diff,
+            revert: false,
+            preflight: false,
+        })
+        .expect("apply patch");
+
+        assert_eq!(result.exit_code, 0, "stderr: {}", result.stderr);
+        let (_, cached_after, _) = run(root, &["git", "diff", "--cached", "--binary"]);
+        assert_eq!(cached_after, cached_before);
+        assert_eq!(
+            read_file_normalized(&root.join("unstaged.txt")),
+            "local work\n"
+        );
+        let (_, patch_staged, _) = run(root, &["git", "diff", "--cached", "--", "patch.txt"]);
+        assert_eq!(patch_staged, "");
+        assert_eq!(read_file_normalized(&root.join("patch.txt")), "after\n");
+    }
+
+    #[test]
+    fn preflight_matches_clean_three_way_apply_without_mutating_worktree() {
+        let _g = env_lock().lock().unwrap();
+        let repo = init_repo();
+        let root = repo.path();
+
+        std::fs::write(root.join("file.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let _ = run(root, &["git", "add", "file.txt"]);
+        let _ = run(root, &["git", "commit", "-m", "seed"]);
+        std::fs::write(root.join("file.txt"), "one\nPATCH\nthree\nfour\nfive\n").unwrap();
+        let (_, diff, _) = run(root, &["git", "diff", "--full-index", "--", "file.txt"]);
+        let _ = run(root, &["git", "restore", "file.txt"]);
+        std::fs::write(root.join("file.txt"), "one\ntwo\nthree\nfour\nLOCAL\n").unwrap();
+
+        let preflight = apply_git_patch(&ApplyGitRequest {
+            cwd: root.to_path_buf(),
+            diff: diff.clone(),
+            revert: false,
+            preflight: true,
+        })
+        .expect("preflight patch");
+        assert_eq!(preflight.exit_code, 0, "stderr: {}", preflight.stderr);
+        assert_eq!(
+            read_file_normalized(&root.join("file.txt")),
+            "one\ntwo\nthree\nfour\nLOCAL\n"
+        );
+
+        let applied = apply_git_patch(&ApplyGitRequest {
+            cwd: root.to_path_buf(),
+            diff,
+            revert: false,
+            preflight: false,
+        })
+        .expect("apply patch");
+        assert_eq!(applied.exit_code, 0, "stderr: {}", applied.stderr);
+        assert_eq!(
+            read_file_normalized(&root.join("file.txt")),
+            "one\nPATCH\nthree\nfour\nLOCAL\n"
+        );
+    }
+
+    #[test]
+    fn preflight_reports_three_way_conflicts_as_failure() {
+        let _g = env_lock().lock().unwrap();
+        let repo = init_repo();
+        let root = repo.path();
+
+        std::fs::write(root.join("file.txt"), "before\n").unwrap();
+        let _ = run(root, &["git", "add", "file.txt"]);
+        let _ = run(root, &["git", "commit", "-m", "seed"]);
+        std::fs::write(root.join("file.txt"), "patch\n").unwrap();
+        let (_, diff, _) = run(root, &["git", "diff", "--full-index", "--", "file.txt"]);
+        std::fs::write(root.join("file.txt"), "local\n").unwrap();
+
+        let result = apply_git_patch(&ApplyGitRequest {
+            cwd: root.to_path_buf(),
+            diff,
+            revert: false,
+            preflight: true,
+        })
+        .expect("preflight patch");
+
+        assert_ne!(result.exit_code, 0);
+        assert_eq!(result.conflicted_paths, vec!["file.txt".to_string()]);
+        assert_eq!(read_file_normalized(&root.join("file.txt")), "local\n");
     }
 
     #[test]

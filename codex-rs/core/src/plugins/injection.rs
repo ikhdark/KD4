@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use codex_connectors::ConnectorSnapshot;
 use codex_connectors::metadata::connector_display_label;
 use codex_protocol::models::ResponseItem;
 
@@ -9,12 +10,16 @@ use crate::context::PluginInstructions;
 use crate::plugins::PluginCapabilitySummary;
 use crate::plugins::render_explicit_plugin_instructions;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_mcp::McpServerSource;
+use codex_mcp::ResolvedMcpCatalog;
 use codex_mcp::ToolInfo;
 
 pub(crate) fn build_plugin_injections(
     mentioned_plugins: &[PluginCapabilitySummary],
     mcp_tools: &[ToolInfo],
     available_connectors: &[connectors::AppInfo],
+    mcp_server_catalog: &ResolvedMcpCatalog,
+    connector_snapshot: &ConnectorSnapshot,
 ) -> Vec<ResponseItem> {
     if mentioned_plugins.is_empty() {
         return Vec::new();
@@ -29,10 +34,17 @@ pub(crate) fn build_plugin_injections(
                 .iter()
                 .filter(|tool| {
                     tool.server_name != CODEX_APPS_MCP_SERVER_NAME
-                        && tool
-                            .plugin_display_names
-                            .iter()
-                            .any(|plugin_name| plugin_name == &plugin.display_name)
+                        && mcp_server_catalog
+                            .server(tool.server_name.as_str())
+                            .is_some_and(|server| match server.source() {
+                                McpServerSource::Plugin(attribution)
+                                | McpServerSource::SelectedPlugin(attribution) => {
+                                    attribution.plugin_id() == plugin.config_name.as_str()
+                                }
+                                McpServerSource::Config
+                                | McpServerSource::Compatibility { .. }
+                                | McpServerSource::Extension { .. } => false,
+                            })
                 })
                 .map(|tool| tool.server_name.clone())
                 .collect::<BTreeSet<String>>()
@@ -42,10 +54,10 @@ pub(crate) fn build_plugin_injections(
                 .iter()
                 .filter(|connector| {
                     connector.is_enabled
-                        && connector
-                            .plugin_display_names
+                        && connector_snapshot
+                            .plugin_ids_for_connector_id(connector.id.as_str())
                             .iter()
-                            .any(|plugin_name| plugin_name == &plugin.display_name)
+                            .any(|plugin_id| plugin_id == &plugin.config_name)
                 })
                 .map(connector_display_label)
                 .collect::<BTreeSet<String>>()
@@ -57,3 +69,7 @@ pub(crate) fn build_plugin_injections(
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "injection_tests.rs"]
+mod tests;

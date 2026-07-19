@@ -166,7 +166,8 @@ pub async fn run_plugin_add(
 
     println!(
         "Added plugin `{}` from marketplace `{}`.",
-        outcome.plugin_id.plugin_name, outcome.plugin_id.marketplace_name
+        outcome.plugin_id.plugin_name(),
+        outcome.plugin_id.marketplace_name()
     );
     println!(
         "Installed plugin root: {}",
@@ -191,8 +192,8 @@ impl JsonPluginAddOutput {
     fn from_outcome(outcome: PluginInstallOutcome) -> Self {
         Self {
             plugin_id: outcome.plugin_id.as_key(),
-            name: outcome.plugin_id.plugin_name,
-            marketplace_name: outcome.plugin_id.marketplace_name,
+            name: outcome.plugin_id.plugin_name().to_string(),
+            marketplace_name: outcome.plugin_id.marketplace_name().to_string(),
             version: outcome.plugin_version,
             installed_path: outcome.installed_path.as_path().display().to_string(),
             auth_policy: auth_policy_label(outcome.auth_policy),
@@ -628,8 +629,8 @@ impl PluginSelection {
     fn from_plugin_id(plugin_id: PluginId) -> Self {
         let plugin_key = plugin_id.as_key();
         Self {
-            plugin_name: plugin_id.plugin_name,
-            marketplace_name: plugin_id.marketplace_name,
+            plugin_name: plugin_id.plugin_name().to_string(),
+            marketplace_name: plugin_id.marketplace_name().to_string(),
             plugin_key,
         }
     }
@@ -642,11 +643,11 @@ fn parse_plugin_selection(
     match (PluginId::parse(&plugin), marketplace_name) {
         (Ok(plugin_id), None) => Ok(PluginSelection::from_plugin_id(plugin_id)),
         (Ok(plugin_id), Some(marketplace_name)) => {
-            if plugin_id.marketplace_name != marketplace_name {
+            if plugin_id.marketplace_name() != marketplace_name {
                 bail!(
                     "plugin id `{}` belongs to marketplace `{}`, but --marketplace specified `{}`",
                     plugin,
-                    plugin_id.marketplace_name,
+                    plugin_id.marketplace_name(),
                     marketplace_name
                 );
             }

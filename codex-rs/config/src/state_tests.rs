@@ -91,6 +91,60 @@ approval_policy = "on-request"
 }
 
 #[test]
+fn feature_alias_overlay_updates_canonical_origin() {
+    let temp_dir = TempDir::new().expect("tempdir");
+    let base_file = test_user_config_path(&temp_dir, "config.toml");
+    let profile_file = test_user_config_path(&temp_dir, "work.config.toml");
+    let base_layer = ConfigLayerEntry::new(
+        ConfigLayerSource::User {
+            file: base_file,
+            profile: None,
+        },
+        toml::from_str(
+            r#"
+[features]
+apps = false
+"#,
+        )
+        .expect("base config"),
+    );
+    let profile_layer = ConfigLayerEntry::new(
+        ConfigLayerSource::User {
+            file: profile_file,
+            profile: Some("work".to_string()),
+        },
+        toml::from_str(
+            r#"
+[features]
+connectors = true
+"#,
+        )
+        .expect("profile config"),
+    );
+    let profile_metadata = profile_layer.metadata();
+    let stack = ConfigLayerStack::new(
+        vec![base_layer, profile_layer],
+        ConfigRequirements::default(),
+        ConfigRequirementsToml::default(),
+    )
+    .expect("multiple user layers should be valid");
+
+    let effective = stack.effective_config();
+    let effective_features = effective
+        .get("features")
+        .and_then(TomlValue::as_table)
+        .expect("effective features");
+    assert_eq!(
+        effective_features.get("apps").and_then(TomlValue::as_bool),
+        Some(true)
+    );
+
+    let origins = stack.origins();
+    assert_eq!(origins.get("features.apps"), Some(&profile_metadata));
+    assert_eq!(origins.get("features.connectors"), Some(&profile_metadata));
+}
+
+#[test]
 fn with_user_config_updates_matching_user_layer_without_replacing_active_profile() {
     let temp_dir = TempDir::new().expect("tempdir");
     let base_file = test_user_config_path(&temp_dir, "config.toml");

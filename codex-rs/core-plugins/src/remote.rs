@@ -1404,8 +1404,8 @@ pub async fn uninstall_remote_plugin(
         remote_plugin_id,
         fallback_capability_summary: _,
     } = target;
-    let marketplace_name = plugin_id.marketplace_name.clone();
-    let plugin_name = plugin_id.plugin_name.clone();
+    let marketplace_name = plugin_id.marketplace_name().to_string();
+    let plugin_name = plugin_id.plugin_name().to_string();
 
     let base_url = config.chatgpt_base_url.trim_end_matches('/');
     let url = format!("{base_url}/ps/plugins/{remote_plugin_id}/uninstall");

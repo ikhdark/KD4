@@ -70,6 +70,7 @@ pub use runtime::RemoteControlEnrollmentRecord;
 pub use runtime::RuntimeDbBackup;
 pub use runtime::RuntimeDbPath;
 pub use runtime::ThreadFilterOptions;
+pub use runtime::ThreadSpawnEdgeWriteError;
 pub use runtime::backup_runtime_db_for_fresh_start;
 pub use runtime::goals_db_filename;
 pub use runtime::goals_db_path;

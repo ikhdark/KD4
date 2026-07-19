@@ -4,6 +4,7 @@ use crate::agent::registry::AgentRegistry;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::resolve_role_config;
 use crate::agent::status::is_final;
+use crate::agent::task_coordinator::AgentTaskCoordinator;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::codex_thread::ThreadConfigSnapshot;
@@ -40,6 +41,7 @@ use codex_protocol::user_input::UserInput;
 use codex_thread_store::ReadThreadParams;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -69,6 +71,7 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_mode: Option<SpawnAgentForkMode>,
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
+    pub(crate) typed_task_binding: Option<codex_agent_task_store::AgentTaskBindingDraft>,
 }
 
 #[derive(Clone, Debug)]
@@ -105,6 +108,8 @@ pub(crate) struct AgentControl {
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Session-scoped state shared by the root thread and every cloned sub-agent control handle.
     rollout_budget: Arc<RolloutBudget>,
+    /// Durable typed-task state shared by the root thread and all of its sub-agents.
+    task_coordinator: AgentTaskCoordinator,
 }
 
 impl AgentControl {
@@ -135,6 +140,10 @@ impl AgentControl {
 
     pub(crate) fn rollout_budget(&self) -> &RolloutBudget {
         self.rollout_budget.as_ref()
+    }
+
+    pub(crate) fn task_coordinator(&self) -> &AgentTaskCoordinator {
+        &self.task_coordinator
     }
 
     /// Send rich user input items to an existing agent thread.
@@ -486,6 +495,24 @@ impl AgentControl {
             };
             if !is_final(&status) {
                 return;
+            }
+
+            if let Some(child_agent_path) = child_agent_path.as_ref()
+                && let Err(error) = control
+                    .task_coordinator()
+                    .seal_missing_receipt(
+                        child_agent_path,
+                        format!(
+                            "typed agent {child_agent_path} finished with status {status:?} without submitting a receipt"
+                        ),
+                    )
+                    .await
+            {
+                warn!(
+                    agent_path = %child_agent_path,
+                    %error,
+                    "failed to seal missing typed-agent receipt"
+                );
             }
 
             let Ok(state) = control.upgrade() else {

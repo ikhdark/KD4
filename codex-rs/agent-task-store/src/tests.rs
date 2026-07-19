@@ -391,6 +391,7 @@ async fn correction_attempt_is_immutable_and_bounded_to_one() {
     fixture
         .store
         .set_agent_gate(
+            TaskActor::Root,
             assignment.assignment_id,
             GateKind::Review,
             GateStatus::Pending,
@@ -406,6 +407,7 @@ async fn correction_attempt_is_immutable_and_bounded_to_one() {
     fixture
         .store
         .set_agent_gate(
+            TaskActor::Root,
             assignment.assignment_id,
             GateKind::Review,
             GateStatus::ChangesRequested,
@@ -546,10 +548,11 @@ async fn integrator_supersedes_only_targeted_successful_claims() {
     fixture
         .store
         .set_agent_gate(
+            TaskActor::Root,
             worker.assignment_id,
             GateKind::Review,
             GateStatus::Pending,
-            "retain claim for cold review".to_string(),
+            "cold review pending".to_string(),
         )
         .await
         .expect("pending gate");
@@ -566,6 +569,30 @@ async fn integrator_supersedes_only_targeted_successful_claims() {
         kind: RelationKind::Integration,
         target_assignment_ids: vec![worker.assignment_id],
     });
+    let blocked = fixture
+        .store
+        .create_assignment(fixture.repo.path(), integrator.clone())
+        .await
+        .expect_err("pending review gate must block a dependency");
+    assert!(matches!(
+        blocked,
+        StoreError::DependencyBlocked { blockers }
+            if blockers.iter().any(|blocker| {
+                blocker.assignment_id == worker.assignment_id
+                    && blocker.state == DependencyState::Incomplete
+            })
+    ));
+    fixture
+        .store
+        .set_agent_gate(
+            TaskActor::Root,
+            worker.assignment_id,
+            GateKind::Review,
+            GateStatus::Passed,
+            "cold review passed".to_string(),
+        )
+        .await
+        .expect("passed gate");
     fixture
         .store
         .create_assignment(fixture.repo.path(), integrator)

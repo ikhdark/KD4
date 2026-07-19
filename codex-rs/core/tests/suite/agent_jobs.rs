@@ -315,6 +315,20 @@ async fn spawn_agents_on_csv_runs_and_exports() -> Result<()> {
 
     test.submit_turn("run batch job").await?;
 
+    let worker_request_bodies = server
+        .received_requests()
+        .await
+        .expect("mock server should capture agent job requests")
+        .into_iter()
+        .filter_map(|request| serde_json::from_slice::<Value>(&decode_body_bytes(&request)).ok())
+        .filter(|body| !has_function_call_output(body) && extract_job_and_item(body).is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(worker_request_bodies.len(), 2);
+    for body in worker_request_bodies {
+        assert_eq!(body["model"].as_str(), Some("gpt-5.6-sol"));
+        assert_eq!(body["reasoning"]["effort"].as_str(), Some("xhigh"));
+    }
+
     let output = fs::read_to_string(&output_path)?;
     assert!(output.contains("result_json"));
     assert!(output.contains("item_id"));

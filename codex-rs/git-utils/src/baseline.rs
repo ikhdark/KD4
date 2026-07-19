@@ -155,8 +155,12 @@ fn commit_current_tree(repo: &gix::Repository, message: &str) -> anyhow::Result<
 }
 
 fn write_index_from_head(root: &Path) -> anyhow::Result<()> {
-    run_git_for_status(root, ["read-tree", "--reset", "HEAD"], /*env*/ None)
-        .context("write git baseline index from HEAD")
+    run_git_for_status(
+        root,
+        ["-c", "core.fsmonitor=false", "read-tree", "--reset", "HEAD"],
+        /*env*/ None,
+    )
+    .context("write git baseline index from HEAD")
 }
 
 fn codex_signature() -> gix::actor::Signature {

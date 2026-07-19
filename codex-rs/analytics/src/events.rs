@@ -1094,8 +1094,8 @@ fn codex_plugin_metadata_with_product_client_id(
         remote_plugin_id,
         plugin_name: plugin_id
             .as_ref()
-            .map(|plugin_id| plugin_id.plugin_name.clone()),
-        marketplace_name: plugin_id.map(|plugin_id| plugin_id.marketplace_name),
+            .map(|plugin_id| plugin_id.plugin_name().to_string()),
+        marketplace_name: plugin_id.map(|plugin_id| plugin_id.marketplace_name().to_string()),
         has_skills: capability_summary
             .as_ref()
             .map(|summary| summary.has_skills),

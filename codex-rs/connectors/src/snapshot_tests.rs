@@ -31,7 +31,19 @@ fn snapshot_merges_sources_in_order_and_dedupes_provenance() {
         &["Alpha".to_string(), "Zulu".to_string()]
     );
     assert_eq!(
+        merged.plugin_ids_for_connector_id("calendar"),
+        &[
+            "host".to_string(),
+            "selected-a".to_string(),
+            "selected-b".to_string(),
+        ]
+    );
+    assert_eq!(
         merged.plugin_display_names_for_connector_id("missing"),
+        &[] as &[String]
+    );
+    assert_eq!(
+        merged.plugin_ids_for_connector_id("missing"),
         &[] as &[String]
     );
 }

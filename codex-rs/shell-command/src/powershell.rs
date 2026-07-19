@@ -6,30 +6,32 @@ use crate::command_safety::try_parse_powershell_ast_commands;
 use crate::shell_detect::ShellType;
 use crate::shell_detect::detect_shell_type;
 
-const POWERSHELL_FLAGS: &[&str] = &["-nologo", "-noprofile", "-command", "-c"];
-
 /// Prefixed command for powershell shell calls to request UTF-8 console output.
 pub const UTF8_OUTPUT_PREFIX: &str =
     "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
 
 pub fn prefix_powershell_script_with_utf8(command: &[String]) -> Vec<String> {
-    let Some((_, script)) = extract_powershell_command(command) else {
+    let Some(extracted) = extract_powershell_command_details(command) else {
         return command.to_vec();
     };
 
-    let trimmed = script.trim_start();
+    let trimmed = extracted.script.trim_start();
     let script = if trimmed.starts_with(UTF8_OUTPUT_PREFIX) {
-        script.to_string()
+        extracted.script.to_string()
     } else {
-        format!("{UTF8_OUTPUT_PREFIX}{script}")
+        format!("{UTF8_OUTPUT_PREFIX}{}", extracted.script)
     };
 
-    let mut command: Vec<String> = command[..(command.len() - 1)]
-        .iter()
-        .map(std::string::ToString::to_string)
-        .collect();
-    command.push(script);
+    let mut command = command.to_vec();
+    command[extracted.script_index] = script;
     command
+}
+
+struct ExtractedPowershellCommand<'a> {
+    shell: &'a str,
+    script: &'a str,
+    script_index: usize,
+    no_profile: bool,
 }
 
 /// Extract the PowerShell script body from an invocation such as:
@@ -41,6 +43,38 @@ pub fn prefix_powershell_script_with_utf8(command: &[String]) -> Vec<String> {
 /// Returns (`shell`, `script`) when the first arg is a PowerShell executable and a
 /// `-Command` (or `-c`) flag is present followed by a script string.
 pub fn extract_powershell_command(command: &[String]) -> Option<(&str, &str)> {
+    let extracted = extract_powershell_command_details(command)?;
+    Some((extracted.shell, extracted.script))
+}
+
+/// Extract a PowerShell script only when profiles are disabled and the requested wrapper resolves
+/// to the trusted host.
+///
+/// This is intended for user-facing summaries that would otherwise hide the executable that will
+/// actually run. Syntax-only consumers should use [`extract_powershell_command`] instead.
+pub(crate) fn extract_trusted_noprofile_powershell_command(
+    command: &[String],
+) -> Option<(&str, &str)> {
+    let (shell, script) = extract_noprofile_powershell_command(command)?;
+    is_trusted_powershell_executable(shell).then_some((shell, script))
+}
+
+/// Extract an exact-shape PowerShell command only when profiles are explicitly disabled.
+pub fn extract_noprofile_powershell_command(command: &[String]) -> Option<(&str, &str)> {
+    let extracted = extract_powershell_command_details(command)?;
+    extracted
+        .no_profile
+        .then_some((extracted.shell, extracted.script))
+}
+
+/// Return whether this executable resolves to the independently selected trusted PowerShell host.
+pub fn is_trusted_powershell_executable(executable: &str) -> bool {
+    crate::command_safety::is_trusted_powershell_host(executable)
+}
+
+fn extract_powershell_command_details(
+    command: &[String],
+) -> Option<ExtractedPowershellCommand<'_>> {
     if command.len() < 3 {
         return None;
     }
@@ -53,33 +87,56 @@ pub fn extract_powershell_command(command: &[String]) -> Option<(&str, &str)> {
         return None;
     }
 
-    // Find the first occurrence of -Command (accept common short alias -c as well)
+    let mut no_profile = false;
     let mut i = 1usize;
-    while i + 1 < command.len() {
+    while i < command.len() {
         let flag = &command[i];
-        // Reject unknown flags
-        if !POWERSHELL_FLAGS.contains(&flag.to_ascii_lowercase().as_str()) {
-            return None;
+        match flag.to_ascii_lowercase().as_str() {
+            "-nologo" => i += 1,
+            "-noprofile" => {
+                no_profile = true;
+                i += 1;
+            }
+            "-command" | "-c" => {
+                let script_index = i + 1;
+                if script_index + 1 != command.len() {
+                    return None;
+                }
+                return Some(ExtractedPowershellCommand {
+                    shell,
+                    script: &command[script_index],
+                    script_index,
+                    no_profile,
+                });
+            }
+            _ => return None,
         }
-        if flag.eq_ignore_ascii_case("-Command") || flag.eq_ignore_ascii_case("-c") {
-            let script = &command[i + 1];
-            return Some((shell, script));
-        }
-        i += 1;
     }
     None
 }
 
 /// Parse the script body from a top-level PowerShell wrapper into argv-like commands.
 ///
-/// This is intentionally narrower than the Windows safe-command parser: it only unwraps the
-/// `-Command`/`-c` body from a PowerShell invocation we already recognize, then delegates the
-/// script itself to the PowerShell AST parser.
+/// This exact-shape parser is used by non-approval consumers such as command preflight. Approval
+/// and execution-policy decisions must use the `-NoProfile` variant below.
 pub fn parse_powershell_command_into_plain_commands(
     command: &[String],
 ) -> Option<Vec<Vec<String>>> {
-    let (executable, script) = extract_powershell_command(command)?;
-    try_parse_powershell_ast_commands(executable, script)
+    let extracted = extract_powershell_command_details(command)?;
+    try_parse_powershell_ast_commands(extracted.shell, extracted.script)
+}
+
+/// Parse an exact-shape PowerShell command only when profiles are disabled, as required by
+/// approval and execution-policy decisions that depend on the parsed command being equivalent to
+/// the command that will actually run.
+pub fn parse_noprofile_powershell_command_into_plain_commands(
+    command: &[String],
+) -> Option<Vec<Vec<String>>> {
+    let (shell, script) = extract_noprofile_powershell_command(command)?;
+    if !is_trusted_powershell_executable(shell) {
+        return None;
+    }
+    try_parse_powershell_ast_commands(shell, script)
 }
 
 /// This function attempts to find a powershell.exe executable on the system.
@@ -233,6 +290,19 @@ mod tests {
             format!("{UTF8_OUTPUT_PREFIX}Write-Host hi"),
         ];
 
+        assert_eq!(prefix_powershell_script_with_utf8(&cmd), cmd);
+    }
+
+    #[test]
+    fn rejects_and_does_not_rewrite_trailing_powershell_arguments() {
+        let cmd = vec![
+            "powershell".to_string(),
+            "-Command".to_string(),
+            "Write-Host hi".to_string(),
+            "unexpected".to_string(),
+        ];
+
+        assert_eq!(extract_powershell_command(&cmd), None);
         assert_eq!(prefix_powershell_script_with_utf8(&cmd), cmd);
     }
 

@@ -10,11 +10,13 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use tracing::warn;
 
 pub const DEFAULT_PLUGIN_VERSION: &str = "local";
 pub const PLUGINS_CACHE_DIR: &str = "plugins/cache";
@@ -80,8 +82,8 @@ impl PluginStore {
 
     pub fn plugin_base_root(&self, plugin_id: &PluginId) -> AbsolutePathBuf {
         self.root
-            .join(&plugin_id.marketplace_name)
-            .join(&plugin_id.plugin_name)
+            .join(plugin_id.marketplace_name())
+            .join(plugin_id.plugin_name())
     }
 
     pub fn plugin_root(&self, plugin_id: &PluginId, plugin_version: &str) -> AbsolutePathBuf {
@@ -89,10 +91,85 @@ impl PluginStore {
     }
 
     pub fn plugin_data_root(&self, plugin_id: &PluginId) -> AbsolutePathBuf {
+        self.data_root
+            .join(plugin_id.marketplace_name())
+            .join(plugin_id.plugin_name())
+    }
+
+    fn legacy_plugin_data_root(&self, plugin_id: &PluginId) -> AbsolutePathBuf {
         self.data_root.join(format!(
             "{}-{}",
-            plugin_id.plugin_name, plugin_id.marketplace_name
+            plugin_id.plugin_name(),
+            plugin_id.marketplace_name()
         ))
+    }
+
+    pub(crate) fn migrate_legacy_plugin_data_roots(&self, plugin_ids: &[PluginId]) {
+        let mut plugin_ids_by_legacy_root = BTreeMap::<PathBuf, Vec<&PluginId>>::new();
+        for plugin_id in plugin_ids {
+            plugin_ids_by_legacy_root
+                .entry(
+                    self.legacy_plugin_data_root(plugin_id)
+                        .as_path()
+                        .to_path_buf(),
+                )
+                .or_default()
+                .push(plugin_id);
+        }
+
+        for (legacy_root, plugin_ids) in plugin_ids_by_legacy_root {
+            if !legacy_root.exists() {
+                continue;
+            }
+            if plugin_ids.len() != 1 {
+                let plugin_keys = plugin_ids
+                    .iter()
+                    .map(|plugin_id| plugin_id.as_key())
+                    .collect::<Vec<_>>();
+                warn!(
+                    legacy_path = %legacy_root.display(),
+                    plugins = ?plugin_keys,
+                    "legacy plugin data directory is ambiguous; leaving it unmigrated"
+                );
+                continue;
+            }
+
+            let plugin_id = plugin_ids[0];
+            let destination = self.plugin_data_root(plugin_id);
+            if destination.as_path().exists() {
+                warn!(
+                    plugin = plugin_id.as_key(),
+                    legacy_path = %legacy_root.display(),
+                    destination = %destination.as_path().display(),
+                    "legacy and nested plugin data directories both exist; leaving the legacy directory unmigrated"
+                );
+                continue;
+            }
+            let Some(destination_parent) = destination.as_path().parent() else {
+                warn!(
+                    plugin = plugin_id.as_key(),
+                    destination = %destination.as_path().display(),
+                    "nested plugin data directory has no parent; leaving the legacy directory unmigrated"
+                );
+                continue;
+            };
+            if let Err(err) = fs::create_dir_all(destination_parent) {
+                warn!(
+                    plugin = plugin_id.as_key(),
+                    destination = %destination.as_path().display(),
+                    "failed to create nested plugin data parent; leaving the legacy directory unmigrated: {err}"
+                );
+                continue;
+            }
+            if let Err(err) = fs::rename(&legacy_root, destination.as_path()) {
+                warn!(
+                    plugin = plugin_id.as_key(),
+                    legacy_path = %legacy_root.display(),
+                    destination = %destination.as_path().display(),
+                    "failed to migrate legacy plugin data directory: {err}"
+                );
+            }
+        }
     }
 
     pub fn active_plugin_version(&self, plugin_id: &PluginId) -> Option<String> {
@@ -300,10 +377,10 @@ impl PluginStore {
 
         let manifest = resolve_install_manifest(source_path.as_path(), manifest);
         let plugin_name = plugin_name_for_source(source_path.as_path(), manifest)?;
-        if plugin_name != plugin_id.plugin_name {
+        if plugin_name != plugin_id.plugin_name() {
             return Err(PluginStoreError::Invalid(format!(
                 "plugin.json name `{plugin_name}` does not match marketplace plugin name `{}`",
-                plugin_id.plugin_name
+                plugin_id.plugin_name()
             )));
         }
         validate_plugin_version_segment(&plugin_version).map_err(PluginStoreError::Invalid)?;

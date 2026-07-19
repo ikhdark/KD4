@@ -46,13 +46,18 @@ pub struct RepoScope {
 
 impl RepoScope {
     pub fn covers_path(&self, path: &str) -> bool {
-        self.path == path || self.recursive && is_descendant(&self.path, path)
+        paths_equal(&self.path, path) || self.recursive && is_descendant(&self.path, path)
     }
 
     pub fn overlaps(&self, other: &Self) -> bool {
-        self.path == other.path
+        paths_equal(&self.path, &other.path)
             || self.recursive && is_descendant(&self.path, &other.path)
             || other.recursive && is_descendant(&other.path, &self.path)
+    }
+
+    pub(crate) fn covers_scope(&self, other: &Self) -> bool {
+        paths_equal(&self.path, &other.path) && (self.recursive || !other.recursive)
+            || self.recursive && is_descendant(&self.path, &other.path)
     }
 }
 
@@ -66,6 +71,7 @@ pub fn normalize_repo_scopes(
 
     for scope in scopes {
         let path = normalize_lexically(&scope.path)?;
+        let path = canonical_relative_identity(&canonical_root, &path)?;
         let duplicate_key = if cfg!(windows) {
             path.to_lowercase()
         } else {
@@ -76,7 +82,6 @@ pub fn normalize_repo_scopes(
                 "duplicate scope path {path}"
             )));
         }
-        ensure_canonical_containment(&canonical_root, &path)?;
         normalized.push(RepoScope {
             path,
             recursive: scope.recursive,
@@ -89,8 +94,7 @@ pub fn normalize_repo_scopes(
 pub(crate) fn normalize_repo_path(repo_root: &Path, path: &str) -> StoreResult<String> {
     let canonical_root = repository_identity(repo_root)?.canonical_root;
     let normalized = normalize_lexically(path)?;
-    ensure_canonical_containment(&canonical_root, &normalized)?;
-    Ok(normalized)
+    canonical_relative_identity(&canonical_root, &normalized)
 }
 
 fn normalize_lexically(path: &str) -> StoreResult<String> {
@@ -135,7 +139,7 @@ fn normalize_lexically(path: &str) -> StoreResult<String> {
     Ok(components.join("/"))
 }
 
-fn ensure_canonical_containment(canonical_root: &Path, relative: &str) -> StoreResult<()> {
+fn canonical_relative_identity(canonical_root: &Path, relative: &str) -> StoreResult<String> {
     let target = canonical_root.join(relative);
     let mut existing = target.as_path();
     while !existing.exists() {
@@ -154,13 +158,50 @@ fn ensure_canonical_containment(canonical_root: &Path, relative: &str) -> StoreR
             "scope resolves outside the repository through a symlink: {relative}"
         )));
     }
-    Ok(())
+    let suffix = target.strip_prefix(existing).map_err(|_| {
+        StoreError::InvalidScope(format!(
+            "scope cannot be made repository-relative: {relative}"
+        ))
+    })?;
+    let canonical_target = canonical_existing.join(suffix);
+    let canonical_relative = canonical_target.strip_prefix(canonical_root).map_err(|_| {
+        StoreError::InvalidScope(format!("scope resolves outside the repository: {relative}"))
+    })?;
+    let components = canonical_relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => Ok(value.to_string_lossy().into_owned()),
+            _ => Err(StoreError::InvalidScope(format!(
+                "scope has an invalid canonical identity: {relative}"
+            ))),
+        })
+        .collect::<StoreResult<Vec<_>>>()?;
+    if components.is_empty() {
+        return Err(StoreError::InvalidScope(
+            "scope path cannot resolve to the repository root".to_string(),
+        ));
+    }
+    Ok(components.join("/"))
 }
 
 fn is_descendant(parent: &str, child: &str) -> bool {
+    let parent = comparison_key(parent);
+    let child = comparison_key(child);
     child
-        .strip_prefix(parent)
+        .strip_prefix(&parent)
         .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn paths_equal(left: &str, right: &str) -> bool {
+    comparison_key(left) == comparison_key(right)
+}
+
+fn comparison_key(path: &str) -> String {
+    if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    }
 }
 
 pub(crate) fn absolute_repo_path(repo_root: &Path, relative: &str) -> PathBuf {

@@ -290,6 +290,102 @@ async fn backfill_sessions_resumes_from_watermark_and_marks_complete() {
 }
 
 #[tokio::test]
+async fn backfill_sessions_retries_from_first_failed_watermark() {
+    let dir = tempdir().expect("tempdir");
+    let codex_home = dir.path().to_path_buf();
+    let first_uuid = Uuid::from_u128(1);
+    let failed_uuid = Uuid::from_u128(2);
+    let last_uuid = Uuid::from_u128(3);
+    let first_path = write_rollout_in_sessions(
+        codex_home.as_path(),
+        "2026-01-27T12-34-56",
+        "2026-01-27T12:34:56Z",
+        first_uuid,
+        /*git*/ None,
+    );
+    let failed_path = codex_home
+        .join("sessions")
+        .join(format!("rollout-2026-01-27T12-35-56-{failed_uuid}.jsonl"));
+    File::create(&failed_path).expect("create empty failed rollout");
+    let last_path = write_rollout_in_sessions(
+        codex_home.as_path(),
+        "2026-01-27T12-36-56",
+        "2026-01-27T12:36:56Z",
+        last_uuid,
+        /*git*/ None,
+    );
+
+    let runtime = codex_state::StateRuntime::init(codex_home.clone(), "test-provider".to_string())
+        .await
+        .expect("initialize runtime");
+
+    backfill_sessions(runtime.as_ref(), codex_home.as_path(), "test-provider").await;
+
+    let state = runtime
+        .get_backfill_state()
+        .await
+        .expect("get incomplete backfill state");
+    assert_eq!(state.status, BackfillStatus::Pending);
+    assert_eq!(
+        state.last_watermark,
+        Some(backfill_watermark_for_path(
+            codex_home.as_path(),
+            first_path.as_path(),
+        ))
+    );
+    let first_id = ThreadId::from_string(&first_uuid.to_string()).expect("first thread id");
+    let failed_id = ThreadId::from_string(&failed_uuid.to_string()).expect("failed thread id");
+    let last_id = ThreadId::from_string(&last_uuid.to_string()).expect("last thread id");
+    assert!(
+        runtime
+            .get_thread(first_id)
+            .await
+            .expect("get first")
+            .is_some()
+    );
+    assert_eq!(
+        runtime.get_thread(failed_id).await.expect("get failed"),
+        None
+    );
+    assert!(
+        runtime
+            .get_thread(last_id)
+            .await
+            .expect("get last")
+            .is_some()
+    );
+
+    write_rollout_in_sessions(
+        codex_home.as_path(),
+        "2026-01-27T12-35-56",
+        "2026-01-27T12:35:56Z",
+        failed_uuid,
+        /*git*/ None,
+    );
+    backfill_sessions(runtime.as_ref(), codex_home.as_path(), "test-provider").await;
+
+    assert!(
+        runtime
+            .get_thread(failed_id)
+            .await
+            .expect("get repaired")
+            .is_some()
+    );
+    let state = runtime
+        .get_backfill_state()
+        .await
+        .expect("get completed backfill state");
+    assert_eq!(state.status, BackfillStatus::Complete);
+    assert_eq!(
+        state.last_watermark,
+        Some(backfill_watermark_for_path(
+            codex_home.as_path(),
+            last_path.as_path(),
+        ))
+    );
+}
+
+#[tokio::test]
 async fn backfill_sessions_preserves_existing_git_branch_and_fills_missing_git_fields() {
     let dir = tempdir().expect("tempdir");
     let codex_home = dir.path().to_path_buf();

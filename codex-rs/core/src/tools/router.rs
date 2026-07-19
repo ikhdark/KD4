@@ -1,3 +1,9 @@
+use crate::agent::task_capabilities::CapabilityPolicyError;
+use crate::agent::task_capabilities::ExternalMutationIntent;
+use crate::agent::task_capabilities::TypedToolClass;
+use crate::agent::task_capabilities::TypedToolRequest;
+use crate::agent::task_capabilities::authorize_typed_tool;
+use crate::agent::task_capabilities::classify_typed_tool;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -9,6 +15,8 @@ use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::spec_plan::build_tool_router;
+use codex_agent_task_store::AttemptState;
+use codex_git_utils::get_git_repo_root;
 use codex_mcp::ToolInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ResponseItem;
@@ -218,6 +226,7 @@ impl ToolRouter {
         source: ToolCallSource,
         terminal_outcome_reached: Option<Arc<AtomicBool>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
+        authorize_bound_typed_tool_call(session.as_ref(), step_context.as_ref(), &call).await?;
         let ToolCall {
             tool_name,
             call_id,
@@ -241,6 +250,83 @@ impl ToolRouter {
         self.registry
             .dispatch_any_with_terminal_outcome(invocation, terminal_outcome_reached)
             .await
+    }
+}
+
+async fn authorize_bound_typed_tool_call(
+    session: &Session,
+    step_context: &StepContext,
+    call: &ToolCall,
+) -> Result<(), FunctionCallError> {
+    let coordinator = session.services.agent_control.task_coordinator();
+    let Some(binding) = coordinator.binding_for_source(&step_context.turn.session_source) else {
+        return Ok(());
+    };
+    let task = coordinator
+        .get_agent_task(binding.assignment_id, Some(0))
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "{}: typed assignment state is unavailable: {error}",
+                call.tool_name.name
+            ))
+        })?;
+    if task.current_attempt.attempt_id != binding.attempt_id
+        || task.current_attempt.state != AttemptState::Active
+    {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{}: the bound typed assignment attempt is no longer active",
+            call.tool_name.name
+        )));
+    }
+
+    let cwd = match step_context.environments.primary() {
+        Some(environment) => environment
+            .cwd()
+            .to_abs_path()
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "{}: typed assignments require a local filesystem environment: {error}",
+                    call.tool_name.name
+                ))
+            })?
+            .to_path_buf(),
+        None => step_context.turn.config.cwd.to_path_buf(),
+    };
+    let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
+    let collaboration_namespace = step_context
+        .turn
+        .config
+        .multi_agent_v2
+        .tool_namespace
+        .as_deref();
+    let class = classify_typed_tool(
+        call.tool_name.namespace.as_deref(),
+        &call.tool_name.name,
+        collaboration_namespace,
+    );
+    let authorization = authorize_typed_tool(
+        &task.assignment,
+        &repo_root,
+        TypedToolRequest {
+            class,
+            external_mutation_intent: ExternalMutationIntent::MayMutate,
+            repo_paths: &[],
+        },
+    );
+    match authorization {
+        Ok(_) => Ok(()),
+        Err(CapabilityPolicyError::MissingStructuredEditPaths)
+            if class == TypedToolClass::StructuredEdit =>
+        {
+            // The verified apply-patch runtime owns complete path extraction and repeats
+            // authorization with that closed path set immediately before execution.
+            Ok(())
+        }
+        Err(error) => Err(FunctionCallError::RespondToModel(format!(
+            "{}: typed assignment capability denied: {error}",
+            call.tool_name.name
+        ))),
     }
 }
 

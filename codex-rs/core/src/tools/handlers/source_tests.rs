@@ -78,7 +78,12 @@ impl ExecutorFileSystem for FailingSourceFileSystem {
         path: &'a PathUri,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
-        self.inner.read_file_stream(path, sandbox)
+        Box::pin(async move {
+            if self.targets(path, InjectedSourceFailure::Read) {
+                return Err(io::Error::other("injected read failure"));
+            }
+            self.inner.read_file_stream(path, sandbox).await
+        })
     }
 
     fn write_file<'a>(
@@ -171,6 +176,7 @@ fn sample_search_output(text: String) -> SourceSearchOutput {
             files_scanned: 1,
             files_skipped_too_large: 0,
             files_skipped_non_utf8: 0,
+            files_changed_during_read: 0,
             filesystem_errors: 0,
             bytes_scanned: 10,
             result_bytes: text.len(),

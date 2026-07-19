@@ -55,8 +55,10 @@ const TURN_0_FORK_PROMPT: &str = "seed fork context";
 const TURN_1_PROMPT: &str = "spawn a child and continue";
 const TURN_2_NO_WAIT_PROMPT: &str = "follow up without wait";
 const CHILD_PROMPT: &str = "child: do work";
+const DEFAULT_SUBAGENT_MODEL: &str = "gpt-5.6-sol";
+const DEFAULT_SUBAGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
 const INHERITED_MODEL: &str = "gpt-5.2";
-const INHERITED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
+const INHERITED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Medium;
 const REQUESTED_MODEL: &str = "gpt-5.4";
 const REQUESTED_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::Low;
 const ROLE_MODEL: &str = "gpt-5.4";
@@ -954,6 +956,29 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_agent_uses_built_in_model_and_reasoning_defaults() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let child_snapshot = spawn_child_and_capture_snapshot(
+        &server,
+        json!({
+            "message": CHILD_PROMPT,
+        }),
+        |builder| builder,
+    )
+    .await?;
+
+    assert_eq!(child_snapshot.model, DEFAULT_SUBAGENT_MODEL);
+    assert_eq!(
+        child_snapshot.reasoning_effort,
+        Some(DEFAULT_SUBAGENT_REASONING_EFFORT)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spawn_agent_requested_model_and_reasoning_override_inherited_settings_without_role()
 -> Result<()> {
     skip_if_no_network!(Ok(()));
@@ -974,6 +999,68 @@ async fn spawn_agent_requested_model_and_reasoning_override_inherited_settings_w
     assert_eq!(
         child_snapshot.reasoning_effort,
         Some(REQUESTED_REASONING_EFFORT)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_agent_model_override_keeps_built_in_reasoning_default() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let child_snapshot = spawn_child_and_capture_snapshot(
+        &server,
+        json!({
+            "message": CHILD_PROMPT,
+            "model": REQUESTED_MODEL,
+        }),
+        |builder| builder,
+    )
+    .await?;
+
+    assert_eq!(child_snapshot.model, REQUESTED_MODEL);
+    assert_eq!(
+        child_snapshot.reasoning_effort,
+        Some(DEFAULT_SUBAGENT_REASONING_EFFORT)
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn spawn_agent_instruction_only_role_keeps_built_in_model_defaults() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let child_snapshot = spawn_child_and_capture_snapshot(
+        &server,
+        json!({
+            "message": CHILD_PROMPT,
+            "agent_type": "custom",
+        }),
+        |builder| {
+            builder.with_config(|config| {
+                let role_path = config.codex_home.join("instruction-only-role.toml");
+                std::fs::write(&role_path, "developer_instructions = \"Stay focused\"\n")
+                    .expect("write instruction-only role config");
+                config.agent_roles.insert(
+                    "custom".to_string(),
+                    AgentRoleConfig {
+                        description: Some("Instruction-only role".to_string()),
+                        config_file: Some(role_path.to_path_buf()),
+                        nickname_candidates: None,
+                    },
+                );
+            })
+        },
+    )
+    .await?;
+
+    assert_eq!(child_snapshot.model, DEFAULT_SUBAGENT_MODEL);
+    assert_eq!(
+        child_snapshot.reasoning_effort,
+        Some(DEFAULT_SUBAGENT_REASONING_EFFORT)
     );
 
     Ok(())
@@ -1136,6 +1223,16 @@ async fn encrypted_multi_agent_v2_spawn_sends_agent_message_to_child() -> Result
         }
         sleep(Duration::from_millis(10)).await;
     };
+    assert!(
+        child_request.has_message_with_input_texts("developer", |texts| {
+            texts.iter().any(|text| {
+                text.contains("You may edit only the contract surface explicitly assigned to you.")
+                    && text.contains(
+                        "the assigned contract owner is authoritative for edits to that behavior;",
+                    )
+            })
+        })
+    );
     assert_eq!(
         strip_metadata_from_json(Value::Array(child_request.inputs_of_type("agent_message"))),
         Value::Array(vec![json!({
@@ -1162,6 +1259,17 @@ async fn encrypted_multi_agent_v2_spawn_sends_agent_message_to_child() -> Result
         .into_iter()
         .find(|thread_id| *thread_id != root_thread_id)
         .expect("child thread ID");
+    let child_snapshot = test
+        .thread_manager
+        .get_thread(child_thread_id)
+        .await?
+        .config_snapshot()
+        .await;
+    assert_eq!(child_snapshot.model, DEFAULT_SUBAGENT_MODEL);
+    assert_eq!(
+        child_snapshot.reasoning_effort,
+        Some(DEFAULT_SUBAGENT_REASONING_EFFORT)
+    );
     let logs = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let logs = String::from_utf8(output.lock().expect("buffer lock").clone())

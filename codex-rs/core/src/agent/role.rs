@@ -29,6 +29,13 @@ use toml::Value as TomlValue;
 pub const DEFAULT_ROLE_NAME: &str = "default";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
 
+/// Model settings that a role explicitly owns and that spawn defaults must not replace.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AgentRoleModelLocks {
+    pub(crate) model: bool,
+    pub(crate) reasoning_effort: bool,
+}
+
 /// Applies a named role layer to `config` while preserving caller-owned provider settings.
 ///
 /// The role layer is inserted at session-flag precedence so it can override persisted config, but
@@ -38,7 +45,7 @@ const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not availabl
 pub(crate) async fn apply_role_to_config(
     config: &mut Config,
     role_name: Option<&str>,
-) -> Result<(), String> {
+) -> Result<AgentRoleModelLocks, String> {
     let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
 
     let role = resolve_role_config(config, role_name)
@@ -57,18 +64,22 @@ async fn apply_role_to_config_inner(
     config: &mut Config,
     role_name: &str,
     role: &AgentRoleConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<AgentRoleModelLocks> {
     let is_built_in = !config.agent_roles.contains_key(role_name);
     let Some(config_file) = role.config_file.as_ref() else {
-        return Ok(());
+        return Ok(AgentRoleModelLocks::default());
     };
     let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
     if role_layer_toml
         .as_table()
         .is_some_and(toml::map::Map::is_empty)
     {
-        return Ok(());
+        return Ok(AgentRoleModelLocks::default());
     }
+    let model_locks = AgentRoleModelLocks {
+        model: role_layer_toml.get("model").is_some(),
+        reasoning_effort: role_layer_toml.get("model_reasoning_effort").is_some(),
+    };
     let preserve_current_provider = role_layer_toml.get("model_provider").is_none();
     let preserve_current_service_tier = role_layer_toml.get("service_tier").is_none();
 
@@ -79,7 +90,7 @@ async fn apply_role_to_config_inner(
         preserve_current_service_tier,
     )
     .await?;
-    Ok(())
+    Ok(model_locks)
 }
 
 async fn load_role_layer_toml(
@@ -346,6 +357,39 @@ Rules:
                         nickname_candidates: None,
                     }
                 ),
+                (
+                    "reviewer".to_string(),
+                    AgentRoleConfig {
+                        description: Some(
+                            "Review one completed assignment against its contract and evidence. Remain read-only and report findings without editing source."
+                                .to_string(),
+                        ),
+                        config_file: None,
+                        nickname_candidates: None,
+                    },
+                ),
+                (
+                    "verifier".to_string(),
+                    AgentRoleConfig {
+                        description: Some(
+                            "Run focused validation for one completed assignment. Remain read-only for source and report reproducible evidence."
+                                .to_string(),
+                        ),
+                        config_file: None,
+                        nickname_candidates: None,
+                    },
+                ),
+                (
+                    "integrator".to_string(),
+                    AgentRoleConfig {
+                        description: Some(
+                            "Integrate completed dependent assignments within the explicitly declared write scope. Preserve unrelated work and resolve only scoped conflicts."
+                                .to_string(),
+                        ),
+                        config_file: None,
+                        nickname_candidates: None,
+                    },
+                ),
                 // Awaiter is temp removed
 //                 (
 //                     "awaiter".to_string(),
@@ -371,7 +415,7 @@ Rules:
 
     /// Resolves a built-in role `config_file` path to embedded content.
     pub(super) fn config_file_contents(path: &Path) -> Option<&'static str> {
-        const EXPLORER: &str = include_str!("builtins/explorer.toml");
+        const EXPLORER: &str = "";
         const AWAITER: &str = include_str!("builtins/awaiter.toml");
         match path.to_str()? {
             "explorer.toml" => Some(EXPLORER),

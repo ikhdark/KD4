@@ -473,10 +473,11 @@ fn extract_remote_plugin_bundle_to_path(
             "remote plugin bundle did not contain a valid plugin.json".to_string(),
         )
     })?;
-    if manifest.name != bundle.plugin_id.plugin_name {
+    if manifest.name != bundle.plugin_id.plugin_name() {
         return Err(RemotePluginBundleInstallError::InvalidBundle(format!(
             "plugin.json name `{}` does not match remote plugin name `{}`",
-            manifest.name, bundle.plugin_id.plugin_name
+            manifest.name,
+            bundle.plugin_id.plugin_name()
         )));
     }
 
@@ -495,7 +496,7 @@ fn prepare_extracted_remote_plugin_root(
     plugin_root: &Path,
     bundle: &ValidatedRemotePluginBundle,
 ) -> Result<(), RemotePluginBundleInstallError> {
-    if bundle.plugin_id.marketplace_name != REMOTE_GLOBAL_MARKETPLACE_NAME {
+    if bundle.plugin_id.marketplace_name() != REMOTE_GLOBAL_MARKETPLACE_NAME {
         return Ok(());
     }
 
@@ -643,8 +644,8 @@ mod tests {
         )
         .expect("valid install plan");
 
-        assert_eq!(bundle.plugin_id.plugin_name, "linear");
-        assert_eq!(bundle.plugin_id.marketplace_name, "openai-curated-remote");
+        assert_eq!(bundle.plugin_id.plugin_name(), "linear");
+        assert_eq!(bundle.plugin_id.marketplace_name(), "openai-curated-remote");
         assert_eq!(bundle.plugin_version, "1.2.3");
         assert_eq!(
             bundle.bundle_download_url.as_str(),

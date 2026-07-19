@@ -20,6 +20,16 @@ fn notify_event(kind: EventKind, paths: Vec<PathBuf>) -> Event {
     event
 }
 
+#[cfg(unix)]
+fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
 #[tokio::test]
 async fn throttled_receiver_coalesces_within_interval() {
     let (tx, rx) = watch_channel();
@@ -33,6 +43,7 @@ async fn throttled_receiver_coalesces_within_interval() {
         first,
         Some(FileWatcherEvent {
             paths: vec![path("a")],
+            rescan_required: false,
         })
     );
 
@@ -47,6 +58,7 @@ async fn throttled_receiver_coalesces_within_interval() {
         second,
         Some(FileWatcherEvent {
             paths: vec![path("b"), path("c")],
+            rescan_required: false,
         })
     );
 }
@@ -64,6 +76,7 @@ async fn throttled_receiver_flushes_pending_on_shutdown() {
         first,
         Some(FileWatcherEvent {
             paths: vec![path("a")],
+            rescan_required: false,
         })
     );
 
@@ -77,6 +90,7 @@ async fn throttled_receiver_flushes_pending_on_shutdown() {
         second,
         Some(FileWatcherEvent {
             paths: vec![path("b")],
+            rescan_required: false,
         })
     );
 
@@ -99,6 +113,7 @@ async fn debounced_receiver_coalesces_each_event_batch() {
         first,
         Some(FileWatcherEvent {
             paths: vec![path("a")],
+            rescan_required: false,
         })
     );
 
@@ -114,6 +129,7 @@ async fn debounced_receiver_coalesces_each_event_batch() {
         second,
         Some(FileWatcherEvent {
             paths: vec![path("c"), path("d")],
+            rescan_required: false,
         })
     );
 }
@@ -133,6 +149,7 @@ async fn debounced_receiver_flushes_pending_on_shutdown() {
         flushed,
         Some(FileWatcherEvent {
             paths: vec![path("a")],
+            rescan_required: false,
         })
     );
 
@@ -140,6 +157,24 @@ async fn debounced_receiver_flushes_pending_on_shutdown() {
         .await
         .expect("closed recv timeout");
     assert_eq!(closed, None);
+}
+
+#[tokio::test]
+async fn subscriber_buffer_overflow_requires_a_rescan() {
+    let (tx, mut rx) = watch_channel();
+    let paths = (0..=SUBSCRIBER_PATH_BUFFER_CAPACITY)
+        .map(|index| path(&format!("changed-{index}")))
+        .collect::<Vec<_>>();
+
+    tx.add_changed_paths(&paths).await;
+
+    assert_eq!(
+        rx.recv().await,
+        Some(FileWatcherEvent {
+            paths: Vec::new(),
+            rescan_required: true,
+        })
+    );
 }
 
 #[test]
@@ -249,6 +284,81 @@ fn deeply_missing_path_registers_nearest_existing_directory_ancestor() {
     assert_eq!(watcher.watch_counts_for_test(temp_dir.path()), Some((1, 0)));
 }
 
+#[test]
+fn live_watcher_requires_a_tokio_runtime() {
+    let result = FileWatcher::new();
+
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn failed_watch_does_not_commit_a_logical_registration() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let root = temp_dir.path().join("watched-dir");
+    std::fs::create_dir(&root).expect("create root");
+
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, _rx) = watcher.add_subscriber();
+    watcher
+        .inner
+        .as_ref()
+        .expect("watcher inner")
+        .lock()
+        .expect("inner lock")
+        .fail_next_watch = true;
+    let result = subscriber.register_paths(vec![WatchPath {
+        path: root.clone(),
+        recursive: false,
+    }]);
+
+    assert!(result.is_err());
+    assert_eq!(watcher.watch_counts_for_test(&root), None);
+    let state = watcher.state.read().expect("state lock");
+    assert!(
+        state
+            .subscribers
+            .get(&subscriber.id)
+            .expect("subscriber")
+            .watched_paths
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn failed_unwatch_still_removes_the_logical_registration() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let root = temp_dir.path().join("watched-dir");
+    std::fs::create_dir(&root).expect("create root");
+
+    let watcher = Arc::new(FileWatcher::new().expect("watcher"));
+    let (subscriber, _rx) = watcher.add_subscriber();
+    let registration = subscriber.register_path(root.clone(), /*recursive*/ false);
+    watcher
+        .inner
+        .as_ref()
+        .expect("watcher inner")
+        .lock()
+        .expect("inner lock")
+        .fail_next_unwatch = true;
+
+    drop(registration);
+
+    assert_eq!(watcher.watch_counts_for_test(&root), None);
+    let state = watcher.state.read().expect("state lock");
+    assert!(
+        state
+            .subscribers
+            .get(&subscriber.id)
+            .expect("subscriber")
+            .watched_paths
+            .is_empty()
+    );
+    drop(state);
+    let inner = watcher.inner.as_ref().expect("watcher inner");
+    let inner = inner.lock().expect("inner lock");
+    assert!(inner.degraded_paths.contains(&root));
+}
+
 #[tokio::test]
 async fn receiver_closes_when_subscriber_drops() {
     let watcher = Arc::new(FileWatcher::noop());
@@ -262,8 +372,8 @@ async fn receiver_closes_when_subscriber_drops() {
     assert_eq!(closed, None);
 }
 
-#[test]
-fn recursive_registration_downgrades_to_non_recursive_after_drop() {
+#[tokio::test]
+async fn recursive_registration_downgrades_to_non_recursive_after_drop() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let root = temp_dir.path().join("watched-dir");
     std::fs::create_dir(&root).expect("create root");
@@ -296,8 +406,8 @@ fn recursive_registration_downgrades_to_non_recursive_after_drop() {
     drop(non_recursive);
 }
 
-#[test]
-fn unregister_holds_state_lock_until_unwatch_finishes() {
+#[tokio::test]
+async fn unregister_holds_state_lock_until_unwatch_finishes() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
     let root = temp_dir.path().join("watched-dir");
     std::fs::create_dir(&root).expect("create root");
@@ -371,6 +481,7 @@ async fn matching_subscribers_are_notified() {
         skills_event,
         FileWatcherEvent {
             paths: vec![path("/tmp/skills/rust/SKILL.md")],
+            rescan_required: false,
         }
     );
 
@@ -418,6 +529,7 @@ async fn ancestor_events_notify_child_watches() {
         event,
         FileWatcherEvent {
             paths: vec![skills_dir],
+            rescan_required: false,
         }
     );
 }
@@ -452,6 +564,7 @@ async fn missing_file_watch_reports_requested_path_when_parent_changes() {
         event,
         FileWatcherEvent {
             paths: vec![missing_file],
+            rescan_required: false,
         }
     );
 }
@@ -479,6 +592,7 @@ async fn missing_file_watch_reports_requested_path_when_parent_delete_event_arri
         created,
         FileWatcherEvent {
             paths: vec![missing_file.clone()],
+            rescan_required: false,
         }
     );
 
@@ -494,6 +608,7 @@ async fn missing_file_watch_reports_requested_path_when_parent_delete_event_arri
         deleted,
         FileWatcherEvent {
             paths: vec![missing_file],
+            rescan_required: false,
         }
     );
 }
@@ -526,6 +641,7 @@ async fn missing_directory_watch_moves_to_created_directory_for_child_events() {
         created,
         FileWatcherEvent {
             paths: vec![skills_dir.clone()],
+            rescan_required: false,
         }
     );
     assert_eq!(watcher.watch_counts_for_test(temp_dir.path()), None);
@@ -542,7 +658,54 @@ async fn missing_directory_watch_moves_to_created_directory_for_child_events() {
         changed_child,
         FileWatcherEvent {
             paths: vec![skill_file],
+            rescan_required: false,
         }
+    );
+}
+
+#[tokio::test]
+async fn missing_watch_rekeys_canonical_identity_when_symlink_appears() {
+    let temp_dir = tempfile::tempdir().expect("temp dir");
+    let real_dir = temp_dir.path().join("real");
+    let linked_dir = temp_dir.path().join("linked");
+    let real_file = real_dir.join("SKILL.md");
+    let requested_file = linked_dir.join("SKILL.md");
+    std::fs::create_dir(&real_dir).expect("create real dir");
+    std::fs::write(&real_file, "name: linked\n").expect("write real file");
+
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _first = subscriber.register_path(requested_file.clone(), /*recursive*/ false);
+
+    if symlink_dir(&real_dir, &linked_dir).is_err() {
+        return;
+    }
+    let canonical_file = real_file.canonicalize().expect("canonical file");
+    watcher
+        .send_paths_for_test(vec![canonical_file.clone()])
+        .await;
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("canonical create event timeout"),
+        Some(FileWatcherEvent {
+            paths: vec![requested_file.clone()],
+            rescan_required: false,
+        })
+    );
+    assert_eq!(watcher.watch_counts_for_test(temp_dir.path()), None);
+    assert_eq!(watcher.watch_counts_for_test(&requested_file), Some((1, 0)));
+
+    watcher.send_paths_for_test(vec![canonical_file]).await;
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("canonical follow-up event timeout"),
+        Some(FileWatcherEvent {
+            paths: vec![requested_file],
+            rescan_required: false,
+        })
     );
 }
 
@@ -552,7 +715,7 @@ async fn spawn_event_loop_filters_non_mutating_events() {
     let (subscriber, rx) = watcher.add_subscriber();
     let _registration = subscriber.register_path(path("/tmp/skills"), /*recursive*/ true);
     let mut rx = ThrottledWatchReceiver::new(rx, TEST_THROTTLE_INTERVAL);
-    let (raw_tx, raw_rx) = mpsc::unbounded_channel();
+    let (raw_tx, raw_rx) = mpsc::channel(RAW_EVENT_BUFFER_CAPACITY);
     watcher.spawn_event_loop_for_test(raw_rx);
 
     raw_tx
@@ -560,6 +723,7 @@ async fn spawn_event_loop_filters_non_mutating_events() {
             EventKind::Access(AccessKind::Open(AccessMode::Any)),
             vec![path("/tmp/skills/SKILL.md")],
         )))
+        .await
         .expect("send access event");
     let blocked = timeout(TEST_THROTTLE_INTERVAL, rx.recv()).await;
     assert_eq!(blocked.is_err(), true);
@@ -569,6 +733,7 @@ async fn spawn_event_loop_filters_non_mutating_events() {
             EventKind::Create(CreateKind::File),
             vec![path("/tmp/skills/SKILL.md")],
         )))
+        .await
         .expect("send create event");
     let event = timeout(Duration::from_secs(1), rx.recv())
         .await
@@ -578,7 +743,95 @@ async fn spawn_event_loop_filters_non_mutating_events() {
         event,
         FileWatcherEvent {
             paths: vec![path("/tmp/skills/SKILL.md")],
+            rescan_required: false,
         }
+    );
+}
+
+#[tokio::test]
+async fn raw_event_buffer_overflow_requires_a_rescan() {
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _registration = subscriber.register_path(path("/tmp/skills"), /*recursive*/ true);
+    let (raw_tx, raw_rx) = mpsc::channel(1);
+    let raw_overflow = Arc::new(AtomicBool::new(false));
+    let raw_overflow_notify = Arc::new(Notify::new());
+
+    enqueue_raw_event(
+        &raw_tx,
+        &raw_overflow,
+        &raw_overflow_notify,
+        Ok(notify_event(
+            EventKind::Access(AccessKind::Open(AccessMode::Any)),
+            vec![path("/tmp/skills/first")],
+        )),
+    );
+    enqueue_raw_event(
+        &raw_tx,
+        &raw_overflow,
+        &raw_overflow_notify,
+        Ok(notify_event(
+            EventKind::Create(CreateKind::File),
+            vec![path("/tmp/skills/dropped")],
+        )),
+    );
+    assert!(raw_overflow.load(Ordering::Acquire));
+    watcher.spawn_event_loop(
+        &Handle::current(),
+        raw_rx,
+        Arc::clone(&raw_overflow),
+        Arc::clone(&raw_overflow_notify),
+    );
+
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("raw overflow rescan timeout"),
+        Some(FileWatcherEvent {
+            paths: Vec::new(),
+            rescan_required: true,
+        })
+    );
+}
+
+#[tokio::test]
+async fn oversized_raw_event_requires_a_rescan_without_entering_the_queue() {
+    let watcher = Arc::new(FileWatcher::noop());
+    let (subscriber, mut rx) = watcher.add_subscriber();
+    let _registration = subscriber.register_path(path("/tmp/skills"), /*recursive*/ true);
+    let (raw_tx, mut raw_rx) = mpsc::channel(1);
+    let raw_overflow = Arc::new(AtomicBool::new(false));
+    let raw_overflow_notify = Arc::new(Notify::new());
+    let paths = (0..=SUBSCRIBER_PATH_BUFFER_CAPACITY)
+        .map(|index| path(&format!("/tmp/skills/changed-{index}")))
+        .collect();
+
+    enqueue_raw_event(
+        &raw_tx,
+        &raw_overflow,
+        &raw_overflow_notify,
+        Ok(notify_event(EventKind::Modify(ModifyKind::Any), paths)),
+    );
+
+    assert!(raw_overflow.load(Ordering::Acquire));
+    assert!(matches!(
+        raw_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    watcher.spawn_event_loop(
+        &Handle::current(),
+        raw_rx,
+        Arc::clone(&raw_overflow),
+        Arc::clone(&raw_overflow_notify),
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("oversized event rescan timeout"),
+        Some(FileWatcherEvent {
+            paths: Vec::new(),
+            rescan_required: true,
+        })
     );
 }
 

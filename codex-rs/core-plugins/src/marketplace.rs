@@ -284,8 +284,8 @@ pub fn find_installable_marketplace_plugin(
         || !product_allowed
     {
         return Err(MarketplaceError::PluginNotAvailable {
-            plugin_name: resolved.plugin_id.plugin_name,
-            marketplace_name: resolved.plugin_id.marketplace_name,
+            plugin_name: resolved.plugin_id.plugin_name().to_string(),
+            marketplace_name: resolved.plugin_id.marketplace_name().to_string(),
         });
     }
 
@@ -400,7 +400,7 @@ pub fn load_marketplace(path: &AbsolutePathBuf) -> Result<Marketplace, Marketpla
             .unwrap_or_default();
 
         plugins.push(MarketplacePlugin {
-            name: plugin.plugin_id.plugin_name,
+            name: plugin.plugin_id.plugin_name().to_string(),
             local_version,
             source: plugin.source,
             policy: plugin.policy,

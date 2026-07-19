@@ -4,6 +4,36 @@ use codex_protocol::protocol::SessionSource;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 
+/// Failure while inserting or replacing a persisted thread-spawn edge.
+#[derive(Debug)]
+pub enum ThreadSpawnEdgeWriteError {
+    /// The requested edge would violate the persisted topology contract.
+    InvalidRequest { message: String },
+    /// SQLite failed while validating or writing the edge.
+    Storage {
+        operation: &'static str,
+        source: sqlx::Error,
+    },
+}
+
+impl std::fmt::Display for ThreadSpawnEdgeWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidRequest { message } => f.write_str(message),
+            Self::Storage { operation, source } => write!(f, "{operation}: {source}"),
+        }
+    }
+}
+
+impl std::error::Error for ThreadSpawnEdgeWriteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidRequest { .. } => None,
+            Self::Storage { source, .. } => Some(source),
+        }
+    }
+}
+
 impl StateRuntime {
     pub async fn get_thread(&self, id: ThreadId) -> anyhow::Result<Option<crate::ThreadMetadata>> {
         let row = sqlx::query(
@@ -83,7 +113,16 @@ WHERE id = ? AND preview = ''
         parent_thread_id: ThreadId,
         child_thread_id: ThreadId,
         status: crate::DirectionalThreadSpawnEdgeStatus,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ThreadSpawnEdgeWriteError> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
+                operation: "begin thread-spawn edge write",
+                source,
+            })?;
+        validate_thread_spawn_edge(&mut tx, parent_thread_id, child_thread_id).await?;
         sqlx::query(
             r#"
 INSERT INTO thread_spawn_edges (
@@ -99,8 +138,18 @@ ON CONFLICT(child_thread_id) DO UPDATE SET
         .bind(parent_thread_id.to_string())
         .bind(child_thread_id.to_string())
         .bind(status.as_ref())
-        .execute(self.pool.as_ref())
-        .await?;
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
+            operation: "upsert thread-spawn edge",
+            source,
+        })?;
+        tx.commit()
+            .await
+            .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
+                operation: "commit thread-spawn edge write",
+                source,
+            })?;
         Ok(())
     }
 
@@ -196,7 +245,7 @@ WITH RECURSIVE subtree(child_thread_id) AS (
     SELECT child_thread_id
     FROM thread_spawn_edges
     WHERE parent_thread_id = ?
-    UNION ALL
+    UNION
     SELECT edge.child_thread_id
     FROM thread_spawn_edges AS edge
     JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
@@ -204,13 +253,14 @@ WITH RECURSIVE subtree(child_thread_id) AS (
 SELECT threads.id
 FROM subtree
 JOIN threads ON threads.id = subtree.child_thread_id
-WHERE threads.agent_path = ?
+WHERE threads.agent_path = ? AND threads.id != ?
 ORDER BY threads.id
 LIMIT 2
             "#,
         )
         .bind(root_thread_id.to_string())
         .bind(agent_path)
+        .bind(root_thread_id.to_string())
         .fetch_all(self.pool.as_ref())
         .await?;
         one_thread_id_from_rows(rows, agent_path)
@@ -243,25 +293,35 @@ LIMIT 2
         root_thread_id: ThreadId,
         status: Option<crate::DirectionalThreadSpawnEdgeStatus>,
     ) -> anyhow::Result<Vec<ThreadId>> {
+        let root_thread_id = root_thread_id.to_string();
         let mut builder = QueryBuilder::<Sqlite>::new(
             r#"
-WITH RECURSIVE subtree(child_thread_id, depth) AS (
-    SELECT child_thread_id, 1
+WITH RECURSIVE subtree(child_thread_id, depth, visited) AS (
+    SELECT child_thread_id, 1, ',' ||
+            "#,
+        );
+        builder.push_bind(root_thread_id.clone());
+        builder.push(
+            r#" || ',' || child_thread_id || ','
     FROM thread_spawn_edges
     WHERE parent_thread_id =
             "#,
         );
-        builder.push_bind(root_thread_id.to_string());
+        builder.push_bind(root_thread_id.clone());
+        builder.push(" AND child_thread_id != ");
+        builder.push_bind(root_thread_id);
         if let Some(status) = status {
             let status = status.to_string();
             builder.push(" AND status = ").push_bind(status.clone());
             builder.push(
                 r#"
     UNION ALL
-    SELECT edge.child_thread_id, subtree.depth + 1
+    SELECT edge.child_thread_id, subtree.depth + 1,
+           subtree.visited || edge.child_thread_id || ','
     FROM thread_spawn_edges AS edge
     JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
-    WHERE status =
+    WHERE instr(subtree.visited, ',' || edge.child_thread_id || ',') = 0
+      AND edge.status =
                 "#,
             );
             builder.push_bind(status);
@@ -269,9 +329,11 @@ WITH RECURSIVE subtree(child_thread_id, depth) AS (
             builder.push(
                 r#"
     UNION ALL
-    SELECT edge.child_thread_id, subtree.depth + 1
+    SELECT edge.child_thread_id, subtree.depth + 1,
+           subtree.visited || edge.child_thread_id || ','
     FROM thread_spawn_edges AS edge
     JOIN subtree ON edge.parent_thread_id = subtree.child_thread_id
+    WHERE instr(subtree.visited, ',' || edge.child_thread_id || ',') = 0
                 "#,
             );
         }
@@ -296,7 +358,35 @@ ORDER BY depth ASC, child_thread_id ASC
         &self,
         parent_thread_id: ThreadId,
         child_thread_id: ThreadId,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ThreadSpawnEdgeWriteError> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
+                operation: "begin inferred thread-spawn edge write",
+                source,
+            })?;
+        let edge_exists = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM thread_spawn_edges WHERE child_thread_id = ?)",
+        )
+        .bind(child_thread_id.to_string())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
+            operation: "check inferred thread-spawn edge",
+            source,
+        })? != 0;
+        if edge_exists {
+            tx.commit()
+                .await
+                .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
+                    operation: "commit inferred thread-spawn edge check",
+                    source,
+                })?;
+            return Ok(());
+        }
+        validate_thread_spawn_edge(&mut tx, parent_thread_id, child_thread_id).await?;
         sqlx::query(
             r#"
 INSERT INTO thread_spawn_edges (
@@ -310,8 +400,18 @@ ON CONFLICT(child_thread_id) DO NOTHING
         .bind(parent_thread_id.to_string())
         .bind(child_thread_id.to_string())
         .bind(crate::DirectionalThreadSpawnEdgeStatus::Open.as_ref())
-        .execute(self.pool.as_ref())
-        .await?;
+        .execute(&mut *tx)
+        .await
+        .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
+            operation: "insert inferred thread-spawn edge",
+            source,
+        })?;
+        tx.commit()
+            .await
+            .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
+                operation: "commit inferred thread-spawn edge write",
+                source,
+            })?;
         Ok(())
     }
 
@@ -324,7 +424,8 @@ ON CONFLICT(child_thread_id) DO NOTHING
             return Ok(());
         };
         self.insert_thread_spawn_edge_if_absent(parent_thread_id, child_thread_id)
-            .await
+            .await?;
+        Ok(())
     }
 
     /// Find a rollout path by thread id using the underlying database.
@@ -1108,6 +1209,54 @@ WHERE assigned_thread_id = ?
 
         Ok(rows_affected)
     }
+}
+
+async fn validate_thread_spawn_edge(
+    connection: &mut SqliteConnection,
+    parent_thread_id: ThreadId,
+    child_thread_id: ThreadId,
+) -> Result<(), ThreadSpawnEdgeWriteError> {
+    if parent_thread_id == child_thread_id {
+        return Err(ThreadSpawnEdgeWriteError::InvalidRequest {
+            message: format!("thread {child_thread_id} cannot be its own parent"),
+        });
+    }
+
+    let parent_is_descendant = sqlx::query_scalar::<_, i64>(
+        r#"
+WITH RECURSIVE descendants(child_thread_id) AS (
+    SELECT child_thread_id
+    FROM thread_spawn_edges
+    WHERE parent_thread_id = ?
+    UNION
+    SELECT edge.child_thread_id
+    FROM thread_spawn_edges AS edge
+    JOIN descendants ON edge.parent_thread_id = descendants.child_thread_id
+)
+SELECT EXISTS(
+    SELECT 1
+    FROM descendants
+    WHERE child_thread_id = ?
+)
+        "#,
+    )
+    .bind(child_thread_id.to_string())
+    .bind(parent_thread_id.to_string())
+    .fetch_one(connection)
+    .await
+    .map_err(|source| ThreadSpawnEdgeWriteError::Storage {
+        operation: "validate thread-spawn edge topology",
+        source,
+    })? != 0;
+    if parent_is_descendant {
+        return Err(ThreadSpawnEdgeWriteError::InvalidRequest {
+            message: format!(
+                "cannot make thread {parent_thread_id} the parent of its descendant {child_thread_id}"
+            ),
+        });
+    }
+
+    Ok(())
 }
 
 fn one_thread_id_from_rows(
@@ -3018,6 +3167,111 @@ mod tests {
             .await
             .expect("all descendants should load");
         assert_eq!(all_descendants, vec![child_thread_id, grandchild_thread_id]);
+    }
+
+    #[tokio::test]
+    async fn thread_spawn_edges_reject_self_parenting_and_cycles() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home, "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let first_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000920").expect("valid thread id");
+        let second_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000921").expect("valid thread id");
+
+        let self_parent_error = runtime
+            .upsert_thread_spawn_edge(
+                first_thread_id,
+                first_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect_err("self-parent edge should be rejected");
+        assert!(matches!(
+            self_parent_error,
+            ThreadSpawnEdgeWriteError::InvalidRequest { .. }
+        ));
+
+        let inferred_self_parent_error = runtime
+            .insert_thread_spawn_edge_if_absent(first_thread_id, first_thread_id)
+            .await
+            .expect_err("inferred self-parent edge should be rejected");
+        assert!(matches!(
+            inferred_self_parent_error,
+            ThreadSpawnEdgeWriteError::InvalidRequest { .. }
+        ));
+
+        runtime
+            .upsert_thread_spawn_edge(
+                first_thread_id,
+                second_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect("first edge should insert");
+        let cycle_error = runtime
+            .upsert_thread_spawn_edge(
+                second_thread_id,
+                first_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect_err("cycle-closing edge should be rejected");
+        assert!(matches!(
+            cycle_error,
+            ThreadSpawnEdgeWriteError::InvalidRequest { .. }
+        ));
+        assert_eq!(
+            runtime
+                .list_thread_spawn_children(first_thread_id)
+                .await
+                .expect("children should load"),
+            vec![second_thread_id]
+        );
+        assert_eq!(
+            runtime
+                .list_thread_spawn_children(second_thread_id)
+                .await
+                .expect("children should load"),
+            Vec::<ThreadId>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_spawn_descendant_traversal_terminates_on_preexisting_cycle() {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home, "test-provider".to_string())
+            .await
+            .expect("state db should initialize");
+        let first_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000930").expect("valid thread id");
+        let second_thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000931").expect("valid thread id");
+
+        for (parent_thread_id, child_thread_id) in [
+            (first_thread_id, second_thread_id),
+            (second_thread_id, first_thread_id),
+        ] {
+            sqlx::query(
+                "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?, ?, ?)",
+            )
+            .bind(parent_thread_id.to_string())
+            .bind(child_thread_id.to_string())
+            .bind(DirectionalThreadSpawnEdgeStatus::Open.as_ref())
+            .execute(runtime.pool.as_ref())
+            .await
+            .expect("malformed edge should insert directly");
+        }
+
+        let descendants = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            runtime.list_thread_spawn_descendants(first_thread_id),
+        )
+        .await
+        .expect("cycle-safe traversal should terminate")
+        .expect("descendants should load");
+        assert_eq!(descendants, vec![second_thread_id]);
     }
 
     #[tokio::test]

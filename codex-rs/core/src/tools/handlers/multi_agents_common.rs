@@ -1,3 +1,4 @@
+use crate::agent::role::AgentRoleModelLocks;
 use crate::config::Config;
 use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
@@ -7,7 +8,9 @@ use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
+use codex_model_provider::create_model_provider;
 use codex_models_manager::manager::RefreshStrategy;
+use codex_models_manager::manager::SharedModelsManager;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
 use codex_protocol::error::CodexErr;
@@ -25,6 +28,8 @@ use serde_json::Value as JsonValue;
 pub(crate) const MIN_WAIT_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 pub(crate) const DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
 pub(crate) const MAX_WAIT_TIMEOUT_MS: i64 = HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
+pub(crate) const DEFAULT_SPAWN_AGENT_MODEL: &str = "gpt-5.6-sol";
+pub(crate) const DEFAULT_SPAWN_AGENT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::XHigh;
 
 pub(crate) fn function_arguments(payload: ToolPayload) -> Result<String, FunctionCallError> {
     match payload {
@@ -197,7 +202,7 @@ pub(crate) fn reject_full_fork_spawn_overrides(
 ) -> Result<(), FunctionCallError> {
     if agent_type.is_some() || model.is_some() || reasoning_effort.is_some() {
         return Err(FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+            "Full-history forked agents use the built-in spawn defaults and do not accept per-call agent_type, model, or reasoning_effort overrides; omit those fields, or spawn without a full-history fork.".to_string(),
         ));
     }
     Ok(())
@@ -231,49 +236,49 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
     Ok(())
 }
 
-pub(crate) async fn apply_requested_spawn_agent_model_overrides(
+/// Resolves role-locked model settings, explicit per-spawn overrides, and built-in defaults.
+///
+/// Provider catalogs may qualify the built-in model slug (for example, Bedrock exposes
+/// `openai.gpt-5.6-sol`), so default resolution accepts a provider prefix while explicit model
+/// overrides continue to require an exact advertised model name. Role-locked values take
+/// precedence; every unlocked reasoning effort defaults independently to `xhigh`.
+pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     session: &Session,
     turn: &TurnContext,
     config: &mut Config,
     requested_model: Option<&str>,
     requested_reasoning_effort: Option<ReasoningEffort>,
+    role_model_locks: AgentRoleModelLocks,
 ) -> Result<(), FunctionCallError> {
-    if requested_model.is_none() && requested_reasoning_effort.is_none() {
-        return Ok(());
-    }
-
-    if let Some(requested_model) = requested_model {
-        let available_models = session
-            .services
-            .models_manager
+    let models_manager = models_manager_for_spawn_config(session, turn, config);
+    let selected_model_name = if role_model_locks.model {
+        config.model.clone().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "spawn_agent role did not resolve its configured model".to_string(),
+            )
+        })?
+    } else {
+        let available_models = models_manager
             .list_models(RefreshStrategy::Offline, config.http_client_factory())
             .await;
-        let selected_model_name = find_spawn_agent_model_name(&available_models, requested_model)?;
-        let selected_model_info = session
-            .services
-            .models_manager
+        match requested_model {
+            Some(requested_model) => {
+                find_spawn_agent_model_name(&available_models, requested_model)?
+            }
+            None => find_default_spawn_agent_model_name(&available_models)?,
+        }
+    };
+
+    config.model = Some(selected_model_name.clone());
+    if !role_model_locks.reasoning_effort {
+        let reasoning_effort =
+            requested_reasoning_effort.unwrap_or(DEFAULT_SPAWN_AGENT_REASONING_EFFORT);
+        let selected_model_info = models_manager
             .get_model_info(&selected_model_name, &config.to_models_manager_config())
             .await;
-
-        config.model = Some(selected_model_name.clone());
-        if let Some(reasoning_effort) = requested_reasoning_effort {
-            validate_spawn_agent_reasoning_effort(
-                &selected_model_name,
-                &selected_model_info.supported_reasoning_levels,
-                &reasoning_effort,
-            )?;
-            config.model_reasoning_effort = Some(reasoning_effort);
-        } else {
-            config.model_reasoning_effort = selected_model_info.default_reasoning_level;
-        }
-
-        return Ok(());
-    }
-
-    if let Some(reasoning_effort) = requested_reasoning_effort {
         validate_spawn_agent_reasoning_effort(
-            &turn.model_info.slug,
-            &turn.model_info.supported_reasoning_levels,
+            &selected_model_name,
+            &selected_model_info.supported_reasoning_levels,
             &reasoning_effort,
         )?;
         config.model_reasoning_effort = Some(reasoning_effort);
@@ -284,6 +289,7 @@ pub(crate) async fn apply_requested_spawn_agent_model_overrides(
 
 pub(crate) async fn apply_spawn_agent_service_tier(
     session: &Session,
+    turn: &TurnContext,
     config: &mut Config,
     parent_service_tier: Option<&str>,
     requested_service_tier: Option<&str>,
@@ -303,9 +309,8 @@ pub(crate) async fn apply_spawn_agent_service_tier(
             "spawn_agent could not resolve the child model for service tier validation".to_string(),
         )
     })?;
-    let model_info = session
-        .services
-        .models_manager
+    let models_manager = models_manager_for_spawn_config(session, turn, config);
+    let model_info = models_manager
         .get_model_info(model.as_str(), &config.to_models_manager_config())
         .await;
 
@@ -337,6 +342,23 @@ pub(crate) async fn apply_spawn_agent_service_tier(
     Ok(())
 }
 
+fn models_manager_for_spawn_config(
+    session: &Session,
+    turn: &TurnContext,
+    config: &Config,
+) -> SharedModelsManager {
+    if config.model_provider_id == turn.config.model_provider_id
+        && config.model_provider == turn.config.model_provider
+    {
+        return session.services.models_manager.clone();
+    }
+
+    create_model_provider(config.model_provider.clone(), turn.auth_manager.clone()).models_manager(
+        config.codex_home.to_path_buf(),
+        config.model_catalog.clone(),
+    )
+}
+
 fn find_spawn_agent_model_name(
     available_models: &[codex_protocol::openai_models::ModelPreset],
     requested_model: &str,
@@ -355,6 +377,31 @@ fn find_spawn_agent_model_name(
                 "Unknown model `{requested_model}` for spawn_agent. Available models: {available}"
             ))
         })
+}
+
+fn find_default_spawn_agent_model_name(
+    available_models: &[codex_protocol::openai_models::ModelPreset],
+) -> Result<String, FunctionCallError> {
+    if let Some(model) = available_models
+        .iter()
+        .find(|model| model.model == DEFAULT_SPAWN_AGENT_MODEL)
+        .or_else(|| {
+            available_models.iter().find(|model| {
+                model
+                    .model
+                    .strip_suffix(DEFAULT_SPAWN_AGENT_MODEL)
+                    .is_some_and(|prefix| {
+                        prefix
+                            .strip_suffix('.')
+                            .is_some_and(|provider| !provider.is_empty())
+                    })
+            })
+        })
+    {
+        return Ok(model.model.clone());
+    }
+
+    find_spawn_agent_model_name(available_models, DEFAULT_SPAWN_AGENT_MODEL)
 }
 
 fn validate_spawn_agent_reasoning_effort(

@@ -69,7 +69,13 @@ impl SkillsWatcher {
                 recursive: true,
             })
             .collect();
-        let registration = self.subscriber.register_paths(roots);
+        let registration = match self.subscriber.register_paths(roots) {
+            Ok(registration) => registration,
+            Err(err) => {
+                warn!("failed to register runtime skills roots: {err}");
+                WatchRegistration::default()
+            }
+        };
         let mut guard = self
             .runtime_extra_roots_registration
             .lock()
@@ -121,7 +127,13 @@ impl SkillsWatcher {
                 recursive: true,
             })
             .collect();
-        self.subscriber.register_paths(roots)
+        match self.subscriber.register_paths(roots) {
+            Ok(registration) => registration,
+            Err(err) => {
+                warn!("failed to register skills roots: {err}");
+                WatchRegistration::default()
+            }
+        }
     }
 
     fn spawn_event_loop(

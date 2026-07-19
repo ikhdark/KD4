@@ -1884,6 +1884,25 @@ impl Session {
             return;
         }
 
+        if let Err(error) = self
+            .services
+            .agent_control
+            .task_coordinator()
+            .seal_missing_receipt(
+                child_agent_path,
+                format!(
+                    "typed agent {child_agent_path} finished with status {status:?} without submitting a receipt"
+                ),
+            )
+            .await
+        {
+            warn!(
+                agent_path = %child_agent_path,
+                %error,
+                "failed to seal missing typed-agent receipt"
+            );
+        }
+
         self.forward_child_completion_to_parent(
             turn_context,
             *parent_thread_id,

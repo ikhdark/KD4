@@ -22,11 +22,13 @@ fn test_runtime_paths() -> ExecServerRuntimePaths {
 }
 
 async fn local_environment_manager() -> Arc<EnvironmentManager> {
-    Arc::new(EnvironmentManager::create_for_tests(
-        /*remote_endpoint*/ None,
-        Some(test_runtime_paths()),
+    Arc::new(
+        EnvironmentManager::create_for_tests(
+            /*remote_endpoint*/ None,
+            Some(test_runtime_paths()),
+        )
+        .await,
     )
-    .await)
 }
 
 async fn local_snapshot(cwd: AbsolutePathBuf, generation: u64) -> TurnEnvironmentSnapshot {
@@ -171,7 +173,10 @@ async fn stable_metadata_dependencies_refresh_head_and_remotes_but_dirty_is_alwa
     .await;
 
     let changed = source.metadata().await;
-    assert_ne!(changed.latest_git_commit_hash.as_deref(), Some(first_head.as_str()));
+    assert_ne!(
+        changed.latest_git_commit_hash.as_deref(),
+        Some(first_head.as_str())
+    );
     assert_eq!(
         changed
             .associated_remote_urls

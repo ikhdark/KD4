@@ -737,6 +737,17 @@ impl Session {
                 error!("failed to initialize thread persistence: {e:#}");
                 e
             })?);
+        if initial_multi_agent_version == Some(MultiAgentVersion::V2)
+            && let Some(state_runtime) = state_db_ctx.as_ref()
+        {
+            agent_control
+                .task_coordinator()
+                .initialize(Arc::clone(state_runtime), session_id.to_string())
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to initialize typed agent task store: {error}")
+                })?;
+        }
         let session_result: anyhow::Result<Arc<Self>> = async {
             let rollout_path = if let Some(live_thread) = live_thread_init.as_ref() {
                 live_thread.local_rollout_path().await?

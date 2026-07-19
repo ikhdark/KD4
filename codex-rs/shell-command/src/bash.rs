@@ -135,7 +135,12 @@ pub fn parse_shell_lc_single_command_prefix(command: &[String]) -> Option<Vec<St
     if !has_named_descendant_kind(root, "heredoc_redirect") {
         return None;
     }
-    if has_named_descendant_kind(root, "file_redirect") {
+    if !has_only_clearly_quoted_heredoc_delimiters(root, script) {
+        return None;
+    }
+    if has_named_descendant_kind(root, "file_redirect")
+        || has_named_descendant_kind(root, "herestring_redirect")
+    {
         return None;
     }
 
@@ -255,6 +260,36 @@ fn is_allowed_heredoc_attachment_kind(kind: &str) -> bool {
             | "herestring_redirect"
             | "redirected_statement"
     )
+}
+
+fn has_only_clearly_quoted_heredoc_delimiters(root: Node<'_>, src: &str) -> bool {
+    let mut stack = vec![root];
+    let mut found = false;
+    while let Some(node) = stack.pop() {
+        if node.kind() == "heredoc_start" {
+            found = true;
+            let Ok(text) = node.utf8_text(src.as_bytes()) else {
+                return false;
+            };
+            let text = text.trim();
+            let delimiter = text
+                .strip_prefix("<<-")
+                .or_else(|| text.strip_prefix("<<"))
+                .unwrap_or(text)
+                .trim();
+            let quoted = (delimiter.starts_with('\'') && delimiter.ends_with('\''))
+                || (delimiter.starts_with('"') && delimiter.ends_with('"'));
+            if delimiter.len() < 2 || !quoted {
+                return false;
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+    }
+    found
 }
 
 fn find_single_command_node(root: Node<'_>) -> Option<Node<'_>> {
@@ -519,7 +554,7 @@ mod tests {
             "python3 << PY\nprint('hello')\nPY".to_string(),
         ];
         let parsed_unquoted = parse_shell_lc_single_command_prefix(&command_unquoted);
-        assert_eq!(parsed_unquoted, Some(vec!["python3".to_string()]));
+        assert_eq!(parsed_unquoted, None);
     }
 
     #[test]
@@ -548,6 +583,16 @@ mod tests {
             "bash".to_string(),
             "-lc".to_string(),
             "python3 <<'PY' > /tmp/out.txt\nprint('hello')\nPY".to_string(),
+        ];
+        assert_eq!(parse_shell_lc_single_command_prefix(&command), None);
+    }
+
+    #[test]
+    fn parse_shell_lc_single_command_prefix_rejects_heredoc_with_herestring() {
+        let command = vec![
+            "bash".to_string(),
+            "-lc".to_string(),
+            "python3 <<'PY' <<< \"$(rm -rf /)\"\nprint('hello')\nPY".to_string(),
         ];
         assert_eq!(parse_shell_lc_single_command_prefix(&command), None);
     }

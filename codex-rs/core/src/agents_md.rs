@@ -97,51 +97,77 @@ async fn read_agents_md(
         return Ok(None);
     }
 
-    let mut remaining: u64 = max_total as u64;
+    let mut remaining = max_total;
     let mut loaded = LoadedAgentsMd::default();
+    let mut entries = Vec::new();
 
-    for p in paths {
-        if remaining == 0 {
-            break;
-        }
-
-        let mut data = match fs.read_file(&p, /*sandbox*/ None).await {
+    // Allocate the byte budget from the nearest scope outward, then restore the
+    // root-to-cwd presentation order expected by instruction precedence.
+    for p in paths.into_iter().rev() {
+        let data = match fs.read_file(&p, /*sandbox*/ None).await {
             Ok(data) => data,
             Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
             Err(err) => return Err(err),
         };
-        let size = data.len() as u64;
-        if size > remaining {
-            data.truncate(remaining as usize);
+        if String::from_utf8_lossy(&data).trim().is_empty() {
+            continue;
         }
 
-        if size > remaining {
+        let original_bytes = data.len();
+        let retained_bytes = original_bytes.min(remaining);
+        let omitted_bytes = original_bytes.saturating_sub(retained_bytes);
+        let mut retained_data = data;
+        retained_data.truncate(retained_bytes);
+        let mut text = String::from_utf8_lossy(&retained_data).to_string();
+
+        if omitted_bytes > 0 {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&project_doc_truncation_notice(
+                &p,
+                original_bytes,
+                retained_bytes,
+            ));
             tracing::warn!(
                 path = %p,
-                remaining_bytes = remaining,
-                "project doc exceeds remaining budget; truncating"
+                original_bytes,
+                retained_bytes,
+                omitted_bytes,
+                "project doc exceeds remaining budget; truncation notice added"
             );
         }
 
-        let text = String::from_utf8_lossy(&data).to_string();
-        if !text.trim().is_empty() {
-            loaded.entries.push(InstructionEntry {
-                contents: text,
-                provenance: InstructionProvenance::Project {
-                    source_path: p,
-                    environment_id: environment_id.to_string(),
-                    cwd: cwd.clone(),
-                },
-            });
-            remaining = remaining.saturating_sub(data.len() as u64);
-        }
+        entries.push(InstructionEntry {
+            contents: text,
+            provenance: InstructionProvenance::Project {
+                source_path: p,
+                environment_id: environment_id.to_string(),
+                cwd: cwd.clone(),
+            },
+        });
+        remaining = remaining.saturating_sub(retained_bytes);
     }
+    entries.reverse();
+    loaded.entries.extend(entries);
 
     if loaded.is_empty() {
         Ok(None)
     } else {
         Ok(Some(loaded))
     }
+}
+
+fn project_doc_truncation_notice(
+    source_path: &PathUri,
+    original_bytes: usize,
+    retained_bytes: usize,
+) -> String {
+    let omitted_bytes = original_bytes.saturating_sub(retained_bytes);
+    format!(
+        "[Project documentation truncation notice: source path: {}; original byte count: {original_bytes}; retained byte count: {retained_bytes}; omitted byte count: {omitted_bytes}.]",
+        source_path.inferred_native_path_string()
+    )
 }
 
 /// Discovers AGENTS.md files from the project root to the current working

@@ -18,6 +18,7 @@ use crate::RemoveOptions;
 use crate::WalkOptions;
 use crate::WalkOutcome;
 use crate::fs_helper::FsHelperPayload;
+use crate::fs_helper::FsHelperReadFileBoundedParams;
 use crate::fs_helper::FsHelperRequest;
 use crate::fs_sandbox::FileSystemSandboxRunner;
 use crate::protocol::FsCanonicalizeParams;
@@ -100,6 +101,38 @@ impl SandboxedFileSystem {
                 format!("fs/readFile returned invalid base64 dataBase64: {err}"),
             )
         })
+    }
+
+    async fn read_file_bounded(
+        &self,
+        path: &PathUri,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Option<Vec<u8>>> {
+        let sandbox = require_platform_sandbox(sandbox)?;
+        validate_native_path(path)?;
+        let response = self
+            .run_sandboxed(
+                sandbox,
+                FsHelperRequest::ReadFileBounded(FsHelperReadFileBoundedParams {
+                    path: path.clone(),
+                    max_bytes,
+                }),
+            )
+            .await?
+            .expect_read_file_bounded()
+            .map_err(map_sandbox_error)?;
+        response
+            .data_base64
+            .map(|data_base64| {
+                STANDARD.decode(data_base64).map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("fs/readFileBounded returned invalid base64 dataBase64: {err}"),
+                    )
+                })
+            })
+            .transpose()
     }
 
     async fn write_file(
@@ -303,6 +336,17 @@ impl ExecutorFileSystem for SandboxedFileSystem {
                 "streaming file reads do not support platform sandboxing",
             ))
         })
+    }
+
+    fn read_file_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(SandboxedFileSystem::read_file_bounded(
+            self, path, max_bytes, sandbox,
+        ))
     }
 
     fn write_file<'a>(

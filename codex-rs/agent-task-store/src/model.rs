@@ -24,8 +24,10 @@ pub const DEFAULT_BINDING_LIMIT: usize = 100;
 pub const MAX_BINDING_LIMIT: usize = 256;
 pub const DEFAULT_MUTATION_EVIDENCE_LIMIT: usize = 20;
 pub const MAX_MUTATION_EVIDENCE_LIMIT: usize = 100;
+pub const MAX_VALIDATION_CALLS_PER_TASK: usize = 100;
 pub const DEFAULT_SNAPSHOT_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
+pub const MAX_MUTATION_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -135,6 +137,15 @@ impl AssignmentDraft {
             if !dependency_ids.insert(*dependency) {
                 return Err(StoreError::InvalidAssignment(format!(
                     "duplicate dependency {dependency}"
+                )));
+            }
+        }
+        let mut required_evidence = HashSet::new();
+        for requirement in &self.required_evidence {
+            validate_nonempty("required evidence", requirement)?;
+            if !required_evidence.insert(requirement.as_str()) {
+                return Err(StoreError::InvalidAssignment(format!(
+                    "duplicate required evidence {requirement}"
                 )));
             }
         }
@@ -634,6 +645,8 @@ pub struct AgentTask {
     pub current_attempt: Attempt,
     pub gates: Vec<AgentGate>,
     pub receipt: Option<AgentReceipt>,
+    #[serde(default)]
+    pub validation_calls: Vec<ValidationCall>,
     pub observations: Vec<RuntimeObservation>,
 }
 

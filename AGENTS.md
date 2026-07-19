@@ -1,6 +1,6 @@
 # Repository policy
 
-Shared policy revision: `2026-07-13`.
+Shared policy revision: `2026-07-18`.
 
 ## Synchronization contract
 
@@ -153,6 +153,11 @@ completes the request.
 - Use durable plans, harnesses, logs, evals, QA artifacts, handoffs, or
   multi-agent workflows only when the user asks or a nearer instruction file
   requires them.
+- Parallel agents should not edit overlapping contract surfaces. Three agents
+  changing the runtime, lifecycle scripts, schemas, and documentation
+  simultaneously can each be locally correct while collectively inconsistent.
+  Use one implementation owner for a contract. Other agents should map or audit
+  it, not independently redefine it.
 
 ## Fast implementation path
 
@@ -248,9 +253,12 @@ risk section when there is no unresolved risk.
 
 ## Tool use
 
-- Use `rg` or `rg --files` for normal text and file discovery. Use `fd`,
-  `ast-grep`, `jq`, `yq`, or another purpose-built tool only when it materially
-  simplifies the task.
+- Use `search_source` and `read_file_span` when available for bounded,
+  citation-friendly repository source lookup and targeted span reads. Use `rg`
+  or `rg --files` for regular-expression searches, exhaustive or closure
+  searches, file discovery, and advanced filtering. Use `fd`, `ast-grep`,
+  `jq`, `yq`, or another purpose-built tool only when it materially simplifies
+  the task.
 - Prefer repository-owned recipes such as `just`, configured formatters,
   generators, and focused test commands over improvised equivalents.
 - Use `apply_patch` for manual edits. Use an owning formatter or generator for

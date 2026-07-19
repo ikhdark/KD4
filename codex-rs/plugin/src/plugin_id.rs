@@ -8,8 +8,8 @@ pub enum PluginIdError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginId {
-    pub plugin_name: String,
-    pub marketplace_name: String,
+    plugin_name: String,
+    marketplace_name: String,
 }
 
 impl PluginId {
@@ -42,6 +42,14 @@ impl PluginId {
         })
     }
 
+    pub fn plugin_name(&self) -> &str {
+        &self.plugin_name
+    }
+
+    pub fn marketplace_name(&self) -> &str {
+        &self.marketplace_name
+    }
+
     pub fn as_key(&self) -> String {
         format!("{}@{}", self.plugin_name, self.marketplace_name)
     }
@@ -62,3 +70,7 @@ pub fn validate_plugin_segment(segment: &str, kind: &str) -> Result<(), String> 
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "plugin_id_tests.rs"]
+mod tests;

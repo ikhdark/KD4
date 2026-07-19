@@ -3,6 +3,15 @@ use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
 use std::collections::BTreeMap;
 
+use super::multi_agents_common::DEFAULT_SPAWN_AGENT_MODEL;
+use super::multi_agents_common::DEFAULT_SPAWN_AGENT_REASONING_EFFORT;
+
+fn spawn_agents_on_csv_description() -> String {
+    format!(
+        "Process a CSV by spawning one worker sub-agent per row. Workers use `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning by default. The instruction string is a template where `{{column}}` placeholders are replaced with row values. Each worker must call `report_agent_job_result` with a JSON object (matching `output_schema` when provided); missing reports are treated as failures. This call blocks until all rows finish and automatically exports results to `output_csv_path` (or a default path)."
+    )
+}
+
 pub fn create_spawn_agents_on_csv_tool() -> ToolSpec {
     let mut output_schema = JsonSchema::object(
         BTreeMap::new(),
@@ -62,11 +71,14 @@ pub fn create_spawn_agents_on_csv_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "spawn_agents_on_csv".to_string(),
-        description: "Process a CSV by spawning one worker sub-agent per row. The instruction string is a template where `{column}` placeholders are replaced with row values. Each worker must call `report_agent_job_result` with a JSON object (matching `output_schema` when provided); missing reports are treated as failures. This call blocks until all rows finish and automatically exports results to `output_csv_path` (or a default path)."
-            .to_string(),
+        description: spawn_agents_on_csv_description(),
         strict: false,
         defer_loading: None,
-        parameters: JsonSchema::object(properties, Some(vec!["csv_path".to_string(), "instruction".to_string()]), Some(false.into())),
+        parameters: JsonSchema::object(
+            properties,
+            Some(vec!["csv_path".to_string(), "instruction".to_string()]),
+            Some(false.into()),
+        ),
         output_schema: None,
     })
 }

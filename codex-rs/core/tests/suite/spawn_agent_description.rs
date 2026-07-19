@@ -190,24 +190,24 @@ async fn spawn_agent_description_lists_visible_models_and_reasoning_efforts() ->
     );
     assert!(
         description
-            .contains("Available model overrides (optional; inherited parent model is preferred):"),
+            .contains("Available model overrides (optional; `gpt-5.6-sol` is the spawn default):"),
         "expected model choices to be framed as overrides in spawn_agent description: {description:?}"
     );
     assert!(
         description.contains(
-            "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed."
+            "Spawned agents use `gpt-5.6-sol` with `xhigh` reasoning by default. Omit `model` and `reasoning_effort` to use those defaults; set either field only when an explicit override is needed. If a model override does not support `xhigh`, also set `reasoning_effort` to a supported value listed for that model."
         ),
-        "expected inherited-model guidance in spawn_agent description: {description:?}"
+        "expected built-in model and reasoning defaults in spawn_agent description: {description:?}"
     );
     assert!(
         description.contains(
-            "Do not set the `model` field unless the user explicitly asks for a different model or there is a clear task-specific reason."
+            "Do not set the `model` or `reasoning_effort` field unless the user explicitly asks for a different setting or there is a clear task-specific reason."
         ),
         "expected model override usage guidance in spawn_agent description: {description:?}"
     );
     assert!(
-        description.contains("Reasoning efforts: low, medium (default), high."),
-        "expected default reasoning effort in spawn_agent description: {description:?}"
+        description.contains("Reasoning efforts: low, medium (catalog default), high."),
+        "expected catalog reasoning effort in spawn_agent description: {description:?}"
     );
     assert!(
         description.contains("Service tiers: priority."),

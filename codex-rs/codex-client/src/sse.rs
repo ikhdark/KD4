@@ -8,7 +8,9 @@ use tokio::time::timeout;
 
 /// Minimal SSE helper that forwards raw `data:` frames as UTF-8 strings.
 ///
-/// Errors and idle timeouts are sent as `Err(StreamError)` before the task exits.
+/// Parsing errors and idle timeouts are sent as `Err(StreamError)` before the
+/// task exits. Clean end-of-stream closes the output channel without an error;
+/// protocol-specific completion requirements belong in the typed consumer.
 pub fn sse_stream(
     stream: ByteStream,
     idle_timeout: Duration,
@@ -30,14 +32,7 @@ pub fn sse_stream(
                     let _ = tx.send(Err(StreamError::Stream(e.to_string()))).await;
                     return;
                 }
-                Ok(None) => {
-                    let _ = tx
-                        .send(Err(StreamError::Stream(
-                            "stream closed before completion".into(),
-                        )))
-                        .await;
-                    return;
-                }
+                Ok(None) => return,
                 Err(_) => {
                     let _ = tx.send(Err(StreamError::Timeout)).await;
                     return;

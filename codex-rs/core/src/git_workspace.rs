@@ -387,20 +387,26 @@ impl GitWorkspaceCache {
     }
 
     fn register_dependencies(&self, dependencies: &[DependencyFingerprint]) -> WatchRegistration {
-        self.watcher_subscriber
-            .as_ref()
-            .map(|subscriber| {
-                subscriber.register_paths(
-                    dependencies
-                        .iter()
-                        .map(|dependency| WatchPath {
-                            path: dependency.path.clone(),
-                            recursive: false,
-                        })
-                        .collect(),
-                )
-            })
-            .unwrap_or_default()
+        let Some(subscriber) = self.watcher_subscriber.as_ref() else {
+            return WatchRegistration::default();
+        };
+        match subscriber.register_paths(
+            dependencies
+                .iter()
+                .map(|dependency| WatchPath {
+                    path: dependency.path.clone(),
+                    recursive: false,
+                })
+                .collect(),
+        ) {
+            Ok(registration) => registration,
+            Err(err) => {
+                warn!("Git workspace cache disabled after watch registration failed: {err}");
+                self.watcher_reliable.store(false, Ordering::Release);
+                self.watcher_generation.fetch_add(1, Ordering::AcqRel);
+                WatchRegistration::default()
+            }
+        }
     }
 }
 

@@ -234,9 +234,9 @@ pub(crate) fn project_effective_user_config(
             let Ok(plugin_id) = PluginId::parse(plugin_key) else {
                 return false;
             };
-            (is_openai_curated_marketplace_name(&plugin_id.marketplace_name)
-                && !configured_marketplace_names.contains(&plugin_id.marketplace_name))
-                || allowed_marketplace_names.contains(&plugin_id.marketplace_name)
+            (is_openai_curated_marketplace_name(plugin_id.marketplace_name())
+                && !configured_marketplace_names.contains(plugin_id.marketplace_name()))
+                || allowed_marketplace_names.contains(plugin_id.marketplace_name())
         });
     }
     Some(user_config)

@@ -1,5 +1,7 @@
 use crate::key_aliases::normalize_key_aliases;
 use crate::key_aliases::normalized_with_key_aliases;
+use codex_features::feature_for_key;
+use codex_features::legacy_feature_keys;
 use codex_network_proxy::normalize_host;
 use toml::Value as TomlValue;
 
@@ -15,6 +17,7 @@ fn merge_toml_values_at_path(base: &mut TomlValue, overlay: &TomlValue, path: &m
         normalize_key_aliases(path, base_table);
         let mut overlay_table = overlay_table.clone();
         normalize_key_aliases(path, &mut overlay_table);
+        apply_feature_alias_overlay_precedence(path, base_table, &overlay_table);
         if is_permission_network_domains_path(path) {
             normalize_network_domain_keys(base_table);
             normalize_network_domain_keys(&mut overlay_table);
@@ -31,6 +34,32 @@ fn merge_toml_values_at_path(base: &mut TomlValue, overlay: &TomlValue, path: &m
         }
     } else {
         *base = normalized_with_key_aliases(overlay, path);
+    }
+}
+
+fn apply_feature_alias_overlay_precedence(
+    path: &[String],
+    base: &mut toml::map::Map<String, TomlValue>,
+    overlay: &toml::map::Map<String, TomlValue>,
+) {
+    if !matches!(path, [features] if features == "features") {
+        return;
+    }
+
+    for legacy_key in legacy_feature_keys() {
+        let Some(alias_value) = overlay.get(legacy_key) else {
+            continue;
+        };
+        let Some(feature) = feature_for_key(legacy_key) else {
+            continue;
+        };
+        let canonical_key = feature.key();
+        if overlay.contains_key(canonical_key) {
+            continue;
+        }
+        if let Some(canonical_value) = base.get_mut(canonical_key) {
+            *canonical_value = alias_value.clone();
+        }
     }
 }
 

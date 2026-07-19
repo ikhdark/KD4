@@ -6,14 +6,20 @@ use std::time::Duration;
 use std::time::SystemTime;
 
 use codex_protocol::ThreadId;
+use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::AgentMessageItem;
+use codex_protocol::items::TurnItem;
+use codex_protocol::items::UserMessageItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::UserMessageEvent;
+use codex_protocol::user_input::UserInput;
 use pretty_assertions::assert_eq;
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -168,6 +174,110 @@ async fn search_rollout_matches_fallback_returns_plain_and_compressed_snippets()
 }
 
 #[tokio::test]
+async fn search_rollout_matches_fallback_has_paginated_plain_compressed_parity()
+-> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let cases = [
+        (
+            Uuid::from_u128(18),
+            false,
+            TurnItem::UserMessage(UserMessageItem::new(&[UserInput::Text {
+                text: "user paginated needle".to_string(),
+                text_elements: Vec::new(),
+            }])),
+            "user paginated needle",
+        ),
+        (
+            Uuid::from_u128(19),
+            true,
+            TurnItem::UserMessage(UserMessageItem::new(&[UserInput::Text {
+                text: "user paginated needle".to_string(),
+                text_elements: Vec::new(),
+            }])),
+            "user paginated needle",
+        ),
+        (
+            Uuid::from_u128(20),
+            false,
+            TurnItem::AgentMessage(AgentMessageItem::new(&[AgentMessageContent::Text {
+                text: "agent paginated needle".to_string(),
+            }])),
+            "agent paginated needle",
+        ),
+        (
+            Uuid::from_u128(21),
+            true,
+            TurnItem::AgentMessage(AgentMessageItem::new(&[AgentMessageContent::Text {
+                text: "agent paginated needle".to_string(),
+            }])),
+            "agent paginated needle",
+        ),
+    ];
+    let mut expected = Vec::new();
+
+    for (uuid, compressed, item, snippet) in cases {
+        let thread_id = ThreadId::from_string(&uuid.to_string())?;
+        let path = rollout_path(home.path(), "2025-01-05T12-00-00", uuid);
+        write_rollout(&path, thread_id, "unrelated conversation")?;
+        append_rollout_item_to_path(
+            &path,
+            &RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id,
+                turn_id: "turn".to_string(),
+                item,
+                completed_at_ms: 0,
+            })),
+        )
+        .await?;
+        if compressed {
+            compress_now(&path)?;
+        }
+        expected.push((path, snippet));
+    }
+
+    let matches = search_rollout_matches(
+        std::path::Path::new("missing-rg-for-test"),
+        home.path(),
+        /*archived*/ false,
+        "paginated needle",
+    )
+    .await?;
+
+    for (path, snippet) in expected {
+        assert_eq!(matches.get(&path), Some(&Some(snippet.to_string())));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_rollout_matches_fallback_retains_metadata_only_compressed_match()
+-> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let plain_uuid = Uuid::from_u128(22);
+    let plain_id = ThreadId::from_string(&plain_uuid.to_string())?;
+    let plain_path = rollout_path(home.path(), "2025-01-06T12-00-00", plain_uuid);
+    write_rollout(&plain_path, plain_id, "unrelated conversation")?;
+
+    let compressed_uuid = Uuid::from_u128(23);
+    let compressed_id = ThreadId::from_string(&compressed_uuid.to_string())?;
+    let compressed_path = rollout_path(home.path(), "2025-01-07T12-00-00", compressed_uuid);
+    write_rollout(&compressed_path, compressed_id, "unrelated conversation")?;
+    compress_now(&compressed_path)?;
+
+    let matches = search_rollout_matches(
+        std::path::Path::new("missing-rg-for-test"),
+        home.path(),
+        /*archived*/ false,
+        "2025-01-03T12:00:00Z",
+    )
+    .await?;
+
+    assert_eq!(matches.get(&plain_path), Some(&None));
+    assert_eq!(matches.get(&compressed_path), Some(&None));
+    Ok(())
+}
+
+#[tokio::test]
 async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<()> {
     let home = TempDir::new()?;
     let active_uuid = Uuid::from_u128(3);
@@ -209,6 +319,114 @@ async fn worker_compresses_old_active_and_archived_rollouts() -> anyhow::Result<
             .join(".tmp")
             .join("rollout-compression.lock")
             .exists()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn worker_skips_rollout_while_append_handle_is_open() -> anyhow::Result<()> {
+    let home = TempDir::new()?;
+    let config = RolloutConfig {
+        codex_home: home.path().to_path_buf(),
+        sqlite_home: home.path().to_path_buf(),
+        cwd: home.path().to_path_buf(),
+        model_provider_id: "test-provider".to_string(),
+        generate_memories: true,
+    };
+    let uuid = Uuid::from_u128(18);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let rollout_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&rollout_path, thread_id, "before active append")?;
+    set_old_mtime(&rollout_path)?;
+
+    let recorder =
+        RolloutRecorder::new(&config, RolloutRecorderParams::resume(rollout_path.clone())).await?;
+
+    worker::run(home.path().to_path_buf()).await?;
+
+    assert!(rollout_path.exists());
+    assert!(!compressed_rollout_path(&rollout_path).exists());
+    recorder
+        .record_canonical_items(&[RolloutItem::EventMsg(EventMsg::UserMessage(
+            UserMessageEvent {
+                message: "after skipped compression".to_string(),
+                ..Default::default()
+            },
+        ))])
+        .await?;
+    recorder.flush().await?;
+    recorder.shutdown().await?;
+
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn append_after_compression_final_check_survives_in_one_representation() -> anyhow::Result<()>
+{
+    let home = TempDir::new()?;
+    let uuid = Uuid::from_u128(19);
+    let thread_id = ThreadId::from_string(&uuid.to_string())?;
+    let rollout_path = rollout_path(home.path(), "2025-01-03T12-00-00", uuid);
+    write_rollout(&rollout_path, thread_id, "before compression race")?;
+    set_old_mtime(&rollout_path)?;
+
+    let (reached_final_check_tx, reached_final_check_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let compression_path = rollout_path.clone();
+    let compression_task = tokio::task::spawn_blocking(move || {
+        worker::compress_rollout_if_cold_blocking_paused(
+            compression_path.as_path(),
+            reached_final_check_tx,
+            resume_rx,
+        )
+    });
+    reached_final_check_rx.await?;
+
+    let append_path = rollout_path.clone();
+    let mut append_task = tokio::spawn(async move {
+        append_rollout_item_to_path(
+            append_path.as_path(),
+            &RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+                message: "append during compression".to_string(),
+                ..Default::default()
+            })),
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut append_task)
+            .await
+            .is_err(),
+        "append should wait for compression's exclusive rollout lock"
+    );
+
+    resume_tx.send(())?;
+    compression_task.await??;
+    append_task.await??;
+
+    let compressed_path = compressed_rollout_path(&rollout_path);
+    assert!(rollout_path.exists());
+    assert!(!compressed_path.exists());
+    let (items, loaded_thread_id, parse_errors) =
+        RolloutRecorder::load_rollout_items(&rollout_path).await?;
+    assert_eq!(loaded_thread_id, Some(thread_id));
+    assert_eq!(parse_errors, 0);
+    assert_eq!(items.len(), 3);
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::UserMessage(event))
+                    if event.message == "append during compression"
+            ))
+            .count(),
+        1
     );
     Ok(())
 }

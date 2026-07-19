@@ -5,7 +5,7 @@ use codex_config::CONFIG_TOML_FILE;
 use codex_config::types::McpServerConfig;
 use codex_config::types::SessionPickerViewMode;
 use codex_config::types::ToolSuggestDisabledTool;
-use codex_features::FEATURES;
+use codex_features::feature_for_key;
 use codex_protocol::config_types::Personality;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::config_types::TrustLevel;
@@ -866,15 +866,23 @@ impl ConfigEditsBuilder {
 
     /// Enable or disable a feature flag by key under the `[features]` table.
     ///
+    /// Legacy aliases are migrated to their canonical key so a stale
+    /// canonical value cannot override the requested edit.
+    ///
     /// Disabling a default-false feature clears the key instead of
     /// persisting `false`, so the config does not pin the feature once it
     /// graduates to globally enabled.
     pub fn set_feature_enabled(mut self, key: &str, enabled: bool) -> Self {
-        let segments = vec!["features".to_string(), key.to_string()];
-        let is_default_false_feature = FEATURES
-            .iter()
-            .find(|spec| spec.key == key)
-            .is_some_and(|spec| !spec.default_enabled);
+        let feature = feature_for_key(key);
+        let canonical_key = feature.map_or(key, |feature| feature.key());
+        if canonical_key != key {
+            self.edits.push(ConfigEdit::ClearPath {
+                segments: vec!["features".to_string(), key.to_string()],
+            });
+        }
+
+        let segments = vec!["features".to_string(), canonical_key.to_string()];
+        let is_default_false_feature = feature.is_some_and(|feature| !feature.default_enabled());
         if enabled || !is_default_false_feature {
             self.edits.push(ConfigEdit::SetPath {
                 segments,

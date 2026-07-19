@@ -13,6 +13,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+anyhow = { workspace = true }
 codex-protocol = { workspace = true }
 codex-state = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

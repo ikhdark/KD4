@@ -2,7 +2,6 @@ use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::Permissions;
 use std::io;
-use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -16,6 +15,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 
 const COMPRESSED_SUFFIX: &str = ".zst";
+const COMPRESSED_READER_CHANNEL_CAPACITY: usize = 64;
 const MAX_NOT_FOUND_RETRIES: usize = 3;
 const OPEN_ROLLOUT_LINE_READER_RETRY_DELAY: Duration = Duration::from_millis(50);
 const TEMP_SUFFIX: &str = ".tmp";
@@ -63,16 +63,58 @@ pub(crate) fn compressed_rollout_path(path: &Path) -> PathBuf {
     path::compressed_rollout_path(path)
 }
 
-/// Materializes a compressed rollout back to plain `.jsonl` for async append paths.
-pub(crate) async fn materialize_rollout_for_append(path: &Path) -> io::Result<PathBuf> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || materialize_rollout_for_append_blocking(path.as_path()))
-        .await
-        .map_err(io::Error::other)?
+/// Shared per-rollout lock held while an append handle remains open.
+///
+/// Compression takes the corresponding exclusive lock before inspecting or
+/// replacing either physical representation.
+pub(crate) struct RolloutAppendLock {
+    _file: File,
 }
 
-/// Materializes a compressed rollout back to plain `.jsonl` for blocking append paths.
-pub(crate) fn materialize_rollout_for_append_blocking(path: &Path) -> io::Result<PathBuf> {
+/// Acquires the append lock and materializes the canonical plain rollout while
+/// compression is excluded. The returned guard must live as long as the append
+/// handle that is opened for the returned path.
+pub(crate) fn lock_rollout_for_append_blocking(
+    path: &Path,
+) -> io::Result<(PathBuf, RolloutAppendLock)> {
+    let plain_path = plain_rollout_path(path);
+    let lock_file = open_rollout_lock_file(plain_path.as_path())?;
+    lock_file.lock_shared()?;
+    let plain_path = materialize_rollout_for_append_locked(plain_path.as_path())?;
+    Ok((plain_path, RolloutAppendLock { _file: lock_file }))
+}
+
+fn try_lock_rollout_for_compression(path: &Path) -> io::Result<Option<File>> {
+    let lock_file = open_rollout_lock_file(plain_rollout_path(path).as_path())?;
+    match lock_file.try_lock() {
+        Ok(()) => Ok(Some(lock_file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn open_rollout_lock_file(path: &Path) -> io::Result<File> {
+    let lock_path = rollout_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(lock_path)
+}
+
+fn rollout_lock_path(path: &Path) -> PathBuf {
+    let plain_path = plain_rollout_path(path);
+    let file_name = plain_path
+        .file_name()
+        .map(OsStr::to_os_string)
+        .unwrap_or_else(|| OsStr::new("rollout").to_os_string());
+    plain_path.with_file_name(format!(".{}.lock", file_name.to_string_lossy()))
+}
+
+fn materialize_rollout_for_append_locked(path: &Path) -> io::Result<PathBuf> {
     let plain_path = plain_rollout_path(path);
     if plain_path.exists() {
         metrics::materialize("plain_exists");
@@ -111,11 +153,15 @@ pub(crate) fn materialize_rollout_for_append_blocking(path: &Path) -> io::Result
         }
         Ok(())
     })();
-    if result.is_err() {
+    if let Err(err) = result {
         let _ = std::fs::remove_file(temp_path.as_path());
+        if err.kind() == io::ErrorKind::NotFound && plain_path.exists() {
+            metrics::materialize("materialized_concurrently");
+            return Ok(plain_path);
+        }
         metrics::materialize("failed");
+        return Err(err);
     }
-    result?;
     metrics::materialize("decompressed");
     Ok(plain_path)
 }
@@ -197,7 +243,12 @@ pub struct RolloutLineReader {
 
 enum RolloutLineReaderInner {
     Plain(tokio::io::Lines<tokio::io::BufReader<tokio::fs::File>>),
-    Blocking(Option<BlockingLineReader>),
+    Blocking(BlockingRolloutLineReader),
+}
+
+struct BlockingRolloutLineReader {
+    receiver: tokio::sync::mpsc::Receiver<io::Result<String>>,
+    task: Option<tokio::task::JoinHandle<io::Result<()>>>,
 }
 
 impl RolloutLineReader {
@@ -205,22 +256,18 @@ impl RolloutLineReader {
     pub async fn next_line(&mut self) -> io::Result<Option<String>> {
         match &mut self.inner {
             RolloutLineReaderInner::Plain(lines) => lines.next_line().await,
-            RolloutLineReaderInner::Blocking(slot) => {
-                let Some(mut reader) = slot.take() else {
-                    return Err(io::Error::other("compressed rollout reader is busy"));
-                };
-                let (line, reader) =
-                    tokio::task::spawn_blocking(move || (reader.next().transpose(), reader))
-                        .await
-                        .map_err(io::Error::other)?;
-                *slot = Some(reader);
-                line
-            }
+            RolloutLineReaderInner::Blocking(reader) => match reader.receiver.recv().await {
+                Some(line) => line.map(Some),
+                None => {
+                    if let Some(task) = reader.task.take() {
+                        task.await.map_err(io::Error::other)??;
+                    }
+                    Ok(None)
+                }
+            },
         }
     }
 }
-
-type BlockingLineReader = std::io::Lines<std::io::BufReader<Box<dyn Read + Send>>>;
 
 mod worker {
     use std::ffi::OsStr;
@@ -247,6 +294,7 @@ mod worker {
     use super::RolloutFile;
     use super::metrics;
     use super::path;
+    use super::try_lock_rollout_for_compression;
 
     const TEMP_SUFFIX: &str = ".tmp";
     const COMPRESSION_LEVEL: i32 = 3;
@@ -492,6 +540,7 @@ mod worker {
         SkippedNotCold,
         SkippedChanged,
         SkippedAlreadyCompressed,
+        SkippedLocked,
     }
 
     impl CompressionOutcome {
@@ -501,6 +550,7 @@ mod worker {
                 CompressionOutcome::SkippedNotCold => "skipped_not_cold",
                 CompressionOutcome::SkippedChanged => "skipped_changed",
                 CompressionOutcome::SkippedAlreadyCompressed => "skipped_already_compressed",
+                CompressionOutcome::SkippedLocked => "skipped_locked",
             }
         }
     }
@@ -555,7 +605,8 @@ mod worker {
                     }
                     CompressionOutcome::SkippedNotCold
                     | CompressionOutcome::SkippedChanged
-                    | CompressionOutcome::SkippedAlreadyCompressed => {
+                    | CompressionOutcome::SkippedAlreadyCompressed
+                    | CompressionOutcome::SkippedLocked => {
                         stats.skipped = stats.skipped.saturating_add(1);
                     }
                 }
@@ -586,6 +637,20 @@ mod worker {
     }
 
     fn compress_rollout_if_cold_blocking(path: &Path) -> io::Result<CompressionMeasurement> {
+        compress_rollout_if_cold_blocking_with_hook(path, || Ok(()))
+    }
+
+    fn compress_rollout_if_cold_blocking_with_hook(
+        path: &Path,
+        after_final_check: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<CompressionMeasurement> {
+        let Some(_rollout_lock) = try_lock_rollout_for_compression(path)? else {
+            return Ok(CompressionMeasurement::new(
+                CompressionOutcome::SkippedLocked,
+                /*source_bytes*/ None,
+                /*compressed_bytes*/ None,
+            ));
+        };
         let before = match cold_file_state(path)? {
             ColdFileState::Cold(state) => state,
             ColdFileState::NotCold(state) => {
@@ -648,12 +713,31 @@ mod worker {
                 /*compressed_bytes*/ None,
             ));
         }
+        after_final_check()?;
         std::fs::remove_file(path)?;
         Ok(CompressionMeasurement::new(
             CompressionOutcome::Compressed,
             source_bytes,
             Some(compressed_bytes),
         ))
+    }
+
+    #[cfg(test)]
+    pub(super) fn compress_rollout_if_cold_blocking_paused(
+        path: &Path,
+        reached_final_check: tokio::sync::oneshot::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) -> io::Result<()> {
+        compress_rollout_if_cold_blocking_with_hook(path, move || {
+            reached_final_check
+                .send(())
+                .map_err(|()| io::Error::other("compression pause receiver was dropped"))?;
+            resume.recv().map_err(|err| {
+                io::Error::other(format!("compression pause sender was dropped: {err}"))
+            })?;
+            Ok(())
+        })
+        .map(|_| ())
     }
 
     struct FileState {
@@ -977,6 +1061,8 @@ mod reader {
     use std::io::Read;
     use std::path::Path;
 
+    use super::BlockingRolloutLineReader;
+    use super::COMPRESSED_READER_CHANNEL_CAPACITY;
     use super::RolloutLineReader;
     use super::RolloutLineReaderInner;
     use super::path;
@@ -996,8 +1082,21 @@ mod reader {
             })
             .await
             .map_err(io::Error::other)??;
+            let (sender, receiver) = tokio::sync::mpsc::channel(COMPRESSED_READER_CHANNEL_CAPACITY);
+            let task = tokio::task::spawn_blocking(move || {
+                for line in reader {
+                    let failed = line.is_err();
+                    if sender.blocking_send(line).is_err() || failed {
+                        break;
+                    }
+                }
+                Ok(())
+            });
             return Ok(RolloutLineReader {
-                inner: RolloutLineReaderInner::Blocking(Some(reader)),
+                inner: RolloutLineReaderInner::Blocking(BlockingRolloutLineReader {
+                    receiver,
+                    task: Some(task),
+                }),
             });
         }
         let file = tokio::fs::File::open(path).await?;

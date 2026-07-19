@@ -136,7 +136,7 @@ fn provider(name: &str) -> Provider {
         query_params: None,
         headers: HeaderMap::new(),
         retry: codex_api::RetryConfig {
-            max_attempts: 1,
+            max_retries: 1,
             base_delay: Duration::from_millis(1),
             retry_429: false,
             retry_5xx: false,
@@ -396,7 +396,7 @@ async fn streaming_client_retries_on_transport_error() -> Result<()> {
     let transport = FlakyTransport::new();
 
     let mut provider = provider("openai");
-    provider.retry.max_attempts = 2;
+    provider.retry.max_retries = 2;
 
     let request = ResponsesApiRequest {
         model: "gpt-test".into(),
@@ -455,7 +455,7 @@ async fn streaming_client_retries_on_transient_auth_error() -> Result<()> {
     let auth = FailsOnceAuth::transient();
 
     let mut provider = provider("openai");
-    provider.retry.max_attempts = 2;
+    provider.retry.max_retries = 2;
 
     let client = ResponsesClient::new(transport, provider, Arc::new(auth.clone()));
     let body = serde_json::json!({ "model": "gpt-test" });
@@ -480,7 +480,7 @@ async fn streaming_client_does_not_retry_auth_build_error() -> Result<()> {
     let auth = FailsOnceAuth::build();
 
     let mut provider = provider("openai");
-    provider.retry.max_attempts = 2;
+    provider.retry.max_retries = 2;
 
     let client = ResponsesClient::new(transport, provider, Arc::new(auth.clone()));
     let body = serde_json::json!({ "model": "gpt-test" });

@@ -18,6 +18,7 @@ export type {
   CommandExecutionItem,
   FileChangeItem,
   McpToolCallItem,
+  CollabToolCallItem,
   WebSearchItem,
   TodoListItem,
   ErrorItem,

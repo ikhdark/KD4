@@ -11,7 +11,7 @@
 //! hunk: add_hunk | delete_hunk | update_hunk
 //! add_hunk: "*** Add File: " filename LF add_line+
 //! delete_hunk: "*** Delete File: " filename LF
-//! update_hunk: "*** Update File: " filename LF change_move? change?
+//! update_hunk: "*** Update File: " filename LF (change_move change? | change)
 //! filename: /(.+)/
 //! add_line: "+" /(.+)/ LF -> line
 //!
@@ -302,6 +302,22 @@ fn test_parse_patch() {
             message: "Update file hunk for path 'test.py' is empty".to_string(),
             line_number: 2,
         })
+    );
+    assert_eq!(
+        parse_patch_text(
+            "*** Begin Patch\n\
+             *** Update File: old.py\n\
+             *** Move to: new.py\n\
+             *** End Patch",
+            ParseMode::Strict
+        )
+        .unwrap()
+        .hunks,
+        vec![UpdateFile {
+            path: PathBuf::from("old.py"),
+            move_path: Some(PathBuf::from("new.py")),
+            chunks: Vec::new(),
+        }]
     );
     assert_eq!(
         parse_patch_text(

@@ -1,19 +1,18 @@
-//! Shared in-process app-server client facade for CLI surfaces.
+//! Shared app-server client facade for CLI surfaces.
 //!
-//! This crate wraps [`codex_app_server::in_process`] behind a single async API
-//! used by surfaces like TUI and exec. It centralizes:
+//! This crate presents in-process and remote app-server transports behind a
+//! single async API used by surfaces like TUI and exec. It centralizes:
 //!
 //! - Runtime startup and initialize-capabilities handshake.
 //! - Typed caller-provided startup identity (`SessionSource` + client name).
 //! - Typed and raw request/notification dispatch.
 //! - Server request resolution and rejection.
-//! - Event consumption with backpressure signaling ([`InProcessServerEvent::Lagged`]).
+//! - Event consumption with backpressure signaling ([`AppServerEvent::Lagged`]).
 //! - Bounded graceful shutdown with abort fallback.
 //!
-//! The facade interposes a worker task between the caller and the underlying
-//! [`InProcessClientHandle`](codex_app_server::in_process::InProcessClientHandle),
-//! bridging async `mpsc` channels on both sides. Queues are bounded so overload
-//! surfaces as channel-full errors rather than unbounded memory growth.
+//! Each transport interposes a worker task between the caller and the underlying
+//! runtime or connection. Queues are bounded so overload surfaces as explicit
+//! backpressure behavior rather than unbounded memory growth.
 
 mod path;
 mod remote;
@@ -44,6 +43,7 @@ use codex_app_server_protocol::RequestId;
 use codex_app_server_protocol::Result as JsonRpcResult;
 use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
+use codex_app_server_protocol::server_notification_requires_delivery;
 use codex_arg0::Arg0DispatchPaths;
 use codex_config::CloudConfigBundleLoader;
 use codex_config::LoaderOverrides;
@@ -146,29 +146,11 @@ fn event_requires_delivery(event: &InProcessServerEvent) -> bool {
     }
 }
 
-/// Returns `true` for notifications that must survive backpressure.
-///
-/// Transcript events (`AgentMessageDelta`, `PlanDelta`, reasoning deltas) and
-/// the authoritative `ItemCompleted` / `TurnCompleted` form the lossless tier
-/// of the event stream. Dropping any of these corrupts the visible assistant
-/// output or leaves surfaces waiting for a completion signal that already
-/// fired. Everything else (`CommandExecutionOutputDelta`, progress, etc.) is
-/// best-effort and may be dropped with only cosmetic impact.
-///
-/// Both the in-process and remote transports delegate to this function so the
-/// classification stays in sync.
-pub(crate) fn server_notification_requires_delivery(notification: &ServerNotification) -> bool {
-    matches!(
-        notification,
-        ServerNotification::TurnCompleted(_)
-            | ServerNotification::ThreadSettingsUpdated(_)
-            | ServerNotification::ItemCompleted(_)
-            | ServerNotification::ExternalAgentConfigImportCompleted(_)
-            | ServerNotification::AgentMessageDelta(_)
-            | ServerNotification::PlanDelta(_)
-            | ServerNotification::ReasoningSummaryTextDelta(_)
-            | ServerNotification::ReasoningTextDelta(_)
-    )
+fn skipped_event_count(event: &InProcessServerEvent) -> usize {
+    match event {
+        InProcessServerEvent::Lagged { skipped } => *skipped,
+        _ => 1,
+    }
 }
 
 /// Outcome of attempting to forward a single event to the consumer channel.
@@ -221,7 +203,7 @@ where
                     *skipped_events = 0;
                 }
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    *skipped_events = skipped_events.saturating_add(1);
+                    *skipped_events = skipped_events.saturating_add(skipped_event_count(&event));
                     warn!("dropping in-process app-server event because consumer queue is full");
                     if let InProcessServerEvent::ServerRequest(request) = event {
                         reject_server_request(request);
@@ -247,7 +229,7 @@ where
     match event_tx.try_send(event) {
         Ok(()) => ForwardEventResult::Continue,
         Err(mpsc::error::TrySendError::Full(event)) => {
-            *skipped_events = skipped_events.saturating_add(1);
+            *skipped_events = skipped_events.saturating_add(skipped_event_count(&event));
             warn!("dropping in-process app-server event because consumer queue is full");
             if let InProcessServerEvent::ServerRequest(request) = event {
                 reject_server_request(request);
@@ -638,7 +620,7 @@ impl InProcessAppServerClient {
     where
         T: DeserializeOwned,
     {
-        let method = request_method_name(&request);
+        let method = request.method_name().to_string();
         let response =
             self.request(request)
                 .await
@@ -811,7 +793,7 @@ impl InProcessAppServerRequestHandle {
     where
         T: DeserializeOwned,
     {
-        let method = request_method_name(&request);
+        let method = request.method_name().to_string();
         let response =
             self.request(request)
                 .await
@@ -923,20 +905,6 @@ impl AppServerClient {
             Self::Remote(client) => AppServerRequestHandle::Remote(client.request_handle()),
         }
     }
-}
-
-/// Extracts the JSON-RPC method name for diagnostics without extending the
-/// protocol crate with in-process-only helpers.
-pub(crate) fn request_method_name(request: &ClientRequest) -> String {
-    serde_json::to_value(request)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("method")
-                .and_then(serde_json::Value::as_str)
-                .map(ToOwned::to_owned)
-        })
-        .unwrap_or_else(|| "<unknown>".to_string())
 }
 
 #[cfg(test)]
@@ -1382,6 +1350,16 @@ mod tests {
         assert_eq!(result, ForwardEventResult::Continue);
         assert_eq!(skipped_events, 1);
 
+        let result = forward_in_process_event(
+            &event_tx,
+            &mut skipped_events,
+            InProcessServerEvent::Lagged { skipped: 2 },
+            |_| {},
+        )
+        .await;
+        assert_eq!(result, ForwardEventResult::Continue);
+        assert_eq!(skipped_events, 3);
+
         let receive_task = tokio::spawn(async move {
             let mut events = Vec::new();
             for _ in 0..5 {
@@ -1422,7 +1400,7 @@ mod tests {
         ));
         assert!(matches!(
             &events[1],
-            InProcessServerEvent::Lagged { skipped: 1 }
+            InProcessServerEvent::Lagged { skipped: 3 }
         ));
         assert!(matches!(
             &events[2],
@@ -1793,11 +1771,57 @@ mod tests {
     #[tokio::test]
     async fn remote_backpressure_preserves_transcript_notifications() {
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let (saturated_tx, saturated_rx) = tokio::sync::oneshot::channel();
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             expect_remote_initialize(&mut websocket).await;
             for notification in [
                 command_execution_output_delta_notification("stdout-1"),
                 command_execution_output_delta_notification("stdout-2"),
+            ] {
+                write_websocket_message(
+                    &mut websocket,
+                    JSONRPCMessage::Notification(
+                        serde_json::from_value(
+                            serde_json::to_value(notification)
+                                .expect("notification should serialize"),
+                        )
+                        .expect("notification should convert to JSON-RPC"),
+                    ),
+                )
+                .await;
+            }
+
+            let request_id = RequestId::String("srv-saturated".to_string());
+            write_websocket_message(
+                &mut websocket,
+                JSONRPCMessage::Request(JSONRPCRequest {
+                    id: request_id.clone(),
+                    method: "item/tool/requestUserInput".to_string(),
+                    params: Some(
+                        serde_json::to_value(ToolRequestUserInputParams {
+                            thread_id: "thread-1".to_string(),
+                            turn_id: "turn-1".to_string(),
+                            item_id: "call-1".to_string(),
+                            questions: Vec::new(),
+                            auto_resolution_ms: None,
+                        })
+                        .expect("params should serialize"),
+                    ),
+                    trace: None,
+                }),
+            )
+            .await;
+            let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+                panic!("expected saturated server request rejection");
+            };
+            assert_eq!(error.id, request_id);
+            assert_eq!(error.error.code, -32001);
+            assert_eq!(error.error.message, "remote app-server event queue is full");
+            saturated_tx
+                .send(())
+                .expect("saturation signal should send");
+
+            for notification in [
                 agent_message_delta_notification("hello"),
                 item_completed_notification("hello"),
                 turn_completed_notification(),
@@ -1824,6 +1848,11 @@ mod tests {
         .await
         .expect("remote client should connect");
 
+        timeout(Duration::from_secs(2), saturated_rx)
+            .await
+            .expect("server request should be rejected before consumption")
+            .expect("saturation signal should arrive");
+
         let first_event = timeout(Duration::from_secs(2), client.next_event())
             .await
             .expect("first event should arrive before timeout")
@@ -1835,51 +1864,45 @@ mod tests {
             )) if notification.delta == "stdout-1"
         ));
 
-        let mut remaining_events = Vec::new();
-        for _ in 0..4 {
-            remaining_events.push(
-                timeout(Duration::from_secs(2), client.next_event())
-                    .await
-                    .expect("event should arrive before timeout")
-                    .expect("event stream should stay open"),
-            );
-        }
+        let lagged = timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .expect("lag marker should arrive before timeout")
+            .expect("event stream should stay open");
+        assert!(matches!(lagged, AppServerEvent::Lagged { skipped: 2 }));
 
-        let mut transcript_event_names = Vec::new();
-        for event in &remaining_events {
-            match event {
-                AppServerEvent::Lagged { skipped: 1 } => {}
-                AppServerEvent::ServerNotification(
-                    ServerNotification::CommandExecutionOutputDelta(notification),
-                ) if notification.delta == "stdout-2" => {}
-                AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
-                    notification,
-                )) if notification.delta == "hello" => {
-                    transcript_event_names.push("agent_message_delta");
-                }
-                AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
-                    notification,
-                )) if matches!(
+        let agent_delta = timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .expect("agent delta should arrive before timeout")
+            .expect("event stream should stay open");
+        assert!(matches!(
+            agent_delta,
+            AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
+                notification
+            )) if notification.delta == "hello"
+        ));
+
+        let item_completed = timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .expect("item completion should arrive before timeout")
+            .expect("event stream should stay open");
+        assert!(matches!(
+            item_completed,
+            AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(notification))
+                if matches!(
                     &notification.item,
                     codex_app_server_protocol::ThreadItem::AgentMessage { text, .. } if text == "hello"
-                ) =>
-                {
-                    transcript_event_names.push("item_completed");
-                }
-                AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(
-                    notification,
-                )) if notification.turn.status
-                    == codex_app_server_protocol::TurnStatus::Completed =>
-                {
-                    transcript_event_names.push("turn_completed");
-                }
-                _ => panic!("unexpected remaining event: {event:?}"),
-            }
-        }
-        assert_eq!(
-            transcript_event_names,
-            vec!["agent_message_delta", "item_completed", "turn_completed"]
-        );
+                )
+        ));
+
+        let turn_completed = timeout(Duration::from_secs(2), client.next_event())
+            .await
+            .expect("turn completion should arrive before timeout")
+            .expect("event stream should stay open");
+        assert!(matches!(
+            turn_completed,
+            AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(notification))
+                if notification.turn.status == codex_app_server_protocol::TurnStatus::Completed
+        ));
 
         done_tx
             .send(())
@@ -1943,7 +1966,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_server_request_received_during_initialize_is_delivered() {
+    async fn remote_server_request_received_during_initialize_is_rejected() {
         let websocket_url = start_test_remote_server(|mut websocket| async move {
             let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
             else {
@@ -1978,6 +2001,17 @@ mod tests {
                 }),
             )
             .await;
+
+            let JSONRPCMessage::Error(error) = read_websocket_message(&mut websocket).await else {
+                panic!("expected pre-initialize server request rejection");
+            };
+            assert_eq!(error.id, request_id);
+            assert_eq!(error.error.code, -32600);
+            assert_eq!(
+                error.error.message,
+                "remote app-server request `item/tool/requestUserInput` is not supported before initialization completes"
+            );
+
             write_websocket_message(
                 &mut websocket,
                 JSONRPCMessage::Response(JSONRPCResponse {
@@ -1993,31 +2027,62 @@ mod tests {
                 panic!("expected initialized notification");
             };
             assert_eq!(notification.method, "initialized");
-
-            let JSONRPCMessage::Response(response) = read_websocket_message(&mut websocket).await
-            else {
-                panic!("expected server request response");
-            };
-            assert_eq!(response.id, request_id);
         })
         .await;
-        let mut client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
+        let client = RemoteAppServerClient::connect(test_remote_connect_args(websocket_url))
             .await
             .expect("remote client should connect");
 
-        let AppServerEvent::ServerRequest(request) = client
-            .next_event()
-            .await
-            .expect("request event should arrive")
-        else {
-            panic!("expected server request event");
-        };
-        client
-            .resolve_server_request(request.id().clone(), serde_json::json!({}))
-            .await
-            .expect("server request should resolve");
-
         client.shutdown().await.expect("shutdown should complete");
+    }
+
+    #[tokio::test]
+    async fn remote_initialize_pending_events_are_bounded() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let websocket_url = start_test_remote_server(|mut websocket| async move {
+            let JSONRPCMessage::Request(request) = read_websocket_message(&mut websocket).await
+            else {
+                panic!("expected initialize request");
+            };
+            assert_eq!(request.method, "initialize");
+
+            for notification in [
+                command_execution_output_delta_notification("stdout-1"),
+                command_execution_output_delta_notification("stdout-2"),
+            ] {
+                write_websocket_message(
+                    &mut websocket,
+                    JSONRPCMessage::Notification(
+                        serde_json::from_value(
+                            serde_json::to_value(notification)
+                                .expect("notification should serialize"),
+                        )
+                        .expect("notification should convert to JSON-RPC"),
+                    ),
+                )
+                .await;
+            }
+            let _ = done_rx.await;
+        })
+        .await;
+
+        let result = RemoteAppServerClient::connect(RemoteAppServerConnectArgs {
+            channel_capacity: 1,
+            ..test_remote_connect_args(websocket_url)
+        })
+        .await;
+        let err = match result {
+            Ok(_) => panic!("initialize event overflow should fail the connection"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string()
+                .contains("exceeded the pending initialize event capacity of 1")
+        );
+        done_tx
+            .send(())
+            .expect("server completion signal should send");
     }
 
     #[tokio::test]

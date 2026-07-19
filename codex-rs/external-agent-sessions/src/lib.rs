@@ -40,6 +40,7 @@ pub struct ImportedExternalAgentSession {
 pub struct PendingSessionImport {
     pub source_path: PathBuf,
     pub source_content_sha256: String,
+    pub source_modified_at: Option<i64>,
     pub session: ImportedExternalAgentSession,
 }
 
@@ -51,7 +52,7 @@ pub fn prepare_validated_session_import(
     if has_been_imported {
         return Ok(None);
     }
-    let Some((source_path, imported_session, source_content_sha256)) =
+    let Some((source_path, imported_session, source_content_sha256, source_modified_at)) =
         load_importable_session(&session.path)?
     else {
         return Ok(None);
@@ -59,15 +60,16 @@ pub fn prepare_validated_session_import(
     Ok(Some(PendingSessionImport {
         source_path,
         source_content_sha256,
+        source_modified_at,
         session: imported_session,
     }))
 }
 
 fn load_importable_session(
     path: &Path,
-) -> io::Result<Option<(PathBuf, ImportedExternalAgentSession, String)>> {
+) -> io::Result<Option<(PathBuf, ImportedExternalAgentSession, String, Option<i64>)>> {
     let source_path = std::fs::canonicalize(path)?;
-    let Some((imported_session, source_content_sha256)) =
+    let Some((imported_session, source_content_sha256, source_modified_at)) =
         load_session_for_import_with_content_sha256(&source_path)?
     else {
         return Ok(None);
@@ -76,6 +78,7 @@ fn load_importable_session(
         source_path,
         imported_session,
         source_content_sha256,
+        source_modified_at,
     )))
 }
 

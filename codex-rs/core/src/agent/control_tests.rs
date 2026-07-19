@@ -37,6 +37,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnCompleteEvent;
 use codex_protocol::protocol::TurnStartedEvent;
+use codex_state::DirectionalThreadSpawnEdgeStatus;
 use codex_thread_store::ArchiveThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LocalThreadStore;
@@ -2962,6 +2963,128 @@ async fn shutdown_agent_tree_closes_descendants_when_started_at_child() {
 }
 
 #[tokio::test]
+async fn failed_initial_submission_rollback_closes_edge_and_releases_child() {
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::Sqlite);
+    config.sqlite_home = home.path().join("sqlite");
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+    let child_thread = harness
+        .manager
+        .get_thread(child_thread_id)
+        .await
+        .expect("child thread should be loaded");
+
+    let error = harness
+        .control
+        .rollback_failed_initial_submission(
+            child_thread.as_ref(),
+            child_thread_id,
+            CodexErr::InternalAgentDied,
+        )
+        .await;
+    assert_matches!(error, CodexErr::InternalAgentDied);
+    assert_eq!(
+        harness.control.get_status(child_thread_id).await,
+        AgentStatus::NotFound
+    );
+
+    let state_db = harness
+        .state_db
+        .as_ref()
+        .expect("sqlite state db should be available");
+    assert_eq!(
+        state_db
+            .list_thread_spawn_children_with_status(
+                parent_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect("open children should load"),
+        Vec::<ThreadId>::new()
+    );
+    assert_eq!(
+        state_db
+            .list_thread_spawn_children_with_status(
+                parent_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Closed,
+            )
+            .await
+            .expect("closed children should load"),
+        vec![child_thread_id]
+    );
+
+    let _ = harness
+        .control
+        .shutdown_live_agent(parent_thread_id)
+        .await
+        .expect("parent shutdown should succeed");
+}
+
+#[tokio::test]
+async fn close_agent_reports_durable_status_failure_after_shutdown() {
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::Sqlite);
+    config.sqlite_home = home.path().join("sqlite");
+    let harness = AgentControlHarness::new_with_config(home, config).await;
+    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
+    let child_thread_id = harness
+        .control
+        .spawn_agent(
+            harness.config.clone(),
+            text_input("hello child"),
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+
+    harness
+        .state_db
+        .as_ref()
+        .expect("sqlite state db should be available")
+        .close()
+        .await;
+    let error = harness
+        .control
+        .close_agent(child_thread_id)
+        .await
+        .expect_err("durable close failure must not report success");
+    assert!(error.to_string().contains("closed spawn-edge status"));
+    assert_eq!(
+        harness.control.get_status(child_thread_id).await,
+        AgentStatus::NotFound
+    );
+
+    let report = harness
+        .manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
+    assert!(report.submit_failed.is_empty());
+    assert!(report.timed_out.is_empty());
+}
+
+#[tokio::test]
 async fn resume_agent_from_rollout_does_not_reopen_closed_descendants() {
     let harness = AgentControlHarness::new().await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
@@ -3376,8 +3499,11 @@ async fn resume_agent_from_rollout_uses_edge_data_when_descendant_metadata_sourc
 }
 
 #[tokio::test]
-async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() {
-    let harness = AgentControlHarness::new().await;
+async fn resume_agent_from_rollout_closes_unrecoverable_child_and_does_not_retry() {
+    let (home, mut config) = test_config().await;
+    let _ = config.features.enable(Feature::Sqlite);
+    config.sqlite_home = home.path().join("sqlite");
+    let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, parent_thread) = harness.start_thread().await;
 
     let child_thread_id = harness
@@ -3432,15 +3558,16 @@ async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() 
     let child_rollout_path = child_thread
         .rollout_path()
         .expect("child thread should have rollout path");
+    let hidden_child_rollout_path = child_rollout_path.with_extension("jsonl.missing");
     let report = harness
         .manager
         .shutdown_all_threads_bounded(Duration::from_secs(5))
         .await;
     assert_eq!(report.submit_failed, Vec::<ThreadId>::new());
     assert_eq!(report.timed_out, Vec::<ThreadId>::new());
-    tokio::fs::remove_file(&child_rollout_path)
+    tokio::fs::rename(&child_rollout_path, &hidden_child_rollout_path)
         .await
-        .expect("child rollout path should be removable");
+        .expect("child rollout path should be hidden");
 
     let resumed_parent_thread_id = harness
         .control
@@ -3465,9 +3592,62 @@ async fn resume_agent_from_rollout_skips_descendants_when_parent_resume_fails() 
         AgentStatus::NotFound
     );
 
+    let state_db = harness
+        .state_db
+        .as_ref()
+        .expect("sqlite state db should be available");
+    assert_eq!(
+        state_db
+            .list_thread_spawn_children_with_status(
+                parent_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Open,
+            )
+            .await
+            .expect("open children should load"),
+        Vec::<ThreadId>::new()
+    );
+    assert_eq!(
+        state_db
+            .list_thread_spawn_children_with_status(
+                parent_thread_id,
+                DirectionalThreadSpawnEdgeStatus::Closed,
+            )
+            .await
+            .expect("closed children should load"),
+        vec![child_thread_id]
+    );
+
+    tokio::fs::rename(&hidden_child_rollout_path, &child_rollout_path)
+        .await
+        .expect("child rollout path should be restored");
     let _ = harness
         .control
-        .shutdown_agent_tree(parent_thread_id)
+        .shutdown_live_agent(parent_thread_id)
         .await
-        .expect("tree shutdown after partial subtree resume should succeed");
+        .expect("parent shutdown after partial subtree resume should succeed");
+
+    let second_resumed_parent_thread_id = harness
+        .control
+        .resume_agent_from_rollout(
+            harness.config.clone(),
+            parent_thread_id,
+            SessionSource::Exec,
+        )
+        .await
+        .expect("second root resume should succeed");
+    assert_eq!(second_resumed_parent_thread_id, parent_thread_id);
+    assert_eq!(
+        harness.control.get_status(child_thread_id).await,
+        AgentStatus::NotFound
+    );
+    assert_eq!(
+        harness.control.get_status(grandchild_thread_id).await,
+        AgentStatus::NotFound
+    );
+
+    let _ = harness
+        .control
+        .shutdown_live_agent(parent_thread_id)
+        .await
+        .expect("parent shutdown after second resume should succeed");
 }

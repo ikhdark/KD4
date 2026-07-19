@@ -1,7 +1,7 @@
 use crate::bash::extract_bash_command;
 use crate::bash::try_parse_shell;
 use crate::bash::try_parse_word_only_commands_sequence;
-use crate::powershell::extract_powershell_command;
+use crate::powershell::extract_trusted_noprofile_powershell_command;
 use codex_protocol::parse_command::ParsedCommand;
 use shlex::split as shlex_split;
 use shlex::try_join as shlex_try_join;
@@ -12,16 +12,12 @@ pub fn shlex_join(tokens: &[String]) -> String {
         .unwrap_or_else(|_| "<command included NUL byte>".to_string())
 }
 
-/// Extracts the shell and script from a command, regardless of platform
+/// Extracts a display-safe shell wrapper and script. PowerShell wrappers are collapsed only when
+/// profiles are disabled and the requested executable resolves to the trusted host.
 pub fn extract_shell_command(command: &[String]) -> Option<(&str, &str)> {
-    extract_bash_command(command).or_else(|| extract_powershell_command(command))
+    extract_bash_command(command).or_else(|| extract_trusted_noprofile_powershell_command(command))
 }
 
-/// DO NOT REVIEW THIS CODE BY HAND
-/// This parsing code is quite complex and not easy to hand-modify.
-/// The easiest way to iterate is to add unit tests and have Codex fix the implementation.
-/// To encourage this, the tests have been put directly below this function rather than at the bottom of the
-///
 /// Parses metadata out of an arbitrary command.
 /// These commands are model driven and could include just about anything.
 /// The parsing is slightly lossy due to the ~infinite expressiveness of an arbitrary command.
@@ -74,6 +70,17 @@ mod tests {
 
     fn vec_str(args: &[&str]) -> Vec<String> {
         args.iter().map(ToString::to_string).collect()
+    }
+
+    #[cfg(windows)]
+    fn windows_powershell_path() -> String {
+        PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+            .join("System32")
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe")
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn assert_parsed(args: &[String], expected: Vec<ParsedCommand>) {
@@ -742,7 +749,14 @@ mod tests {
     fn small_formatting_always_true_commands() {
         for cmd in ["wc", "tr", "cut", "sort", "uniq", "xargs", "tee", "column"] {
             assert!(is_small_formatting_command(&shlex_split_safe(cmd)));
+        }
+        for cmd in ["wc", "tr", "cut", "uniq", "column"] {
             assert!(is_small_formatting_command(&shlex_split_safe(&format!(
+                "{cmd} -x"
+            ))));
+        }
+        for cmd in ["sort", "xargs", "tee"] {
+            assert!(!is_small_formatting_command(&shlex_split_safe(&format!(
                 "{cmd} -x"
             ))));
         }
@@ -823,11 +837,11 @@ mod tests {
         assert!(!is_small_formatting_command(&shlex_split_safe(
             "sed -n 1,200p file.txt"
         )));
-        // Invalid ranges with file -> small formatting
-        assert!(is_small_formatting_command(&shlex_split_safe(
+        // Unknown programs and file operands are not discarded.
+        assert!(!is_small_formatting_command(&shlex_split_safe(
             "sed -n p file.txt"
         )));
-        assert!(is_small_formatting_command(&shlex_split_safe(
+        assert!(!is_small_formatting_command(&shlex_split_safe(
             "sed -n +10p file.txt"
         )));
     }
@@ -902,6 +916,23 @@ mod tests {
                 path: None,
             }],
         );
+    }
+
+    #[test]
+    fn mutating_or_dynamic_pipeline_stages_remain_visible() {
+        for inner in [
+            "rg pattern | tee output.txt",
+            "rg pattern | sort -o output.txt",
+            "rg pattern | xargs rm",
+            r#"rg pattern | awk '{ system("touch output.txt") }'"#,
+        ] {
+            assert_parsed(
+                &vec_str(&["bash", "-lc", inner]),
+                vec![ParsedCommand::Unknown {
+                    cmd: inner.to_string(),
+                }],
+            );
+        }
     }
 
     #[test]
@@ -1235,38 +1266,57 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn powershell_command_is_stripped() {
+    fn profile_enabled_powershell_wrapper_remains_visible() {
+        let powershell = windows_powershell_path();
+        let command = vec_str(&[powershell.as_str(), "-Command", "Get-ChildItem"]);
         assert_parsed(
-            &vec_str(&["powershell", "-Command", "Get-ChildItem"]),
+            &command,
             vec![ParsedCommand::Unknown {
-                cmd: "Get-ChildItem".to_string(),
+                cmd: shlex_join(&command),
             }],
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn pwsh_with_noprofile_and_c_alias_is_stripped() {
+    fn powershell_with_noprofile_and_c_alias_is_stripped() {
+        let powershell = windows_powershell_path();
         assert_parsed(
-            &vec_str(&["pwsh", "-NoProfile", "-c", "Write-Host hi"]),
+            &vec_str(&[powershell.as_str(), "-NoProfile", "-c", "Write-Host hi"]),
             vec![ParsedCommand::Unknown {
                 cmd: "Write-Host hi".to_string(),
             }],
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn powershell_with_path_is_stripped() {
-        let command = if cfg!(windows) {
-            "C:\\windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
-        } else {
-            "/usr/local/bin/powershell.exe"
-        };
+        let command = windows_powershell_path();
 
         assert_parsed(
-            &vec_str(&[command, "-NoProfile", "-c", "Write-Host hi"]),
+            &vec_str(&[command.as_str(), "-NoProfile", "-c", "Write-Host hi"]),
             vec![ParsedCommand::Unknown {
                 cmd: "Write-Host hi".to_string(),
+            }],
+        );
+    }
+
+    #[test]
+    fn untrusted_powershell_path_remains_visible() {
+        let command = vec_str(&[
+            "./workspace-local/pwsh.exe",
+            "-NoProfile",
+            "-c",
+            "Get-ChildItem",
+        ]);
+
+        assert_parsed(
+            &command,
+            vec![ParsedCommand::Unknown {
+                cmd: shlex_join(&command),
             }],
         );
     }
@@ -1277,7 +1327,7 @@ pub fn parse_command_impl(command: &[String]) -> Vec<ParsedCommand> {
         return commands;
     }
 
-    if let Some((_, script)) = extract_powershell_command(command) {
+    if let Some((_, script)) = extract_trusted_noprofile_powershell_command(command) {
         return vec![ParsedCommand::Unknown {
             cmd: script.to_string(),
         }];
@@ -1951,7 +2001,8 @@ pub fn parse_shell_script(script: &str) -> Vec<ParsedCommand> {
 }
 
 /// Return true if this looks like a small formatting helper in a pipeline.
-/// Examples: `head -n 40`, `tail -n +10`, `wc -l`, `awk ...`, `cut ...`, `tr ...`.
+/// Examples include `head -n 40`, `tail -n +10`, `wc -l`, and narrowly allowlisted
+/// `sort`/`tee`/`awk`/`sed` forms.
 /// We try to keep variants that clearly include a file path (e.g. `tail -n 30 file`).
 fn is_small_formatting_command(tokens: &[String]) -> bool {
     if tokens.is_empty() {
@@ -1959,11 +2010,11 @@ fn is_small_formatting_command(tokens: &[String]) -> bool {
     }
     let cmd = tokens[0].as_str();
     match cmd {
-        // Always formatting; typically used in pipes.
-        // `nl` is special-cased below to allow `nl <file>` to be treated as a read command.
-        "wc" | "tr" | "cut" | "sort" | "uniq" | "tee" | "column" | "yes" | "printf" => true,
-        "xargs" => !is_mutating_xargs_command(tokens),
-        "awk" => awk_data_file_operand(&tokens[1..]).is_none(),
+        "wc" | "tr" | "cut" | "uniq" | "column" | "yes" | "printf" => true,
+        "sort" => is_small_sort_formatter(tokens),
+        "tee" => is_small_tee_formatter(tokens),
+        "xargs" => tokens.len() == 1,
+        "awk" => is_small_awk_formatter(tokens),
         "head" => {
             // Treat as formatting when no explicit file operand is present.
             // Common forms: `head -n 40`, `head -c 100`.
@@ -2013,61 +2064,88 @@ fn is_small_formatting_command(tokens: &[String]) -> bool {
                 _ => false,
             }
         }
-        "sed" => {
-            // Keep `sed -n <range> file` (treated as a file read elsewhere);
-            // otherwise consider it a formatting helper in a pipeline.
-            sed_read_path(&tokens[1..]).is_none()
-        }
+        "sed" => is_small_sed_formatter(tokens),
         _ => false,
     }
 }
 
-fn is_mutating_xargs_command(tokens: &[String]) -> bool {
-    xargs_subcommand(tokens).is_some_and(xargs_is_mutating_subcommand)
+fn is_small_sort_formatter(tokens: &[String]) -> bool {
+    tokens.iter().skip(1).all(|token| match token.as_str() {
+        "--dictionary-order"
+        | "--fold-case"
+        | "--general-numeric-sort"
+        | "--human-numeric-sort"
+        | "--ignore-leading-blanks"
+        | "--ignore-nonprinting"
+        | "--month-sort"
+        | "--numeric-sort"
+        | "--random-sort"
+        | "--reverse"
+        | "--stable"
+        | "--unique"
+        | "--version-sort"
+        | "--zero-terminated" => true,
+        short if short.starts_with('-') && !short.starts_with("--") => {
+            short.chars().skip(1).all(|flag| {
+                matches!(
+                    flag,
+                    'b' | 'd'
+                        | 'f'
+                        | 'g'
+                        | 'h'
+                        | 'i'
+                        | 'M'
+                        | 'n'
+                        | 'R'
+                        | 'r'
+                        | 's'
+                        | 'u'
+                        | 'V'
+                        | 'z'
+                )
+            })
+        }
+        _ => false,
+    })
 }
 
-fn xargs_subcommand(tokens: &[String]) -> Option<&[String]> {
-    if tokens.first().map(String::as_str) != Some("xargs") {
-        return None;
-    }
-    let mut i = 1;
-    while i < tokens.len() {
-        let token = &tokens[i];
-        if token == "--" {
-            return tokens.get(i + 1..).filter(|rest| !rest.is_empty());
-        }
-        if !token.starts_with('-') {
-            return tokens.get(i..).filter(|rest| !rest.is_empty());
-        }
-        let takes_value = matches!(
+fn is_small_tee_formatter(tokens: &[String]) -> bool {
+    tokens.iter().skip(1).all(|token| {
+        matches!(
             token.as_str(),
-            "-E" | "-e" | "-I" | "-L" | "-n" | "-P" | "-s"
-        );
-        if takes_value && token.len() == 2 {
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    None
+            "-i" | "-p" | "--ignore-interrupts" | "--output-error"
+        ) || token.starts_with("--output-error=")
+    })
 }
 
-fn xargs_is_mutating_subcommand(tokens: &[String]) -> bool {
-    let Some((head, tail)) = tokens.split_first() else {
+fn is_small_awk_formatter(tokens: &[String]) -> bool {
+    let [_, program] = tokens else {
         return false;
     };
-    match head.as_str() {
-        "perl" | "ruby" => xargs_has_in_place_flag(tail),
-        "sed" => xargs_has_in_place_flag(tail) || tail.iter().any(|token| token == "--in-place"),
-        "rg" => tail.iter().any(|token| token == "--replace"),
-        _ => false,
+    let compact: String = program.chars().filter(|ch| !ch.is_whitespace()).collect();
+    if compact == "{print}" {
+        return true;
     }
+    compact
+        .strip_prefix("{print$")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .is_some_and(|field| !field.is_empty() && field.chars().all(|ch| ch.is_ascii_digit()))
 }
 
-fn xargs_has_in_place_flag(tokens: &[String]) -> bool {
-    tokens.iter().any(|token| {
-        token == "-i" || token.starts_with("-i") || token == "-pi" || token.starts_with("-pi")
-    })
+fn is_small_sed_formatter(tokens: &[String]) -> bool {
+    match tokens {
+        [_] => true,
+        [_, flag] if flag == "-n" => true,
+        [_, flag, script] if flag == "-n" => is_valid_sed_n_arg(Some(script)),
+        [_, first, second, script]
+            if matches!(first.as_str(), "-n" | "-e")
+                && matches!(second.as_str(), "-n" | "-e")
+                && first != second =>
+        {
+            is_valid_sed_n_arg(Some(script))
+        }
+        _ => false,
+    }
 }
 
 fn drop_small_formatting_commands(mut commands: Vec<Vec<String>>) -> Vec<Vec<String>> {

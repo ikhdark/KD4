@@ -13,6 +13,7 @@ use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::DEFAULT_OBSERVATION_LIMIT;
 use codex_agent_task_store::DeclaredChange;
 use codex_agent_task_store::GateKind;
+use codex_agent_task_store::GateStatus;
 use codex_agent_task_store::MAX_OBSERVATION_LIMIT;
 use codex_agent_task_store::ReceiptDraft;
 use codex_agent_task_store::StoreError;
@@ -25,12 +26,14 @@ use codex_tools::ToolSpec;
 
 const GET_AGENT_TASK_TOOL: &str = "get_agent_task";
 const SUBMIT_AGENT_RECEIPT_TOOL: &str = "submit_agent_receipt";
+const SET_AGENT_GATE_TOOL: &str = "set_agent_gate";
 const AMEND_AGENT_TASK_TOOL: &str = "amend_agent_task";
 const WAIVE_AGENT_GATE_TOOL: &str = "waive_agent_gate";
 const ABANDON_AGENT_TASK_TOOL: &str = "abandon_agent_task";
 
 pub(crate) struct GetAgentTaskHandler;
 pub(crate) struct SubmitAgentReceiptHandler;
+pub(crate) struct SetAgentGateHandler;
 pub(crate) struct AmendAgentTaskHandler;
 pub(crate) struct WaiveAgentGateHandler;
 pub(crate) struct AbandonAgentTaskHandler;
@@ -75,6 +78,13 @@ define_handler!(
     SUBMIT_AGENT_RECEIPT_TOOL,
     submit_agent_receipt_spec,
     handle_submit_agent_receipt,
+    false
+);
+define_handler!(
+    SetAgentGateHandler,
+    SET_AGENT_GATE_TOOL,
+    set_agent_gate_spec,
+    handle_set_agent_gate,
     false
 );
 define_handler!(
@@ -184,11 +194,52 @@ async fn handle_submit_agent_receipt(
             "{SUBMIT_AGENT_RECEIPT_TOOL}: the typed task store is unavailable"
         ))
     })?;
+    store
+        .finalize_pending_mutations(binding.attempt_id)
+        .await
+        .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
     let receipt = store
         .submit_agent_receipt(binding.attempt_id, args.into_receipt_draft())
         .await
         .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
     Ok(boxed_tool_output(SubmitAgentReceiptResult { receipt }))
+}
+
+async fn handle_set_agent_gate(
+    invocation: ToolInvocation,
+) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
+    let ToolInvocation {
+        session,
+        turn,
+        payload,
+        ..
+    } = invocation;
+    let arguments = function_arguments(payload)?;
+    let args: SetAgentGateArgs = parse_arguments(&arguments)?;
+    let assignment_id = parse_assignment_id(SET_AGENT_GATE_TOOL, &args.assignment_id)?;
+    let coordinator = session.services.agent_control.task_coordinator();
+    let actor = if turn.session_source.is_non_root_agent() {
+        let binding = coordinator
+            .binding_for_source(&turn.session_source)
+            .ok_or_else(|| {
+                FunctionCallError::RespondToModel(format!(
+                    "{SET_AGENT_GATE_TOOL}: the caller is not a typed agent with a bound task"
+                ))
+            })?;
+        TaskActor::Attempt(binding.attempt_id)
+    } else {
+        TaskActor::Root
+    };
+    let store = coordinator.store().ok_or_else(|| {
+        FunctionCallError::RespondToModel(format!(
+            "{SET_AGENT_GATE_TOOL}: the typed task store is unavailable"
+        ))
+    })?;
+    let gate = store
+        .set_agent_gate(actor, assignment_id, args.gate, args.status, args.reason)
+        .await
+        .map_err(|error| task_store_error(SET_AGENT_GATE_TOOL, error))?;
+    Ok(boxed_tool_output(SetAgentGateResult { gate }))
 }
 
 async fn handle_amend_agent_task(
@@ -219,7 +270,7 @@ async fn handle_amend_agent_task(
     // binding and the coordinator cache so mutation attribution and receipt fallback use it.
     let binding = match coordinator.binding_for_assignment(assignment_id) {
         Some(binding) => Some(binding),
-        None => store
+        None => coordinator
             .get_agent_task_binding(assignment_id)
             .await
             .map_err(|error| task_store_error(AMEND_AGENT_TASK_TOOL, error))?,
@@ -303,7 +354,7 @@ async fn handle_abandon_agent_task(
     // already-dead runtime thread cannot turn a sealed result into a reported tool failure.
     let binding = match coordinator.binding_for_assignment(assignment_id) {
         Some(binding) => Some(binding),
-        None => store
+        None => coordinator
             .get_agent_task_binding(assignment_id)
             .await
             .ok()
@@ -439,6 +490,15 @@ struct DeclaredChangeArgs {
     summary: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetAgentGateArgs {
+    assignment_id: String,
+    gate: GateKind,
+    status: GateStatus,
+    reason: String,
+}
+
 impl DeclaredChangeArgs {
     fn into_declared_change(self) -> DeclaredChange {
         DeclaredChange {
@@ -532,6 +592,11 @@ struct SubmitAgentReceiptResult {
 }
 
 #[derive(Debug, Serialize)]
+struct SetAgentGateResult {
+    gate: AgentGate,
+}
+
+#[derive(Debug, Serialize)]
 struct AmendAgentTaskResult {
     attempt: Attempt,
 }
@@ -570,6 +635,7 @@ macro_rules! impl_json_output {
 
 impl_json_output!(GetAgentTaskResult, GET_AGENT_TASK_TOOL);
 impl_json_output!(SubmitAgentReceiptResult, SUBMIT_AGENT_RECEIPT_TOOL);
+impl_json_output!(SetAgentGateResult, SET_AGENT_GATE_TOOL);
 impl_json_output!(AmendAgentTaskResult, AMEND_AGENT_TASK_TOOL);
 impl_json_output!(WaiveAgentGateResult, WAIVE_AGENT_GATE_TOOL);
 impl_json_output!(AbandonAgentTaskResult, ABANDON_AGENT_TASK_TOOL);
@@ -577,8 +643,9 @@ impl_json_output!(AbandonAgentTaskResult, ABANDON_AGENT_TASK_TOOL);
 fn get_agent_task_spec() -> ToolSpec {
     function_spec(
         GET_AGENT_TASK_TOOL,
-        "Read a durable typed-agent assignment, its current attempt, gates, receipt, and recent \
-         observations. observation_limit defaults to 20 and cannot exceed 100.",
+        "Read a durable typed-agent assignment, its current attempt, gates, receipt, captured \
+         validation calls, and recent observations. observation_limit defaults to 20 and cannot \
+         exceed 100.",
         object_schema(
             [
                 (
@@ -708,6 +775,45 @@ fn submit_agent_receipt_spec() -> ToolSpec {
                 "blockers",
                 "risks",
             ],
+        ),
+    )
+}
+
+fn set_agent_gate_spec() -> ToolSpec {
+    function_spec(
+        SET_AGENT_GATE_TOOL,
+        "Submit an evidence-backed gate verdict. Reviewers may set only review gates for their declared targets; verifiers may set only verification gates for their declared targets. Root may set any non-waiver gate. Waivers remain root-only through waive_agent_gate.",
+        object_schema(
+            [
+                ("assignment_id", assignment_id_schema()),
+                (
+                    "gate",
+                    enum_schema(
+                        ["risk", "review", "verification", "mutation", "ownership"],
+                        "Gate kind to evaluate.",
+                    ),
+                ),
+                (
+                    "status",
+                    enum_schema(
+                        [
+                            "pending",
+                            "passed",
+                            "changes_requested",
+                            "failed",
+                            "violated",
+                        ],
+                        "Gate verdict. Waived is intentionally unavailable here.",
+                    ),
+                ),
+                (
+                    "reason",
+                    JsonSchema::string(Some(
+                        "Concise evidence-backed reason for the verdict.".to_string(),
+                    )),
+                ),
+            ],
+            &["assignment_id", "gate", "status", "reason"],
         ),
     )
 }

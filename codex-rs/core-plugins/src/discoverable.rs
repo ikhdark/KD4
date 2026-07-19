@@ -213,13 +213,14 @@ fn is_tool_suggest_fallback_plugin(plugin_id: &str) -> bool {
     let Ok(plugin_id) = PluginId::parse(plugin_id) else {
         return false;
     };
-    if plugin_id.marketplace_name != OPENAI_API_CURATED_MARKETPLACE_NAME {
+    if plugin_id.marketplace_name() != OPENAI_API_CURATED_MARKETPLACE_NAME {
         return false;
     }
 
     let default_curated_plugin_id = format!(
         "{}@{}",
-        plugin_id.plugin_name, OPENAI_CURATED_MARKETPLACE_NAME
+        plugin_id.plugin_name(),
+        OPENAI_CURATED_MARKETPLACE_NAME
     );
     TOOL_SUGGEST_DISCOVERABLE_PLUGIN_ALLOWLIST.contains(&default_curated_plugin_id.as_str())
 }

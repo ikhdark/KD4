@@ -158,7 +158,69 @@ fn plugin_data_root_derives_path_from_key() {
 
     assert_eq!(
         store.plugin_data_root(&plugin_id).as_path(),
-        tmp.path().join("plugins/data/sample-debug")
+        tmp.path().join("plugins/data/debug/sample")
+    );
+}
+
+#[test]
+fn legacy_plugin_data_root_migrates_when_configured_id_is_unambiguous() {
+    let tmp = tempdir().unwrap();
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    let plugin_id = PluginId::parse("sample@debug").unwrap();
+    let legacy_root = tmp.path().join("plugins/data/sample-debug");
+    fs::create_dir_all(&legacy_root).unwrap();
+    fs::write(legacy_root.join("state.json"), "legacy state").unwrap();
+
+    store.migrate_legacy_plugin_data_roots(std::slice::from_ref(&plugin_id));
+
+    assert!(!legacy_root.exists());
+    assert_eq!(
+        fs::read_to_string(store.plugin_data_root(&plugin_id).join("state.json")).unwrap(),
+        "legacy state"
+    );
+}
+
+#[test]
+fn ambiguous_legacy_plugin_data_root_is_not_assigned_to_either_plugin() {
+    let tmp = tempdir().unwrap();
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    let first = PluginId::parse("a-b@c").unwrap();
+    let second = PluginId::parse("a@b-c").unwrap();
+    let legacy_root = tmp.path().join("plugins/data/a-b-c");
+    fs::create_dir_all(&legacy_root).unwrap();
+    fs::write(legacy_root.join("state.json"), "ambiguous state").unwrap();
+
+    store.migrate_legacy_plugin_data_roots(&[first.clone(), second.clone()]);
+
+    assert_eq!(
+        fs::read_to_string(legacy_root.join("state.json")).unwrap(),
+        "ambiguous state"
+    );
+    assert!(!store.plugin_data_root(&first).as_path().exists());
+    assert!(!store.plugin_data_root(&second).as_path().exists());
+}
+
+#[test]
+fn legacy_plugin_data_root_does_not_overwrite_existing_nested_data() {
+    let tmp = tempdir().unwrap();
+    let store = PluginStore::new(tmp.path().to_path_buf());
+    let plugin_id = PluginId::parse("sample@debug").unwrap();
+    let legacy_root = tmp.path().join("plugins/data/sample-debug");
+    let nested_root = store.plugin_data_root(&plugin_id);
+    fs::create_dir_all(&legacy_root).unwrap();
+    fs::create_dir_all(nested_root.as_path()).unwrap();
+    fs::write(legacy_root.join("state.json"), "legacy state").unwrap();
+    fs::write(nested_root.join("state.json"), "nested state").unwrap();
+
+    store.migrate_legacy_plugin_data_roots(std::slice::from_ref(&plugin_id));
+
+    assert_eq!(
+        fs::read_to_string(legacy_root.join("state.json")).unwrap(),
+        "legacy state"
+    );
+    assert_eq!(
+        fs::read_to_string(nested_root.join("state.json")).unwrap(),
+        "nested state"
     );
 }
 

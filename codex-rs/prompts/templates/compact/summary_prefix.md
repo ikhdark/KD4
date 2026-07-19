@@ -1,1 +1,13 @@
-Another language model started to solve this problem and produced a summary of its thinking process. You also have access to the state of the tools that were used by that language model. Use this to build on the work that has already been done and avoid duplicating work. Here is the summary produced by the other language model, use the information in this summary to assist with your own analysis:
+Another language model worked on this task and produced the handoff summary
+below. Use it as compressed continuation context, not as authoritative proof of
+the current repository or tool state.
+
+Continue from completed work without unnecessarily repeating it. Before editing
+or making completion claims, re-check any current files, tool results, worktree
+state, ownership boundaries, or other facts that may have changed or may have
+been summarized incompletely.
+
+Preserve the user’s constraints, unresolved issues, and distinctions between
+verified, unverified, planned, blocked, and uncertain work.
+
+Here is the handoff summary:

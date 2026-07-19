@@ -1870,6 +1870,7 @@ dependencies = [
 name = "codex-agent-graph-store"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "codex-protocol",
  "codex-state",
  "pretty_assertions",
@@ -1897,6 +1898,23 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "codex-agent-task-store"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "codex-state",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -2635,6 +2653,7 @@ dependencies = [
  "chrono",
  "clap",
  "codex-agent-graph-store",
+ "codex-agent-task-store",
  "codex-analytics",
  "codex-api",
  "codex-app-server-protocol",
@@ -3058,6 +3077,7 @@ dependencies = [
  "codex-app-server-protocol",
  "codex-protocol",
  "codex-utils-output-truncation",
+ "codex-utils-path",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3106,6 +3126,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "unicode-casefold",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -46,12 +46,18 @@ use crate::tools::handlers::multi_agents_common::MAX_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents_common::MIN_WAIT_TIMEOUT_MS;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
 use crate::tools::handlers::multi_agents_spec::WaitAgentTimeoutOptions;
+use crate::tools::handlers::multi_agents_v2::AbandonAgentTaskHandler;
+use crate::tools::handlers::multi_agents_v2::AmendAgentTaskHandler;
 use crate::tools::handlers::multi_agents_v2::FollowupTaskHandler as FollowupTaskHandlerV2;
+use crate::tools::handlers::multi_agents_v2::GetAgentTaskHandler;
 use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
+use crate::tools::handlers::multi_agents_v2::SetAgentGateHandler;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
+use crate::tools::handlers::multi_agents_v2::SubmitAgentReceiptHandler;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
+use crate::tools::handlers::multi_agents_v2::WaiveAgentGateHandler;
 use crate::tools::handlers::view_image_spec::ViewImageToolOptions;
 use crate::tools::hosted_spec::WebSearchToolOptions;
 use crate::tools::hosted_spec::create_web_search_tool;
@@ -862,6 +868,33 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 multi_agent_v2_handler(ListAgentsHandlerV2, tool_namespace),
                 exposure,
             ));
+            planned_tools.add_arc(override_tool_exposure(
+                multi_agent_v2_handler(GetAgentTaskHandler, tool_namespace),
+                exposure,
+            ));
+            planned_tools.add_arc(override_tool_exposure(
+                multi_agent_v2_handler(SetAgentGateHandler, tool_namespace),
+                exposure,
+            ));
+            if turn_context.session_source.is_non_root_agent() {
+                planned_tools.add_arc(override_tool_exposure(
+                    multi_agent_v2_handler(SubmitAgentReceiptHandler, tool_namespace),
+                    exposure,
+                ));
+            } else {
+                planned_tools.add_arc(override_tool_exposure(
+                    multi_agent_v2_handler(AmendAgentTaskHandler, tool_namespace),
+                    exposure,
+                ));
+                planned_tools.add_arc(override_tool_exposure(
+                    multi_agent_v2_handler(WaiveAgentGateHandler, tool_namespace),
+                    exposure,
+                ));
+                planned_tools.add_arc(override_tool_exposure(
+                    multi_agent_v2_handler(AbandonAgentTaskHandler, tool_namespace),
+                    exposure,
+                ));
+            }
         } else {
             let agent_type_description =
                 agent_type_description(turn_context, context.default_agent_type_description);

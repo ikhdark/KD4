@@ -5,6 +5,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
 
+use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::EventMsg;
@@ -67,7 +69,12 @@ pub async fn search_rollout_matches(
         return scan_rollout_matches(root.as_path(), json_search_term.as_str(), search_term).await;
     };
     let mut matches = plain_matches;
-    matches.extend(scan_compressed_rollout_matches(root.as_path(), search_term).await?);
+    for (path, snippet) in
+        scan_compressed_rollout_matches(root.as_path(), json_search_term.as_str(), search_term)
+            .await?
+    {
+        insert_rollout_match(&mut matches, path, snippet);
+    }
     Ok(matches)
 }
 
@@ -208,6 +215,7 @@ async fn scan_rollout_matches(
     let mut matches = HashMap::new();
     let mut dirs = vec![root.to_path_buf()];
     let json_search_term = case_insensitive_literal_regex(json_search_term)?;
+    let search_term = case_insensitive_literal_regex(search_term)?;
 
     while let Some(dir) = dirs.pop() {
         let mut entries = match tokio::fs::read_dir(dir).await {
@@ -228,21 +236,14 @@ async fn scan_rollout_matches(
             let Some(rollout_file) = compression::RolloutFile::from_path(path) else {
                 continue;
             };
-            if rollout_file.is_compressed() {
-                if let Some(snippet) =
-                    first_rollout_content_match_snippet(rollout_file.path(), search_term).await?
-                {
-                    matches.insert(
-                        compression::plain_rollout_path(rollout_file.path()),
-                        Some(snippet),
-                    );
-                }
-                continue;
-            }
-            if rollout_contains(rollout_file.path(), &json_search_term).await? {
-                let snippet =
-                    first_rollout_content_match_snippet(rollout_file.path(), search_term).await?;
-                matches.insert(rollout_file.into_path(), snippet);
+            let (matched, snippet) =
+                inspect_rollout_match(rollout_file.path(), &json_search_term, &search_term).await?;
+            if matched {
+                insert_rollout_match(
+                    &mut matches,
+                    compression::plain_rollout_path(rollout_file.path()),
+                    snippet,
+                );
             }
         }
     }
@@ -250,39 +251,44 @@ async fn scan_rollout_matches(
     Ok(matches)
 }
 
-async fn rollout_contains(path: &Path, search_term: &Regex) -> io::Result<bool> {
+async fn inspect_rollout_match(
+    path: &Path,
+    json_search_term: &Regex,
+    search_term: &Regex,
+) -> io::Result<(bool, Option<String>)> {
     let mut lines = compression::open_rollout_line_reader(path).await?;
+    let mut matched = false;
     while let Some(line) = lines.next_line().await? {
-        if search_term.is_match(line.as_str()) {
-            return Ok(true);
+        if !json_search_term.is_match(line.as_str()) {
+            continue;
+        }
+        matched = true;
+        if let Some(snippet) = content_match_snippet(line.as_str(), search_term) {
+            return Ok((true, Some(snippet)));
         }
     }
-    Ok(false)
+    Ok((matched, None))
 }
 
 pub async fn first_rollout_content_match_snippet(
     path: &Path,
     search_term: &str,
 ) -> io::Result<Option<String>> {
-    let mut lines = compression::open_rollout_line_reader(path).await?;
     let json_search_term = case_insensitive_literal_regex(json_escaped_search_term(search_term)?)?;
     let search_term = case_insensitive_literal_regex(search_term)?;
-    while let Some(line) = lines.next_line().await? {
-        if json_search_term.is_match(line.as_str())
-            && let Some(snippet) = content_match_snippet(line.as_str(), &search_term)
-        {
-            return Ok(Some(snippet));
-        }
-    }
-    Ok(None)
+    let (_, snippet) = inspect_rollout_match(path, &json_search_term, &search_term).await?;
+    Ok(snippet)
 }
 
 async fn scan_compressed_rollout_matches(
     root: &Path,
+    json_search_term: &str,
     search_term: &str,
 ) -> io::Result<RolloutSearchMatches> {
     let mut matches = HashMap::new();
     let mut dirs = vec![root.to_path_buf()];
+    let json_search_term = case_insensitive_literal_regex(json_search_term)?;
+    let search_term = case_insensitive_literal_regex(search_term)?;
 
     while let Some(dir) = dirs.pop() {
         let mut entries = match tokio::fs::read_dir(dir).await {
@@ -306,12 +312,13 @@ async fn scan_compressed_rollout_matches(
             if !rollout_file.is_compressed() {
                 continue;
             }
-            if let Some(snippet) =
-                first_rollout_content_match_snippet(rollout_file.path(), search_term).await?
-            {
-                matches.insert(
+            let (matched, snippet) =
+                inspect_rollout_match(rollout_file.path(), &json_search_term, &search_term).await?;
+            if matched {
+                insert_rollout_match(
+                    &mut matches,
                     compression::plain_rollout_path(rollout_file.path()),
-                    Some(snippet),
+                    snippet,
                 );
             }
         }
@@ -340,21 +347,22 @@ fn content_match_snippet(jsonl_line: &str, search_term: &Regex) -> Option<String
 
 fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
     match item {
-        RolloutItem::EventMsg(EventMsg::UserMessage(user)) => {
-            let text = strip_user_message_prefix(user.message.as_str());
-            if text.is_empty() {
-                None
-            } else {
-                Some(text.to_string())
+        RolloutItem::EventMsg(EventMsg::UserMessage(user)) => user_message_text(&user.message),
+        RolloutItem::EventMsg(EventMsg::AgentMessage(agent)) => agent_message_text(&agent.message),
+        RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => match &event.item {
+            TurnItem::UserMessage(user) => user_message_text(&user.message()),
+            TurnItem::AgentMessage(agent) => {
+                let text = agent
+                    .content
+                    .iter()
+                    .map(|content| match content {
+                        AgentMessageContent::Text { text } => text.as_str(),
+                    })
+                    .collect::<String>();
+                agent_message_text(&text)
             }
-        }
-        RolloutItem::EventMsg(EventMsg::AgentMessage(agent)) => {
-            if agent.message.trim().is_empty() {
-                None
-            } else {
-                Some(agent.message.trim().to_string())
-            }
-        }
+            _ => None,
+        },
         RolloutItem::ResponseItem(ResponseItem::Message { role, content, .. }) => {
             let text = content
                 .iter()
@@ -376,6 +384,16 @@ fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
         | RolloutItem::Compacted(_)
         | RolloutItem::WorldState(_) => None,
     }
+}
+
+fn user_message_text(message: &str) -> Option<String> {
+    let text = strip_user_message_prefix(message);
+    (!text.is_empty()).then(|| text.to_string())
+}
+
+fn agent_message_text(message: &str) -> Option<String> {
+    let text = message.trim();
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 fn content_item_text(item: &ContentItem) -> Option<&str> {
@@ -435,6 +453,7 @@ mod tests {
     use super::*;
     use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
+    use std::io::Write as _;
 
     fn user_rollout_line(timestamp: &str, message: &str) -> String {
         serde_json::to_string(&RolloutLine {
@@ -502,6 +521,31 @@ mod tests {
         insert_rollout_match(&mut matches, path.clone(), Some("later".to_string()));
 
         assert_eq!(matches.get(&path), Some(&Some("first".to_string())));
+    }
+
+    #[tokio::test]
+    async fn compressed_scan_retains_metadata_only_match() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let root = tempdir.path().join("sessions");
+        std::fs::create_dir_all(&root).expect("create sessions directory");
+        let rollout_path =
+            root.join("rollout-2026-07-09T00-00-00-00000000-0000-0000-0000-000000000001.jsonl");
+        let compressed_path = compression::compressed_rollout_path(&rollout_path);
+        let output = std::fs::File::create(&compressed_path).expect("create compressed rollout");
+        let mut encoder = zstd::stream::write::Encoder::new(output, 3).expect("create encoder");
+        writeln!(
+            encoder,
+            "{}",
+            user_rollout_line("needle", "unrelated conversation")
+        )
+        .expect("write compressed rollout");
+        encoder.finish().expect("finish compressed rollout");
+
+        let matches = scan_compressed_rollout_matches(&root, "needle", "needle")
+            .await
+            .expect("scan compressed rollouts");
+
+        assert_eq!(matches.get(&rollout_path), Some(&None));
     }
 
     #[test]

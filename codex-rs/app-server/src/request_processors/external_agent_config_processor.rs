@@ -93,6 +93,7 @@ impl ExternalAgentConfigRequestProcessor {
             codex_home.clone(),
             Arc::clone(&thread_manager),
             thread_store,
+            state_db.clone(),
             config_manager,
             arg0_paths,
         );

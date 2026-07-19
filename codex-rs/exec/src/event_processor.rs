@@ -25,24 +25,33 @@ pub(crate) trait EventProcessor {
     /// Handle a local exec warning that is not represented as an app-server notification.
     fn process_warning(&mut self, message: String) -> CodexStatus;
 
-    fn print_final_output(&mut self) {}
+    /// Handle an unrecoverable failure in exec's local app-server event stream.
+    fn process_event_stream_error(&mut self, message: String);
+
+    fn print_final_output(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
-pub(crate) fn handle_last_message(last_agent_message: Option<&str>, output_file: &Path) {
+pub(crate) fn handle_last_message(
+    last_agent_message: Option<&str>,
+    output_file: &Path,
+) -> std::io::Result<()> {
     let message = last_agent_message.unwrap_or_default();
-    write_last_message_file(message, Some(output_file));
+    std::fs::write(output_file, message).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "failed to write last message file {}: {error}",
+                output_file.display()
+            ),
+        )
+    })?;
     if last_agent_message.is_none() {
         eprintln!(
             "Warning: no last agent message; wrote empty content to {}",
             output_file.display()
         );
     }
-}
-
-fn write_last_message_file(contents: &str, last_message_path: Option<&Path>) {
-    if let Some(path) = last_message_path
-        && let Err(e) = std::fs::write(path, contents)
-    {
-        eprintln!("Failed to write last message file {path:?}: {e}");
-    }
+    Ok(())
 }

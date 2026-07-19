@@ -630,6 +630,7 @@ mod tests {
 
         assert!(is_known_safe_command(&vec_str(&[
             powershell,
+            "-NoProfile",
             "-Command",
             "Get-Location",
         ])));

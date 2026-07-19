@@ -133,9 +133,21 @@ impl EventProcessorWithJsonOutput {
                 completed: matches!(
                     step.status,
                     codex_app_server_protocol::TurnPlanStepStatus::Completed
+                        | codex_app_server_protocol::TurnPlanStepStatus::Passed
                 ),
             })
             .collect()
+    }
+
+    fn map_turn_error(error: codex_app_server_protocol::TurnError) -> ThreadErrorEvent {
+        ThreadErrorEvent {
+            message: match error.additional_details {
+                Some(details) if !details.is_empty() => {
+                    format!("{} ({details})", error.message)
+                }
+                _ => error.message,
+            },
+        }
     }
 
     fn map_item_with_id(
@@ -245,7 +257,7 @@ impl EventProcessorWithJsonOutput {
                     tool: match tool {
                         CollabAgentTool::SpawnAgent => CollabTool::SpawnAgent,
                         CollabAgentTool::SendInput => CollabTool::SendInput,
-                        CollabAgentTool::ResumeAgent => CollabTool::Wait,
+                        CollabAgentTool::ResumeAgent => CollabTool::ResumeAgent,
                         CollabAgentTool::Wait => CollabTool::Wait,
                         CollabAgentTool::CloseAgent => CollabTool::CloseAgent,
                     },
@@ -405,6 +417,27 @@ impl EventProcessorWithJsonOutput {
         }
     }
 
+    pub fn collect_event_stream_error(&mut self, message: String) -> Vec<ThreadEvent> {
+        self.final_message = None;
+        self.emit_final_message_on_shutdown = false;
+        let mut events = Vec::new();
+        if let Some(running) = self.running_todo_list.take() {
+            events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                item: ExecThreadItem {
+                    id: running.item_id,
+                    details: ThreadItemDetails::TodoList(TodoListItem {
+                        items: running.items,
+                    }),
+                },
+            }));
+        }
+        let error = ThreadErrorEvent { message };
+        self.last_critical_error = Some(error.clone());
+        events.push(ThreadEvent::Error(error.clone()));
+        events.push(ThreadEvent::TurnFailed(TurnFailedEvent { error }));
+        events
+    }
+
     pub fn collect_thread_events(
         &mut self,
         notification: ServerNotification,
@@ -432,15 +465,20 @@ impl EventProcessorWithJsonOutput {
                 warning.status
             }
             ServerNotification::Error(notification) => {
-                let message = match notification.error.additional_details {
-                    Some(details) if !details.is_empty() => {
-                        format!("{} ({details})", notification.error.message)
-                    }
-                    _ => notification.error.message,
-                };
-                let error = ThreadErrorEvent { message };
-                self.last_critical_error = Some(error.clone());
-                events.push(ThreadEvent::Error(error));
+                let error = Self::map_turn_error(notification.error);
+                if notification.will_retry {
+                    events.push(ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                        item: ExecThreadItem {
+                            id: self.next_item_id(),
+                            details: ThreadItemDetails::Error(ErrorItem {
+                                message: error.message,
+                            }),
+                        },
+                    }));
+                } else {
+                    self.last_critical_error = Some(error.clone());
+                    events.push(ThreadEvent::Error(error));
+                }
                 CodexStatus::Running
             }
             ServerNotification::DeprecationNotice(notification) => {
@@ -528,14 +566,7 @@ impl EventProcessorWithJsonOutput {
                         let error = notification
                             .turn
                             .error
-                            .map(|error| ThreadErrorEvent {
-                                message: match error.additional_details {
-                                    Some(details) if !details.is_empty() => {
-                                        format!("{} ({details})", error.message)
-                                    }
-                                    _ => error.message,
-                                },
-                            })
+                            .map(Self::map_turn_error)
                             .or_else(|| self.last_critical_error.clone())
                             .unwrap_or_else(|| ThreadErrorEvent {
                                 message: "turn failed".to_string(),
@@ -546,6 +577,15 @@ impl EventProcessorWithJsonOutput {
                     TurnStatus::Interrupted => {
                         self.final_message = None;
                         self.emit_final_message_on_shutdown = false;
+                        let error = notification
+                            .turn
+                            .error
+                            .map(Self::map_turn_error)
+                            .or_else(|| self.last_critical_error.clone())
+                            .unwrap_or_else(|| ThreadErrorEvent {
+                                message: "turn interrupted".to_string(),
+                            });
+                        events.push(ThreadEvent::TurnFailed(TurnFailedEvent { error }));
                         CodexStatus::InitiateShutdown
                     }
                     TurnStatus::InProgress => CodexStatus::Running,
@@ -615,12 +655,19 @@ impl EventProcessor for EventProcessorWithJsonOutput {
         collected.status
     }
 
-    fn print_final_output(&mut self) {
+    fn process_event_stream_error(&mut self, message: String) {
+        for event in self.collect_event_stream_error(message) {
+            self.emit(event);
+        }
+    }
+
+    fn print_final_output(&mut self) -> std::io::Result<()> {
         if self.emit_final_message_on_shutdown
             && let Some(path) = self.last_message_path.as_deref()
         {
-            handle_last_message(self.final_message.as_deref(), path);
+            handle_last_message(self.final_message.as_deref(), path)?;
         }
+        Ok(())
     }
 }
 

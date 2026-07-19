@@ -7,6 +7,7 @@ use crate::init_state_db;
 use crate::local_agent_graph_store_from_state_db;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnContext;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::thread_manager::thread_store_from_config;
@@ -23,6 +24,10 @@ use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_model_provider::create_model_provider;
+use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_4_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID;
+use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
+use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
@@ -312,6 +317,208 @@ async fn spawn_agent_uses_explorer_role_and_preserves_approval_policy() {
 }
 
 #[tokio::test]
+async fn spawn_agent_uses_bedrock_qualified_default_model_and_reasoning() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, turn) = make_session_and_context().await;
+    let provider_info = ModelProviderInfo::create_amazon_bedrock_provider(/*aws*/ None);
+    let provider = create_model_provider(provider_info.clone(), turn.auth_manager.clone());
+    session.services.models_manager = provider.models_manager(
+        turn.config.codex_home.to_path_buf(),
+        /*config_model_catalog*/ None,
+    );
+    let mut turn = turn
+        .with_model(
+            AMAZON_BEDROCK_GPT_5_4_MODEL_ID.to_string(),
+            &session.services.models_manager,
+        )
+        .await;
+    let mut config = (*turn.config).clone();
+    config.model_provider_id = AMAZON_BEDROCK_PROVIDER_ID.to_string();
+    config.model_provider = provider_info.clone();
+    turn.provider = provider;
+    turn.config = Arc::new(config);
+
+    let manager = ThreadManager::with_models_provider_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        provider_info,
+    );
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+
+    let output = SpawnAgentHandler::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({"message": "inspect this repo"})),
+        ))
+        .await
+        .expect("spawn_agent should resolve the Bedrock-qualified default model");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let snapshot = manager
+        .get_thread(parse_agent_id(&result.agent_id))
+        .await
+        .expect("spawned agent thread should exist")
+        .config_snapshot()
+        .await;
+
+    assert_eq!(snapshot.model, AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID);
+    assert_eq!(
+        snapshot.reasoning_effort,
+        Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT)
+    );
+}
+
+#[tokio::test]
+async fn spawn_agent_role_switches_provider_before_default_reasoning_validation() {
+    #[derive(Debug, Deserialize)]
+    struct SpawnAgentResult {
+        agent_id: String,
+    }
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    tokio::fs::create_dir_all(&turn.config.codex_home)
+        .await
+        .expect("codex home should be created");
+    let role_config_path = turn.config.codex_home.join("bedrock-role.toml");
+    tokio::fs::write(
+        &role_config_path,
+        format!(
+            "model_provider = \"{AMAZON_BEDROCK_PROVIDER_ID}\"\nmodel = \"{AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID}\"\n"
+        ),
+    )
+    .await
+    .expect("Bedrock role config should be written");
+    let mut config = (*turn.config).clone();
+    config.agent_roles.insert(
+        "bedrock".to_string(),
+        AgentRoleConfig {
+            description: Some("Bedrock model role".to_string()),
+            config_file: Some(role_config_path.to_path_buf()),
+            nickname_candidates: None,
+        },
+    );
+    set_turn_config(&mut turn, config);
+
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+
+    let output = SpawnAgentHandler::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "agent_type": "bedrock"
+            })),
+        ))
+        .await
+        .expect("spawn_agent should validate defaults against the role provider");
+    let (content, _) = expect_text_output(output);
+    let result: SpawnAgentResult =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let snapshot = manager
+        .get_thread(parse_agent_id(&result.agent_id))
+        .await
+        .expect("spawned agent thread should exist")
+        .config_snapshot()
+        .await;
+
+    assert_eq!(snapshot.model_provider_id, AMAZON_BEDROCK_PROVIDER_ID);
+    assert_eq!(snapshot.model, AMAZON_BEDROCK_GPT_5_6_SOL_MODEL_ID);
+    assert_eq!(
+        snapshot.reasoning_effort,
+        Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT)
+    );
+}
+
+#[tokio::test]
+async fn spawn_agent_events_report_role_resolved_model_and_reasoning() {
+    let (mut session, mut turn, rx) = make_session_and_context_with_rx().await;
+    let role_name = install_role_with_model_override(
+        Arc::get_mut(&mut turn).expect("turn context should be uniquely owned"),
+    )
+    .await;
+    let manager = thread_manager();
+    let root = manager
+        .start_thread((*turn.config).clone())
+        .await
+        .expect("root thread should start");
+    {
+        let session = Arc::get_mut(&mut session).expect("session should be uniquely owned");
+        session.services.agent_control = manager.agent_control();
+        session.thread_id = root.thread_id;
+    }
+
+    SpawnAgentHandler::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "agent_type": role_name,
+                "model": "gpt-5.4",
+                "reasoning_effort": "low"
+            })),
+        ))
+        .await
+        .expect("spawn should succeed");
+
+    let (started, completed) = timeout(Duration::from_secs(1), async {
+        let mut started = None;
+        let mut completed = None;
+        while started.is_none() || completed.is_none() {
+            let event = rx.recv().await.expect("spawn lifecycle event");
+            match event.msg {
+                EventMsg::ItemStarted(event) => {
+                    if let codex_protocol::items::TurnItem::CollabAgentToolCall(item) = event.item
+                        && item.id == "call-1"
+                    {
+                        started = Some(item);
+                    }
+                }
+                EventMsg::ItemCompleted(event) => {
+                    if let codex_protocol::items::TurnItem::CollabAgentToolCall(item) = event.item
+                        && item.id == "call-1"
+                    {
+                        completed = Some(item);
+                    }
+                }
+                _ => {}
+            }
+        }
+        (
+            started.expect("started spawn item"),
+            completed.expect("completed spawn item"),
+        )
+    })
+    .await
+    .expect("spawn lifecycle events should arrive");
+
+    assert_eq!(started.model.as_deref(), Some("gpt-5-role-override"));
+    assert_eq!(started.reasoning_effort, Some(ReasoningEffort::Minimal));
+    assert_eq!(completed.model.as_deref(), Some("gpt-5-role-override"));
+    assert_eq!(completed.reasoning_effort, Some(ReasoningEffort::Minimal));
+}
+
+#[tokio::test]
 async fn spawn_agent_fork_context_rejects_agent_type_override() {
     let (mut session, mut turn) = make_session_and_context().await;
     let role_name = install_role_with_model_override(&mut turn).await;
@@ -340,7 +547,7 @@ async fn spawn_agent_fork_context_rejects_agent_type_override() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+            "Full-history forked agents use the built-in spawn defaults and do not accept per-call agent_type, model, or reasoning_effort overrides; omit those fields, or spawn without a full-history fork.".to_string(),
         )
     );
 }
@@ -375,7 +582,7 @@ async fn spawn_agent_fork_context_rejects_child_model_overrides() {
     assert_eq!(
         err,
             FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+            "Full-history forked agents use the built-in spawn defaults and do not accept per-call agent_type, model, or reasoning_effort overrides; omit those fields, or spawn without a full-history fork.".to_string(),
         )
     );
 }
@@ -421,13 +628,13 @@ async fn multi_agent_v2_spawn_fork_turns_all_rejects_agent_type_override() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+            "Full-history forked agents use the built-in spawn defaults and do not accept per-call agent_type, model, or reasoning_effort overrides; omit those fields, or spawn without a full-history fork.".to_string(),
         )
     );
 }
 
 #[tokio::test]
-async fn multi_agent_v2_spawn_defaults_to_full_fork_and_rejects_child_model_overrides() {
+async fn multi_agent_v2_spawn_model_override_defaults_to_no_fork() {
     let (mut session, mut turn) = make_session_and_context().await;
     let manager = thread_manager();
     let root = manager
@@ -443,7 +650,7 @@ async fn multi_agent_v2_spawn_defaults_to_full_fork_and_rejects_child_model_over
         .expect("test config should allow feature update");
     set_turn_config(&mut turn, config);
 
-    let err = SpawnAgentHandlerV2::default()
+    let output = SpawnAgentHandlerV2::default()
         .handle(invocation(
             Arc::new(session),
             Arc::new(turn),
@@ -451,18 +658,162 @@ async fn multi_agent_v2_spawn_defaults_to_full_fork_and_rejects_child_model_over
             function_payload(json!({
                 "message": "inspect this repo",
                 "task_name": "fork_context_v2",
-                "model": "gpt-5-child-override",
+                "model": "gpt-5.4",
                 "reasoning_effort": "low"
             })),
         ))
         .await
-        .err()
-        .expect("default full fork should reject child model overrides");
+        .expect("model override should default to an unforked spawn");
+    let (content, _) = expect_text_output(output);
+    let result: serde_json::Value =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    assert_eq!(result["task_name"], "/root/fork_context_v2");
+    let agent_id = manager
+        .captured_ops()
+        .into_iter()
+        .map(|(thread_id, _)| thread_id)
+        .find(|thread_id| *thread_id != root.thread_id)
+        .expect("spawned agent should receive an op");
+    let snapshot = manager
+        .get_thread(agent_id)
+        .await
+        .expect("spawned agent thread should exist")
+        .config_snapshot()
+        .await;
+    assert_eq!(snapshot.model, "gpt-5.4");
+    assert_eq!(snapshot.reasoning_effort, Some(ReasoningEffort::Low));
+}
 
+#[tokio::test]
+async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow sqlite");
+    let state_runtime = init_state_db(&config)
+        .await
+        .expect("typed spawn requires persistent test state");
+    let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Some(state_runtime.clone()),
+    );
+    let root = manager
+        .start_thread(config.clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = manager.agent_control();
+    session.thread_id = root.thread_id;
+    let root_session_id = session.services.agent_control.session_id().to_string();
+    session
+        .services
+        .agent_control
+        .task_coordinator()
+        .initialize(state_runtime, root_session_id)
+        .await
+        .expect("typed task coordinator should initialize");
+    let agent_control = session.services.agent_control.clone();
+    set_turn_config(&mut turn, config);
+
+    let output = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "task_name": "typed_explorer",
+                "agent_type": "explorer",
+                "assignment": {
+                    "objective": "inspect the bounded path",
+                    "acceptance_criteria": [{
+                        "id": "criterion-1",
+                        "text": "report evidence"
+                    }],
+                    "write_scope": [],
+                    "stop_condition": "stop after reporting evidence"
+                }
+            })),
+        ))
+        .await
+        .expect("typed spawn should create and bind durable task state");
+    let (content, _) = expect_text_output(output);
+    let result: serde_json::Value =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    assert_eq!(result["task_name"], "/root/typed_explorer");
+    let assignment_id = codex_agent_task_store::AssignmentId::parse(
+        result["assignment_id"]
+            .as_str()
+            .expect("typed spawn should return assignment id"),
+    )
+    .expect("assignment id should be UUIDv7");
+    let binding = agent_control
+        .task_coordinator()
+        .binding_for_assignment(assignment_id)
+        .expect("typed assignment should be bound before spawn returns");
+    assert_eq!(binding.agent_path, "/root/typed_explorer");
+    assert!(binding.thread_id.is_some());
+    let task = agent_control
+        .task_coordinator()
+        .get_agent_task(assignment_id, Some(0))
+        .await
+        .expect("typed assignment should be readable from durable store");
+    assert_eq!(
+        task.assignment.role,
+        codex_agent_task_store::AgentRole::Explorer
+    );
+    assert_eq!(task.current_attempt.attempt_id, binding.attempt_id);
+}
+
+#[tokio::test]
+async fn multi_agent_v2_typed_spawn_is_root_only() {
+    let (session, mut turn) = make_session_and_context().await;
+    turn.session_source = SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+        parent_thread_id: session.thread_id,
+        depth: 1,
+        agent_path: Some(AgentPath::try_from("/root/worker").expect("agent path")),
+        agent_nickname: None,
+        agent_role: None,
+    });
+
+    let err = match SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "task_name": "nested_typed_worker",
+                "agent_type": "worker",
+                "assignment": {
+                    "objective": "modify the bounded path",
+                    "acceptance_criteria": [{
+                        "id": "criterion-1",
+                        "text": "complete the bounded change"
+                    }],
+                    "write_scope": [{
+                        "path": "src",
+                        "recursive": true
+                    }],
+                    "stop_condition": "stop after validation"
+                }
+            })),
+        ))
+        .await
+    {
+        Ok(_) => panic!("non-root agents must not create durable typed assignments"),
+        Err(err) => err,
+    };
     assert_eq!(
         err,
-            FunctionCallError::RespondToModel(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.".to_string(),
+        FunctionCallError::RespondToModel(
+            "spawn_agent: durable typed assignments are root-only".to_string()
         )
     );
 }
@@ -890,6 +1241,11 @@ async fn spawn_agent_full_history_fork_accepts_explicit_service_tier() {
         snapshot.service_tier,
         Some(ServiceTier::Fast.request_value().to_string())
     );
+    assert_eq!(snapshot.model, DEFAULT_SPAWN_AGENT_MODEL);
+    assert_eq!(
+        snapshot.reasoning_effort,
+        Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT)
+    );
 }
 
 #[tokio::test]
@@ -955,6 +1311,11 @@ async fn multi_agent_v2_full_history_fork_accepts_explicit_service_tier() {
     assert_eq!(
         snapshot.service_tier,
         Some(ServiceTier::Fast.request_value().to_string())
+    );
+    assert_eq!(snapshot.model, DEFAULT_SPAWN_AGENT_MODEL);
+    assert_eq!(
+        snapshot.reasoning_effort,
+        Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT)
     );
 }
 

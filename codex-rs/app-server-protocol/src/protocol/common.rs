@@ -200,7 +200,7 @@ macro_rules! client_request_definitions {
         $(
             $(#[experimental($reason:expr)])?
             $(#[doc = $variant_doc:literal])*
-            $variant:ident $(=> $wire:literal)? {
+            $variant:ident => $wire:literal {
                 params: $(#[$params_meta:meta])* $params:ty,
                 $(inspect_params: $inspect_params:tt,)?
                 serialization: $serialization:ident $( ( $($serialization_args:tt)* ) )?,
@@ -215,7 +215,8 @@ macro_rules! client_request_definitions {
         pub enum ClientRequest {
             $(
                 $(#[doc = $variant_doc])*
-                $(#[serde(rename = $wire)] #[ts(rename = $wire)])?
+                #[serde(rename = $wire)]
+                #[ts(rename = $wire)]
                 $variant {
                     #[serde(rename = "id")]
                     request_id: RequestId,
@@ -232,16 +233,14 @@ macro_rules! client_request_definitions {
                 }
             }
 
+            pub fn method_name(&self) -> &'static str {
+                match self {
+                    $(Self::$variant { .. } => $wire,)*
+                }
+            }
+
             pub fn method(&self) -> String {
-                serde_json::to_value(self)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("method")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_else(|| "<unknown>".to_string())
+                self.method_name().to_string()
             }
 
             pub fn serialization_scope(&self) -> Option<ClientRequestSerializationScope> {
@@ -265,7 +264,7 @@ macro_rules! client_request_definitions {
         pub enum ClientResponse {
             $(
                 $(#[doc = $variant_doc])*
-                $(#[serde(rename = $wire)])?
+                #[serde(rename = $wire)]
                 $variant {
                     #[serde(rename = "id")]
                     request_id: RequestId,
@@ -281,16 +280,14 @@ macro_rules! client_request_definitions {
                 }
             }
 
+            pub fn method_name(&self) -> &'static str {
+                match self {
+                    $(Self::$variant { .. } => $wire,)*
+                }
+            }
+
             pub fn method(&self) -> String {
-                serde_json::to_value(self)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("method")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_else(|| "<unknown>".to_string())
+                self.method_name().to_string()
             }
 
             pub fn into_jsonrpc_parts(
@@ -405,7 +402,7 @@ macro_rules! client_request_definitions {
 
         pub(crate) const EXPERIMENTAL_CLIENT_METHODS: &[&str] = &[
             $(
-                experimental_method_entry!($(#[experimental($reason)])? $(=> $wire)?),
+                experimental_method_entry!($(#[experimental($reason)])? => $wire),
             )*
         ];
         pub(crate) const EXPERIMENTAL_CLIENT_METHOD_PARAM_TYPES: &[&str] = &[
@@ -470,7 +467,7 @@ macro_rules! client_response_payload_from_impl {
 }
 
 client_request_definitions! {
-    Initialize {
+    Initialize => "initialize" {
         params: v1::InitializeParams,
         serialization: None,
         response: v1::InitializeResponse,
@@ -1153,25 +1150,25 @@ client_request_definitions! {
     },
 
     /// DEPRECATED APIs below
-    GetConversationSummary {
+    GetConversationSummary => "getConversationSummary" {
         params: v1::GetConversationSummaryParams,
         serialization: None,
         response: v1::GetConversationSummaryResponse,
     },
-    GitDiffToRemote {
+    GitDiffToRemote => "gitDiffToRemote" {
         params: v1::GitDiffToRemoteParams,
         serialization: None,
         response: v1::GitDiffToRemoteResponse,
     },
     /// DEPRECATED in favor of GetAccount
-    GetAuthStatus {
+    GetAuthStatus => "getAuthStatus" {
         params: v1::GetAuthStatusParams,
         serialization: global("account-auth"),
         response: v1::GetAuthStatusResponse,
     },
     // Legacy fuzzy search cancellation is intentionally concurrent: clients reuse a
     // cancellation token so a newer request can cancel an older in-flight search.
-    FuzzyFileSearch {
+    FuzzyFileSearch => "fuzzyFileSearch" {
         params: FuzzyFileSearchParams,
         serialization: None,
         response: FuzzyFileSearchResponse,
@@ -1205,7 +1202,7 @@ macro_rules! server_request_definitions {
         $(
             $(#[experimental($reason:expr)])?
             $(#[doc = $variant_doc:literal])*
-            $variant:ident $(=> $wire:literal)? {
+            $variant:ident => $wire:literal {
                 params: $params:ty,
                 response: $response:ty,
             }
@@ -1218,7 +1215,8 @@ macro_rules! server_request_definitions {
         pub enum ServerRequest {
             $(
                 $(#[doc = $variant_doc])*
-                $(#[serde(rename = $wire)] #[ts(rename = $wire)])?
+                #[serde(rename = $wire)]
+                #[ts(rename = $wire)]
                 $variant {
                     #[serde(rename = "id")]
                     request_id: RequestId,
@@ -1258,7 +1256,7 @@ macro_rules! server_request_definitions {
         pub enum ServerResponse {
             $(
                 $(#[doc = $variant_doc])*
-                $(#[serde(rename = $wire)])?
+                #[serde(rename = $wire)]
                 $variant {
                     #[serde(rename = "id")]
                     request_id: RequestId,
@@ -1274,16 +1272,14 @@ macro_rules! server_request_definitions {
                 }
             }
 
+            pub fn method_name(&self) -> &'static str {
+                match self {
+                    $(Self::$variant { .. } => $wire,)*
+                }
+            }
+
             pub fn method(&self) -> String {
-                serde_json::to_value(self)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("method")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_owned)
-                    })
-                    .unwrap_or_else(|| "<unknown>".to_string())
+                self.method_name().to_string()
             }
         }
 
@@ -1303,7 +1299,7 @@ macro_rules! server_request_definitions {
 
         pub(crate) const EXPERIMENTAL_SERVER_METHODS: &[&str] = &[
             $(
-                experimental_method_entry!($(#[experimental($reason)])? $(=> $wire)?),
+                experimental_method_entry!($(#[experimental($reason)])? => $wire),
             )*
         ];
         pub(crate) const EXPERIMENTAL_SERVER_METHOD_PARAM_TYPES: &[&str] = &[
@@ -1516,13 +1512,13 @@ server_request_definitions! {
     /// DEPRECATED APIs below
     /// Request to approve a patch.
     /// This request is used for Turns started via the legacy APIs (i.e. SendUserTurn, SendUserMessage).
-    ApplyPatchApproval {
+    ApplyPatchApproval => "applyPatchApproval" {
         params: v1::ApplyPatchApprovalParams,
         response: v1::ApplyPatchApprovalResponse,
     },
     /// Request to exec a command.
     /// This request is used for Turns started via the legacy APIs (i.e. SendUserTurn, SendUserMessage).
-    ExecCommandApproval {
+    ExecCommandApproval => "execCommandApproval" {
         params: v1::ExecCommandApprovalParams,
         response: v1::ExecCommandApprovalResponse,
     },
@@ -1707,6 +1703,24 @@ server_notification_definitions! {
     #[strum(serialize = "account/login/completed")]
     AccountLoginCompleted(v2::AccountLoginCompletedNotification),
 
+}
+
+/// Returns `true` for notifications that must survive transport backpressure.
+///
+/// These notifications either carry the authoritative assistant transcript or
+/// close a lifecycle/configuration operation that clients may be awaiting.
+pub fn server_notification_requires_delivery(notification: &ServerNotification) -> bool {
+    matches!(
+        notification,
+        ServerNotification::TurnCompleted(_)
+            | ServerNotification::ThreadSettingsUpdated(_)
+            | ServerNotification::ItemCompleted(_)
+            | ServerNotification::ExternalAgentConfigImportCompleted(_)
+            | ServerNotification::AgentMessageDelta(_)
+            | ServerNotification::PlanDelta(_)
+            | ServerNotification::ReasoningSummaryTextDelta(_)
+            | ServerNotification::ReasoningTextDelta(_)
+    )
 }
 
 client_notification_definitions! {

@@ -12,6 +12,12 @@ use crate::image_url::is_remote_image_url;
 
 const DIRECT_INPUT_TO_MULTI_AGENT_V2_SUBAGENT_ERROR: &str =
     "direct app-server input is not allowed for multi-agent v2 sub-agents";
+const MAX_ADDITIONAL_CONTEXT_ENTRIES: usize = 16;
+const MAX_ADDITIONAL_CONTEXT_SOURCE_BYTES: usize = 256;
+const MAX_ADDITIONAL_CONTEXT_AGGREGATE_RENDERED_BYTES: usize = 32 * 1_024;
+// Context fragments cap each escaped value at approximately 1,000 tokens.
+const MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES: usize = 4_000;
+const ESTIMATED_ADDITIONAL_CONTEXT_WRAPPER_BYTES: usize = 96;
 
 fn validate_user_input_image_urls(input: &[V2UserInput]) -> Result<(), JSONRPCErrorError> {
     if input.iter().any(|item| {
@@ -83,9 +89,37 @@ pub(crate) struct TurnRequestProcessor {
 
 fn map_additional_context(
     additional_context: Option<HashMap<String, AdditionalContextEntry>>,
-) -> BTreeMap<String, CoreAdditionalContextEntry> {
-    additional_context
-        .unwrap_or_default()
+) -> Result<BTreeMap<String, CoreAdditionalContextEntry>, JSONRPCErrorError> {
+    let additional_context = additional_context.unwrap_or_default();
+    if additional_context.len() > MAX_ADDITIONAL_CONTEXT_ENTRIES {
+        return Err(invalid_request(format!(
+            "additionalContext may contain at most {MAX_ADDITIONAL_CONTEXT_ENTRIES} entries (received {})",
+            additional_context.len()
+        )));
+    }
+
+    let longest_source_bytes = additional_context
+        .keys()
+        .map(|source| source.len())
+        .max()
+        .unwrap_or_default();
+    if longest_source_bytes > MAX_ADDITIONAL_CONTEXT_SOURCE_BYTES {
+        return Err(invalid_request(format!(
+            "additionalContext source identifiers may contain at most {MAX_ADDITIONAL_CONTEXT_SOURCE_BYTES} bytes (longest was {longest_source_bytes} bytes)"
+        )));
+    }
+
+    let estimated_rendered_bytes = additional_context
+        .iter()
+        .map(|(source, entry)| estimated_additional_context_rendered_bytes(source, entry))
+        .fold(0usize, usize::saturating_add);
+    if estimated_rendered_bytes > MAX_ADDITIONAL_CONTEXT_AGGREGATE_RENDERED_BYTES {
+        return Err(invalid_request(format!(
+            "additionalContext may render to at most {MAX_ADDITIONAL_CONTEXT_AGGREGATE_RENDERED_BYTES} bytes (estimated {estimated_rendered_bytes} bytes)"
+        )));
+    }
+
+    Ok(additional_context
         .into_iter()
         .map(|(key, entry)| {
             (
@@ -101,7 +135,37 @@ fn map_additional_context(
                 },
             )
         })
-        .collect()
+        .collect())
+}
+
+fn estimated_additional_context_rendered_bytes(
+    source: &str,
+    entry: &AdditionalContextEntry,
+) -> usize {
+    let source_bytes = source.chars().fold(0usize, |total, ch| {
+        let escaped = match ch {
+            '&' => "&amp;".len(),
+            '<' => "&lt;".len(),
+            '>' => "&gt;".len(),
+            '"' => "&quot;".len(),
+            '\'' => "&#39;".len(),
+            _ => ch.len_utf8(),
+        };
+        total.saturating_add(escaped)
+    });
+    let value_bytes = entry.value.chars().fold(0usize, |total, ch| {
+        let escaped = match ch {
+            '&' => "&amp;".len(),
+            '<' => "&lt;".len(),
+            '>' => "&gt;".len(),
+            _ => ch.len_utf8(),
+        };
+        total.saturating_add(escaped)
+    });
+
+    source_bytes
+        .saturating_add(value_bytes.min(MAX_ADDITIONAL_CONTEXT_VALUE_RENDERED_BYTES))
+        .saturating_add(ESTIMATED_ADDITIONAL_CONTEXT_WRAPPER_BYTES)
 }
 
 struct ThreadSettingsBuildParams {
@@ -155,15 +219,17 @@ impl TurnRequestProcessor {
     pub(crate) async fn turn_start(
         &self,
         request_id: ConnectionRequestId,
-        params: TurnStartParams,
+        mut params: TurnStartParams,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         supports_openai_form_elicitation: bool,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         validate_user_input_image_urls(&params.input)?;
+        let additional_context = map_additional_context(params.additional_context.take())?;
         self.turn_start_inner(
             request_id,
             params,
+            additional_context,
             app_server_client_name,
             app_server_client_version,
             /*supports_openai_form_elicitation*/ supports_openai_form_elicitation,
@@ -194,10 +260,11 @@ impl TurnRequestProcessor {
     pub(crate) async fn turn_steer(
         &self,
         request_id: &ConnectionRequestId,
-        params: TurnSteerParams,
+        mut params: TurnSteerParams,
     ) -> Result<Option<ClientResponsePayload>, JSONRPCErrorError> {
         validate_user_input_image_urls(&params.input)?;
-        self.turn_steer_inner(request_id, params)
+        let additional_context = map_additional_context(params.additional_context.take())?;
+        self.turn_steer_inner(request_id, params, additional_context)
             .await
             .map(|response| Some(response.into()))
     }
@@ -443,6 +510,7 @@ impl TurnRequestProcessor {
         &self,
         request_id: ConnectionRequestId,
         params: TurnStartParams,
+        additional_context: BTreeMap<String, CoreAdditionalContextEntry>,
         app_server_client_name: Option<String>,
         app_server_client_version: Option<String>,
         supports_openai_form_elicitation: bool,
@@ -491,7 +559,6 @@ impl TurnRequestProcessor {
             .map(V2UserInput::into_core)
             .collect();
         let client_user_message_id = params.client_user_message_id;
-        let additional_context = map_additional_context(params.additional_context);
         let turn_has_input = !mapped_items.is_empty();
         let cwd = resolve_request_cwd(params.cwd)?;
         let environments = self
@@ -860,6 +927,7 @@ impl TurnRequestProcessor {
         &self,
         request_id: &ConnectionRequestId,
         params: TurnSteerParams,
+        additional_context: BTreeMap<String, CoreAdditionalContextEntry>,
     ) -> Result<TurnSteerResponse, JSONRPCErrorError> {
         let (_, thread) = self
             .load_thread(&params.thread_id)
@@ -890,8 +958,6 @@ impl TurnRequestProcessor {
             .into_iter()
             .map(V2UserInput::into_core)
             .collect();
-        let additional_context = map_additional_context(params.additional_context);
-
         let turn_id = thread
             .steer_input(
                 mapped_items,
@@ -1447,6 +1513,10 @@ impl TurnRequestProcessor {
         .await
     }
 }
+
+#[cfg(test)]
+#[path = "turn_processor_tests.rs"]
+mod tests;
 
 fn xcode_26_4_mcp_elicitations_auto_deny(
     client_name: Option<&str>,

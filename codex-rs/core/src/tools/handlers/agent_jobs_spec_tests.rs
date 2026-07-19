@@ -19,8 +19,9 @@ fn spawn_agents_on_csv_tool_requires_csv_and_instruction() {
         create_spawn_agents_on_csv_tool(),
         ToolSpec::Function(ResponsesApiTool {
             name: "spawn_agents_on_csv".to_string(),
-            description: "Process a CSV by spawning one worker sub-agent per row. The instruction string is a template where `{column}` placeholders are replaced with row values. Each worker must call `report_agent_job_result` with a JSON object (matching `output_schema` when provided); missing reports are treated as failures. This call blocks until all rows finish and automatically exports results to `output_csv_path` (or a default path)."
-                .to_string(),
+            description: format!(
+                "Process a CSV by spawning one worker sub-agent per row. Workers use `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning by default. The instruction string is a template where `{{column}}` placeholders are replaced with row values. Each worker must call `report_agent_job_result` with a JSON object (matching `output_schema` when provided); missing reports are treated as failures. This call blocks until all rows finish and automatically exports results to `output_csv_path` (or a default path)."
+            ),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([

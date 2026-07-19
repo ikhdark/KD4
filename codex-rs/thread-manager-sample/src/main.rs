@@ -324,6 +324,7 @@ async fn run_turn(thread: &CodexThread, thread_id: &str, prompt: String) -> anyh
 
     let mut current_turn_id: Option<String> = None;
     let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
     loop {
         let event = thread.next_event().await.context("read Codex event")?;
         let notification = match &event.msg {
@@ -331,33 +332,7 @@ async fn run_turn(thread: &CodexThread, thread_id: &str, prompt: String) -> anyh
                 current_turn_id = Some(event.turn_id.clone());
                 None
             }
-            EventMsg::DynamicToolCallResponse(_)
-            | EventMsg::McpToolCallBegin(_)
-            | EventMsg::McpToolCallEnd(_)
-            | EventMsg::CollabAgentSpawnBegin(_)
-            | EventMsg::CollabAgentSpawnEnd(_)
-            | EventMsg::CollabAgentInteractionBegin(_)
-            | EventMsg::CollabAgentInteractionEnd(_)
-            | EventMsg::CollabWaitingBegin(_)
-            | EventMsg::CollabWaitingEnd(_)
-            | EventMsg::CollabCloseBegin(_)
-            | EventMsg::CollabCloseEnd(_)
-            | EventMsg::CollabResumeBegin(_)
-            | EventMsg::CollabResumeEnd(_)
-            | EventMsg::SubAgentActivity(_)
-            | EventMsg::AgentMessageContentDelta(_)
-            | EventMsg::PlanDelta(_)
-            | EventMsg::ReasoningContentDelta(_)
-            | EventMsg::ReasoningRawContentDelta(_)
-            | EventMsg::AgentReasoningSectionBreak(_)
-            | EventMsg::ItemStarted(_)
-            | EventMsg::ItemCompleted(_)
-            | EventMsg::PatchApplyBegin(_)
-            | EventMsg::PatchApplyUpdated(_)
-            | EventMsg::TerminalInteraction(_)
-            | EventMsg::ExecCommandBegin(_)
-            | EventMsg::ExecCommandOutputDelta(_)
-            | EventMsg::ExecCommandEnd(_) => Some(item_event_to_server_notification(
+            msg if is_mapped_item_event(msg) => Some(item_event_to_server_notification(
                 event.msg.clone(),
                 thread_id,
                 current_turn_id
@@ -373,6 +348,10 @@ async fn run_turn(thread: &CodexThread, thread_id: &str, prompt: String) -> anyh
                 .write_all(b"\n")
                 .context("write notification newline")?;
             stdout.flush().context("flush notification output")?;
+        }
+
+        if let Some(diagnostic) = user_facing_diagnostic(&event.msg) {
+            let _ = writeln!(stderr, "{diagnostic}");
         }
 
         match event.msg {
@@ -404,3 +383,57 @@ async fn run_turn(thread: &CodexThread, thread_id: &str, prompt: String) -> anyh
         }
     }
 }
+
+fn is_mapped_item_event(msg: &EventMsg) -> bool {
+    matches!(
+        msg,
+        EventMsg::DynamicToolCallResponse(_)
+            | EventMsg::CollabAgentSpawnBegin(_)
+            | EventMsg::CollabAgentSpawnEnd(_)
+            | EventMsg::CollabAgentInteractionBegin(_)
+            | EventMsg::CollabAgentInteractionEnd(_)
+            | EventMsg::CollabWaitingBegin(_)
+            | EventMsg::CollabWaitingEnd(_)
+            | EventMsg::CollabCloseBegin(_)
+            | EventMsg::CollabCloseEnd(_)
+            | EventMsg::CollabResumeBegin(_)
+            | EventMsg::CollabResumeEnd(_)
+            | EventMsg::SubAgentActivity(_)
+            | EventMsg::AgentMessageContentDelta(_)
+            | EventMsg::PlanDelta(_)
+            | EventMsg::ReasoningContentDelta(_)
+            | EventMsg::ReasoningRawContentDelta(_)
+            | EventMsg::AgentReasoningSectionBreak(_)
+            | EventMsg::ItemStarted(_)
+            | EventMsg::ItemCompleted(_)
+            | EventMsg::PatchApplyUpdated(_)
+            | EventMsg::TerminalInteraction(_)
+            | EventMsg::ExecCommandBegin(_)
+            | EventMsg::ExecCommandOutputDelta(_)
+            | EventMsg::ExecCommandEnd(_)
+    )
+}
+
+fn user_facing_diagnostic(msg: &EventMsg) -> Option<String> {
+    match msg {
+        EventMsg::Warning(event) => Some(format!("warning: {}", event.message)),
+        EventMsg::GuardianWarning(event) => Some(format!("guardian warning: {}", event.message)),
+        EventMsg::DeprecationNotice(event) => Some(match event.details.as_deref() {
+            Some(details) if !details.is_empty() => {
+                format!("deprecation notice: {}; {details}", event.summary)
+            }
+            _ => format!("deprecation notice: {}", event.summary),
+        }),
+        EventMsg::StreamError(event) => Some(match event.additional_details.as_deref() {
+            Some(details) if !details.is_empty() && details != event.message => {
+                format!("stream error (recovering): {}; {details}", event.message)
+            }
+            _ => format!("stream error (recovering): {}", event.message),
+        }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[path = "main_tests.rs"]
+mod tests;

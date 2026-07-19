@@ -8,14 +8,16 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 
+use super::multi_agents_common::DEFAULT_SPAWN_AGENT_MODEL;
+use super::multi_agents_common::DEFAULT_SPAWN_AGENT_REASONING_EFFORT;
+
 pub const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
 const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
 
-const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE: &str = "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed.";
-const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str =
-    "Model override for the new agent. Omit unless an explicit override is needed.";
 const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str =
     "Service tier override for the new agent. Omit unless explicitly requested.";
+const SPAWN_AGENT_V1_FULL_HISTORY_OVERRIDE_GUIDANCE: &str = "Full-history forks (`fork_context=true`) do not accept per-call `agent_type`, `model`, or `reasoning_effort` overrides; keep `fork_context` false or omit it when using those fields.";
+const SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE: &str = "Full-history forks (`fork_turns=\"all\"`) do not accept per-call `agent_type`, `model`, or `reasoning_effort` overrides; set `fork_turns` to `none` or a positive integer when using those fields.";
 const MAX_MODEL_OVERRIDES_IN_SPAWN_AGENT_DESCRIPTION: usize = 5;
 const MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION: usize = 64;
 
@@ -25,6 +27,24 @@ pub struct SpawnAgentToolOptions {
     pub agent_type_description: String,
     pub hide_agent_type_model_reasoning: bool,
     pub usage_hint_text: Option<String>,
+}
+
+fn spawn_agent_default_guidance() -> String {
+    format!(
+        "Spawned agents use `{DEFAULT_SPAWN_AGENT_MODEL}` with `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}` reasoning by default. Omit `model` and `reasoning_effort` to use those defaults; set either field only when an explicit override is needed. If a model override does not support `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}`, also set `reasoning_effort` to a supported value listed for that model."
+    )
+}
+
+fn spawn_agent_model_override_description() -> String {
+    format!(
+        "Model override for the new agent. Omit to use `{DEFAULT_SPAWN_AGENT_MODEL}`. If the chosen model does not support `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}`, also set `reasoning_effort` to a supported value."
+    )
+}
+
+fn spawn_agent_reasoning_override_description() -> String {
+    format!(
+        "Reasoning effort override for the new agent. Omit to use `{DEFAULT_SPAWN_AGENT_REASONING_EFFORT}`, including when `model` is explicitly overridden."
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,11 +67,16 @@ impl Default for WaitAgentTimeoutOptions {
 pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
     let available_models_description = (!options.hide_agent_type_model_reasoning)
         .then(|| spawn_agent_models_description(&options.available_models));
-    let inherited_model_guidance =
-        (!options.hide_agent_type_model_reasoning).then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE);
+    let default_model_guidance =
+        (!options.hide_agent_type_model_reasoning).then(spawn_agent_default_guidance);
+    let full_history_override_guidance = (!options.hide_agent_type_model_reasoning)
+        .then_some(SPAWN_AGENT_V1_FULL_HISTORY_OVERRIDE_GUIDANCE);
     let return_value_description =
         "Returns the spawned agent id plus the user-facing nickname when available.";
-    let mut properties = spawn_agent_common_properties_v1(&options.agent_type_description);
+    let mut properties = spawn_agent_common_properties_v1(
+        &options.agent_type_description,
+        full_history_override_guidance,
+    );
     if options.hide_agent_type_model_reasoning {
         hide_spawn_agent_metadata_options(&mut properties);
     }
@@ -63,7 +88,7 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
             name: "spawn_agent".to_string(),
             description: spawn_agent_tool_description(
                 available_models_description.as_deref(),
-                inherited_model_guidance,
+                default_model_guidance.as_deref(),
                 return_value_description,
                 options.usage_hint_text,
             ),
@@ -78,12 +103,24 @@ pub fn create_spawn_agent_tool_v1(options: SpawnAgentToolOptions) -> ToolSpec {
 pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
     let available_models_description = (!options.hide_agent_type_model_reasoning)
         .then(|| spawn_agent_models_description(&options.available_models));
-    let inherited_model_guidance =
-        (!options.hide_agent_type_model_reasoning).then_some(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE);
-    let mut properties = spawn_agent_common_properties_v2(&options.agent_type_description);
+    let default_model_guidance =
+        (!options.hide_agent_type_model_reasoning).then(spawn_agent_default_guidance);
+    let full_history_override_guidance = (!options.hide_agent_type_model_reasoning)
+        .then_some(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE);
+    let mut properties = spawn_agent_common_properties_v2(
+        &options.agent_type_description,
+        full_history_override_guidance,
+    );
     if options.hide_agent_type_model_reasoning {
         hide_spawn_agent_metadata_options(&mut properties);
+        // Typed assignments require an explicit built-in role even when optional legacy spawn
+        // metadata is hidden.
+        properties.insert(
+            "agent_type".to_string(),
+            JsonSchema::string(Some(options.agent_type_description.clone())),
+        );
     }
+    properties.insert("assignment".to_string(), typed_assignment_schema());
     properties.insert(
         "task_name".to_string(),
         JsonSchema::string(Some(
@@ -96,14 +133,15 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
         name: "spawn_agent".to_string(),
         description: spawn_agent_tool_description_v2(
             available_models_description.as_deref(),
-            inherited_model_guidance,
+            default_model_guidance.as_deref(),
+            full_history_override_guidance,
             options.usage_hint_text,
         ),
         strict: false,
         defer_loading: None,
         parameters: JsonSchema::object(
             properties,
-            Some(vec!["task_name".to_string(), "message".to_string()]),
+            Some(vec!["task_name".to_string()]),
             Some(false.into()),
         ),
         output_schema: Some(spawn_agent_output_schema_v2(
@@ -381,6 +419,10 @@ fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
                 "task_name": {
                     "type": "string",
                     "description": "Canonical task name for the spawned agent."
+                },
+                "assignment_id": {
+                    "type": "string",
+                    "description": "Durable UUIDv7 assignment id, present only for typed assignments."
                 }
             },
             "required": ["task_name"],
@@ -398,6 +440,10 @@ fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
             "nickname": {
                 "type": ["string", "null"],
                 "description": "User-facing nickname for the spawned agent when available."
+            },
+            "assignment_id": {
+                "type": "string",
+                "description": "Durable UUIDv7 assignment id, present only for typed assignments."
             }
         },
         "required": ["task_name", "nickname"],
@@ -549,7 +595,13 @@ fn create_collab_input_items_schema() -> JsonSchema {
         ))
 }
 
-fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<String, JsonSchema> {
+fn spawn_agent_common_properties_v1(
+    agent_type_description: &str,
+    full_history_override_guidance: Option<&str>,
+) -> BTreeMap<String, JsonSchema> {
+    let full_history_override_guidance = full_history_override_guidance
+        .map(|guidance| format!(" {guidance}"))
+        .unwrap_or_default();
     BTreeMap::from([
         (
             "message".to_string(),
@@ -565,23 +617,17 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
         ),
         (
             "fork_context".to_string(),
-            JsonSchema::boolean(Some(
-                "True forks the current thread history into the new agent; false or omitted starts with only the initial prompt."
-                    .to_string(),
-            )),
+            JsonSchema::boolean(Some(format!(
+                "True forks the current thread history into the new agent; false or omitted starts with only the initial prompt.{full_history_override_guidance}"
+            ))),
         ),
         (
             "model".to_string(),
-            JsonSchema::string(Some(
-                SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION.to_string(),
-            )),
+            JsonSchema::string(Some(spawn_agent_model_override_description())),
         ),
         (
             "reasoning_effort".to_string(),
-            JsonSchema::string(Some(
-                "Reasoning effort override for the new agent. Omit to inherit the parent effort."
-                    .to_string(),
-            )),
+            JsonSchema::string(Some(spawn_agent_reasoning_override_description())),
         ),
         (
             "service_tier".to_string(),
@@ -592,7 +638,13 @@ fn spawn_agent_common_properties_v1(agent_type_description: &str) -> BTreeMap<St
     ])
 }
 
-fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<String, JsonSchema> {
+fn spawn_agent_common_properties_v2(
+    agent_type_description: &str,
+    full_history_override_guidance: Option<&str>,
+) -> BTreeMap<String, JsonSchema> {
+    let full_history_override_guidance = full_history_override_guidance
+        .map(|guidance| format!(" {guidance}"))
+        .unwrap_or_default();
     BTreeMap::from([
         (
             "message".to_string(),
@@ -607,23 +659,17 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
         ),
         (
             "fork_turns".to_string(),
-            JsonSchema::string(Some(
-                "Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
-                    .to_string(),
-            )),
+            JsonSchema::string(Some(format!(
+                "Optional number of turns to fork. Defaults to `none` for typed assignments or explicit role/model/reasoning overrides, and otherwise defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns.{full_history_override_guidance}"
+            ))),
         ),
         (
             "model".to_string(),
-            JsonSchema::string(Some(
-                SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION.to_string(),
-            )),
+            JsonSchema::string(Some(spawn_agent_model_override_description())),
         ),
         (
             "reasoning_effort".to_string(),
-            JsonSchema::string(Some(
-                "Reasoning effort override for the new agent. Omit to inherit the parent effort."
-                    .to_string(),
-            )),
+            JsonSchema::string(Some(spawn_agent_reasoning_override_description())),
         ),
         (
             "service_tier".to_string(),
@@ -632,6 +678,129 @@ fn spawn_agent_common_properties_v2(agent_type_description: &str) -> BTreeMap<St
             )),
         ),
     ])
+}
+
+fn typed_assignment_schema() -> JsonSchema {
+    let criterion = JsonSchema::object(
+        BTreeMap::from([
+            (
+                "id".to_string(),
+                JsonSchema::string(Some("Stable acceptance-criterion id.".to_string())),
+            ),
+            (
+                "text".to_string(),
+                JsonSchema::string(Some("Required observable outcome.".to_string())),
+            ),
+        ]),
+        Some(vec!["id".to_string(), "text".to_string()]),
+        Some(false.into()),
+    );
+    let repo_scope = JsonSchema::object(
+        BTreeMap::from([
+            (
+                "path".to_string(),
+                JsonSchema::string(Some("Repository-relative path.".to_string())),
+            ),
+            (
+                "recursive".to_string(),
+                JsonSchema::boolean(Some(
+                    "Whether this scope includes descendants of path.".to_string(),
+                )),
+            ),
+        ]),
+        Some(vec!["path".to_string(), "recursive".to_string()]),
+        Some(false.into()),
+    );
+    let string_array = |description: &str| {
+        JsonSchema::array(JsonSchema::string(None), Some(description.to_string()))
+    };
+    let relation = JsonSchema::object(
+        BTreeMap::from([
+            (
+                "kind".to_string(),
+                JsonSchema::string_enum(
+                    vec![json!("review"), json!("verification"), json!("integration")],
+                    Some("How this assignment relates to its targets.".to_string()),
+                ),
+            ),
+            (
+                "target_assignment_ids".to_string(),
+                string_array("UUIDv7 assignments reviewed, verified, or integrated."),
+            ),
+        ]),
+        Some(vec![
+            "kind".to_string(),
+            "target_assignment_ids".to_string(),
+        ]),
+        Some(false.into()),
+    );
+    let mut schema = JsonSchema::object(
+        BTreeMap::from([
+            (
+                "objective".to_string(),
+                JsonSchema::string(Some("Concrete objective for the new agent.".to_string())),
+            ),
+            (
+                "acceptance_criteria".to_string(),
+                JsonSchema::array(
+                    criterion,
+                    Some("Evidence-backed outcomes required for completion.".to_string()),
+                ),
+            ),
+            (
+                "read_scope".to_string(),
+                JsonSchema::array(
+                    repo_scope.clone(),
+                    Some("Repository paths the agent is expected to inspect.".to_string()),
+                ),
+            ),
+            (
+                "write_scope".to_string(),
+                JsonSchema::array(
+                    repo_scope,
+                    Some(
+                        "Exclusive repository write scopes; use an empty array for read-only roles."
+                            .to_string(),
+                    ),
+                ),
+            ),
+            (
+                "stop_condition".to_string(),
+                JsonSchema::string(Some(
+                    "Condition that ends the assignment without further work.".to_string(),
+                )),
+            ),
+            (
+                "dependencies".to_string(),
+                string_array("Successful sealed assignment ids required before this task."),
+            ),
+            (
+                "risk_hints".to_string(),
+                string_array("Known risks the agent must account for."),
+            ),
+            (
+                "required_evidence".to_string(),
+                string_array("Validation evidence required in a completed receipt."),
+            ),
+            (
+                "prohibited_changes".to_string(),
+                string_array("Changes explicitly outside this assignment."),
+            ),
+            ("relation".to_string(), relation),
+        ]),
+        Some(vec![
+            "objective".to_string(),
+            "acceptance_criteria".to_string(),
+            "write_scope".to_string(),
+            "stop_condition".to_string(),
+        ]),
+        Some(false.into()),
+    );
+    schema.description = Some(
+        "Durable typed assignment. Use either assignment or legacy message, never both. Typed assignments require an explicit built-in agent_type."
+            .to_string(),
+    );
+    schema
 }
 
 fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchema>) {
@@ -643,17 +812,17 @@ fn hide_spawn_agent_metadata_options(properties: &mut BTreeMap<String, JsonSchem
 
 fn spawn_agent_tool_description(
     available_models_description: Option<&str>,
-    inherited_model_guidance: Option<&str>,
+    default_model_guidance: Option<&str>,
     return_value_description: &str,
     usage_hint_text: Option<String>,
 ) -> String {
     let agent_role_guidance = available_models_description.unwrap_or_default();
-    let inherited_model_guidance = inherited_model_guidance.unwrap_or_default();
+    let default_model_guidance = default_model_guidance.unwrap_or_default();
 
     let tool_description = format!(
         r#"
         {agent_role_guidance}
-        Spawn a sub-agent for a well-scoped task. {return_value_description} {inherited_model_guidance}"#
+        Spawn a sub-agent for a well-scoped task. {return_value_description} {default_model_guidance}"#
     );
 
     if let Some(usage_hint_text) = usage_hint_text {
@@ -671,7 +840,7 @@ fn spawn_agent_tool_description(
     format!(
         r#"
         {tool_description}
-This spawn_agent tool provides you access to sub-agents that inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model or there is a clear task-specific reason. You should follow the rules and guidelines below to use this tool.
+This spawn_agent tool provides access to sub-agents that use the built-in model and reasoning defaults unless explicitly overridden. Do not set the `model` or `reasoning_effort` field unless the user explicitly asks for a different setting or there is a clear task-specific reason. You should follow the rules and guidelines below to use this tool.
 
 Do not spawn sub-agents unless the user or applicable AGENTS.md/skill instructions explicitly ask for sub-agents, delegation, or parallel agent work.
 Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.
@@ -710,11 +879,13 @@ Requests for depth, thoroughness, research, investigation, or detailed codebase 
 
 fn spawn_agent_tool_description_v2(
     available_models_description: Option<&str>,
-    inherited_model_guidance: Option<&str>,
+    default_model_guidance: Option<&str>,
+    full_history_override_guidance: Option<&str>,
     usage_hint_text: Option<String>,
 ) -> String {
     let agent_role_guidance = available_models_description.unwrap_or_default();
-    let inherited_model_guidance = inherited_model_guidance.unwrap_or_default();
+    let default_model_guidance = default_model_guidance.unwrap_or_default();
+    let full_history_override_guidance = full_history_override_guidance.unwrap_or_default();
 
     let tool_description = format!(
         r#"
@@ -722,11 +893,13 @@ fn spawn_agent_tool_description_v2(
         Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
 You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
 The spawned agent will have the same tools as you and the ability to spawn its own subagents.
-{inherited_model_guidance}
+{default_model_guidance}
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
+Use `assignment` for durable typed coordination or `message` for a legacy plain-text task; exactly one is required. Typed assignments require an explicit built-in `agent_type` and return an `assignment_id`.
 
+    {full_history_override_guidance}
 Note that passing `fork_turns="none"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns="all"` will provide the subagent with all surrounding context."#
     );
 
@@ -767,7 +940,7 @@ fn spawn_agent_models_description(models: &[ModelPreset]) -> String {
                         None => effort,
                     };
                     if &preset.effort == default_reasoning_effort {
-                        format!("{effort} (default)")
+                        format!("{effort} (catalog default)")
                     } else {
                         effort.to_string()
                     }
@@ -799,7 +972,7 @@ fn spawn_agent_models_description(models: &[ModelPreset]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        "Available model overrides (optional; inherited parent model is preferred):\n{model_descriptions}"
+        "Available model overrides (optional; `{DEFAULT_SPAWN_AGENT_MODEL}` is the spawn default):\n{model_descriptions}"
     )
 }
 

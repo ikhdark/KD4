@@ -36,13 +36,13 @@ impl<T: ContextualUserFragment> FragmentRegistration for FragmentRegistrationPro
 
 /// Context payload that is injected as a message fragment.
 ///
-/// Implementations own the response role and provide the fragment body. Marked
-/// fragments also provide start/end markers used to recognize injected context
-/// later. `render()` compacts adjacent repeated non-empty body lines, then
-/// concatenates markers and body without adding separators, so implementations
-/// should include any whitespace they need between tags in `body()`. Unmarked
-/// fragments should leave both markers empty, in which case the default helpers
-/// render only the body and never match arbitrary text.
+/// Implementations own the response role and provide the exact fragment body.
+/// Marked fragments also provide start/end markers used to recognize injected
+/// context later. `render()` concatenates markers and body without adding
+/// separators, so implementations should include any whitespace they need
+/// between tags in `body()`. Unmarked fragments should leave both markers empty,
+/// in which case the default helpers render only the body and never match
+/// arbitrary text.
 pub trait ContextualUserFragment {
     fn role(&self) -> &'static str;
 
@@ -69,7 +69,6 @@ pub trait ContextualUserFragment {
             return body;
         }
 
-        let body = compact_repeated_lines(&body);
         format!("{start_marker}{body}{end_marker}")
     }
 
@@ -112,33 +111,6 @@ pub trait ContextualUserFragment {
             phase: None,
         }
     }
-}
-
-fn compact_repeated_lines(body: &str) -> String {
-    let mut rendered = String::with_capacity(body.len());
-    let mut lines = body.split_inclusive('\n').peekable();
-
-    while let Some(line) = lines.next() {
-        let line_text = line.strip_suffix('\n').unwrap_or(line);
-        let mut repeated = 0usize;
-        while !line_text.trim().is_empty()
-            && lines
-                .peek()
-                .is_some_and(|next| next.strip_suffix('\n').unwrap_or(next) == line_text)
-        {
-            repeated += 1;
-            lines.next();
-        }
-
-        rendered.push_str(line);
-        if repeated > 0 {
-            rendered.push_str(&format!(
-                "[context compaction: omitted {repeated} repeated lines]\n"
-            ));
-        }
-    }
-
-    rendered
 }
 
 pub(crate) fn matches_marked_text(start_marker: &str, end_marker: &str, text: &str) -> bool {

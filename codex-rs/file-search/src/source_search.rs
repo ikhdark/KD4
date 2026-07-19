@@ -1,9 +1,14 @@
 use std::fs;
 use std::fs::File;
+use std::io;
+use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use anyhow::Context;
 use anyhow::bail;
@@ -32,6 +37,19 @@ pub const SOURCE_READ_DEFAULT_LINES: usize = 120;
 pub const SOURCE_READ_MAX_LINES: usize = 400;
 pub const SOURCE_READ_MAX_BYTES: usize = 512 * 1024;
 
+#[derive(Clone, Copy)]
+struct SourceWalkLimits {
+    max_depth: usize,
+    max_directories: usize,
+    max_entries: usize,
+}
+
+const SOURCE_WALK_LIMITS: SourceWalkLimits = SourceWalkLimits {
+    max_depth: SOURCE_SEARCH_MAX_WALK_DEPTH,
+    max_directories: SOURCE_SEARCH_MAX_WALK_DIRECTORIES,
+    max_entries: SOURCE_SEARCH_MAX_WALK_ENTRIES,
+};
+
 #[derive(Debug, Parser)]
 #[command(
     version,
@@ -54,20 +72,20 @@ pub struct SourceSearchCli {
     pub read_file: Option<PathBuf>,
 
     /// First 1-based line for --read-file.
-    #[arg(long, default_value_t = 1)]
-    pub start_line: usize,
+    #[arg(long)]
+    pub start_line: Option<usize>,
 
     /// Number of lines for --read-file.
-    #[arg(long, default_value_t = SOURCE_READ_DEFAULT_LINES)]
-    pub line_count: usize,
+    #[arg(long)]
+    pub line_count: Option<usize>,
 
     /// Maximum number of search matches to return.
-    #[arg(long, default_value_t = SOURCE_SEARCH_DEFAULT_MAX_MATCHES)]
-    pub max_matches: usize,
+    #[arg(long)]
+    pub max_matches: Option<usize>,
 
     /// Context lines around each search match.
-    #[arg(long, default_value_t = 0)]
-    pub context_lines: usize,
+    #[arg(long)]
+    pub context_lines: Option<usize>,
 
     /// Use case-sensitive fixed-string matching.
     #[arg(long)]
@@ -142,6 +160,7 @@ pub struct SourceSearchCoverage {
     pub files_scanned: usize,
     pub files_skipped_too_large: usize,
     pub files_skipped_non_utf8: usize,
+    pub files_changed_during_read: usize,
     pub filesystem_errors: usize,
     pub bytes_scanned: usize,
     pub result_bytes: usize,
@@ -162,6 +181,7 @@ pub enum SourceTruncatedReason {
     MaxBytes,
     MaxResultBytes,
     WalkLimit,
+    FilesChangedDuringRead,
     OversizedFiles,
     NonUtf8Files,
     FilesystemErrors,
@@ -201,24 +221,57 @@ pub struct ReadFileSpanOutput {
 pub fn run_source_search_cli(cli: SourceSearchCli) -> anyhow::Result<()> {
     let json = cli.json;
     if let Some(path) = cli.read_file {
-        if cli.query.is_some() || !cli.roots.is_empty() {
-            bail!("--read-file cannot be combined with a query or --path");
+        if cli.query.is_some()
+            || !cli.roots.is_empty()
+            || cli.max_matches.is_some()
+            || cli.context_lines.is_some()
+            || cli.case_sensitive
+            || cli.include_generated
+            || cli.include_vendor
+            || cli.include_locks
+        {
+            bail!("--read-file cannot be combined with search-only arguments");
+        }
+        let start_line = cli.start_line.unwrap_or(1);
+        if start_line == 0 {
+            bail!("--start-line must be 1 or greater");
+        }
+        let line_count = cli.line_count.unwrap_or(SOURCE_READ_DEFAULT_LINES);
+        if !(1..=SOURCE_READ_MAX_LINES).contains(&line_count) {
+            bail!(
+                "--line-count must be between 1 and {SOURCE_READ_MAX_LINES} (received {line_count})"
+            );
         }
         let output = read_file_span(ReadFileSpanOptions {
             repo_root: cli.repo_root,
             path,
-            start_line: cli.start_line,
-            line_count: cli.line_count,
+            start_line,
+            line_count,
         })?;
         print_output(&output, json, print_span_human)
     } else {
+        if cli.start_line.is_some() || cli.line_count.is_some() {
+            bail!("--start-line and --line-count require --read-file");
+        }
         let Some(query) = cli.query else {
             bail!("a query or --read-file is required");
         };
+        let max_matches = cli.max_matches.unwrap_or(SOURCE_SEARCH_DEFAULT_MAX_MATCHES);
+        if !(1..=SOURCE_SEARCH_MAX_MATCHES).contains(&max_matches) {
+            bail!(
+                "--max-matches must be between 1 and {SOURCE_SEARCH_MAX_MATCHES} (received {max_matches})"
+            );
+        }
+        let context_lines = cli.context_lines.unwrap_or(0);
+        if context_lines > SOURCE_SEARCH_MAX_CONTEXT_LINES {
+            bail!(
+                "--context-lines must not exceed {SOURCE_SEARCH_MAX_CONTEXT_LINES} (received {context_lines})"
+            );
+        }
         let mut options = SourceSearchOptions::new(cli.repo_root, query);
         options.roots = cli.roots;
-        options.max_matches = cli.max_matches;
-        options.context_lines = cli.context_lines;
+        options.max_matches = max_matches;
+        options.context_lines = context_lines;
         options.case_sensitive = cli.case_sensitive;
         options.include_generated = cli.include_generated;
         options.include_vendor = cli.include_vendor;
@@ -229,6 +282,13 @@ pub fn run_source_search_cli(cli: SourceSearchCli) -> anyhow::Result<()> {
 }
 
 pub fn search_source(options: SourceSearchOptions) -> anyhow::Result<SourceSearchOutput> {
+    search_source_with_walk_limits(options, SOURCE_WALK_LIMITS)
+}
+
+fn search_source_with_walk_limits(
+    options: SourceSearchOptions,
+    walk_limits: SourceWalkLimits,
+) -> anyhow::Result<SourceSearchOutput> {
     let repo_root = canonical_repo_root(&options.repo_root)?;
     let roots = resolve_search_roots(&repo_root, &options.roots)?;
     let mut accumulator = SourceSearchAccumulator::new(&options)?;
@@ -237,7 +297,7 @@ pub fn search_source(options: SourceSearchOptions) -> anyhow::Result<SourceSearc
         if accumulator.should_stop() {
             break;
         }
-        scan_root(&repo_root, root, &mut accumulator)?;
+        scan_root(&repo_root, root, &mut accumulator, walk_limits)?;
     }
 
     let roots = roots
@@ -253,7 +313,10 @@ pub fn read_file_span(options: ReadFileSpanOptions) -> anyhow::Result<ReadFileSp
     }
     let repo_root = canonical_repo_root(&options.repo_root)?;
     let path = resolve_confined_path(&repo_root, &options.path, "source file")?;
-    let metadata = fs::metadata(&path)
+    let mut file = File::open(&path)
+        .with_context(|| format!("unable to open source file `{}`", path.display()))?;
+    let metadata = file
+        .metadata()
         .with_context(|| format!("unable to inspect source file `{}`", path.display()))?;
     if !metadata.is_file() {
         bail!("source path `{}` is not a file", options.path.display());
@@ -268,12 +331,12 @@ pub fn read_file_span(options: ReadFileSpanOptions) -> anyhow::Result<ReadFileSp
         );
     }
 
-    let mut bytes = Vec::with_capacity(file_len);
-    File::open(&path)
-        .with_context(|| format!("unable to open source file `{}`", path.display()))?
-        .take(file_len as u64)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("unable to read source file `{}`", path.display()))?;
+    let Some(bytes) = read_open_file_stably(&mut file, &path, &metadata)? else {
+        bail!(
+            "source file `{}` changed while it was being read; retry the read",
+            options.path.display()
+        );
+    };
     let relative_path = relative_display(&repo_root, &path);
     read_file_span_from_bytes(relative_path, bytes, options.start_line, options.line_count)
 }
@@ -437,6 +500,29 @@ impl SourceSearchAccumulator {
             .get_or_insert(SourceTruncatedReason::WalkLimit);
     }
 
+    pub fn reserve_walk_directory(&mut self, limit: usize) -> bool {
+        if self.state.walk_directories_seen >= limit {
+            self.mark_walk_limit();
+            return false;
+        }
+        self.state.walk_directories_seen = self.state.walk_directories_seen.saturating_add(1);
+        true
+    }
+
+    pub fn reserve_walk_entry(&mut self, limit: usize) -> bool {
+        if self.state.walk_entries_seen >= limit {
+            self.mark_walk_limit();
+            return false;
+        }
+        self.state.walk_entries_seen = self.state.walk_entries_seen.saturating_add(1);
+        true
+    }
+
+    pub fn mark_file_changed_during_read(&mut self) {
+        self.state.files_changed_during_read =
+            self.state.files_changed_during_read.saturating_add(1);
+    }
+
     pub fn mark_filesystem_error(&mut self) {
         self.state.filesystem_errors = self.state.filesystem_errors.saturating_add(1);
     }
@@ -453,6 +539,7 @@ impl SourceSearchAccumulator {
             files_scanned: self.state.files_scanned,
             files_skipped_too_large: self.state.files_skipped_too_large,
             files_skipped_non_utf8: self.state.files_skipped_non_utf8,
+            files_changed_during_read: self.state.files_changed_during_read,
             filesystem_errors: self.state.filesystem_errors,
             bytes_scanned: self.state.bytes_scanned,
             result_bytes: self.state.result_bytes,
@@ -477,6 +564,7 @@ impl SourceSearchAccumulator {
             output.truncated_reason = source_truncated_reason(
                 coverage_limit,
                 result_limit,
+                output.coverage.files_changed_during_read,
                 output.coverage.filesystem_errors,
                 output.coverage.files_skipped_too_large,
                 output.coverage.files_skipped_non_utf8,
@@ -493,6 +581,7 @@ impl SourceSearchAccumulator {
                 output.truncated_reason = source_truncated_reason(
                     coverage_limit,
                     result_limit,
+                    output.coverage.files_changed_during_read,
                     output.coverage.filesystem_errors,
                     output.coverage.files_skipped_too_large,
                     output.coverage.files_skipped_non_utf8,
@@ -507,9 +596,12 @@ impl SourceSearchAccumulator {
 }
 
 struct SearchState {
+    walk_directories_seen: usize,
+    walk_entries_seen: usize,
     files_scanned: usize,
     files_skipped_too_large: usize,
     files_skipped_non_utf8: usize,
+    files_changed_during_read: usize,
     filesystem_errors: usize,
     bytes_scanned: usize,
     result_bytes: usize,
@@ -524,9 +616,12 @@ struct SearchState {
 impl SearchState {
     fn new(max_matches: usize) -> Self {
         Self {
+            walk_directories_seen: 0,
+            walk_entries_seen: 0,
             files_scanned: 0,
             files_skipped_too_large: 0,
             files_skipped_non_utf8: 0,
+            files_changed_during_read: 0,
             filesystem_errors: 0,
             bytes_scanned: 0,
             result_bytes: 0,
@@ -543,12 +638,16 @@ impl SearchState {
 fn source_truncated_reason(
     coverage_limit: Option<SourceTruncatedReason>,
     result_limit: Option<SourceTruncatedReason>,
+    files_changed_during_read: usize,
     filesystem_errors: usize,
     files_skipped_too_large: usize,
     files_skipped_non_utf8: usize,
 ) -> Option<SourceTruncatedReason> {
     coverage_limit
         .or(result_limit)
+        .or_else(|| {
+            (files_changed_during_read > 0).then_some(SourceTruncatedReason::FilesChangedDuringRead)
+        })
         .or_else(|| (filesystem_errors > 0).then_some(SourceTruncatedReason::FilesystemErrors))
         .or_else(|| (files_skipped_too_large > 0).then_some(SourceTruncatedReason::OversizedFiles))
         .or_else(|| (files_skipped_non_utf8 > 0).then_some(SourceTruncatedReason::NonUtf8Files))
@@ -570,6 +669,7 @@ fn scan_root(
     repo_root: &Path,
     root: &Path,
     accumulator: &mut SourceSearchAccumulator,
+    walk_limits: SourceWalkLimits,
 ) -> anyhow::Result<()> {
     let metadata = match fs::metadata(root) {
         Ok(metadata) => metadata,
@@ -591,30 +691,69 @@ fn scan_root(
 
     let include_generated = accumulator.include_generated;
     let include_vendor = accumulator.include_vendor;
+    let depth_limit_hit = Arc::new(AtomicBool::new(false));
+    let filter_depth_limit_hit = Arc::clone(&depth_limit_hit);
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false)
         .follow_links(false)
         .require_git(true)
+        .max_depth(Some(walk_limits.max_depth.saturating_add(1)))
         .sort_by_file_name(Ord::cmp)
         .filter_entry(move |entry| {
-            entry.depth() == 0
-                || should_descend_source_path(entry.path(), include_generated, include_vendor)
+            let is_directory = entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir());
+            if entry.depth() > 0
+                && is_directory
+                && !should_descend_source_path(entry.path(), include_generated, include_vendor)
+            {
+                return false;
+            }
+            let max_entry_depth = walk_limits
+                .max_depth
+                .saturating_add(usize::from(!is_directory));
+            if entry.depth() > max_entry_depth {
+                filter_depth_limit_hit.store(true, Ordering::Relaxed);
+                return false;
+            }
+            true
         });
 
     for entry in builder.build() {
+        if depth_limit_hit.load(Ordering::Relaxed) {
+            accumulator.mark_walk_limit();
+            break;
+        }
         if accumulator.should_stop() {
             break;
         }
         let Some(entry) = recover_walk_entry(entry, accumulator) else {
             continue;
         };
+        if entry.depth() > 0 {
+            if !accumulator.reserve_walk_entry(walk_limits.max_entries) {
+                break;
+            }
+        }
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir())
+        {
+            if !accumulator.reserve_walk_directory(walk_limits.max_directories) {
+                break;
+            }
+            continue;
+        }
         if entry
             .file_type()
             .is_some_and(|file_type| file_type.is_file())
         {
             recover_scan_result(scan_file(repo_root, entry.path(), accumulator), accumulator);
         }
+    }
+    if depth_limit_hit.load(Ordering::Relaxed) {
+        accumulator.mark_walk_limit();
     }
     Ok(())
 }
@@ -644,19 +783,206 @@ fn scan_file(
     accumulator: &mut SourceSearchAccumulator,
 ) -> anyhow::Result<()> {
     let path = resolve_confined_path(repo_root, path, "source file")?;
-    let metadata = fs::metadata(&path)?;
+    let mut file = File::open(&path)?;
+    let metadata = file.metadata()?;
     let file_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
     let relative_path = path.strip_prefix(repo_root).unwrap_or(&path);
     if !accumulator.consider_file(relative_path, file_len) {
         return Ok(());
     }
 
-    let mut bytes = Vec::with_capacity(file_len);
-    File::open(&path)?
-        .take(file_len as u64)
-        .read_to_end(&mut bytes)?;
-    accumulator.add_file_bytes(relative_path, bytes);
+    match read_open_file_stably(&mut file, &path, &metadata)? {
+        Some(bytes) => accumulator.add_file_bytes(relative_path, bytes),
+        None => accumulator.mark_file_changed_during_read(),
+    }
     Ok(())
+}
+
+fn read_open_file_stably(
+    file: &mut File,
+    path: &Path,
+    metadata_before: &fs::Metadata,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let identity_before = native_file_identity(file, metadata_before)
+        .with_context(|| format!("unable to identify source file `{}`", path.display()))?;
+    let Some(bytes) = read_open_file_once(file, path, metadata_before)? else {
+        return Ok(None);
+    };
+    let mut verification_file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("unable to reopen source file `{}`", path.display()));
+        }
+    };
+    let verification_metadata = verification_file
+        .metadata()
+        .with_context(|| format!("unable to re-inspect source file `{}`", path.display()))?;
+    let verification_identity = native_file_identity(&verification_file, &verification_metadata)
+        .with_context(|| format!("unable to re-identify source file `{}`", path.display()))?;
+    if !verification_metadata.is_file()
+        || file_metadata_changed(metadata_before, &verification_metadata)
+        || identity_before != verification_identity
+    {
+        return Ok(None);
+    }
+    let Some(verification_bytes) =
+        read_open_file_once(&mut verification_file, path, &verification_metadata)?
+    else {
+        return Ok(None);
+    };
+    if bytes != verification_bytes {
+        return Ok(None);
+    }
+    let final_file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "unable to reopen source file `{}` after reading",
+                    path.display()
+                )
+            });
+        }
+    };
+    let final_metadata = final_file
+        .metadata()
+        .with_context(|| format!("unable to finally inspect source file `{}`", path.display()))?;
+    let final_identity = native_file_identity(&final_file, &final_metadata).with_context(|| {
+        format!(
+            "unable to finally identify source file `{}`",
+            path.display()
+        )
+    })?;
+    if file_metadata_changed(&verification_metadata, &final_metadata)
+        || verification_identity != final_identity
+    {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+fn read_open_file_once(
+    file: &mut File,
+    path: &Path,
+    metadata_before: &fs::Metadata,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let expected_len = usize::try_from(metadata_before.len()).unwrap_or(usize::MAX);
+    let read_limit = SOURCE_SEARCH_MAX_FILE_BYTES.saturating_add(1);
+    let mut bytes = Vec::with_capacity(expected_len.min(SOURCE_SEARCH_MAX_FILE_BYTES));
+    Read::by_ref(file)
+        .take(read_limit as u64)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("unable to read source file `{}`", path.display()))?;
+    let metadata_after = file
+        .metadata()
+        .with_context(|| format!("unable to re-inspect source file `{}`", path.display()))?;
+    if bytes.len() != expected_len || file_metadata_changed(metadata_before, &metadata_after) {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+fn file_metadata_changed(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || before.created().ok() != after.created().ok()
+        || before.is_file() != after.is_file()
+        || before.is_dir() != after.is_dir()
+        || before.is_symlink() != after.is_symlink()
+        || platform_file_metadata_changed(before, after)
+}
+
+#[cfg(unix)]
+fn platform_file_metadata_changed(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+}
+
+#[cfg(windows)]
+fn platform_file_metadata_changed(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    before.file_attributes() != after.file_attributes()
+        || before.creation_time() != after.creation_time()
+        || before.last_write_time() != after.last_write_time()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_file_metadata_changed(_before: &fs::Metadata, _after: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn native_file_identity(_file: &File, metadata: &fs::Metadata) -> io::Result<NativeFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(NativeFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeFileIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
+}
+
+#[cfg(windows)]
+fn native_file_identity(file: &File, _metadata: &fs::Metadata) -> io::Result<NativeFileIdentity> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` owns a valid handle and `information` points to writable,
+    // correctly sized storage for the duration of the call.
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr())
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful call initialized the complete structure.
+    let information = unsafe { information.assume_init() };
+    Ok(NativeFileIdentity {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeFileIdentity;
+
+#[cfg(not(any(unix, windows)))]
+fn native_file_identity(_file: &File, _metadata: &fs::Metadata) -> io::Result<NativeFileIdentity> {
+    Ok(NativeFileIdentity)
+}
+
+fn is_changed_file_race_error(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::InvalidInput
+    )
 }
 
 fn collect_matches(
@@ -840,14 +1166,14 @@ pub fn should_scan_source_file(
     include_vendor: bool,
     include_locks: bool,
 ) -> bool {
-    if is_lockfile(path) && !include_locks {
-        return false;
-    }
     if !include_vendor && has_named_component(path, is_vendor_dir) {
         return false;
     }
     if !include_generated && has_named_component(path, is_generated_dir) {
         return false;
+    }
+    if is_lockfile(path) {
+        return include_locks;
     }
     looks_like_source_path(path)
 }
@@ -918,6 +1244,77 @@ fn looks_like_source_path(path: &Path) -> bool {
             | "css"
             | "html"
             | "txt"
+            | "go"
+            | "c"
+            | "h"
+            | "cc"
+            | "cpp"
+            | "cxx"
+            | "hh"
+            | "hpp"
+            | "hxx"
+            | "inl"
+            | "m"
+            | "mm"
+            | "cs"
+            | "java"
+            | "kt"
+            | "kts"
+            | "scala"
+            | "sc"
+            | "swift"
+            | "sql"
+            | "proto"
+            | "graphql"
+            | "gql"
+            | "rb"
+            | "php"
+            | "dart"
+            | "lua"
+            | "r"
+            | "jl"
+            | "ex"
+            | "exs"
+            | "erl"
+            | "hrl"
+            | "fs"
+            | "fsx"
+            | "fsi"
+            | "vb"
+            | "zig"
+            | "nim"
+            | "hs"
+            | "lhs"
+            | "ml"
+            | "mli"
+            | "clj"
+            | "cljs"
+            | "cljc"
+            | "edn"
+            | "groovy"
+            | "gradle"
+            | "vue"
+            | "svelte"
+            | "astro"
+            | "xml"
+            | "xsd"
+            | "xsl"
+            | "hcl"
+            | "tf"
+            | "tfvars"
+            | "nix"
+            | "cmake"
+            | "bzl"
+            | "bazel"
+            | "ini"
+            | "cfg"
+            | "conf"
+            | "properties"
+            | "thrift"
+            | "capnp"
+            | "asm"
+            | "s"
+            | "sol"
     )
 }
 
@@ -963,6 +1360,12 @@ fn print_search_human(output: &SourceSearchOutput) {
     }
     if output.truncated {
         eprintln!("source search truncated: {:?}", output.truncated_reason);
+    }
+    if output.coverage.files_changed_during_read > 0 {
+        eprintln!(
+            "source search skipped {} file(s) that changed while being read",
+            output.coverage.files_changed_during_read
+        );
     }
 }
 

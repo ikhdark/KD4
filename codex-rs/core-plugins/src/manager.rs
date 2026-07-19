@@ -411,6 +411,29 @@ impl PluginLoadCacheKey {
     }
 }
 
+fn retain_first_active_plugin_mcp_server_by_name(plugins: &mut [LoadedPlugin]) {
+    let mut winning_plugins = HashMap::<String, String>::new();
+    for plugin in plugins {
+        if !plugin.is_active() {
+            continue;
+        }
+        let plugin_config_name = plugin.config_name.clone();
+        plugin.mcp_servers.retain(|server_name, _| {
+            let Some(winning_plugin) = winning_plugins.get(server_name) else {
+                winning_plugins.insert(server_name.clone(), plugin_config_name.clone());
+                return true;
+            };
+            warn!(
+                server = %server_name,
+                winning_plugin = %winning_plugin,
+                ignored_plugin = %plugin_config_name,
+                "ignoring duplicate plugin MCP server name"
+            );
+            false
+        });
+    }
+}
+
 impl PluginsManager {
     pub fn new(codex_home: PathBuf) -> Self {
         Self::new_with_options(codex_home, Some(Product::Codex), /*auth_mode*/ None)
@@ -596,6 +619,7 @@ impl PluginsManager {
                 plugin_active,
             );
         }
+        retain_first_active_plugin_mcp_server_by_name(&mut plugins);
         PluginLoadOutcome::from_plugins(plugins)
     }
 
@@ -749,9 +773,9 @@ impl PluginsManager {
             };
             cache.as_ref().and_then(|plugins| {
                 plugins.iter().find_map(|plugin| {
-                    (plugin.name == plugin_id.plugin_name
-                        && plugin.marketplace_name == plugin_id.marketplace_name)
-                        .then(|| plugin.id.clone())
+                    (plugin.name == plugin_id.plugin_name()
+                        && plugin.marketplace_name == plugin_id.marketplace_name())
+                    .then(|| plugin.id.clone())
                 })
             })
         };
@@ -1321,7 +1345,7 @@ impl PluginsManager {
                     config_layer_stack,
                     self.codex_home.as_path(),
                     &request.marketplace_path,
-                    &resolved.plugin_id.marketplace_name,
+                    resolved.plugin_id.marketplace_name(),
                 )
         {
             let err = MarketplaceError::InvalidMarketplaceFile {
@@ -1439,7 +1463,7 @@ impl PluginsManager {
     ) -> Result<PluginInstallOutcome, PluginInstallError> {
         let auth_policy = resolved.policy.authentication;
         let plugin_version =
-            if is_openai_curated_marketplace_name(&resolved.plugin_id.marketplace_name) {
+            if is_openai_curated_marketplace_name(resolved.plugin_id.marketplace_name()) {
                 let curated_plugin_version = read_curated_plugins_sha(self.codex_home.as_path())
                     .ok_or_else(|| {
                         PluginStoreError::Invalid(
@@ -1706,7 +1730,7 @@ impl PluginsManager {
                 &config.config_layer_stack,
                 self.codex_home.as_path(),
                 &request.marketplace_path,
-                &plugin.plugin_id.marketplace_name,
+                plugin.plugin_id.marketplace_name(),
             )
             .map_err(|message| MarketplaceError::InvalidMarketplaceFile {
                 path: request.marketplace_path.to_path_buf(),
@@ -1714,12 +1738,12 @@ impl PluginsManager {
             })?;
         if !self.restriction_product_matches(plugin.policy.products.as_deref()) {
             return Err(MarketplaceError::PluginNotFound {
-                plugin_name: plugin.plugin_id.plugin_name,
-                marketplace_name: plugin.plugin_id.marketplace_name,
+                plugin_name: plugin.plugin_id.plugin_name().to_string(),
+                marketplace_name: plugin.plugin_id.marketplace_name().to_string(),
             });
         }
 
-        let marketplace_name = plugin.plugin_id.marketplace_name.clone();
+        let marketplace_name = plugin.plugin_id.marketplace_name().to_string();
         let plugin_key = plugin.plugin_id.as_key();
         let manifest_fallback = plugin
             .manifest_fallback
@@ -1738,7 +1762,7 @@ impl PluginsManager {
                 &marketplace_name,
                 ConfiguredMarketplacePlugin {
                     id: plugin_key.clone(),
-                    name: plugin.plugin_id.plugin_name,
+                    name: plugin.plugin_id.plugin_name().to_string(),
                     local_version: plugin
                         .manifest
                         .as_ref()

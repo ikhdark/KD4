@@ -4,6 +4,7 @@ use crate::agent::control::SpawnAgentOptions;
 use crate::agent::control::render_input_preview;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
+use crate::agent::role::AgentRoleModelLocks;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
@@ -69,23 +70,6 @@ async fn handle_spawn_agent(
             "Agent depth limit reached. Solve the task yourself.".to_string(),
         ));
     }
-    session
-        .emit_turn_item_started(
-            &turn,
-            &TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
-                id: call_id.clone(),
-                tool: CollabAgentTool::SpawnAgent,
-                status: CollabAgentToolCallStatus::InProgress,
-                sender_thread_id: session.thread_id,
-                receiver_thread_ids: Vec::new(),
-                receiver_agents: Vec::new(),
-                prompt: Some(prompt.clone()),
-                model: Some(args.model.clone().unwrap_or_default()),
-                reasoning_effort: Some(args.reasoning_effort.clone().unwrap_or_default()),
-                agents_states: Default::default(),
-            }),
-        )
-        .await;
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
     if let Some(service_tier) = args.service_tier.as_ref() {
@@ -97,27 +81,52 @@ async fn handle_spawn_agent(
             args.model.as_deref(),
             args.reasoning_effort.clone(),
         )?;
+    }
+    let role_model_locks = if args.fork_context {
+        AgentRoleModelLocks::default()
     } else {
-        apply_requested_spawn_agent_model_overrides(
-            &session,
-            turn.as_ref(),
-            &mut config,
-            args.model.as_deref(),
-            args.reasoning_effort.clone(),
-        )
-        .await?;
         apply_role_to_config(&mut config, role_name)
             .await
-            .map_err(FunctionCallError::RespondToModel)?;
-    }
+            .map_err(FunctionCallError::RespondToModel)?
+    };
+    apply_spawn_agent_model_defaults_and_overrides(
+        &session,
+        turn.as_ref(),
+        &mut config,
+        args.model.as_deref(),
+        args.reasoning_effort.clone(),
+        role_model_locks,
+    )
+    .await?;
     apply_spawn_agent_service_tier(
         &session,
+        turn.as_ref(),
         &mut config,
         turn.config.service_tier.as_deref(),
         args.service_tier.as_deref(),
     )
     .await?;
     apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+    let resolved_model = config.model.clone().unwrap_or_default();
+    let resolved_reasoning_effort = config.model_reasoning_effort.clone().unwrap_or_default();
+
+    session
+        .emit_turn_item_started(
+            &turn,
+            &TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
+                id: call_id.clone(),
+                tool: CollabAgentTool::SpawnAgent,
+                status: CollabAgentToolCallStatus::InProgress,
+                sender_thread_id: session.thread_id,
+                receiver_thread_ids: Vec::new(),
+                receiver_agents: Vec::new(),
+                prompt: Some(prompt.clone()),
+                model: Some(resolved_model.clone()),
+                reasoning_effort: Some(resolved_reasoning_effort.clone()),
+                agents_states: Default::default(),
+            }),
+        )
+        .await;
 
     let result = Box::pin(session.services.agent_control.spawn_agent_with_metadata(
         config,
@@ -134,6 +143,7 @@ async fn handle_spawn_agent(
             fork_mode: args.fork_context.then_some(SpawnAgentForkMode::FullHistory),
             parent_thread_id: Some(session.thread_id),
             environments: Some(turn.environments.to_selections()),
+            ..Default::default()
         },
     ))
     .await
@@ -173,11 +183,11 @@ async fn handle_spawn_agent(
     let effective_model = agent_snapshot
         .as_ref()
         .map(|snapshot| snapshot.model.clone())
-        .unwrap_or_else(|| args.model.clone().unwrap_or_default());
+        .unwrap_or(resolved_model);
     let effective_reasoning_effort = agent_snapshot
         .as_ref()
         .and_then(|snapshot| snapshot.reasoning_effort.clone())
-        .unwrap_or(args.reasoning_effort.unwrap_or_default());
+        .unwrap_or(resolved_reasoning_effort);
     let nickname = new_agent_nickname.clone();
     let receiver_thread_ids = new_thread_id.into_iter().collect();
     let receiver_agents = new_thread_id

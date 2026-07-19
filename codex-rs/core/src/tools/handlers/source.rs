@@ -26,6 +26,7 @@ use codex_file_search::source_search::read_file_span_from_bytes;
 use codex_file_search::source_search::should_descend_source_path;
 use codex_file_search::source_search::should_scan_source_file;
 use codex_file_system::ExecutorFileSystem;
+use codex_file_system::FileMetadata;
 use codex_file_system::FileSystemSandboxContext;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -220,11 +221,12 @@ async fn handle_read_file_span(
             args.path, file_len, SOURCE_SEARCH_MAX_FILE_BYTES
         )));
     }
-    let bytes = source_context
-        .fs
-        .read_file(&path, Some(&source_context.sandbox))
-        .await
-        .map_err(|err| source_fs_error("read", &path, err))?;
+    let Some(bytes) = read_source_file_stably(&source_context, &path, &metadata).await? else {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "source file `{}` changed while it was being read; retry the read",
+            args.path
+        )));
+    };
     let relative_path = relative_source_path(&source_context, &path)?;
     let output = read_file_span_from_bytes(
         relative_path,
@@ -399,17 +401,13 @@ async fn scan_source_root(
     }
 
     let mut queue = VecDeque::from([(root.clone(), 0usize)]);
-    let mut directories_seen = 0usize;
-    let mut entries_seen = 0usize;
     while let Some((directory, depth)) = queue.pop_front() {
         if accumulator.should_stop() {
             break;
         }
-        if directories_seen >= SOURCE_SEARCH_MAX_WALK_DIRECTORIES {
-            accumulator.mark_walk_limit();
+        if !accumulator.reserve_walk_directory(SOURCE_SEARCH_MAX_WALK_DIRECTORIES) {
             break;
         }
-        directories_seen = directories_seen.saturating_add(1);
         let entries_result = context
             .fs
             .read_directory(&directory, Some(&context.sandbox))
@@ -428,11 +426,9 @@ async fn scan_source_root(
             if accumulator.should_stop() {
                 break;
             }
-            if entries_seen >= SOURCE_SEARCH_MAX_WALK_ENTRIES {
-                accumulator.mark_walk_limit();
+            if !accumulator.reserve_walk_entry(SOURCE_SEARCH_MAX_WALK_ENTRIES) {
                 return Ok(());
             }
-            entries_seen = entries_seen.saturating_add(1);
             let Some(child) = recover_scan_result(directory.join(&entry.file_name), accumulator)
             else {
                 continue;
@@ -549,13 +545,56 @@ async fn add_source_file(
     if !accumulator.consider_file(Path::new(&relative), file_len) {
         return Ok(());
     }
-    let bytes = context
-        .fs
-        .read_file(path, Some(&context.sandbox))
-        .await
-        .map_err(|err| source_fs_error("read", path, err))?;
-    accumulator.add_file_bytes(Path::new(&relative), bytes);
+    match read_source_file_stably(context, path, &metadata).await? {
+        Some(bytes) => accumulator.add_file_bytes(Path::new(&relative), bytes),
+        None => accumulator.mark_file_changed_during_read(),
+    }
     Ok(())
+}
+
+async fn read_source_file_stably(
+    context: &LocalSourceContext,
+    path: &PathUri,
+    metadata_before: &FileMetadata,
+) -> Result<Option<Vec<u8>>, FunctionCallError> {
+    let expected_len = usize::try_from(metadata_before.size).unwrap_or(usize::MAX);
+    let bytes = match context
+        .fs
+        .read_file_bounded(path, SOURCE_SEARCH_MAX_FILE_BYTES, Some(&context.sandbox))
+        .await
+    {
+        Ok(bytes) => bytes,
+        Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
+        Err(err) => return Err(source_fs_error("read", path, err)),
+    };
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    let metadata_after = match context.fs.get_metadata(path, Some(&context.sandbox)).await {
+        Ok(metadata) => metadata,
+        Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
+        Err(err) => return Err(source_fs_error("re-inspect", path, err)),
+    };
+    if bytes.len() != expected_len || source_metadata_changed(metadata_before, &metadata_after) {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+fn source_metadata_changed(before: &FileMetadata, after: &FileMetadata) -> bool {
+    before.size != after.size
+        || before.created_at_ms != after.created_at_ms
+        || before.modified_at_ms != after.modified_at_ms
+        || before.is_file != after.is_file
+        || before.is_directory != after.is_directory
+        || before.is_symlink != after.is_symlink
+}
+
+fn is_changed_file_race_error(kind: ErrorKind) -> bool {
+    matches!(
+        kind,
+        ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::InvalidInput
+    )
 }
 
 fn recover_scan_result<T, E>(
@@ -611,10 +650,11 @@ fn render_search_output_inner(output: &SourceSearchOutput, render_truncated: boo
         "Source search evidence:".to_string(),
         format!("query: {}", output.query),
         format!(
-            "coverage: files={} skipped_too_large={} skipped_non_utf8={} filesystem_errors={} bytes={} total_matches={} returned={} truncated={}",
+            "coverage: files={} skipped_too_large={} skipped_non_utf8={} changed_during_read={} filesystem_errors={} bytes={} total_matches={} returned={} truncated={}",
             output.coverage.files_scanned,
             output.coverage.files_skipped_too_large,
             output.coverage.files_skipped_non_utf8,
+            output.coverage.files_changed_during_read,
             output.coverage.filesystem_errors,
             output.coverage.bytes_scanned,
             output.coverage.total_matches,

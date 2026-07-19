@@ -177,6 +177,7 @@ impl Cursor {
 /// pagination.
 struct AnchorState {
     ts: OffsetDateTime,
+    id: Option<Uuid>,
     passed: bool,
 }
 
@@ -185,20 +186,28 @@ impl AnchorState {
         match anchor {
             Some(cursor) => Self {
                 ts: cursor.ts,
+                id: cursor
+                    .id
+                    .and_then(|id| Uuid::parse_str(id.to_string().as_str()).ok()),
                 passed: false,
             },
             None => Self {
                 ts: OffsetDateTime::UNIX_EPOCH,
+                id: None,
                 passed: true,
             },
         }
     }
 
-    fn should_skip(&mut self, ts: OffsetDateTime, _id: Uuid) -> bool {
+    fn should_skip(&mut self, ts: OffsetDateTime, id: Uuid) -> bool {
         if self.passed {
             return false;
         }
-        if ts < self.ts {
+        let passed_anchor = match self.id {
+            Some(anchor_id) => (ts, id) < (self.ts, anchor_id),
+            None => ts < self.ts,
+        };
+        if passed_anchor {
             self.passed = true;
             false
         } else {
@@ -758,13 +767,10 @@ fn build_next_cursor(items: &[ThreadItem], sort_key: ThreadSortKey) -> Option<Cu
             OffsetDateTime::parse(recency_at, &Rfc3339).ok()?
         }
     };
-    match sort_key {
-        ThreadSortKey::RecencyAt => Some(Cursor::with_thread_id(
-            ts,
-            ThreadId::from_string(&id.to_string()).ok()?,
-        )),
-        ThreadSortKey::CreatedAt | ThreadSortKey::UpdatedAt => Some(Cursor::new(ts)),
-    }
+    Some(Cursor::with_thread_id(
+        ts,
+        ThreadId::from_string(&id.to_string()).ok()?,
+    ))
 }
 
 async fn build_thread_item(

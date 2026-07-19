@@ -117,11 +117,14 @@ async fn try_init_with_roots_inner(
                 )
             })?;
     let backfill_gate_started = Instant::now();
-    let backfill_gate_result = wait_for_backfill_gate(
-        runtime.as_ref(),
+    let backfill_gate_result = wait_for_backfill_gate_with_timeout(
         codex_home.as_path(),
-        default_model_provider_id.as_str(),
-        backfill_lease_seconds,
+        wait_for_backfill_gate(
+            runtime.as_ref(),
+            codex_home.as_path(),
+            default_model_provider_id.as_str(),
+            backfill_lease_seconds,
+        ),
     )
     .await;
     codex_state::record_backfill_gate(
@@ -136,13 +139,26 @@ async fn try_init_with_roots_inner(
     Ok(runtime)
 }
 
+async fn wait_for_backfill_gate_with_timeout(
+    codex_home: &Path,
+    wait: impl std::future::Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    match tokio::time::timeout(STARTUP_BACKFILL_WAIT_TIMEOUT, wait).await {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "timed out waiting for state db backfill at {} after {:?}",
+            codex_home.display(),
+            STARTUP_BACKFILL_WAIT_TIMEOUT,
+        )),
+    }
+}
+
 async fn wait_for_backfill_gate(
     runtime: &codex_state::StateRuntime,
     codex_home: &Path,
     default_model_provider_id: &str,
     backfill_lease_seconds: Option<i64>,
 ) -> anyhow::Result<()> {
-    let wait_started = Instant::now();
     let mut reported_wait = false;
     loop {
         let backfill_state = runtime.get_backfill_state().await.map_err(|err| {
@@ -175,15 +191,12 @@ async fn wait_for_backfill_gate(
         if backfill_state.status == codex_state::BackfillStatus::Complete {
             return Ok(());
         }
-        if wait_started.elapsed() >= STARTUP_BACKFILL_WAIT_TIMEOUT {
+        if backfill_state.status == codex_state::BackfillStatus::Pending {
             return Err(anyhow::anyhow!(
-                "timed out waiting for state db backfill at {} after {:?} (status: {})",
+                "state db backfill remains incomplete at {}; falling back until a later startup retry",
                 codex_home.display(),
-                STARTUP_BACKFILL_WAIT_TIMEOUT,
-                backfill_state.status.as_str()
             ));
         }
-
         let message = format!(
             "state db backfill is {} at {}; waiting up to {:?} before retrying startup initialization",
             backfill_state.status.as_str(),

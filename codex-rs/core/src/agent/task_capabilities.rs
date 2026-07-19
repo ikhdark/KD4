@@ -220,7 +220,15 @@ pub(crate) fn classify_typed_tool(
     if matches_name(name, &["git_diff"]) {
         return TypedToolClass::Diff;
     }
-    if matches_name(name, &["shell_command", "exec_command", "write_stdin"]) {
+    if matches_name(
+        name,
+        &[
+            "shell_command",
+            "exec_command",
+            "write_stdin",
+            "verify_local",
+        ],
+    ) {
         return TypedToolClass::Shell;
     }
     if name == "apply_patch" {
@@ -234,9 +242,9 @@ pub(crate) fn classify_typed_tool(
 
 /// Applies the typed capability profile to a classified tool call.
 ///
-/// Shell authorization is intentionally separate from shell write authorization. A later runtime
-/// hook must intersect the central filesystem sandbox with the assignment policy. Source mutation
-/// is authorized here only for structured edits whose complete path set is in scope.
+/// Shell authorization is intentionally coarse here. The shell handler admits only commands that
+/// the shared command-safety classifier proves read-only, plus the bounded `verify_local` tool.
+/// Source mutation is authorized only for structured edits whose complete path set is in scope.
 pub(crate) fn authorize_typed_tool(
     assignment: &Assignment,
     repo_root: &Path,
@@ -378,7 +386,10 @@ pub(crate) fn derive_risk_policy(
 fn classify_collaboration_tool(name: &str) -> TypedToolClass {
     if matches_name(name, &["send_message", "wait_agent", "list_agents"]) {
         TypedToolClass::AgentCommunication
-    } else if matches_name(name, &["get_agent_task", "submit_agent_receipt"]) {
+    } else if matches_name(
+        name,
+        &["get_agent_task", "submit_agent_receipt", "set_agent_gate"],
+    ) {
         TypedToolClass::OwnTask
     } else if matches_name(
         name,
@@ -476,6 +487,56 @@ fn normalize_repo_relative_path(
     let canonical_root = canonical_repository_root(repo_root)?;
     ensure_canonical_containment(&canonical_root, &normalized, path)?;
     Ok(normalized)
+}
+
+/// Converts one absolute local path into the repository-relative identity used by typed-task
+/// scopes. Windows path prefixes and components are compared case-insensitively, while the
+/// returned spelling remains stable for evidence and receipt display.
+pub(crate) fn normalize_absolute_repo_path(
+    repo_root: &Path,
+    path: &Path,
+) -> Result<String, CapabilityPolicyError> {
+    if !repo_root.is_absolute() || !path.is_absolute() {
+        return Err(invalid_path(
+            &path.to_string_lossy(),
+            "repository root and target must both be absolute",
+        ));
+    }
+
+    let relative = if cfg!(windows) {
+        let root_components = repo_root.components().collect::<Vec<_>>();
+        let path_components = path.components().collect::<Vec<_>>();
+        if path_components.len() < root_components.len()
+            || !path_components
+                .iter()
+                .zip(&root_components)
+                .all(|(candidate, root)| {
+                    candidate
+                        .as_os_str()
+                        .to_string_lossy()
+                        .eq_ignore_ascii_case(&root.as_os_str().to_string_lossy())
+                })
+        {
+            return Err(invalid_path(
+                &path.to_string_lossy(),
+                "absolute path is outside the assignment repository",
+            ));
+        }
+        path_components[root_components.len()..]
+            .iter()
+            .map(|component| component.as_os_str())
+            .collect::<PathBuf>()
+    } else {
+        path.strip_prefix(repo_root)
+            .map(Path::to_path_buf)
+            .map_err(|_| {
+                invalid_path(
+                    &path.to_string_lossy(),
+                    "absolute path is outside the assignment repository",
+                )
+            })?
+    };
+    normalize_repo_relative_path(repo_root, &relative.to_string_lossy())
 }
 
 fn normalize_repo_path_lexically(path: &str) -> Result<String, CapabilityPolicyError> {

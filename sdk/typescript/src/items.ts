@@ -71,6 +71,40 @@ export type McpToolCallItem = {
   status: McpToolCallStatus;
 };
 
+/** The status of a collaboration tool call. */
+export type CollabToolCallStatus = "in_progress" | "completed" | "failed";
+
+/** Supported collaboration tools. */
+export type CollabTool = "spawn_agent" | "send_input" | "resume_agent" | "wait" | "close_agent";
+
+/** The status of a collaboration agent. */
+export type CollabAgentStatus =
+  | "pending_init"
+  | "running"
+  | "interrupted"
+  | "completed"
+  | "errored"
+  | "shutdown"
+  | "not_found";
+
+/** Last known state of a collaboration agent. */
+export type CollabAgentState = {
+  status: CollabAgentStatus;
+  message: string | null;
+};
+
+/** A call to a collaboration tool. */
+export type CollabToolCallItem = {
+  id: string;
+  type: "collab_tool_call";
+  tool: CollabTool;
+  sender_thread_id: string;
+  receiver_thread_ids: string[];
+  prompt: string | null;
+  agents_states: Record<string, CollabAgentState>;
+  status: CollabToolCallStatus;
+};
+
 /** Response from the agent. Either natural-language text or JSON when structured output is requested. */
 export type AgentMessageItem = {
   id: string;
@@ -123,6 +157,7 @@ export type ThreadItem =
   | CommandExecutionItem
   | FileChangeItem
   | McpToolCallItem
+  | CollabToolCallItem
   | WebSearchItem
   | TodoListItem
   | ErrorItem;

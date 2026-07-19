@@ -78,6 +78,24 @@ WHERE id = 1
         Ok(())
     }
 
+    /// Release rollout metadata backfill ownership while preserving its last
+    /// contiguous successful watermark so a later worker can retry.
+    pub async fn mark_backfill_pending(&self) -> anyhow::Result<()> {
+        self.ensure_backfill_state_row().await?;
+        sqlx::query(
+            r#"
+UPDATE backfill_state
+SET status = ?, updated_at = ?
+WHERE id = 1
+            "#,
+        )
+        .bind(crate::BackfillStatus::Pending.as_str())
+        .bind(Utc::now().timestamp())
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(())
+    }
+
     /// Mark rollout metadata backfill as complete.
     pub async fn mark_backfill_complete(&self, last_watermark: Option<&str>) -> anyhow::Result<()> {
         self.ensure_backfill_state_row().await?;
@@ -150,6 +168,17 @@ mod tests {
             Some("sessions/2026/01/27/rollout-a.jsonl".to_string())
         );
         assert_eq!(running.last_success_at, None);
+
+        runtime
+            .mark_backfill_pending()
+            .await
+            .expect("release incomplete backfill");
+        let pending = runtime
+            .get_backfill_state()
+            .await
+            .expect("get pending backfill state");
+        assert_eq!(pending.status, crate::BackfillStatus::Pending);
+        assert_eq!(pending.last_watermark, running.last_watermark);
 
         runtime
             .mark_backfill_complete(Some("sessions/2026/01/28/rollout-b.jsonl"))

@@ -43,7 +43,7 @@ impl AgentGraphStore for LocalAgentGraphStore {
                     to_state_status(status),
                 )
                 .await
-                .map_err(internal_error)
+                .map_err(thread_spawn_edge_write_error)
         })
     }
 
@@ -56,7 +56,7 @@ impl AgentGraphStore for LocalAgentGraphStore {
             self.state_db
                 .set_thread_spawn_edge_status(child_thread_id, to_state_status(status))
                 .await
-                .map_err(internal_error)
+                .map_err(|err| internal_error("update thread-spawn edge status", err))
         })
     }
 
@@ -74,13 +74,13 @@ impl AgentGraphStore for LocalAgentGraphStore {
                         to_state_status(status),
                     )
                     .await
-                    .map_err(internal_error);
+                    .map_err(|err| internal_error("list thread-spawn children by status", err));
             }
 
             self.state_db
                 .list_thread_spawn_children(parent_thread_id)
                 .await
-                .map_err(internal_error)
+                .map_err(|err| internal_error("list thread-spawn children", err))
         })
     }
 
@@ -98,12 +98,12 @@ impl AgentGraphStore for LocalAgentGraphStore {
                         to_state_status(status),
                     )
                     .await
-                    .map_err(internal_error),
+                    .map_err(|err| internal_error("list thread-spawn descendants by status", err)),
                 None => self
                     .state_db
                     .list_thread_spawn_descendants(root_thread_id)
                     .await
-                    .map_err(internal_error),
+                    .map_err(|err| internal_error("list thread-spawn descendants", err)),
             }
         })
     }
@@ -116,9 +116,21 @@ fn to_state_status(status: ThreadSpawnEdgeStatus) -> codex_state::DirectionalThr
     }
 }
 
-fn internal_error(err: impl std::fmt::Display) -> AgentGraphStoreError {
+fn thread_spawn_edge_write_error(
+    err: codex_state::ThreadSpawnEdgeWriteError,
+) -> AgentGraphStoreError {
+    match err {
+        codex_state::ThreadSpawnEdgeWriteError::InvalidRequest { message } => {
+            AgentGraphStoreError::InvalidRequest { message }
+        }
+        err => internal_error("upsert thread-spawn edge", err),
+    }
+}
+
+fn internal_error(operation: &'static str, err: impl Into<anyhow::Error>) -> AgentGraphStoreError {
     AgentGraphStoreError::Internal {
-        message: err.to_string(),
+        operation,
+        source: err.into(),
     }
 }
 
@@ -239,6 +251,19 @@ mod tests {
             .await
             .expect("closed children should load");
         assert_eq!(closed_children, vec![child_thread_id]);
+    }
+
+    #[tokio::test]
+    async fn local_store_reports_invalid_topology_as_invalid_request() {
+        let fixture = state_runtime().await;
+        let store = LocalAgentGraphStore::new(fixture.state_db);
+        let thread_id = thread_id(/*suffix*/ 12);
+
+        let error = store
+            .upsert_thread_spawn_edge(thread_id, thread_id, ThreadSpawnEdgeStatus::Open)
+            .await
+            .expect_err("self-parent edge should be rejected");
+        assert!(matches!(error, AgentGraphStoreError::InvalidRequest { .. }));
     }
 
     #[tokio::test]

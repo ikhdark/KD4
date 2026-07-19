@@ -1316,6 +1316,11 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         "wait_agent",
         "interrupt_agent",
         "list_agents",
+        "get_agent_task",
+        "submit_agent_receipt",
+        "amend_agent_task",
+        "waive_agent_gate",
+        "abandon_agent_task",
         "send_input",
         "resume_agent",
         "assign_task",
@@ -1328,6 +1333,10 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         "wait_agent",
         "interrupt_agent",
         "list_agents",
+        "get_agent_task",
+        "amend_agent_task",
+        "waive_agent_gate",
+        "abandon_agent_task",
     ] {
         assert!(
             v2.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
@@ -1336,6 +1345,12 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
             "expected {tool_name} in {MULTI_AGENT_V2_NAMESPACE} namespace"
         );
     }
+    assert!(
+        !v2.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
+            .iter()
+            .any(|name| name == "submit_agent_receipt"),
+        "expected submit_agent_receipt to be hidden from the root agent"
+    );
     let ToolSpec::Namespace(namespace) = v2.visible_spec(MULTI_AGENT_V2_NAMESPACE) else {
         panic!("expected {MULTI_AGENT_V2_NAMESPACE} namespace");
     };
@@ -1354,6 +1369,31 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
     assert!(spawn_agent_description.contains(
         "Note that passing `fork_turns=\"none\"` will not pass any surrounding context to the spawned subagent"
     ));
+
+    let v2_subagent = probe(|turn| {
+        set_feature(turn, Feature::MultiAgentV2, /*enabled*/ true);
+        turn.session_source =
+            SessionSource::SubAgent(SubAgentSource::Other("typed-task-test".to_string()));
+    })
+    .await;
+    for tool_name in ["get_agent_task", "submit_agent_receipt"] {
+        assert!(
+            v2_subagent
+                .namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
+                .iter()
+                .any(|name| name == tool_name),
+            "expected {tool_name} in the subagent {MULTI_AGENT_V2_NAMESPACE} namespace"
+        );
+    }
+    for tool_name in ["amend_agent_task", "waive_agent_gate", "abandon_agent_task"] {
+        assert!(
+            !v2_subagent
+                .namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
+                .iter()
+                .any(|name| name == tool_name),
+            "expected {tool_name} to be hidden from subagents"
+        );
+    }
 
     let direct_model_only = probe(|turn| {
         set_features(
@@ -1500,6 +1540,10 @@ async fn multi_agent_v2_can_use_configured_tool_namespace() {
         "wait_agent",
         "interrupt_agent",
         "list_agents",
+        "get_agent_task",
+        "amend_agent_task",
+        "waive_agent_gate",
+        "abandon_agent_task",
     ] {
         namespaced.assert_visible_lacks(&[tool_name]);
         assert!(
@@ -1591,6 +1635,10 @@ async fn code_mode_only_can_expose_namespaced_multi_agent_v2_as_normal_tools() {
         "wait_agent",
         "interrupt_agent",
         "list_agents",
+        "get_agent_task",
+        "amend_agent_task",
+        "waive_agent_gate",
+        "abandon_agent_task",
     ] {
         assert!(
             plan.namespace_function_names("agents")

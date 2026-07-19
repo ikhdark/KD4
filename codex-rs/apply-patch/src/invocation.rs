@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use codex_exec_server::ExecutorFileSystem;
@@ -194,6 +195,29 @@ async fn try_verify_apply_patch_args(
         .map(|dir| cwd.join(dir))
         .transpose()?
         .unwrap_or_else(|| cwd.clone());
+
+    let mut mutation_endpoints = HashSet::new();
+    for hunk in &hunks {
+        let source_path = hunk.resolve_path(&effective_cwd)?;
+        let move_path = match hunk {
+            Hunk::UpdateFile {
+                move_path: Some(move_path),
+                ..
+            } => Some(effective_cwd.join(&move_path.to_string_lossy())?),
+            _ => None,
+        };
+
+        for path in std::iter::once(source_path).chain(move_path) {
+            if !mutation_endpoints.insert(path.clone()) {
+                return Err(ParseError::InvalidPatchError(format!(
+                    "path '{}' is mutated more than once in the same patch",
+                    path.inferred_native_path_string()
+                ))
+                .into());
+            }
+        }
+    }
+
     let mut changes = HashMap::new();
     for hunk in hunks {
         let path = hunk.resolve_path(&effective_cwd)?;
@@ -405,6 +429,19 @@ mod tests {
     /// Helper to construct a patch with the given body.
     fn wrap_patch(body: &str) -> String {
         format!("*** Begin Patch\n{body}\n*** End Patch")
+    }
+
+    fn assert_duplicate_path_error(result: MaybeApplyPatchVerified, expected_path: &PathUri) {
+        let expected_message = format!(
+            "path '{}' is mutated more than once in the same patch",
+            expected_path.inferred_native_path_string()
+        );
+        match result {
+            MaybeApplyPatchVerified::CorrectnessError(ApplyPatchError::ParseError(
+                ParseError::InvalidPatchError(message),
+            )) => assert_eq!(message, expected_message),
+            other => panic!("expected duplicate path error, got {other:?}"),
+        }
     }
 
     fn strs_to_strings(strs: &[&str]) -> Vec<String> {
@@ -810,6 +847,63 @@ PATCH"#,
     }
 
     #[tokio::test]
+    async fn test_unified_diff_insert_after_named_context() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("context.txt");
+        fs::write(&path, "fn first() {\n}\n\nfn second() {\n}\n").unwrap();
+
+        let patch = wrap_patch(&format!(
+            r#"*** Update File: {}
+@@ fn first() {{
++    newly_inserted();"#,
+            path.display()
+        ));
+        let patch = parse_patch(&patch).unwrap();
+        let chunks = match patch.hunks.as_slice() {
+            [Hunk::UpdateFile { chunks, .. }] => chunks,
+            _ => panic!("Expected a single UpdateFile hunk"),
+        };
+
+        let path_uri = PathUri::from_host_native_path(&path).expect("absolute test path");
+        let diff =
+            unified_diff_from_chunks(&path_uri, chunks, LOCAL_FS.as_ref(), /*sandbox*/ None)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            diff.content,
+            "fn first() {\n    newly_inserted();\n}\n\nfn second() {\n}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unified_diff_insert_at_eof_preserves_multiple_newlines() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("multiple-newlines.txt");
+        fs::write(&path, "foo\n\n\n").unwrap();
+
+        let patch = wrap_patch(&format!(
+            r#"*** Update File: {}
+@@
++quux"#,
+            path.display()
+        ));
+        let patch = parse_patch(&patch).unwrap();
+        let chunks = match patch.hunks.as_slice() {
+            [Hunk::UpdateFile { chunks, .. }] => chunks,
+            _ => panic!("Expected a single UpdateFile hunk"),
+        };
+
+        let path_uri = PathUri::from_host_native_path(&path).expect("absolute test path");
+        let diff =
+            unified_diff_from_chunks(&path_uri, chunks, LOCAL_FS.as_ref(), /*sandbox*/ None)
+                .await
+                .unwrap();
+
+        assert_eq!(diff.content, "foo\n\n\nquux\n");
+    }
+
+    #[tokio::test]
     async fn test_apply_patch_should_resolve_absolute_paths_in_cwd() {
         let session_dir = tempdir().unwrap();
         let relative_path = "source.txt";
@@ -919,6 +1013,113 @@ PATCH"#,
             }
             other => panic!("expected update change, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_verify_rejects_move_then_add_for_the_same_source() {
+        let dir = tempdir().unwrap();
+        let worktree = dir.path().join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        fs::write(worktree.join("src.txt"), "old\n").unwrap();
+        let cwd = PathUri::from_host_native_path(&worktree).expect("absolute test path");
+        let patch = wrap_patch(
+            "*** Update File: src.txt\n*** Move to: ../outside.txt\n@@\n-old\n+moved\n*** Add File: src.txt\n+replacement",
+        );
+
+        let result = verify_apply_patch_args(
+            parse_patch(&patch).unwrap(),
+            &cwd,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await;
+
+        assert_duplicate_path_error(result, &cwd.join("src.txt").unwrap());
+        assert_eq!(
+            fs::read_to_string(worktree.join("src.txt")).unwrap(),
+            "old\n"
+        );
+        assert!(!dir.path().join("outside.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_verify_rejects_duplicate_path_before_reading_source() {
+        let dir = tempdir().unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute test path");
+        let patch = wrap_patch(
+            "*** Update File: missing.txt\n*** Move to: ../outside.txt\n@@\n-old\n+moved\n*** Add File: missing.txt\n+replacement",
+        );
+
+        let result = verify_apply_patch_args(
+            parse_patch(&patch).unwrap(),
+            &cwd,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await;
+
+        assert_duplicate_path_error(result, &cwd.join("missing.txt").unwrap());
+        assert!(!dir.path().join("missing.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_verify_rejects_move_then_delete_for_the_destination() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.txt"), "old\n").unwrap();
+        fs::write(dir.path().join("b.txt"), "existing\n").unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute test path");
+        let patch = wrap_patch(
+            "*** Update File: a.txt\n*** Move to: b.txt\n@@\n-old\n+moved\n*** Delete File: b.txt",
+        );
+
+        let result = verify_apply_patch_args(
+            parse_patch(&patch).unwrap(),
+            &cwd,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await;
+
+        assert_duplicate_path_error(result, &cwd.join("b.txt").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_verify_rejects_add_then_update_for_the_same_path() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("same.txt"), "old\n").unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute test path");
+        let patch = wrap_patch(
+            "*** Add File: same.txt\n+intermediate\n*** Update File: same.txt\n@@\n-old\n+new",
+        );
+
+        let result = verify_apply_patch_args(
+            parse_patch(&patch).unwrap(),
+            &cwd,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await;
+
+        assert_duplicate_path_error(result, &cwd.join("same.txt").unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_verify_rejects_move_to_the_same_resolved_path() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("same.txt"), "old\n").unwrap();
+        let cwd = PathUri::from_host_native_path(dir.path()).expect("absolute test path");
+        let patch =
+            wrap_patch("*** Update File: same.txt\n*** Move to: ./same.txt\n@@\n-old\n+new");
+
+        let result = verify_apply_patch_args(
+            parse_patch(&patch).unwrap(),
+            &cwd,
+            LOCAL_FS.as_ref(),
+            /*sandbox*/ None,
+        )
+        .await;
+
+        assert_duplicate_path_error(result, &cwd.join("same.txt").unwrap());
     }
 
     #[tokio::test]

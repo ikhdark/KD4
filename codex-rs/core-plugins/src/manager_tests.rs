@@ -314,30 +314,39 @@ path = {:?}
 }
 
 fn write_auth_projection_plugin(codex_home: &Path, name: &str, include_app: bool) {
+    write_auth_projection_plugin_with_server(codex_home, name, name, include_app.then_some(name));
+}
+
+fn write_auth_projection_plugin_with_server(
+    codex_home: &Path,
+    plugin_name: &str,
+    server_name: &str,
+    app_name: Option<&str>,
+) {
     let plugin_root = codex_home
         .join("plugins/cache")
         .join("test")
-        .join(name)
+        .join(plugin_name)
         .join("local");
     write_file(
         &plugin_root.join(".codex-plugin/plugin.json"),
-        &format!(r#"{{"name":"{name}"}}"#),
+        &format!(r#"{{"name":"{plugin_name}"}}"#),
     );
     write_file(
         &plugin_root.join(".mcp.json"),
         &format!(
             r#"{{
   "mcpServers": {{
-    "{name}": {{
+    "{server_name}": {{
       "type": "stdio",
-      "command": "{name}-mcp"
+      "command": "{plugin_name}-mcp"
     }}
   }}
 }}"#
         ),
     );
-    if include_app {
-        write_auth_projection_app(codex_home, name, name);
+    if let Some(app_name) = app_name {
+        write_auth_projection_app(codex_home, plugin_name, app_name);
     }
 }
 
@@ -512,6 +521,56 @@ async fn plugin_auth_projection_keeps_non_conflicting_mcp_with_chatgpt_apps_rout
         sample.app_connector_ids,
         vec![AppConnectorId("connector_sample".to_string())]
     );
+}
+
+#[tokio::test]
+async fn duplicate_mcp_servers_resolve_after_auth_dependent_app_routing() {
+    let codex_home = TempDir::new().unwrap();
+    write_auth_projection_plugin_with_server(codex_home.path(), "alpha", "shared", Some("shared"));
+    write_auth_projection_plugin_with_server(codex_home.path(), "beta", "shared", None);
+    write_file(
+        &codex_home.path().join(CONFIG_TOML_FILE),
+        r#"[features]
+plugins = true
+
+[plugins."alpha@test"]
+enabled = true
+
+[plugins."beta@test"]
+enabled = true
+"#,
+    );
+    let config = load_config(codex_home.path(), codex_home.path()).await;
+
+    for (auth_mode, expected_owner) in [
+        (AuthMode::ApiKey, "alpha@test"),
+        (AuthMode::Chatgpt, "beta@test"),
+    ] {
+        let manager = PluginsManager::new_with_options(
+            codex_home.path().to_path_buf(),
+            Some(Product::Codex),
+            Some(auth_mode),
+        );
+
+        let outcome = manager.plugins_for_config(&config).await;
+        let owners = outcome
+            .capability_summaries()
+            .iter()
+            .filter(|plugin| {
+                plugin
+                    .mcp_server_names
+                    .iter()
+                    .any(|server_name| server_name == "shared")
+            })
+            .map(|plugin| plugin.config_name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(owners, vec![expected_owner]);
+        assert_eq!(
+            sorted_effective_mcp_server_names(&outcome),
+            vec!["shared".to_string()]
+        );
+    }
 }
 
 #[tokio::test]

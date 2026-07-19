@@ -37,7 +37,7 @@ fn model_preset(id: &str, show_in_picker: bool) -> ModelPreset {
 }
 
 #[test]
-fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
+fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
     let tool = create_spawn_agent_tool_v2(SpawnAgentToolOptions {
         available_models: vec![
             model_preset("visible", /*show_in_picker*/ true),
@@ -67,18 +67,20 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         .expect("spawn_agent should use object params");
     assert!(description.contains("Spawns an agent to work on the specified task."));
     assert!(description.contains("The spawned agent will have the same tools as you"));
+    assert!(description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE));
     assert!(!description.contains("max_concurrent_threads_per_session"));
-    assert!(description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
+    assert!(description.contains(&spawn_agent_default_guidance()));
     assert!(
         description
-            .contains("Available model overrides (optional; inherited parent model is preferred):")
+            .contains("Available model overrides (optional; `gpt-5.6-sol` is the spawn default):")
     );
     assert!(description.contains(
-        "- `visible-model`: visible description Reasoning efforts: medium (default). Service tiers: priority."
+        "- `visible-model`: visible description Reasoning efforts: medium (catalog default). Service tiers: priority."
     ));
     assert!(!description.contains("hidden-model"));
     assert!(properties.contains_key("task_name"));
     assert!(properties.contains_key("message"));
+    assert!(properties.contains_key("assignment"));
     assert_eq!(
         properties
             .get("message")
@@ -86,6 +88,14 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         Some(true)
     );
     assert!(properties.contains_key("fork_turns"));
+    assert!(
+        properties
+            .get("fork_turns")
+            .and_then(|schema| schema.description.as_deref())
+            .is_some_and(|description| {
+                description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE)
+            })
+    );
     assert!(!properties.contains_key("items"));
     assert!(!properties.contains_key("fork_context"));
     assert_eq!(
@@ -96,7 +106,13 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
         properties
             .get("model")
             .and_then(|schema| schema.description.as_deref()),
-        Some(SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION)
+        Some(spawn_agent_model_override_description().as_str())
+    );
+    assert_eq!(
+        properties
+            .get("reasoning_effort")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(spawn_agent_reasoning_override_description().as_str())
     );
     assert_eq!(
         properties
@@ -106,11 +122,13 @@ fn spawn_agent_tool_v2_requires_task_name_and_lists_visible_models() {
     );
     assert_eq!(
         parameters.required.as_ref(),
-        Some(&vec!["task_name".to_string(), "message".to_string()])
+        Some(&vec!["task_name".to_string()])
     );
+    let output_schema = output_schema.expect("spawn_agent output schema");
+    assert_eq!(output_schema["required"], json!(["task_name", "nickname"]));
     assert_eq!(
-        output_schema.expect("spawn_agent output schema")["required"],
-        json!(["task_name", "nickname"])
+        output_schema["properties"]["assignment_id"]["type"],
+        json!("string")
     );
 }
 
@@ -143,6 +161,14 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
 
     assert!(properties.contains_key("fork_context"));
     assert!(!properties.contains_key("fork_turns"));
+    assert!(
+        properties
+            .get("fork_context")
+            .and_then(|schema| schema.description.as_deref())
+            .is_some_and(|description| {
+                description.contains(SPAWN_AGENT_V1_FULL_HISTORY_OVERRIDE_GUIDANCE)
+            })
+    );
     assert_eq!(
         properties
             .get("message")
@@ -153,7 +179,13 @@ fn spawn_agent_tool_v1_keeps_legacy_fork_context_field() {
         properties
             .get("model")
             .and_then(|schema| schema.description.as_deref()),
-        Some(SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION)
+        Some(spawn_agent_model_override_description().as_str())
+    );
+    assert_eq!(
+        properties
+            .get("reasoning_effort")
+            .and_then(|schema| schema.description.as_deref()),
+        Some(spawn_agent_reasoning_override_description().as_str())
     );
     assert_eq!(
         properties
@@ -207,7 +239,7 @@ fn spawn_agent_tool_caps_reasoning_effort_value_length() {
     assert_eq!(
         spawn_agent_models_description(&[model]),
         format!(
-            "Available model overrides (optional; inherited parent model is preferred):\n- `visible-model`: visible description Reasoning efforts: {} (default). Service tiers: priority.",
+            "Available model overrides (optional; `{DEFAULT_SPAWN_AGENT_MODEL}` is the spawn default):\n- `visible-model`: visible description Reasoning efforts: {} (catalog default). Service tiers: priority.",
             "é".repeat(MAX_REASONING_EFFORT_CHARS_IN_SPAWN_AGENT_DESCRIPTION)
         )
     );
@@ -235,12 +267,25 @@ fn spawn_agent_tool_hides_service_tier_with_spawn_metadata() {
         .as_ref()
         .expect("spawn_agent should use object params");
 
-    assert!(!properties.contains_key("agent_type"));
+    assert_eq!(
+        properties.get("agent_type"),
+        Some(&JsonSchema::string(Some("role help".to_string())))
+    );
+    assert!(properties.contains_key("assignment"));
     assert!(!properties.contains_key("model"));
     assert!(!properties.contains_key("reasoning_effort"));
     assert!(!properties.contains_key("service_tier"));
-    assert!(!description.contains(SPAWN_AGENT_INHERITED_MODEL_GUIDANCE));
+    assert!(!description.contains(&spawn_agent_default_guidance()));
     assert!(!description.contains("Available model overrides"));
+    assert!(!description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE));
+    assert!(
+        properties
+            .get("fork_turns")
+            .and_then(|schema| schema.description.as_deref())
+            .is_some_and(|description| {
+                !description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE)
+            })
+    );
 }
 
 #[test]

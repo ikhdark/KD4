@@ -3,6 +3,7 @@ use anyhow::Context;
 use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex_exec::test_codex_exec;
+use predicates::str::contains;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 use std::string::ToString;
@@ -125,6 +126,129 @@ async fn mount_exec_responses(
     count: usize,
 ) -> core_test_support::responses::ResponseMock {
     responses::mount_sse_sequence(server, (0..count).map(exec_sse_response).collect()).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_resume_last_fails_when_history_is_empty() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let test = test_codex_exec();
+    let server = MockServer::start().await;
+
+    test.cmd_with_server(&server)
+        .arg("--skip-git-repo-check")
+        .arg("resume")
+        .arg("--last")
+        .arg("echo should not start a new thread")
+        .assert()
+        .failure()
+        .stderr(contains("no resumable session found"));
+
+    Ok(())
+}
+
+#[test]
+fn exec_resume_without_selector_fails_instead_of_starting_thread() {
+    let test = test_codex_exec();
+
+    test.cmd()
+        .arg("--skip-git-repo-check")
+        .arg("resume")
+        .assert()
+        .failure()
+        .stderr(contains(
+            "resume requires a session ID or name, or the --last flag",
+        ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_resume_last_reports_when_provider_filter_excludes_history() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let test = test_codex_exec();
+    let server = MockServer::start().await;
+    let _response_mock = mount_exec_responses(&server, /*count*/ 1).await;
+
+    test.cmd_with_server(&server)
+        .arg("--skip-git-repo-check")
+        .arg("create a session for the default provider")
+        .assert()
+        .success();
+
+    let alternate_provider = format!(
+        "model_providers.alternate={{ name = 'Alternate', base_url = '{}/v1', wire_api = 'responses' }}",
+        server.uri()
+    );
+    test.cmd_with_server(&server)
+        .arg("-c")
+        .arg(alternate_provider)
+        .arg("-c")
+        .arg("model_provider='alternate'")
+        .arg("--skip-git-repo-check")
+        .arg("resume")
+        .arg("--last")
+        .arg("do not start a new thread")
+        .assert()
+        .failure()
+        .stderr(contains(
+            "resumable sessions were found, but none match model provider `alternate`",
+        ));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_resume_last_reports_when_cwd_filter_excludes_history() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let test = test_codex_exec();
+    let server = MockServer::start().await;
+    let _response_mock = mount_exec_responses(&server, /*count*/ 1).await;
+    let first_cwd = TempDir::new()?;
+    let other_cwd = TempDir::new()?;
+
+    test.cmd_with_server(&server)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(first_cwd.path())
+        .arg("create a session in the first directory")
+        .assert()
+        .success();
+
+    test.cmd_with_server(&server)
+        .arg("--skip-git-repo-check")
+        .arg("-C")
+        .arg(other_cwd.path())
+        .arg("resume")
+        .arg("--last")
+        .arg("do not start a new thread")
+        .assert()
+        .failure()
+        .stderr(contains("none match the current working directory"))
+        .stderr(contains("use --all"));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exec_resume_unknown_name_fails_instead_of_starting_thread() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let test = test_codex_exec();
+    let server = MockServer::start().await;
+
+    test.cmd_with_server(&server)
+        .arg("--skip-git-repo-check")
+        .arg("resume")
+        .arg("missing-thread-name")
+        .arg("echo should not start a new thread")
+        .assert()
+        .failure()
+        .stderr(contains(
+            "no resumable session named `missing-thread-name` found",
+        ));
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

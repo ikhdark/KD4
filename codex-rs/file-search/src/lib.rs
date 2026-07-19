@@ -14,6 +14,7 @@ use nucleo::Utf32String;
 use nucleo::pattern::CaseMatching;
 use nucleo::pattern::Normalization;
 use serde::Serialize;
+use std::fs;
 use std::num::NonZero;
 use std::path::Path;
 use std::path::PathBuf;
@@ -22,6 +23,7 @@ use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::RwLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
@@ -39,6 +41,23 @@ pub mod source_routes;
 pub mod source_search;
 
 pub use cli::Cli;
+
+const FILE_SEARCH_MAX_WALK_DEPTH: usize = 64;
+const FILE_SEARCH_MAX_WALK_DIRECTORIES: usize = 10_000;
+const FILE_SEARCH_MAX_WALK_ENTRIES: usize = 50_000;
+
+#[derive(Clone, Copy)]
+struct FileSearchWalkLimits {
+    max_depth: usize,
+    max_directories: usize,
+    max_entries: usize,
+}
+
+const FILE_SEARCH_WALK_LIMITS: FileSearchWalkLimits = FileSearchWalkLimits {
+    max_depth: FILE_SEARCH_MAX_WALK_DEPTH,
+    max_directories: FILE_SEARCH_MAX_WALK_DIRECTORIES,
+    max_entries: FILE_SEARCH_MAX_WALK_ENTRIES,
+};
 
 /// A single match result returned from the search.
 ///
@@ -163,6 +182,22 @@ pub fn create_session(
     reporter: Arc<dyn SessionReporter>,
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> anyhow::Result<FileSearchSession> {
+    create_session_with_walk_limits(
+        search_directories,
+        options,
+        reporter,
+        cancel_flag,
+        FILE_SEARCH_WALK_LIMITS,
+    )
+}
+
+fn create_session_with_walk_limits(
+    search_directories: Vec<PathBuf>,
+    options: FileSearchOptions,
+    reporter: Arc<dyn SessionReporter>,
+    cancel_flag: Option<Arc<AtomicBool>>,
+    walk_limits: FileSearchWalkLimits,
+) -> anyhow::Result<FileSearchSession> {
     let FileSearchOptions {
         limit,
         exclude,
@@ -194,9 +229,9 @@ pub fn create_session(
     let inner = Arc::new(SessionInner {
         search_directories,
         limit: limit.get(),
-        threads: threads.get(),
         compute_indices,
         respect_gitignore,
+        walk_limits,
         cancelled,
         shutdown: Arc::new(AtomicBool::new(false)),
         reporter,
@@ -347,9 +382,9 @@ fn create_pattern(pattern: &str) -> Pattern {
 struct SessionInner {
     search_directories: Vec<PathBuf>,
     limit: usize,
-    threads: usize,
     compute_indices: bool,
     respect_gitignore: bool,
+    walk_limits: FileSearchWalkLimits,
     cancelled: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     reporter: Arc<dyn SessionReporter>,
@@ -424,15 +459,66 @@ fn walker_worker(
     for root in inner.search_directories.iter().skip(1) {
         walk_builder.add(root);
     }
+    let canonical_search_directories = inner
+        .search_directories
+        .iter()
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .collect::<Vec<_>>();
+    let root_directory_count = inner
+        .search_directories
+        .iter()
+        .filter(|root| fs::metadata(root).is_ok_and(|metadata| metadata.is_dir()))
+        .count();
+    let entries_seen = Arc::new(AtomicUsize::new(0));
+    let directories_seen = Arc::new(AtomicUsize::new(
+        root_directory_count.min(inner.walk_limits.max_directories),
+    ));
+    let walk_limit_hit = Arc::new(AtomicBool::new(
+        root_directory_count > inner.walk_limits.max_directories,
+    ));
+    let filter_entries_seen = Arc::clone(&entries_seen);
+    let filter_directories_seen = Arc::clone(&directories_seen);
+    let filter_walk_limit_hit = Arc::clone(&walk_limit_hit);
+    let walk_limits = inner.walk_limits;
     walk_builder
-        .threads(inner.threads)
         // Allow hidden entries.
         .hidden(false)
-        // Follow symlinks to search their contents.
+        // Follow links only when their canonical targets remain in a search root.
         .follow_links(true)
         // Keep ignore behavior aligned with git repositories: only apply
         // gitignore rules when a git context exists.
-        .require_git(true);
+        .require_git(true)
+        .max_depth(Some(walk_limits.max_depth.saturating_add(1)))
+        .filter_entry(move |entry| {
+            let is_directory = entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_dir());
+            let max_entry_depth = walk_limits
+                .max_depth
+                .saturating_add(usize::from(!is_directory));
+            if entry.depth() > max_entry_depth {
+                return false;
+            }
+            if entry.depth() > 0
+                && !reserve_walk_slot(&filter_entries_seen, walk_limits.max_entries)
+            {
+                filter_walk_limit_hit.store(true, Ordering::Relaxed);
+                return true;
+            }
+            if entry.depth() > 0
+                && is_directory
+                && !reserve_walk_slot(&filter_directories_seen, walk_limits.max_directories)
+            {
+                filter_walk_limit_hit.store(true, Ordering::Relaxed);
+                return true;
+            }
+            !entry.path_is_symlink()
+                || fs::canonicalize(entry.path()).is_ok_and(|target| {
+                    canonical_search_directories
+                        .iter()
+                        .any(|root| target.starts_with(root))
+                })
+        });
     if !inner.respect_gitignore {
         walk_builder
             .git_ignore(false)
@@ -445,41 +531,47 @@ fn walker_worker(
         walk_builder.overrides(override_matcher);
     }
 
-    let walker = walk_builder.build_parallel();
-
-    walker.run(|| {
-        const CHECK_INTERVAL: usize = 1024;
-        let mut n = 0;
-        let search_directories = inner.search_directories.clone();
-        let injector = injector.clone();
-        let cancelled = inner.cancelled.clone();
-        let shutdown = inner.shutdown.clone();
-
-        Box::new(move |entry| {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => return ignore::WalkState::Continue,
-            };
-            let path = entry.path();
-            let Some(full_path) = path.to_str() else {
-                return ignore::WalkState::Continue;
-            };
-            if let Some((_, relative_path)) = get_file_path(path, &search_directories) {
-                injector.push(Arc::from(full_path), |_, cols| {
-                    cols[0] = Utf32String::from(relative_path);
-                });
-            }
-            n += 1;
-            if n >= CHECK_INTERVAL {
-                if cancelled.load(Ordering::Relaxed) || shutdown.load(Ordering::Relaxed) {
-                    return ignore::WalkState::Quit;
+    const CHECK_INTERVAL: usize = 1024;
+    let mut n = 0;
+    for entry in walk_builder.build() {
+        if walk_limit_hit.load(Ordering::Relaxed) {
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                if !reserve_walk_slot(&entries_seen, walk_limits.max_entries) {
+                    break;
                 }
-                n = 0;
+                continue;
             }
-            ignore::WalkState::Continue
-        })
-    });
+        };
+        let path = entry.path();
+        let Some(full_path) = path.to_str() else {
+            continue;
+        };
+        if let Some((_, relative_path)) = get_file_path(path, &inner.search_directories) {
+            injector.push(Arc::from(full_path), |_, cols| {
+                cols[0] = Utf32String::from(relative_path);
+            });
+        }
+        n += 1;
+        if n >= CHECK_INTERVAL {
+            if inner.cancelled.load(Ordering::Relaxed) || inner.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            n = 0;
+        }
+    }
     let _ = inner.work_tx.send(WorkSignal::WalkComplete);
+}
+
+fn reserve_walk_slot(counter: &AtomicUsize, limit: usize) -> bool {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < limit).then(|| count.saturating_add(1))
+        })
+        .is_ok()
 }
 
 fn matcher_worker(
@@ -793,6 +885,134 @@ mod tests {
             fs::write(path, format!("contents {i}")).unwrap();
         }
         dir
+    }
+
+    fn run_with_walk_limits(
+        pattern_text: &str,
+        roots: Vec<PathBuf>,
+        walk_limits: FileSearchWalkLimits,
+    ) -> FileSearchSnapshot {
+        let reporter = Arc::new(RunReporter::default());
+        let session = create_session_with_walk_limits(
+            roots,
+            FileSearchOptions {
+                threads: NonZero::new(1).unwrap(),
+                ..Default::default()
+            },
+            reporter.clone(),
+            /*cancel_flag*/ None,
+            walk_limits,
+        )
+        .expect("session");
+        session.update_query(pattern_text);
+        let snapshot = reporter.wait_for_complete();
+        drop(session);
+        snapshot
+    }
+
+    #[cfg(unix)]
+    fn try_symlink_directory(target: &Path, link: &Path) -> bool {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+
+    #[cfg(windows)]
+    fn try_symlink_directory(target: &Path, link: &Path) -> bool {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn try_symlink_directory(_target: &Path, _link: &Path) -> bool {
+        false
+    }
+
+    #[test]
+    fn fuzzy_walk_respects_explicit_depth_directory_and_entry_bounds() {
+        let depth_root = tempfile::tempdir().unwrap();
+        fs::write(depth_root.path().join("root-needle.txt"), "root").unwrap();
+        fs::create_dir(depth_root.path().join("nested")).unwrap();
+        fs::write(depth_root.path().join("nested/deep-needle.txt"), "deep").unwrap();
+        let depth_snapshot = run_with_walk_limits(
+            "needle",
+            vec![depth_root.path().to_path_buf()],
+            FileSearchWalkLimits {
+                max_depth: 0,
+                max_directories: FILE_SEARCH_MAX_WALK_DIRECTORIES,
+                max_entries: FILE_SEARCH_MAX_WALK_ENTRIES,
+            },
+        );
+        assert!(
+            depth_snapshot
+                .matches
+                .iter()
+                .all(|file_match| !file_match.path.starts_with("nested"))
+        );
+
+        let directory_snapshot = run_with_walk_limits(
+            "needle",
+            vec![depth_root.path().to_path_buf()],
+            FileSearchWalkLimits {
+                max_depth: FILE_SEARCH_MAX_WALK_DEPTH,
+                max_directories: 1,
+                max_entries: FILE_SEARCH_MAX_WALK_ENTRIES,
+            },
+        );
+        assert!(
+            directory_snapshot
+                .matches
+                .iter()
+                .all(|file_match| !file_match.path.starts_with("nested"))
+        );
+
+        let entry_root = tempfile::tempdir().unwrap();
+        fs::write(entry_root.path().join("a-needle.txt"), "a").unwrap();
+        fs::write(entry_root.path().join("b-needle.txt"), "b").unwrap();
+        let entry_snapshot = run_with_walk_limits(
+            "needle",
+            vec![entry_root.path().to_path_buf()],
+            FileSearchWalkLimits {
+                max_depth: FILE_SEARCH_MAX_WALK_DEPTH,
+                max_directories: FILE_SEARCH_MAX_WALK_DIRECTORIES,
+                max_entries: 1,
+            },
+        );
+        assert!(entry_snapshot.matches.len() <= 1);
+    }
+
+    #[test]
+    fn fuzzy_walk_follows_only_symlinks_confined_to_search_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let workspace = temp.path().join("workspace");
+        let inside = workspace.join("inside");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&inside).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(inside.join("inside-target.txt"), "inside").unwrap();
+        fs::write(outside.join("outside-target.txt"), "outside").unwrap();
+        if !try_symlink_directory(&inside, &workspace.join("inside-link"))
+            || !try_symlink_directory(&outside, &workspace.join("outside-link"))
+        {
+            return;
+        }
+
+        let inside_results = run(
+            "inside-target",
+            vec![workspace.clone()],
+            FileSearchOptions::default(),
+            /*cancel_flag*/ None,
+        )
+        .expect("inside search");
+        assert!(inside_results.matches.iter().any(|file_match| {
+            file_match.path == Path::new("inside-link").join("inside-target.txt")
+        }));
+
+        let outside_results = run(
+            "outside-target",
+            vec![workspace],
+            FileSearchOptions::default(),
+            /*cancel_flag*/ None,
+        )
+        .expect("outside search");
+        assert!(outside_results.matches.is_empty());
     }
 
     #[test]

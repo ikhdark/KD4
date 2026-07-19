@@ -783,7 +783,9 @@ fn commands_for_exec_policy(command: &[String]) -> ExecPolicyCommands {
     #[cfg(windows)]
     {
         if let Some(commands) =
-            codex_shell_command::powershell::parse_powershell_command_into_plain_commands(command)
+            codex_shell_command::powershell::parse_noprofile_powershell_command_into_plain_commands(
+                command,
+            )
             && !commands.is_empty()
         {
             return ExecPolicyCommands {

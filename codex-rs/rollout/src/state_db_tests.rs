@@ -108,6 +108,26 @@ async fn try_init_times_out_waiting_for_stuck_startup_backfill() -> anyhow::Resu
 }
 
 #[tokio::test]
+async fn startup_backfill_timeout_covers_in_flight_work() {
+    let home = TempDir::new().expect("temp dir");
+    let result = tokio::time::timeout(
+        STARTUP_BACKFILL_WAIT_TIMEOUT + std::time::Duration::from_secs(1),
+        wait_for_backfill_gate_with_timeout(
+            home.path(),
+            std::future::pending::<anyhow::Result<()>>(),
+        ),
+    )
+    .await
+    .expect("backfill gate should enforce its own timeout");
+    let err = result.expect_err("pending backfill work should time out");
+    assert!(
+        err.to_string()
+            .contains("timed out waiting for state db backfill"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
 async fn reconcile_rollout_preserves_existing_explicit_title() -> anyhow::Result<()> {
     let home = TempDir::new().expect("temp dir");
     let thread_id = ThreadId::new();

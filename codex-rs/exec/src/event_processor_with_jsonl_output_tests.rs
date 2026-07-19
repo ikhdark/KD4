@@ -53,11 +53,38 @@ fn failed_turn_does_not_overwrite_output_last_message_file() {
     assert_eq!(status, CodexStatus::InitiateShutdown);
     assert_eq!(processor.final_message(), None);
 
-    EventProcessor::print_final_output(&mut processor);
+    EventProcessor::print_final_output(&mut processor).expect("skip final output for failed turn");
 
     assert_eq!(
         std::fs::read_to_string(&output_path).expect("read output file"),
         "keep existing contents"
+    );
+}
+
+#[test]
+fn output_last_message_write_failure_is_returned() {
+    let tempdir = tempdir().expect("create tempdir");
+
+    let result = handle_last_message(Some("final answer"), tempdir.path());
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn event_stream_error_emits_fatal_and_turn_terminal_events() {
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+
+    let events = processor.collect_event_stream_error("worker exited early".to_string());
+
+    let error = ThreadErrorEvent {
+        message: "worker exited early".to_string(),
+    };
+    assert_eq!(
+        events,
+        vec![
+            ThreadEvent::Error(error.clone()),
+            ThreadEvent::TurnFailed(TurnFailedEvent { error }),
+        ]
     );
 }
 

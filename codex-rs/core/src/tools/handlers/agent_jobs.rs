@@ -1,9 +1,12 @@
 use crate::agent::control::SpawnAgentOptions;
+use crate::agent::role::AgentRoleModelLocks;
 use crate::agent::status::is_final;
 use crate::config::Config;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
+use crate::tools::handlers::multi_agents::apply_spawn_agent_model_defaults_and_overrides;
+use crate::tools::handlers::multi_agents::apply_spawn_agent_service_tier;
 use crate::tools::handlers::multi_agents::build_agent_spawn_config;
 use crate::tools::handlers::parse_arguments;
 use codex_protocol::ThreadId;
@@ -124,7 +127,24 @@ async fn build_runner_options(
     }
     let max_concurrency = normalize_concurrency(requested_concurrency, agent_max_threads);
     let base_instructions = session.get_base_instructions().await;
-    let spawn_config = build_agent_spawn_config(&base_instructions, turn.as_ref())?;
+    let mut spawn_config = build_agent_spawn_config(&base_instructions, turn.as_ref())?;
+    apply_spawn_agent_model_defaults_and_overrides(
+        session,
+        turn.as_ref(),
+        &mut spawn_config,
+        /*requested_model*/ None,
+        /*requested_reasoning_effort*/ None,
+        AgentRoleModelLocks::default(),
+    )
+    .await?;
+    apply_spawn_agent_service_tier(
+        session,
+        turn.as_ref(),
+        &mut spawn_config,
+        turn.config.service_tier.as_deref(),
+        /*requested_service_tier*/ None,
+    )
+    .await?;
     Ok(JobRunnerOptions {
         max_concurrency,
         spawn_config,

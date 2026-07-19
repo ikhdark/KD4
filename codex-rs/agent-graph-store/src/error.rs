@@ -12,9 +12,12 @@ pub enum AgentGraphStoreError {
     },
 
     /// Catch-all for implementation failures that do not fit a more specific category.
-    #[error("agent graph store internal error: {message}")]
+    #[error("agent graph store failed to {operation}: {source}")]
     Internal {
-        /// User-facing explanation of the implementation failure.
-        message: String,
+        /// Operation that failed.
+        operation: &'static str,
+        /// Underlying implementation failure, preserved for inspection and downcasting.
+        #[source]
+        source: anyhow::Error,
     },
 }

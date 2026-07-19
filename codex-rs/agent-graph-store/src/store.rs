@@ -17,8 +17,9 @@ pub type AgentGraphStoreFuture<'a, T> =
 pub trait AgentGraphStore: Send + Sync {
     /// Insert or replace the directional parent/child edge for a spawned thread.
     ///
-    /// `child_thread_id` has at most one persisted parent. Re-inserting the same child should
-    /// update both the parent and status to match the supplied values.
+    /// `child_thread_id` has at most one persisted parent, and persisted edges must remain
+    /// acyclic. Re-inserting the same child should update both the parent and status to match the
+    /// supplied values, unless the requested reparenting would create a cycle.
     fn upsert_thread_spawn_edge(
         &self,
         parent_thread_id: ThreadId,

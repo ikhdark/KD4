@@ -247,6 +247,138 @@ fn generated_vendor_and_lock_paths_are_excluded_by_default() {
 }
 
 #[test]
+fn common_source_language_extensions_are_scanned() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let source_paths = [
+        "main.go",
+        "main.c",
+        "main.h",
+        "main.cc",
+        "main.cpp",
+        "main.cxx",
+        "main.hh",
+        "main.hpp",
+        "main.hxx",
+        "main.cs",
+        "Main.java",
+        "Main.kt",
+        "build.kts",
+        "main.swift",
+        "schema.sql",
+        "api.proto",
+    ];
+    for path in source_paths {
+        fs::write(repo.path().join(path), "needle\n").expect("write source");
+    }
+
+    let output = search_source(search_options(repo.path(), "needle")).expect("search");
+
+    assert_eq!(output.coverage.total_matches, source_paths.len());
+}
+
+#[test]
+fn walk_depth_limit_marks_coverage_incomplete() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    let mut directory = repo.path().to_path_buf();
+    for depth in 0..=1 {
+        directory = directory.join(format!("d{depth}"));
+    }
+    fs::create_dir_all(&directory).expect("deep source directory");
+    fs::write(directory.join("deep.rs"), "needle\n").expect("deep source");
+
+    let output = search_source_with_walk_limits(
+        search_options(repo.path(), "needle"),
+        SourceWalkLimits {
+            max_depth: 1,
+            max_directories: SOURCE_SEARCH_MAX_WALK_DIRECTORIES,
+            max_entries: SOURCE_SEARCH_MAX_WALK_ENTRIES,
+        },
+    )
+    .expect("search");
+
+    assert_eq!(output.coverage.total_matches, 0);
+    assert_eq!(
+        output.truncated_reason,
+        Some(SourceTruncatedReason::WalkLimit)
+    );
+}
+
+#[test]
+fn walk_directory_limit_stops_before_descending() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::create_dir(repo.path().join("nested")).expect("nested directory");
+    fs::write(repo.path().join("nested/deep.rs"), "needle\n").expect("deep source");
+
+    let output = search_source_with_walk_limits(
+        search_options(repo.path(), "needle"),
+        SourceWalkLimits {
+            max_depth: SOURCE_SEARCH_MAX_WALK_DEPTH,
+            max_directories: 1,
+            max_entries: SOURCE_SEARCH_MAX_WALK_ENTRIES,
+        },
+    )
+    .expect("search");
+
+    assert_eq!(output.coverage.total_matches, 0);
+    assert_eq!(
+        output.truncated_reason,
+        Some(SourceTruncatedReason::WalkLimit)
+    );
+}
+
+#[test]
+fn walk_entry_limit_stops_before_examining_an_extra_entry() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join("a.rs"), "needle a\n").expect("first source");
+    fs::write(repo.path().join("b.rs"), "needle b\n").expect("second source");
+
+    let output = search_source_with_walk_limits(
+        search_options(repo.path(), "needle"),
+        SourceWalkLimits {
+            max_depth: SOURCE_SEARCH_MAX_WALK_DEPTH,
+            max_directories: SOURCE_SEARCH_MAX_WALK_DIRECTORIES,
+            max_entries: 1,
+        },
+    )
+    .expect("search");
+
+    assert_eq!(output.coverage.files_scanned, 1);
+    assert_eq!(output.coverage.total_matches, 1);
+    assert_eq!(
+        output.truncated_reason,
+        Some(SourceTruncatedReason::WalkLimit)
+    );
+}
+
+#[test]
+fn walk_entry_limit_is_shared_across_explicit_roots() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::create_dir_all(repo.path().join("a")).expect("first root");
+    fs::create_dir_all(repo.path().join("b")).expect("second root");
+    fs::write(repo.path().join("a/first.rs"), "needle first\n").expect("first source");
+    fs::write(repo.path().join("b/second.rs"), "needle second\n").expect("second source");
+    let mut options = search_options(repo.path(), "needle");
+    options.roots = vec![PathBuf::from("a"), PathBuf::from("b")];
+
+    let output = search_source_with_walk_limits(
+        options,
+        SourceWalkLimits {
+            max_depth: SOURCE_SEARCH_MAX_WALK_DEPTH,
+            max_directories: SOURCE_SEARCH_MAX_WALK_DIRECTORIES,
+            max_entries: 1,
+        },
+    )
+    .expect("search");
+
+    assert_eq!(output.coverage.files_scanned, 1);
+    assert_eq!(output.coverage.total_matches, 1);
+    assert_eq!(
+        output.truncated_reason,
+        Some(SourceTruncatedReason::WalkLimit)
+    );
+}
+
+#[test]
 fn files_over_per_file_budget_are_skipped_without_consuming_scan_bytes() {
     let repo = tempfile::tempdir().expect("tempdir");
     fs::write(

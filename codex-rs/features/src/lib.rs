@@ -497,17 +497,21 @@ impl Features {
                 }
                 _ => {}
             }
-            if k == "imagegenext" && m.contains_key(Feature::ImageGeneration.key()) {
-                self.record_legacy_usage(k, Feature::ImageGeneration);
-                continue;
-            }
-            match feature_for_key(k) {
+            let feature = if let Some(feature) = canonical_feature_for_key(k) {
+                Some(feature)
+            } else if let Some(feature) = legacy::feature_for_alias(k) {
+                legacy::record_alias_usage(self, k, feature);
+                if m.contains_key(feature.key()) {
+                    continue;
+                }
+                Some(feature)
+            } else {
+                None
+            };
+            match feature {
                 Some(feat) => {
                     if matches!(feat, Feature::TuiAppServer) {
                         continue;
-                    }
-                    if k != feat.key() {
-                        self.record_legacy_usage(k.as_str(), feat);
                     }
                     if *v {
                         self.enable(feat);
@@ -621,7 +625,7 @@ pub fn feature_for_key(key: &str) -> Option<Feature> {
             return Some(spec.id);
         }
     }
-    legacy::feature_for_key(key)
+    legacy::feature_for_alias(key)
 }
 
 pub fn canonical_feature_for_key(key: &str) -> Option<Feature> {
@@ -1384,7 +1388,7 @@ pub fn unstable_features_warning_event(
         return None;
     }
 
-    let mut under_development_feature_keys = Vec::new();
+    let mut under_development_feature_keys = BTreeSet::new();
     if let Some(table) = effective_features {
         for (key, value) in table {
             let is_enabled = value.as_bool() == Some(true)
@@ -1396,14 +1400,14 @@ pub fn unstable_features_warning_event(
             if !is_enabled {
                 continue;
             }
-            let Some(spec) = FEATURES.iter().find(|spec| spec.key == key.as_str()) else {
+            let Some(feature) = feature_for_key(key) else {
                 continue;
             };
-            if !features.enabled(spec.id) {
+            if !features.enabled(feature) {
                 continue;
             }
-            if matches!(spec.stage, Stage::UnderDevelopment) {
-                under_development_feature_keys.push(spec.key.to_string());
+            if matches!(feature.stage(), Stage::UnderDevelopment) {
+                under_development_feature_keys.insert(feature.key());
             }
         }
     }
@@ -1412,8 +1416,10 @@ pub fn unstable_features_warning_event(
         return None;
     }
 
-    under_development_feature_keys.sort();
-    let under_development_feature_keys = under_development_feature_keys.join(", ");
+    let under_development_feature_keys = under_development_feature_keys
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(", ");
     let message = format!(
         "Under-development features enabled: {under_development_feature_keys}. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in {config_path}."
     );

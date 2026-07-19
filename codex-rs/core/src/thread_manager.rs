@@ -1174,6 +1174,23 @@ impl ThreadManagerState {
         self.threads.write().await.remove(thread_id)
     }
 
+    /// Remove a thread only when the currently loaded instance is the expected one.
+    pub(crate) async fn remove_thread_if_same(
+        &self,
+        thread_id: &ThreadId,
+        expected_thread: &Arc<CodexThread>,
+    ) -> bool {
+        let mut threads = self.threads.write().await;
+        if !threads
+            .get(thread_id)
+            .is_some_and(|thread| Arc::ptr_eq(thread, expected_thread))
+        {
+            return false;
+        }
+        threads.remove(thread_id);
+        true
+    }
+
     pub(crate) async fn effective_multi_agent_version_for_spawn(
         &self,
         initial_history: &InitialHistory,

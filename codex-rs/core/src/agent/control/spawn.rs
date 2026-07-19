@@ -333,6 +333,42 @@ impl AgentControl {
             residency_slot.commit(new_thread.thread_id);
         }
 
+        self.persist_thread_spawn_edge_for_source(
+            new_thread.thread.as_ref(),
+            new_thread.thread_id,
+            notification_source.as_ref(),
+        )
+        .await;
+
+        if let Some(mut binding) = options.typed_task_binding.clone() {
+            let spawned_agent_path = agent_metadata.agent_path.as_ref().map(ToString::to_string);
+            if spawned_agent_path.as_deref() != Some(binding.agent_path.as_str()) {
+                return Err(self
+                    .rollback_failed_initial_submission(
+                        new_thread.thread.as_ref(),
+                        new_thread.thread_id,
+                        CodexErr::Fatal(format!(
+                            "typed task binding path {} does not match spawned agent path {}",
+                            binding.agent_path,
+                            spawned_agent_path.as_deref().unwrap_or("<missing>")
+                        )),
+                    )
+                    .await);
+            }
+            binding.thread_id = Some(new_thread.thread_id.to_string());
+            if let Err(error) = self.task_coordinator().bind_agent_task(binding).await {
+                return Err(self
+                    .rollback_failed_initial_submission(
+                        new_thread.thread.as_ref(),
+                        new_thread.thread_id,
+                        CodexErr::Fatal(format!(
+                            "failed to bind typed task before starting spawned agent: {error}"
+                        )),
+                    )
+                    .await);
+            }
+        }
+
         if let Some(SessionSource::SubAgent(
             subagent_source @ SubAgentSource::ThreadSpawn {
                 parent_thread_id, ..
@@ -382,17 +418,10 @@ impl AgentControl {
         // TODO(jif) add helper for drain
         state.notify_thread_created(new_thread.thread_id);
 
-        self.persist_thread_spawn_edge_for_source(
-            new_thread.thread.as_ref(),
-            new_thread.thread_id,
-            notification_source.as_ref(),
-        )
-        .await;
-
-        match initial_input {
+        let initial_submission_result = match initial_input {
             SpawnInitialInput::UserInput(input) => {
                 self.send_input_after_capacity_check(new_thread.thread_id, &state, input)
-                    .await?;
+                    .await
             }
             SpawnInitialInput::InterAgentCommunication(communication, context) => {
                 self.send_inter_agent_communication_after_capacity_check(
@@ -401,8 +430,17 @@ impl AgentControl {
                     communication,
                     context,
                 )
-                .await?;
+                .await
             }
+        };
+        if let Err(err) = initial_submission_result {
+            return Err(self
+                .rollback_failed_initial_submission(
+                    new_thread.thread.as_ref(),
+                    new_thread.thread_id,
+                    err,
+                )
+                .await);
         }
         if multi_agent_version != MultiAgentVersion::V2 {
             let child_reference = agent_metadata
@@ -423,6 +461,48 @@ impl AgentControl {
             metadata: agent_metadata,
             status: self.get_status(new_thread.thread_id).await,
         })
+    }
+
+    pub(crate) async fn rollback_failed_initial_submission(
+        &self,
+        child_thread: &crate::CodexThread,
+        child_thread_id: ThreadId,
+        submission_error: CodexErr,
+    ) -> CodexErr {
+        let mut cleanup_failures = Vec::new();
+        match self.upgrade() {
+            Ok(state) => {
+                if !child_thread.config_snapshot().await.ephemeral
+                    && let Some(agent_graph_store) = state.agent_graph_store()
+                    && let Err(err) = agent_graph_store
+                        .set_thread_spawn_edge_status(
+                            child_thread_id,
+                            codex_agent_graph_store::ThreadSpawnEdgeStatus::Closed,
+                        )
+                        .await
+                {
+                    cleanup_failures
+                        .push(format!("failed to persist closed spawn-edge status: {err}"));
+                }
+            }
+            Err(err) => cleanup_failures.push(format!(
+                "failed to access thread manager for spawn rollback: {err}"
+            )),
+        }
+
+        match self.shutdown_live_agent(child_thread_id).await {
+            Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => {}
+            Err(err) => cleanup_failures.push(format!("failed to shut down spawned thread: {err}")),
+        }
+
+        if cleanup_failures.is_empty() {
+            submission_error
+        } else {
+            CodexErr::Fatal(format!(
+                "initial submission to spawned agent {child_thread_id} failed ({submission_error}); cleanup was incomplete: {}",
+                cleanup_failures.join("; ")
+            ))
+        }
     }
 
     async fn spawn_forked_thread(
@@ -604,6 +684,7 @@ impl AgentControl {
         };
 
         let mut resume_queue = VecDeque::from([(thread_id, root_depth)]);
+        let mut seen_thread_ids = HashSet::from([thread_id]);
         while let Some((parent_thread_id, parent_depth)) = resume_queue.pop_front() {
             let child_ids = match agent_graph_store
                 .list_thread_spawn_children(
@@ -622,6 +703,12 @@ impl AgentControl {
             };
 
             for child_thread_id in child_ids {
+                if !seen_thread_ids.insert(child_thread_id) {
+                    warn!(
+                        "skipping repeated persisted thread-spawn edge to {child_thread_id} while restoring {thread_id}"
+                    );
+                    continue;
+                }
                 let child_depth = parent_depth + 1;
                 let child_resumed = if state.get_thread(child_thread_id).await.is_ok() {
                     true
@@ -643,6 +730,18 @@ impl AgentControl {
                     {
                         Ok((_, _)) => true,
                         Err(err) => {
+                            if matches!(&err, CodexErr::ThreadNotFound(_))
+                                && let Err(close_err) = agent_graph_store
+                                    .set_thread_spawn_edge_status(
+                                        child_thread_id,
+                                        codex_agent_graph_store::ThreadSpawnEdgeStatus::Closed,
+                                    )
+                                    .await
+                            {
+                                warn!(
+                                    "failed to close unrecoverable persisted thread-spawn edge for {child_thread_id}: {close_err}"
+                                );
+                            }
                             warn!("failed to resume descendant thread {child_thread_id}: {err}");
                             false
                         }

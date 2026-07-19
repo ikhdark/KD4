@@ -571,28 +571,30 @@ async fn project_doc_invalid_utf8_uses_lossy_text() {
     assert_eq!(res, "project\u{FFFD} doc");
 }
 
-/// Oversize file is truncated to `project_doc_max_bytes`.
 #[tokio::test]
-async fn doc_larger_than_limit_is_truncated() {
+async fn doc_larger_than_limit_includes_explicit_truncation_notice() {
     const LIMIT: usize = 1024;
     let tmp = tempfile::tempdir().expect("tempdir");
 
     let huge = "A".repeat(LIMIT * 2); // 2 KiB
-    fs::write(tmp.path().join("AGENTS.md"), &huge).unwrap();
+    let source = tmp.path().join("AGENTS.md");
+    fs::write(&source, &huge).unwrap();
 
     let res = get_user_instructions(&make_config(&tmp, LIMIT, /*instructions*/ None).await)
         .await
         .expect("doc expected");
+    let notice =
+        project_doc_truncation_notice(&PathUri::from_abs_path(&source.abs()), LIMIT * 2, LIMIT);
 
-    assert_eq!(res.len(), LIMIT, "doc should be truncated to LIMIT bytes");
-    assert_eq!(res, huge[..LIMIT]);
+    assert_eq!(res, format!("{}\n\n{notice}", &huge[..LIMIT]));
 }
 
 #[tokio::test]
-async fn total_byte_limit_truncates_later_project_docs() {
+async fn total_byte_limit_preserves_nearest_doc_and_notices_broader_truncation() {
     let repo = tempfile::tempdir().expect("tempdir");
     fs::write(repo.path().join(".git"), "").unwrap();
-    fs::write(repo.path().join("AGENTS.md"), "root").unwrap();
+    let root_doc = repo.path().join("AGENTS.md");
+    fs::write(&root_doc, "root").unwrap();
     let nested = repo.path().join("nested");
     fs::create_dir(&nested).unwrap();
     fs::write(nested.join("AGENTS.md"), "abcdef").unwrap();
@@ -601,25 +603,28 @@ async fn total_byte_limit_truncates_later_project_docs() {
     config.cwd = nested.abs();
 
     let loaded = load_agents_md(&config).await.expect("project instructions");
+    let root_notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&root_doc.abs()),
+        /*original_bytes*/ 4,
+        /*retained_bytes*/ 1,
+    );
+    let truncated_root = format!("r\n\n{root_notice}");
     let expected = LoadedAgentsMd {
         user_instructions: None,
         entries: vec![
             InstructionEntry {
-                contents: "root".to_string(),
-                provenance: project_provenance(
-                    repo.path().join("AGENTS.md").abs(),
-                    config.cwd.clone(),
-                ),
+                contents: truncated_root.clone(),
+                provenance: project_provenance(root_doc.abs(), config.cwd.clone()),
             },
             InstructionEntry {
-                contents: "abc".to_string(),
+                contents: "abcdef".to_string(),
                 provenance: project_provenance(config.cwd.join("AGENTS.md"), config.cwd.clone()),
             },
         ],
     };
 
     assert_eq!(loaded, expected);
-    assert_eq!(loaded.text(), "root\n\nabc");
+    assert_eq!(loaded.text(), format!("{truncated_root}\n\nabcdef"));
 }
 
 #[tokio::test]
@@ -1027,11 +1032,21 @@ async fn project_doc_byte_limit_is_applied_independently_per_environment() {
     let loaded = load_project_instructions(&config.config, user_instructions, &environments)
         .await
         .expect("instructions expected");
+    let primary_notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&primary.path().join("AGENTS.md").abs()),
+        /*original_bytes*/ 5,
+        /*retained_bytes*/ 3,
+    );
+    let secondary_notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&secondary.path().join("AGENTS.md").abs()),
+        /*original_bytes*/ 5,
+        /*retained_bytes*/ 3,
+    );
 
     assert_eq!(
         loaded.text(),
         format!(
-            "for `primary` with root {}\n\nABC\n\nfor `secondary` with root {}\n\nVWX",
+            "for `primary` with root {}\n\nABC\n\n{primary_notice}\n\nfor `secondary` with root {}\n\nVWX\n\n{secondary_notice}",
             primary.path().display(),
             secondary.path().display()
         )

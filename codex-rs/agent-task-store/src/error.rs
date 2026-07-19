@@ -33,6 +33,10 @@ pub enum StoreError {
     WriteClaimInactive(AssignmentId),
     #[error("operation requires root authority")]
     RootAuthorityRequired,
+    #[error("actor is not authorized to set the {gate} gate")]
+    GateAuthorityRequired { gate: String },
+    #[error("gate {gate} may be waived only through the root-authorized waiver operation")]
+    GateWaiverRequired { gate: String },
     #[error("gate {gate} cannot be waived")]
     GateNotWaivable { gate: String },
     #[error("gate {gate} is already sealed")]
@@ -45,6 +49,15 @@ pub enum StoreError {
     ValidationCallImmutable(String),
     #[error("receipt references validation calls with incompatible status: {call_ids:?}")]
     ValidationCallStatusInvalid { call_ids: Vec<String> },
+    #[error("completed receipt is missing required evidence: {requirements:?}")]
+    RequiredEvidenceMissing { requirements: Vec<String> },
+    #[error(
+        "declared changes do not match finalized mutation evidence; declared={declared:?}, finalized={finalized:?}"
+    )]
+    MutationEvidenceMismatch {
+        declared: Vec<String>,
+        finalized: Vec<String>,
+    },
     #[error("observation limit must be between 0 and 100, got {0}")]
     InvalidObservationLimit(usize),
     #[error("wake watermark {0} does not belong to this root session")]
@@ -61,6 +74,16 @@ pub enum StoreError {
     InvalidSnapshotChunkSize(usize),
     #[error("snapshot offset {offset} exceeds {total_bytes} bytes")]
     InvalidSnapshotOffset { offset: u64, total_bytes: u64 },
+    #[error("private mutation snapshot for {path} is {bytes} bytes; limit is {max_bytes} bytes")]
+    SnapshotTooLarge {
+        path: String,
+        bytes: u64,
+        max_bytes: u64,
+    },
+    #[error(
+        "private mutation snapshot hash does not match retained evidence for {path} under attempt {attempt_id}"
+    )]
+    SnapshotHashMismatch { attempt_id: AttemptId, path: String },
     #[error("mutation path is not covered by the active write claim: {0}")]
     MutationOutsideClaim(String),
     #[error("mutation evidence for {path} has not been started under attempt {attempt_id}")]

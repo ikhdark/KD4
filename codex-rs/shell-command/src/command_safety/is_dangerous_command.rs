@@ -142,18 +142,88 @@ pub(crate) fn find_git_subcommand<'a>(
     None
 }
 
-fn is_dangerous_to_call_with_exec(command: &[String]) -> bool {
-    let cmd0 = command.first().map(String::as_str);
-
-    match cmd0 {
-        Some("rm") => matches!(command.get(1).map(String::as_str), Some("-f" | "-rf")),
-
-        // for sudo <cmd> simply do the check for <cmd>
-        Some("sudo") => is_dangerous_to_call_with_exec(&command[1..]),
-
-        // ── anything else ─────────────────────────────────────────────────
-        _ => false,
+fn is_dangerous_to_call_with_exec(mut command: &[String]) -> bool {
+    loop {
+        match command
+            .first()
+            .and_then(|executable| executable_name_lookup_key(executable))
+            .as_deref()
+        {
+            Some("rm") => return rm_has_force_option(&command[1..]),
+            Some("sudo") => {
+                let Some(subcommand) = sudo_subcommand(command) else {
+                    return false;
+                };
+                command = subcommand;
+            }
+            _ => return false,
+        }
     }
+}
+
+fn rm_has_force_option(args: &[String]) -> bool {
+    for arg in args {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--force" {
+            return true;
+        }
+        if arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg.chars().skip(1).any(|flag| flag == 'f')
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn sudo_subcommand(command: &[String]) -> Option<&[String]> {
+    let mut index = 1;
+    while index < command.len() {
+        let arg = command[index].as_str();
+        if arg == "--" {
+            return command.get(index + 1..).filter(|rest| !rest.is_empty());
+        }
+        if arg == "-" || !arg.starts_with('-') {
+            return command.get(index..).filter(|rest| !rest.is_empty());
+        }
+
+        let takes_separate_value = sudo_short_option_consumes_next(arg)
+            || matches!(
+                arg,
+                "--auth-type"
+                    | "--chdir"
+                    | "--chroot"
+                    | "--close-from"
+                    | "--command-timeout"
+                    | "--group"
+                    | "--host"
+                    | "--prompt"
+                    | "--role"
+                    | "--type"
+                    | "--user"
+            );
+        index += if takes_separate_value { 2 } else { 1 };
+    }
+    None
+}
+
+fn sudo_short_option_consumes_next(arg: &str) -> bool {
+    if !arg.starts_with('-') || arg.starts_with("--") {
+        return false;
+    }
+    let flags: Vec<char> = arg.chars().skip(1).collect();
+    for (index, flag) in flags.iter().enumerate() {
+        if matches!(
+            flag,
+            'a' | 'C' | 'D' | 'g' | 'h' | 'p' | 'R' | 'r' | 'T' | 't' | 'u'
+        ) {
+            return index + 1 == flags.len();
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -172,6 +242,39 @@ mod tests {
     #[test]
     fn rm_f_is_dangerous() {
         assert!(command_might_be_dangerous(&vec_str(&["rm", "-f", "/"])));
+    }
+
+    #[test]
+    fn rm_force_variants_and_full_paths_are_dangerous() {
+        for command in [
+            vec_str(&["/bin/rm", "-fr", "target"]),
+            vec_str(&["/bin/rm", "--force", "target"]),
+            vec_str(&["/bin/rm", "-r", "-f", "target"]),
+        ] {
+            assert!(command_might_be_dangerous(&command), "{command:?}");
+        }
+    }
+
+    #[test]
+    fn sudo_options_do_not_hide_dangerous_rm() {
+        assert!(command_might_be_dangerous(&vec_str(&[
+            "sudo", "-u", "root", "/bin/rm", "--force", "target"
+        ])));
+        assert!(command_might_be_dangerous(&vec_str(&[
+            "sudo",
+            "--preserve-env",
+            "sudo",
+            "-n",
+            "rm",
+            "-rf",
+            "target"
+        ])));
+        assert!(command_might_be_dangerous(&vec_str(&[
+            "sudo", "-nu", "root", "/bin/rm", "-f", "target"
+        ])));
+        assert!(command_might_be_dangerous(&vec_str(&[
+            "sudo", "-uroot", "/bin/rm", "-f", "target"
+        ])));
     }
 
     #[test]

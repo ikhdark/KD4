@@ -125,6 +125,18 @@ impl LocalFileSystem {
         file_system.read_file(path, sandbox).await
     }
 
+    async fn read_file_bounded(
+        &self,
+        path: &PathUri,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Option<Vec<u8>>> {
+        let (file_system, sandbox) = self.file_system_for(sandbox)?;
+        file_system
+            .read_file_bounded(path, max_bytes, sandbox)
+            .await
+    }
+
     async fn read_file_stream(
         &self,
         path: &PathUri,
@@ -221,6 +233,17 @@ impl ExecutorFileSystem for LocalFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Vec<u8>> {
         Box::pin(LocalFileSystem::read_file(self, path, sandbox))
+    }
+
+    fn read_file_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(LocalFileSystem::read_file_bounded(
+            self, path, max_bytes, sandbox,
+        ))
     }
 
     fn read_file_stream<'a>(
@@ -332,6 +355,18 @@ impl UnsandboxedFileSystem {
         self.file_system.read_file(path, /*sandbox*/ None).await
     }
 
+    async fn read_file_bounded(
+        &self,
+        path: &PathUri,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Option<Vec<u8>>> {
+        reject_platform_sandbox_context(sandbox)?;
+        self.file_system
+            .read_file_bounded(path, max_bytes, /*sandbox*/ None)
+            .await
+    }
+
     async fn read_file_stream(
         &self,
         path: &PathUri,
@@ -433,6 +468,17 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Vec<u8>> {
         Box::pin(UnsandboxedFileSystem::read_file(self, path, sandbox))
+    }
+
+    fn read_file_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(UnsandboxedFileSystem::read_file_bounded(
+            self, path, max_bytes, sandbox,
+        ))
     }
 
     fn read_file_stream<'a>(
@@ -548,6 +594,40 @@ impl DirectFileSystem {
             return Err(file_too_large_error());
         }
         Ok(bytes)
+    }
+
+    async fn read_file_bounded(
+        &self,
+        path: &PathUri,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Option<Vec<u8>>> {
+        reject_sandbox_context(sandbox)?;
+        let path = path.to_abs_path()?;
+        let Some(first) = read_bounded_file_snapshot(path.as_path(), max_bytes).await? else {
+            return Ok(None);
+        };
+        let Some(second) = (match read_bounded_file_snapshot(path.as_path(), max_bytes).await {
+            Ok(snapshot) => snapshot,
+            Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
+            Err(err) => return Err(err),
+        }) else {
+            return Ok(None);
+        };
+        let final_state = match read_native_file_state(path.as_path()).await {
+            Ok(state) => state,
+            Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        if first.bytes != second.bytes
+            || native_file_metadata_changed(&first.metadata, &second.metadata)
+            || first.identity != second.identity
+            || native_file_metadata_changed(&second.metadata, &final_state.metadata)
+            || second.identity != final_state.identity
+        {
+            return Ok(None);
+        }
+        Ok(Some(first.bytes))
     }
 
     async fn read_file_stream(
@@ -728,6 +808,17 @@ impl ExecutorFileSystem for DirectFileSystem {
         Box::pin(DirectFileSystem::read_file(self, path, sandbox))
     }
 
+    fn read_file_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(DirectFileSystem::read_file_bounded(
+            self, path, max_bytes, sandbox,
+        ))
+    }
+
     fn read_file_stream<'a>(
         &'a self,
         path: &'a PathUri,
@@ -796,6 +887,168 @@ impl ExecutorFileSystem for DirectFileSystem {
             sandbox,
         ))
     }
+}
+
+struct BoundedFileSnapshot {
+    bytes: Vec<u8>,
+    metadata: std::fs::Metadata,
+    identity: NativeFileIdentity,
+}
+
+struct NativeFileState {
+    metadata: std::fs::Metadata,
+    identity: NativeFileIdentity,
+}
+
+async fn read_bounded_file_snapshot(
+    path: &Path,
+    max_bytes: usize,
+) -> io::Result<Option<BoundedFileSnapshot>> {
+    let mut file = regular_file::open(path).await?;
+    let metadata_before = file.metadata().await?;
+    let identity_before = native_file_identity(&file, &metadata_before)?;
+    let expected_len = usize::try_from(metadata_before.len()).unwrap_or(usize::MAX);
+    if expected_len > max_bytes {
+        return Ok(None);
+    }
+
+    let mut bytes = Vec::with_capacity(expected_len.min(FILE_READ_CHUNK_SIZE));
+    let read_limit = u64::try_from(max_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    AsyncReadExt::take(&mut file, read_limit)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > max_bytes {
+        return Ok(None);
+    }
+
+    let metadata_after = file.metadata().await?;
+    let identity_after = native_file_identity(&file, &metadata_after)?;
+    if bytes.len() != expected_len
+        || native_file_metadata_changed(&metadata_before, &metadata_after)
+        || identity_before != identity_after
+    {
+        return Ok(None);
+    }
+    Ok(Some(BoundedFileSnapshot {
+        bytes,
+        metadata: metadata_before,
+        identity: identity_before,
+    }))
+}
+
+async fn read_native_file_state(path: &Path) -> io::Result<NativeFileState> {
+    let file = regular_file::open(path).await?;
+    let metadata = file.metadata().await?;
+    let identity = native_file_identity(&file, &metadata)?;
+    Ok(NativeFileState { metadata, identity })
+}
+
+fn native_file_metadata_changed(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+        || before.created().ok() != after.created().ok()
+        || before.is_file() != after.is_file()
+        || before.is_dir() != after.is_dir()
+        || before.is_symlink() != after.is_symlink()
+        || platform_file_metadata_changed(before, after)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn native_file_identity(
+    _file: &tokio::fs::File,
+    metadata: &std::fs::Metadata,
+) -> io::Result<NativeFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(NativeFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(unix)]
+fn platform_file_metadata_changed(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    before.ctime() != after.ctime() || before.ctime_nsec() != after.ctime_nsec()
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeFileIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
+}
+
+#[cfg(windows)]
+fn native_file_identity(
+    file: &tokio::fs::File,
+    _metadata: &std::fs::Metadata,
+) -> io::Result<NativeFileIdentity> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
+    use windows_sys::Win32::Storage::FileSystem::GetFileInformationByHandle;
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` owns a valid handle and `information` points to writable,
+    // correctly sized storage for the duration of the call.
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle() as HANDLE, information.as_mut_ptr())
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a successful call initialized the complete structure.
+    let information = unsafe { information.assume_init() };
+    Ok(NativeFileIdentity {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index: (u64::from(information.nFileIndexHigh) << 32)
+            | u64::from(information.nFileIndexLow),
+    })
+}
+
+#[cfg(windows)]
+fn platform_file_metadata_changed(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    before.file_attributes() != after.file_attributes()
+        || before.creation_time() != after.creation_time()
+        || before.last_write_time() != after.last_write_time()
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeFileIdentity;
+
+#[cfg(not(any(unix, windows)))]
+fn native_file_identity(
+    _file: &tokio::fs::File,
+    _metadata: &std::fs::Metadata,
+) -> io::Result<NativeFileIdentity> {
+    Ok(NativeFileIdentity)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_file_metadata_changed(_before: &std::fs::Metadata, _after: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn is_changed_file_race_error(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput
+    )
 }
 
 fn reject_sandbox_context(sandbox: Option<&FileSystemSandboxContext>) -> io::Result<()> {

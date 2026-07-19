@@ -729,8 +729,13 @@ async fn build_pure_pending_turn_plan(
         &available_connectors,
         &skill_name_counts_lower,
     );
-    let plugin_items =
-        build_plugin_injections(&mentioned_plugins, &mcp_tools, &available_connectors);
+    let plugin_items = build_plugin_injections(
+        &mentioned_plugins,
+        &mcp_tools,
+        &available_connectors,
+        &step_context.mcp.config().mcp_server_catalog,
+        &connector_snapshot,
+    );
     let mut explicitly_enabled_connectors = collect_explicit_app_ids(&user_input);
     explicitly_enabled_connectors.extend(skill_connector_ids);
     let connector_names_by_id = available_connectors

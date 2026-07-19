@@ -25,6 +25,7 @@ use crate::list::ThreadItem;
 use crate::list::ThreadSortKey;
 use crate::list::ThreadsPage;
 use crate::list::get_threads;
+use crate::list::parse_cursor;
 use crate::list::read_head_for_summary;
 use crate::rollout_date_parts;
 use anyhow::Result;
@@ -785,7 +786,7 @@ async fn test_pagination_cursor() {
         .join(format!("rollout-2025-03-04T09-00-00-{u4}.jsonl"));
     let updated_page1: Vec<Option<String>> =
         page1.items.iter().map(|i| i.updated_at.clone()).collect();
-    let expected_cursor1: Cursor = serde_json::from_str("\"2025-03-04T09-00-00\"").unwrap();
+    let expected_cursor1 = parse_cursor(format!("2025-03-04T09-00-00|{u4}").as_str()).unwrap();
     let expected_page1 = ThreadsPage {
         items: vec![
             ThreadItem {
@@ -861,7 +862,7 @@ async fn test_pagination_cursor() {
         .join(format!("rollout-2025-03-02T09-00-00-{u2}.jsonl"));
     let updated_page2: Vec<Option<String>> =
         page2.items.iter().map(|i| i.updated_at.clone()).collect();
-    let expected_cursor2: Cursor = serde_json::from_str("\"2025-03-02T09-00-00\"").unwrap();
+    let expected_cursor2 = parse_cursor(format!("2025-03-02T09-00-00|{u2}").as_str()).unwrap();
     let expected_page2 = ThreadsPage {
         items: vec![
             ThreadItem {
@@ -1402,7 +1403,7 @@ async fn test_updated_at_uses_file_mtime() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_timestamp_only_cursor_skips_same_second_filesystem_ties() {
+async fn test_cursor_preserves_same_second_filesystem_ties() {
     let temp = TempDir::new().unwrap();
     let home = temp.path();
 
@@ -1462,9 +1463,15 @@ async fn test_timestamp_only_cursor_skips_same_second_filesystem_ties() {
         .join("07")
         .join("01")
         .join(format!("rollout-2025-07-01T00-00-00-{u2}.jsonl"));
+    let p1 = home
+        .join("sessions")
+        .join("2025")
+        .join("07")
+        .join("01")
+        .join(format!("rollout-2025-07-01T00-00-00-{u1}.jsonl"));
     let updated_page1: Vec<Option<String>> =
         page1.items.iter().map(|i| i.updated_at.clone()).collect();
-    let expected_cursor1: Cursor = serde_json::from_str(&format!("\"{ts}\"")).unwrap();
+    let expected_cursor1 = parse_cursor(format!("{ts}|{u2}").as_str()).unwrap();
     let expected_page1 = ThreadsPage {
         items: vec![
             ThreadItem {
@@ -1526,10 +1533,28 @@ async fn test_timestamp_only_cursor_skips_same_second_filesystem_ties() {
     )
     .await
     .unwrap();
-    // The filesystem fallback only has second-precision timestamps in filenames. The primary
-    // SQLite-backed listing uses unique millisecond timestamps and does not have this tie.
+    let updated_page2 = page2.items.first().and_then(|item| item.updated_at.clone());
     let expected_page2 = ThreadsPage {
-        items: Vec::new(),
+        items: vec![ThreadItem {
+            path: p1,
+            thread_id: Some(thread_id_from_uuid(u1)),
+            first_user_message: Some("Hello from user".to_string()),
+            preview: Some("Hello from user".to_string()),
+            cwd: Some(Path::new(".").to_path_buf()),
+            git_branch: None,
+            git_sha: None,
+            git_origin_url: None,
+            source: Some(SessionSource::VSCode),
+            history_mode: Default::default(),
+            parent_thread_id: None,
+            agent_nickname: None,
+            agent_role: None,
+            model_provider: Some(TEST_PROVIDER.to_string()),
+            cli_version: Some("test_version".to_string()),
+            created_at: Some(ts.to_string()),
+            recency_at: updated_page2.clone(),
+            updated_at: updated_page2,
+        }],
         next_cursor: None,
         num_scanned_files: 3,
         reached_scan_cap: false,

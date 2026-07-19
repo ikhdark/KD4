@@ -89,6 +89,11 @@ fn map_todo_items_preserves_text_and_completion_state() {
             status: TurnPlanStepStatus::Completed,
             ..Default::default()
         },
+        TurnPlanStep {
+            step: "prove runtime path".to_string(),
+            status: TurnPlanStepStatus::Passed,
+            ..Default::default()
+        },
     ]);
 
     assert_eq!(
@@ -100,6 +105,10 @@ fn map_todo_items_preserves_text_and_completion_state() {
             },
             TodoItem {
                 text: "drop legacy notifications".to_string(),
+                completed: true,
+            },
+            TodoItem {
+                text: "prove runtime path".to_string(),
                 completed: true,
             },
         ]
@@ -799,6 +808,37 @@ fn collab_spawn_begin_and_end_emit_item_events() {
             status: CodexStatus::Running,
         }
     );
+}
+
+#[test]
+fn collab_resume_agent_preserves_tool_identity() {
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+
+    let collected =
+        processor.collect_thread_events(ServerNotification::ItemStarted(ItemStartedNotification {
+            item: ThreadItem::CollabAgentToolCall {
+                id: "collab-resume-1".to_string(),
+                tool: CollabAgentTool::ResumeAgent,
+                status: ApiCollabAgentToolCallStatus::InProgress,
+                sender_thread_id: "thread-parent".to_string(),
+                receiver_thread_ids: vec!["thread-child".to_string()],
+                prompt: None,
+                model: None,
+                reasoning_effort: None,
+                agents_states: std::collections::HashMap::new(),
+            },
+            thread_id: "thread-parent".to_string(),
+            turn_id: "turn-1".to_string(),
+            started_at_ms: 0,
+        }));
+
+    let ThreadEvent::ItemStarted(ItemStartedEvent { item }) = &collected.events[0] else {
+        panic!("expected item.started event");
+    };
+    let ThreadItemDetails::CollabToolCall(item) = &item.details else {
+        panic!("expected collab tool call item");
+    };
+    assert_eq!(item.tool, CollabTool::ResumeAgent);
 }
 
 #[test]
@@ -1657,6 +1697,72 @@ fn turn_failure_prefers_structured_error_message() {
             events: vec![ThreadEvent::TurnFailed(TurnFailedEvent {
                 error: ThreadErrorEvent {
                     message: "backend failed (request id abc)".to_string(),
+                },
+            })],
+            status: CodexStatus::InitiateShutdown,
+        }
+    );
+}
+
+#[test]
+fn retryable_error_is_emitted_as_non_fatal_item() {
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+
+    let collected = processor.collect_thread_events(ServerNotification::Error(ErrorNotification {
+        error: TurnError {
+            message: "temporary backend failure".to_string(),
+            codex_error_info: None,
+            additional_details: Some("retrying".to_string()),
+        },
+        will_retry: true,
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+    }));
+
+    assert_eq!(
+        collected,
+        CollectedThreadEvents {
+            events: vec![ThreadEvent::ItemCompleted(ItemCompletedEvent {
+                item: ExecThreadItem {
+                    id: "item_0".to_string(),
+                    details: ThreadItemDetails::Error(ErrorItem {
+                        message: "temporary backend failure (retrying)".to_string(),
+                    }),
+                },
+            })],
+            status: CodexStatus::Running,
+        }
+    );
+}
+
+#[test]
+fn interrupted_turn_emits_turn_failed_terminal_event() {
+    let mut processor = EventProcessorWithJsonOutput::new(/*last_message_path*/ None);
+
+    let collected = processor.collect_thread_events(ServerNotification::TurnCompleted(
+        TurnCompletedNotification {
+            thread_id: "thread-1".to_string(),
+            completion: None,
+            turn: Turn {
+                id: "turn-1".to_string(),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: Vec::new(),
+                status: TurnStatus::Interrupted,
+                error: None,
+                started_at: None,
+                completed_at: Some(0),
+                duration_ms: None,
+            },
+            timing: None,
+        },
+    ));
+
+    assert_eq!(
+        collected,
+        CollectedThreadEvents {
+            events: vec![ThreadEvent::TurnFailed(TurnFailedEvent {
+                error: ThreadErrorEvent {
+                    message: "turn interrupted".to_string(),
                 },
             })],
             status: CodexStatus::InitiateShutdown,

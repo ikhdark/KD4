@@ -405,12 +405,21 @@ impl EventProcessor for EventProcessorWithHumanOutput {
         CodexStatus::Running
     }
 
-    fn print_final_output(&mut self) {
-        if self.emit_final_message_on_shutdown
+    fn process_event_stream_error(&mut self, message: String) {
+        self.final_message = None;
+        self.final_message_rendered = false;
+        self.emit_final_message_on_shutdown = false;
+        eprintln!("{} {message}", "ERROR:".style(self.red).style(self.bold));
+    }
+
+    fn print_final_output(&mut self) -> std::io::Result<()> {
+        let output_file_result = if self.emit_final_message_on_shutdown
             && let Some(path) = self.last_message_path.as_deref()
         {
-            handle_last_message(self.final_message.as_deref(), path);
-        }
+            handle_last_message(self.final_message.as_deref(), path)
+        } else {
+            Ok(())
+        };
 
         if let Some(usage) = &self.last_total_token_usage {
             eprintln!(
@@ -445,6 +454,7 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 message
             );
         }
+        output_file_result
     }
 }
 

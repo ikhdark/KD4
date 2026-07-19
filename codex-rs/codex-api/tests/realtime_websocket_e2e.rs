@@ -64,7 +64,7 @@ fn test_provider(base_url: String) -> Provider {
         query_params: Some(HashMap::new()),
         headers: HeaderMap::new(),
         retry: RetryConfig {
-            max_attempts: 1,
+            max_retries: 1,
             base_delay: Duration::from_millis(1),
             retry_429: false,
             retry_5xx: false,
@@ -240,7 +240,7 @@ async fn realtime_ws_connect_webrtc_sideband_retries_join_until_server_is_availa
     });
 
     let mut provider = test_provider(format!("http://{addr}"));
-    provider.retry.max_attempts = 1;
+    provider.retry.max_retries = 1;
     provider.retry.base_delay = Duration::from_millis(100);
 
     let client = RealtimeWebsocketClient::new(provider);

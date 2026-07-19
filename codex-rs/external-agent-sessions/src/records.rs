@@ -9,6 +9,7 @@ use serde_json::Value as JsonValue;
 use sha2::Digest;
 use sha2::Sha256;
 use std::fs::File;
+use std::fs::Metadata;
 use std::io;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -16,6 +17,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 const NOTE_MAX_LEN: usize = 2_000;
+const TOOL_NAME_MAX_LEN: usize = 120;
 const TOOL_RESULT_MAX_LEN: usize = 4_000;
 const EXTERNAL_AGENT_TOOL_CALL_TAG: &str = "external_agent_tool_call";
 const EXTERNAL_AGENT_TOOL_RESULT_TAG: &str = "external_agent_tool_result";
@@ -31,6 +33,7 @@ pub(super) struct ParsedSessionImport {
     pub ai_title: Option<String>,
     pub messages: Vec<ConversationMessage>,
     pub content_sha256: String,
+    pub source_modified_at: Option<i64>,
 }
 
 pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
@@ -109,6 +112,7 @@ pub fn summarize_session(path: &Path) -> io::Result<Option<SessionSummary>> {
 
 pub(super) fn read_session_import(path: &Path) -> io::Result<ParsedSessionImport> {
     let file = File::open(path)?;
+    let metadata_before = file.metadata().ok();
     let mut reader = BufReader::new(file);
     let mut cwd = None;
     let mut custom_title = None;
@@ -145,13 +149,33 @@ pub(super) fn read_session_import(path: &Path) -> io::Result<ParsedSessionImport
             messages.push(message);
         }
     }
+    let metadata_after = reader.get_ref().metadata().ok();
     Ok(ParsedSessionImport {
         cwd,
         custom_title,
         ai_title,
         messages,
         content_sha256: format!("{:x}", hasher.finalize()),
+        source_modified_at: metadata_before
+            .as_ref()
+            .zip(metadata_after.as_ref())
+            .and_then(|(before, after)| stable_source_modified_at(before, after)),
     })
+}
+
+pub(super) fn stable_source_modified_at(before: &Metadata, after: &Metadata) -> Option<i64> {
+    if before.len() != after.len() {
+        return None;
+    }
+    let before_modified = before.modified().ok()?;
+    let after_modified = after.modified().ok()?;
+    if before_modified != after_modified {
+        return None;
+    }
+    before_modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
 }
 
 fn custom_title_from_record(record: &JsonValue) -> Option<&str> {
@@ -286,22 +310,25 @@ fn tool_call_note(block: &JsonValue) -> String {
         .get("name")
         .and_then(JsonValue::as_str)
         .unwrap_or("unknown");
-    let mut lines = vec![format!("[{EXTERNAL_AGENT_TOOL_CALL_TAG}: {name}]")];
+    let mut lines = Vec::new();
     if let Some(input) = block.get("input").and_then(JsonValue::as_object) {
         if let Some(description) = input.get("description").and_then(JsonValue::as_str) {
-            lines.push(format!("description: {description}"));
+            lines.push(format!(
+                "description: {}",
+                truncate(description, NOTE_MAX_LEN)
+            ));
         }
         if let Some(command) = input.get("command").and_then(JsonValue::as_str) {
-            lines.push(format!("command: {command}"));
+            lines.push(format!("command: {}", truncate(command, NOTE_MAX_LEN)));
         }
         if let Some(file) = input
             .get("file_path")
             .or_else(|| input.get("file"))
             .and_then(JsonValue::as_str)
         {
-            lines.push(format!("file: {file}"));
+            lines.push(format!("file: {}", truncate(file, NOTE_MAX_LEN)));
         }
-        if lines.len() == 1 {
+        if lines.is_empty() {
             lines.push(format!(
                 "input: {}",
                 truncate(&JsonValue::Object(input.clone()).to_string(), NOTE_MAX_LEN)
@@ -313,8 +340,23 @@ fn tool_call_note(block: &JsonValue) -> String {
             truncate(&input.to_string(), NOTE_MAX_LEN)
         ));
     }
-    lines.push(format!("[/{EXTERNAL_AGENT_TOOL_CALL_TAG}]"));
-    lines.join("\n")
+    bounded_tool_call_note(name, &lines.join("\n"))
+}
+
+fn bounded_tool_call_note(name: &str, body: &str) -> String {
+    let name = truncate(name, TOOL_NAME_MAX_LEN);
+    let opening = format!("[{EXTERNAL_AGENT_TOOL_CALL_TAG}: {name}]");
+    let closing = format!("[/{EXTERNAL_AGENT_TOOL_CALL_TAG}]");
+    if body.is_empty() {
+        return format!("{opening}\n{closing}");
+    }
+    let fixed_len = opening
+        .chars()
+        .count()
+        .saturating_add(closing.chars().count())
+        .saturating_add(2);
+    let body = truncate(body, NOTE_MAX_LEN.saturating_sub(fixed_len));
+    format!("{opening}\n{body}\n{closing}")
 }
 
 fn tool_result_note(block: &JsonValue) -> String {
@@ -416,6 +458,23 @@ mod tests {
              command: git status --short\n\
              [/external_agent_tool_call]"
         );
+    }
+
+    #[test]
+    fn bounds_oversized_recognized_tool_call_fields_and_preserves_closing_tag() {
+        let block = serde_json::json!({
+            "type": "tool_use",
+            "name": "B".repeat(TOOL_NAME_MAX_LEN * 2),
+            "input": {
+                "command": "x".repeat(NOTE_MAX_LEN * 2),
+            }
+        });
+
+        let note = tool_call_note(&block);
+
+        assert!(note.chars().count() <= NOTE_MAX_LEN);
+        assert!(note.contains("\ncommand: "));
+        assert!(note.ends_with("[/external_agent_tool_call]"));
     }
 
     #[test]

@@ -1452,31 +1452,33 @@ fn extract_plugin_migration_details(
             continue;
         };
         if let Some(installable_plugins) =
-            configured_marketplace_plugins.get(&plugin_id.marketplace_name)
+            configured_marketplace_plugins.get(plugin_id.marketplace_name())
         {
-            if !installable_plugins.contains(&plugin_id.plugin_name) {
+            if !installable_plugins.contains(plugin_id.plugin_name()) {
                 tracing::warn!(
                     plugin_id = %plugin_id.as_key(),
-                    marketplace_name = %plugin_id.marketplace_name,
+                    marketplace_name = %plugin_id.marketplace_name(),
                     "enabled external agent plugin was not found in configured marketplace"
                 );
                 continue;
             }
-        } else if !loadable_marketplaces.contains(&plugin_id.marketplace_name) {
+        } else if !loadable_marketplaces.contains(plugin_id.marketplace_name()) {
             tracing::warn!(
                 plugin_id = %plugin_id.as_key(),
-                marketplace_name = %plugin_id.marketplace_name,
+                marketplace_name = %plugin_id.marketplace_name(),
                 "marketplace source was not found for enabled external agent plugin"
             );
             continue;
         }
         let plugin_group = plugins
-            .entry(plugin_id.marketplace_name.clone())
+            .entry(plugin_id.marketplace_name().to_string())
             .or_insert_with(|| PluginsMigration {
-                marketplace_name: plugin_id.marketplace_name.clone(),
+                marketplace_name: plugin_id.marketplace_name().to_string(),
                 plugin_names: Vec::new(),
             });
-        plugin_group.plugin_names.push(plugin_id.plugin_name);
+        plugin_group
+            .plugin_names
+            .push(plugin_id.plugin_name().to_string());
     }
 
     let plugins = plugins
@@ -1526,7 +1528,7 @@ fn has_enabled_plugin_for_marketplace(settings: &JsonValue, marketplace_name: &s
         .into_iter()
         .any(|plugin_id| {
             PluginId::parse(&plugin_id)
-                .map(|plugin_id| plugin_id.marketplace_name == marketplace_name)
+                .map(|plugin_id| plugin_id.marketplace_name() == marketplace_name)
                 .unwrap_or(false)
         })
 }
