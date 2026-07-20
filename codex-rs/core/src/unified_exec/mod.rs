@@ -71,8 +71,8 @@ pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 2_000;
 pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
 pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
 pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
-pub(crate) const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 4_000;
-pub(crate) const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 8_000;
+pub(crate) const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 10_000;
+pub(crate) const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 10_000;
 pub(crate) const ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS: usize = 10_000;
 #[cfg(all(test, unix))]
 pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = DEFAULT_SUCCESS_OUTPUT_TOKENS;

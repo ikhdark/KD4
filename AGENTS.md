@@ -1,6 +1,6 @@
 # Repository policy
 
-Shared policy revision: `2026-07-18`.
+Shared policy revision: `2026-07-20`.
 
 ## Synchronization contract
 
@@ -158,6 +158,20 @@ completes the request.
   simultaneously can each be locally correct while collectively inconsistent.
   Use one implementation owner for a contract. Other agents should map or audit
   it, not independently redefine it.
+- Agents may work in parallel on independent fixes or non-overlapping contract
+  surfaces. Establish explicit ownership boundaries before editing, and if an
+  overlap appears, stop editing the overlapping surface until ownership is
+  resolved through cross-task coordination.
+- Read-only agents may investigate in parallel to help other busy agents. They
+  may inspect relevant or adjacent contract surfaces but must not edit them;
+  report findings to the busy agent, who retains edit ownership for the owned
+  surface.
+- When task-relevant files change concurrently in a shared checkout, inspect
+  active Codex tasks for overlapping contract ownership. Use cross-task
+  messaging to establish one implementation owner, tell competing tasks which
+  behavior and files to stop editing, and request a source-freeze notice before
+  shared validation. Do not create new tasks or sub-agents solely for
+  coordination, and do not send repeated messages without new overlap or state.
 
 ## Fast implementation path
 
