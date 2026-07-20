@@ -54,6 +54,7 @@ pub use codex_file_system::FileSystemReadStream;
 pub use codex_file_system::FileSystemResult;
 pub use codex_file_system::FileSystemSandboxContext;
 pub use codex_file_system::ReadDirectoryEntry;
+pub use codex_file_system::ReadDirectoryOutcome;
 pub use codex_file_system::RemoveOptions;
 pub use codex_file_system::WalkEntry;
 pub use codex_file_system::WalkEntryKind;

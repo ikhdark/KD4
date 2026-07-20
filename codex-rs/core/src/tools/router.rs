@@ -26,6 +26,8 @@ use codex_tools::ToolCall as ExtensionToolCall;
 use codex_tools::ToolExecutor;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio_util::sync::CancellationToken;
@@ -43,6 +45,7 @@ pub struct ToolCall {
 pub struct ToolRouter {
     registry: ToolRegistry,
     model_visible_specs: Vec<ToolSpec>,
+    proven_read_only_external_tools: HashSet<ToolName>,
 }
 
 pub(crate) struct ToolRouterParams<'a> {
@@ -71,13 +74,20 @@ impl ToolRouter {
         params: ToolRouterParams<'_>,
         tool_search_handler_cache: &ToolSearchHandlerCache,
     ) -> Self {
-        build_tool_router(step_context, params, tool_search_handler_cache)
+        let proven_read_only_external_tools = collect_proven_read_only_external_tools(
+            params.mcp_tools.as_deref(),
+            params.deferred_mcp_tools.as_deref(),
+        );
+        let mut router = build_tool_router(step_context, params, tool_search_handler_cache);
+        router.proven_read_only_external_tools = proven_read_only_external_tools;
+        router
     }
 
     pub(crate) fn from_parts(registry: ToolRegistry, model_visible_specs: Vec<ToolSpec>) -> Self {
         Self {
             registry,
             model_visible_specs,
+            proven_read_only_external_tools: HashSet::new(),
         }
     }
 
@@ -226,7 +236,21 @@ impl ToolRouter {
         source: ToolCallSource,
         terminal_outcome_reached: Option<Arc<AtomicBool>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
-        authorize_bound_typed_tool_call(session.as_ref(), step_context.as_ref(), &call).await?;
+        let external_mutation_intent = if self
+            .proven_read_only_external_tools
+            .contains(&call.tool_name)
+        {
+            ExternalMutationIntent::ProvenReadOnly
+        } else {
+            ExternalMutationIntent::MayMutate
+        };
+        authorize_bound_typed_tool_call(
+            session.as_ref(),
+            step_context.as_ref(),
+            &call,
+            external_mutation_intent,
+        )
+        .await?;
         let ToolCall {
             tool_name,
             call_id,
@@ -253,10 +277,42 @@ impl ToolRouter {
     }
 }
 
+fn collect_proven_read_only_external_tools(
+    mcp_tools: Option<&[ToolInfo]>,
+    deferred_mcp_tools: Option<&[ToolInfo]>,
+) -> HashSet<ToolName> {
+    let mut external_tool_read_only = HashMap::new();
+    for tool in mcp_tools
+        .into_iter()
+        .flatten()
+        .chain(deferred_mcp_tools.into_iter().flatten())
+    {
+        let name = ToolName::new(
+            Some(tool.callable_namespace.clone()),
+            tool.callable_name.clone(),
+        );
+        let read_only = tool
+            .tool
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint)
+            == Some(true);
+        external_tool_read_only
+            .entry(name)
+            .and_modify(|all_read_only| *all_read_only &= read_only)
+            .or_insert(read_only);
+    }
+    external_tool_read_only
+        .into_iter()
+        .filter_map(|(name, read_only)| read_only.then_some(name))
+        .collect()
+}
+
 async fn authorize_bound_typed_tool_call(
     session: &Session,
     step_context: &StepContext,
     call: &ToolCall,
+    external_mutation_intent: ExternalMutationIntent,
 ) -> Result<(), FunctionCallError> {
     let coordinator = session.services.agent_control.task_coordinator();
     let Some(binding) = coordinator.binding_for_source(&step_context.turn.session_source) else {
@@ -310,7 +366,7 @@ async fn authorize_bound_typed_tool_call(
         &repo_root,
         TypedToolRequest {
             class,
-            external_mutation_intent: ExternalMutationIntent::MayMutate,
+            external_mutation_intent,
             repo_paths: &[],
         },
     );

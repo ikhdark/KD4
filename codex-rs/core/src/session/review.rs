@@ -88,7 +88,7 @@ pub(super) async fn spawn_review_thread(
 
     let per_turn_config = Arc::new(per_turn_config);
     let review_turn_id = sub_id.to_string();
-    let turn_metadata_state = Arc::new(TurnMetadataState::new(
+    let turn_metadata_state = Arc::new(TurnMetadataState::new_with_git_metadata_source(
         sess.session_id().to_string(),
         sess.thread_id().to_string(),
         forked_from_thread_id,
@@ -96,11 +96,12 @@ pub(super) async fn spawn_review_thread(
         &session_source,
         thread_source,
         review_turn_id.clone(),
-        #[allow(deprecated)]
-        parent_turn_context.cwd.clone(),
         &parent_turn_context.permission_profile,
         parent_turn_context.windows_sandbox_level,
         parent_turn_context.network.is_some(),
+        parent_turn_context
+            .turn_metadata_state
+            .git_metadata_source(),
     ));
 
     let extension_data = Arc::new(codex_extension_api::ExtensionData::new(

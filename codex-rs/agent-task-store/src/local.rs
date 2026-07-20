@@ -129,7 +129,7 @@ impl LocalAgentTaskStore {
         candidate_id: AssignmentId,
         dependencies: &[AssignmentId],
     ) -> StoreResult<()> {
-        self.validate_dependencies_impl(candidate_id, None, dependencies)
+        self.validate_dependencies_impl(candidate_id, None, dependencies, None)
             .await
     }
 
@@ -138,10 +138,17 @@ impl LocalAgentTaskStore {
         candidate_id: AssignmentId,
         repository_id: Option<&str>,
         dependencies: &[AssignmentId],
+        allowed_pending_gate: Option<(AssignmentId, GateKind)>,
     ) -> StoreResult<()> {
         let mut transaction = self.pool.begin().await?;
-        validate_dependencies_tx(&mut transaction, candidate_id, repository_id, dependencies)
-            .await?;
+        validate_dependencies_tx(
+            &mut transaction,
+            candidate_id,
+            repository_id,
+            dependencies,
+            allowed_pending_gate,
+        )
+        .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -186,11 +193,24 @@ impl LocalAgentTaskStore {
             .bind(encode(&assignment.created_at)?)
             .execute(&mut *transaction)
             .await?;
+        let allowed_pending_gate = assignment.relation.as_ref().and_then(|relation| {
+            let gate = match (assignment.role, relation.kind) {
+                (AgentRole::Reviewer, RelationKind::Review) => GateKind::Review,
+                (AgentRole::Verifier, RelationKind::Verification) => GateKind::Verification,
+                _ => return None,
+            };
+            relation
+                .target_assignment_ids
+                .first()
+                .copied()
+                .map(|target| (target, gate))
+        });
         validate_dependencies_tx(
             &mut transaction,
             assignment.assignment_id,
             Some(&assignment.repository_id),
             &assignment.dependencies,
+            allowed_pending_gate,
         )
         .await?;
         let (supersedes, conflicts) =
@@ -401,6 +421,33 @@ impl LocalAgentTaskStore {
         Ok(binding)
     }
 
+    async fn remove_agent_task_binding_impl(
+        &self,
+        actor: TaskActor,
+        assignment_id: AssignmentId,
+    ) -> StoreResult<bool> {
+        actor.require_root()?;
+        let mut transaction = self.pool.begin().await?;
+        lock_assignment_tx(&mut transaction, assignment_id).await?;
+        let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
+        if !matches!(
+            attempt.state,
+            AttemptState::NeedsMain | AttemptState::Abandoned
+        ) || attempt.sealed_at.is_none()
+        {
+            return Err(StoreError::InvalidAssignment(
+                "an agent task binding may be removed only after a failed start seals the current attempt"
+                    .to_string(),
+            ));
+        }
+        let deleted = sqlx::query("DELETE FROM agent_task_bindings WHERE assignment_id = ?")
+            .bind(assignment_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(deleted.rows_affected() != 0)
+    }
+
     async fn get_agent_task_binding_impl(
         &self,
         assignment_id: AssignmentId,
@@ -544,6 +591,7 @@ impl LocalAgentTaskStore {
         &self,
         attempt_id: AttemptId,
         mut draft: ReceiptDraft,
+        review_reason: Option<String>,
     ) -> StoreResult<AgentReceipt> {
         if draft.summary.trim().is_empty() {
             return Err(StoreError::InvalidAssignment(
@@ -635,6 +683,20 @@ impl LocalAgentTaskStore {
                 &assignment,
                 attempt_id,
                 &mut draft,
+            )
+            .await?;
+        }
+        if let Some(review_reason) = review_reason.as_deref() {
+            if draft.status != AgentStatusClaim::Completed {
+                return Err(StoreError::InvalidAssignment(
+                    "cold review may be required only for a completed receipt".to_string(),
+                ));
+            }
+            insert_risk_review_gates_tx(
+                &mut transaction,
+                attempt.assignment_id,
+                attempt_id,
+                review_reason,
             )
             .await?;
         }
@@ -963,6 +1025,13 @@ impl LocalAgentTaskStore {
         if gate.status.is_sealed() {
             record_gate_verdict_tx(&mut transaction, attempt.attempt_id, &gate).await?;
         }
+        let needs_main = gate_requires_main_intervention(&attempt, kind, status);
+        if needs_main {
+            transition_attempt_to_needs_main_tx(&mut transaction, &attempt).await?;
+        }
+        if kind == GateKind::Review && status == GateStatus::Passed {
+            ensure_pending_verification_for_risk_review_tx(&mut transaction, assignment_id).await?;
+        }
         release_successful_claim_if_unblocked_tx(&mut transaction, assignment_id).await?;
         append_observation_tx(
             &mut transaction,
@@ -973,6 +1042,18 @@ impl LocalAgentTaskStore {
             None,
         )
         .await?;
+        if needs_main {
+            append_observation_tx(
+                &mut transaction,
+                &assignment,
+                attempt.attempt_id,
+                ObservationKind::NeedsMain,
+                "review or verification could not be resolved within the bounded workflow"
+                    .to_string(),
+                None,
+            )
+            .await?;
+        }
         transaction.commit().await?;
         Ok(gate)
     }
@@ -1034,6 +1115,9 @@ impl LocalAgentTaskStore {
             .execute(&mut *transaction)
             .await?;
         record_gate_verdict_tx(&mut transaction, attempt.attempt_id, &gate).await?;
+        if kind == GateKind::Review {
+            ensure_pending_verification_for_risk_review_tx(&mut transaction, assignment_id).await?;
+        }
         release_successful_claim_if_unblocked_tx(&mut transaction, assignment_id).await?;
         append_observation_tx(
             &mut transaction,
@@ -1692,6 +1776,17 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         Box::pin(async move { self.bind_agent_task_impl(binding).await })
     }
 
+    fn remove_agent_task_binding(
+        &self,
+        actor: TaskActor,
+        assignment_id: AssignmentId,
+    ) -> TaskStoreFuture<'_, bool> {
+        Box::pin(async move {
+            self.remove_agent_task_binding_impl(actor, assignment_id)
+                .await
+        })
+    }
+
     fn get_agent_task_binding(
         &self,
         assignment_id: AssignmentId,
@@ -1732,7 +1827,22 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         attempt_id: AttemptId,
         receipt: ReceiptDraft,
     ) -> TaskStoreFuture<'_, AgentReceipt> {
-        Box::pin(async move { self.submit_agent_receipt_impl(attempt_id, receipt).await })
+        Box::pin(async move {
+            self.submit_agent_receipt_impl(attempt_id, receipt, None)
+                .await
+        })
+    }
+
+    fn submit_agent_receipt_with_review(
+        &self,
+        attempt_id: AttemptId,
+        receipt: ReceiptDraft,
+        review_reason: String,
+    ) -> TaskStoreFuture<'_, AgentReceipt> {
+        Box::pin(async move {
+            self.submit_agent_receipt_impl(attempt_id, receipt, Some(review_reason))
+                .await
+        })
     }
 
     fn amend_agent_task(
@@ -1986,6 +2096,7 @@ async fn validate_dependencies_tx(
     candidate_id: AssignmentId,
     repository_id: Option<&str>,
     dependencies: &[AssignmentId],
+    allowed_pending_gate: Option<(AssignmentId, GateKind)>,
 ) -> StoreResult<()> {
     let mut blockers = Vec::new();
     for dependency in dependencies {
@@ -2077,7 +2188,11 @@ async fn validate_dependencies_tx(
                     "gate identity does not match dependency {dependency}"
                 )));
             }
-            if !matches!(gate.status, GateStatus::Passed | GateStatus::Waived) {
+            let allowed_for_relation = gate.status == GateStatus::Pending
+                && allowed_pending_gate == Some((*dependency, gate.kind));
+            if !allowed_for_relation
+                && !matches!(gate.status, GateStatus::Passed | GateStatus::Waived)
+            {
                 blocking_gates.push((gate.kind, gate.status));
             }
         }
@@ -2171,6 +2286,167 @@ async fn record_gate_verdict_tx(
         .bind(encode(gate)?)
         .bind(encode(&gate.updated_at)?)
         .bind(encode(&sealed_at)?)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+async fn insert_risk_review_gates_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment_id: AssignmentId,
+    attempt_id: AttemptId,
+    review_reason: &str,
+) -> StoreResult<()> {
+    if review_reason.trim().is_empty() {
+        return Err(StoreError::InvalidAssignment(
+            "cold-review reason cannot be empty".to_string(),
+        ));
+    }
+
+    let now = Utc::now();
+    let risk_gate = AgentGate {
+        assignment_id,
+        kind: GateKind::Risk,
+        status: GateStatus::Passed,
+        reason: review_reason.to_string(),
+        waiver_reason: None,
+        updated_at: now,
+        sealed_at: Some(now),
+    };
+    let existing_risk = sqlx::query_scalar::<_, String>(
+        "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
+    )
+    .bind(assignment_id.to_string())
+    .bind(encode(&GateKind::Risk)?)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .map(|value| decode::<AgentGate>(&value))
+    .transpose()?;
+    match existing_risk {
+        Some(existing) if existing.status == GateStatus::Passed => {}
+        Some(existing) => {
+            return Err(StoreError::CorruptData(format!(
+                "assignment {assignment_id} has incompatible risk gate {:?}",
+                existing.status
+            )));
+        }
+        None => {
+            sqlx::query("INSERT INTO gates (assignment_id, kind, status, body_json, updated_at, sealed_at) VALUES (?, ?, ?, ?, ?, ?)")
+                .bind(assignment_id.to_string())
+                .bind(encode(&GateKind::Risk)?)
+                .bind(encode(&GateStatus::Passed)?)
+                .bind(encode(&risk_gate)?)
+                .bind(encode(&now)?)
+                .bind(encode(&now)?)
+                .execute(&mut **transaction)
+                .await?;
+        }
+    }
+    record_gate_verdict_tx(transaction, attempt_id, &risk_gate).await?;
+
+    let review_gate = AgentGate {
+        assignment_id,
+        kind: GateKind::Review,
+        status: GateStatus::Pending,
+        reason: review_reason.to_string(),
+        waiver_reason: None,
+        updated_at: now,
+        sealed_at: None,
+    };
+    let existing_review = sqlx::query_scalar::<_, String>(
+        "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
+    )
+    .bind(assignment_id.to_string())
+    .bind(encode(&GateKind::Review)?)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .map(|value| decode::<AgentGate>(&value))
+    .transpose()?;
+    match existing_review {
+        Some(existing) if existing.status == GateStatus::Pending => {
+            sqlx::query("UPDATE gates SET status = ?, body_json = ?, updated_at = ?, sealed_at = NULL WHERE assignment_id = ? AND kind = ?")
+                .bind(encode(&GateStatus::Pending)?)
+                .bind(encode(&review_gate)?)
+                .bind(encode(&now)?)
+                .bind(assignment_id.to_string())
+                .bind(encode(&GateKind::Review)?)
+                .execute(&mut **transaction)
+                .await?;
+        }
+        Some(existing) => {
+            return Err(StoreError::CorruptData(format!(
+                "assignment {assignment_id} has incompatible review gate {:?}",
+                existing.status
+            )));
+        }
+        None => {
+            sqlx::query("INSERT INTO gates (assignment_id, kind, status, body_json, updated_at, sealed_at) VALUES (?, ?, ?, ?, ?, NULL)")
+                .bind(assignment_id.to_string())
+                .bind(encode(&GateKind::Review)?)
+                .bind(encode(&GateStatus::Pending)?)
+                .bind(encode(&review_gate)?)
+                .bind(encode(&now)?)
+                .execute(&mut **transaction)
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_pending_verification_for_risk_review_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment_id: AssignmentId,
+) -> StoreResult<()> {
+    let risk_gate = sqlx::query_scalar::<_, String>(
+        "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
+    )
+    .bind(assignment_id.to_string())
+    .bind(encode(&GateKind::Risk)?)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .map(|value| decode::<AgentGate>(&value))
+    .transpose()?;
+    if risk_gate
+        .as_ref()
+        .is_none_or(|gate| gate.status != GateStatus::Passed)
+    {
+        return Ok(());
+    }
+
+    let existing = sqlx::query_scalar::<_, String>(
+        "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
+    )
+    .bind(assignment_id.to_string())
+    .bind(encode(&GateKind::Verification)?)
+    .fetch_optional(&mut **transaction)
+    .await?
+    .map(|value| decode::<AgentGate>(&value))
+    .transpose()?;
+    if let Some(existing) = existing {
+        if existing.status == GateStatus::Pending {
+            return Ok(());
+        }
+        return Err(StoreError::GateAlreadySealed {
+            gate: GateKind::Verification.to_string(),
+        });
+    }
+
+    let now = Utc::now();
+    let gate = AgentGate {
+        assignment_id,
+        kind: GateKind::Verification,
+        status: GateStatus::Pending,
+        reason: "independent verification required after risk-gated cold review".to_string(),
+        waiver_reason: None,
+        updated_at: now,
+        sealed_at: None,
+    };
+    sqlx::query("INSERT INTO gates (assignment_id, kind, status, body_json, updated_at, sealed_at) VALUES (?, ?, ?, ?, ?, NULL)")
+        .bind(assignment_id.to_string())
+        .bind(encode(&GateKind::Verification)?)
+        .bind(encode(&GateStatus::Pending)?)
+        .bind(encode(&gate)?)
+        .bind(encode(&now)?)
         .execute(&mut **transaction)
         .await?;
     Ok(())
@@ -2462,6 +2738,38 @@ async fn release_successful_claim_if_unblocked_tx(
         != 0;
     if successful && pending_gate_count(transaction, assignment_id).await? == 0 {
         release_claim(transaction, assignment_id, None).await?;
+    }
+    Ok(())
+}
+
+fn gate_requires_main_intervention(attempt: &Attempt, kind: GateKind, status: GateStatus) -> bool {
+    matches!(
+        (kind, status),
+        (GateKind::Review, GateStatus::Failed)
+            | (
+                GateKind::Verification,
+                GateStatus::Failed | GateStatus::ChangesRequested
+            )
+    ) || kind == GateKind::Review && status == GateStatus::ChangesRequested && attempt.ordinal > 0
+}
+
+async fn transition_attempt_to_needs_main_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attempt: &Attempt,
+) -> StoreResult<()> {
+    let updated = sqlx::query(
+        "UPDATE attempts SET state = ? WHERE attempt_id = ? AND state = ? AND sealed_at IS NOT NULL",
+    )
+    .bind(encode(&AttemptState::NeedsMain)?)
+    .bind(attempt.attempt_id.to_string())
+    .bind(encode(&AttemptState::Completed)?)
+    .execute(&mut **transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(StoreError::InvalidAssignment(
+            "a failed review or verification verdict requires a sealed completed attempt"
+                .to_string(),
+        ));
     }
     Ok(())
 }

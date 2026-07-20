@@ -29,6 +29,8 @@ use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use sha2::Digest;
+use sha2::Sha256;
 use std::io;
 use toml::Value as TomlValue;
 use tracing::error;
@@ -179,24 +181,7 @@ async fn agents_md_paths(
 ) -> io::Result<Vec<PathUri>> {
     let dir = cwd.clone();
 
-    let mut merged = TomlValue::Table(toml::map::Map::new());
-    for layer in config.config_layer_stack.get_layers(
-        ConfigLayerStackOrdering::LowestPrecedenceFirst,
-        /*include_disabled*/ false,
-    ) {
-        if matches!(layer.name, ConfigLayerSource::Project { .. }) {
-            continue;
-        }
-        merge_toml_values(&mut merged, &layer.config);
-    }
-    let project_root_markers = match project_root_markers_from_config(&merged) {
-        Ok(Some(markers)) => markers,
-        Ok(None) => default_project_root_markers(),
-        Err(err) => {
-            tracing::warn!("invalid project_root_markers: {err}");
-            default_project_root_markers()
-        }
-    };
+    let project_root_markers = effective_project_root_markers(config);
     let project_root = find_nearest_ancestor_with_markers(
         fs,
         &dir,
@@ -223,7 +208,6 @@ async fn agents_md_paths(
     } else {
         vec![dir]
     };
-
     let mut found = Vec::new();
     let candidate_filenames = candidate_filenames(config);
     for directory in search_dirs {
@@ -243,6 +227,27 @@ async fn agents_md_paths(
         }
     }
     Ok(found)
+}
+
+pub(crate) fn effective_project_root_markers(config: &Config) -> Vec<String> {
+    let mut merged = TomlValue::Table(toml::map::Map::new());
+    for layer in config.config_layer_stack.get_layers(
+        ConfigLayerStackOrdering::LowestPrecedenceFirst,
+        /*include_disabled*/ false,
+    ) {
+        if matches!(layer.name, ConfigLayerSource::Project { .. }) {
+            continue;
+        }
+        merge_toml_values(&mut merged, &layer.config);
+    }
+    match project_root_markers_from_config(&merged) {
+        Ok(Some(markers)) => markers,
+        Ok(None) => default_project_root_markers(),
+        Err(err) => {
+            tracing::warn!("invalid project_root_markers: {err}");
+            default_project_root_markers()
+        }
+    }
 }
 
 fn candidate_filenames(config: &Config) -> Vec<&str> {
@@ -328,6 +333,11 @@ impl LoadedAgentsMd {
         } else {
             self.legacy_text()
         }
+    }
+
+    /// Stable digest of the exact model-visible instruction text.
+    pub(crate) fn semantic_digest(&self) -> [u8; 32] {
+        Sha256::digest(self.text().as_bytes()).into()
     }
 
     fn legacy_text(&self) -> String {

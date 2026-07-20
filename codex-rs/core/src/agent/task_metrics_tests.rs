@@ -556,6 +556,26 @@ fn deterministic_replay_scenarios_cover_required_rules() {
 }
 
 #[test]
+fn typed_spawns_reject_every_unsuccessful_dependency_state() {
+    for dependency_state in [
+        DependencyState::Incomplete,
+        DependencyState::Blocked,
+        DependencyState::Failed,
+        DependencyState::Violated,
+        DependencyState::Abandoned,
+    ] {
+        let result = evaluate_replay(ReplayInput {
+            dependency_state,
+            ..ReplayInput::default()
+        });
+
+        assert_eq!(result.spawn, SpawnDisposition::RejectedDependency);
+        assert_eq!(result.gate, GateDisposition::NotEntered);
+        assert_eq!(result.outcome, FinalOutcome::Blocked);
+    }
+}
+
+#[test]
 fn unauthorized_shell_models_enforcement_and_detection_only_platforms() {
     let supported = evaluate_replay(ReplayInput {
         unauthorized_shell: true,

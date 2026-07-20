@@ -776,7 +776,11 @@ fn typed_assignment_schema() -> JsonSchema {
             ),
             (
                 "risk_hints".to_string(),
-                string_array("Known risks the agent must account for."),
+                string_array(
+                    "Known risks the agent must account for. Use a recognized risk domain \
+                     (concurrency, unsafe, lifecycle, persistence, schema, protocol, security, or \
+                     installation), or prefix a configured risk with path: or contract:.",
+                ),
             ),
             (
                 "required_evidence".to_string(),

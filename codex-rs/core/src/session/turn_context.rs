@@ -1,5 +1,6 @@
 use super::*;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::git_workspace::GitWorkspaceMetadataSource;
 use crate::shell_snapshot::ShellSnapshotFile;
 use codex_core_skills::HostSkillsSnapshot;
 use codex_file_system::FileSystemSandboxContext;
@@ -493,6 +494,7 @@ impl Session {
         models_manager: &SharedModelsManager,
         network: Option<NetworkProxy>,
         environments: TurnEnvironmentSnapshot,
+        git_metadata_source: Option<GitWorkspaceMetadataSource>,
         cwd: AbsolutePathBuf,
         sub_id: String,
         skills_snapshot: HostSkillsSnapshot,
@@ -524,7 +526,7 @@ impl Session {
             &model_info,
         );
         let per_turn_config = Arc::new(per_turn_config);
-        let turn_metadata_state = Arc::new(TurnMetadataState::new(
+        let turn_metadata_state = Arc::new(TurnMetadataState::new_with_git_metadata_source(
             session_id.to_string(),
             thread_id.to_string(),
             session_configuration.forked_from_thread_id,
@@ -532,10 +534,10 @@ impl Session {
             &session_configuration.session_source,
             session_configuration.thread_source.clone(),
             sub_id.clone(),
-            cwd.clone(),
             &session_configuration.permission_profile(),
             session_configuration.windows_sandbox_level,
             network.is_some(),
+            git_metadata_source,
         ));
         let (current_date, timezone) = local_time_context();
         let extension_data = Arc::new(codex_extension_api::ExtensionData::new(sub_id.clone()));
@@ -691,6 +693,12 @@ impl Session {
         multi_agent_runtime: TurnMultiAgentRuntime,
     ) -> Arc<TurnContext> {
         let turn_environments = self.services.turn_environments.snapshot().await;
+        let git_metadata_source = self
+            .services
+            .git_workspace
+            .snapshot(&turn_environments)
+            .await
+            .primary_local_metadata_source();
         let primary_turn_environment = turn_environments.primary().cloned();
         // TODO(anp): Migrate per-turn config and legacy TurnContext cwd consumers to PathUri so
         // a foreign primary environment does not fall back to the session's host cwd.
@@ -773,6 +781,7 @@ impl Session {
                     .then(|| started_proxy.proxy())
                 }),
             turn_environments,
+            git_metadata_source,
             cwd,
             sub_id,
             skills_snapshot,

@@ -552,55 +552,6 @@ fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
 }
 
 #[test]
-fn verifier_writable_roots_are_profile_repository_and_scope_bound() {
-    let fixture = RepoFixture::new();
-    let verifier = fixture.assignment(CapabilityProfile::ReadSearchShell, Vec::new());
-    let roots = vec![
-        recursive_scope("codex-rs/target"),
-        recursive_scope(".codex/verify-local"),
-        recursive_scope("build"),
-    ];
-    for allowed in [
-        "codex-rs/target",
-        "codex-rs/target/debug/x",
-        ".codex\\verify-local\\log",
-        "build/artifacts/result.json",
-    ] {
-        assert!(verifier_can_write_path(&verifier, fixture.path(), &roots, allowed).unwrap());
-    }
-    for denied in ["codex-rs/targeted/x", "builder/result", "src/lib.rs"] {
-        assert!(!verifier_can_write_path(&verifier, fixture.path(), &roots, denied).unwrap());
-    }
-
-    let worker = fixture.assignment(
-        CapabilityProfile::ScopedSourceWrite,
-        vec![recursive_scope("src")],
-    );
-    assert!(
-        !verifier_can_write_path(&worker, fixture.path(), &roots, "codex-rs/target/debug/x")
-            .unwrap()
-    );
-    assert!(typed_agent_can_write_path(&worker, fixture.path(), &roots, "src/lib.rs").unwrap());
-    assert!(
-        !typed_agent_can_write_path(
-            &worker,
-            fixture.path(),
-            &roots,
-            "build/artifacts/result.json"
-        )
-        .unwrap()
-    );
-    let reviewer = fixture.assignment(CapabilityProfile::ReadSearchDiff, Vec::new());
-    assert!(!typed_agent_can_write_path(&reviewer, fixture.path(), &roots, "src/lib.rs").unwrap());
-    for invalid in ["../target", "/tmp/target", "C:\\target"] {
-        assert!(matches!(
-            verifier_can_write_path(&verifier, fixture.path(), &roots, invalid),
-            Err(CapabilityPolicyError::InvalidRepoPath { .. })
-        ));
-    }
-}
-
-#[test]
 fn cold_review_context_is_attempt_bound_and_structurally_excludes_worker_history() {
     let fixture = RepoFixture::new();
     let assignment = fixture.assignment(

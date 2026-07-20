@@ -49,7 +49,7 @@ async fn stable_refresh_reuses_loaded_arc_and_semantic_digest() {
 
     assert!(Arc::ptr_eq(&first, &second));
     let expected_digest: [u8; 32] = Sha256::digest(first.text().as_bytes()).into();
-    assert_eq!(*first.semantic_digest(), expected_digest);
+    assert_eq!(first.semantic_digest(), expected_digest);
 }
 
 #[tokio::test]
@@ -139,10 +139,7 @@ async fn effective_marker_configuration_invalidates_cached_discovery() {
     manager.refresh(&marker_config, &environments).await;
     let with_root = manager.get_loaded().await.expect("root-aware load");
     assert!(!Arc::ptr_eq(&nested_only, &with_root));
-    assert_eq!(
-        with_root.text(),
-        "root instructions\n\nnested instructions"
-    );
+    assert_eq!(with_root.text(), "root instructions\n\nnested instructions");
 }
 
 #[tokio::test]

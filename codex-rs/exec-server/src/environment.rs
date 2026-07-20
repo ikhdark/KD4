@@ -667,6 +667,18 @@ mod tests {
         .expect("runtime paths")
     }
 
+    fn successful_process_argv() -> Vec<String> {
+        if cfg!(windows) {
+            vec![
+                std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
+                "/C".to_string(),
+                "exit /B 0".to_string(),
+            ]
+        } else {
+            vec!["true".to_string()]
+        }
+    }
+
     fn assert_local_environment_unavailable(manager: &EnvironmentManager) {
         assert!(manager.try_local_environment().is_none());
     }
@@ -1245,7 +1257,7 @@ mod tests {
             .get_exec_backend()
             .start(crate::ExecParams {
                 process_id: ProcessId::from("default-env-proc"),
-                argv: vec!["true".to_string()],
+                argv: successful_process_argv(),
                 cwd: PathUri::from_host_native_path(
                     std::env::current_dir().expect("read current dir"),
                 )

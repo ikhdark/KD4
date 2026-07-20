@@ -1,28 +1,49 @@
 use super::*;
+use crate::agent::task_capabilities::ColdReviewContext;
+use crate::agent::task_capabilities::ColdReviewContextInput;
+use crate::agent::task_capabilities::RiskPolicyInput;
+use crate::agent::task_capabilities::build_cold_review_context;
+use crate::agent::task_capabilities::derive_risk_policy;
 use codex_agent_task_store::AcceptanceCriterion;
 use codex_agent_task_store::AgentGate;
 use codex_agent_task_store::AgentReceipt;
+use codex_agent_task_store::AgentRole;
 use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
 use codex_agent_task_store::AgentTaskBindingDraft;
+use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::AssignmentId;
 use codex_agent_task_store::Attempt;
 use codex_agent_task_store::AttemptAmendment;
+use codex_agent_task_store::AttributionConfidence;
 use codex_agent_task_store::CriterionResult;
 use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::DEFAULT_OBSERVATION_LIMIT;
 use codex_agent_task_store::DeclaredChange;
 use codex_agent_task_store::GateKind;
 use codex_agent_task_store::GateStatus;
+use codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT;
 use codex_agent_task_store::MAX_OBSERVATION_LIMIT;
+use codex_agent_task_store::MAX_SNAPSHOT_CHUNK_BYTES;
+use codex_agent_task_store::MutationEvidence;
+use codex_agent_task_store::MutationSnapshotVersion;
 use codex_agent_task_store::ReceiptDraft;
+use codex_agent_task_store::RelationKind;
+use codex_agent_task_store::RepoScope;
+use codex_agent_task_store::RiskDomain;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::TaskActor;
+use codex_agent_task_store::ValidationCallStatus;
+use codex_git_utils::get_git_repo_root;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
+use similar::ChangeTag;
+use similar::TextDiff;
+use std::collections::BTreeSet;
+use std::path::Path;
 
 const GET_AGENT_TASK_TOOL: &str = "get_agent_task";
 const SUBMIT_AGENT_RECEIPT_TOOL: &str = "submit_agent_receipt";
@@ -30,6 +51,8 @@ const SET_AGENT_GATE_TOOL: &str = "set_agent_gate";
 const AMEND_AGENT_TASK_TOOL: &str = "amend_agent_task";
 const WAIVE_AGENT_GATE_TOOL: &str = "waive_agent_gate";
 const ABANDON_AGENT_TASK_TOOL: &str = "abandon_agent_task";
+const MAX_COLD_REVIEW_DIFF_BYTES: usize = 256 * 1024;
+const MAX_COLD_REVIEW_FILE_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct GetAgentTaskHandler;
 pub(crate) struct SubmitAgentReceiptHandler;
@@ -155,7 +178,18 @@ async fn handle_get_agent_task(
             "{GET_AGENT_TASK_TOOL}: non-root callers may only read their own current bound task"
         )));
     }
-    Ok(boxed_tool_output(GetAgentTaskResult { task }))
+    let cold_review_context = if caller_binding.is_some() {
+        build_evaluation_context(session.as_ref(), turn.config.cwd.as_path(), &task).await?
+    } else {
+        None
+    };
+    coordinator
+        .maybe_emit_terminal_metrics(assignment_id, &turn.session_telemetry)
+        .await;
+    Ok(boxed_tool_output(GetAgentTaskResult {
+        task,
+        cold_review_context,
+    }))
 }
 
 async fn handle_submit_agent_receipt(
@@ -198,11 +232,476 @@ async fn handle_submit_agent_receipt(
         .finalize_pending_mutations(binding.attempt_id)
         .await
         .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
-    let receipt = store
-        .submit_agent_receipt(binding.attempt_id, args.into_receipt_draft())
+    // Risk derivation and cold-review evidence must cover the complete attempt, including writes
+    // that another runtime path finalized before receipt submission.
+    let observed_writes = store
+        .list_mutation_evidence(binding.attempt_id, Some(MAX_MUTATION_EVIDENCE_LIMIT))
         .await
         .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
+    let draft = args.into_receipt_draft();
+    let review_reason = derive_review_reason(
+        store.as_ref(),
+        turn.config.cwd.as_path(),
+        &task,
+        &draft,
+        &observed_writes,
+    )
+    .await?;
+    let receipt = match review_reason {
+        Some(review_reason) => {
+            store
+                .submit_agent_receipt_with_review(binding.attempt_id, draft, review_reason)
+                .await
+        }
+        None => store.submit_agent_receipt(binding.attempt_id, draft).await,
+    }
+    .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
+    coordinator.mark_task_inactive(binding.assignment_id);
+    coordinator
+        .maybe_emit_terminal_metrics(binding.assignment_id, &turn.session_telemetry)
+        .await;
     Ok(boxed_tool_output(SubmitAgentReceiptResult { receipt }))
+}
+
+#[derive(Default)]
+struct ParsedRiskHints {
+    high_risk_paths: Vec<RepoScope>,
+    contracts: Vec<String>,
+    domains: Vec<RiskDomain>,
+}
+
+struct SnapshotContent {
+    existed: bool,
+    bytes: Option<Vec<u8>>,
+    total_bytes: u64,
+}
+
+#[derive(Default)]
+struct AttemptDiffSummary {
+    text: String,
+    changed_paths: Vec<String>,
+    non_generated_changed_files: u32,
+    non_generated_changed_lines: u32,
+}
+
+async fn derive_review_reason(
+    store: &dyn AgentTaskStore,
+    cwd: &Path,
+    task: &AgentTask,
+    draft: &ReceiptDraft,
+    observed_writes: &[MutationEvidence],
+) -> Result<Option<String>, FunctionCallError> {
+    if draft.status != AgentStatusClaim::Completed {
+        return Ok(None);
+    }
+
+    let repo_root = get_git_repo_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let diff = build_attempt_diff(store, task.current_attempt.attempt_id, observed_writes)
+        .await
+        .map_err(|error| task_store_error(SUBMIT_AGENT_RECEIPT_TOOL, error))?;
+    let risk_hints = parse_risk_hints(&task.assignment.risk_hints);
+    let successful_validation_ids = task
+        .validation_calls
+        .iter()
+        .filter(|call| call.status == ValidationCallStatus::Succeeded)
+        .map(|call| call.call_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let focused_validation_succeeded = !draft.validation_call_ids.is_empty()
+        && draft
+            .validation_call_ids
+            .iter()
+            .all(|call_id| successful_validation_ids.contains(call_id.as_str()));
+    let touched_contracts = if diff.changed_paths.is_empty() {
+        Vec::new()
+    } else {
+        risk_hints.contracts.clone()
+    };
+    let drift = observed_writes
+        .iter()
+        .any(|evidence| evidence.attribution_confidence == AttributionConfidence::DetectionOnly);
+    let derived = derive_risk_policy(
+        &task.assignment,
+        &repo_root,
+        RiskPolicyInput {
+            changed_paths: &diff.changed_paths,
+            configured_high_risk_paths: &risk_hints.high_risk_paths,
+            touched_contracts: &touched_contracts,
+            configured_high_risk_contracts: &risk_hints.contracts,
+            cross_owner_scope: false,
+            named_domains: &risk_hints.domains,
+            non_generated_changed_files: diff.non_generated_changed_files,
+            non_generated_changed_lines: diff.non_generated_changed_lines,
+            focused_validation_succeeded,
+            // Overlap is rejected atomically when the assignment is accepted. Detection-only
+            // attribution is the remaining persisted signal that concurrent drift may exist.
+            ownership_conflict: false,
+            drift,
+        },
+    )
+    .map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "{SUBMIT_AGENT_RECEIPT_TOOL}: risk evidence is invalid: {error}"
+        ))
+    })?;
+    Ok(derived.decision.review_required.then(|| {
+        format!(
+            "cold review required: {}",
+            derived.decision.reasons.join("; ")
+        )
+    }))
+}
+
+async fn build_evaluation_context(
+    session: &crate::session::session::Session,
+    cwd: &Path,
+    task: &AgentTask,
+) -> Result<Option<ColdReviewContext>, FunctionCallError> {
+    let (role_name, relation_kind) = match task.assignment.role {
+        AgentRole::Reviewer => ("reviewer", RelationKind::Review),
+        AgentRole::Verifier => ("verifier", RelationKind::Verification),
+        _ => return Ok(None),
+    };
+    let relation = task.assignment.relation.as_ref().ok_or_else(|| {
+        FunctionCallError::RespondToModel(format!(
+            "{GET_AGENT_TASK_TOOL}: {role_name} assignment is missing its evaluation target"
+        ))
+    })?;
+    if relation.kind != relation_kind || relation.target_assignment_ids.len() != 1 {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{GET_AGENT_TASK_TOOL}: {role_name} assignment has an invalid evaluation relation"
+        )));
+    }
+    let target_assignment_id = relation.target_assignment_ids[0];
+    let coordinator = session.services.agent_control.task_coordinator();
+    let store = coordinator.store().ok_or_else(|| {
+        FunctionCallError::RespondToModel(format!(
+            "{GET_AGENT_TASK_TOOL}: the typed task store is unavailable"
+        ))
+    })?;
+    let target = store
+        .get_agent_task(target_assignment_id, Some(0))
+        .await
+        .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
+    let observed_writes = store
+        .list_mutation_evidence(
+            target.current_attempt.attempt_id,
+            Some(MAX_MUTATION_EVIDENCE_LIMIT),
+        )
+        .await
+        .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
+    let diff = build_attempt_diff(
+        store.as_ref(),
+        target.current_attempt.attempt_id,
+        &observed_writes,
+    )
+    .await
+    .map_err(|error| task_store_error(GET_AGENT_TASK_TOOL, error))?;
+    let applicable_instructions = session
+        .services
+        .agents_md_manager
+        .get_loaded()
+        .await
+        .map(|instructions| instructions.text())
+        .filter(|instructions| !instructions.trim().is_empty())
+        .into_iter()
+        .collect();
+    let relevant_contracts = parse_risk_hints(&target.assignment.risk_hints).contracts;
+    let nearest_tests = target
+        .assignment
+        .required_evidence
+        .iter()
+        .cloned()
+        .chain(
+            target
+                .validation_calls
+                .iter()
+                .map(|call| call.command_summary.clone()),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let repo_root = get_git_repo_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    build_cold_review_context(
+        &repo_root,
+        ColdReviewContextInput {
+            assignment: target.assignment,
+            attempt_id: target.current_attempt.attempt_id,
+            applicable_instructions,
+            attempt_specific_diff: diff.text,
+            observed_writes,
+            relevant_contracts,
+            nearest_tests,
+        },
+    )
+    .map(Some)
+    .map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "{GET_AGENT_TASK_TOOL}: cold-review evidence is invalid: {error}"
+        ))
+    })
+}
+
+fn parse_risk_hints(hints: &[String]) -> ParsedRiskHints {
+    let mut paths = BTreeSet::new();
+    let mut contracts = BTreeSet::new();
+    let mut domains = BTreeSet::new();
+    for hint in hints {
+        let hint = hint.trim();
+        if hint.is_empty() {
+            continue;
+        }
+        if let Some((kind, value)) = hint.split_once(':') {
+            let value = value.trim();
+            if kind.trim().eq_ignore_ascii_case("path") && !value.is_empty() {
+                paths.insert(value.to_string());
+                continue;
+            }
+            if kind.trim().eq_ignore_ascii_case("contract") && !value.is_empty() {
+                contracts.insert(value.to_string());
+                continue;
+            }
+        }
+        if let Some(domain) = risk_domain_from_hint(hint) {
+            domains.insert(domain);
+        } else {
+            // Unstructured root-authored hints are conservatively treated as contract risks.
+            contracts.insert(hint.to_string());
+        }
+    }
+    ParsedRiskHints {
+        high_risk_paths: paths
+            .into_iter()
+            .map(|path| RepoScope {
+                path,
+                recursive: true,
+            })
+            .collect(),
+        contracts: contracts.into_iter().collect(),
+        domains: domains.into_iter().collect(),
+    }
+}
+
+fn risk_domain_from_hint(hint: &str) -> Option<RiskDomain> {
+    let normalized = hint.trim().to_ascii_lowercase().replace(['-', '_'], " ");
+    let normalized = normalized.strip_suffix(" risk").unwrap_or(&normalized);
+    match normalized {
+        "concurrency" => Some(RiskDomain::Concurrency),
+        "unsafe" | "unsafe code" => Some(RiskDomain::UnsafeCode),
+        "lifecycle" => Some(RiskDomain::Lifecycle),
+        "persistence" => Some(RiskDomain::Persistence),
+        "schema" => Some(RiskDomain::Schema),
+        "protocol" => Some(RiskDomain::Protocol),
+        "security" => Some(RiskDomain::Security),
+        "installation" => Some(RiskDomain::Installation),
+        _ => None,
+    }
+}
+
+async fn build_attempt_diff(
+    store: &dyn AgentTaskStore,
+    attempt_id: codex_agent_task_store::AttemptId,
+    observed_writes: &[MutationEvidence],
+) -> Result<AttemptDiffSummary, StoreError> {
+    let mut summary = AttemptDiffSummary::default();
+    let mut truncated = false;
+    for evidence in observed_writes {
+        let final_existed = evidence.final_write_existed.unwrap_or(false);
+        if evidence.pre_write_hash == evidence.final_hash
+            && evidence.pre_write_existed == final_existed
+        {
+            continue;
+        }
+        summary.changed_paths.push(evidence.path.clone());
+        let (section, changed_lines, generated) = if evidence.snapshot_retained {
+            let before = read_snapshot(
+                store,
+                attempt_id,
+                &evidence.path,
+                MutationSnapshotVersion::PreWrite,
+            )
+            .await?;
+            let after = read_snapshot(
+                store,
+                attempt_id,
+                &evidence.path,
+                MutationSnapshotVersion::Final,
+            )
+            .await?;
+            render_snapshot_diff(&evidence.path, &before, &after)
+        } else {
+            (
+                format!(
+                    "diff --git a/{0} b/{0}\n[private mutation snapshot unavailable]\n",
+                    evidence.path
+                ),
+                401,
+                false,
+            )
+        };
+        if !generated {
+            summary.non_generated_changed_files =
+                summary.non_generated_changed_files.saturating_add(1);
+            summary.non_generated_changed_lines = summary
+                .non_generated_changed_lines
+                .saturating_add(changed_lines);
+        }
+        push_bounded_diff(&mut summary.text, &section, &mut truncated);
+    }
+    if truncated {
+        const NOTICE: &str = "\n[attempt-specific diff truncated; write hashes remain available]\n";
+        let keep = MAX_COLD_REVIEW_DIFF_BYTES.saturating_sub(NOTICE.len());
+        summary
+            .text
+            .truncate(floor_char_boundary(&summary.text, keep));
+        summary.text.push_str(NOTICE);
+    }
+    Ok(summary)
+}
+
+async fn read_snapshot(
+    store: &dyn AgentTaskStore,
+    attempt_id: codex_agent_task_store::AttemptId,
+    path: &str,
+    version: MutationSnapshotVersion,
+) -> Result<SnapshotContent, StoreError> {
+    let first = store
+        .read_mutation_snapshot(
+            attempt_id,
+            path.to_string(),
+            version,
+            0,
+            Some(MAX_SNAPSHOT_CHUNK_BYTES),
+        )
+        .await?;
+    if first.total_bytes > MAX_COLD_REVIEW_FILE_BYTES as u64 {
+        return Ok(SnapshotContent {
+            existed: first.existed,
+            bytes: None,
+            total_bytes: first.total_bytes,
+        });
+    }
+    let mut bytes = first.bytes;
+    let existed = first.existed;
+    let total_bytes = first.total_bytes;
+    let mut next_offset = first.next_offset;
+    while let Some(offset) = next_offset {
+        let chunk = store
+            .read_mutation_snapshot(
+                attempt_id,
+                path.to_string(),
+                version,
+                offset,
+                Some(MAX_SNAPSHOT_CHUNK_BYTES),
+            )
+            .await?;
+        if chunk.existed != existed || chunk.total_bytes != total_bytes {
+            return Err(StoreError::CorruptData(format!(
+                "snapshot metadata changed while reading {path}"
+            )));
+        }
+        bytes.extend_from_slice(&chunk.bytes);
+        next_offset = chunk.next_offset;
+    }
+    Ok(SnapshotContent {
+        existed,
+        bytes: Some(bytes),
+        total_bytes,
+    })
+}
+
+fn render_snapshot_diff(
+    path: &str,
+    before: &SnapshotContent,
+    after: &SnapshotContent,
+) -> (String, u32, bool) {
+    let (Some(before_bytes), Some(after_bytes)) = (&before.bytes, &after.bytes) else {
+        return (
+            format!(
+                "diff --git a/{0} b/{0}\n[snapshot exceeds cold-review limit: before={1} bytes, after={2} bytes]\n",
+                path, before.total_bytes, after.total_bytes
+            ),
+            401,
+            false,
+        );
+    };
+    let generated = confirmed_generated(before, before_bytes, after, after_bytes);
+    let (Ok(before_text), Ok(after_text)) = (
+        std::str::from_utf8(before_bytes),
+        std::str::from_utf8(after_bytes),
+    ) else {
+        return (
+            format!("diff --git a/{0} b/{0}\nBinary files differ\n", path),
+            401,
+            generated,
+        );
+    };
+    let text_diff = TextDiff::from_lines(before_text, after_text);
+    let changed_lines = text_diff
+        .iter_all_changes()
+        .filter(|change| change.tag() != ChangeTag::Equal)
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX);
+    let old_header = before
+        .existed
+        .then(|| format!("a/{path}"))
+        .unwrap_or_else(|| "/dev/null".to_string());
+    let new_header = after
+        .existed
+        .then(|| format!("b/{path}"))
+        .unwrap_or_else(|| "/dev/null".to_string());
+    let mut section = format!("diff --git a/{0} b/{0}\n", path);
+    section.push_str(
+        &text_diff
+            .unified_diff()
+            .context_radius(3)
+            .header(&old_header, &new_header)
+            .to_string(),
+    );
+    if !section.ends_with('\n') {
+        section.push('\n');
+    }
+    (section, changed_lines, generated)
+}
+
+fn confirmed_generated(
+    before: &SnapshotContent,
+    before_bytes: &[u8],
+    after: &SnapshotContent,
+    after_bytes: &[u8],
+) -> bool {
+    (!before.existed || generated_marker(before_bytes))
+        && (!after.existed || generated_marker(after_bytes))
+}
+
+fn generated_marker(contents: &[u8]) -> bool {
+    let prefix = &contents[..contents.len().min(4096)];
+    let lowercase = String::from_utf8_lossy(prefix).to_ascii_lowercase();
+    lowercase.contains("@generated")
+        || lowercase.contains("code generated") && lowercase.contains("do not edit")
+        || lowercase.contains("automatically generated") && lowercase.contains("do not edit")
+}
+
+fn push_bounded_diff(output: &mut String, section: &str, truncated: &mut bool) {
+    if output.len() >= MAX_COLD_REVIEW_DIFF_BYTES {
+        *truncated = true;
+        return;
+    }
+    let remaining = MAX_COLD_REVIEW_DIFF_BYTES - output.len();
+    if section.len() <= remaining {
+        output.push_str(section);
+    } else {
+        output.push_str(&section[..floor_char_boundary(section, remaining)]);
+        *truncated = true;
+    }
+}
+
+fn floor_char_boundary(value: &str, mut index: usize) -> usize {
+    index = index.min(value.len());
+    while index > 0 && !value.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 async fn handle_set_agent_gate(
@@ -239,6 +738,9 @@ async fn handle_set_agent_gate(
         .set_agent_gate(actor, assignment_id, args.gate, args.status, args.reason)
         .await
         .map_err(|error| task_store_error(SET_AGENT_GATE_TOOL, error))?;
+    coordinator
+        .maybe_emit_terminal_metrics(assignment_id, &turn.session_telemetry)
+        .await;
     Ok(boxed_tool_output(SetAgentGateResult { gate }))
 }
 
@@ -304,16 +806,12 @@ async fn handle_waive_agent_gate(
     let args: WaiveAgentGateArgs = parse_arguments(&arguments)?;
     require_root(&turn.session_source, WAIVE_AGENT_GATE_TOOL)?;
     let assignment_id = parse_assignment_id(WAIVE_AGENT_GATE_TOOL, &args.assignment_id)?;
-    let store = session
-        .services
-        .agent_control
-        .task_coordinator()
-        .store()
-        .ok_or_else(|| {
-            FunctionCallError::RespondToModel(format!(
-                "{WAIVE_AGENT_GATE_TOOL}: the typed task store is unavailable"
-            ))
-        })?;
+    let coordinator = session.services.agent_control.task_coordinator();
+    let store = coordinator.store().ok_or_else(|| {
+        FunctionCallError::RespondToModel(format!(
+            "{WAIVE_AGENT_GATE_TOOL}: the typed task store is unavailable"
+        ))
+    })?;
     let gate = store
         .waive_agent_gate(
             TaskActor::Root,
@@ -323,6 +821,9 @@ async fn handle_waive_agent_gate(
         )
         .await
         .map_err(|error| task_store_error(WAIVE_AGENT_GATE_TOOL, error))?;
+    coordinator
+        .maybe_emit_terminal_metrics(assignment_id, &turn.session_telemetry)
+        .await;
     Ok(boxed_tool_output(WaiveAgentGateResult { gate }))
 }
 
@@ -349,6 +850,10 @@ async fn handle_abandon_agent_task(
         .abandon_agent_task(TaskActor::Root, assignment_id, args.reason)
         .await
         .map_err(|error| task_store_error(ABANDON_AGENT_TASK_TOOL, error))?;
+    coordinator.mark_task_inactive(assignment_id);
+    coordinator
+        .maybe_emit_terminal_metrics(assignment_id, &turn.session_telemetry)
+        .await;
 
     // Durable abandonment is authoritative. Every following step is best-effort so a missing or
     // already-dead runtime thread cannot turn a sealed result into a reported tool failure.
@@ -584,6 +1089,8 @@ struct AbandonAgentTaskArgs {
 #[derive(Debug, Serialize)]
 struct GetAgentTaskResult {
     task: AgentTask,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cold_review_context: Option<ColdReviewContext>,
 }
 
 #[derive(Debug, Serialize)]
@@ -644,8 +1151,8 @@ fn get_agent_task_spec() -> ToolSpec {
     function_spec(
         GET_AGENT_TASK_TOOL,
         "Read a durable typed-agent assignment, its current attempt, gates, receipt, captured \
-         validation calls, and recent observations. observation_limit defaults to 20 and cannot \
-         exceed 100.",
+         validation calls, and recent observations. A bound reviewer or verifier also receives \
+         isolated evidence for its target. observation_limit defaults to 20 and cannot exceed 100.",
         object_schema(
             [
                 (

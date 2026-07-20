@@ -161,6 +161,21 @@ async fn handle_spawn_agent(
     let typed_task = if let Some(assignment_args) = args.assignment.take() {
         let role = typed_role.expect("typed role is resolved when assignment is present");
         let coordinator = session.services.agent_control.task_coordinator();
+        if coordinator.store().is_none() {
+            let state_runtime = session.services.state_db.as_ref().ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "spawn_agent: durable typed assignments require persistent local session state"
+                        .to_string(),
+                )
+            })?;
+            coordinator
+                .initialize(
+                    state_runtime.clone(),
+                    session.services.agent_control.session_id().to_string(),
+                )
+                .await
+                .map_err(typed_task_store_error)?;
+        }
         let root_session_id = coordinator.root_session_id().ok_or_else(|| {
             FunctionCallError::RespondToModel(
                 "spawn_agent: durable typed assignments require persistent local session state"
@@ -225,21 +240,43 @@ async fn handle_spawn_agent(
     let spawned_agent = match spawned_agent {
         Ok(spawned_agent) => spawned_agent,
         Err(error) => {
-            if let Some((assignment, _)) = typed_task.as_ref()
-                && let Some(store) = session.services.agent_control.task_coordinator().store()
-                && let Err(rollback_error) = store
-                    .abandon_agent_task(
-                        TaskActor::Root,
-                        assignment.assignment_id,
-                        format!("spawn failed before the typed agent started: {error}"),
-                    )
-                    .await
-            {
-                tracing::warn!(
-                    assignment_id = %assignment.assignment_id,
-                    %rollback_error,
-                    "failed to abandon typed assignment after spawn failure"
-                );
+            if let Some((assignment, _)) = typed_task.as_ref() {
+                let coordinator = session.services.agent_control.task_coordinator();
+                if let Some(store) = coordinator.store() {
+                    if let Err(rollback_error) = store
+                        .abandon_agent_task(
+                            TaskActor::Root,
+                            assignment.assignment_id,
+                            format!("spawn failed before the typed agent started: {error}"),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            assignment_id = %assignment.assignment_id,
+                            %rollback_error,
+                            "failed to abandon typed assignment after spawn failure"
+                        );
+                    }
+                    // A terminal fallback receipt may race the explicit abandonment while the
+                    // child is shutting down. Removal performs its own terminal-state check, so
+                    // attempt it independently and never delete an active task's binding.
+                    if let Err(cleanup_error) = coordinator
+                        .remove_agent_task_binding(assignment.assignment_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            assignment_id = %assignment.assignment_id,
+                            %cleanup_error,
+                            "failed to remove typed task binding after spawn failure"
+                        );
+                    }
+                    coordinator
+                        .maybe_emit_terminal_metrics(
+                            assignment.assignment_id,
+                            &turn.session_telemetry,
+                        )
+                        .await;
+                }
             }
             return Err(collab_spawn_error(error));
         }

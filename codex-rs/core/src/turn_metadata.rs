@@ -9,6 +9,8 @@ use std::sync::atomic::Ordering;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
+use crate::git_workspace::GitWorkspaceMetadata;
+use crate::git_workspace::GitWorkspaceMetadataSource;
 use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::TurnMetadataWorkspace;
@@ -16,10 +18,6 @@ use crate::responses_metadata::filter_extra_metadata;
 use crate::responses_metadata::subagent_header_value;
 use crate::responses_metadata::subagent_metadata_kind;
 use crate::sandbox_tags::permission_profile_sandbox_tag;
-use codex_git_utils::get_git_remote_urls_assume_git_repo;
-use codex_git_utils::get_git_repo_root;
-use codex_git_utils::get_has_changes;
-use codex_git_utils::get_head_commit_hash;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
@@ -43,6 +41,16 @@ struct WorkspaceGitMetadata {
     associated_remote_urls: Option<BTreeMap<String, String>>,
     latest_git_commit_hash: Option<String>,
     has_changes: Option<bool>,
+}
+
+impl From<GitWorkspaceMetadata> for WorkspaceGitMetadata {
+    fn from(value: GitWorkspaceMetadata) -> Self {
+        Self {
+            associated_remote_urls: value.associated_remote_urls,
+            latest_git_commit_hash: value.latest_git_commit_hash,
+            has_changes: value.has_changes,
+        }
+    }
 }
 
 impl WorkspaceGitMetadata {
@@ -84,8 +92,8 @@ pub async fn detached_memory_responses_metadata(
 
 #[derive(Clone, Debug)]
 pub(crate) struct TurnMetadataState {
-    cwd: AbsolutePathBuf,
     repo_root: Option<String>,
+    git_metadata_source: Option<GitWorkspaceMetadataSource>,
     session_id: String,
     thread_id: String,
     forked_from_thread_id: Option<ThreadId>,
@@ -103,6 +111,7 @@ pub(crate) struct TurnMetadataState {
 }
 
 impl TurnMetadataState {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session_id: String,
@@ -117,7 +126,39 @@ impl TurnMetadataState {
         windows_sandbox_level: WindowsSandboxLevel,
         enforce_managed_network: bool,
     ) -> Self {
-        let repo_root = get_git_repo_root(&cwd).map(|root| root.to_string_lossy().into_owned());
+        let git_metadata_source = GitWorkspaceMetadataSource::discover_local(cwd.clone());
+        Self::new_with_git_metadata_source(
+            session_id,
+            thread_id,
+            forked_from_thread_id,
+            parent_thread_id,
+            session_source,
+            thread_source,
+            turn_id,
+            permission_profile,
+            windows_sandbox_level,
+            enforce_managed_network,
+            git_metadata_source,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_with_git_metadata_source(
+        session_id: String,
+        thread_id: String,
+        forked_from_thread_id: Option<ThreadId>,
+        parent_thread_id: Option<ThreadId>,
+        session_source: &SessionSource,
+        thread_source: Option<ThreadSource>,
+        turn_id: String,
+        permission_profile: &PermissionProfile,
+        windows_sandbox_level: WindowsSandboxLevel,
+        enforce_managed_network: bool,
+        git_metadata_source: Option<GitWorkspaceMetadataSource>,
+    ) -> Self {
+        let repo_root = git_metadata_source
+            .as_ref()
+            .map(|source| source.repo_root().to_string_lossy().into_owned());
         let sandbox = Some(
             permission_profile_sandbox_tag(
                 permission_profile,
@@ -127,8 +168,8 @@ impl TurnMetadataState {
             .to_string(),
         );
         Self {
-            cwd,
             repo_root,
+            git_metadata_source,
             session_id,
             thread_id,
             forked_from_thread_id,
@@ -222,6 +263,10 @@ impl TurnMetadataState {
             .cloned()
     }
 
+    pub(crate) fn git_metadata_source(&self) -> Option<GitWorkspaceMetadataSource> {
+        self.git_metadata_source.clone()
+    }
+
     fn responses_metadata_template(&self) -> CodexResponsesMetadata {
         CodexResponsesMetadata {
             turn_id: Some(self.turn_id.clone()),
@@ -313,37 +358,21 @@ impl TurnMetadataState {
     }
 
     async fn fetch_workspace_git_metadata(&self) -> WorkspaceGitMetadata {
-        let (head_commit_hash, associated_remote_urls, has_changes) = tokio::join!(
-            get_head_commit_hash(&self.cwd),
-            get_git_remote_urls_assume_git_repo(&self.cwd),
-            get_has_changes(&self.cwd),
-        );
-        let latest_git_commit_hash = head_commit_hash.map(|sha| sha.0);
-
-        WorkspaceGitMetadata {
-            associated_remote_urls,
-            latest_git_commit_hash,
-            has_changes,
+        match self.git_metadata_source.as_ref() {
+            Some(source) => source.metadata().await.into(),
+            None => WorkspaceGitMetadata::default(),
         }
     }
 }
 
 async fn memory_workspaces(cwd: &AbsolutePathBuf) -> BTreeMap<String, TurnMetadataWorkspace> {
-    let repo_root = get_git_repo_root(cwd).map(|root| root.to_string_lossy().into_owned());
-    let (head_commit_hash, associated_remote_urls, has_changes) = tokio::join!(
-        get_head_commit_hash(cwd),
-        get_git_remote_urls_assume_git_repo(cwd),
-        get_has_changes(cwd),
-    );
-    let workspace_git_metadata = WorkspaceGitMetadata {
-        associated_remote_urls,
-        latest_git_commit_hash: head_commit_hash.map(|sha| sha.0),
-        has_changes,
+    let Some(source) = GitWorkspaceMetadataSource::discover_local(cwd.clone()) else {
+        return BTreeMap::new();
     };
+    let repo_root = source.repo_root().to_string_lossy().into_owned();
+    let workspace_git_metadata: WorkspaceGitMetadata = source.metadata().await.into();
     let mut workspaces = BTreeMap::new();
-    if let Some(repo_root) = repo_root
-        && !workspace_git_metadata.is_empty()
-    {
+    if !workspace_git_metadata.is_empty() {
         workspaces.insert(repo_root, workspace_git_metadata.into());
     }
     workspaces

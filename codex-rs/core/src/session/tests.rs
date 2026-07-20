@@ -5559,6 +5559,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         )),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
+        git_workspace: crate::git_workspace::GitWorkspaceCache::new(),
     };
 
     let plugins_input = per_turn_config.plugins_config_input();
@@ -5578,6 +5579,11 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         .skills_service
         .snapshot_for_config(&skills_input, Some(Arc::clone(&skill_fs)))
         .await;
+    let git_metadata_source = services
+        .git_workspace
+        .snapshot(&resolved_turn_environments)
+        .await
+        .primary_local_metadata_source();
     let turn_context = Session::make_turn_context(
         thread_id,
         SessionId::from(thread_id),
@@ -5594,6 +5600,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         &models_manager,
         /*network*/ None,
         resolved_turn_environments,
+        git_metadata_source,
         session_configuration.cwd().clone(),
         "turn_id".to_string(),
         skills_snapshot,
@@ -7698,6 +7705,7 @@ where
         )),
         tool_search_handler_cache: Default::default(),
         turn_environments: Arc::clone(&turn_environments),
+        git_workspace: crate::git_workspace::GitWorkspaceCache::new(),
     };
 
     let plugins_input = per_turn_config.plugins_config_input();
@@ -7717,6 +7725,11 @@ where
         .skills_service
         .snapshot_for_config(&skills_input, Some(Arc::clone(&skill_fs)))
         .await;
+    let git_metadata_source = services
+        .git_workspace
+        .snapshot(&resolved_turn_environments)
+        .await
+        .primary_local_metadata_source();
     let turn_context = Arc::new(Session::make_turn_context(
         thread_id,
         SessionId::from(thread_id),
@@ -7733,6 +7746,7 @@ where
         &models_manager,
         /*network*/ None,
         resolved_turn_environments,
+        git_metadata_source,
         session_configuration.cwd().clone(),
         "turn_id".to_string(),
         skills_snapshot,

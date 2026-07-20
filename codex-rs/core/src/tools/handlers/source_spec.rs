@@ -1,3 +1,6 @@
+use codex_file_search::source_search::SOURCE_READ_MAX_LINES;
+use codex_file_search::source_search::SOURCE_SEARCH_MAX_CONTEXT_LINES;
+use codex_file_search::source_search::SOURCE_SEARCH_MAX_MATCHES;
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
@@ -33,16 +36,15 @@ pub(crate) fn create_search_source_tool(options: SourceToolOptions) -> ToolSpec 
         ),
         (
             "max_results".to_string(),
-            JsonSchema::number(Some(
-                "Maximum matches to return; hard-capped by the runtime.".to_string(),
-            )),
+            JsonSchema::number(Some(format!(
+                "Maximum matches to return; must be between 1 and {SOURCE_SEARCH_MAX_MATCHES}."
+            ))),
         ),
         (
             "context_lines".to_string(),
-            JsonSchema::number(Some(
-                "Context lines before and after each match; hard-capped by the runtime."
-                    .to_string(),
-            )),
+            JsonSchema::number(Some(format!(
+                "Context lines before and after each match; must not exceed {SOURCE_SEARCH_MAX_CONTEXT_LINES}."
+            ))),
         ),
         (
             "case_sensitive".to_string(),
@@ -93,9 +95,9 @@ pub(crate) fn create_read_file_span_tool(options: SourceToolOptions) -> ToolSpec
         ),
         (
             "line_count".to_string(),
-            JsonSchema::number(Some(
-                "Number of lines to return; hard-capped by the runtime.".to_string(),
-            )),
+            JsonSchema::number(Some(format!(
+                "Number of lines to return; must be between 1 and {SOURCE_READ_MAX_LINES}."
+            ))),
         ),
     ]);
     add_environment_id(&mut properties, options);

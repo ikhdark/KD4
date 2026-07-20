@@ -82,20 +82,14 @@ impl GitWorkspaceSnapshot {
             .map(|entry| {
                 (
                     entry.environment_id.clone(),
-                    entry
-                        .repo_root
-                        .as_ref()
-                        .unwrap_or(&entry.cwd)
-                        .to_path_buf(),
+                    entry.repo_root.as_ref().unwrap_or(&entry.cwd).to_path_buf(),
                 )
             })
             .collect()
     }
 
     pub(crate) fn primary_is_git(&self) -> Option<bool> {
-        self.entries
-            .first()
-            .map(|entry| entry.repo_root.is_some())
+        self.entries.first().map(|entry| entry.repo_root.is_some())
     }
 
     pub(crate) fn primary_local_metadata_source(&self) -> Option<GitWorkspaceMetadataSource> {
@@ -138,8 +132,8 @@ pub(crate) struct GitWorkspaceMetadata {
 
 impl GitWorkspaceMetadataSource {
     pub(crate) fn discover_local(cwd: AbsolutePathBuf) -> Option<Self> {
-        let repo_root = AbsolutePathBuf::from_absolute_path(get_git_repo_root(cwd.as_path())?)
-            .ok()?;
+        let repo_root =
+            AbsolutePathBuf::from_absolute_path(get_git_repo_root(cwd.as_path())?).ok()?;
         Some(Self {
             cwd,
             repo_root,
@@ -271,7 +265,10 @@ impl GitWorkspaceCache {
                 .collect(),
         };
         let cacheable = environments.starting.is_empty()
-            && !key.environments.iter().any(|environment| environment.remote)
+            && !key
+                .environments
+                .iter()
+                .any(|environment| environment.remote)
             && self.watcher_reliable.load(Ordering::Acquire);
         let dependencies = cacheable
             .then(|| root_dependencies(&key.environments))
@@ -475,7 +472,12 @@ fn resolve_git_dirs(repo_root: &AbsolutePathBuf) -> Option<(PathBuf, PathBuf, Op
         .unwrap_or_else(|| git_dir.clone());
     let head_ref = std::fs::read_to_string(git_dir.join("HEAD"))
         .ok()
-        .and_then(|head| head.trim().strip_prefix("ref:").map(str::trim).map(PathBuf::from));
+        .and_then(|head| {
+            head.trim()
+                .strip_prefix("ref:")
+                .map(str::trim)
+                .map(PathBuf::from)
+        });
     Some((git_dir, common_dir, head_ref))
 }
 
@@ -499,7 +501,10 @@ async fn git_config_signature(executable: &Path, cwd: &Path) -> Option<[u8; 32]>
         .await
         .ok()?
         .ok()?;
-    output.status.success().then(|| Sha256::digest(output.stdout).into())
+    output
+        .status
+        .success()
+        .then(|| Sha256::digest(output.stdout).into())
 }
 
 fn root_dependencies(
@@ -534,10 +539,7 @@ enum DependencyState {
     },
 }
 
-fn dependency_fingerprint(
-    path: PathBuf,
-    hash_contents: bool,
-) -> Option<DependencyFingerprint> {
+fn dependency_fingerprint(path: PathBuf, hash_contents: bool) -> Option<DependencyFingerprint> {
     match std::fs::metadata(&path) {
         Ok(metadata) if metadata.is_dir() => Some(DependencyFingerprint {
             path,

@@ -15,6 +15,15 @@ codex-utils-path-uri = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
 [lib]
 test = false
 doctest = false

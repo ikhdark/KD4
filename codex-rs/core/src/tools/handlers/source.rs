@@ -408,26 +408,38 @@ async fn scan_source_root(
         if !accumulator.reserve_walk_directory(SOURCE_SEARCH_MAX_WALK_DIRECTORIES) {
             break;
         }
+        let remaining_entries = accumulator.remaining_walk_entries(SOURCE_SEARCH_MAX_WALK_ENTRIES);
+        if remaining_entries == 0 {
+            accumulator.mark_walk_limit();
+            return Ok(());
+        }
         let entries_result = context
             .fs
-            .read_directory(&directory, Some(&context.sandbox))
+            .read_directory_bounded(&directory, remaining_entries, Some(&context.sandbox))
             .await;
-        let mut entries = if depth == 0 {
+        let outcome = if depth == 0 {
             entries_result.map_err(|err| source_fs_error("read directory", &directory, err))?
         } else {
-            let Some(entries) = recover_scan_result(entries_result, accumulator) else {
+            let Some(outcome) = recover_scan_result(entries_result, accumulator) else {
                 continue;
             };
-            entries
+            outcome
         };
+        if outcome.entries_examined > remaining_entries
+            || outcome.entries.len() > outcome.entries_examined
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "bounded directory read returned an invalid entry count".to_string(),
+            ));
+        }
+        accumulator.record_walk_entries(outcome.entries_examined, SOURCE_SEARCH_MAX_WALK_ENTRIES);
+        let limit_reached = outcome.limit_reached;
+        let mut entries = outcome.entries;
         entries.sort_by(|left, right| left.file_name.cmp(&right.file_name));
 
         for entry in entries {
             if accumulator.should_stop() {
                 break;
-            }
-            if !accumulator.reserve_walk_entry(SOURCE_SEARCH_MAX_WALK_ENTRIES) {
-                return Ok(());
             }
             let Some(child) = recover_scan_result(directory.join(&entry.file_name), accumulator)
             else {
@@ -499,6 +511,10 @@ async fn scan_source_root(
                 accumulator,
             );
         }
+        if limit_reached {
+            accumulator.mark_walk_limit();
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -560,7 +576,12 @@ async fn read_source_file_stably(
     let expected_len = usize::try_from(metadata_before.size).unwrap_or(usize::MAX);
     let bytes = match context
         .fs
-        .read_file_bounded(path, SOURCE_SEARCH_MAX_FILE_BYTES, Some(&context.sandbox))
+        .read_file_bounded_confined(
+            path,
+            &context.repo_root,
+            SOURCE_SEARCH_MAX_FILE_BYTES,
+            Some(&context.sandbox),
+        )
         .await
     {
         Ok(bytes) => bytes,
@@ -591,10 +612,7 @@ fn source_metadata_changed(before: &FileMetadata, after: &FileMetadata) -> bool 
 }
 
 fn is_changed_file_race_error(kind: ErrorKind) -> bool {
-    matches!(
-        kind,
-        ErrorKind::NotFound | ErrorKind::PermissionDenied | ErrorKind::InvalidInput
-    )
+    matches!(kind, ErrorKind::NotFound | ErrorKind::InvalidInput)
 }
 
 fn recover_scan_result<T, E>(

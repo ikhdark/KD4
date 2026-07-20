@@ -21,6 +21,7 @@ use crate::FileSystemReadStream;
 use crate::FileSystemResult;
 use crate::FileSystemSandboxContext;
 use crate::ReadDirectoryEntry;
+use crate::ReadDirectoryOutcome;
 use crate::RemoveOptions;
 use crate::WalkOptions;
 use crate::WalkOutcome;
@@ -137,6 +138,19 @@ impl LocalFileSystem {
             .await
     }
 
+    async fn read_file_bounded_confined(
+        &self,
+        path: &PathUri,
+        root: &PathUri,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Option<Vec<u8>>> {
+        let (file_system, sandbox) = self.file_system_for(sandbox)?;
+        file_system
+            .read_file_bounded_confined(path, root, max_bytes, sandbox)
+            .await
+    }
+
     async fn read_file_stream(
         &self,
         path: &PathUri,
@@ -182,6 +196,18 @@ impl LocalFileSystem {
     ) -> FileSystemResult<Vec<ReadDirectoryEntry>> {
         let (file_system, sandbox) = self.file_system_for(sandbox)?;
         file_system.read_directory(path, sandbox).await
+    }
+
+    async fn read_directory_bounded(
+        &self,
+        path: &PathUri,
+        max_entries: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<ReadDirectoryOutcome> {
+        let (file_system, sandbox) = self.file_system_for(sandbox)?;
+        file_system
+            .read_directory_bounded(path, max_entries, sandbox)
+            .await
     }
 
     async fn walk(
@@ -246,6 +272,18 @@ impl ExecutorFileSystem for LocalFileSystem {
         ))
     }
 
+    fn read_file_bounded_confined<'a>(
+        &'a self,
+        path: &'a PathUri,
+        root: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(LocalFileSystem::read_file_bounded_confined(
+            self, path, root, max_bytes, sandbox,
+        ))
+    }
+
     fn read_file_stream<'a>(
         &'a self,
         path: &'a PathUri,
@@ -288,6 +326,20 @@ impl ExecutorFileSystem for LocalFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>> {
         Box::pin(LocalFileSystem::read_directory(self, path, sandbox))
+    }
+
+    fn read_directory_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_entries: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome> {
+        Box::pin(LocalFileSystem::read_directory_bounded(
+            self,
+            path,
+            max_entries,
+            sandbox,
+        ))
     }
 
     fn walk<'a>(
@@ -367,6 +419,19 @@ impl UnsandboxedFileSystem {
             .await
     }
 
+    async fn read_file_bounded_confined(
+        &self,
+        path: &PathUri,
+        root: &PathUri,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Option<Vec<u8>>> {
+        reject_platform_sandbox_context(sandbox)?;
+        self.file_system
+            .read_file_bounded_confined(path, root, max_bytes, /*sandbox*/ None)
+            .await
+    }
+
     async fn read_file_stream(
         &self,
         path: &PathUri,
@@ -419,6 +484,18 @@ impl UnsandboxedFileSystem {
         reject_platform_sandbox_context(sandbox)?;
         self.file_system
             .read_directory(path, /*sandbox*/ None)
+            .await
+    }
+
+    async fn read_directory_bounded(
+        &self,
+        path: &PathUri,
+        max_entries: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<ReadDirectoryOutcome> {
+        reject_platform_sandbox_context(sandbox)?;
+        self.file_system
+            .read_directory_bounded(path, max_entries, /*sandbox*/ None)
             .await
     }
 
@@ -481,6 +558,18 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         ))
     }
 
+    fn read_file_bounded_confined<'a>(
+        &'a self,
+        path: &'a PathUri,
+        root: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(UnsandboxedFileSystem::read_file_bounded_confined(
+            self, path, root, max_bytes, sandbox,
+        ))
+    }
+
     fn read_file_stream<'a>(
         &'a self,
         path: &'a PathUri,
@@ -525,6 +614,20 @@ impl ExecutorFileSystem for UnsandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>> {
         Box::pin(UnsandboxedFileSystem::read_directory(self, path, sandbox))
+    }
+
+    fn read_directory_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_entries: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome> {
+        Box::pin(UnsandboxedFileSystem::read_directory_bounded(
+            self,
+            path,
+            max_entries,
+            sandbox,
+        ))
     }
 
     fn remove<'a>(
@@ -630,6 +733,58 @@ impl DirectFileSystem {
         Ok(Some(first.bytes))
     }
 
+    async fn read_file_bounded_confined(
+        &self,
+        path: &PathUri,
+        root: &PathUri,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Option<Vec<u8>>> {
+        reject_sandbox_context(sandbox)?;
+        let path = path.to_abs_path()?;
+        let root = root.to_abs_path()?;
+        let canonical_root = tokio::fs::canonicalize(root.as_path()).await?;
+        let canonical_path = tokio::fs::canonicalize(path.as_path()).await?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "file resolves outside the confined root",
+            ));
+        }
+        let Some(first) =
+            read_bounded_confined_file_snapshot(&canonical_root, &canonical_path, max_bytes)
+                .await?
+        else {
+            return Ok(None);
+        };
+        let Some(second) =
+            (match read_bounded_confined_file_snapshot(&canonical_root, &canonical_path, max_bytes)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
+                Err(err) => return Err(err),
+            })
+        else {
+            return Ok(None);
+        };
+        let final_state =
+            match read_confined_native_file_state(&canonical_root, &canonical_path).await {
+                Ok(state) => state,
+                Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
+                Err(err) => return Err(err),
+            };
+        if first.bytes != second.bytes
+            || native_file_metadata_changed(&first.metadata, &second.metadata)
+            || first.identity != second.identity
+            || native_file_metadata_changed(&second.metadata, &final_state.metadata)
+            || second.identity != final_state.identity
+        {
+            return Ok(None);
+        }
+        Ok(Some(first.bytes))
+    }
+
     async fn read_file_stream(
         &self,
         path: &PathUri,
@@ -708,6 +863,48 @@ impl DirectFileSystem {
             });
         }
         Ok(entries)
+    }
+
+    async fn read_directory_bounded(
+        &self,
+        path: &PathUri,
+        max_entries: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<ReadDirectoryOutcome> {
+        reject_sandbox_context(sandbox)?;
+        if max_entries == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bounded directory read limit must be greater than zero",
+            ));
+        }
+        let path = path.to_abs_path()?;
+        let mut entries = Vec::new();
+        let mut entries_examined = 0usize;
+        let mut read_dir = tokio::fs::read_dir(path.as_path()).await?;
+        while entries_examined < max_entries {
+            let Some(entry) = read_dir.next_entry().await? else {
+                return Ok(ReadDirectoryOutcome {
+                    entries,
+                    entries_examined,
+                    limit_reached: false,
+                });
+            };
+            entries_examined = entries_examined.saturating_add(1);
+            let Ok(metadata) = tokio::fs::metadata(entry.path()).await else {
+                continue;
+            };
+            entries.push(ReadDirectoryEntry {
+                file_name: entry.file_name().to_string_lossy().into_owned(),
+                is_directory: metadata.is_dir(),
+                is_file: metadata.is_file(),
+            });
+        }
+        Ok(ReadDirectoryOutcome {
+            entries,
+            entries_examined,
+            limit_reached: true,
+        })
     }
 
     async fn remove(
@@ -819,6 +1016,18 @@ impl ExecutorFileSystem for DirectFileSystem {
         ))
     }
 
+    fn read_file_bounded_confined<'a>(
+        &'a self,
+        path: &'a PathUri,
+        root: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(DirectFileSystem::read_file_bounded_confined(
+            self, path, root, max_bytes, sandbox,
+        ))
+    }
+
     fn read_file_stream<'a>(
         &'a self,
         path: &'a PathUri,
@@ -863,6 +1072,20 @@ impl ExecutorFileSystem for DirectFileSystem {
         Box::pin(DirectFileSystem::read_directory(self, path, sandbox))
     }
 
+    fn read_directory_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_entries: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome> {
+        Box::pin(DirectFileSystem::read_directory_bounded(
+            self,
+            path,
+            max_entries,
+            sandbox,
+        ))
+    }
+
     fn remove<'a>(
         &'a self,
         path: &'a PathUri,
@@ -904,7 +1127,23 @@ async fn read_bounded_file_snapshot(
     path: &Path,
     max_bytes: usize,
 ) -> io::Result<Option<BoundedFileSnapshot>> {
-    let mut file = regular_file::open(path).await?;
+    let file = regular_file::open(path).await?;
+    read_bounded_file_snapshot_from_file(file, max_bytes).await
+}
+
+async fn read_bounded_confined_file_snapshot(
+    root: &Path,
+    path: &Path,
+    max_bytes: usize,
+) -> io::Result<Option<BoundedFileSnapshot>> {
+    let file = open_confined_native_file(root, path).await?;
+    read_bounded_file_snapshot_from_file(file, max_bytes).await
+}
+
+async fn read_bounded_file_snapshot_from_file(
+    mut file: tokio::fs::File,
+    max_bytes: usize,
+) -> io::Result<Option<BoundedFileSnapshot>> {
     let metadata_before = file.metadata().await?;
     let identity_before = native_file_identity(&file, &metadata_before)?;
     let expected_len = usize::try_from(metadata_before.len()).unwrap_or(usize::MAX);
@@ -940,6 +1179,25 @@ async fn read_bounded_file_snapshot(
 
 async fn read_native_file_state(path: &Path) -> io::Result<NativeFileState> {
     let file = regular_file::open(path).await?;
+    native_file_state(file).await
+}
+
+async fn read_confined_native_file_state(root: &Path, path: &Path) -> io::Result<NativeFileState> {
+    let file = open_confined_native_file(root, path).await?;
+    native_file_state(file).await
+}
+
+async fn open_confined_native_file(root: &Path, path: &Path) -> io::Result<tokio::fs::File> {
+    let root = root.to_path_buf();
+    let path = path.to_path_buf();
+    let file =
+        tokio::task::spawn_blocking(move || codex_file_system::open_confined_file(&root, &path))
+            .await
+            .map_err(|err| io::Error::other(format!("filesystem task failed: {err}")))??;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+async fn native_file_state(file: tokio::fs::File) -> io::Result<NativeFileState> {
     let metadata = file.metadata().await?;
     let identity = native_file_identity(&file, &metadata)?;
     Ok(NativeFileState { metadata, identity })

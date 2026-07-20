@@ -32,6 +32,7 @@ use super::ToolCall;
 use super::ToolCallSource;
 use super::ToolRouter;
 use super::ToolRouterParams;
+use super::collect_proven_read_only_external_tools;
 use super::extension_tool_executors;
 
 struct ExtensionEchoContributor;
@@ -365,6 +366,26 @@ fn mcp_tool_info(
         connector_name: None,
         plugin_display_names: Vec::new(),
     }
+}
+
+#[test]
+fn mcp_read_only_intent_requires_consistent_metadata() {
+    let mut read_only = mcp_tool_info("reader", false, "mcp__reader", "lookup");
+    read_only.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
+    let read_only_tools = [read_only];
+    let callable_name = ToolName::namespaced("mcp__reader", "lookup");
+    assert!(
+        collect_proven_read_only_external_tools(Some(&read_only_tools), None)
+            .contains(&callable_name)
+    );
+
+    let mut conflicting = mcp_tool_info("reader", false, "mcp__reader", "lookup");
+    conflicting.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(false));
+    let conflicting_tools = [conflicting];
+    assert!(
+        !collect_proven_read_only_external_tools(Some(&read_only_tools), Some(&conflicting_tools),)
+            .contains(&callable_name)
+    );
 }
 
 #[tokio::test]

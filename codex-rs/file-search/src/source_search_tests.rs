@@ -456,7 +456,7 @@ fn read_span_is_one_based_bounded_and_reports_route() {
 }
 
 #[test]
-fn read_span_caps_lines_and_rejects_outside_files() {
+fn read_span_rejects_invalid_line_count_and_outside_files() {
     let parent = tempfile::tempdir().expect("tempdir");
     let repo = parent.path().join("repo");
     fs::create_dir_all(&repo).expect("repo");
@@ -468,22 +468,29 @@ fn read_span_caps_lines_and_rejects_outside_files() {
     let outside = parent.path().join("outside.rs");
     fs::write(&outside, "outside\n").expect("outside");
 
-    let output = read_file_span(ReadFileSpanOptions {
+    let limit_error = read_file_span(ReadFileSpanOptions {
         repo_root: repo.clone(),
         path: PathBuf::from("source.rs"),
         start_line: 1,
         line_count: SOURCE_READ_MAX_LINES + 100,
     })
-    .expect("read");
-    assert_eq!(output.lines.len(), SOURCE_READ_MAX_LINES);
-    assert!(output.truncated);
+    .expect_err("excessive line count rejected");
+    assert!(
+        limit_error
+            .to_string()
+            .contains("line_count must be between")
+    );
 
-    let error = read_file_span(ReadFileSpanOptions {
+    let outside_error = read_file_span(ReadFileSpanOptions {
         repo_root: repo,
         path: outside,
         start_line: 1,
         line_count: 1,
     })
     .expect_err("outside path rejected");
-    assert!(error.to_string().contains("outside repository root"));
+    assert!(
+        outside_error
+            .to_string()
+            .contains("outside repository root")
+    );
 }

@@ -14,10 +14,13 @@ use crate::FileSystemReadStream;
 use crate::FileSystemResult;
 use crate::FileSystemSandboxContext;
 use crate::ReadDirectoryEntry;
+use crate::ReadDirectoryOutcome;
 use crate::RemoveOptions;
 use crate::WalkOptions;
 use crate::WalkOutcome;
+use crate::fs_helper::FS_PERMISSION_DENIED_ERROR_CODE;
 use crate::fs_helper::FsHelperPayload;
+use crate::fs_helper::FsHelperReadDirectoryBoundedParams;
 use crate::fs_helper::FsHelperReadFileBoundedParams;
 use crate::fs_helper::FsHelperRequest;
 use crate::fs_sandbox::FileSystemSandboxRunner;
@@ -109,14 +112,40 @@ impl SandboxedFileSystem {
         max_bytes: usize,
         sandbox: Option<&FileSystemSandboxContext>,
     ) -> FileSystemResult<Option<Vec<u8>>> {
+        self.read_file_bounded_request(path, None, max_bytes, sandbox)
+            .await
+    }
+
+    async fn read_file_bounded_confined(
+        &self,
+        path: &PathUri,
+        root: &PathUri,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Option<Vec<u8>>> {
+        self.read_file_bounded_request(path, Some(root), max_bytes, sandbox)
+            .await
+    }
+
+    async fn read_file_bounded_request(
+        &self,
+        path: &PathUri,
+        confined_root: Option<&PathUri>,
+        max_bytes: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<Option<Vec<u8>>> {
         let sandbox = require_platform_sandbox(sandbox)?;
         validate_native_path(path)?;
+        if let Some(root) = confined_root {
+            validate_native_path(root)?;
+        }
         let response = self
             .run_sandboxed(
                 sandbox,
                 FsHelperRequest::ReadFileBounded(FsHelperReadFileBoundedParams {
                     path: path.clone(),
                     max_bytes,
+                    confined_root: confined_root.cloned(),
                 }),
             )
             .await?
@@ -236,6 +265,40 @@ impl SandboxedFileSystem {
             .collect())
     }
 
+    async fn read_directory_bounded(
+        &self,
+        path: &PathUri,
+        max_entries: usize,
+        sandbox: Option<&FileSystemSandboxContext>,
+    ) -> FileSystemResult<ReadDirectoryOutcome> {
+        let sandbox = require_platform_sandbox(sandbox)?;
+        validate_native_path(path)?;
+        let response = self
+            .run_sandboxed(
+                sandbox,
+                FsHelperRequest::ReadDirectoryBounded(FsHelperReadDirectoryBoundedParams {
+                    path: path.clone(),
+                    max_entries,
+                }),
+            )
+            .await?
+            .expect_read_directory_bounded()
+            .map_err(map_sandbox_error)?;
+        Ok(ReadDirectoryOutcome {
+            entries: response
+                .entries
+                .into_iter()
+                .map(|entry| ReadDirectoryEntry {
+                    file_name: entry.file_name,
+                    is_directory: entry.is_directory,
+                    is_file: entry.is_file,
+                })
+                .collect(),
+            entries_examined: response.entries_examined,
+            limit_reached: response.limit_reached,
+        })
+    }
+
     async fn walk(
         &self,
         path: &PathUri,
@@ -349,6 +412,18 @@ impl ExecutorFileSystem for SandboxedFileSystem {
         ))
     }
 
+    fn read_file_bounded_confined<'a>(
+        &'a self,
+        path: &'a PathUri,
+        root: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(SandboxedFileSystem::read_file_bounded_confined(
+            self, path, root, max_bytes, sandbox,
+        ))
+    }
+
     fn write_file<'a>(
         &'a self,
         path: &'a PathUri,
@@ -385,6 +460,20 @@ impl ExecutorFileSystem for SandboxedFileSystem {
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>> {
         Box::pin(SandboxedFileSystem::read_directory(self, path, sandbox))
+    }
+
+    fn read_directory_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_entries: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome> {
+        Box::pin(SandboxedFileSystem::read_directory_bounded(
+            self,
+            path,
+            max_entries,
+            sandbox,
+        ))
     }
 
     fn walk<'a>(
@@ -447,6 +536,9 @@ fn require_platform_sandbox(
 fn map_sandbox_error(error: JSONRPCErrorError) -> io::Error {
     match error.code {
         -32004 => io::Error::new(io::ErrorKind::NotFound, error.message),
+        FS_PERMISSION_DENIED_ERROR_CODE => {
+            io::Error::new(io::ErrorKind::PermissionDenied, error.message)
+        }
         -32600 => io::Error::new(io::ErrorKind::InvalidInput, error.message),
         _ => io::Error::other(error.message),
     }

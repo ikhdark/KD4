@@ -45,18 +45,37 @@ use crate::rpc::not_found;
 
 pub const CODEX_FS_HELPER_ARG1: &str = "--codex-run-as-fs-helper";
 const FS_READ_FILE_BOUNDED_OPERATION: &str = "fs/readFileBounded";
+const FS_READ_DIRECTORY_BOUNDED_OPERATION: &str = "fs/readDirectoryBounded";
+pub(crate) const FS_PERMISSION_DENIED_ERROR_CODE: i64 = -32003;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FsHelperReadFileBoundedParams {
     pub(crate) path: PathUri,
     pub(crate) max_bytes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) confined_root: Option<PathUri>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FsHelperReadFileBoundedResponse {
     pub(crate) data_base64: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FsHelperReadDirectoryBoundedParams {
+    pub(crate) path: PathUri,
+    pub(crate) max_entries: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FsHelperReadDirectoryBoundedResponse {
+    pub(crate) entries: Vec<FsReadDirectoryEntry>,
+    pub(crate) entries_examined: usize,
+    pub(crate) limit_reached: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +95,8 @@ pub(crate) enum FsHelperRequest {
     Canonicalize(FsCanonicalizeParams),
     #[serde(rename = "fs/readDirectory")]
     ReadDirectory(FsReadDirectoryParams),
+    #[serde(rename = "fs/readDirectoryBounded")]
+    ReadDirectoryBounded(FsHelperReadDirectoryBoundedParams),
     #[serde(rename = "fs/walk")]
     Walk(FsWalkParams),
     #[serde(rename = "fs/remove")]
@@ -108,6 +129,8 @@ pub(crate) enum FsHelperPayload {
     Canonicalize(FsCanonicalizeResponse),
     #[serde(rename = "fs/readDirectory")]
     ReadDirectory(FsReadDirectoryResponse),
+    #[serde(rename = "fs/readDirectoryBounded")]
+    ReadDirectoryBounded(FsHelperReadDirectoryBoundedResponse),
     #[serde(rename = "fs/walk")]
     Walk(FsWalkResponse),
     #[serde(rename = "fs/remove")]
@@ -126,6 +149,7 @@ impl FsHelperPayload {
             Self::GetMetadata(_) => FS_GET_METADATA_METHOD,
             Self::Canonicalize(_) => FS_CANONICALIZE_METHOD,
             Self::ReadDirectory(_) => FS_READ_DIRECTORY_METHOD,
+            Self::ReadDirectoryBounded(_) => FS_READ_DIRECTORY_BOUNDED_OPERATION,
             Self::Walk(_) => FS_WALK_METHOD,
             Self::Remove(_) => FS_REMOVE_METHOD,
             Self::Copy(_) => FS_COPY_METHOD,
@@ -202,6 +226,18 @@ impl FsHelperPayload {
         }
     }
 
+    pub(crate) fn expect_read_directory_bounded(
+        self,
+    ) -> Result<FsHelperReadDirectoryBoundedResponse, JSONRPCErrorError> {
+        match self {
+            Self::ReadDirectoryBounded(response) => Ok(response),
+            other => Err(unexpected_response(
+                FS_READ_DIRECTORY_BOUNDED_OPERATION,
+                other.operation(),
+            )),
+        }
+    }
+
     pub(crate) fn expect_walk(self) -> Result<FsWalkResponse, JSONRPCErrorError> {
         match self {
             Self::Walk(response) => Ok(response),
@@ -245,10 +281,21 @@ pub(crate) async fn run_direct_request(
             }))
         }
         FsHelperRequest::ReadFileBounded(params) => {
-            let data = file_system
-                .read_file_bounded(&params.path, params.max_bytes, /*sandbox*/ None)
-                .await
-                .map_err(map_fs_error)?;
+            let data = if let Some(root) = params.confined_root.as_ref() {
+                file_system
+                    .read_file_bounded_confined(
+                        &params.path,
+                        root,
+                        params.max_bytes,
+                        /*sandbox*/ None,
+                    )
+                    .await
+            } else {
+                file_system
+                    .read_file_bounded(&params.path, params.max_bytes, /*sandbox*/ None)
+                    .await
+            }
+            .map_err(map_fs_error)?;
             Ok(FsHelperPayload::ReadFileBounded(
                 FsHelperReadFileBoundedResponse {
                     data_base64: data.map(|data| STANDARD.encode(data)),
@@ -321,6 +368,28 @@ pub(crate) async fn run_direct_request(
                 entries,
             }))
         }
+        FsHelperRequest::ReadDirectoryBounded(params) => {
+            let outcome = file_system
+                .read_directory_bounded(&params.path, params.max_entries, /*sandbox*/ None)
+                .await
+                .map_err(map_fs_error)?;
+            let entries = outcome
+                .entries
+                .into_iter()
+                .map(|entry| FsReadDirectoryEntry {
+                    file_name: entry.file_name,
+                    is_directory: entry.is_directory,
+                    is_file: entry.is_file,
+                })
+                .collect();
+            Ok(FsHelperPayload::ReadDirectoryBounded(
+                FsHelperReadDirectoryBoundedResponse {
+                    entries,
+                    entries_examined: outcome.entries_examined,
+                    limit_reached: outcome.limit_reached,
+                },
+            ))
+        }
         FsHelperRequest::Walk(params) => {
             let outcome = file_system
                 .walk(&params.path, params.options, /*sandbox*/ None)
@@ -362,9 +431,12 @@ pub(crate) async fn run_direct_request(
 fn map_fs_error(err: io::Error) -> JSONRPCErrorError {
     match err.kind() {
         io::ErrorKind::NotFound => not_found(err.to_string()),
-        io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied => {
-            invalid_request(err.to_string())
-        }
+        io::ErrorKind::InvalidInput => invalid_request(err.to_string()),
+        io::ErrorKind::PermissionDenied => JSONRPCErrorError {
+            code: FS_PERMISSION_DENIED_ERROR_CODE,
+            data: None,
+            message: err.to_string(),
+        },
         _ => internal_error(err.to_string()),
     }
 }

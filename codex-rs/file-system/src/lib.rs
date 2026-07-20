@@ -1,5 +1,7 @@
+mod confined_file;
 mod find_up;
 
+pub use confined_file::open_confined_file;
 pub use find_up::FindUpErrorPolicy;
 pub use find_up::find_nearest_ancestor_with_markers;
 pub use find_up::find_nearest_native_ancestor_with_markers;
@@ -68,6 +70,19 @@ pub struct ReadDirectoryEntry {
     pub file_name: String,
     pub is_directory: bool,
     pub is_file: bool,
+}
+
+/// A producer-bounded directory read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadDirectoryOutcome {
+    pub entries: Vec<ReadDirectoryEntry>,
+    /// Number of raw directory entries consumed from the filesystem.
+    pub entries_examined: usize,
+    /// Whether the read stopped because it exhausted its entry budget.
+    ///
+    /// This is conservative: it may be true when the directory contains
+    /// exactly `entries_examined` entries.
+    pub limit_reached: bool,
 }
 
 /// Bounds for a recursive filesystem walk.
@@ -319,6 +334,26 @@ pub trait ExecutorFileSystem: Send + Sync {
         })
     }
 
+    /// Reads a stable bounded snapshot while keeping every open beneath `root`.
+    ///
+    /// Implementations must override this method with handle-relative,
+    /// opened-handle, or server-side confinement. The default fails closed.
+    fn read_file_bounded_confined<'a>(
+        &'a self,
+        path: &'a PathUri,
+        root: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            let _ = (path, root, max_bytes, sandbox);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "confined bounded reads are not implemented by this filesystem",
+            ))
+        })
+    }
+
     /// Reads a file and decodes it as UTF-8 text.
     fn read_file_text<'a>(
         &'a self,
@@ -356,6 +391,26 @@ pub trait ExecutorFileSystem: Send + Sync {
         path: &'a PathUri,
         sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, Vec<ReadDirectoryEntry>>;
+
+    /// Reads at most `max_entries` raw directory entries without first
+    /// materializing the complete directory.
+    ///
+    /// The default fails closed because implementing this in terms of
+    /// [`Self::read_directory`] would not enforce the producer-side bound.
+    fn read_directory_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_entries: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome> {
+        Box::pin(async move {
+            let _ = (path, max_entries, sandbox);
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bounded directory reads are not implemented by this filesystem",
+            ))
+        })
+    }
 
     /// Recursively lists descendants, optionally following directory symlinks.
     fn walk<'a>(

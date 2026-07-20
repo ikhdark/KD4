@@ -53,6 +53,18 @@ const HARNESS_KEY_AUTHORIZATION: &str = "harness-key-authorization";
 const REGISTRY_TOKEN: &str = "registry-token";
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+fn successful_process_argv() -> Vec<String> {
+    if cfg!(windows) {
+        vec![
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
+            "/C".to_string(),
+            "exit /B 0".to_string(),
+        ]
+    } else {
+        vec!["true".to_string()]
+    }
+}
+
 #[derive(Debug)]
 struct StaticRegistryAuthProvider;
 
@@ -143,7 +155,7 @@ async fn remote_environment_routes_encrypted_exec_server_rpc() -> Result<()> {
     let response = client
         .exec(ExecParams {
             process_id: ProcessId::from("proc-1"),
-            argv: vec!["true".to_string()],
+            argv: successful_process_argv(),
             cwd: PathUri::from_host_native_path(std::env::current_dir()?)?,
             env_policy: None,
             env: HashMap::new(),

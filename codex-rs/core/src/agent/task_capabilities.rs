@@ -8,6 +8,7 @@ use codex_agent_task_store::RepoScope;
 use codex_agent_task_store::RiskDomain;
 use codex_agent_task_store::RiskFacts;
 use codex_agent_task_store::RiskGateDecision;
+use codex_agent_task_store::evaluate_risk_gate;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
@@ -274,43 +275,6 @@ pub(crate) fn authorize_typed_tool(
     }
 }
 
-/// Returns whether a verifier may write a build/cache path through the central shell sandbox.
-/// Invalid, absolute, traversing, cross-repository, or symlink-escaping paths fail closed.
-pub(crate) fn verifier_can_write_path(
-    assignment: &Assignment,
-    repo_root: &Path,
-    verifier_writable_roots: &[RepoScope],
-    path: &str,
-) -> Result<bool, CapabilityPolicyError> {
-    if assignment.capability_profile != CapabilityProfile::ReadSearchShell {
-        verify_assignment_authority(assignment, repo_root)?;
-        return Ok(false);
-    }
-    typed_agent_can_write_path(assignment, repo_root, verifier_writable_roots, path)
-}
-
-/// Intersects typed-agent write authority with normalized repository paths. Source writers are
-/// limited to their immutable assignment scope; verifiers are limited to centrally supplied
-/// build/cache roots; explorer and reviewer profiles can never write.
-pub(crate) fn typed_agent_can_write_path(
-    assignment: &Assignment,
-    repo_root: &Path,
-    verifier_writable_roots: &[RepoScope],
-    path: &str,
-) -> Result<bool, CapabilityPolicyError> {
-    verify_assignment_authority(assignment, repo_root)?;
-    let normalized = normalize_repo_relative_path(repo_root, path)?;
-    match assignment.capability_profile {
-        CapabilityProfile::ReadSearch | CapabilityProfile::ReadSearchDiff => Ok(false),
-        CapabilityProfile::ReadSearchShell => {
-            scopes_cover_path(repo_root, verifier_writable_roots, &normalized)
-        }
-        CapabilityProfile::ScopedSourceWrite | CapabilityProfile::IntegratorSourceWrite => {
-            scopes_cover_path(repo_root, &assignment.write_scope, &normalized)
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RiskPolicyInput<'a> {
     pub changed_paths: &'a [String],
@@ -374,7 +338,7 @@ pub(crate) fn derive_risk_policy(
         ownership_conflict: input.ownership_conflict,
         drift: input.drift,
     };
-    let decision = evaluate_closed_risk_gate(&facts);
+    let decision = evaluate_risk_gate(&facts);
     Ok(DerivedRiskPolicy {
         facts,
         decision,
@@ -691,38 +655,6 @@ fn normalized_comparison_path(path: &str) -> String {
     }
 }
 
-fn evaluate_closed_risk_gate(facts: &RiskFacts) -> RiskGateDecision {
-    let mut reasons = Vec::new();
-    if facts.configured_high_risk_path {
-        reasons.push("configured high-risk contract or path".to_string());
-    }
-    if facts.cross_owner_scope {
-        reasons.push("cross-owner scope".to_string());
-    }
-    for domain in &facts.domains {
-        reasons.push(risk_domain_reason(*domain).to_string());
-    }
-    if facts.non_generated_changed_files > 5 {
-        reasons.push("more than five non-generated changed files".to_string());
-    }
-    if facts.non_generated_changed_lines > 400 {
-        reasons.push("more than 400 non-generated changed lines".to_string());
-    }
-    if !facts.focused_validation_succeeded {
-        reasons.push("missing successful focused validation".to_string());
-    }
-    if facts.ownership_conflict {
-        reasons.push("ownership conflict".to_string());
-    }
-    if facts.drift {
-        reasons.push("concurrent drift".to_string());
-    }
-    RiskGateDecision {
-        review_required: !reasons.is_empty(),
-        reasons,
-    }
-}
-
 fn normalize_contract_id(contract: &str) -> Option<String> {
     let mut normalized = String::new();
     let mut pending_separator = false;
@@ -738,19 +670,6 @@ fn normalize_contract_id(contract: &str) -> Option<String> {
         normalized.extend(character.to_lowercase());
     }
     (!normalized.is_empty()).then_some(normalized)
-}
-
-fn risk_domain_reason(domain: RiskDomain) -> &'static str {
-    match domain {
-        RiskDomain::Concurrency => "concurrency risk",
-        RiskDomain::UnsafeCode => "unsafe risk",
-        RiskDomain::Lifecycle => "lifecycle risk",
-        RiskDomain::Persistence => "persistence risk",
-        RiskDomain::Schema => "schema risk",
-        RiskDomain::Protocol => "protocol risk",
-        RiskDomain::Security => "security risk",
-        RiskDomain::Installation => "installation risk",
-    }
 }
 
 fn invalid_path(path: &str, reason: impl Into<String>) -> CapabilityPolicyError {

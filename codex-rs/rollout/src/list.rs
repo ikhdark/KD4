@@ -154,10 +154,6 @@ pub struct Cursor {
 }
 
 impl Cursor {
-    pub(crate) fn new(ts: OffsetDateTime) -> Self {
-        Self { ts, id: None }
-    }
-
     pub(crate) fn with_thread_id(ts: OffsetDateTime, id: ThreadId) -> Self {
         Self { ts, id: Some(id) }
     }

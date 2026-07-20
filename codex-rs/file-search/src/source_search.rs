@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -7,14 +8,20 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use anyhow::Context;
 use anyhow::bail;
 use clap::ArgAction;
 use clap::Parser;
+use codex_file_system::open_confined_file;
+use ignore::Match;
 use ignore::WalkBuilder;
+use ignore::gitignore::Gitignore;
+use ignore::gitignore::GitignoreBuilder;
 use serde::Serialize;
 use unicode_casefold::UnicodeCaseFold;
 
@@ -49,6 +56,157 @@ const SOURCE_WALK_LIMITS: SourceWalkLimits = SourceWalkLimits {
     max_directories: SOURCE_SEARCH_MAX_WALK_DIRECTORIES,
     max_entries: SOURCE_SEARCH_MAX_WALK_ENTRIES,
 };
+
+#[derive(Clone)]
+struct DirectoryIgnoreRules {
+    ignore: Gitignore,
+    git_ignore: Gitignore,
+}
+
+struct SourceIgnoreMatcher {
+    directory_rules: Mutex<HashMap<PathBuf, DirectoryIgnoreRules>>,
+    repository_roots: Mutex<HashMap<PathBuf, Option<PathBuf>>>,
+    repository_excludes: Mutex<HashMap<PathBuf, Gitignore>>,
+    global_gitignore: Gitignore,
+}
+
+impl SourceIgnoreMatcher {
+    fn new(root: &Path) -> Self {
+        let global_base = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
+        let (global_gitignore, _) = GitignoreBuilder::new(global_base).build_global();
+        Self {
+            directory_rules: Mutex::new(HashMap::new()),
+            repository_roots: Mutex::new(HashMap::new()),
+            repository_excludes: Mutex::new(HashMap::new()),
+            global_gitignore,
+        }
+    }
+
+    fn is_ignored(&self, path: &Path, is_directory: bool) -> bool {
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+
+        for directory in parent.ancestors() {
+            let rules = self.rules_for(directory);
+            if let Some(ignored) = ignore_decision(rules.ignore.matched(path, is_directory)) {
+                return ignored;
+            }
+        }
+
+        let Some(repository_root) = self.repository_root_for(parent) else {
+            return false;
+        };
+        for directory in parent.ancestors() {
+            let rules = self.rules_for(directory);
+            if let Some(ignored) = ignore_decision(rules.git_ignore.matched(path, is_directory)) {
+                return ignored;
+            }
+            if directory == repository_root {
+                break;
+            }
+        }
+
+        let exclude = self.repository_exclude_for(&repository_root);
+        if let Some(ignored) = ignore_decision(exclude.matched(path, is_directory)) {
+            return ignored;
+        }
+        ignore_decision(self.global_gitignore.matched(path, is_directory)).unwrap_or(false)
+    }
+
+    fn rules_for(&self, directory: &Path) -> DirectoryIgnoreRules {
+        let mut cache = self
+            .directory_rules
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache
+            .entry(directory.to_path_buf())
+            .or_insert_with(|| DirectoryIgnoreRules {
+                ignore: build_ignore_file_matcher(directory, &directory.join(".ignore")),
+                git_ignore: build_ignore_file_matcher(directory, &directory.join(".gitignore")),
+            })
+            .clone()
+    }
+
+    fn repository_root_for(&self, directory: &Path) -> Option<PathBuf> {
+        let mut cache = self
+            .repository_roots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache
+            .entry(directory.to_path_buf())
+            .or_insert_with(|| {
+                directory
+                    .ancestors()
+                    .find(|ancestor| ancestor.join(".git").metadata().is_ok())
+                    .map(Path::to_path_buf)
+            })
+            .clone()
+    }
+
+    fn repository_exclude_for(&self, repository_root: &Path) -> Gitignore {
+        let mut cache = self
+            .repository_excludes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache
+            .entry(repository_root.to_path_buf())
+            .or_insert_with(|| {
+                let git_dir = resolve_git_common_directory(repository_root)
+                    .unwrap_or_else(|| repository_root.join(".git"));
+                build_ignore_file_matcher(repository_root, &git_dir.join("info/exclude"))
+            })
+            .clone()
+    }
+}
+
+fn build_ignore_file_matcher(root: &Path, ignore_file: &Path) -> Gitignore {
+    let mut builder = GitignoreBuilder::new(root);
+    let _ = builder.add(ignore_file);
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
+}
+
+fn resolve_git_common_directory(repository_root: &Path) -> Option<PathBuf> {
+    let dot_git = repository_root.join(".git");
+    let metadata = dot_git.metadata().ok()?;
+    if !metadata.is_file() {
+        return Some(dot_git);
+    }
+
+    let dot_git_contents = fs::read_to_string(dot_git).ok()?;
+    let git_dir_target = dot_git_contents.strip_prefix("gitdir:")?.trim();
+    if git_dir_target.is_empty() {
+        return None;
+    }
+    let real_git_dir = PathBuf::from(git_dir_target);
+    let real_git_dir = if real_git_dir.is_absolute() {
+        real_git_dir
+    } else {
+        repository_root.join(real_git_dir)
+    };
+    let common_dir = fs::read_to_string(real_git_dir.join("commondir"))
+        .ok()
+        .map(|contents| contents.trim().to_owned())
+        .filter(|contents| !contents.is_empty())
+        .map(PathBuf::from)
+        .map(|common_dir| {
+            if common_dir.is_absolute() {
+                common_dir
+            } else {
+                real_git_dir.join(common_dir)
+            }
+        })
+        .unwrap_or(real_git_dir);
+    Some(common_dir)
+}
+
+fn ignore_decision<T>(matched: Match<T>) -> Option<bool> {
+    match matched {
+        Match::None => None,
+        Match::Ignore(_) => Some(true),
+        Match::Whitelist(_) => Some(false),
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -311,9 +469,15 @@ pub fn read_file_span(options: ReadFileSpanOptions) -> anyhow::Result<ReadFileSp
     if options.start_line == 0 {
         bail!("start_line must be 1 or greater");
     }
+    if !(1..=SOURCE_READ_MAX_LINES).contains(&options.line_count) {
+        bail!(
+            "line_count must be between 1 and {SOURCE_READ_MAX_LINES} (received {})",
+            options.line_count
+        );
+    }
     let repo_root = canonical_repo_root(&options.repo_root)?;
     let path = resolve_confined_path(&repo_root, &options.path, "source file")?;
-    let mut file = File::open(&path)
+    let mut file = open_confined_file(&repo_root, &path)
         .with_context(|| format!("unable to open source file `{}`", path.display()))?;
     let metadata = file
         .metadata()
@@ -331,7 +495,7 @@ pub fn read_file_span(options: ReadFileSpanOptions) -> anyhow::Result<ReadFileSp
         );
     }
 
-    let Some(bytes) = read_open_file_stably(&mut file, &path, &metadata)? else {
+    let Some(bytes) = read_open_file_stably(&mut file, &repo_root, &path, &metadata)? else {
         bail!(
             "source file `{}` changed while it was being read; retry the read",
             options.path.display()
@@ -351,6 +515,9 @@ pub fn read_file_span_from_bytes(
     if start_line == 0 {
         bail!("start_line must be 1 or greater");
     }
+    if !(1..=SOURCE_READ_MAX_LINES).contains(&line_count) {
+        bail!("line_count must be between 1 and {SOURCE_READ_MAX_LINES} (received {line_count})");
+    }
     if bytes.len() > SOURCE_SEARCH_MAX_FILE_BYTES {
         bail!(
             "source file `{relative_path}` is too large ({} bytes, max {})",
@@ -361,8 +528,6 @@ pub fn read_file_span_from_bytes(
     let text = String::from_utf8(bytes)
         .with_context(|| format!("source file `{relative_path}` is not UTF-8"))?;
     let source_lines = text.lines().collect::<Vec<_>>();
-    let requested_line_count = line_count.max(1);
-    let line_count = requested_line_count.min(SOURCE_READ_MAX_LINES);
     let start_index = start_line.saturating_sub(1).min(source_lines.len());
     let end_index = start_index
         .saturating_add(line_count)
@@ -390,17 +555,16 @@ pub fn read_file_span_from_bytes(
         }
     }
 
-    let omitted_by_line_limit = requested_line_count > line_count && end_index < source_lines.len();
     Ok(ReadFileSpanOutput {
         path: relative_path.clone(),
         source_map_route: source_map_route_for_path(Path::new(&relative_path)),
         requested_start_line: start_line,
-        requested_line_count,
+        requested_line_count: line_count,
         start_line: lines.first().map(|line| line.line_number),
         end_line: lines.last().map(|line| line.line_number),
         total_lines: source_lines.len(),
         bytes_returned,
-        truncated: byte_truncated || omitted_by_line_limit,
+        truncated: byte_truncated,
         lines,
     })
 }
@@ -419,7 +583,18 @@ pub struct SourceSearchAccumulator {
 impl SourceSearchAccumulator {
     pub fn new(options: &SourceSearchOptions) -> anyhow::Result<Self> {
         validate_query(&options.query)?;
-        let max_matches = options.max_matches.clamp(1, SOURCE_SEARCH_MAX_MATCHES);
+        if !(1..=SOURCE_SEARCH_MAX_MATCHES).contains(&options.max_matches) {
+            bail!(
+                "max_matches must be between 1 and {SOURCE_SEARCH_MAX_MATCHES} (received {})",
+                options.max_matches
+            );
+        }
+        if options.context_lines > SOURCE_SEARCH_MAX_CONTEXT_LINES {
+            bail!(
+                "context_lines must not exceed {SOURCE_SEARCH_MAX_CONTEXT_LINES} (received {})",
+                options.context_lines
+            );
+        }
         let query_cmp = if options.case_sensitive {
             options.query.clone()
         } else {
@@ -429,11 +604,11 @@ impl SourceSearchAccumulator {
             query: options.query.clone(),
             query_cmp,
             case_sensitive: options.case_sensitive,
-            context_lines: options.context_lines.min(SOURCE_SEARCH_MAX_CONTEXT_LINES),
+            context_lines: options.context_lines,
             include_generated: options.include_generated,
             include_vendor: options.include_vendor,
             include_locks: options.include_locks,
-            state: SearchState::new(max_matches),
+            state: SearchState::new(options.max_matches),
         })
     }
 
@@ -509,13 +684,16 @@ impl SourceSearchAccumulator {
         true
     }
 
-    pub fn reserve_walk_entry(&mut self, limit: usize) -> bool {
-        if self.state.walk_entries_seen >= limit {
-            self.mark_walk_limit();
-            return false;
-        }
-        self.state.walk_entries_seen = self.state.walk_entries_seen.saturating_add(1);
-        true
+    pub fn remaining_walk_entries(&self, limit: usize) -> usize {
+        limit.saturating_sub(self.state.walk_entries_seen)
+    }
+
+    pub fn record_walk_entries(&mut self, count: usize, limit: usize) {
+        self.state.walk_entries_seen = self
+            .state
+            .walk_entries_seen
+            .saturating_add(count)
+            .min(limit);
     }
 
     pub fn mark_file_changed_during_read(&mut self) {
@@ -693,31 +871,45 @@ fn scan_root(
     let include_vendor = accumulator.include_vendor;
     let depth_limit_hit = Arc::new(AtomicBool::new(false));
     let filter_depth_limit_hit = Arc::clone(&depth_limit_hit);
+    let remaining_entries = accumulator.remaining_walk_entries(walk_limits.max_entries);
+    if remaining_entries == 0 {
+        accumulator.mark_walk_limit();
+        return Ok(());
+    }
+    let entries_examined = Arc::new(AtomicUsize::new(0));
+    let filter_entries_examined = Arc::clone(&entries_examined);
+    let entry_limit_hit = Arc::new(AtomicBool::new(false));
+    let filter_entry_limit_hit = Arc::clone(&entry_limit_hit);
+    let ignore_matcher = Arc::new(SourceIgnoreMatcher::new(root));
+    let filter_ignore_matcher = Arc::clone(&ignore_matcher);
     let mut builder = WalkBuilder::new(root);
     builder
+        .standard_filters(false)
         .hidden(false)
         .follow_links(false)
-        .require_git(true)
         .max_depth(Some(walk_limits.max_depth.saturating_add(1)))
-        .sort_by_file_name(Ord::cmp)
         .filter_entry(move |entry| {
+            if entry.depth() == 0 {
+                return true;
+            }
+            let examined = filter_entries_examined
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            if examined >= remaining_entries {
+                filter_entry_limit_hit.store(true, Ordering::Relaxed);
+                // Force the budget-consuming entry to be yielded so the
+                // iterator can be dropped before it examines another entry.
+                return true;
+            }
+            let (should_yield, depth_exceeded) =
+                source_walk_entry_filter(entry, walk_limits, include_generated, include_vendor);
+            if depth_exceeded {
+                filter_depth_limit_hit.store(true, Ordering::Relaxed);
+            }
             let is_directory = entry
                 .file_type()
                 .is_some_and(|file_type| file_type.is_dir());
-            if entry.depth() > 0
-                && is_directory
-                && !should_descend_source_path(entry.path(), include_generated, include_vendor)
-            {
-                return false;
-            }
-            let max_entry_depth = walk_limits
-                .max_depth
-                .saturating_add(usize::from(!is_directory));
-            if entry.depth() > max_entry_depth {
-                filter_depth_limit_hit.store(true, Ordering::Relaxed);
-                return false;
-            }
-            true
+            should_yield && !filter_ignore_matcher.is_ignored(entry.path(), is_directory)
         });
 
     for entry in builder.build() {
@@ -728,34 +920,91 @@ fn scan_root(
         if accumulator.should_stop() {
             break;
         }
-        let Some(entry) = recover_walk_entry(entry, accumulator) else {
-            continue;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let _ = recover_walk_entry::<ignore::DirEntry, _>(Err(error), accumulator);
+                let examined = entries_examined
+                    .fetch_add(1, Ordering::Relaxed)
+                    .saturating_add(1);
+                if examined >= remaining_entries {
+                    entry_limit_hit.store(true, Ordering::Relaxed);
+                    accumulator.mark_walk_limit();
+                    break;
+                }
+                continue;
+            }
         };
-        if entry.depth() > 0 {
-            if !accumulator.reserve_walk_entry(walk_limits.max_entries) {
+        let (mut should_process, depth_exceeded) =
+            source_walk_entry_filter(&entry, walk_limits, include_generated, include_vendor);
+        if depth_exceeded {
+            depth_limit_hit.store(true, Ordering::Relaxed);
+        }
+        let is_directory = entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir());
+        if should_process && ignore_matcher.is_ignored(entry.path(), is_directory) {
+            should_process = false;
+        }
+        if is_directory {
+            if should_process && !accumulator.reserve_walk_directory(walk_limits.max_directories) {
                 break;
             }
-        }
-        if entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_dir())
-        {
-            if !accumulator.reserve_walk_directory(walk_limits.max_directories) {
+            if entry_limit_hit.load(Ordering::Relaxed) {
+                accumulator.mark_walk_limit();
                 break;
             }
             continue;
         }
-        if entry
-            .file_type()
-            .is_some_and(|file_type| file_type.is_file())
+        if should_process
+            && entry
+                .file_type()
+                .is_some_and(|file_type| file_type.is_file())
         {
             recover_scan_result(scan_file(repo_root, entry.path(), accumulator), accumulator);
         }
+        if entry_limit_hit.load(Ordering::Relaxed) {
+            accumulator.mark_walk_limit();
+            break;
+        }
     }
+    accumulator.record_walk_entries(
+        entries_examined
+            .load(Ordering::Relaxed)
+            .min(remaining_entries),
+        walk_limits.max_entries,
+    );
     if depth_limit_hit.load(Ordering::Relaxed) {
         accumulator.mark_walk_limit();
     }
+    if entry_limit_hit.load(Ordering::Relaxed) {
+        accumulator.mark_walk_limit();
+    }
     Ok(())
+}
+
+fn source_walk_entry_filter(
+    entry: &ignore::DirEntry,
+    walk_limits: SourceWalkLimits,
+    include_generated: bool,
+    include_vendor: bool,
+) -> (bool, bool) {
+    let is_directory = entry
+        .file_type()
+        .is_some_and(|file_type| file_type.is_dir());
+    if entry.depth() > 0
+        && is_directory
+        && !should_descend_source_path(entry.path(), include_generated, include_vendor)
+    {
+        return (false, false);
+    }
+    let max_entry_depth = walk_limits
+        .max_depth
+        .saturating_add(usize::from(!is_directory));
+    if entry.depth() > max_entry_depth {
+        return (false, true);
+    }
+    (true, false)
 }
 
 fn recover_walk_entry<T, E>(
@@ -783,7 +1032,7 @@ fn scan_file(
     accumulator: &mut SourceSearchAccumulator,
 ) -> anyhow::Result<()> {
     let path = resolve_confined_path(repo_root, path, "source file")?;
-    let mut file = File::open(&path)?;
+    let mut file = open_confined_file(repo_root, &path)?;
     let metadata = file.metadata()?;
     let file_len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
     let relative_path = path.strip_prefix(repo_root).unwrap_or(&path);
@@ -791,7 +1040,7 @@ fn scan_file(
         return Ok(());
     }
 
-    match read_open_file_stably(&mut file, &path, &metadata)? {
+    match read_open_file_stably(&mut file, repo_root, &path, &metadata)? {
         Some(bytes) => accumulator.add_file_bytes(relative_path, bytes),
         None => accumulator.mark_file_changed_during_read(),
     }
@@ -800,6 +1049,7 @@ fn scan_file(
 
 fn read_open_file_stably(
     file: &mut File,
+    repo_root: &Path,
     path: &Path,
     metadata_before: &fs::Metadata,
 ) -> anyhow::Result<Option<Vec<u8>>> {
@@ -808,7 +1058,7 @@ fn read_open_file_stably(
     let Some(bytes) = read_open_file_once(file, path, metadata_before)? else {
         return Ok(None);
     };
-    let mut verification_file = match File::open(path) {
+    let mut verification_file = match open_confined_file(repo_root, path) {
         Ok(file) => file,
         Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
         Err(err) => {
@@ -835,7 +1085,7 @@ fn read_open_file_stably(
     if bytes != verification_bytes {
         return Ok(None);
     }
-    let final_file = match File::open(path) {
+    let final_file = match open_confined_file(repo_root, path) {
         Ok(file) => file,
         Err(err) if is_changed_file_race_error(err.kind()) => return Ok(None),
         Err(err) => {
@@ -1217,7 +1467,19 @@ fn is_lockfile(path: &Path) -> bool {
             let name = name.to_ascii_lowercase();
             matches!(
                 name.as_str(),
-                "cargo.lock" | "pnpm-lock.yaml" | "package-lock.json" | "yarn.lock" | "uv.lock"
+                "cargo.lock"
+                    | "pnpm-lock.yaml"
+                    | "package-lock.json"
+                    | "packages.lock.json"
+                    | "npm-shrinkwrap.json"
+                    | "yarn.lock"
+                    | "uv.lock"
+                    | ".terraform.lock.hcl"
+                    | "gradle.lockfile"
+                    | "bun.lockb"
+                    | "package.resolved"
+                    | "go.sum"
+                    | "go.work.sum"
             ) || name.ends_with(".lock")
         })
 }

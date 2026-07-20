@@ -82,6 +82,35 @@ fn completed_receipt(validation_call_ids: Vec<String>) -> ReceiptDraft {
     }
 }
 
+fn relation_draft(root_session_id: &str, role: AgentRole, target: AssignmentId) -> AssignmentDraft {
+    let (capability_profile, kind) = match role {
+        AgentRole::Reviewer => (CapabilityProfile::ReadSearchDiff, RelationKind::Review),
+        AgentRole::Verifier => (
+            CapabilityProfile::ReadSearchShell,
+            RelationKind::Verification,
+        ),
+        _ => panic!("relation_draft supports only reviewer and verifier roles"),
+    };
+    AssignmentDraft {
+        root_session_id: root_session_id.to_string(),
+        role,
+        capability_profile,
+        objective: format!("{role:?} the bounded change"),
+        acceptance_criteria: vec![criterion()],
+        read_scope: Vec::new(),
+        write_scope: Vec::new(),
+        stop_condition: "stop after an evidence-backed verdict".to_string(),
+        dependencies: vec![target],
+        risk_hints: Vec::new(),
+        required_evidence: Vec::new(),
+        prohibited_changes: Vec::new(),
+        relation: Some(AssignmentRelation {
+            kind,
+            target_assignment_ids: vec![target],
+        }),
+    }
+}
+
 #[test]
 fn ids_and_scope_validation_are_strict() {
     assert_eq!(AssignmentId::new().as_uuid().get_version_num(), 7);
@@ -381,6 +410,92 @@ async fn agent_task_bindings_persist_and_are_root_session_scoped() {
 }
 
 #[tokio::test]
+async fn sealed_failed_start_binding_can_be_removed_without_deleting_task_history() {
+    let fixture = Fixture::new().await;
+    let root_session_id = "failed-start-root";
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft(root_session_id, "src"))
+        .await
+        .expect("worker assignment");
+    fixture
+        .store
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            agent_path: "/root/retryable_worker".to_string(),
+            task_name: "retryable_worker".to_string(),
+            thread_id: Some("failed-thread".to_string()),
+        })
+        .await
+        .expect("failed-start task binds before initial submission");
+
+    assert!(matches!(
+        fixture
+            .store
+            .remove_agent_task_binding(TaskActor::Root, assignment.assignment_id)
+            .await,
+        Err(StoreError::InvalidAssignment(_))
+    ));
+
+    fixture
+        .store
+        .abandon_agent_task(
+            TaskActor::Root,
+            assignment.assignment_id,
+            "initial submission failed".to_string(),
+        )
+        .await
+        .expect("failed-start assignment is durably abandoned");
+    assert!(
+        fixture
+            .store
+            .remove_agent_task_binding(TaskActor::Root, assignment.assignment_id)
+            .await
+            .expect("sealed failed-start binding can be removed")
+    );
+    assert_eq!(
+        fixture
+            .store
+            .get_agent_task_binding(assignment.assignment_id)
+            .await
+            .expect("removed binding lookup"),
+        None
+    );
+    let abandoned = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .expect("abandoned task history remains readable");
+    assert_eq!(abandoned.current_attempt.state, AttemptState::Abandoned);
+    assert_eq!(
+        abandoned
+            .receipt
+            .expect("abandonment receipt remains durable")
+            .status,
+        AgentStatusClaim::Abandoned
+    );
+
+    let (retry_assignment, retry_attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft(root_session_id, "src"))
+        .await
+        .expect("released write claim allows a retry assignment");
+    let retry_binding = fixture
+        .store
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: retry_assignment.assignment_id,
+            attempt_id: retry_attempt.attempt_id,
+            agent_path: "/root/retryable_worker".to_string(),
+            task_name: "retryable_worker".to_string(),
+            thread_id: Some("retry-thread".to_string()),
+        })
+        .await
+        .expect("removed failed-start binding allows the canonical path to be retried");
+    assert_eq!(retry_binding.assignment_id, retry_assignment.assignment_id);
+}
+
+#[tokio::test]
 async fn correction_attempt_is_immutable_and_bounded_to_one() {
     let fixture = Fixture::new().await;
     let (assignment, attempt) = fixture
@@ -457,6 +572,290 @@ async fn correction_attempt_is_immutable_and_bounded_to_one() {
             .await,
         Err(StoreError::AmendmentLimitReached(_))
     ));
+}
+
+#[tokio::test]
+async fn risk_review_progresses_to_independent_verification_without_releasing_claim() {
+    let fixture = Fixture::new().await;
+    let (worker, worker_attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("risk-root", "src"))
+        .await
+        .expect("worker assignment");
+    fixture
+        .store
+        .submit_agent_receipt_with_review(
+            worker_attempt.attempt_id,
+            completed_receipt(Vec::new()),
+            "cross-owner scope".to_string(),
+        )
+        .await
+        .expect("risk-gated receipt");
+
+    let task = fixture
+        .store
+        .get_agent_task(worker.assignment_id, Some(0))
+        .await
+        .expect("risk-gated task");
+    assert!(
+        task.gates
+            .iter()
+            .any(|gate| { gate.kind == GateKind::Risk && gate.status == GateStatus::Passed })
+    );
+    assert!(
+        task.gates
+            .iter()
+            .any(|gate| { gate.kind == GateKind::Review && gate.status == GateStatus::Pending })
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .create_assignment(
+                fixture.repo.path(),
+                worker_draft("risk-root", "src/file.rs")
+            )
+            .await,
+        Err(StoreError::WriteClaimConflict { .. })
+    ));
+
+    let (_, reviewer_attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            relation_draft("risk-root", AgentRole::Reviewer, worker.assignment_id),
+        )
+        .await
+        .expect("matching reviewer may cross the pending review gate");
+    fixture
+        .store
+        .set_agent_gate(
+            TaskActor::Attempt(reviewer_attempt.attempt_id),
+            worker.assignment_id,
+            GateKind::Review,
+            GateStatus::Passed,
+            "cold review passed".to_string(),
+        )
+        .await
+        .expect("review verdict");
+    let reviewed = fixture
+        .store
+        .get_agent_task(worker.assignment_id, Some(0))
+        .await
+        .expect("reviewed task");
+    assert!(
+        reviewed.gates.iter().any(|gate| {
+            gate.kind == GateKind::Verification && gate.status == GateStatus::Pending
+        })
+    );
+
+    let (_, verifier_attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            relation_draft("risk-root", AgentRole::Verifier, worker.assignment_id),
+        )
+        .await
+        .expect("matching verifier may cross the pending verification gate");
+    fixture
+        .store
+        .set_agent_gate(
+            TaskActor::Attempt(verifier_attempt.attempt_id),
+            worker.assignment_id,
+            GateKind::Verification,
+            GateStatus::Passed,
+            "independent verification passed".to_string(),
+        )
+        .await
+        .expect("verification verdict");
+    fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("risk-root", "src/file.rs"),
+        )
+        .await
+        .expect("claim releases only after verification passes");
+}
+
+#[tokio::test]
+async fn exhausted_review_and_failed_verification_transition_to_needs_main() {
+    let review_fixture = Fixture::new().await;
+    let (review_worker, review_attempt) = review_fixture
+        .store
+        .create_assignment(
+            review_fixture.repo.path(),
+            worker_draft("review-root", "src"),
+        )
+        .await
+        .expect("review worker");
+    review_fixture
+        .store
+        .submit_agent_receipt_with_review(
+            review_attempt.attempt_id,
+            completed_receipt(Vec::new()),
+            "cold review required".to_string(),
+        )
+        .await
+        .expect("initial risk-gated receipt");
+    let (_, reviewer_attempt) = review_fixture
+        .store
+        .create_assignment(
+            review_fixture.repo.path(),
+            relation_draft(
+                "review-root",
+                AgentRole::Reviewer,
+                review_worker.assignment_id,
+            ),
+        )
+        .await
+        .expect("reviewer assignment");
+    review_fixture
+        .store
+        .set_agent_gate(
+            TaskActor::Attempt(reviewer_attempt.attempt_id),
+            review_worker.assignment_id,
+            GateKind::Review,
+            GateStatus::ChangesRequested,
+            "one correction is required".to_string(),
+        )
+        .await
+        .expect("first review requests the bounded correction");
+    let correction = review_fixture
+        .store
+        .amend_agent_task(
+            TaskActor::Root,
+            review_worker.assignment_id,
+            AttemptAmendment {
+                reason: "address the review finding".to_string(),
+                objective: None,
+                acceptance_criteria: None,
+                stop_condition: None,
+            },
+        )
+        .await
+        .expect("single correction attempt");
+    review_fixture
+        .store
+        .submit_agent_receipt_with_review(
+            correction.attempt_id,
+            completed_receipt(Vec::new()),
+            "corrected work requires a fresh review".to_string(),
+        )
+        .await
+        .expect("corrected receipt");
+    review_fixture
+        .store
+        .set_agent_gate(
+            TaskActor::Attempt(reviewer_attempt.attempt_id),
+            review_worker.assignment_id,
+            GateKind::Review,
+            GateStatus::ChangesRequested,
+            "the correction remains unresolved".to_string(),
+        )
+        .await
+        .expect("second unresolved review becomes needs_main");
+    let review_task = review_fixture
+        .store
+        .get_agent_task(review_worker.assignment_id, Some(10))
+        .await
+        .expect("review task");
+    assert_eq!(review_task.current_attempt.state, AttemptState::NeedsMain);
+    assert!(
+        review_task
+            .observations
+            .iter()
+            .any(|observation| observation.kind == ObservationKind::NeedsMain)
+    );
+    review_fixture
+        .store
+        .create_assignment(
+            review_fixture.repo.path(),
+            worker_draft("review-root", "src/file.rs"),
+        )
+        .await
+        .expect("needs_main review releases the retained claim");
+
+    let verification_fixture = Fixture::new().await;
+    let (verification_worker, verification_attempt) = verification_fixture
+        .store
+        .create_assignment(
+            verification_fixture.repo.path(),
+            worker_draft("verification-root", "src"),
+        )
+        .await
+        .expect("verification worker");
+    verification_fixture
+        .store
+        .submit_agent_receipt_with_review(
+            verification_attempt.attempt_id,
+            completed_receipt(Vec::new()),
+            "independent review and verification required".to_string(),
+        )
+        .await
+        .expect("verification risk-gated receipt");
+    let (_, verification_reviewer) = verification_fixture
+        .store
+        .create_assignment(
+            verification_fixture.repo.path(),
+            relation_draft(
+                "verification-root",
+                AgentRole::Reviewer,
+                verification_worker.assignment_id,
+            ),
+        )
+        .await
+        .expect("verification reviewer");
+    verification_fixture
+        .store
+        .set_agent_gate(
+            TaskActor::Attempt(verification_reviewer.attempt_id),
+            verification_worker.assignment_id,
+            GateKind::Review,
+            GateStatus::Passed,
+            "cold review passed".to_string(),
+        )
+        .await
+        .expect("review verdict");
+    let (_, verifier_attempt) = verification_fixture
+        .store
+        .create_assignment(
+            verification_fixture.repo.path(),
+            relation_draft(
+                "verification-root",
+                AgentRole::Verifier,
+                verification_worker.assignment_id,
+            ),
+        )
+        .await
+        .expect("verifier assignment");
+    verification_fixture
+        .store
+        .set_agent_gate(
+            TaskActor::Attempt(verifier_attempt.attempt_id),
+            verification_worker.assignment_id,
+            GateKind::Verification,
+            GateStatus::Failed,
+            "independent verification failed".to_string(),
+        )
+        .await
+        .expect("failed verification becomes needs_main");
+    let verification_task = verification_fixture
+        .store
+        .get_agent_task(verification_worker.assignment_id, Some(0))
+        .await
+        .expect("verification task");
+    assert_eq!(
+        verification_task.current_attempt.state,
+        AttemptState::NeedsMain
+    );
+    verification_fixture
+        .store
+        .create_assignment(
+            verification_fixture.repo.path(),
+            worker_draft("verification-root", "src/file.rs"),
+        )
+        .await
+        .expect("failed verification releases the retained claim");
 }
 
 #[tokio::test]

@@ -616,7 +616,17 @@ pub fn evaluate_risk_gate(facts: &RiskFacts) -> RiskGateDecision {
         reasons.push("cross-owner scope".to_string());
     }
     for domain in &facts.domains {
-        reasons.push(format!("{domain:?} risk").to_lowercase());
+        let reason = match domain {
+            RiskDomain::Concurrency => "concurrency risk",
+            RiskDomain::UnsafeCode => "unsafe risk",
+            RiskDomain::Lifecycle => "lifecycle risk",
+            RiskDomain::Persistence => "persistence risk",
+            RiskDomain::Schema => "schema risk",
+            RiskDomain::Protocol => "protocol risk",
+            RiskDomain::Security => "security risk",
+            RiskDomain::Installation => "installation risk",
+        };
+        reasons.push(reason.to_string());
     }
     if facts.non_generated_changed_files > 5 {
         reasons.push("more than five non-generated changed files".to_string());

@@ -17,6 +17,7 @@ use crate::tools::handlers::multi_agents_v2::InterruptAgentHandler;
 use crate::tools::handlers::multi_agents_v2::ListAgentsHandler as ListAgentsHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SendMessageHandler as SendMessageHandlerV2;
 use crate::tools::handlers::multi_agents_v2::SpawnAgentHandler as SpawnAgentHandlerV2;
+use crate::tools::handlers::multi_agents_v2::SubmitAgentReceiptHandler as SubmitAgentReceiptHandlerV2;
 use crate::tools::handlers::multi_agents_v2::WaitAgentHandler as WaitAgentHandlerV2;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_extension_api::empty_extension_registry;
@@ -696,6 +697,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         .features
         .enable(Feature::Sqlite)
         .expect("test config should allow sqlite");
+    config.ephemeral = false;
     let state_runtime = init_state_db(&config)
         .await
         .expect("typed spawn requires persistent test state");
@@ -710,18 +712,25 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         .start_thread(config.clone())
         .await
         .expect("root thread should start");
-    session.services.agent_control = manager.agent_control();
+    session.services.agent_control = root.thread.codex.session.services.agent_control.clone();
+    session.services.state_db = root.thread.codex.session.services.state_db.clone();
     session.thread_id = root.thread_id;
     let root_session_id = session.services.agent_control.session_id().to_string();
-    session
-        .services
-        .agent_control
-        .task_coordinator()
-        .initialize(state_runtime, root_session_id)
-        .await
-        .expect("typed task coordinator should initialize");
     let agent_control = session.services.agent_control.clone();
+    assert!(
+        agent_control.task_coordinator().store().is_none(),
+        "a fresh root should defer typed-task storage until a typed assignment is requested"
+    );
+    let child_config = config.clone();
     set_turn_config(&mut turn, config);
+    let task_name = format!(
+        "typed_worker_{}",
+        ThreadId::new().to_string().replace('-', "")
+    );
+    let risk_path = format!("typed-risk-{task_name}.txt");
+    let repo_root = codex_git_utils::get_git_repo_root(child_config.cwd.as_path())
+        .unwrap_or_else(|| child_config.cwd.to_path_buf());
+    let risk_file = repo_root.join(&risk_path);
 
     let output = SpawnAgentHandlerV2::default()
         .handle(invocation(
@@ -729,15 +738,16 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
             Arc::new(turn),
             "spawn_agent",
             function_payload(json!({
-                "task_name": "typed_explorer",
-                "agent_type": "explorer",
+                "task_name": task_name.clone(),
+                "agent_type": "worker",
                 "assignment": {
                     "objective": "inspect the bounded path",
                     "acceptance_criteria": [{
                         "id": "criterion-1",
                         "text": "report evidence"
                     }],
-                    "write_scope": [],
+                    "write_scope": [{"path": risk_path.clone(), "recursive": false}],
+                    "risk_hints": [format!("path:{risk_path}")],
                     "stop_condition": "stop after reporting evidence"
                 }
             })),
@@ -747,7 +757,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
     let (content, _) = expect_text_output(output);
     let result: serde_json::Value =
         serde_json::from_str(&content).expect("spawn_agent result should be json");
-    assert_eq!(result["task_name"], "/root/typed_explorer");
+    assert_eq!(result["task_name"], format!("/root/{task_name}"));
     let assignment_id = codex_agent_task_store::AssignmentId::parse(
         result["assignment_id"]
             .as_str()
@@ -758,7 +768,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         .task_coordinator()
         .binding_for_assignment(assignment_id)
         .expect("typed assignment should be bound before spawn returns");
-    assert_eq!(binding.agent_path, "/root/typed_explorer");
+    assert_eq!(binding.agent_path, format!("/root/{task_name}"));
     assert!(binding.thread_id.is_some());
     let task = agent_control
         .task_coordinator()
@@ -767,9 +777,356 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         .expect("typed assignment should be readable from durable store");
     assert_eq!(
         task.assignment.role,
-        codex_agent_task_store::AgentRole::Explorer
+        codex_agent_task_store::AgentRole::Worker
     );
     assert_eq!(task.current_attempt.attempt_id, binding.attempt_id);
+
+    let task_store = agent_control
+        .task_coordinator()
+        .store()
+        .expect("typed task store should remain available");
+    task_store
+        .begin_mutation(
+            binding.attempt_id,
+            repo_root.as_path(),
+            risk_path.clone(),
+            codex_agent_task_store::AttributionConfidence::Definitive,
+        )
+        .await
+        .expect("high-risk mutation should begin");
+    std::fs::write(&risk_file, "high-risk evidence\n").expect("high-risk file should change");
+    task_store
+        .finalize_mutation(binding.attempt_id, repo_root.as_path(), risk_path.clone())
+        .await
+        .expect("high-risk mutation should be finalized before receipt submission");
+    let finalized_evidence = task_store
+        .list_mutation_evidence(
+            binding.attempt_id,
+            Some(codex_agent_task_store::MAX_MUTATION_EVIDENCE_LIMIT),
+        )
+        .await
+        .expect("finalized mutation evidence should remain queryable");
+    assert_eq!(finalized_evidence.len(), 1);
+    assert_ne!(
+        finalized_evidence[0].pre_write_hash,
+        finalized_evidence[0].final_hash
+    );
+    assert_eq!(
+        task_store
+            .get_agent_task(assignment_id, Some(0))
+            .await
+            .expect("risk hints should remain durable")
+            .assignment
+            .risk_hints,
+        vec![format!("path:{risk_path}")]
+    );
+
+    let child_thread_id = ThreadId::from_string(
+        binding
+            .thread_id
+            .as_deref()
+            .expect("typed binding should retain the child thread id"),
+    )
+    .expect("typed binding thread id should parse");
+    let child_source = agent_control
+        .get_agent_config_snapshot(child_thread_id)
+        .await
+        .expect("spawned typed agent should have a config snapshot")
+        .session_source;
+    let validation_call_id = format!("validation-{}", ThreadId::new());
+    assert!(
+        agent_control
+            .task_coordinator()
+            .record_validation_call_for_source(
+                &child_source,
+                validation_call_id.clone(),
+                "focused validation".to_string(),
+                codex_agent_task_store::ValidationCallStatus::Succeeded,
+            )
+            .await
+            .expect("validation call should persist for the bound attempt")
+    );
+    let (mut child_session, mut child_turn) = make_session_and_context().await;
+    child_session.services.agent_control = agent_control.clone();
+    child_session.thread_id = child_thread_id;
+    child_turn.session_source = child_source;
+    set_turn_config(&mut child_turn, child_config);
+    SubmitAgentReceiptHandlerV2
+        .handle(invocation(
+            Arc::new(child_session),
+            Arc::new(child_turn),
+            "submit_agent_receipt",
+            function_payload(json!({
+                "status": "completed",
+                "summary": "reported bounded evidence",
+                "criterion_results": [{
+                    "criterion_id": "criterion-1",
+                    "status": "passed",
+                    "evidence": validation_call_id.clone()
+                }],
+                "declared_changes": [{
+                    "path": risk_path.clone(),
+                    "summary": "recorded high-risk evidence"
+                }],
+                "validation_call_ids": [validation_call_id.clone()],
+                "blockers": [],
+                "risks": [],
+                "next_action": null
+            })),
+        ))
+        .await
+        .expect("bound attempt should seal a validation-backed risk-gated receipt");
+
+    let reloaded = crate::agent::task_coordinator::AgentTaskCoordinator::default();
+    reloaded
+        .initialize(state_runtime, root_session_id)
+        .await
+        .expect("typed task coordinator should reload persisted bindings");
+    assert_eq!(
+        reloaded
+            .binding_for_assignment(assignment_id)
+            .expect("reloaded coordinator should restore the typed binding"),
+        binding
+    );
+    let reloaded_task = reloaded
+        .get_agent_task(assignment_id, Some(0))
+        .await
+        .expect("reloaded coordinator should restore the typed task lifecycle");
+    assert_eq!(
+        reloaded_task.current_attempt.state,
+        codex_agent_task_store::AttemptState::Completed
+    );
+    assert_eq!(
+        reloaded_task
+            .receipt
+            .expect("reloaded task should retain its sealed receipt")
+            .validation_call_ids,
+        vec![validation_call_id]
+    );
+    assert!(reloaded_task.gates.iter().any(|gate| {
+        gate.kind == codex_agent_task_store::GateKind::Risk
+            && gate.status == codex_agent_task_store::GateStatus::Passed
+    }));
+    assert!(reloaded_task.gates.iter().any(|gate| {
+        gate.kind == codex_agent_task_store::GateKind::Review
+            && gate.status == codex_agent_task_store::GateStatus::Pending
+    }));
+
+    let _ = agent_control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("typed child shutdown should submit");
+    std::fs::remove_file(risk_file).expect("high-risk test file should be removed");
+}
+
+#[tokio::test]
+async fn multi_agent_v2_typed_spawn_rejects_conflicting_write_claims() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow sqlite");
+    config.ephemeral = false;
+    let state_runtime = init_state_db(&config)
+        .await
+        .expect("typed spawn requires persistent test state");
+    let manager = ThreadManager::with_models_provider_home_and_state_for_tests(
+        CodexAuth::from_api_key("dummy"),
+        config.model_provider.clone(),
+        config.codex_home.to_path_buf(),
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        Some(state_runtime),
+    );
+    let root = manager
+        .start_thread(config.clone())
+        .await
+        .expect("root thread should start");
+    session.services.agent_control = root.thread.codex.session.services.agent_control.clone();
+    session.services.state_db = root.thread.codex.session.services.state_db.clone();
+    session.thread_id = root.thread_id;
+    let agent_control = session.services.agent_control.clone();
+    set_turn_config(&mut turn, config);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let suffix = ThreadId::new().to_string().replace('-', "");
+    let first_task_name = format!("typed_writer_one_{suffix}");
+    let second_task_name = format!("typed_writer_two_{suffix}");
+    let claim_path = format!("claimed-{suffix}");
+    let overlapping_path = format!("{claim_path}/child");
+
+    let first = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            function_payload(json!({
+                "task_name": first_task_name,
+                "agent_type": "worker",
+                "assignment": {
+                    "objective": "edit the claimed path",
+                    "acceptance_criteria": [{
+                        "id": "criterion-1",
+                        "text": "complete the bounded edit"
+                    }],
+                    "write_scope": [{"path": claim_path, "recursive": true}],
+                    "stop_condition": "stop after the edit"
+                }
+            })),
+        ))
+        .await
+        .expect("first typed writer should acquire its write claim");
+    let (content, _) = expect_text_output(first);
+    let first_result: serde_json::Value =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let assignment_id = codex_agent_task_store::AssignmentId::parse(
+        first_result["assignment_id"]
+            .as_str()
+            .expect("typed spawn should return assignment id"),
+    )
+    .expect("assignment id should parse");
+
+    let error = SpawnAgentHandlerV2::default()
+        .handle(invocation(
+            Arc::clone(&session),
+            Arc::clone(&turn),
+            "spawn_agent",
+            function_payload(json!({
+                "task_name": second_task_name,
+                "agent_type": "worker",
+                "assignment": {
+                    "objective": "edit an overlapping path",
+                    "acceptance_criteria": [{
+                        "id": "criterion-1",
+                        "text": "complete the bounded edit"
+                    }],
+                    "write_scope": [{"path": overlapping_path, "recursive": true}],
+                    "stop_condition": "stop after the edit"
+                }
+            })),
+        ))
+        .await
+        .err()
+        .expect("overlapping typed writers must not both acquire claims");
+    assert!(matches!(
+        error,
+        FunctionCallError::RespondToModel(message)
+            if message.contains("active write claims overlap")
+    ));
+
+    let binding = agent_control
+        .task_coordinator()
+        .binding_for_assignment(assignment_id)
+        .expect("first typed writer should remain bound after the conflict");
+    let child_thread_id = ThreadId::from_string(
+        binding
+            .thread_id
+            .as_deref()
+            .expect("typed binding should retain the child thread id"),
+    )
+    .expect("typed binding thread id should parse");
+    agent_control
+        .task_coordinator()
+        .store()
+        .expect("typed task store should remain available")
+        .abandon_agent_task(
+            codex_agent_task_store::TaskActor::Root,
+            assignment_id,
+            "test cleanup".to_string(),
+        )
+        .await
+        .expect("test cleanup should release the first claim");
+    assert!(
+        agent_control
+            .task_coordinator()
+            .remove_agent_task_binding(assignment_id)
+            .await
+            .expect("test cleanup should remove the sealed binding")
+    );
+    assert!(
+        agent_control
+            .task_coordinator()
+            .binding_for_assignment(assignment_id)
+            .is_none()
+    );
+    let _ = agent_control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("typed child shutdown should submit");
+}
+
+#[tokio::test]
+async fn multi_agent_v2_typed_spawn_failure_releases_write_claim() {
+    let (session, mut turn) = make_session_and_context().await;
+    let mut config = (*turn.config).clone();
+    config
+        .features
+        .enable(Feature::MultiAgentV2)
+        .expect("test config should allow feature update");
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow sqlite");
+    let state_runtime = init_state_db(&config)
+        .await
+        .expect("typed spawn requires persistent test state");
+    let root_session_id = session.services.agent_control.session_id().to_string();
+    session
+        .services
+        .agent_control
+        .task_coordinator()
+        .initialize(state_runtime, root_session_id.clone())
+        .await
+        .expect("typed task coordinator should initialize");
+    set_turn_config(&mut turn, config);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let failed_claim_path = format!("failed-claim-{}", ThreadId::new());
+
+    for task_name in ["failed_writer_one", "failed_writer_two"] {
+        let error = SpawnAgentHandlerV2::default()
+            .handle(invocation(
+                Arc::clone(&session),
+                Arc::clone(&turn),
+                "spawn_agent",
+                function_payload(json!({
+                    "task_name": task_name,
+                    "agent_type": "worker",
+                    "assignment": {
+                        "objective": "exercise spawn rollback",
+                        "acceptance_criteria": [{
+                            "id": "criterion-1",
+                            "text": "release the claim after failure"
+                        }],
+                        "write_scope": [{"path": failed_claim_path.clone(), "recursive": true}],
+                        "stop_condition": "stop when spawning fails"
+                    }
+                })),
+            ))
+            .await
+            .err()
+            .expect("the detached test control has no live thread manager");
+        assert_eq!(
+            error,
+            FunctionCallError::RespondToModel("collab manager unavailable".to_string())
+        );
+    }
+    assert!(
+        session
+            .services
+            .agent_control
+            .task_coordinator()
+            .store()
+            .expect("typed task store should remain available")
+            .list_agent_task_bindings(root_session_id, None)
+            .await
+            .expect("failed spawns should leave no durable bindings")
+            .is_empty()
+    );
 }
 
 #[tokio::test]

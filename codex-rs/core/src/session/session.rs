@@ -4,6 +4,7 @@ use crate::agents_md_manager::AgentsMdManager;
 use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::git_workspace::GitWorkspaceCache;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
 use crate::startup_timing::StartupTimingState;
@@ -857,19 +858,6 @@ impl Session {
                 slug: Some(session_model),
             };
             config.features.emit_metrics(&session_telemetry);
-            session_telemetry.counter(
-                THREAD_STARTED_METRIC,
-                /*inc*/ 1,
-                &[(
-                    "is_git",
-                    if get_git_repo_root(session_configuration.cwd()).is_some() {
-                        "true"
-                    } else {
-                        "false"
-                    },
-                )],
-            );
-
             session_telemetry.conversation_starts(
                 config.model_provider.name.as_str(),
                 session_configuration.collaboration_mode.reasoning_effort(),
@@ -925,6 +913,20 @@ impl Session {
             ));
             turn_environments.update_selections(session_configuration.environment_selections());
             let resolved_environments = turn_environments.snapshot().await;
+            let git_workspace = GitWorkspaceCache::new();
+            let initial_git_workspace = git_workspace.snapshot(&resolved_environments).await;
+            session_telemetry.counter(
+                THREAD_STARTED_METRIC,
+                /*inc*/ 1,
+                &[(
+                    "is_git",
+                    if initial_git_workspace.primary_is_git() == Some(true) {
+                        "true"
+                    } else {
+                        "false"
+                    },
+                )],
+            );
             let agents_md_manager = Arc::new(AgentsMdManager::new(user_instructions));
             agents_md_manager
                 .refresh(config.as_ref(), &resolved_environments)
@@ -1173,6 +1175,7 @@ impl Session {
                 )),
                 tool_search_handler_cache: Default::default(),
                 turn_environments: Arc::clone(&turn_environments),
+                git_workspace,
             };
             let sess = Arc::new(Session {
                 thread_id,

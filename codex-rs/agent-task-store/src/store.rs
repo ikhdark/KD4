@@ -23,6 +23,7 @@ use crate::MutationSnapshotVersion;
 use crate::ObservationKind;
 use crate::ReceiptDraft;
 use crate::RuntimeObservation;
+use crate::StoreError;
 use crate::StoreResult;
 use crate::TaskActor;
 use crate::ValidationCall;
@@ -50,6 +51,21 @@ pub trait AgentTaskStore: Send + Sync {
         binding: AgentTaskBindingDraft,
     ) -> TaskStoreFuture<'_, AgentTaskBinding>;
 
+    /// Removes only the runtime binding for a sealed failed-start task. The assignment, attempts,
+    /// receipts, observations, and mutation evidence remain durable.
+    fn remove_agent_task_binding(
+        &self,
+        actor: TaskActor,
+        assignment_id: AssignmentId,
+    ) -> TaskStoreFuture<'_, bool> {
+        Box::pin(async move {
+            let _ = (actor, assignment_id);
+            Err(StoreError::InvalidAssignment(
+                "agent task binding removal is not supported by this store".to_string(),
+            ))
+        })
+    }
+
     fn get_agent_task_binding(
         &self,
         assignment_id: AssignmentId,
@@ -75,6 +91,17 @@ pub trait AgentTaskStore: Send + Sync {
         &self,
         attempt_id: AttemptId,
         receipt: ReceiptDraft,
+    ) -> TaskStoreFuture<'_, AgentReceipt>;
+
+    /// Seals a successful receipt while atomically retaining the assignment behind a
+    /// risk-derived cold-review gate. Implementations must create the risk/review gates in the
+    /// same transaction as the receipt so an invalid receipt cannot leave an orphaned gate and a
+    /// valid high-risk receipt cannot briefly release its write claim.
+    fn submit_agent_receipt_with_review(
+        &self,
+        attempt_id: AttemptId,
+        receipt: ReceiptDraft,
+        review_reason: String,
     ) -> TaskStoreFuture<'_, AgentReceipt>;
 
     fn amend_agent_task(

@@ -293,6 +293,7 @@ fn resolved_local_environments<const N: usize>(
     environments: [(&str, AbsolutePathBuf); N],
 ) -> TurnEnvironmentSnapshot {
     TurnEnvironmentSnapshot {
+        generation: 0,
         turn_environments: environments
             .into_iter()
             .map(|(environment_id, cwd)| {

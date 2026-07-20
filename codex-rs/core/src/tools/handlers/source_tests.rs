@@ -15,6 +15,7 @@ use codex_file_system::ExecutorFileSystemFuture;
 use codex_file_system::FileMetadata;
 use codex_file_system::FileSystemReadStream;
 use codex_file_system::ReadDirectoryEntry;
+use codex_file_system::ReadDirectoryOutcome;
 use codex_file_system::RemoveOptions;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseInputItem;
@@ -86,6 +87,23 @@ impl ExecutorFileSystem for FailingSourceFileSystem {
         })
     }
 
+    fn read_file_bounded_confined<'a>(
+        &'a self,
+        path: &'a PathUri,
+        root: &'a PathUri,
+        max_bytes: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, Option<Vec<u8>>> {
+        Box::pin(async move {
+            if self.targets(path, InjectedSourceFailure::Read) {
+                return Err(io::Error::other("injected read failure"));
+            }
+            self.inner
+                .read_file_bounded_confined(path, root, max_bytes, sandbox)
+                .await
+        })
+    }
+
     fn write_file<'a>(
         &'a self,
         path: &'a PathUri,
@@ -127,6 +145,22 @@ impl ExecutorFileSystem for FailingSourceFileSystem {
                 return Err(io::Error::other("injected directory read failure"));
             }
             self.inner.read_directory(path, sandbox).await
+        })
+    }
+
+    fn read_directory_bounded<'a>(
+        &'a self,
+        path: &'a PathUri,
+        max_entries: usize,
+        sandbox: Option<&'a FileSystemSandboxContext>,
+    ) -> ExecutorFileSystemFuture<'a, ReadDirectoryOutcome> {
+        Box::pin(async move {
+            if self.targets(path, InjectedSourceFailure::ReadDirectory) {
+                return Err(io::Error::other("injected directory read failure"));
+            }
+            self.inner
+                .read_directory_bounded(path, max_entries, sandbox)
+                .await
         })
     }
 

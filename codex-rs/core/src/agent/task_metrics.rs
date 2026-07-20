@@ -8,10 +8,18 @@
 
 use codex_agent_task_store::AgentRole;
 use codex_agent_task_store::AgentStatusClaim;
+use codex_agent_task_store::AgentTask;
+use codex_agent_task_store::Assignment;
+use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::CapabilityProfile;
+use codex_agent_task_store::CriterionStatus;
+use codex_agent_task_store::GateKind;
+use codex_agent_task_store::GateStatus;
+use codex_agent_task_store::ValidationCallStatus;
 use codex_otel::SessionTelemetry;
 use std::collections::BTreeMap;
 use std::time::Duration;
+use std::time::Instant;
 
 const MAX_METRIC_ROWS: usize = 256;
 const MAX_RECORDED_EVENTS: usize = 4_096;
@@ -55,24 +63,28 @@ impl OpaqueId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum RoleLabel {
+    #[cfg(test)]
     Root,
     Explorer,
     Worker,
     Reviewer,
     Verifier,
     Integrator,
+    #[cfg(test)]
     Legacy,
 }
 
 impl RoleLabel {
     const fn as_str(self) -> &'static str {
         match self {
+            #[cfg(test)]
             Self::Root => "root",
             Self::Explorer => "explorer",
             Self::Worker => "worker",
             Self::Reviewer => "reviewer",
             Self::Verifier => "verifier",
             Self::Integrator => "integrator",
+            #[cfg(test)]
             Self::Legacy => "legacy",
         }
     }
@@ -97,6 +109,7 @@ pub(crate) enum CapabilityLabel {
     ReadSearchShell,
     ScopedWrite,
     CrossOwnerWrite,
+    #[cfg(test)]
     Legacy,
 }
 
@@ -108,6 +121,7 @@ impl CapabilityLabel {
             Self::ReadSearchShell => "read_search_shell",
             Self::ScopedWrite => "scoped_write",
             Self::CrossOwnerWrite => "cross_owner_write",
+            #[cfg(test)]
             Self::Legacy => "legacy",
         }
     }
@@ -145,6 +159,7 @@ pub(crate) struct UsageTotals {
     pub calls: u64,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConcurrencySlice {
     pub duration: Duration,
@@ -201,6 +216,7 @@ pub(crate) struct TaskMetricInput {
     pub duration: Duration,
     pub critical_path_idle_time: Duration,
     pub role_usage: Vec<RoleUsage>,
+    #[cfg(test)]
     pub concurrency: Vec<ConcurrencySlice>,
     pub first_pass_validation_succeeded: bool,
     pub acceptance_total: u32,
@@ -270,6 +286,7 @@ pub(crate) enum MetricsError {
 }
 
 impl TaskMetrics {
+    #[cfg(test)]
     pub(crate) fn evaluate(input: TaskMetricInput) -> Result<Self, MetricsError> {
         if input.role_usage.len() > MAX_METRIC_ROWS || input.concurrency.len() > MAX_METRIC_ROWS {
             return Err(MetricsError::TooManyRows);
@@ -479,6 +496,7 @@ impl TaskMetricRecorder {
         self.recorded_events
     }
 
+    #[cfg(test)]
     pub(crate) fn is_terminal(&self) -> bool {
         self.finished
     }
@@ -559,6 +577,7 @@ impl TaskMetricRecorder {
                 duration: elapsed,
                 critical_path_idle_time,
                 role_usage,
+                #[cfg(test)]
                 concurrency: Vec::new(),
                 first_pass_validation_succeeded: terminal.first_pass_validation_succeeded,
                 acceptance_total: terminal.acceptance_total,
@@ -658,6 +677,194 @@ impl TaskMetricRecorder {
             critical_path_idle_time,
         ))
     }
+}
+
+/// Process-local measurements for one durable typed task.
+///
+/// Persistence remains authoritative for task state. This runtime owns only bounded counters and
+/// monotonic timestamps, so it can be dropped safely on restart without affecting task recovery.
+#[derive(Debug)]
+pub(crate) struct TaskMetricRuntime {
+    started_at: Instant,
+    role: AgentRole,
+    capability: CapabilityProfile,
+    recorder: TaskMetricRecorder,
+}
+
+impl TaskMetricRuntime {
+    pub(crate) fn new(
+        assignment: &Assignment,
+        active_turns: u32,
+        capacity: u32,
+    ) -> Result<Self, MetricsError> {
+        Ok(Self {
+            started_at: Instant::now(),
+            role: assignment.role,
+            capability: assignment.capability_profile,
+            recorder: TaskMetricRecorder::new(
+                OpaqueId::new(assignment.assignment_id.as_uuid().as_u128()),
+                active_turns,
+                capacity,
+            )?,
+        })
+    }
+
+    pub(crate) fn transition_concurrency(
+        &mut self,
+        active_turns: u32,
+        capacity: u32,
+    ) -> Result<(), MetricsError> {
+        self.recorder
+            .transition_concurrency(self.started_at.elapsed(), active_turns, capacity)
+    }
+
+    pub(crate) fn record_usage(&mut self, tokens: u64, calls: u64) -> Result<(), MetricsError> {
+        self.recorder
+            .record_store_role_usage(self.role, self.capability, tokens, calls)
+    }
+
+    pub(crate) fn finish_and_emit(
+        &mut self,
+        task: &AgentTask,
+        session_telemetry: &SessionTelemetry,
+    ) -> Result<bool, MetricsError> {
+        self.recorder
+            .finish_and_emit(
+                self.started_at.elapsed(),
+                terminal_input(task),
+                session_telemetry,
+            )
+            .map(|metrics| metrics.is_some())
+    }
+}
+
+pub(crate) fn terminal_metrics_ready(task: &AgentTask) -> bool {
+    if !task.current_attempt.state.is_terminal()
+        || task.gates.iter().any(|gate| !gate.status.is_sealed())
+    {
+        return false;
+    }
+
+    // The first review rejection is an explicit correction opportunity, not a final outcome.
+    !(task.current_attempt.ordinal == 0
+        && task.gates.iter().any(|gate| {
+            gate.kind == GateKind::Review && gate.status == GateStatus::ChangesRequested
+        }))
+}
+
+fn terminal_input(task: &AgentTask) -> TaskMetricTerminalInput {
+    let receipt = task.receipt.as_ref();
+    let acceptance_total = saturating_u32(task.assignment.acceptance_criteria.len());
+    let acceptance_final_closed = receipt
+        .map(|receipt| {
+            saturating_u32(
+                receipt
+                    .criterion_results
+                    .iter()
+                    .filter(|criterion| criterion.status == CriterionStatus::Passed)
+                    .count(),
+            )
+        })
+        .unwrap_or(0);
+    let acceptance_first_pass_closed = if task.current_attempt.ordinal == 0 {
+        acceptance_final_closed
+    } else {
+        0
+    };
+    let first_pass_validation_succeeded = task.current_attempt.ordinal == 0
+        && receipt.is_some_and(|receipt| {
+            receipt.status == AgentStatusClaim::Completed
+                && receipt.validation_call_ids.iter().all(|call_id| {
+                    task.validation_calls.iter().any(|call| {
+                        call.call_id == *call_id && call.status == ValidationCallStatus::Succeeded
+                    })
+                })
+        });
+
+    let mut reviewer_findings = FindingTotals::default();
+    for gate in task
+        .gates
+        .iter()
+        .filter(|gate| gate.kind == GateKind::Review)
+    {
+        match gate.status {
+            GateStatus::ChangesRequested | GateStatus::Failed | GateStatus::Violated => {
+                reviewer_findings.confirmed = reviewer_findings.confirmed.saturating_add(1);
+            }
+            GateStatus::Waived | GateStatus::Pending => {
+                reviewer_findings.unresolved = reviewer_findings.unresolved.saturating_add(1);
+            }
+            GateStatus::Passed => {}
+        }
+    }
+
+    let conflicts = saturating_u32(
+        task.gates
+            .iter()
+            .filter(|gate| {
+                gate.kind == GateKind::Ownership
+                    && matches!(gate.status, GateStatus::Failed | GateStatus::Violated)
+            })
+            .count(),
+    );
+    let drift = u32::from(
+        task.assignment
+            .risk_hints
+            .iter()
+            .chain(task.gates.iter().map(|gate| &gate.reason))
+            .any(|value| value.to_ascii_lowercase().contains("drift")),
+    );
+    let waivers = saturating_u32(
+        task.gates
+            .iter()
+            .filter(|gate| gate.status == GateStatus::Waived)
+            .count(),
+    );
+    let gate_violations = task
+        .gates
+        .iter()
+        .filter(|gate| gate.status == GateStatus::Violated)
+        .count();
+    let violations = saturating_u32(gate_violations).saturating_add(u32::from(
+        task.current_attempt.state == AttemptState::Violated && gate_violations == 0,
+    ));
+
+    TaskMetricTerminalInput {
+        first_pass_validation_succeeded,
+        acceptance_total,
+        acceptance_first_pass_closed,
+        acceptance_final_closed,
+        duplicate_work: 0,
+        conflicts,
+        drift,
+        reviewer_findings,
+        corrections: u32::from(task.current_attempt.ordinal),
+        waivers,
+        violations,
+        final_outcome: final_outcome(task),
+    }
+}
+
+fn final_outcome(task: &AgentTask) -> FinalOutcome {
+    match task.current_attempt.state {
+        AttemptState::Completed => task
+            .receipt
+            .as_ref()
+            .map(|receipt| receipt.status.into())
+            .unwrap_or(FinalOutcome::Completed),
+        AttemptState::NeedsMain => match task.receipt.as_ref().map(|receipt| receipt.status) {
+            Some(AgentStatusClaim::Blocked) => FinalOutcome::Blocked,
+            Some(AgentStatusClaim::Failed) => FinalOutcome::Failed,
+            _ => FinalOutcome::NeedsMain,
+        },
+        AttemptState::Violated => FinalOutcome::Violated,
+        AttemptState::Abandoned => FinalOutcome::Abandoned,
+        AttemptState::Active => FinalOutcome::NeedsMain,
+    }
+}
+
+fn saturating_u32(value: usize) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
 }
 
 fn validate_concurrency_state(active_turns: u32, capacity: u32) -> Result<(), MetricsError> {

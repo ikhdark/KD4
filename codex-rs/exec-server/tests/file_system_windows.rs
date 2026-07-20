@@ -79,9 +79,10 @@ async fn file_system_remote_fs_helper_respects_windows_sandbox_write_policy() ->
             Some(&sandbox),
         )
         .await;
-    // Some local Windows hosts cannot create restricted tokens. Reaching that
-    // error still proves the remote fs helper went through the Windows sandbox
-    // launcher; before the wrapper fix this read would have run unsandboxed.
+    // Some local Windows hosts cannot safely run the restricted-token backend.
+    // Reaching a fail-closed backend error still proves the remote fs helper
+    // went through the Windows sandbox launcher; before the wrapper fix this
+    // read would have run unsandboxed.
     if is_unsupported_restricted_token_host(&read_result) {
         return Ok(());
     }
@@ -113,7 +114,10 @@ fn read_only_sandbox_for_cwd(cwd: std::path::PathBuf) -> Result<FileSystemSandbo
 
 fn is_unsupported_restricted_token_host<T>(result: &std::io::Result<T>) -> bool {
     result.as_ref().err().is_some_and(|err| {
-        err.to_string()
-            .contains("windows sandbox failed: CreateRestrictedToken failed: 87")
+        let message = err.to_string();
+        message.contains("windows sandbox failed: CreateRestrictedToken failed: 87")
+            || message.contains(
+                "legacy Windows restricted-token sandbox cannot safely enforce delete boundaries",
+            )
     })
 }

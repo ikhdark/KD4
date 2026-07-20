@@ -2673,6 +2673,7 @@ dependencies = [
  "codex-feedback",
  "codex-file-search",
  "codex-file-system",
+ "codex-file-watcher",
  "codex-git-utils",
  "codex-home",
  "codex-hooks",
@@ -3117,6 +3118,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "codex-file-system",
  "crossbeam-channel",
  "ignore",
  "nucleo",
@@ -3138,7 +3140,9 @@ dependencies = [
  "codex-utils-absolute-path",
  "codex-utils-path-uri",
  "futures",
+ "libc",
  "serde",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

@@ -333,7 +333,6 @@ use crate::unified_exec::UnifiedExecProcessManager;
 use crate::windows_sandbox::WindowsSandboxLevelExt;
 use codex_core_plugins::PluginsManager;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
-use codex_git_utils::get_git_repo_root;
 use codex_mcp::McpConfig;
 use codex_mcp::compute_auth_statuses;
 use codex_mcp::effective_mcp_servers;
@@ -1884,10 +1883,11 @@ impl Session {
             return;
         }
 
-        if let Err(error) = self
-            .services
-            .agent_control
-            .task_coordinator()
+        let task_coordinator = self.services.agent_control.task_coordinator();
+        let assignment_id = task_coordinator
+            .binding_for_agent_path(child_agent_path)
+            .map(|binding| binding.assignment_id);
+        if let Err(error) = task_coordinator
             .seal_missing_receipt(
                 child_agent_path,
                 format!(
@@ -1901,6 +1901,11 @@ impl Session {
                 %error,
                 "failed to seal missing typed-agent receipt"
             );
+        }
+        if let Some(assignment_id) = assignment_id {
+            task_coordinator
+                .maybe_emit_terminal_metrics(assignment_id, &turn_context.session_telemetry)
+                .await;
         }
 
         self.forward_child_completion_to_parent(
@@ -3786,6 +3791,14 @@ impl Session {
                         .await;
                 }
             }
+            self.services
+                .agent_control
+                .task_coordinator()
+                .record_task_usage_for_source(
+                    &turn_context.session_source,
+                    token_usage.total_tokens.max(0) as u64,
+                    1,
+                );
             budget_result?;
         }
         Ok(())
