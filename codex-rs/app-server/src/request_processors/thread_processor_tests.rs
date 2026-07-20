@@ -443,7 +443,7 @@ mod thread_processor_behavior_tests {
     #[test]
     fn validate_dynamic_tools_rejects_reserved_responses_namespace() {
         let tools = vec![dynamic_tool(
-            Some("functions"),
+            Some("collaboration"),
             "lookup_ticket",
             json!({
                 "type": "object",
@@ -453,7 +453,7 @@ mod thread_processor_behavior_tests {
             /*defer_loading*/ true,
         )];
         let err = validate_dynamic_tools(&tools).expect_err("reserved Responses namespace");
-        assert!(err.contains("functions"), "unexpected error: {err}");
+        assert!(err.contains("collaboration"), "unexpected error: {err}");
         assert!(err.contains("Responses API"), "unexpected error: {err}");
     }
 

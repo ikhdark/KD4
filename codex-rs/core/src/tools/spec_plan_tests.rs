@@ -42,8 +42,7 @@ use crate::tools::router::ToolRouterParams;
 use crate::tools::router::ToolSuggestCandidates;
 use crate::tools::router::ToolSuggestPresentation;
 
-const MULTI_AGENT_V2_NAMESPACE: &str = "collaboration";
-const MULTI_AGENT_V2_TASK_NAMESPACE: &str = "agent_tasks";
+const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
 
 #[derive(Default)]
 struct ToolPlanInputs {
@@ -1309,7 +1308,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         });
     })
     .await;
-    v2.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE, MULTI_AGENT_V2_TASK_NAMESPACE]);
+    v2.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE]);
     v2.assert_visible_lacks(&[
         "spawn_agent",
         "send_message",
@@ -1334,6 +1333,10 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         "wait_agent",
         "interrupt_agent",
         "list_agents",
+        "get_agent_task",
+        "amend_agent_task",
+        "waive_agent_gate",
+        "abandon_agent_task",
     ] {
         assert!(
             v2.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
@@ -1342,27 +1345,8 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
             "expected {tool_name} in {MULTI_AGENT_V2_NAMESPACE} namespace"
         );
     }
-    for tool_name in [
-        "get_agent_task",
-        "amend_agent_task",
-        "waive_agent_gate",
-        "abandon_agent_task",
-    ] {
-        assert!(
-            v2.namespace_function_names(MULTI_AGENT_V2_TASK_NAMESPACE)
-                .iter()
-                .any(|name| name == tool_name),
-            "expected {tool_name} in {MULTI_AGENT_V2_TASK_NAMESPACE} namespace"
-        );
-        assert!(
-            !v2.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
-                .iter()
-                .any(|name| name == tool_name),
-            "expected {tool_name} outside the reserved {MULTI_AGENT_V2_NAMESPACE} namespace"
-        );
-    }
     assert!(
-        !v2.namespace_function_names(MULTI_AGENT_V2_TASK_NAMESPACE)
+        !v2.namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
             .iter()
             .any(|name| name == "submit_agent_receipt"),
         "expected submit_agent_receipt to be hidden from the root agent"
@@ -1395,16 +1379,16 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
     for tool_name in ["get_agent_task", "submit_agent_receipt"] {
         assert!(
             v2_subagent
-                .namespace_function_names(MULTI_AGENT_V2_TASK_NAMESPACE)
+                .namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
                 .iter()
                 .any(|name| name == tool_name),
-            "expected {tool_name} in the subagent {MULTI_AGENT_V2_TASK_NAMESPACE} namespace"
+            "expected {tool_name} in the subagent {MULTI_AGENT_V2_NAMESPACE} namespace"
         );
     }
     for tool_name in ["amend_agent_task", "waive_agent_gate", "abandon_agent_task"] {
         assert!(
             !v2_subagent
-                .namespace_function_names(MULTI_AGENT_V2_TASK_NAMESPACE)
+                .namespace_function_names(MULTI_AGENT_V2_NAMESPACE)
                 .iter()
                 .any(|name| name == tool_name),
             "expected {tool_name} to be hidden from subagents"
@@ -1425,8 +1409,7 @@ async fn multi_agent_feature_selects_one_agent_tool_family() {
         });
     })
     .await;
-    direct_model_only
-        .assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE, MULTI_AGENT_V2_TASK_NAMESPACE]);
+    direct_model_only.assert_visible_contains(&[MULTI_AGENT_V2_NAMESPACE]);
     direct_model_only.assert_visible_lacks(&["spawn_agent", "send_message", "wait_agent"]);
     assert_eq!(
         direct_model_only

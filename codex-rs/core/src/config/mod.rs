@@ -324,7 +324,8 @@ Payload:
 
 Messages may be addressed to your full agent path, such as `/root/...`.
 "#;
-const DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "collaboration";
+const DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "agents";
+const LEGACY_MULTI_AGENT_V2_TOOL_NAMESPACE: &str = "collaboration";
 const DEFAULT_MULTI_AGENT_V2_SHARED_USAGE_HINT_TEXT: &str = r#"Call `spawn_agent`, `send_message`, `followup_task`, `wait_agent`, `interrupt_agent`, and `list_agents` as direct collaboration tool calls, not from inside `functions.exec`. Follow each tool's current schema for targets and parameters.
 
 All agents share the same working directory and filesystem:
@@ -2613,6 +2614,12 @@ fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config
         .and_then(|config| config.tool_namespace.as_ref())
         .cloned()
         .or(default.tool_namespace);
+    let tool_namespace = match tool_namespace.as_deref() {
+        Some(LEGACY_MULTI_AGENT_V2_TOOL_NAMESPACE) => {
+            Some(DEFAULT_MULTI_AGENT_V2_TOOL_NAMESPACE.to_string())
+        }
+        _ => tool_namespace,
+    };
     let hide_spawn_agent_metadata = base
         .and_then(|config| config.hide_spawn_agent_metadata)
         .unwrap_or(default.hide_spawn_agent_metadata);
@@ -2941,6 +2948,7 @@ fn validate_multi_agent_v2_tool_namespace(namespace: Option<&str>) -> std::io::R
         "api_tool",
         "browser",
         "computer",
+        "collaboration",
         "container",
         "file_search",
         "functions",

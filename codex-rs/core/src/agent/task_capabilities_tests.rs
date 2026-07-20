@@ -122,13 +122,13 @@ fn exact_scope(path: &str) -> RepoScope {
 fn tool_classification_separates_typed_authority() {
     for name in ["send_message", "wait_agent", "list_agents"] {
         assert_eq!(
-            classify_typed_tool(None, name, None, None),
+            classify_typed_tool(None, name, None),
             TypedToolClass::AgentCommunication
         );
     }
     for name in ["get_agent_task", "submit_agent_receipt"] {
         assert_eq!(
-            classify_typed_tool(None, name, None, None),
+            classify_typed_tool(None, name, None),
             TypedToolClass::OwnTask
         );
     }
@@ -142,7 +142,7 @@ fn tool_classification_separates_typed_authority() {
         "abandon_agent_task",
     ] {
         assert_eq!(
-            classify_typed_tool(None, name, None, None),
+            classify_typed_tool(None, name, None),
             TypedToolClass::RootTaskControl
         );
     }
@@ -155,83 +155,39 @@ fn tool_classification_separates_typed_authority() {
         ("mcp__server__read", TypedToolClass::DynamicExternal),
         ("future_unclassified_tool", TypedToolClass::Unknown),
     ] {
-        assert_eq!(classify_typed_tool(None, name, None, None), class);
+        assert_eq!(classify_typed_tool(None, name, None), class);
     }
 }
 
 #[test]
 fn namespaces_cannot_spoof_core_or_collaboration_tools() {
-    let collaboration_namespace = Some("collaboration");
-    let task_namespace = Some("agent_tasks");
+    let collaboration_namespace = Some("agents");
     assert_eq!(
-        classify_typed_tool(
-            Some("collaboration"),
-            "send_message",
-            collaboration_namespace,
-            task_namespace,
-        ),
+        classify_typed_tool(Some("agents"), "send_message", collaboration_namespace),
         TypedToolClass::AgentCommunication
     );
     assert_eq!(
-        classify_typed_tool(
-            Some("collaboration"),
-            "spawn_agent",
-            collaboration_namespace,
-            task_namespace,
-        ),
+        classify_typed_tool(Some("agents"), "spawn_agent", collaboration_namespace),
         TypedToolClass::RootTaskControl
     );
     assert_eq!(
-        classify_typed_tool(
-            Some("collaboration"),
-            "apply_patch",
-            collaboration_namespace,
-            task_namespace,
-        ),
+        classify_typed_tool(Some("agents"), "apply_patch", collaboration_namespace),
         TypedToolClass::Unknown
     );
     assert_eq!(
-        classify_typed_tool(
-            Some("agent_tasks"),
-            "get_agent_task",
-            collaboration_namespace,
-            task_namespace,
-        ),
-        TypedToolClass::OwnTask
-    );
-    assert_eq!(
-        classify_typed_tool(
-            Some("agent_tasks"),
-            "send_message",
-            collaboration_namespace,
-            task_namespace,
-        ),
-        TypedToolClass::Unknown
-    );
-    assert_eq!(
-        classify_typed_tool(
-            Some("foreign"),
-            "apply_patch",
-            collaboration_namespace,
-            task_namespace,
-        ),
+        classify_typed_tool(Some("foreign"), "apply_patch", collaboration_namespace,),
         TypedToolClass::DynamicExternal
     );
     assert_eq!(
-        classify_typed_tool(Some(""), "search_source", None, None),
+        classify_typed_tool(Some(""), "search_source", None),
         TypedToolClass::DynamicExternal
     );
     assert_eq!(
-        classify_typed_tool(
-            None,
-            "send_message",
-            collaboration_namespace,
-            task_namespace,
-        ),
+        classify_typed_tool(None, "send_message", collaboration_namespace),
         TypedToolClass::Unknown
     );
     assert_eq!(
-        classify_typed_tool(None, "Apply_Patch", None, None),
+        classify_typed_tool(None, "Apply_Patch", None),
         TypedToolClass::Unknown
     );
 }

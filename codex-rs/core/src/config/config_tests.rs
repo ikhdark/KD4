@@ -10312,7 +10312,7 @@ usage_hint_text = "Custom delegation guidance."
 root_agent_usage_hint_text = "Root guidance."
 subagent_usage_hint_text = "Subagent guidance."
 multi_agent_mode_hint_text = "Custom mode guidance."
-tool_namespace = "agents"
+tool_namespace = "collaboration"
 hide_spawn_agent_metadata = true
 non_code_mode_only = true
 "#,

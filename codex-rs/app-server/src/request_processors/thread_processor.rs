@@ -236,6 +236,7 @@ fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
         "api_tool",
         "browser",
         "computer",
+        "collaboration",
         "container",
         "file_search",
         "functions",

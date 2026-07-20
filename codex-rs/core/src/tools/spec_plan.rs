@@ -103,8 +103,6 @@ use tracing::instrument;
 use tracing::warn;
 
 const MULTI_AGENT_V2_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
-const RESERVED_COLLABORATION_NAMESPACE: &str = "collaboration";
-const MULTI_AGENT_V2_TASK_TOOL_NAMESPACE: &str = "agent_tasks";
 const IMAGE_GEN_NAMESPACE: &str = "image_gen";
 const IMAGEGEN_TOOL_NAME: &str = "imagegen";
 
@@ -830,7 +828,6 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
             let tool_namespace = namespace_tools_enabled(turn_context)
                 .then_some(turn_context.config.multi_agent_v2.tool_namespace.as_deref())
                 .flatten();
-            let task_tool_namespace = multi_agent_v2_task_tool_namespace(tool_namespace);
             let agent_type_description =
                 agent_type_description(turn_context, context.default_agent_type_description);
             planned_tools.add_arc(override_tool_exposure(
@@ -872,29 +869,29 @@ fn add_collaboration_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mu
                 exposure,
             ));
             planned_tools.add_arc(override_tool_exposure(
-                multi_agent_v2_handler(GetAgentTaskHandler, task_tool_namespace),
+                multi_agent_v2_handler(GetAgentTaskHandler, tool_namespace),
                 exposure,
             ));
             planned_tools.add_arc(override_tool_exposure(
-                multi_agent_v2_handler(SetAgentGateHandler, task_tool_namespace),
+                multi_agent_v2_handler(SetAgentGateHandler, tool_namespace),
                 exposure,
             ));
             if turn_context.session_source.is_non_root_agent() {
                 planned_tools.add_arc(override_tool_exposure(
-                    multi_agent_v2_handler(SubmitAgentReceiptHandler, task_tool_namespace),
+                    multi_agent_v2_handler(SubmitAgentReceiptHandler, tool_namespace),
                     exposure,
                 ));
             } else {
                 planned_tools.add_arc(override_tool_exposure(
-                    multi_agent_v2_handler(AmendAgentTaskHandler, task_tool_namespace),
+                    multi_agent_v2_handler(AmendAgentTaskHandler, tool_namespace),
                     exposure,
                 ));
                 planned_tools.add_arc(override_tool_exposure(
-                    multi_agent_v2_handler(WaiveAgentGateHandler, task_tool_namespace),
+                    multi_agent_v2_handler(WaiveAgentGateHandler, tool_namespace),
                     exposure,
                 ));
                 planned_tools.add_arc(override_tool_exposure(
-                    multi_agent_v2_handler(AbandonAgentTaskHandler, task_tool_namespace),
+                    multi_agent_v2_handler(AbandonAgentTaskHandler, tool_namespace),
                     exposure,
                 ));
             }
@@ -1098,15 +1095,6 @@ fn append_extension_tool_executors(
             continue;
         }
         planned_tools.add(ExtensionToolAdapter::new(executor));
-    }
-}
-
-pub(crate) fn multi_agent_v2_task_tool_namespace(
-    collaboration_namespace: Option<&str>,
-) -> Option<&str> {
-    match collaboration_namespace {
-        Some(RESERVED_COLLABORATION_NAMESPACE) => Some(MULTI_AGENT_V2_TASK_TOOL_NAMESPACE),
-        namespace => namespace,
     }
 }
 
