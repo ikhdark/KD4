@@ -15,6 +15,7 @@ use crate::tools::registry::AnyToolResult;
 use crate::tools::registry::ToolArgumentDiffConsumer;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::spec_plan::build_tool_router;
+use crate::tools::spec_plan::multi_agent_v2_task_tool_namespace;
 use codex_agent_task_store::AttemptState;
 use codex_git_utils::get_git_repo_root;
 use codex_mcp::ToolInfo;
@@ -352,14 +353,24 @@ async fn authorize_bound_typed_tool_call(
     let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
     let collaboration_namespace = step_context
         .turn
-        .config
-        .multi_agent_v2
-        .tool_namespace
-        .as_deref();
+        .provider
+        .capabilities()
+        .namespace_tools
+        .then_some(
+            step_context
+                .turn
+                .config
+                .multi_agent_v2
+                .tool_namespace
+                .as_deref(),
+        )
+        .flatten();
+    let task_namespace = multi_agent_v2_task_tool_namespace(collaboration_namespace);
     let class = classify_typed_tool(
         call.tool_name.namespace.as_deref(),
         &call.tool_name.name,
         collaboration_namespace,
+        task_namespace,
     );
     let authorization = authorize_typed_tool(
         &task.assignment,

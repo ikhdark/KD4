@@ -181,25 +181,49 @@ pub(crate) fn build_cold_review_context(
 
 /// Classifies a tool name without trusting an arbitrary namespace to impersonate a core tool.
 ///
-/// MultiAgentV2's collaboration namespace is configurable, so callers must pass the namespace
-/// selected for the active turn. Any other namespace is external. When collaboration tools are
-/// unnamespaced, pass `None` for both namespace arguments.
+/// MultiAgentV2's collaboration and task namespaces are configurable, so callers must pass the
+/// namespaces selected for the active turn. Any other namespace is external. When these tools are
+/// unnamespaced, pass `None` for all namespace arguments.
 pub(crate) fn classify_typed_tool(
     namespace: Option<&str>,
     name: &str,
     collaboration_namespace: Option<&str>,
+    task_namespace: Option<&str>,
 ) -> TypedToolClass {
     if let Some(namespace) = namespace {
-        if namespace.is_empty() || collaboration_namespace != Some(namespace) {
+        if namespace.is_empty() {
             return TypedToolClass::DynamicExternal;
         }
-        return classify_collaboration_tool(name);
+        let mut matched_internal_namespace = false;
+        if collaboration_namespace == Some(namespace) {
+            matched_internal_namespace = true;
+            let class = classify_collaboration_tool(name);
+            if class != TypedToolClass::Unknown {
+                return class;
+            }
+        }
+        if task_namespace == Some(namespace) {
+            matched_internal_namespace = true;
+            let class = classify_task_tool(name);
+            if class != TypedToolClass::Unknown {
+                return class;
+            }
+        }
+        return if matched_internal_namespace {
+            TypedToolClass::Unknown
+        } else {
+            TypedToolClass::DynamicExternal
+        };
     }
 
-    if collaboration_namespace.is_none() {
+    if collaboration_namespace.is_none() && task_namespace.is_none() {
         let collaboration_class = classify_collaboration_tool(name);
         if collaboration_class != TypedToolClass::Unknown {
             return collaboration_class;
+        }
+        let task_class = classify_task_tool(name);
+        if task_class != TypedToolClass::Unknown {
+            return task_class;
         }
     }
     if matches_name(
@@ -352,20 +376,28 @@ fn classify_collaboration_tool(name: &str) -> TypedToolClass {
         TypedToolClass::AgentCommunication
     } else if matches_name(
         name,
-        &["get_agent_task", "submit_agent_receipt", "set_agent_gate"],
-    ) {
-        TypedToolClass::OwnTask
-    } else if matches_name(
-        name,
         &[
             "spawn_agent",
             "send_input",
             "followup_task",
             "interrupt_agent",
-            "amend_agent_task",
-            "waive_agent_gate",
-            "abandon_agent_task",
         ],
+    ) {
+        TypedToolClass::RootTaskControl
+    } else {
+        TypedToolClass::Unknown
+    }
+}
+
+fn classify_task_tool(name: &str) -> TypedToolClass {
+    if matches_name(
+        name,
+        &["get_agent_task", "submit_agent_receipt", "set_agent_gate"],
+    ) {
+        TypedToolClass::OwnTask
+    } else if matches_name(
+        name,
+        &["amend_agent_task", "waive_agent_gate", "abandon_agent_task"],
     ) {
         TypedToolClass::RootTaskControl
     } else {
