@@ -78,6 +78,8 @@ pub(crate) const REALTIME_USER_TEXT_PREFIX: &str = "[USER] ";
 pub(crate) const REALTIME_BACKEND_TEXT_PREFIX: &str = "[BACKEND] ";
 const REALTIME_V2_HANDOFF_COMPLETE_ACKNOWLEDGEMENT: &str =
     "Background agent finished. Use the preceding [BACKEND] messages as the result.";
+const REALTIME_V2_HANDOFF_ABORTED_ACKNOWLEDGEMENT: &str =
+    "Background agent stopped before it finished.";
 const REALTIME_V2_STEER_ACKNOWLEDGEMENT: &str =
     "This was sent to steer the previous background agent task.";
 const REALTIME_ACTIVE_RESPONSE_ERROR_PREFIX: &str =
@@ -124,6 +126,7 @@ enum RealtimeOutbound {
     HandoffUpdate { handoff_id: String, text: String },
     HandoffAppend { handoff_id: String, text: String },
     CompletedHandoff { handoff_id: String, text: String },
+    AbortedHandoff { handoff_id: String },
     ConversationItem { text: String },
     HandoffCompleteAck { handoff_id: String },
 }
@@ -650,6 +653,36 @@ impl RealtimeConversationManager {
         handoff
             .output_tx
             .send(output)
+            .await
+            .map_err(|_| CodexErr::InvalidRequest("conversation is not running".to_string()))
+    }
+
+    pub(crate) async fn handoff_abort(&self) -> CodexResult<()> {
+        let handoff = {
+            let guard = self.state.lock().await;
+            guard.as_ref().map(|state| state.handoff.clone())
+        };
+        let Some(handoff) = handoff else {
+            return Ok(());
+        };
+
+        let handoff_id = {
+            let mut active_handoff = handoff.active_handoff.lock().await;
+            let mut last_output_text = handoff.last_output_text.lock().await;
+            let handoff_id = active_handoff.take();
+            *last_output_text = None;
+            handoff_id
+        };
+        if handoff.client_managed_handoffs || handoff.session_kind == RealtimeSessionKind::V1 {
+            return Ok(());
+        }
+
+        let Some(handoff_id) = handoff_id else {
+            return Ok(());
+        };
+        handoff
+            .output_tx
+            .send(RealtimeOutbound::AbortedHandoff { handoff_id })
             .await
             .map_err(|_| CodexErr::InvalidRequest("conversation is not running".to_string()))
     }
@@ -1485,6 +1518,7 @@ async fn handle_handoff_output(
                     .send_conversation_item_create(text, ConversationTextRole::Developer)
                     .await
             }
+            RealtimeOutbound::AbortedHandoff { .. } => Ok(()),
             RealtimeOutbound::HandoffCompleteAck { .. } => Ok(()),
         },
         RealtimeEventParser::RealtimeV2 => match handoff_output {
@@ -1536,6 +1570,21 @@ async fn handle_handoff_output(
                 writer
                     .send_conversation_item_create(text, ConversationTextRole::Developer)
                     .await
+            }
+            RealtimeOutbound::AbortedHandoff { handoff_id } => {
+                if let Err(err) = writer
+                    .send_conversation_function_call_output(
+                        handoff_id,
+                        REALTIME_V2_HANDOFF_ABORTED_ACKNOWLEDGEMENT.to_string(),
+                    )
+                    .await
+                {
+                    Err(err)
+                } else {
+                    return response_create_queue
+                        .request_create(writer, events_tx, "aborted handoff")
+                        .await;
+                }
             }
             RealtimeOutbound::HandoffCompleteAck { handoff_id } => {
                 writer

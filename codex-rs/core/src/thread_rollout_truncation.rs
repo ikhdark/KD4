@@ -33,12 +33,16 @@ fn rollout_item_is_user_turn_boundary(item: &RolloutItem) -> bool {
 /// A user message boundary is a `RolloutItem::ResponseItem(ResponseItem::Message { .. })`
 /// whose parsed turn item is `TurnItem::UserMessage`.
 ///
-/// Rollouts can contain `ThreadRolledBack` markers. Those markers indicate that the
-/// last N user turns were removed from the effective thread history; we apply them here so
-/// indexing uses the post-rollback history rather than the raw stream.
+/// Rollouts can contain `ThreadRolledBack` markers. Those markers remove instruction turns,
+/// including inter-agent instructions, so we track those boundaries separately from the real
+/// user-message positions returned by this function.
 pub(crate) fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize> {
+    let mut rollback_turn_positions = Vec::new();
     let mut user_positions = Vec::new();
     for (idx, item) in items.iter().enumerate() {
+        if is_rollback_instruction_turn_boundary(items, idx, item) {
+            rollback_turn_positions.push(idx);
+        }
         match item {
             RolloutItem::ResponseItem(item @ ResponseItem::Message { .. })
                 if matches!(
@@ -50,8 +54,12 @@ pub(crate) fn user_message_positions_in_rollout(items: &[RolloutItem]) -> Vec<us
             }
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
                 let num_turns = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
-                let new_len = user_positions.len().saturating_sub(num_turns);
-                user_positions.truncate(new_len);
+                if let Some(rollback_start_idx) = apply_rollback_to_instruction_turn_positions(
+                    &mut rollback_turn_positions,
+                    num_turns,
+                ) {
+                    user_positions.retain(|position| *position < rollback_start_idx);
+                }
             }
             _ => {}
         }
@@ -74,55 +82,77 @@ pub(crate) fn fork_turn_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize
     let mut rollback_turn_positions = Vec::new();
     let mut fork_turn_positions = Vec::new();
     for (idx, item) in items.iter().enumerate() {
+        if is_rollback_instruction_turn_boundary(items, idx, item) {
+            rollback_turn_positions.push(idx);
+        }
         match item {
             RolloutItem::ResponseItem(item) => {
-                let has_delivery_metadata = matches!(item, ResponseItem::AgentMessage { .. })
-                    && idx.checked_sub(1).is_some_and(|previous_idx| {
-                        matches!(
-                            items.get(previous_idx),
-                            Some(RolloutItem::InterAgentCommunicationMetadata { .. })
-                        )
-                    });
-                if is_user_turn_boundary(item) && !has_delivery_metadata {
-                    rollback_turn_positions.push(idx);
-                }
                 if is_real_user_message_boundary(item) || is_trigger_turn_boundary(item) {
                     fork_turn_positions.push(idx);
                 }
             }
             RolloutItem::InterAgentCommunication(communication) => {
-                rollback_turn_positions.push(idx);
                 if communication.trigger_turn {
                     fork_turn_positions.push(idx);
                 }
             }
             RolloutItem::InterAgentCommunicationMetadata { trigger_turn } => {
-                rollback_turn_positions.push(idx);
                 if *trigger_turn {
                     fork_turn_positions.push(idx);
                 }
             }
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
                 let num_turns = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);
-                if num_turns == 0 {
-                    continue;
+                if let Some(rollback_start_idx) = apply_rollback_to_instruction_turn_positions(
+                    &mut rollback_turn_positions,
+                    num_turns,
+                ) {
+                    fork_turn_positions.retain(|position| *position < rollback_start_idx);
                 }
-                let Some(rollback_start_idx) = rollback_turn_positions
-                    .len()
-                    .checked_sub(num_turns)
-                    .map(|rollback_start| rollback_turn_positions[rollback_start])
-                    .or_else(|| rollback_turn_positions.first().copied())
-                else {
-                    continue;
-                };
-                let new_rollback_len = rollback_turn_positions.len().saturating_sub(num_turns);
-                rollback_turn_positions.truncate(new_rollback_len);
-                fork_turn_positions.retain(|position| *position < rollback_start_idx);
             }
             _ => {}
         }
     }
     fork_turn_positions
+}
+
+fn is_rollback_instruction_turn_boundary(
+    items: &[RolloutItem],
+    idx: usize,
+    item: &RolloutItem,
+) -> bool {
+    match item {
+        RolloutItem::ResponseItem(item) => {
+            let has_delivery_metadata = matches!(item, ResponseItem::AgentMessage { .. })
+                && idx.checked_sub(1).is_some_and(|previous_idx| {
+                    matches!(
+                        items.get(previous_idx),
+                        Some(RolloutItem::InterAgentCommunicationMetadata { .. })
+                    )
+                });
+            is_user_turn_boundary(item) && !has_delivery_metadata
+        }
+        RolloutItem::InterAgentCommunication(_)
+        | RolloutItem::InterAgentCommunicationMetadata { .. } => true,
+        _ => false,
+    }
+}
+
+fn apply_rollback_to_instruction_turn_positions(
+    rollback_turn_positions: &mut Vec<usize>,
+    num_turns: usize,
+) -> Option<usize> {
+    if num_turns == 0 {
+        return None;
+    }
+    let rollback_start_idx = rollback_turn_positions
+        .len()
+        .checked_sub(num_turns)
+        .map(|rollback_start| rollback_turn_positions[rollback_start])
+        .or_else(|| rollback_turn_positions.first().copied())?;
+    let new_len = rollback_turn_positions.len().saturating_sub(num_turns);
+    rollback_turn_positions.truncate(new_len);
+    Some(rollback_start_idx)
 }
 
 /// Return a prefix of `items` obtained by cutting strictly before the nth user message.

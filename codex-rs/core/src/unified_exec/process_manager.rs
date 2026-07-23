@@ -41,6 +41,7 @@ use crate::unified_exec::MAX_YIELD_TIME_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::unified_exec::MIN_YIELD_TIME_MS;
 use crate::unified_exec::ProcessEntry;
+use crate::unified_exec::ProcessIdReservation;
 use crate::unified_exec::ProcessStore;
 use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
@@ -279,7 +280,7 @@ async fn finish_deferred_network_approval_for_session(
 
 fn network_approval_error_message(err: ToolError) -> String {
     match err {
-        ToolError::Rejected(message) => message,
+        ToolError::Denied(message) | ToolError::Rejected(message) => message,
         ToolError::Codex(err) => err.to_string(),
     }
 }
@@ -397,7 +398,7 @@ impl UnifiedExecProcessManager {
         build_unified_exec_environment(context).0
     }
 
-    pub(crate) async fn allocate_process_id(&self) -> i32 {
+    async fn allocate_process_id_value(&self) -> i32 {
         loop {
             let mut store = self.process_store.lock().await;
 
@@ -424,6 +425,27 @@ impl UnifiedExecProcessManager {
         }
     }
 
+    pub(crate) async fn reserve_process_id(&self) -> ProcessIdReservation {
+        let process_id = self.allocate_process_id_value().await;
+        let (transfer_sender, transfer_receiver) = tokio::sync::oneshot::channel();
+        let process_store = Arc::clone(&self.process_store);
+        tokio::spawn(async move {
+            if transfer_receiver.await.is_err() {
+                process_store
+                    .lock()
+                    .await
+                    .reserved_process_ids
+                    .remove(&process_id);
+            }
+        });
+        ProcessIdReservation::new(process_id, transfer_sender)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn allocate_process_id(&self) -> i32 {
+        self.allocate_process_id_value().await
+    }
+
     pub(crate) async fn release_process_id(&self, process_id: i32) {
         let removed = {
             let mut store = self.process_store.lock().await;
@@ -437,8 +459,10 @@ impl UnifiedExecProcessManager {
     pub(crate) async fn exec_command(
         &self,
         request: ExecCommandRequest,
+        mut process_id_reservation: ProcessIdReservation,
         context: &UnifiedExecContext,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
+        debug_assert_eq!(request.process_id, process_id_reservation.process_id());
         let cwd = request.cwd.clone();
         let executor_readiness_timing_guard = context
             .turn
@@ -501,6 +525,7 @@ impl UnifiedExecProcessManager {
                 request.turn_environment.environment_id.clone(),
                 start,
                 request.process_id,
+                &mut process_id_reservation,
                 request.tty,
                 request.attempt_key.clone(),
                 request.raw_output_artifact.clone(),
@@ -686,6 +711,19 @@ impl UnifiedExecProcessManager {
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let process_id = request.process_id;
 
+        // Different terminal sessions can be polled concurrently, but reads and
+        // writes against one terminal must not overlap because they share a
+        // draining output buffer and process lifecycle.
+        let locked_process = {
+            let store = self.process_store.lock().await;
+            let entry = store
+                .processes
+                .get(&process_id)
+                .ok_or(UnifiedExecError::UnknownProcessId { process_id })?;
+            Arc::clone(&entry.process)
+        };
+        let _interaction_guard = locked_process.interaction_lock().lock_owned().await;
+
         let PreparedProcessHandles {
             process,
             output_buffer,
@@ -701,7 +739,9 @@ impl UnifiedExecProcessManager {
             process_id,
             tty,
             ..
-        } = self.prepare_process_handles(process_id).await?;
+        } = self
+            .prepare_process_handles(process_id, &locked_process)
+            .await?;
         let mut status_after_write = None;
 
         if !request.input.is_empty() {
@@ -866,12 +906,16 @@ impl UnifiedExecProcessManager {
     async fn prepare_process_handles(
         &self,
         process_id: i32,
+        expected_process: &Arc<UnifiedExecProcess>,
     ) -> Result<PreparedProcessHandles, UnifiedExecError> {
         let mut store = self.process_store.lock().await;
         let entry = store
             .processes
             .get_mut(&process_id)
             .ok_or(UnifiedExecError::UnknownProcessId { process_id })?;
+        if !Arc::ptr_eq(&entry.process, expected_process) {
+            return Err(UnifiedExecError::UnknownProcessId { process_id });
+        }
         entry.last_used = Instant::now();
         let OutputHandles {
             output_buffer,
@@ -914,6 +958,7 @@ impl UnifiedExecProcessManager {
         environment_id: String,
         started_at: Instant,
         process_id: i32,
+        process_id_reservation: &mut ProcessIdReservation,
         tty: bool,
         attempt_key: crate::tools::command_execution::CommandAttemptKey,
         raw_output_artifact: crate::tools::command_output_artifact::RawOutputArtifact,
@@ -937,6 +982,7 @@ impl UnifiedExecProcessManager {
             let mut store = self.process_store.lock().await;
             let pruned_entry = Self::prune_processes_if_needed(&mut store);
             store.processes.insert(process_id, entry);
+            process_id_reservation.transfer_to_store();
             pruned_entry
         };
         // prune_processes_if_needed runs while holding process_store; do async
@@ -1282,7 +1328,6 @@ impl UnifiedExecProcessManager {
         const POST_EXIT_CLOSE_WAIT_CAP: Duration = Duration::from_millis(50);
 
         let mut collected: Vec<u8> = Vec::with_capacity(4096);
-        let mut omitted_bytes = 0_usize;
         let mut lagged_chunks = 0_u64;
         let mut exit_signal_received = cancellation_token.is_cancelled();
         let mut post_exit_deadline: Option<Instant> = None;
@@ -1299,8 +1344,10 @@ impl UnifiedExecProcessManager {
             let mut wait_for_output = None;
             {
                 let mut guard = output_buffer.lock().await;
-                drained_chunks = guard.drain_chunks();
                 drained_omitted_bytes = guard.take_unreported_omitted_bytes();
+                let omission_marker = (drained_omitted_bytes > 0)
+                    .then(|| omitted_output_marker(drained_omitted_bytes));
+                drained_chunks = guard.drain_chunks_with_omission_marker(omission_marker);
                 drained_lagged_chunks = guard.take_unreported_lagged_chunks();
                 if drained_chunks.is_empty()
                     && drained_omitted_bytes == 0
@@ -1309,7 +1356,6 @@ impl UnifiedExecProcessManager {
                     wait_for_output = Some(output_notify.notified());
                 }
             }
-            omitted_bytes = omitted_bytes.saturating_add(drained_omitted_bytes);
             lagged_chunks = lagged_chunks.saturating_add(drained_lagged_chunks);
 
             if drained_chunks.is_empty() && drained_omitted_bytes == 0 && drained_lagged_chunks == 0
@@ -1368,9 +1414,6 @@ impl UnifiedExecProcessManager {
             }
         }
 
-        if omitted_bytes > 0 {
-            collected.extend_from_slice(&omitted_output_marker(omitted_bytes));
-        }
         if lagged_chunks > 0 {
             collected.extend_from_slice(&lagged_output_marker(lagged_chunks));
         }
@@ -1418,14 +1461,23 @@ impl UnifiedExecProcessManager {
             return None;
         }
 
-        let meta: Vec<(i32, Instant, bool)> = store
+        let mut meta: Vec<(i32, Instant, bool)> = store
             .processes
             .iter()
             .map(|(id, entry)| (*id, entry.last_used, entry.process.has_exited()))
             .collect();
 
-        if let Some(process_id) = Self::process_id_to_prune_from_meta(&meta) {
-            return store.remove(process_id);
+        while let Some(process_id) = Self::process_id_to_prune_from_meta(&meta) {
+            // Do not prune a process while write_stdin owns its interaction lock.
+            if let Some(interaction_lock) = store
+                .processes
+                .get(&process_id)
+                .map(|entry| entry.process.interaction_lock())
+                && let Ok(_interaction_guard) = interaction_lock.try_lock_owned()
+            {
+                return store.remove(process_id);
+            }
+            meta.retain(|(id, _, _)| *id != process_id);
         }
 
         None

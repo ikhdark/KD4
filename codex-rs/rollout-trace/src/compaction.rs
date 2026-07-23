@@ -94,6 +94,14 @@ impl CompactionTraceContext {
         }
     }
 
+    /// Returns whether compaction trace payloads will be recorded.
+    ///
+    /// Callers should branch on this only when preparing a checkpoint payload
+    /// would otherwise require cloning history that the request path still owns.
+    pub fn is_enabled(&self) -> bool {
+        matches!(self.state, CompactionTraceContextState::Enabled(_))
+    }
+
     /// Builds an enabled context for upstream attempts that compute one checkpoint.
     pub fn enabled(
         writer: Arc<TraceWriter>,

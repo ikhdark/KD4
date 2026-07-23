@@ -357,6 +357,54 @@ async fn process_compacted_history_reinjects_full_initial_context() {
 }
 
 #[tokio::test]
+async fn process_compacted_history_restates_custom_realtime_start_for_active_reference() {
+    let (session, mut turn_context) = crate::session::tests::make_session_and_context().await;
+    let custom_instructions = "custom realtime replacement policy";
+    turn_context.realtime_active = true;
+    Arc::make_mut(&mut turn_context.config).experimental_realtime_start_instructions =
+        Some(custom_instructions.to_string());
+    session
+        .replace_history(Vec::new(), Some(turn_context.to_turn_context_item()))
+        .await;
+    let turn_context = Arc::new(turn_context);
+    let world_state = Arc::new(build_world_state_from_turn_context(&session, &turn_context).await);
+    let initial_context_injection = InitialContextInjection::BeforeLastUserMessage(world_state);
+
+    let (refreshed, _) = crate::compact_remote::process_compacted_history(
+        &session,
+        &turn_context,
+        vec![user_message("summary")],
+        &initial_context_injection,
+    )
+    .await;
+    let developer_text = refreshed
+        .iter()
+        .filter_map(|item| match item {
+            ResponseItem::Message { role, content, .. } if role == "developer" => {
+                Some(content.as_slice())
+            }
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|item| match item {
+            ContentItem::InputText { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert_eq!(
+        developer_text.matches("<realtime_conversation>").count(),
+        1,
+        "expected exactly one realtime start block after compaction, got {developer_text:?}"
+    );
+    assert!(
+        developer_text.contains(custom_instructions),
+        "expected custom realtime instructions after compaction, got {developer_text:?}"
+    );
+}
+
+#[tokio::test]
 async fn process_compacted_history_drops_non_user_content_messages() {
     let compacted_history = vec![
         ResponseItem::Message {

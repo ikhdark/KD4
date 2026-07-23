@@ -295,7 +295,7 @@ impl ToolOutput for AbortedToolOutput {
         match payload {
             ToolPayload::ToolSearch { .. } => ResponseInputItem::ToolSearchOutput {
                 call_id: call_id.to_string(),
-                status: "completed".to_string(),
+                status: "incomplete".to_string(),
                 execution: "client".to_string(),
                 tools: Vec::new(),
             },
@@ -459,16 +459,19 @@ impl ExecCommandToolOutput {
 
     fn model_output(&self, max_tokens: usize) -> String {
         let raw = String::from_utf8_lossy(&self.raw_output);
-        let summarized = summarize_shell_output_for_model(
-            raw.as_ref(),
-            self.exit_code.unwrap_or_default(),
-            /*timed_out*/ self.process_id.is_some(),
-            ShellOutputSummaryOptions {
-                enabled: true,
-                turn_cost_guard: false,
-                command_text: self.hook_command.as_deref(),
-            },
-        );
+        let summarized = match (self.process_id, self.exit_code) {
+            (None, Some(exit_code)) => summarize_shell_output_for_model(
+                raw.as_ref(),
+                exit_code,
+                /*timed_out*/ false,
+                ShellOutputSummaryOptions {
+                    enabled: true,
+                    turn_cost_guard: false,
+                    command_text: self.hook_command.as_deref(),
+                },
+            ),
+            _ => None,
+        };
         let content = summarized.as_deref().unwrap_or(raw.as_ref());
         formatted_truncate_text(content, TruncationPolicy::Tokens(max_tokens))
     }

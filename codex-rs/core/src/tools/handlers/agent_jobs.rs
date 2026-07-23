@@ -1,3 +1,4 @@
+use crate::agent::control::AgentJobBinding;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::role::AgentRoleModelLocks;
 use crate::agent::status::is_final;
@@ -30,6 +31,8 @@ use tokio::sync::watch::Receiver;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use uuid::Uuid;
 
 mod report_agent_job_result;
@@ -42,6 +45,20 @@ const DEFAULT_AGENT_JOB_CONCURRENCY: usize = 16;
 const MAX_AGENT_JOB_CONCURRENCY: usize = 64;
 const STATUS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_AGENT_JOB_ITEM_TIMEOUT: Duration = Duration::from_secs(60 * 30);
+const PARENT_TOOL_CANCELLATION_REASON: &str = "cancelled by parent tool request";
+const MAX_SCHEMA_VALIDATION_ERRORS: usize = 5;
+const AGENT_JOB_OUTPUT_COLUMNS: [&str; 10] = [
+    "job_id",
+    "item_id",
+    "row_index",
+    "source_id",
+    "status",
+    "attempt_count",
+    "last_error",
+    "result_json",
+    "reported_at",
+    "completed_at",
+];
 
 #[derive(Debug, Deserialize)]
 struct SpawnAgentsOnCsvArgs {
@@ -173,17 +190,108 @@ fn normalize_max_runtime_seconds(requested: Option<u64>) -> Result<Option<u64>, 
     Ok(Some(requested))
 }
 
+fn validate_agent_job_output_schema(schema: &Value) -> Result<(), FunctionCallError> {
+    if !schema.is_object() {
+        return Err(FunctionCallError::RespondToModel(
+            "output_schema must be a JSON Schema object".to_string(),
+        ));
+    }
+    jsonschema::meta::validate(schema).map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "output_schema is not a valid JSON Schema: {error}"
+        ))
+    })?;
+    let root_allows_object = match schema.get("type") {
+        None => true,
+        Some(Value::String(schema_type)) => schema_type == "object",
+        Some(Value::Array(schema_types)) => schema_types
+            .iter()
+            .any(|schema_type| schema_type.as_str() == Some("object")),
+        Some(_) => false,
+    };
+    if !root_allows_object {
+        return Err(FunctionCallError::RespondToModel(
+            "output_schema root type must allow JSON object results".to_string(),
+        ));
+    }
+    jsonschema::validator_for(schema).map_err(|error| {
+        FunctionCallError::RespondToModel(format!("output_schema could not be compiled: {error}"))
+    })?;
+    Ok(())
+}
+
+fn validate_agent_job_result(schema: &Value, result: &Value) -> Result<(), FunctionCallError> {
+    let validator = jsonschema::validator_for(schema).map_err(|error| {
+        FunctionCallError::Fatal(format!(
+            "stored agent job output_schema could not be compiled: {error}"
+        ))
+    })?;
+    let mut errors = validator.iter_errors(result);
+    let mut messages = Vec::new();
+    for error in errors.by_ref().take(MAX_SCHEMA_VALIDATION_ERRORS) {
+        let pointer = error.instance_path().as_str();
+        let path = if pointer.is_empty() {
+            "$".to_string()
+        } else {
+            format!("${pointer}")
+        };
+        messages.push(format!("{path}: {error}"));
+    }
+    if messages.is_empty() {
+        return Ok(());
+    }
+    if errors.next().is_some() {
+        messages.push("additional validation errors omitted".to_string());
+    }
+    Err(FunctionCallError::RespondToModel(format!(
+        "result does not match output_schema: {}",
+        messages.join("; ")
+    )))
+}
+
+async fn observe_parent_job_cancellation(
+    cancellation_token: &CancellationToken,
+    db: &codex_state::StateRuntime,
+    job_id: &str,
+) -> anyhow::Result<bool> {
+    if !cancellation_token.is_cancelled() {
+        return Ok(false);
+    }
+    db.mark_agent_job_cancelled(job_id, PARENT_TOOL_CANCELLATION_REASON)
+        .await?;
+    Ok(true)
+}
+
 async fn run_agent_job_loop(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
     db: Arc<codex_state::StateRuntime>,
     job_id: String,
     options: JobRunnerOptions,
+    cancellation_token: CancellationToken,
 ) -> anyhow::Result<()> {
     let job = db
         .get_agent_job(job_id.as_str())
         .await?
         .ok_or_else(|| anyhow::anyhow!("agent job {job_id} was not found"))?;
+    let _cancellation_observer = AbortOnDropHandle::new(tokio::spawn({
+        let cancellation_token = cancellation_token.clone();
+        let db = db.clone();
+        let job_id = job_id.clone();
+        async move {
+            cancellation_token.cancelled().await;
+            if let Err(error) = db
+                .mark_agent_job_cancelled(job_id.as_str(), PARENT_TOOL_CANCELLATION_REASON)
+                .await
+            {
+                tracing::warn!(
+                    %job_id,
+                    %error,
+                    "failed to persist parent cancellation for agent job"
+                );
+            }
+        }
+    }));
     let runtime_timeout = job_runtime_timeout(&job);
     let mut active_items: HashMap<ThreadId, ActiveJobItem> = HashMap::new();
     recover_running_items(
@@ -199,8 +307,18 @@ async fn run_agent_job_loop(
     loop {
         let mut progressed = false;
 
+        if observe_parent_job_cancellation(&cancellation_token, db.as_ref(), job_id.as_str())
+            .await?
+        {
+            cancel_requested = true;
+        }
+
         if !cancel_requested && db.is_agent_job_cancelled(job_id.as_str()).await? {
             cancel_requested = true;
+        }
+
+        if cancel_requested {
+            break;
         }
 
         if !cancel_requested && active_items.len() < options.max_concurrency {
@@ -213,6 +331,20 @@ async fn run_agent_job_loop(
                 )
                 .await?;
             for item in pending_items {
+                if observe_parent_job_cancellation(
+                    &cancellation_token,
+                    db.as_ref(),
+                    job_id.as_str(),
+                )
+                .await?
+                {
+                    cancel_requested = true;
+                    break;
+                }
+                if db.is_agent_job_cancelled(job_id.as_str()).await? {
+                    cancel_requested = true;
+                    break;
+                }
                 let prompt = build_worker_prompt(&job, &item)?;
                 let items = vec![UserInput::Text {
                     text: prompt,
@@ -230,6 +362,11 @@ async fn run_agent_job_loop(
                         SpawnAgentOptions {
                             parent_thread_id: Some(session.thread_id),
                             environments: Some(turn.environments.to_selections()),
+                            agent_job_binding: Some(AgentJobBinding {
+                                state_db: db.clone(),
+                                job_id: job_id.clone(),
+                                item_id: item.item_id.clone(),
+                            }),
                             ..Default::default()
                         },
                     )
@@ -237,41 +374,51 @@ async fn run_agent_job_loop(
                 {
                     Ok(spawned_agent) => spawned_agent.thread_id,
                     Err(CodexErr::AgentLimitReached { .. }) => {
-                        db.mark_agent_job_item_pending(
+                        if observe_parent_job_cancellation(
+                            &cancellation_token,
+                            db.as_ref(),
                             job_id.as_str(),
-                            item.item_id.as_str(),
-                            /*error_message*/ None,
                         )
-                        .await?;
+                        .await?
+                        {
+                            cancel_requested = true;
+                            break;
+                        }
                         break;
                     }
                     Err(err) => {
                         let error_message = format!("failed to spawn worker: {err}");
-                        db.mark_agent_job_item_failed(
+                        let job_cancelled = observe_parent_job_cancellation(
+                            &cancellation_token,
+                            db.as_ref(),
                             job_id.as_str(),
-                            item.item_id.as_str(),
-                            error_message.as_str(),
                         )
-                        .await?;
+                        .await?
+                            || db.is_agent_job_cancelled(job_id.as_str()).await?;
+                        if job_cancelled {
+                            cancel_requested = true;
+                            break;
+                        }
+                        let marked_failed = db
+                            .mark_agent_job_item_spawn_failed(
+                                job_id.as_str(),
+                                item.item_id.as_str(),
+                                error_message.as_str(),
+                            )
+                            .await?;
+                        if !marked_failed {
+                            if db.is_agent_job_cancelled(job_id.as_str()).await? {
+                                cancel_requested = true;
+                                break;
+                            }
+                            return Err(anyhow::anyhow!(
+                                "{error_message}; item was no longer pending or bound to the worker"
+                            ));
+                        }
                         progressed = true;
                         continue;
                     }
                 };
-                let assigned = db
-                    .mark_agent_job_item_running_with_thread(
-                        job_id.as_str(),
-                        item.item_id.as_str(),
-                        thread_id.to_string().as_str(),
-                    )
-                    .await?;
-                if !assigned {
-                    let _ = session
-                        .services
-                        .agent_control
-                        .shutdown_live_agent(thread_id)
-                        .await;
-                    continue;
-                }
                 active_items.insert(
                     thread_id,
                     ActiveJobItem {
@@ -286,7 +433,22 @@ async fn run_agent_job_loop(
                     },
                 );
                 progressed = true;
+                if observe_parent_job_cancellation(
+                    &cancellation_token,
+                    db.as_ref(),
+                    job_id.as_str(),
+                )
+                .await?
+                    || db.is_agent_job_cancelled(job_id.as_str()).await?
+                {
+                    cancel_requested = true;
+                    break;
+                }
             }
+        }
+
+        if cancel_requested {
+            break;
         }
 
         if reap_stale_active_items(
@@ -301,16 +463,10 @@ async fn run_agent_job_loop(
             progressed = true;
         }
 
-        let finished = find_finished_threads(session.clone(), &active_items).await;
+        let finished = find_finished_threads(session.clone(), &mut active_items).await;
         if finished.is_empty() {
             let progress = db.get_agent_job_progress(job_id.as_str()).await?;
-            if cancel_requested {
-                if progress.running_items == 0 && active_items.is_empty() {
-                    break;
-                }
-            } else if progress.pending_items == 0
-                && progress.running_items == 0
-                && active_items.is_empty()
+            if progress.pending_items == 0 && progress.running_items == 0 && active_items.is_empty()
             {
                 break;
             }
@@ -333,14 +489,49 @@ async fn run_agent_job_loop(
         }
     }
 
-    if let Err(err) = export_job_csv_snapshot(db.clone(), &job).await {
-        let message = format!("auto-export failed: {err}");
+    if observe_parent_job_cancellation(&cancellation_token, db.as_ref(), job_id.as_str()).await? {
+        cancel_requested = true;
+    }
+    if !cancel_requested && db.is_agent_job_cancelled(job_id.as_str()).await? {
+        cancel_requested = true;
+    }
+
+    let cleanup_error = if cancel_requested {
+        terminate_agent_job_workers(
+            session.clone(),
+            db.clone(),
+            job_id.as_str(),
+            &mut active_items,
+            "job cancelled before worker completion",
+        )
+        .await
+        .err()
+    } else {
+        None
+    };
+    let export_error = export_job_csv_snapshot(db.clone(), &job).await.err();
+    if let Some(cleanup_error) = cleanup_error {
+        if let Some(export_error) = export_error {
+            return Err(anyhow::anyhow!(
+                "failed to terminate workers for agent job {job_id}: {cleanup_error}; final export also failed: {export_error}"
+            ));
+        }
+        return Err(anyhow::anyhow!(
+            "failed to terminate workers for agent job {job_id}: {cleanup_error}"
+        ));
+    }
+    if let Some(export_error) = export_error {
+        if cancel_requested {
+            return Err(anyhow::anyhow!(
+                "failed to export cancelled agent job {job_id}: {export_error}"
+            ));
+        }
+        let message = format!("auto-export failed: {export_error}");
         db.mark_agent_job_failed(job_id.as_str(), message.as_str())
             .await?;
         return Ok(());
     }
-    let cancelled = cancel_requested || db.is_agent_job_cancelled(job_id.as_str()).await?;
-    if cancelled {
+    if cancel_requested {
         return Ok(());
     }
     db.mark_agent_job_completed(job_id.as_str()).await?;
@@ -357,10 +548,17 @@ async fn export_job_csv_snapshot(
     let csv_content = render_job_csv(job.input_headers.as_slice(), items.as_slice())
         .map_err(|err| anyhow::anyhow!("failed to render job csv for auto-export: {err}"))?;
     let output_path = PathBuf::from(job.output_csv_path.clone());
-    if let Some(parent) = output_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    tokio::fs::write(&output_path, csv_content).await?;
+    write_job_csv_atomically(output_path, csv_content).await?;
+    Ok(())
+}
+
+async fn write_job_csv_atomically(output_path: PathBuf, csv_content: String) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let write_paths = crate::path_utils::resolve_symlink_write_paths(&output_path)?;
+        crate::path_utils::write_atomically(&write_paths.write_path, &csv_content)
+    })
+    .await
+    .map_err(|err| anyhow::anyhow!("atomic csv write task failed: {err}"))??;
     Ok(())
 }
 
@@ -444,12 +642,89 @@ async fn recover_running_items(
     Ok(())
 }
 
+async fn terminate_agent_job_workers(
+    session: Arc<Session>,
+    db: Arc<codex_state::StateRuntime>,
+    job_id: &str,
+    active_items: &mut HashMap<ThreadId, ActiveJobItem>,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let mut state_errors = Vec::new();
+    let mut item_ids = HashSet::new();
+    let mut thread_ids = HashSet::new();
+    for (thread_id, item) in std::mem::take(active_items) {
+        thread_ids.insert(thread_id);
+        item_ids.insert(item.item_id);
+    }
+
+    match db
+        .list_agent_job_items(
+            job_id,
+            Some(codex_state::AgentJobItemStatus::Running),
+            /*limit*/ None,
+        )
+        .await
+    {
+        Ok(running_items) => {
+            for item in running_items {
+                let item_id = item.item_id;
+                if let Some(assigned_thread_id) = item.assigned_thread_id {
+                    match ThreadId::from_string(assigned_thread_id.as_str()) {
+                        Ok(thread_id) => {
+                            thread_ids.insert(thread_id);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                job_id,
+                                item_id,
+                                assigned_thread_id,
+                                error = ?error,
+                                "failed to parse worker thread id while terminating agent job"
+                            );
+                        }
+                    }
+                }
+                item_ids.insert(item_id);
+            }
+        }
+        Err(error) => state_errors.push(format!("failed to load running items: {error}")),
+    }
+
+    for item_id in item_ids {
+        if let Err(err) = db
+            .mark_agent_job_item_failed(job_id, item_id.as_str(), reason)
+            .await
+        {
+            state_errors.push(format!("failed to terminate item {item_id}: {err}"));
+        }
+    }
+
+    for thread_id in thread_ids {
+        if let Err(err) = session
+            .services
+            .agent_control
+            .shutdown_live_agent(thread_id)
+            .await
+        {
+            tracing::warn!(
+                %thread_id,
+                error = %err,
+                "failed to shut down worker for cancelled agent job"
+            );
+        }
+    }
+    if !state_errors.is_empty() {
+        return Err(anyhow::anyhow!(state_errors.join("; ")));
+    }
+    Ok(())
+}
+
 async fn find_finished_threads(
     session: Arc<Session>,
-    active_items: &HashMap<ThreadId, ActiveJobItem>,
+    active_items: &mut HashMap<ThreadId, ActiveJobItem>,
 ) -> Vec<(ThreadId, String)> {
     let mut finished = Vec::new();
-    for (thread_id, item) in active_items {
+    for (thread_id, item) in active_items.iter_mut() {
         let status = active_item_status(session.as_ref(), *thread_id, item).await;
         if is_final(&status) {
             finished.push((*thread_id, item.item_id.clone()));
@@ -461,14 +736,20 @@ async fn find_finished_threads(
 async fn active_item_status(
     session: &Session,
     thread_id: ThreadId,
-    item: &ActiveJobItem,
+    item: &mut ActiveJobItem,
 ) -> AgentStatus {
-    if let Some(status_rx) = item.status_rx.as_ref()
-        && status_rx.has_changed().is_ok()
-    {
-        return status_rx.borrow().clone();
+    if let Some(status) = active_item_watch_status(item) {
+        return status;
     }
     session.services.agent_control.get_status(thread_id).await
+}
+
+fn active_item_watch_status(item: &mut ActiveJobItem) -> Option<AgentStatus> {
+    let status_rx = item.status_rx.as_mut()?;
+    if status_rx.has_changed().is_err() {
+        return None;
+    }
+    Some(status_rx.borrow_and_update().clone())
 }
 
 async fn wait_for_status_change(active_items: &HashMap<ThreadId, ActiveJobItem>) {
@@ -576,38 +857,58 @@ Input row (JSON):\n\
 {row_json}\n\n\
 Expected result schema (JSON Schema or {{}}):\n\
 {output_schema}\n\n\
-You MUST call the `report_agent_job_result` tool exactly once with:\n\
+You MUST successfully call the `report_agent_job_result` tool with:\n\
 1. `job_id` = \"{job_id}\"\n\
 2. `item_id` = \"{item_id}\"\n\
 3. `result` = a JSON object that contains your analysis result for this row.\n\n\
+If the tool rejects your result, correct the payload and call it again.\n\n\
 If you need to stop the job early, include `stop` = true in the tool call.\n\n\
 After the tool call succeeds, stop.",
     ))
 }
 
 fn render_instruction_template(instruction: &str, row_json: &Value) -> String {
-    const OPEN_BRACE_SENTINEL: &str = "__CODEX_OPEN_BRACE__";
-    const CLOSE_BRACE_SENTINEL: &str = "__CODEX_CLOSE_BRACE__";
+    let row = row_json.as_object();
+    let mut rendered = String::with_capacity(instruction.len());
+    let mut cursor = 0;
 
-    let mut rendered = instruction
-        .replace("{{", OPEN_BRACE_SENTINEL)
-        .replace("}}", CLOSE_BRACE_SENTINEL);
-    let Some(row) = row_json.as_object() else {
-        return rendered
-            .replace(OPEN_BRACE_SENTINEL, "{")
-            .replace(CLOSE_BRACE_SENTINEL, "}");
-    };
-    for (key, value) in row {
-        let placeholder = format!("{{{key}}}");
-        let replacement = value
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| value.to_string());
-        rendered = rendered.replace(placeholder.as_str(), replacement.as_str());
+    while cursor < instruction.len() {
+        let remaining = &instruction[cursor..];
+        if remaining.starts_with("{{") {
+            rendered.push('{');
+            cursor += 2;
+            continue;
+        }
+        if remaining.starts_with("}}") {
+            rendered.push('}');
+            cursor += 2;
+            continue;
+        }
+        if remaining.starts_with('{')
+            && let Some(close_offset) = remaining[1..].find('}')
+        {
+            let key = &remaining[1..close_offset + 1];
+            if !key.contains('{')
+                && let Some(value) = row.and_then(|row| row.get(key))
+            {
+                if let Some(value) = value.as_str() {
+                    rendered.push_str(value);
+                } else {
+                    rendered.push_str(&value.to_string());
+                }
+                cursor += close_offset + 2;
+                continue;
+            }
+        }
+
+        let character = remaining
+            .chars()
+            .next()
+            .expect("cursor should remain on a character boundary");
+        rendered.push(character);
+        cursor += character.len_utf8();
     }
     rendered
-        .replace(OPEN_BRACE_SENTINEL, "{")
-        .replace(CLOSE_BRACE_SENTINEL, "}")
 }
 
 fn ensure_unique_headers(headers: &[String]) -> Result<(), FunctionCallError> {
@@ -616,6 +917,11 @@ fn ensure_unique_headers(headers: &[String]) -> Result<(), FunctionCallError> {
         if !seen.insert(header) {
             return Err(FunctionCallError::RespondToModel(format!(
                 "csv header {header} is duplicated"
+            )));
+        }
+        if AGENT_JOB_OUTPUT_COLUMNS.contains(&header.as_str()) {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "csv header {header} conflicts with a generated output column"
             )));
         }
     }
@@ -688,18 +994,7 @@ fn render_job_csv(
 ) -> Result<String, FunctionCallError> {
     let mut csv = String::new();
     let mut output_headers = headers.to_vec();
-    output_headers.extend([
-        "job_id".to_string(),
-        "item_id".to_string(),
-        "row_index".to_string(),
-        "source_id".to_string(),
-        "status".to_string(),
-        "attempt_count".to_string(),
-        "last_error".to_string(),
-        "result_json".to_string(),
-        "reported_at".to_string(),
-        "completed_at".to_string(),
-    ]);
+    output_headers.extend(AGENT_JOB_OUTPUT_COLUMNS.map(str::to_string));
     csv.push_str(
         output_headers
             .iter()

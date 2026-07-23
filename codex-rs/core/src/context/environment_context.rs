@@ -212,20 +212,26 @@ pub(crate) fn push_xml_escaped_text(rendered: &mut String, value: &str) {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct NetworkContext {
+    enabled: bool,
     allowed_domains: Vec<String>,
     denied_domains: Vec<String>,
 }
 
 impl NetworkContext {
-    pub(crate) fn new(allowed_domains: Vec<String>, denied_domains: Vec<String>) -> Self {
+    pub(crate) fn new(
+        enabled: bool,
+        allowed_domains: Vec<String>,
+        denied_domains: Vec<String>,
+    ) -> Self {
         Self {
+            enabled,
             allowed_domains,
             denied_domains,
         }
     }
 
     pub(super) fn render(&self) -> String {
-        let mut rendered = "<network enabled=\"true\">".to_string();
+        let mut rendered = format!("<network enabled=\"{}\">", self.enabled);
         Self::push_rendered_domain_element(&mut rendered, "allowed", &self.allowed_domains);
         Self::push_rendered_domain_element(&mut rendered, "denied", &self.denied_domains);
         rendered.push_str("</network>");
@@ -237,8 +243,6 @@ impl NetworkContext {
             return;
         }
 
-        rendered_network.push_str(&format!("<{name}>"));
-        rendered_network.push_str(&domains.join(","));
-        rendered_network.push_str(&format!("</{name}>"));
+        push_text_element(rendered_network, name, &domains.join(","));
     }
 }

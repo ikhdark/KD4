@@ -149,9 +149,13 @@ pub(crate) async fn run_codex_thread_interactive(
     );
     let codex = Arc::new(codex);
 
-    // Use a child token so parent cancel cascades but we can scope it to this task
-    let cancel_token_events = cancel_token.child_token();
-    let cancel_token_ops = cancel_token.child_token();
+    // Keep both proxy directions on one liveness token. Parent cancellation still
+    // cascades, while child termination or either forwarder failing tears down the
+    // other direction as well.
+    let delegate_liveness = cancel_token.child_token();
+    cancel_delegate_when_session_loop_terminates(&codex, delegate_liveness.clone());
+    let cancel_token_events = delegate_liveness.clone();
+    let cancel_token_ops = delegate_liveness;
 
     // Forward events from the sub-agent to the consumer, filtering approvals and
     // routing them to the parent session for decisions.
@@ -187,6 +191,17 @@ pub(crate) async fn run_codex_thread_interactive(
         session: Arc::clone(&codex.session),
         session_loop_termination: codex.session_loop_termination.clone(),
     })
+}
+
+fn cancel_delegate_when_session_loop_terminates(
+    codex: &Codex,
+    delegate_liveness: CancellationToken,
+) {
+    let session_loop_termination = codex.session_loop_termination.clone();
+    tokio::spawn(async move {
+        session_loop_termination.await;
+        delegate_liveness.cancel();
+    });
 }
 
 /// Convenience wrapper for one-time use with an initial prompt.
@@ -236,28 +251,7 @@ pub(crate) async fn run_codex_thread_one_shot(
     let agent_status = io.agent_status.clone();
     let session = Arc::clone(&io.session);
     let session_loop_termination = io.session_loop_termination.clone();
-    let io_for_bridge = io;
-    tokio::spawn(async move {
-        while let Ok(event) = io_for_bridge.next_event().await {
-            let should_shutdown = matches!(
-                event.msg,
-                EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
-            );
-            let _ = tx_bridge.send(event).await;
-            if should_shutdown {
-                let _ = ops_tx
-                    .send(Submission {
-                        id: "shutdown".to_string(),
-                        op: Op::Shutdown {},
-                        client_user_message_id: None,
-                        trace: None,
-                    })
-                    .await;
-                child_cancel.cancel();
-                break;
-            }
-        }
-    });
+    tokio::spawn(bridge_one_shot_events(io, tx_bridge, ops_tx, child_cancel));
 
     // For one-shot usage, return a closed `tx_sub` so callers cannot submit
     // additional ops after the initial request. Create a channel and drop the
@@ -272,6 +266,33 @@ pub(crate) async fn run_codex_thread_one_shot(
         session,
         session_loop_termination,
     })
+}
+
+async fn bridge_one_shot_events(
+    io: Codex,
+    tx_bridge: Sender<Event>,
+    ops_tx: Sender<Submission>,
+    child_cancel: CancellationToken,
+) {
+    while let Ok(event) = io.next_event().await {
+        let should_shutdown = matches!(
+            event.msg,
+            EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_)
+        );
+        let _ = tx_bridge.send(event).await;
+        if should_shutdown {
+            let _ = ops_tx
+                .send(Submission {
+                    id: "shutdown".to_string(),
+                    op: Op::Shutdown {},
+                    client_user_message_id: None,
+                    trace: None,
+                })
+                .await;
+            child_cancel.cancel();
+            break;
+        }
+    }
 }
 
 async fn forward_events(
@@ -437,12 +458,17 @@ async fn forward_events(
             }
         }
     }
+    cancel_token.cancel();
 }
 
 /// Ask the delegate to stop and drain its events so background sends do not hit a closed channel.
 async fn shutdown_delegate(codex: &Codex) {
-    let _ = codex.submit(Op::Interrupt).await;
-    let _ = codex.submit(Op::Shutdown {}).await;
+    if codex.submit(Op::Interrupt).await.is_err() {
+        return;
+    }
+    if codex.submit(Op::Shutdown {}).await.is_err() {
+        return;
+    }
 
     let _ = timeout(Duration::from_millis(500), async {
         while let Ok(event) = codex.next_event().await {
@@ -483,8 +509,11 @@ async fn forward_ops(
             Ok(Ok(submission)) => submission,
             Ok(Err(_)) | Err(_) => break,
         };
-        let _ = codex.submit_with_id(submission).await;
+        if codex.submit_with_id(submission).await.is_err() {
+            break;
+        }
     }
+    cancel_token_ops.cancel();
 }
 
 /// Handle an ExecApprovalRequest by consulting the parent session and replying.

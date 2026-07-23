@@ -16,6 +16,7 @@ use codex_protocol::protocol::HookRunStatus;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::Op;
+use codex_utils_output_truncation::approx_token_count;
 use core_test_support::PathBufExt;
 use core_test_support::assert_regex_match;
 use core_test_support::context_snapshot;
@@ -46,6 +47,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const CONFIGURED_CONTEXT_WINDOW: i64 = 128_000;
+const THREAD_HINT_CONTEXT_MAX_TOKENS: usize = 1_100;
 
 fn token_budget_contexts(request: &ResponsesRequest) -> Vec<String> {
     let context_window_prefix = format!("{CONTEXT_WINDOW_OPEN_TAG}\nThread id: ");
@@ -338,6 +340,165 @@ async fn token_budget_context_injects_plain_thread_hint_text() -> Result<()> {
             .iter()
             .any(|name| name == "mcp__notes__thread_hint"),
         "thread_hint should be hidden from model tool exposure"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_budget_context_truncates_oversized_thread_hint() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let rmcp_test_server_bin = stdio_server_bin()?;
+    let oversized_hint = "oversized thread hint ".repeat(600);
+    let oversized_hint_for_server = oversized_hint.clone();
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
+            config
+                .features
+                .enable(Feature::TokenBudget)
+                .expect("test config should allow token budget");
+            let mut servers = config.mcp_servers.get().clone();
+            servers.insert(
+                "notes".to_string(),
+                McpServerConfig {
+                    auth: Default::default(),
+                    transport: McpServerTransportConfig::Stdio {
+                        command: rmcp_test_server_bin,
+                        args: Vec::new(),
+                        env: Some(HashMap::from([(
+                            "MCP_TEST_THREAD_HINT".to_string(),
+                            oversized_hint_for_server,
+                        )])),
+                        env_vars: Vec::new(),
+                        cwd: None,
+                    },
+                    environment_id: "local".to_string(),
+                    enabled: true,
+                    required: false,
+                    supports_parallel_tool_calls: false,
+                    disabled_reason: None,
+                    startup_timeout_sec: Some(Duration::from_secs(10)),
+                    tool_timeout_sec: None,
+                    default_tools_approval_mode: None,
+                    enabled_tools: None,
+                    disabled_tools: None,
+                    scopes: None,
+                    oauth: None,
+                    oauth_resource: None,
+                    tools: HashMap::new(),
+                },
+            );
+            config
+                .mcp_servers
+                .set(servers)
+                .expect("test mcp servers should accept any configuration");
+        })
+        .build(&server)
+        .await?;
+    wait_for_mcp_server(&test.codex, "notes").await?;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-1"),
+            ev_completed("resp-1"),
+        ])],
+    )
+    .await;
+
+    test.submit_turn("inject an oversized history hint").await?;
+
+    let request = responses.single_request();
+    let token_budgets = token_budget_contexts(&request);
+    assert_eq!(token_budgets.len(), 1);
+    let context = &token_budgets[0];
+    assert!(context.contains("tokens truncated"));
+    assert!(!context.contains(&oversized_hint));
+    assert!(
+        approx_token_count(context) < THREAD_HINT_CONTEXT_MAX_TOKENS,
+        "thread hint context exceeded its bounded envelope"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_budget_context_discards_mcp_application_error_thread_hint() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let rmcp_test_server_bin = stdio_server_bin()?;
+    let diagnostic = "thread hint storage authorization failed";
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
+            config
+                .features
+                .enable(Feature::TokenBudget)
+                .expect("test config should allow token budget");
+            let mut servers = config.mcp_servers.get().clone();
+            servers.insert(
+                "notes".to_string(),
+                McpServerConfig {
+                    auth: Default::default(),
+                    transport: McpServerTransportConfig::Stdio {
+                        command: rmcp_test_server_bin,
+                        args: Vec::new(),
+                        env: Some(HashMap::from([
+                            ("MCP_TEST_THREAD_HINT".to_string(), diagnostic.to_string()),
+                            ("MCP_TEST_THREAD_HINT_IS_ERROR".to_string(), "1".to_string()),
+                        ])),
+                        env_vars: Vec::new(),
+                        cwd: None,
+                    },
+                    environment_id: "local".to_string(),
+                    enabled: true,
+                    required: false,
+                    supports_parallel_tool_calls: false,
+                    disabled_reason: None,
+                    startup_timeout_sec: Some(Duration::from_secs(10)),
+                    tool_timeout_sec: None,
+                    default_tools_approval_mode: None,
+                    enabled_tools: None,
+                    disabled_tools: None,
+                    scopes: None,
+                    oauth: None,
+                    oauth_resource: None,
+                    tools: HashMap::new(),
+                },
+            );
+            config
+                .mcp_servers
+                .set(servers)
+                .expect("test mcp servers should accept any configuration");
+        })
+        .build(&server)
+        .await?;
+    wait_for_mcp_server(&test.codex, "notes").await?;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![sse(vec![
+            ev_response_created("resp-1"),
+            ev_completed("resp-1"),
+        ])],
+    )
+    .await;
+
+    test.submit_turn("ignore an application-error history hint")
+        .await?;
+
+    let request = responses.single_request();
+    let token_budgets = token_budget_contexts(&request);
+    assert_eq!(token_budgets.len(), 1);
+    token_budget_window_ids(&token_budgets[0], test.session_configured.thread_id);
+    assert!(
+        !request
+            .message_input_texts("developer")
+            .iter()
+            .any(|text| text.contains(diagnostic)),
+        "MCP application-error diagnostics must not become thread hints"
     );
 
     Ok(())

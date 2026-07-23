@@ -590,10 +590,23 @@ impl Session {
         sub_id: String,
         updates: SessionSettingsUpdate,
     ) -> CodexResult<Arc<TurnContext>> {
+        let final_output_json_schema = updates.final_output_json_schema.clone();
+        let session_configuration = self.apply_turn_settings(&sub_id, &updates).await?;
+
+        Ok(self
+            .new_turn_from_configuration(sub_id, session_configuration, final_output_json_schema)
+            .await)
+    }
+
+    pub(crate) async fn apply_turn_settings(
+        &self,
+        sub_id: &str,
+        updates: &SessionSettingsUpdate,
+    ) -> CodexResult<SessionConfiguration> {
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
         let update_result: CodexResult<_> = {
             let mut state = self.state.lock().await;
-            match state.session_configuration.clone().apply(&updates) {
+            match state.session_configuration.clone().apply(updates) {
                 Ok(next) => {
                     let previous_permission_profile =
                         state.session_configuration.permission_profile();
@@ -629,7 +642,7 @@ impl Session {
                 Err(err) => {
                     let message = err.to_string();
                     self.send_event_raw(Event {
-                        id: sub_id.clone(),
+                        id: sub_id.to_string(),
                         msg: EventMsg::Error(ErrorEvent {
                             message: message.clone(),
                             codex_error_info: Some(CodexErrorInfo::BadRequest),
@@ -646,16 +659,10 @@ impl Session {
                 .await;
         }
 
-        Ok(self
-            .new_turn_from_configuration(
-                sub_id,
-                session_configuration,
-                updates.final_output_json_schema,
-            )
-            .await)
+        Ok(session_configuration)
     }
 
-    async fn new_turn_from_configuration(
+    pub(crate) async fn new_turn_from_configuration(
         &self,
         sub_id: String,
         session_configuration: SessionConfiguration,

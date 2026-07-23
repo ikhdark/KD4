@@ -435,6 +435,14 @@ impl Environment {
             local_runtime_paths: None,
         }
     }
+
+    /// Builds a test-only local environment backed by the supplied filesystem.
+    pub fn default_for_tests_with_filesystem(filesystem: Arc<dyn ExecutorFileSystem>) -> Self {
+        Self {
+            filesystem,
+            ..Self::default_for_tests()
+        }
+    }
 }
 
 impl std::fmt::Debug for Environment {

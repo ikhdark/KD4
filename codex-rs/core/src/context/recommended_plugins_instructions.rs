@@ -11,17 +11,12 @@ pub(crate) struct RecommendedPluginsInstructions {
 }
 
 impl RecommendedPluginsInstructions {
-    pub(crate) fn from_plugins(plugins: &[DiscoverableTool]) -> Option<Self> {
+    pub(crate) fn from_plugins(mut plugins: Vec<DiscoverableTool>) -> Option<Self> {
         if plugins.is_empty() {
             return None;
         }
-        Some(Self {
-            plugins: plugins
-                .iter()
-                .take(MAX_RECOMMENDED_PLUGINS)
-                .cloned()
-                .collect(),
-        })
+        plugins.truncate(MAX_RECOMMENDED_PLUGINS);
+        Some(Self { plugins })
     }
 }
 

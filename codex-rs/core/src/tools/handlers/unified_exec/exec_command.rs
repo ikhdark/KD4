@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
+use crate::shell::Shell;
+use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::command_output_artifact::replace_raw_output_artifact;
@@ -13,13 +15,14 @@ use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::apply_granted_turn_permissions;
 use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
+use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_tool_environment;
-use crate::tools::handlers::rewrite_function_script_argument;
+use crate::tools::handlers::rewrite_function_command_argument;
 use crate::tools::handlers::updated_hook_command;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
@@ -43,6 +46,7 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathConvention;
+use serde::Deserialize;
 
 use super::super::shell_spec::CommandToolOptions;
 use super::super::shell_spec::create_exec_command_tool_with_environment_id;
@@ -51,6 +55,34 @@ use super::ExecCommandEnvironmentArgs;
 use super::get_command;
 use super::post_unified_exec_tool_use_payload;
 use super::shell_mode_for_environment;
+
+#[derive(Debug, Deserialize)]
+struct ExecCommandHookArgs {
+    #[serde(default)]
+    cmd: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    program: Option<String>,
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    #[serde(default)]
+    script_body: Option<String>,
+}
+
+impl ExecCommandHookArgs {
+    fn command_invocation(&self) -> Result<CommandInvocation, FunctionCallError> {
+        CommandInvocation::from_parts(
+            "exec_command",
+            "cmd",
+            self.cmd.as_deref(),
+            self.kind.as_deref(),
+            self.program.as_deref(),
+            self.args.as_deref(),
+            self.script_body.as_deref(),
+        )
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExecCommandHandlerOptions {
@@ -80,6 +112,54 @@ impl Default for ExecCommandHandler {
 impl ExecCommandHandler {
     pub(crate) fn new(options: ExecCommandHandlerOptions) -> Self {
         Self { options }
+    }
+}
+
+pub(super) fn validate_and_consume_remote_shell(
+    args: &mut ExecCommandArgs,
+    remote_shell: Option<&Shell>,
+    environment_id: &str,
+) -> Result<(), String> {
+    let Some(requested_shell) = args.shell.take() else {
+        return Ok(());
+    };
+    let Some(remote_shell) = remote_shell else {
+        return Err(format!(
+            "environment `{environment_id}` does not report a shell"
+        ));
+    };
+    if detect_shell_type(Path::new(&requested_shell)) != Some(remote_shell.shell_type) {
+        return Err(format!(
+            "environment `{environment_id}` only supports `{}`",
+            remote_shell.name()
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn attach_powershell_failure_advisory(
+    response: &mut ExecCommandToolOutput,
+    shell_type: ShellType,
+    is_powershell_script: bool,
+) {
+    if response.process_id.is_some() {
+        return;
+    }
+
+    let advisory = {
+        let output = String::from_utf8_lossy(&response.raw_output);
+        powershell_script_failure_advisory(
+            Some(shell_type),
+            response.exit_code,
+            is_powershell_script,
+            output.as_ref(),
+        )
+    };
+    if let Some(advisory) = advisory {
+        response.repair_notice = Some(match response.repair_notice.take() {
+            Some(repair_notice) => format!("{repair_notice}\n\n{advisory}"),
+            None => advisory.to_string(),
+        });
     }
 }
 
@@ -205,38 +285,36 @@ impl ExecCommandHandler {
             .map_err(FunctionCallError::RespondToModel)?;
         let shell_mode =
             shell_mode_for_environment(&turn.unified_exec_shell_mode, environment.as_ref());
-        // Remote environments may use a different OS and must build commands with their native
-        // shell; fall back to the session shell when the environment did not report one.
+        let environment_is_remote = environment.is_remote();
+        if environment_is_remote && !original_invocation.is_argv() {
+            if turn_environment.shell.is_none() {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "environment `{}` does not report a shell",
+                    turn_environment.environment_id
+                )));
+            }
+            // TODO(anp): Resolve requested shells in remote environments instead of restricting
+            // commands to the reported default shell.
+            validate_and_consume_remote_shell(
+                &mut args,
+                turn_environment.shell.as_ref(),
+                &turn_environment.environment_id,
+            )
+            .map_err(FunctionCallError::RespondToModel)?;
+        }
+        // A remote shell is required above for every shell-wrapped command. The local session
+        // fallback can therefore only be reached by local commands or structured remote argv.
         let shell = turn_environment
             .shell
             .clone()
             .map(Arc::new)
             .unwrap_or_else(|| session.user_shell());
-        // TODO(anp): Resolve requested shells in remote environments instead of restricting
-        // commands to the reported default shell.
-        if environment.is_remote()
-            && let Some(requested_shell) = args.shell.as_deref()
-        {
-            let Some(remote_shell) = turn_environment.shell.as_ref() else {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "environment `{}` does not report a shell",
-                    turn_environment.environment_id
-                )));
-            };
-            if detect_shell_type(Path::new(requested_shell)) != Some(remote_shell.shell_type) {
-                return Err(FunctionCallError::RespondToModel(format!(
-                    "environment `{}` only supports `{}`",
-                    turn_environment.environment_id,
-                    remote_shell.name()
-                )));
-            }
-        }
         let original_resolved_command = get_command(
             &args,
             Arc::clone(&shell),
             &shell_mode,
             turn.config.permissions.allow_login_shell,
-            environment.is_remote(),
+            environment_is_remote,
         )
         .map_err(FunctionCallError::RespondToModel)?;
         let original_safety_command = original_resolved_command.safety_command.clone();
@@ -262,7 +340,7 @@ impl ExecCommandHandler {
                 Arc::clone(&shell),
                 &shell_mode,
                 turn.config.permissions.allow_login_shell,
-                environment.is_remote(),
+                environment_is_remote,
             )
             .map_err(FunctionCallError::RespondToModel)?
         } else {
@@ -283,6 +361,7 @@ impl ExecCommandHandler {
         let command = resolved_command.command;
         let safety_command = resolved_command.safety_command;
         let shell_type = resolved_command.shell_type;
+        let is_powershell_script = command_invocation.is_powershell_script();
         let command_for_display = hook_command.clone();
 
         let ExecCommandArgs {
@@ -392,11 +471,7 @@ impl ExecCommandHandler {
             .begin_attempt(&attempt_key, repair_notice.is_some())
             .await
             .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
-        // Reserve an interactive process id only after all fallible command,
-        // permission, and retry-identity checks. Rejected commands never
-        // consume an id.
-        let process_id = manager.allocate_process_id().await;
-
+        let interception_started_at = std::time::Instant::now();
         let intercepted = intercept_apply_patch(
             &command,
             &cwd,
@@ -409,6 +484,7 @@ impl ExecCommandHandler {
             "exec_command",
         )
         .await;
+        let interception_wall_time = interception_started_at.elapsed();
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         session
             .services
@@ -417,7 +493,6 @@ impl ExecCommandHandler {
             .await;
         match intercepted {
             Ok(Some(output)) => {
-                manager.release_process_id(process_id).await;
                 let raw_output = output.into_text().into_bytes();
                 let raw_output_artifact = create_raw_output_artifact(
                     turn.config.codex_home.as_path(),
@@ -433,21 +508,20 @@ impl ExecCommandHandler {
                 return Ok(boxed_tool_output(ExecCommandToolOutput {
                     event_call_id: String::new(),
                     chunk_id: String::new(),
-                    wall_time: std::time::Duration::ZERO,
+                    wall_time: interception_wall_time,
                     raw_output,
                     truncation_policy: turn.model_info.truncation_policy.into(),
                     max_output_tokens,
                     process_id: None,
-                    exit_code: None,
+                    exit_code: Some(0),
                     original_token_count: None,
-                    hook_command: None,
+                    hook_command: Some(hook_command),
                     raw_output_artifact: Some(raw_output_artifact),
                     repair_notice,
                 }));
             }
             Ok(None) => {}
             Err(err) => {
-                manager.release_process_id(process_id).await;
                 session
                     .services
                     .command_execution
@@ -465,6 +539,10 @@ impl ExecCommandHandler {
         .await;
 
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
+        // Reserve only for a real process launch. The manager-owned reservation
+        // releases itself if cancellation wins before process-store transfer.
+        let process_id_reservation = manager.reserve_process_id().await;
+        let process_id = process_id_reservation.process_id();
         let exec_result = manager
             .exec_command(
                 ExecCommandRequest {
@@ -490,6 +568,7 @@ impl ExecCommandHandler {
                     justification,
                     prefix_rule,
                 },
+                process_id_reservation,
                 &context,
             )
             .await;
@@ -526,6 +605,7 @@ impl ExecCommandHandler {
                             .await;
                     }
                 }
+                attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
                 Ok(boxed_tool_output(response))
             }
             Err(UnifiedExecError::SandboxDenied { output, .. }) => {
@@ -544,18 +624,8 @@ impl ExecCommandHandler {
                         .record_exit(&attempt_key, output.exit_code)
                         .await;
                 }
-                let advisory = powershell_script_failure_advisory(
-                    Some(shell_type),
-                    Some(output.exit_code),
-                    &output_text,
-                );
                 let original_token_count = approx_token_count(&output_text);
-                let output_text = if let Some(advisory) = advisory {
-                    format!("{output_text}\n\n{advisory}")
-                } else {
-                    output_text
-                };
-                Ok(boxed_tool_output(ExecCommandToolOutput {
+                let mut response = ExecCommandToolOutput {
                     event_call_id: context.call_id.clone(),
                     chunk_id: generate_chunk_id(),
                     wall_time: output.duration,
@@ -570,7 +640,9 @@ impl ExecCommandHandler {
                     hook_command: Some(hook_command),
                     raw_output_artifact: Some(finalized_artifact),
                     repair_notice,
-                }))
+                };
+                attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
+                Ok(boxed_tool_output(response))
             }
             Err(err) => {
                 let retry_failure = matches!(
@@ -621,7 +693,7 @@ impl CoreToolRuntime for ExecCommandHandler {
             return None;
         };
 
-        parse_arguments::<ExecCommandArgs>(arguments)
+        parse_arguments::<ExecCommandHookArgs>(arguments)
             .ok()
             .and_then(|args| args.command_invocation().ok())
             .map(|args| PreToolUsePayload {
@@ -640,11 +712,14 @@ impl CoreToolRuntime for ExecCommandHandler {
                 "hook input rewrite received unsupported exec_command payload".to_string(),
             ));
         };
+        let args: ExecCommandHookArgs = parse_arguments(&arguments)?;
+        let command_invocation = args.command_invocation()?;
         invocation.payload = ToolPayload::Function {
-            arguments: rewrite_function_script_argument(
+            arguments: rewrite_function_command_argument(
                 &arguments,
                 "exec_command",
                 "cmd",
+                &command_invocation,
                 updated_hook_command(&updated_input)?,
             )?,
         };

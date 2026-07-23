@@ -153,6 +153,8 @@ use codex_thread_store::ReadThreadParams;
 use codex_thread_store::ResumeThreadParams;
 use codex_thread_store::ThreadPersistenceMetadata;
 use codex_thread_store::ThreadStore;
+use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::truncate_text;
 use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use futures::future::Shared;
@@ -469,6 +471,7 @@ pub(crate) fn resolve_multi_agent_version(
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 512;
+const THREAD_HINT_MAX_TOKENS: usize = 1_000;
 const CYBER_VERIFY_URL: &str = "https://chatgpt.com/cyber";
 const CYBER_SAFETY_URL: &str = "https://developers.openai.com/codex/concepts/cyber-safety";
 
@@ -1460,6 +1463,18 @@ impl Session {
         // will be processed again if the rollout is reconstructed in a future session.
         // This meets image resizing requirements without modifying persisted rollouts.
         prepare_response_items(&mut history);
+        let prefix_tokens = if matches!(
+            turn_context.config.model_auto_compact_token_limit_scope,
+            AutoCompactTokenLimitScope::BodyAfterPrefix
+        ) {
+            let base_instructions = self.get_base_instructions().await;
+            ContextManager::estimate_items_token_count_with_base_instructions(
+                &history,
+                &base_instructions,
+            )
+        } else {
+            None
+        };
         {
             let mut state = self.state.lock().await;
             state.replace_history(history, reference_context_item);
@@ -1478,16 +1493,6 @@ impl Session {
             );
             state.set_previous_turn_settings(previous_turn_settings.clone());
         }
-        let prefix_tokens = if matches!(
-            turn_context.config.model_auto_compact_token_limit_scope,
-            AutoCompactTokenLimitScope::BodyAfterPrefix
-        ) {
-            let history = self.clone_history().await;
-            let base_instructions = self.get_base_instructions().await;
-            history.estimate_token_count_with_base_instructions(&base_instructions)
-        } else {
-            None
-        };
         if let Some(prefix_tokens) = prefix_tokens {
             self.set_auto_compact_window_estimated_prefill_for_scope(turn_context, prefix_tokens)
                 .await;
@@ -1993,13 +1998,17 @@ impl Session {
     }
 
     async fn maybe_clear_realtime_handoff_for_event(&self, msg: &EventMsg) {
-        if !matches!(msg, EventMsg::TurnComplete(_)) {
-            return;
-        }
-        if let Err(err) = self.conversation.handoff_complete().await {
+        let (result, clear_after) = match msg {
+            EventMsg::TurnComplete(_) => (self.conversation.handoff_complete().await, true),
+            EventMsg::TurnAborted(_) => (self.conversation.handoff_abort().await, false),
+            _ => return,
+        };
+        if let Err(err) = result {
             debug!("failed to finalize realtime handoff output: {err}");
         }
-        self.conversation.clear_active_handoff().await;
+        if clear_after {
+            self.conversation.clear_active_handoff().await;
+        }
     }
 
     pub(crate) async fn send_event_raw(&self, event: Event) {
@@ -2969,19 +2978,23 @@ impl Session {
             .config
             .features
             .enabled(Feature::DeferredExecutor);
-        // Keep the old turn-frozen environment view unless deferred executors are enabled.
-        let environments = if deferred_executor_enabled {
-            self.services.turn_environments.snapshot().await
-        } else {
-            turn_context.environments.clone()
-        };
-        if deferred_executor_enabled {
+        // Keep the old turn-frozen environment view unless deferred executors are enabled. The
+        // deferred path captures live environments inside AGENTS.md refresh serialization so the
+        // environment snapshot and returned instructions stay ordered as one request-scoped value.
+        let (environments, loaded_agents_md) = if deferred_executor_enabled {
             self.services
                 .agents_md_manager
-                .refresh(&turn_context.config, &environments)
-                .await;
-        }
-        let loaded_agents_md = self.services.agents_md_manager.get_loaded().await;
+                .refresh_for_step(
+                    &turn_context.config,
+                    self.services.turn_environments.as_ref(),
+                )
+                .await
+        } else {
+            (
+                turn_context.environments.clone(),
+                self.services.agents_md_manager.get_loaded().await,
+            )
+        };
         let selected_capability_roots = self
             .resolve_selected_capability_roots_for_step(&environments)
             .await;
@@ -3048,7 +3061,7 @@ impl Session {
         warn!("server reported model {server_model} while requested model was {requested_model}");
 
         let warning_message = format!(
-            "Your account was flagged for potentially high-risk cyber activity and this request was routed to gpt-5.2 as a fallback. To regain access to gpt-5.3-codex, apply for trusted access: {CYBER_VERIFY_URL} or learn more: {CYBER_SAFETY_URL}"
+            "Your account was flagged for potentially high-risk cyber activity and this request for {requested_model} was routed to {server_model} as a fallback. To regain access to {requested_model}, apply for trusted access: {CYBER_VERIFY_URL} or learn more: {CYBER_SAFETY_URL}"
         );
 
         self.send_event(
@@ -3131,17 +3144,16 @@ impl Session {
             }
         }
 
-        self.persist_rollout_items(&[RolloutItem::Compacted(compacted_item)])
-            .await;
+        let mut rollout_items = Vec::with_capacity(3);
+        rollout_items.push(RolloutItem::Compacted(compacted_item));
         // Persist the baseline after the replacement history that established it.
         if let Some(world_state_item) = world_state_item {
-            self.persist_rollout_items(&[RolloutItem::WorldState(world_state_item)])
-                .await;
+            rollout_items.push(RolloutItem::WorldState(world_state_item));
         }
         if let Some(turn_context_item) = reference_context_item {
-            self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item)])
-                .await;
+            rollout_items.push(RolloutItem::TurnContext(turn_context_item));
         }
+        self.persist_rollout_items(&rollout_items).await;
         {
             let mut state = self.state.lock().await;
             state.queue_pending_session_start_source(codex_hooks::SessionStartSource::Compact);
@@ -3421,9 +3433,8 @@ impl Session {
             } else {
                 None
             };
-        if let Some(recommended_plugins) = recommended_plugin_candidates
-            .as_deref()
-            .and_then(RecommendedPluginsInstructions::from_plugins)
+        if let Some(recommended_plugins) =
+            recommended_plugin_candidates.and_then(RecommendedPluginsInstructions::from_plugins)
         {
             contextual_user_sections.push(recommended_plugins.render());
         }
@@ -3481,6 +3492,9 @@ impl Session {
                 .await
                 .ok()
                 .and_then(|result| {
+                    if result.is_error.unwrap_or(false) {
+                        return None;
+                    }
                     let text = result
                         .content
                         .iter()
@@ -3490,6 +3504,8 @@ impl Session {
                         .filter(|text| !text.is_empty())
                         .collect::<Vec<_>>()
                         .join("\n");
+                    let text =
+                        truncate_text(&text, TruncationPolicy::Tokens(THREAD_HINT_MAX_TOKENS));
                     (!text.is_empty()).then_some(text)
                 });
             developer_sections.push(
@@ -3727,19 +3743,26 @@ impl Session {
             self.record_conversation_items(turn_context, &context_items)
                 .await;
         }
-        // Persist state only after any model-visible context generated from it.
+        // Persist state only after any model-visible context generated from it, keeping records
+        // from the same state transition ordered in one append.
+        let mut rollout_items = Vec::with_capacity(2);
         if let Some(world_state_item) = world_state_item {
-            self.persist_rollout_items(&[RolloutItem::WorldState(world_state_item)])
-                .await;
+            rollout_items.push(RolloutItem::WorldState(world_state_item));
         }
+        if !only_world_state_changed {
+            // Persist one `TurnContextItem` per real user turn so resume/lazy replay can recover
+            // the latest durable baseline even when this turn emitted no model-visible context
+            // diffs.
+            rollout_items.push(RolloutItem::TurnContext(turn_context_item.clone()));
+        }
+        if !rollout_items.is_empty() {
+            self.persist_rollout_items(&rollout_items).await;
+        }
+
         // A snapshot-only change does not require a duplicate TurnContext record.
         if only_world_state_changed {
             return world_state;
         }
-        // Persist one `TurnContextItem` per real user turn so resume/lazy replay can recover the
-        // latest durable baseline even when this turn emitted no model-visible context diffs.
-        self.persist_rollout_items(&[RolloutItem::TurnContext(turn_context_item.clone())])
-            .await;
 
         // Advance the persisted-settings baseline even when this turn emitted no model-visible
         // context items.
@@ -3970,7 +3993,8 @@ impl Session {
         let Some(active_task) = active_turn.task.as_ref() else {
             return Err(SteerInputError::NoActiveTurn(input));
         };
-        let active_turn_id = &active_task.turn_context.sub_id;
+        let active_turn_context = Arc::clone(&active_task.turn_context);
+        let active_turn_id = active_turn_context.sub_id.clone();
 
         if let Some(expected_turn_id) = expected_turn_id
             && expected_turn_id != active_turn_id
@@ -3998,6 +4022,7 @@ impl Session {
         if input.is_empty() {
             return Err(SteerInputError::EmptyInput);
         }
+        let input_for_telemetry = input.clone();
 
         let additional_context_input = {
             let mut state = self.state.lock().await;
@@ -4026,7 +4051,11 @@ impl Session {
                 pending_input,
             )
             .await;
-        Ok(active_turn_id.clone())
+        drop(active);
+        active_turn_context
+            .session_telemetry
+            .user_prompt(&input_for_telemetry);
+        Ok(active_turn_id)
     }
 
     pub(crate) async fn record_memory_citation_for_turn(&self, sub_id: &str) {

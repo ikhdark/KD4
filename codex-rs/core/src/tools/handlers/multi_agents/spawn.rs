@@ -207,7 +207,11 @@ async fn handle_spawn_agent(
             TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
                 id: call_id,
                 tool: CollabAgentTool::SpawnAgent,
-                status: collab_tool_call_status(&status, new_thread_id),
+                status: if result.is_ok() {
+                    CollabAgentToolCallStatus::Completed
+                } else {
+                    CollabAgentToolCallStatus::Failed
+                },
                 sender_thread_id: session.thread_id,
                 receiver_thread_ids,
                 receiver_agents,

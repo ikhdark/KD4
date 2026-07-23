@@ -3,6 +3,7 @@ use crate::unified_exec::ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS;
 use crate::unified_exec::DEFAULT_FAILURE_OUTPUT_TOKENS;
 use crate::unified_exec::DEFAULT_SUCCESS_OUTPUT_TOKENS;
 use crate::unified_exec::OutputBudgetClass;
+use crate::unified_exec::async_watcher::omitted_output_marker;
 use crate::unified_exec::async_watcher::resolve_aggregated_output;
 use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::clamp_yield_time_for_readiness;
@@ -11,6 +12,35 @@ use codex_network_proxy::ManagedNetworkSandboxContext;
 use pretty_assertions::assert_eq;
 use tokio::time::Duration;
 use tokio::time::Instant;
+
+#[tokio::test]
+async fn dropped_process_id_reservation_is_released_before_store_transfer() {
+    let manager = UnifiedExecProcessManager::default();
+    let reservation = manager.reserve_process_id().await;
+    assert_eq!(reservation.process_id(), 1000);
+    drop(reservation);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if manager
+                .process_store
+                .lock()
+                .await
+                .reserved_process_ids
+                .is_empty()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropped reservation should be released");
+
+    let next = manager.reserve_process_id().await;
+    assert_eq!(next.process_id(), 1000);
+    manager.release_process_id(next.process_id()).await;
+}
 
 #[test]
 fn adaptive_output_budget_matches_upstream_default_and_honors_override() {
@@ -170,6 +200,13 @@ async fn capacity_omission_is_reported_once_per_drain_and_preserved_for_finaliza
     )
     .await;
     let collected = String::from_utf8(collected).expect("collected output is UTF-8");
+    assert_eq!(
+        collected,
+        format!(
+            "0123{}cdef",
+            String::from_utf8(omitted_output_marker(8)).expect("marker is UTF-8")
+        )
+    );
     assert_eq!(
         collected
             .matches("8 byte(s) omitted from the middle")

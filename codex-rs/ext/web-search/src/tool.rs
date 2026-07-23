@@ -37,6 +37,7 @@ use crate::schema::commands_schema;
 pub(crate) const WEB_NAMESPACE: &str = "web";
 pub(crate) const RUN_TOOL_NAME: &str = "run";
 const WEB_RUN_DESCRIPTION: &str = include_str!("../web_run_description.md");
+const WEB_SEARCH_CANCELLED_MESSAGE: &str = "web search cancelled";
 
 pub(crate) struct WebSearchTool {
     pub(crate) session_id: String,
@@ -78,6 +79,10 @@ impl ToolExecutor<ToolCall> for WebSearchTool {
         true
     }
 
+    fn handles_runtime_cancellation(&self) -> bool {
+        true
+    }
+
     fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
         Box::pin(self.handle_call(call))
     }
@@ -87,21 +92,30 @@ impl WebSearchTool {
     async fn handle_call(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let commands = parse_commands(&call)?;
         let command_action = command_action(&commands);
-        let provider = self
-            .provider
-            .api_provider()
+        let Some(client) = call
+            .cancellation_token
+            .run_until_cancelled(async {
+                let provider = self
+                    .provider
+                    .api_provider()
+                    .await
+                    .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+                let auth = self
+                    .provider
+                    .api_auth()
+                    .await
+                    .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
+                Ok::<_, FunctionCallError>(SearchClient::new(
+                    ReqwestTransport::new(build_reqwest_client()),
+                    provider,
+                    auth,
+                ))
+            })
             .await
-            .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
-        let auth = self
-            .provider
-            .api_auth()
-            .await
-            .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
-        let client = SearchClient::new(
-            ReqwestTransport::new(build_reqwest_client()),
-            provider,
-            auth,
-        );
+        else {
+            return Err(cancelled_error());
+        };
+        let client = client?;
         let request = SearchRequest {
             id: self.session_id.clone(),
             model: call.model.clone(),
@@ -125,40 +139,58 @@ impl WebSearchTool {
                 }),
             ))
             .await;
-        let response = client
-            .search(&request, HeaderMap::new())
-            .await
-            .map_err(|err| FunctionCallError::Fatal(err.to_string()))?;
-        let legacy_action = match &command_action {
-            WebSearchAction::Search { query, queries } => CoreWebSearchAction::Search {
-                query: query.clone(),
-                queries: queries.clone(),
-            },
-            WebSearchAction::OpenPage { url } => CoreWebSearchAction::OpenPage { url: url.clone() },
-            WebSearchAction::FindInPage { url, pattern } => CoreWebSearchAction::FindInPage {
-                url: url.clone(),
-                pattern: pattern.clone(),
-            },
-            WebSearchAction::Other => CoreWebSearchAction::Other,
-        };
-        let query = web_search_action_detail(&legacy_action);
-        call.turn_item_emitter
-            .emit_completed(extension_turn_item(
-                WebSearchItem {
-                    id: call.call_id.clone(),
-                    query: query.clone(),
-                    action: Some(command_action),
-                },
-                EventMsg::WebSearchEnd(WebSearchEndEvent {
-                    call_id: call.call_id.clone(),
-                    query,
-                    action: legacy_action,
-                }),
-            ))
+        let search_result = call
+            .cancellation_token
+            .run_until_cancelled(client.search(&request, HeaderMap::new()))
             .await;
-
-        Ok(Box::new(SearchOutput::new(response.output)))
+        let terminal_item = completed_turn_item(&call.call_id, command_action);
+        match search_result {
+            None => {
+                call.turn_item_emitter.emit_completed(terminal_item).await;
+                Err(cancelled_error())
+            }
+            Some(Err(err)) => {
+                call.turn_item_emitter.emit_completed(terminal_item).await;
+                Err(FunctionCallError::Fatal(err.to_string()))
+            }
+            Some(Ok(response)) => {
+                call.turn_item_emitter.emit_completed(terminal_item).await;
+                Ok(Box::new(SearchOutput::new(response.output)))
+            }
+        }
     }
+}
+
+fn cancelled_error() -> FunctionCallError {
+    FunctionCallError::RespondToModel(WEB_SEARCH_CANCELLED_MESSAGE.to_string())
+}
+
+fn completed_turn_item(call_id: &str, action: WebSearchAction) -> ExtensionTurnItem {
+    let legacy_action = match &action {
+        WebSearchAction::Search { query, queries } => CoreWebSearchAction::Search {
+            query: query.clone(),
+            queries: queries.clone(),
+        },
+        WebSearchAction::OpenPage { url } => CoreWebSearchAction::OpenPage { url: url.clone() },
+        WebSearchAction::FindInPage { url, pattern } => CoreWebSearchAction::FindInPage {
+            url: url.clone(),
+            pattern: pattern.clone(),
+        },
+        WebSearchAction::Other => CoreWebSearchAction::Other,
+    };
+    let query = web_search_action_detail(&legacy_action);
+    extension_turn_item(
+        WebSearchItem {
+            id: call_id.to_string(),
+            query: query.clone(),
+            action: Some(action),
+        },
+        EventMsg::WebSearchEnd(WebSearchEndEvent {
+            call_id: call_id.to_string(),
+            query,
+            action: legacy_action,
+        }),
+    )
 }
 
 fn parse_commands(call: &ToolCall) -> Result<SearchCommands, FunctionCallError> {

@@ -44,9 +44,9 @@ impl CommandInvocation {
         args: Option<&[String]>,
         script_body: Option<&str>,
     ) -> Result<Self, FunctionCallError> {
-        let script = script.and_then(non_empty);
+        let script = script.and_then(non_blank);
         let program = program.and_then(non_empty);
-        let script_body = script_body.and_then(non_empty);
+        let script_body = script_body.and_then(non_blank);
         let has_argv_fields = program.is_some() || args.is_some();
         let has_powershell_script_fields = script_body.is_some();
         let kind = match kind {
@@ -151,6 +151,21 @@ impl CommandInvocation {
         }
     }
 
+    pub(crate) fn with_updated_hook_command(
+        &self,
+        tool_name: &str,
+        updated_command: &str,
+    ) -> Result<Self, FunctionCallError> {
+        match self {
+            Self::Script(_) => Ok(Self::Script(updated_command.to_string())),
+            Self::PowerShellScript(_) => Ok(Self::PowerShellScript(updated_command.to_string())),
+            Self::Argv { .. } if updated_command == self.display_command() => Ok(self.clone()),
+            Self::Argv { .. } => Err(FunctionCallError::RespondToModel(format!(
+                "{tool_name} hook cannot rewrite a direct argv command as text because that would lose structured `program`/`args`; return the original `command` value or block the tool call instead."
+            ))),
+        }
+    }
+
     pub(crate) fn is_argv(&self) -> bool {
         matches!(self, Self::Argv { .. })
     }
@@ -220,9 +235,14 @@ fn non_empty(value: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
+fn non_blank(value: &str) -> Option<&str> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
 pub(crate) fn powershell_script_failure_advisory(
     shell_type: Option<ShellType>,
     exit_code: Option<i32>,
+    is_powershell_script: bool,
     output: &str,
 ) -> Option<&'static str> {
     if shell_type != Some(ShellType::PowerShell) || exit_code.is_none_or(|code| code == 0) {
@@ -253,7 +273,7 @@ pub(crate) fn powershell_script_failure_advisory(
     .iter()
     .any(|needle| lower.contains(needle));
 
-    looks_like_parser_or_quoting_failure.then_some(
+    (!is_powershell_script && looks_like_parser_or_quoting_failure).then_some(
         "Hint: if this failed because of PowerShell quoting or parser handling, retry with `kind: \"powershell_script\"` and `script_body` so Codex encodes the script body instead of nesting quotes.",
     )
 }

@@ -7,19 +7,16 @@ use codex_protocol::items::TurnItem;
 use codex_utils_stream_parser::strip_citations;
 use tokio_util::sync::CancellationToken;
 
-use crate::function_tool::FunctionCallError;
 use crate::parse_turn_item;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::parallel::ToolCallRuntime;
+use crate::tools::router::ToolCallBuildError;
 use crate::tools::router::ToolRouter;
 use codex_memories_read::citations::parse_memory_citation;
 use codex_memories_read::citations::thread_ids_from_memory_citation;
-use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result;
 use codex_protocol::memory_citation::MemoryCitation;
-use codex_protocol::models::FunctionCallOutputBody;
-use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
@@ -388,14 +385,13 @@ pub(crate) async fn handle_output_item_done(
 
             output.last_agent_message = finalized_facts.and_then(|facts| facts.last_agent_message);
         }
-        // The tool request should be answered directly (or was denied); push that response into the transcript.
-        Err(FunctionCallError::RespondToModel(message)) => {
-            let response = ResponseInputItem::FunctionCallOutput {
-                call_id: String::new(),
-                output: FunctionCallOutputPayload {
-                    body: FunctionCallOutputBody::Text(message),
-                    ..Default::default()
-                },
+        // Preserve the tool-search response shape and call ID when argument parsing fails.
+        Err(ToolCallBuildError::ToolSearchArguments { call_id, .. }) => {
+            let response = ResponseInputItem::ToolSearchOutput {
+                call_id,
+                status: "incomplete".to_string(),
+                execution: "client".to_string(),
+                tools: Vec::new(),
             };
             record_completed_response_item(ctx.sess.as_ref(), ctx.turn_context.as_ref(), &item)
                 .await;
@@ -409,10 +405,6 @@ pub(crate) async fn handle_output_item_done(
             }
 
             output.needs_follow_up = true;
-        }
-        // A fatal error occurred; surface it back into history.
-        Err(FunctionCallError::Fatal(message)) => {
-            return Err(CodexErr::Fatal(message));
         }
     }
 

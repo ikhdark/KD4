@@ -518,6 +518,95 @@ async fn reconstruct_history_rollback_keeps_history_and_metadata_in_sync_for_inc
 }
 
 #[tokio::test]
+async fn reconstruct_history_rollback_discards_checkpoint_without_truncating_surviving_history() {
+    let (session, turn_context) = make_session_and_context().await;
+    let surviving_context_item = turn_context.to_turn_context_item();
+    let mut rolled_back_context_item = surviving_context_item.clone();
+    rolled_back_context_item.turn_id = Some("rolled-back-compaction-turn".to_string());
+    rolled_back_context_item.model = "rolled-back-model".to_string();
+    let rolled_back_turn_id = rolled_back_context_item
+        .turn_id
+        .clone()
+        .expect("rolled-back turn context should have turn_id");
+    let surviving_user = user_message("surviving user");
+    let surviving_assistant = assistant_message("surviving assistant");
+    let surviving_world_state = json!({"test": {"environment": "surviving"}});
+    let mut rollout_items = completed_user_turn_rollout(
+        surviving_context_item.clone(),
+        vec![
+            RolloutItem::WorldState(WorldStateItem::full(surviving_world_state.clone())),
+            RolloutItem::ResponseItem(surviving_user.clone()),
+            RolloutItem::ResponseItem(surviving_assistant.clone()),
+        ],
+    );
+    rollout_items.extend([
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: rolled_back_turn_id,
+                trace_id: None,
+                started_at: None,
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                client_id: None,
+                message: "rolled-back user".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+                ..Default::default()
+            },
+        )),
+        RolloutItem::TurnContext(rolled_back_context_item),
+        RolloutItem::WorldState(WorldStateItem::patch(json!({
+            "test": {"environment": "rolled-back"}
+        }))),
+        RolloutItem::ResponseItem(user_message("rolled-back history")),
+        RolloutItem::Compacted(CompactedItem {
+            message: String::new(),
+            replacement_history: Some(Vec::new()),
+            window_number: Some(1),
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )),
+    ]);
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(
+        reconstructed.history,
+        vec![surviving_user, surviving_assistant]
+    );
+    assert_eq!(
+        reconstructed.previous_turn_settings,
+        Some(PreviousTurnSettings {
+            model: turn_context.model_info.slug.clone(),
+            comp_hash: None,
+            realtime_active: Some(turn_context.realtime_active),
+        })
+    );
+    assert_eq!(
+        serde_json::to_value(reconstructed.reference_context_item)
+            .expect("serialize reconstructed reference context item"),
+        serde_json::to_value(Some(surviving_context_item))
+            .expect("serialize expected reference context item")
+    );
+    assert_eq!(
+        serde_json::to_value(reconstructed.world_state_baseline)
+            .expect("serialize reconstructed world state"),
+        surviving_world_state
+    );
+}
+
+#[tokio::test]
 async fn reconstruct_history_rollback_skips_non_user_turns_for_history_and_metadata() {
     let (session, turn_context) = make_session_and_context().await;
     let first_context_item = turn_context.to_turn_context_item();
@@ -898,6 +987,8 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
         .clone()
         .expect("turn context should have turn_id");
     let incomplete_turn_id = "incomplete-compacted-user-turn".to_string();
+    let surviving_user = user_message("surviving user message");
+    let surviving_assistant = assistant_message("surviving assistant message");
 
     let rollout_items = vec![
         RolloutItem::EventMsg(EventMsg::TurnStarted(
@@ -920,6 +1011,8 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
             },
         )),
         RolloutItem::TurnContext(previous_context_item.clone()),
+        RolloutItem::ResponseItem(surviving_user.clone()),
+        RolloutItem::ResponseItem(surviving_assistant.clone()),
         RolloutItem::EventMsg(EventMsg::TurnComplete(
             codex_protocol::protocol::TurnCompleteEvent {
                 turn_id: previous_turn_id,
@@ -985,6 +1078,10 @@ async fn record_initial_history_resumed_rollback_drops_incomplete_user_turn_comp
         serde_json::to_value(Some(previous_context_item))
             .expect("serialize expected reference context item")
     );
+    assert_eq!(
+        session.state.lock().await.clone_history().raw_items(),
+        &[surviving_user, surviving_assistant]
+    );
 }
 
 #[tokio::test]
@@ -1048,6 +1145,66 @@ async fn reconstruct_history_restores_initial_window_from_session_meta() {
         },
         git: None,
     })];
+
+    let reconstructed = session
+        .reconstruct_history_from_rollout(&turn_context, &rollout_items)
+        .await;
+
+    assert_eq!(reconstructed.window_number, 0);
+    assert_eq!(reconstructed.first_window_id, Some(initial_window_id));
+    assert_eq!(reconstructed.previous_window_id, None);
+    assert_eq!(reconstructed.window_id, Some(initial_window_id));
+}
+
+#[tokio::test]
+async fn reconstruct_history_rollback_ignores_discarded_legacy_compaction_for_window_fallback() {
+    let (session, turn_context) = make_session_and_context().await;
+    let thread_id = ThreadId::default();
+    let initial_window_id = Uuid::now_v7();
+    let rolled_back_turn_id = "rolled-back-legacy-compaction".to_string();
+    let rollout_items = vec![
+        RolloutItem::SessionMeta(SessionMetaLine {
+            meta: SessionMeta {
+                session_id: thread_id.into(),
+                id: thread_id,
+                context_window: Some(SessionContextWindow {
+                    window_id: initial_window_id.to_string(),
+                }),
+                ..SessionMeta::default()
+            },
+            git: None,
+        }),
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: rolled_back_turn_id,
+                trace_id: None,
+                started_at: None,
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                client_id: None,
+                message: "rolled-back user".to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+                ..Default::default()
+            },
+        )),
+        RolloutItem::Compacted(CompactedItem {
+            message: "legacy summary".to_string(),
+            replacement_history: Some(Vec::new()),
+            window_number: None,
+            first_window_id: None,
+            previous_window_id: None,
+            window_id: None,
+        }),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+            codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+        )),
+    ];
 
     let reconstructed = session
         .reconstruct_history_from_rollout(&turn_context, &rollout_items)

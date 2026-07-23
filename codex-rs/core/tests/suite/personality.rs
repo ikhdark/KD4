@@ -41,6 +41,7 @@ use wiremock::MockServer;
 const LOCAL_FRIENDLY_TEMPLATE: &str =
     "You optimize for team morale and being a supportive teammate as much as code quality.";
 const LOCAL_PRAGMATIC_TEMPLATE: &str = "You are a deeply pragmatic, effective software engineer.";
+const PERSONALITY_RESET_TEXT: &str = "The previously requested personality no longer applies. No personality-specific communication style is currently active.";
 
 fn read_only_text_turn(
     test: &TestCodex,
@@ -364,6 +365,102 @@ async fn user_turn_personality_some_adds_update_message() -> anyhow::Result<()> 
     assert!(
         personality_text.contains(LOCAL_FRIENDLY_TEMPLATE),
         "expected personality update to include the local pragmatic template, got: {personality_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn user_turn_personality_none_resets_previous_update_message() -> anyhow::Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let resp_mock = mount_sse_sequence(
+        &server,
+        vec![
+            sse_completed("resp-1"),
+            sse_completed("resp-2"),
+            sse_completed("resp-3"),
+        ],
+    )
+    .await;
+    let mut builder = test_codex()
+        .with_model("exp-codex-personality")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Personality)
+                .expect("test config should allow feature update");
+        });
+    let test = builder.build(&server).await?;
+
+    test.codex
+        .submit(read_only_text_turn(
+            &test,
+            "hello 1",
+            test.session_configured.model.clone(),
+            test.config.permissions.approval_policy.value(),
+        ))
+        .await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    core_test_support::submit_thread_settings(
+        &test.codex,
+        codex_protocol::protocol::ThreadSettingsOverrides {
+            personality: Some(Personality::Friendly),
+            ..Default::default()
+        },
+    )
+    .await?;
+    test.codex
+        .submit(read_only_text_turn(
+            &test,
+            "hello 2",
+            test.session_configured.model.clone(),
+            test.config.permissions.approval_policy.value(),
+        ))
+        .await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    core_test_support::submit_thread_settings(
+        &test.codex,
+        codex_protocol::protocol::ThreadSettingsOverrides {
+            personality: Some(Personality::None),
+            ..Default::default()
+        },
+    )
+    .await?;
+    test.codex
+        .submit(read_only_text_turn(
+            &test,
+            "hello 3",
+            test.session_configured.model.clone(),
+            test.config.permissions.approval_policy.value(),
+        ))
+        .await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = resp_mock.requests();
+    assert_eq!(requests.len(), 3, "expected three requests");
+    let developer_texts = requests
+        .last()
+        .expect("expected personality reset request")
+        .message_input_texts("developer");
+    let friendly_index = developer_texts
+        .iter()
+        .position(|text| {
+            text.contains("<personality_spec>") && text.contains(LOCAL_FRIENDLY_TEMPLATE)
+        })
+        .expect("expected prior friendly personality update");
+    let reset_index = developer_texts
+        .iter()
+        .position(|text| {
+            text.contains("<personality_spec>") && text.contains(PERSONALITY_RESET_TEXT)
+        })
+        .expect("expected personality reset update");
+    assert!(
+        reset_index > friendly_index,
+        "reset must supersede the prior personality block"
     );
 
     Ok(())

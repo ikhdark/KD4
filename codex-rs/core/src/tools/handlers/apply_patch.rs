@@ -39,6 +39,7 @@ use crate::tools::sandboxing::ToolCtx;
 use codex_apply_patch::ApplyPatchAction;
 use codex_apply_patch::ApplyPatchFileChange;
 use codex_apply_patch::Hunk;
+use codex_apply_patch::ParseError;
 use codex_apply_patch::StreamingPatchParser;
 use codex_exec_server::ExecutorFileSystem;
 use codex_features::Feature;
@@ -72,8 +73,9 @@ impl ApplyPatchHandler {
 #[derive(Default)]
 struct ApplyPatchArgumentDiffConsumer {
     parser: StreamingPatchParser,
+    parse_error: Option<ParseError>,
     last_sent_at: Option<Instant>,
-    pending: Option<PatchApplyUpdatedEvent>,
+    pending: Option<String>,
 }
 
 impl ToolArgumentDiffConsumer for ApplyPatchArgumentDiffConsumer {
@@ -103,24 +105,36 @@ impl ToolArgumentDiffConsumer for ApplyPatchArgumentDiffConsumer {
 
 impl ApplyPatchArgumentDiffConsumer {
     fn push_delta(&mut self, call_id: String, delta: &str) -> Option<PatchApplyUpdatedEvent> {
-        let hunks = self.parser.push_delta(delta).ok()?;
-        if hunks.is_empty() {
+        if self.parse_error.is_some() {
             return None;
         }
-        let changes = convert_apply_patch_hunks_to_protocol(&hunks);
-        let event = PatchApplyUpdatedEvent { call_id, changes };
+        match self.parser.push_delta_in_place(delta) {
+            Ok(()) => {}
+            Err(err) => {
+                self.parse_error = Some(err);
+                self.pending = None;
+                return None;
+            }
+        }
+        if self.parser.hunks().is_empty() {
+            return None;
+        }
+
         let now = Instant::now();
         match self.last_sent_at {
             Some(last_sent_at)
                 if now.duration_since(last_sent_at) < APPLY_PATCH_ARGUMENT_DIFF_BUFFER_INTERVAL =>
             {
-                self.pending = Some(event);
+                self.pending = Some(call_id);
                 None
             }
             Some(_) | None => {
                 self.pending = None;
                 self.last_sent_at = Some(now);
-                Some(event)
+                Some(PatchApplyUpdatedEvent {
+                    call_id,
+                    changes: convert_apply_patch_hunks_to_protocol(self.parser.hunks()),
+                })
             }
         }
     }
@@ -128,11 +142,25 @@ impl ApplyPatchArgumentDiffConsumer {
     fn finish_update_on_complete(
         &mut self,
     ) -> Result<Option<PatchApplyUpdatedEvent>, FunctionCallError> {
-        self.parser.finish().map_err(|err| {
-            FunctionCallError::RespondToModel(format!("failed to parse apply_patch: {err}"))
-        })?;
+        if let Some(err) = &self.parse_error {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "failed to parse apply_patch: {err}"
+            )));
+        }
 
-        let event = self.pending.take();
+        if let Err(err) = self.parser.finish_in_place() {
+            self.pending = None;
+            self.parse_error = Some(err);
+            let err = self.parse_error.as_ref().expect("parse error was stored");
+            return Err(FunctionCallError::RespondToModel(format!(
+                "failed to parse apply_patch: {err}"
+            )));
+        }
+
+        let event = self.pending.take().map(|call_id| PatchApplyUpdatedEvent {
+            call_id,
+            changes: convert_apply_patch_hunks_to_protocol(self.parser.hunks()),
+        });
         if event.is_some() {
             self.last_sent_at = Some(Instant::now());
         }
@@ -560,8 +588,14 @@ pub(crate) async fn intercept_apply_patch(
     tool_name: &str,
 ) -> Result<Option<FunctionToolOutput>, FunctionCallError> {
     let sandbox = turn.file_system_sandbox_context(/*additional_permissions*/ None, cwd);
-    match codex_apply_patch::maybe_parse_apply_patch_verified(command, cwd, fs, Some(&sandbox))
-        .await
+    match codex_apply_patch::maybe_parse_apply_patch_verified_for_environment(
+        command,
+        cwd,
+        fs,
+        Some(&sandbox),
+        &turn_environment.environment_id,
+    )
+    .await
     {
         codex_apply_patch::MaybeApplyPatchVerified::Body(changes) => {
             let (approval_keys, effective_additional_permissions, file_system_sandbox_policy) =

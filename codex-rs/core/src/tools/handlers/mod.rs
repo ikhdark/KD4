@@ -62,6 +62,7 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnEnvironment;
 pub(crate) use crate::tools::code_mode::CodeModeExecuteHandler;
 pub(crate) use crate::tools::code_mode::CodeModeWaitHandler;
+use crate::tools::handlers::command_shape::CommandInvocation;
 pub use apply_patch::ApplyPatchHandler;
 use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -132,19 +133,26 @@ fn rewrite_function_arguments(
     })
 }
 
-fn rewrite_function_script_argument(
+fn rewrite_function_command_argument(
     arguments: &str,
     tool_name: &str,
     field_name: &str,
+    command_invocation: &CommandInvocation,
     value: &str,
 ) -> Result<String, FunctionCallError> {
-    rewrite_function_arguments(arguments, tool_name, |arguments| {
-        arguments.insert(field_name.to_string(), Value::String(value.to_string()));
-        arguments.remove("kind");
-        arguments.remove("program");
-        arguments.remove("args");
-        arguments.remove("script_body");
-    })
+    match command_invocation.with_updated_hook_command(tool_name, value)? {
+        CommandInvocation::Script(script) => {
+            rewrite_function_arguments(arguments, tool_name, |arguments| {
+                arguments.insert(field_name.to_string(), Value::String(script));
+            })
+        }
+        CommandInvocation::PowerShellScript(script_body) => {
+            rewrite_function_arguments(arguments, tool_name, |arguments| {
+                arguments.insert("script_body".to_string(), Value::String(script_body));
+            })
+        }
+        CommandInvocation::Argv { .. } => Ok(arguments.to_string()),
+    }
 }
 
 fn parse_arguments_with_base_path<T>(

@@ -197,6 +197,55 @@ fn diff_consumer_sends_next_update_after_buffer_interval() {
 }
 
 #[test]
+fn diff_consumer_permanently_suppresses_progress_after_parse_error() {
+    let mut consumer = ApplyPatchArgumentDiffConsumer::default();
+    assert!(
+        consumer
+            .push_delta("call-1".to_string(), "*** Begin Patch\n")
+            .is_none()
+    );
+    assert!(
+        consumer
+            .push_delta("call-1".to_string(), "*** Add File: hello.txt\n+hello",)
+            .is_some()
+    );
+    consumer.last_sent_at = Some(std::time::Instant::now());
+    assert!(
+        consumer
+            .push_delta("call-1".to_string(), "\n+world")
+            .is_none()
+    );
+    assert!(consumer.pending.is_some());
+
+    assert!(
+        consumer
+            .push_delta("call-1".to_string(), "\ninvalid line\n")
+            .is_none()
+    );
+    assert!(consumer.pending.is_none());
+
+    consumer.last_sent_at =
+        Some(std::time::Instant::now() - APPLY_PATCH_ARGUMENT_DIFF_BUFFER_INTERVAL);
+    assert!(
+        consumer
+            .push_delta(
+                "call-1".to_string(),
+                "*** Add File: later.txt\n+later\n*** Update File: hello.txt\n@@\n-hello\n+goodbye\n*** End Patch",
+            )
+            .is_none()
+    );
+    assert!(consumer.pending.is_none());
+    let Err(FunctionCallError::RespondToModel(message)) = consumer.finish_update_on_complete()
+    else {
+        panic!("expected the original streaming parse failure");
+    };
+    assert_eq!(
+        message,
+        "failed to parse apply_patch: invalid hunk at line 5, 'invalid line' is not a valid hunk header. Valid hunk headers: '*** Add File: {path}', '*** Delete File: {path}', '*** Update File: {path}'"
+    );
+}
+
+#[test]
 fn reconcile_environment_id_requires_selection_when_enabled() {
     assert_eq!(
         require_environment_id(Some("remote"), /*allow_environment_id*/ false),
@@ -209,6 +258,77 @@ fn reconcile_environment_id_requires_selection_when_enabled() {
             /*parsed_environment_id*/ None, /*allow_environment_id*/ true
         ),
         Ok(None)
+    );
+}
+
+#[tokio::test]
+async fn intercepted_patch_rejects_mismatched_environment_without_mutation() {
+    let (session, mut turn) = make_session_and_context().await;
+    let turn_environment = turn
+        .environments
+        .primary()
+        .expect("primary environment")
+        .clone();
+    let selected_environment_id = turn_environment.environment_id.clone();
+    let cwd = turn_environment.cwd().clone();
+    let selected_target_path = cwd
+        .to_abs_path()
+        .expect("local environment cwd")
+        .join("phase31-environment-mismatch.txt");
+    let other_environment_dir = TempDir::new().expect("other environment cwd");
+    let other_environment_cwd = PathUri::from_abs_path(&other_environment_dir.path().abs());
+    let other_environment = TurnEnvironment::new(
+        "phase31-environment-b".to_string(),
+        Arc::new(codex_exec_server::Environment::default_for_tests()),
+        other_environment_cwd.clone(),
+        /*shell*/ None,
+    );
+    let patch_environment_id = other_environment.environment_id.clone();
+    let other_target_path = other_environment_cwd
+        .to_abs_path()
+        .expect("other local environment cwd")
+        .join("phase31-environment-mismatch.txt");
+    assert_ne!(
+        selected_target_path.parent(),
+        other_target_path.parent(),
+        "test environments must have distinct cwds"
+    );
+    turn.environments.turn_environments.push(other_environment);
+    let patch = format!(
+        "*** Begin Patch\n*** Environment ID: {patch_environment_id}\n*** Add File: phase31-environment-mismatch.txt\n+must not be written\n*** End Patch"
+    );
+    let command = vec!["apply_patch".to_string(), patch];
+    let fs = turn_environment.environment.get_filesystem();
+
+    let result = intercept_apply_patch(
+        &command,
+        &cwd,
+        fs.as_ref(),
+        turn_environment,
+        Arc::new(session),
+        Arc::new(turn),
+        /*tracker*/ None,
+        "phase31-call",
+        "shell",
+    )
+    .await;
+
+    let Err(FunctionCallError::RespondToModel(message)) = result else {
+        panic!("expected an environment mismatch error");
+    };
+    assert_eq!(
+        message,
+        format!(
+            "apply_patch verification failed: patch environment id `{patch_environment_id}` does not match selected shell environment `{selected_environment_id}`"
+        )
+    );
+    assert!(
+        !selected_target_path.exists(),
+        "mismatched patch must not mutate selected environment A"
+    );
+    assert!(
+        !other_target_path.exists(),
+        "mismatched patch must not redirect mutation to environment B"
     );
 }
 

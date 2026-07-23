@@ -23,6 +23,7 @@ fn fish_fallback_to_zsh() {
 }
 
 #[test]
+#[cfg(unix)]
 fn detects_bash() {
     let bash_shell = get_shell(ShellType::Bash, /*path*/ None).unwrap();
     let shell_path = bash_shell.shell_path;
@@ -34,6 +35,7 @@ fn detects_bash() {
 }
 
 #[test]
+#[cfg(unix)]
 fn detects_sh() {
     let sh_shell = get_shell(ShellType::Sh, /*path*/ None).unwrap();
     let shell_path = sh_shell.shell_path;
@@ -144,6 +146,7 @@ fn derive_exec_args() {
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn test_current_shell_detects_zsh() {
     let shell = Command::new("sh")
         .arg("-c")
@@ -164,11 +167,8 @@ async fn test_current_shell_detects_zsh() {
 }
 
 #[tokio::test]
+#[cfg(windows)]
 async fn detects_powershell_as_default() {
-    if !cfg!(windows) {
-        return;
-    }
-
     let powershell_shell = default_user_shell();
     let shell_path = powershell_shell.shell_path;
 
@@ -176,11 +176,8 @@ async fn detects_powershell_as_default() {
 }
 
 #[test]
+#[cfg(windows)]
 fn finds_powershell() {
-    if !cfg!(windows) {
-        return;
-    }
-
     let powershell_shell = get_shell(ShellType::PowerShell, /*path*/ None).unwrap();
     let shell_path = powershell_shell.shell_path;
 

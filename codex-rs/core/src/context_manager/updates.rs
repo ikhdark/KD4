@@ -71,12 +71,16 @@ fn build_collaboration_mode_update_item(
 
     let prev = previous?;
     if prev.collaboration_mode.as_ref() != Some(&next.collaboration_mode) {
-        // If the next mode has empty developer instructions, this returns None and we emit no
-        // update, so prior collaboration instructions remain in the prompt history.
-        Some(
-            CollaborationModeInstructions::from_collaboration_mode(&next.collaboration_mode)?
-                .render(),
-        )
+        match CollaborationModeInstructions::from_collaboration_mode(&next.collaboration_mode) {
+            Some(instructions) => Some(instructions.render()),
+            None if prev.collaboration_mode.as_ref().is_some_and(|mode| {
+                CollaborationModeInstructions::from_collaboration_mode(mode).is_some()
+            }) =>
+            {
+                Some(CollaborationModeInstructions::reset().render())
+            }
+            None => None,
+        }
     } else {
         None
     }
@@ -101,6 +105,18 @@ fn build_multi_agent_mode_update_item(
     }
 }
 
+fn build_realtime_start_item(next: &TurnContext) -> String {
+    if let Some(instructions) = next
+        .config
+        .experimental_realtime_start_instructions
+        .as_deref()
+    {
+        RealtimeStartWithInstructions::new(instructions).render()
+    } else {
+        RealtimeStartInstructions.render()
+    }
+}
+
 pub(crate) fn build_realtime_update_item(
     previous: Option<&TurnContextItem>,
     previous_turn_settings: Option<&PreviousTurnSettings>,
@@ -111,17 +127,7 @@ pub(crate) fn build_realtime_update_item(
         next.realtime_active,
     ) {
         (Some(true), false) => Some(RealtimeEndInstructions::new("inactive").render()),
-        (Some(false), true) | (None, true) => Some(
-            if let Some(instructions) = next
-                .config
-                .experimental_realtime_start_instructions
-                .as_deref()
-            {
-                RealtimeStartWithInstructions::new(instructions).render()
-            } else {
-                RealtimeStartInstructions.render()
-            },
-        ),
+        (Some(false), true) | (None, true) => Some(build_realtime_start_item(next)),
         (Some(true), true) | (Some(false), false) => None,
         (None, false) => previous_turn_settings
             .and_then(|settings| settings.realtime_active)
@@ -135,7 +141,11 @@ pub(crate) fn build_initial_realtime_item(
     previous_turn_settings: Option<&PreviousTurnSettings>,
     next: &TurnContext,
 ) -> Option<String> {
-    build_realtime_update_item(previous, previous_turn_settings, next)
+    if next.realtime_active {
+        Some(build_realtime_start_item(next))
+    } else {
+        build_realtime_update_item(previous, previous_turn_settings, next)
+    }
 }
 
 fn build_personality_update_item(
@@ -151,15 +161,21 @@ fn build_personality_update_item(
         return None;
     }
 
-    if let Some(personality) = next.personality
-        && next.personality != previous.personality
-    {
-        let model_info = &next.model_info;
-        let personality_message = personality_message_for(model_info, personality);
-        personality_message.map(|message| PersonalitySpecInstructions::new(message).render())
-    } else {
-        None
+    let personality = next.personality?;
+    if Some(personality) == previous.personality {
+        return None;
     }
+
+    if personality == Personality::None {
+        return previous
+            .personality
+            .filter(|previous| *previous != Personality::None)
+            .map(|_| PersonalitySpecInstructions::reset().render());
+    }
+
+    let model_info = &next.model_info;
+    let personality_message = personality_message_for(model_info, personality);
+    personality_message.map(|message| PersonalitySpecInstructions::new(message).render())
 }
 
 pub(crate) fn personality_message_for(

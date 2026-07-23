@@ -23,8 +23,8 @@ harness maintenance is actually requested.
 
 Durable policy, templates, environment source, and fork-local skills are
 reviewable source. Generated runs, verification output, app backups, patched-app
-trees, and Wiring Guard sessions are local state; the exact boundary is owned by
-[`AGENTS.md`](AGENTS.md).
+trees, and specialist-tool sessions are local state; the exact boundary is owned
+by [`AGENTS.md`](AGENTS.md).
 
 Project-local runtime configuration may be added as `.codex/config.toml` only
 when this checkout needs an explicit setting. Its absence is intentional and is

@@ -3,7 +3,7 @@ use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
-use codex_protocol::models::ShellCommandToolCallParams;
+use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -43,26 +43,43 @@ mod shell_command;
 pub use shell_command::ShellCommandHandler;
 pub(crate) use shell_command::ShellCommandHandlerOptions;
 
+#[derive(Debug, Deserialize)]
+struct ShellCommandHookArgs {
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    program: Option<String>,
+    #[serde(default)]
+    args: Option<Vec<String>>,
+    #[serde(default)]
+    script_body: Option<String>,
+}
+
+fn parse_shell_command_hook_invocation(
+    arguments: &str,
+) -> Result<CommandInvocation, FunctionCallError> {
+    let args: ShellCommandHookArgs = parse_arguments(arguments)?;
+    CommandInvocation::from_parts(
+        "shell_command",
+        "command",
+        args.command.as_deref(),
+        args.kind.as_deref(),
+        args.program.as_deref(),
+        args.args.as_deref(),
+        args.script_body.as_deref(),
+    )
+}
+
 fn shell_command_payload_command(payload: &ToolPayload) -> Option<String> {
     let ToolPayload::Function { arguments } = payload else {
         return None;
     };
 
-    parse_arguments::<ShellCommandToolCallParams>(arguments)
+    parse_shell_command_hook_invocation(arguments)
         .ok()
-        .and_then(|params| {
-            CommandInvocation::from_parts(
-                "shell_command",
-                "command",
-                params.command.as_deref(),
-                params.kind.as_deref(),
-                params.program.as_deref(),
-                params.args.as_deref(),
-                params.script_body.as_deref(),
-            )
-            .ok()
-            .map(|command| command.display_command())
-        })
+        .map(|command| command.display_command())
 }
 
 pub(super) struct RunExecLikeArgs {
@@ -72,6 +89,7 @@ pub(super) struct RunExecLikeArgs {
     pub(super) hook_command: String,
     pub(super) safety_command: Vec<String>,
     pub(super) shell_type: Option<ShellType>,
+    pub(super) is_powershell_script: bool,
     pub(super) additional_permissions: Option<AdditionalPermissionProfile>,
     pub(super) prefix_rule: Option<Vec<String>>,
     pub(super) session: Arc<crate::session::session::Session>,
@@ -170,6 +188,7 @@ async fn run_exec_like_with_exit_code_inner(
         hook_command,
         safety_command,
         shell_type,
+        is_powershell_script,
         additional_permissions,
         prefix_rule,
         session,
@@ -408,6 +427,7 @@ async fn run_exec_like_with_exit_code_inner(
         powershell_script_failure_advisory(
             shell_type,
             Some(output.exit_code),
+            is_powershell_script,
             &output.aggregated_output.text,
         )
     });
@@ -469,7 +489,7 @@ fn retry_exit_code(out: &Result<ExecToolCallOutput, ToolError>) -> Option<i32> {
             Some(output.exit_code)
         }
         Err(ToolError::Codex(_)) => Some(-1),
-        Err(ToolError::Rejected(message)) if message == "rejected by user" => None,
+        Err(ToolError::Denied(_)) => None,
         Err(ToolError::Rejected(_)) => Some(-1),
     }
 }
@@ -483,7 +503,7 @@ fn clone_output_bearing_result(
         | Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output, .. }))) => {
             Some((**output).clone())
         }
-        Err(ToolError::Codex(_)) | Err(ToolError::Rejected(_)) => None,
+        Err(ToolError::Codex(_)) | Err(ToolError::Denied(_)) | Err(ToolError::Rejected(_)) => None,
     }
 }
 

@@ -268,6 +268,38 @@ fn truncates_rollout_from_start_applies_thread_rollback_markers() {
     );
 }
 
+#[test]
+fn truncates_rollout_from_start_preserves_users_before_rolled_back_inter_agent_turn() {
+    let rollout_items = vec![
+        RolloutItem::ResponseItem(user_msg("u1")),
+        RolloutItem::ResponseItem(assistant_msg("a1")),
+        RolloutItem::ResponseItem(inter_agent_msg(
+            "triggered task",
+            /*trigger_turn*/ true,
+        )),
+        RolloutItem::ResponseItem(assistant_msg("a2")),
+        RolloutItem::EventMsg(EventMsg::ThreadRolledBack(ThreadRolledBackEvent {
+            num_turns: 1,
+        })),
+        RolloutItem::ResponseItem(user_msg("u2")),
+        RolloutItem::ResponseItem(assistant_msg("a3")),
+    ];
+
+    assert_eq!(
+        user_message_positions_in_rollout(&rollout_items),
+        vec![0, 5]
+    );
+
+    let truncated = truncate_rollout_before_nth_user_message_from_start(
+        &rollout_items,
+        /*n_from_start*/ 1,
+    );
+    assert_eq!(
+        serde_json::to_value(&truncated).unwrap(),
+        serde_json::to_value(&rollout_items[..5]).unwrap()
+    );
+}
+
 #[tokio::test]
 async fn ignores_session_prefix_messages_when_truncating_rollout_from_start() {
     let (session, turn_context) = make_session_and_context().await;

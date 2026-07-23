@@ -29,7 +29,13 @@ pub const MAX_DIMENSION: u32 = 2048;
 /// This is a high sanity guard against pathological inputs, not a protocol
 /// requirement or target upload size.
 pub const MAX_PROMPT_IMAGE_INPUT_BYTES: usize = 1024 * 1024 * 1024;
-const MAX_IMAGE_CACHE_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum source byte length accepted by local tools before prompt-image processing.
+///
+/// Source bytes can coexist with a base64 representation and downstream copies,
+/// so this memory-safety bound is intentionally tighter than the high sanity
+/// guard for already-materialized prompt input representations.
+pub const MAX_PROMPT_IMAGE_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_IMAGE_CACHE_BYTES: usize = MAX_PROMPT_IMAGE_SOURCE_BYTES;
 
 pub mod error;
 

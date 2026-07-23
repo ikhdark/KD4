@@ -31,13 +31,16 @@ use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 use codex_utils_output_truncation::truncate_text;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
+use std::sync::Arc;
 use std::sync::LazyLock;
 
 /// Transcript of thread history
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ContextManager {
     /// The oldest items are at the beginning of the vector.
-    items: Vec<ResponseItem>,
+    /// Snapshots share the vector until a caller needs to mutate it, avoiding
+    /// deep copies while session state is locked.
+    items: Arc<Vec<ResponseItem>>,
     /// Bumped whenever history is rewritten, such as compaction or rollback.
     history_version: u64,
     token_info: Option<TokenUsageInfo>,
@@ -59,7 +62,7 @@ pub(crate) struct ContextManager {
 impl ContextManager {
     pub(crate) fn new() -> Self {
         Self {
-            items: Vec::new(),
+            items: Arc::new(Vec::new()),
             history_version: 0,
             token_info: TokenUsageInfo::new_or_append(
                 &None, &None, /*model_context_window*/ None,
@@ -130,7 +133,7 @@ impl ContextManager {
             }
 
             let processed = self.process_item(item_ref, policy);
-            self.items.push(processed);
+            Arc::make_mut(&mut self.items).push(processed);
         }
     }
 
@@ -140,7 +143,7 @@ impl ContextManager {
     /// outputs.
     pub(crate) fn for_prompt(mut self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
         self.normalize_history(input_modalities);
-        self.items
+        Arc::unwrap_or_clone(self.items)
     }
 
     /// Returns raw items in the history.
@@ -150,6 +153,11 @@ impl ContextManager {
 
     /// Returns raw items in the history and consumes the snapshot.
     pub(crate) fn into_raw_items(self) -> Vec<ResponseItem> {
+        Arc::unwrap_or_clone(self.items)
+    }
+
+    /// Returns the immutable raw-item snapshot without cloning its contents.
+    pub(crate) fn into_shared_raw_items(self) -> Arc<Vec<ResponseItem>> {
         self.items
     }
 
@@ -172,11 +180,17 @@ impl ContextManager {
         &self,
         base_instructions: &BaseInstructions,
     ) -> Option<i64> {
+        Self::estimate_items_token_count_with_base_instructions(self.raw_items(), base_instructions)
+    }
+
+    pub(crate) fn estimate_items_token_count_with_base_instructions(
+        items: &[ResponseItem],
+        base_instructions: &BaseInstructions,
+    ) -> Option<i64> {
         let base_tokens =
             i64::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i64::MAX);
 
-        let items_tokens = self
-            .items
+        let items_tokens = items
             .iter()
             .map(estimate_item_token_count)
             .fold(0i64, i64::saturating_add);
@@ -188,17 +202,18 @@ impl ContextManager {
         if !self.items.is_empty() {
             // Remove the oldest item (front of the list). Items are ordered from
             // oldest → newest, so index 0 is the first entry recorded.
-            let removed = self.items.remove(0);
+            let items = Arc::make_mut(&mut self.items);
+            let removed = items.remove(0);
             // If the removed item participates in a call/output pair, also remove
             // its corresponding counterpart to keep the invariants intact without
             // running a full normalization pass.
-            normalize::remove_corresponding_for(&mut self.items, &removed);
+            normalize::remove_corresponding_for(items, &removed);
             self.world_state_baseline = None;
         }
     }
 
     pub(crate) fn replace(&mut self, items: Vec<ResponseItem>) {
-        self.items = items;
+        self.items = Arc::new(items);
         self.history_version = self.history_version.saturating_add(1);
         self.world_state_baseline = None;
     }
@@ -206,35 +221,40 @@ impl ContextManager {
     /// Replace image content in the last turn if it originated from a tool output.
     /// Returns true when a tool image was replaced, false otherwise.
     pub(crate) fn replace_last_turn_images(&mut self, placeholder: &str) -> bool {
-        let Some(index) = self.items.iter().rposition(|item| {
-            matches!(item, ResponseItem::FunctionCallOutput { .. }) || is_user_turn_boundary(item)
-        }) else {
+        let Some(turn_start) = self.items.iter().rposition(is_user_turn_boundary) else {
             return false;
         };
 
-        match &mut self.items[index] {
-            ResponseItem::FunctionCallOutput { output, .. } => {
-                let Some(content_items) = output.content_items_mut() else {
-                    return false;
-                };
-                let mut replaced = false;
-                let placeholder = placeholder.to_string();
-                for item in content_items.iter_mut() {
-                    if matches!(item, FunctionCallOutputContentItem::InputImage { .. }) {
-                        *item = FunctionCallOutputContentItem::InputText {
-                            text: placeholder.clone(),
-                        };
-                        replaced = true;
-                    }
+        let mut replaced = false;
+        let placeholder = placeholder.to_string();
+        for item in Arc::make_mut(&mut self.items)
+            .iter_mut()
+            .skip(turn_start.saturating_add(1))
+        {
+            let output = match item {
+                ResponseItem::FunctionCallOutput { output, .. }
+                | ResponseItem::CustomToolCallOutput { output, .. } => output,
+                _ => continue,
+            };
+            let Some(content_items) = output.content_items_mut() else {
+                continue;
+            };
+            for content_item in content_items {
+                if matches!(
+                    content_item,
+                    FunctionCallOutputContentItem::InputImage { .. }
+                ) {
+                    *content_item = FunctionCallOutputContentItem::InputText {
+                        text: placeholder.clone(),
+                    };
+                    replaced = true;
                 }
-                if replaced {
-                    self.history_version = self.history_version.saturating_add(1);
-                }
-                replaced
             }
-            ResponseItem::Message { .. } => false,
-            _ => false,
         }
+        if replaced {
+            self.history_version = self.history_version.saturating_add(1);
+        }
+        replaced
     }
 
     /// Drop the last `num_turns` instruction turns from this history.
@@ -261,7 +281,7 @@ impl ContextManager {
         let snapshot = self.items.clone();
         let user_positions = user_message_positions(&snapshot);
         let Some(&first_instruction_turn_idx) = user_positions.first() else {
-            self.replace(snapshot);
+            self.replace(Arc::unwrap_or_clone(snapshot));
             return;
         };
 
@@ -357,14 +377,16 @@ impl ContextManager {
     /// 2. every output has a corresponding call entry
     /// 3. when images are unsupported, image content is stripped from messages and tool outputs
     fn normalize_history(&mut self, input_modalities: &[InputModality]) {
+        let items = Arc::make_mut(&mut self.items);
+
         // all function/tool calls must have a corresponding output
-        normalize::ensure_call_outputs_present(&mut self.items);
+        normalize::ensure_call_outputs_present(items);
 
         // all outputs must have a corresponding function/tool call
-        normalize::remove_orphan_outputs(&mut self.items);
+        normalize::remove_orphan_outputs(items);
 
         // strip images when model does not support them
-        normalize::strip_images_when_unsupported(input_modalities, &mut self.items);
+        normalize::strip_images_when_unsupported(input_modalities, items);
     }
 
     fn process_item(&self, item: &ResponseItem, policy: TruncationPolicy) -> ResponseItem {
@@ -516,7 +538,7 @@ fn estimate_encrypted_function_output_length(encoded_len: usize) -> usize {
     encoded_len.saturating_mul(9).div_ceil(16)
 }
 
-fn estimate_item_token_count(item: &ResponseItem) -> i64 {
+pub(crate) fn estimate_item_token_count(item: &ResponseItem) -> i64 {
     let model_visible_bytes = estimate_response_item_model_visible_bytes(item);
     approx_tokens_from_byte_count_i64(model_visible_bytes)
 }

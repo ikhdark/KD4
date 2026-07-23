@@ -1,6 +1,19 @@
 use super::*;
 use crate::function_tool::FunctionCallError;
+use crate::session::step_context::StepContext;
+use crate::session::tests::make_session_and_context;
+use crate::session::turn_context::TurnEnvironment;
+use crate::tools::context::ToolCallSource;
+use crate::tools::context::ToolInvocation;
+use crate::turn_diff_tracker::TurnDiffTracker;
+use codex_apply_patch::AppliedPatchDelta;
+use codex_exec_server::LOCAL_FS;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use codex_utils_path_uri::PathUri;
 use serde_json::json;
+use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 fn base_args() -> serde_json::Value {
     json!({
@@ -30,6 +43,94 @@ fn structured_process_output(stdout: String, stderr: &str, exit_code: i32) -> Ex
     output.stderr.text = stderr.to_string();
     output.aggregated_output.text = format!("{stdout}{stderr}");
     output
+}
+
+async fn create_verify_local_repo(root: &Path) {
+    tokio::fs::create_dir_all(root.join("scripts"))
+        .await
+        .expect("create scripts dir");
+    tokio::fs::write(root.join("scripts/verify_local.py"), "# fixture")
+        .await
+        .expect("write verifier fixture");
+    tokio::fs::write(root.join("justfile"), "# fixture")
+        .await
+        .expect("write justfile fixture");
+    tokio::fs::write(root.join("kd4_features.toml"), "# fixture")
+        .await
+        .expect("write feature manifest fixture");
+}
+
+async fn task_evidence_fixture() -> (tempfile::TempDir, PathBuf, TaskEvidenceLedger) {
+    let temp = tempfile::tempdir().expect("create task evidence fixture");
+    let repo = temp.path().join("repo");
+    create_verify_local_repo(&repo).await;
+    tokio::fs::write(repo.join("changed.rs"), "before")
+        .await
+        .expect("write changed file");
+    let git = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["init", "--quiet"])
+        .output()
+        .await
+        .expect("git init should run");
+    assert!(
+        git.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&git.stderr)
+    );
+    let ledger = TaskEvidenceLedger::load_or_new(
+        temp.path().join("codex-home"),
+        codex_protocol::ThreadId::new(),
+        &repo,
+    )
+    .await;
+    (temp, repo, ledger)
+}
+
+async fn apply_patch_delta(root: &Path, patch: &str) -> AppliedPatchDelta {
+    let cwd = PathUri::from_host_native_path(root).expect("absolute tempdir path");
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    codex_apply_patch::apply_patch(
+        patch,
+        &cwd,
+        &mut stdout,
+        &mut stderr,
+        LOCAL_FS.as_ref(),
+        /*sandbox*/ None,
+    )
+    .await
+    .expect("patch should apply")
+}
+
+fn configure_two_local_environments(
+    turn: &mut crate::TurnContext,
+    primary_cwd: AbsolutePathBuf,
+    secondary_cwd: AbsolutePathBuf,
+) {
+    let current = turn
+        .environments
+        .turn_environments
+        .first()
+        .cloned()
+        .expect("default local turn environment");
+    let secondary_environment = Arc::clone(&current.environment);
+    let secondary_shell = current.shell.clone();
+    turn.environments.turn_environments[0] = TurnEnvironment::new(
+        current.environment_id,
+        current.environment,
+        PathUri::from_abs_path(&primary_cwd),
+        current.shell,
+    );
+    turn.environments
+        .turn_environments
+        .push(TurnEnvironment::new(
+            "secondary".to_string(),
+            secondary_environment,
+            PathUri::from_abs_path(&secondary_cwd),
+            secondary_shell,
+        ));
 }
 
 #[test]
@@ -173,6 +274,135 @@ fn validation_state_directories_are_unique_and_separate() {
 fn handler_waits_for_shell_runtime_cancellation_cleanup() {
     let handler = VerifyLocalHandler::for_verify_local_environment_id(false);
     assert!(handler.waits_for_runtime_cancellation());
+}
+
+#[tokio::test]
+async fn stale_post_verifier_evidence_fails_output_and_preserves_diff_state() {
+    let (_temp, repo, ledger) = task_evidence_fixture().await;
+    let tracked_delta = apply_patch_delta(
+        &repo,
+        "*** Begin Patch\n*** Update File: changed.rs\n@@\n-before\n+tracked\n*** End Patch",
+    )
+    .await;
+    let tracker = Arc::new(Mutex::new(TurnDiffTracker::with_environment_display_roots(
+        [("primary".to_string(), repo.clone())],
+    )));
+    tracker.lock().await.track_delta("primary", &tracked_delta);
+    assert!(tracker.lock().await.has_unvalidated_mutation());
+    let validation_start = ledger
+        .begin_verify_local_validation()
+        .await
+        .expect("validation start snapshot");
+    let payload = json!({
+        "schema_version": VERIFY_LOCAL_JSON_SCHEMA_VERSION,
+        "producer": VERIFY_LOCAL_JSON_PRODUCER,
+        "mode": "fast",
+        "verdict": "VERIFIED",
+        "scope": {
+            "source": "changed",
+            "active_files": ["changed.rs"],
+            "ignored_dirty_files": [],
+            "stale_reasons": []
+        }
+    });
+    let shell_output =
+        FunctionToolOutput::from_text("generic shell envelope".to_string(), Some(true));
+    let exec_output = structured_process_output(payload.to_string(), "", 0);
+    let (mut output, run) = finalize_verify_local_output(
+        shell_output,
+        Some(&exec_output),
+        Some(exec_output.exit_code),
+        false,
+    );
+    assert_eq!(output.success, Some(true));
+    assert!(run.is_proof_bearing());
+
+    tokio::fs::write(repo.join("changed.rs"), "after")
+        .await
+        .expect("change file after verifier snapshot");
+
+    let proof_accepted = apply_verify_local_evidence_decision(
+        &ledger,
+        &mut output,
+        &run,
+        "fast",
+        Some(&validation_start),
+        &tracker,
+        vec![
+            "just".to_string(),
+            "verify-local".to_string(),
+            "--fast".to_string(),
+            "--json".to_string(),
+        ],
+        "primary",
+    )
+    .await;
+
+    assert!(!proof_accepted);
+    assert_eq!(output.success, Some(false));
+    let text = output.into_text();
+    assert!(text.contains("freshness evidence was rejected"));
+    assert!(text.contains("Rerun verify_local"));
+    assert!(tracker.lock().await.has_unvalidated_mutation());
+}
+
+#[tokio::test]
+async fn mismatched_selected_environment_fails_before_execution_or_evidence_recording() {
+    let temp = tempfile::tempdir().expect("create multi-environment fixture");
+    let primary_repo = temp.path().join("primary");
+    let secondary_repo = temp.path().join("secondary");
+    create_verify_local_repo(&primary_repo).await;
+    create_verify_local_repo(&secondary_repo).await;
+
+    let (mut session, mut turn) = make_session_and_context().await;
+    let codex_home = temp.path().join("codex-home");
+    session.services.task_evidence =
+        TaskEvidenceLedger::load_or_new(codex_home.clone(), session.thread_id, &primary_repo).await;
+    configure_two_local_environments(
+        &mut turn,
+        AbsolutePathBuf::from_absolute_path(&primary_repo).expect("primary absolute path"),
+        AbsolutePathBuf::from_absolute_path(&secondary_repo).expect("secondary absolute path"),
+    );
+    let evidence_path = codex_home
+        .join("task-evidence")
+        .join(format!("{}.json", session.thread_id));
+    let evidence_before = tokio::fs::read(&evidence_path)
+        .await
+        .expect("read initial evidence");
+    let turn = Arc::new(turn);
+    let tracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+    let mut args = base_args();
+    args["environment_id"] = json!("secondary");
+
+    let result = VerifyLocalHandler::for_verify_local_environment_id(true)
+        .handle(ToolInvocation {
+            session: Arc::new(session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: CancellationToken::new(),
+            tracker,
+            call_id: "call-verify-local".to_string(),
+            tool_name: codex_tools::ToolName::plain(VERIFY_LOCAL_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: args.to_string(),
+            },
+        })
+        .await;
+
+    let Err(FunctionCallError::RespondToModel(message)) = result else {
+        panic!("expected repository-root mismatch");
+    };
+    assert_eq!(
+        message,
+        "verify_local cannot validate the selected environment because its repository root does not match the session task-evidence root"
+    );
+    assert_eq!(
+        tokio::fs::read(evidence_path)
+            .await
+            .expect("read evidence after rejection"),
+        evidence_before
+    );
 }
 
 #[test]
@@ -454,6 +684,7 @@ fn only_versioned_successful_json_is_proof_bearing() {
         assert!(!run.tool_success);
         assert!(!run.is_proof_bearing());
         assert!(render_verify_local_output(&run, false).contains("unsupported JSON contract"));
+        assert!(render_verify_local_output(&run, true).contains("unsupported JSON contract"));
     }
 
     let nonzero = parse_verify_local_run(
@@ -507,8 +738,26 @@ fn malformed_scope_objects_are_never_proof_bearing() {
             String::new(),
             Some(0),
         );
-        assert!(run.tool_success);
+        assert!(!run.tool_success);
         assert!(run.scope.is_none());
         assert!(!run.is_proof_bearing());
+        assert!(
+            render_verify_local_output(&run, false).contains("missing or malformed proof scope")
+        );
+        assert!(
+            render_verify_local_output(&run, true).contains("missing or malformed proof scope")
+        );
     }
+}
+
+#[test]
+fn plain_text_verified_is_not_a_successful_proof_contract() {
+    let run = parse_verify_local_run("Verdict: VERIFIED".to_string(), String::new(), Some(0));
+
+    assert_eq!(run.verdict_text.as_deref(), Some("VERIFIED"));
+    assert!(!run.tool_success);
+    assert!(run.scope.is_none());
+    assert!(!run.is_proof_bearing());
+    assert!(render_verify_local_output(&run, false).contains("versioned JSON proof contract"));
+    assert!(render_verify_local_output(&run, true).contains("versioned JSON proof contract"));
 }

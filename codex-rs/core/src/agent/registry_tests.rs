@@ -85,7 +85,9 @@ fn commit_holds_slot_until_release() {
     let registry = Arc::new(AgentRegistry::default());
     let reservation = registry.reserve_spawn_slot(Some(1)).expect("reserve slot");
     let thread_id = ThreadId::new();
-    reservation.commit(agent_metadata(thread_id));
+    reservation
+        .commit(agent_metadata(thread_id))
+        .expect("commit reservation");
 
     let err = match registry.reserve_spawn_slot(Some(1)) {
         Ok(_) => panic!("limit should be enforced"),
@@ -108,7 +110,9 @@ fn release_ignores_unknown_thread_id() {
     let registry = Arc::new(AgentRegistry::default());
     let reservation = registry.reserve_spawn_slot(Some(1)).expect("reserve slot");
     let thread_id = ThreadId::new();
-    reservation.commit(agent_metadata(thread_id));
+    reservation
+        .commit(agent_metadata(thread_id))
+        .expect("commit reservation");
 
     registry.release_spawned_thread(ThreadId::new());
 
@@ -133,13 +137,17 @@ fn release_is_idempotent_for_registered_threads() {
     let registry = Arc::new(AgentRegistry::default());
     let reservation = registry.reserve_spawn_slot(Some(1)).expect("reserve slot");
     let first_id = ThreadId::new();
-    reservation.commit(agent_metadata(first_id));
+    reservation
+        .commit(agent_metadata(first_id))
+        .expect("commit first reservation");
 
     registry.release_spawned_thread(first_id);
 
     let reservation = registry.reserve_spawn_slot(Some(1)).expect("slot reused");
     let second_id = ThreadId::new();
-    reservation.commit(agent_metadata(second_id));
+    reservation
+        .commit(agent_metadata(second_id))
+        .expect("commit second reservation");
 
     registry.release_spawned_thread(first_id);
 
@@ -190,7 +198,9 @@ fn agent_nickname_resets_used_pool_when_exhausted() {
         .reserve_agent_nickname_with_preference(&["alpha"], /*preferred*/ None)
         .expect("reserve first agent name");
     let first_id = ThreadId::new();
-    first.commit(agent_metadata(first_id));
+    first
+        .commit(agent_metadata(first_id))
+        .expect("commit first reservation");
     assert_eq!(first_name, "alpha");
 
     let mut second = registry
@@ -218,7 +228,9 @@ fn released_nickname_stays_used_until_pool_reset() {
         .reserve_agent_nickname_with_preference(&["alpha"], /*preferred*/ None)
         .expect("reserve first agent name");
     let first_id = ThreadId::new();
-    first.commit(agent_metadata(first_id));
+    first
+        .commit(agent_metadata(first_id))
+        .expect("commit first reservation");
     assert_eq!(first_name, "alpha");
 
     registry.release_spawned_thread(first_id);
@@ -231,7 +243,9 @@ fn released_nickname_stays_used_until_pool_reset() {
         .expect("released name should still be marked used");
     assert_eq!(second_name, "beta");
     let second_id = ThreadId::new();
-    second.commit(agent_metadata(second_id));
+    second
+        .commit(agent_metadata(second_id))
+        .expect("commit second reservation");
     registry.release_spawned_thread(second_id);
 
     let mut third = registry
@@ -260,7 +274,9 @@ fn repeated_resets_advance_the_ordinal_suffix() {
         .reserve_agent_nickname_with_preference(&["Plato"], /*preferred*/ None)
         .expect("reserve first agent name");
     let first_id = ThreadId::new();
-    first.commit(agent_metadata(first_id));
+    first
+        .commit(agent_metadata(first_id))
+        .expect("commit first reservation");
     assert_eq!(first_name, "Plato");
     registry.release_spawned_thread(first_id);
 
@@ -271,7 +287,9 @@ fn repeated_resets_advance_the_ordinal_suffix() {
         .reserve_agent_nickname_with_preference(&["Plato"], /*preferred*/ None)
         .expect("reserve second agent name");
     let second_id = ThreadId::new();
-    second.commit(agent_metadata(second_id));
+    second
+        .commit(agent_metadata(second_id))
+        .expect("commit second reservation");
     assert_eq!(second_name, "Plato the 2nd");
     registry.release_spawned_thread(second_id);
 
@@ -331,11 +349,13 @@ fn committed_agent_path_is_indexed_until_release() {
     reservation
         .reserve_agent_path(&agent_path("/root/researcher"))
         .expect("reserve path");
-    reservation.commit(AgentMetadata {
-        agent_id: Some(thread_id),
-        agent_path: Some(agent_path("/root/researcher")),
-        ..Default::default()
-    });
+    reservation
+        .commit(AgentMetadata {
+            agent_id: Some(thread_id),
+            agent_path: Some(agent_path("/root/researcher")),
+            ..Default::default()
+        })
+        .expect("commit reservation");
 
     assert_eq!(
         registry.agent_id_for_path(&agent_path("/root/researcher")),
@@ -347,4 +367,48 @@ fn committed_agent_path_is_indexed_until_release() {
         registry.agent_id_for_path(&agent_path("/root/researcher")),
         None
     );
+}
+
+#[test]
+fn closing_parent_rejects_new_and_in_flight_spawn_commits() {
+    let registry = Arc::new(AgentRegistry::default());
+    let parent_thread_id = ThreadId::new();
+    let child_thread_id = ThreadId::new();
+    let mut in_flight = registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve in-flight slot");
+    in_flight
+        .reserve_parent_thread(parent_thread_id)
+        .expect("parent should initially accept spawns");
+
+    let closing_guard = registry.begin_closing_agent_tree(parent_thread_id);
+    let mut late = registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve late slot");
+    let late_err = late
+        .reserve_parent_thread(parent_thread_id)
+        .expect_err("closing parent should reject a new spawn");
+    assert!(late_err.to_string().contains("is closing"));
+    drop(late);
+
+    drop(closing_guard);
+    let commit_err = in_flight
+        .commit(agent_metadata(child_thread_id))
+        .expect_err("spawn paused before commit must remain blocked after shutdown finishes");
+    assert!(commit_err.to_string().contains("is closing"));
+    assert!(
+        registry
+            .agent_metadata_for_thread(child_thread_id)
+            .is_none()
+    );
+
+    let mut retry = registry
+        .reserve_spawn_slot(/*max_threads*/ None)
+        .expect("reserve retry slot");
+    retry
+        .reserve_parent_thread(parent_thread_id)
+        .expect("failed in-flight spawn should release the closing admission gate");
+    retry
+        .commit(agent_metadata(child_thread_id))
+        .expect("commit retry");
 }

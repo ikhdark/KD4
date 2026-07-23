@@ -11,18 +11,24 @@ use codex_utils_output_truncation::TruncationPolicy;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 /// Raw response history snapshot available when an extension tool is invoked.
 #[derive(Clone, Debug, Default)]
 pub struct ConversationHistory {
-    items: Arc<[ResponseItem]>,
+    items: Arc<Vec<ResponseItem>>,
 }
 
 impl ConversationHistory {
     pub fn new(items: Vec<ResponseItem>) -> Self {
         Self {
-            items: items.into(),
+            items: Arc::new(items),
         }
+    }
+
+    /// Builds a history view without deep-cloning an existing immutable snapshot.
+    pub fn from_shared_items(items: Arc<Vec<ResponseItem>>) -> Self {
+        Self { items }
     }
 
     pub fn items(&self) -> &[ResponseItem] {
@@ -95,6 +101,8 @@ pub struct ToolCall {
     pub truncation_policy: TruncationPolicy,
     pub conversation_history: ConversationHistory,
     pub turn_item_emitter: Arc<dyn TurnItemEmitter>,
+    pub cancellation_token: CancellationToken,
+    pub primary_environment_id: Option<String>,
     pub environments: Vec<ToolEnvironment>,
     pub payload: ToolPayload,
 }
@@ -109,6 +117,8 @@ impl std::fmt::Debug for ToolCall {
             .field("truncation_policy", &self.truncation_policy)
             .field("conversation_history", &self.conversation_history)
             .field("turn_item_emitter", &"<host turn item emitter>")
+            .field("cancelled", &self.cancellation_token.is_cancelled())
+            .field("primary_environment_id", &self.primary_environment_id)
             .field("environment_count", &self.environments.len())
             .field("payload", &self.payload)
             .finish()

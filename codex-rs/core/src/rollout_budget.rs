@@ -51,6 +51,11 @@ impl RolloutBudget {
         state.weighted_tokens_used >= state.config.limit_tokens as f64
     }
 
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.lock()
+            .is_some_and(|state| state.weighted_tokens_used >= state.config.limit_tokens as f64)
+    }
+
     pub(crate) fn pending_reminder(
         &self,
         thread_id: ThreadId,

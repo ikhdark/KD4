@@ -21,11 +21,14 @@ use codex_protocol::protocol::TurnDiffEvent;
 use codex_shell_command::parse_command::parse_command;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use codex_utils_string::truncate_middle_with_token_budget;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use super::format_exec_output_str;
+
+const REJECTION_OUTPUT_MAX_TOKENS: usize = 900;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ToolEventCtx<'a> {
@@ -63,7 +66,7 @@ pub(crate) enum ToolEventStage<'a> {
 pub(crate) enum ToolEventFailure<'a> {
     Output(ExecToolCallOutput),
     Message(String),
-    Rejected {
+    Denied {
         message: String,
         applied_patch_delta: Option<&'a AppliedPatchDelta>,
     },
@@ -90,6 +93,52 @@ fn tracker_update_for_known_delta<'a>(
             delta,
         }
     }
+}
+
+fn apply_patch_intent_paths(changes: &HashMap<PathBuf, FileChange>) -> Vec<PathBuf> {
+    let mut paths = Vec::with_capacity(changes.len());
+    for (path, change) in changes {
+        paths.push(path.clone());
+        if let FileChange::Update {
+            move_path: Some(move_path),
+            ..
+        } = change
+            && !move_path.as_os_str().is_empty()
+        {
+            paths.push(move_path.clone());
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn apply_patch_evidence_cwd(
+    ctx: ToolEventCtx<'_>,
+    environment_id: Option<&str>,
+) -> Option<AbsolutePathBuf> {
+    let environment = match environment_id {
+        Some(environment_id) => ctx
+            .turn
+            .environments
+            .turn_environments
+            .iter()
+            .find(|environment| environment.environment_id == environment_id),
+        None => ctx.turn.environments.primary(),
+    }?;
+    if environment.environment.is_remote() {
+        return None;
+    }
+    let cwd = environment.cwd().to_abs_path().ok()?;
+    cwd.as_path()
+        .ancestors()
+        .any(|candidate| {
+            ctx.session
+                .services
+                .task_evidence
+                .matches_repo_root(candidate)
+        })
+        .then_some(cwd)
 }
 
 pub(crate) async fn emit_exec_command_begin(
@@ -226,17 +275,12 @@ impl ToolEmitter {
                 Self::ApplyPatch {
                     changes,
                     auto_approved,
-                    ..
+                    environment_id,
                 },
                 ToolEventStage::Begin,
             ) => {
-                let paths = changes.keys().cloned().collect::<Vec<_>>();
-                if let Some(cwd) = ctx
-                    .turn
-                    .environments
-                    .primary()
-                    .and_then(|environment| environment.cwd().to_abs_path().ok())
-                {
+                let paths = apply_patch_intent_paths(changes);
+                if let Some(cwd) = apply_patch_evidence_cwd(ctx, environment_id.as_deref()) {
                     ctx.session
                         .services
                         .task_evidence
@@ -324,7 +368,7 @@ impl ToolEmitter {
                     environment_id,
                     ..
                 },
-                ToolEventStage::Failure(ToolEventFailure::Rejected {
+                ToolEventStage::Failure(ToolEventFailure::Denied {
                     message,
                     applied_patch_delta,
                 }),
@@ -433,15 +477,15 @@ impl ToolEmitter {
                 (event, result)
             }
             Err(ToolError::Rejected(msg)) => {
-                // Normalize common rejection messages for exec tools so tests and
+                let bounded =
+                    truncate_middle_with_token_budget(&msg, REJECTION_OUTPUT_MAX_TOKENS).0;
+                let event = ToolEventStage::Failure(ToolEventFailure::Message(bounded.clone()));
+                let result = Err(FunctionCallError::RespondToModel(bounded));
+                (event, result)
+            }
+            Err(ToolError::Denied(msg)) => {
+                // Normalize common denial messages for exec tools so tests and
                 // users see a clear, consistent phrase.
-                //
-                // NOTE: ToolError::Rejected is currently used for both user-declined approvals
-                // and some operational/runtime rejection paths (for example setup failures).
-                // We intentionally map all of them through the "rejected" event path for now,
-                // which means a subset of non-user failures may be reported as Declined.
-                //
-                // TODO: We should add a new ToolError variant for user-declined approvals.
                 let normalized = if msg == "rejected by user" {
                     match self {
                         Self::Shell { .. } | Self::UnifiedExec { .. } => {
@@ -452,11 +496,13 @@ impl ToolEmitter {
                 } else {
                     msg
                 };
-                let event = ToolEventStage::Failure(ToolEventFailure::Rejected {
-                    message: normalized.clone(),
+                let bounded =
+                    truncate_middle_with_token_budget(&normalized, REJECTION_OUTPUT_MAX_TOKENS).0;
+                let event = ToolEventStage::Failure(ToolEventFailure::Denied {
+                    message: bounded.clone(),
                     applied_patch_delta,
                 });
-                let result = Err(FunctionCallError::RespondToModel(normalized));
+                let result = Err(FunctionCallError::RespondToModel(bounded));
                 (event, result)
             }
         };
@@ -515,11 +561,6 @@ async fn emit_exec_stage(
 ) {
     match stage {
         ToolEventStage::Begin => {
-            ctx.session
-                .services
-                .task_evidence
-                .record_command_intent(ctx.call_id, exec_input.command)
-                .await;
             emit_exec_command_begin(
                 ctx,
                 exec_input.command,
@@ -566,7 +607,7 @@ async fn emit_exec_stage(
             };
             emit_exec_end(ctx, exec_input, exec_result).await;
         }
-        ToolEventStage::Failure(ToolEventFailure::Rejected { message, .. }) => {
+        ToolEventStage::Failure(ToolEventFailure::Denied { message, .. }) => {
             let text = message.to_string();
             let exec_result = ExecCommandResult {
                 stdout: String::new(),
@@ -605,7 +646,6 @@ async fn emit_exec_end(
         .services
         .task_evidence
         .record_command(
-            ctx.call_id,
             exec_input.command,
             exec_input.cwd,
             exec_result.exit_code,
@@ -706,17 +746,60 @@ async fn emit_patch_end(
 mod tests {
     use super::*;
     use crate::session::tests::make_session_and_context_with_dynamic_tools_and_rx;
+    use crate::session::turn_context::TurnEnvironment;
+    use crate::task_evidence::TaskEvidenceLedger;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_exec_server::LOCAL_FS;
+    use codex_protocol::ThreadId;
     use codex_protocol::error::CodexErr;
     use codex_protocol::error::SandboxErr;
     use codex_protocol::exec_output::ExecToolCallOutput;
     use codex_protocol::items::TurnItem;
     use codex_protocol::protocol::PatchApplyStatus;
     use codex_utils_path_uri::PathUri;
+    use std::path::Path;
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::sync::Mutex;
+
+    async fn enable_task_evidence_for_repo(session: &mut Arc<Session>, repo: &Path) {
+        tokio::fs::create_dir_all(repo.join("scripts"))
+            .await
+            .expect("scripts directory");
+        tokio::fs::write(repo.join("scripts/verify_local.py"), "# fixture")
+            .await
+            .expect("verifier fixture");
+        tokio::fs::write(repo.join("kd4_features.toml"), "# fixture")
+            .await
+            .expect("feature manifest fixture");
+        let ledger =
+            TaskEvidenceLedger::load_or_new(repo.join(".codex-home"), ThreadId::new(), repo).await;
+        Arc::get_mut(session)
+            .expect("single session reference")
+            .services
+            .task_evidence = ledger;
+    }
+
+    fn set_turn_environments(turn: &mut Arc<TurnContext>, environments: &[(&str, &Path)]) {
+        let turn = Arc::get_mut(turn).expect("single turn reference");
+        let template = turn
+            .environments
+            .primary()
+            .expect("primary environment")
+            .clone();
+        turn.environments.turn_environments = environments
+            .iter()
+            .map(|(environment_id, cwd)| {
+                let cwd = AbsolutePathBuf::from_absolute_path(cwd).expect("absolute cwd");
+                TurnEnvironment::new(
+                    (*environment_id).to_string(),
+                    Arc::clone(&template.environment),
+                    PathUri::from_abs_path(&cwd),
+                    template.shell.clone(),
+                )
+            })
+            .collect();
+    }
 
     async fn assert_failed_apply_patch_tracks_committed_delta(
         out: Result<ExecToolCallOutput, ToolError>,
@@ -796,12 +879,240 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejected_apply_patch_tracks_committed_delta() {
+    async fn user_declined_apply_patch_tracks_committed_delta() {
         assert_failed_apply_patch_tracks_committed_delta(
-            Err(ToolError::Rejected("rejected by user".to_string())),
+            Err(ToolError::Denied("rejected by user".to_string())),
             PatchApplyStatus::Declined,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn operational_apply_patch_rejection_is_reported_as_failed() {
+        let (session, turn, rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        let message = "apply_patch: the typed task store is unavailable";
+
+        let error = ToolEmitter::ApplyPatch {
+            changes: HashMap::new(),
+            auto_approved: false,
+            environment_id: None,
+        }
+        .finish(
+            ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", None),
+            Err(ToolError::Rejected(message.to_string())),
+            None,
+        )
+        .await
+        .expect_err("operational failure should be returned to the model");
+        assert!(matches!(
+            error,
+            FunctionCallError::RespondToModel(text) if text == message
+        ));
+
+        let completed = rx_event.recv().await.expect("item completed event");
+        assert!(matches!(
+            completed.msg,
+            EventMsg::ItemCompleted(event)
+                if matches!(
+                    &event.item,
+                    TurnItem::FileChange(FileChangeItem {
+                        status: Some(PatchApplyStatus::Failed),
+                        stderr: Some(stderr),
+                        ..
+                    }) if stderr == message
+                )
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejection_output_is_bounded_before_populating_model_and_event() {
+        let (session, turn, rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        let dir = tempdir().expect("tempdir");
+        let cwd = AbsolutePathBuf::from_absolute_path(dir.path()).expect("absolute cwd");
+        let emitter = ToolEmitter::shell(
+            vec!["echo".to_string(), "hello".to_string()],
+            cwd,
+            ExecCommandSource::Agent,
+            String::new(),
+        );
+        let rejection = format!(
+            "rejection-head\n{}\nrejection-tail",
+            "denied-🙂-".repeat(2_000)
+        );
+
+        let error = emitter
+            .finish(
+                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "call-id", None),
+                Err(ToolError::Denied(rejection.clone())),
+                None,
+            )
+            .await
+            .expect_err("rejection should be returned to the model");
+        let FunctionCallError::RespondToModel(model_text) = error else {
+            panic!("expected model-visible rejection");
+        };
+
+        assert!(model_text.len() < rejection.len());
+        assert!(model_text.starts_with("rejection-head"));
+        assert!(model_text.ends_with("rejection-tail"));
+        assert_eq!(model_text.matches("tokens truncated").count(), 1);
+        assert!(model_text.len() <= REJECTION_OUTPUT_MAX_TOKENS * 4 + 128);
+
+        let completed = rx_event.recv().await.expect("item completed event");
+        let EventMsg::ItemCompleted(event) = completed.msg else {
+            panic!("expected item completed event");
+        };
+        let TurnItem::CommandExecution(item) = event.item else {
+            panic!("expected command execution item");
+        };
+        assert_eq!(item.status, CommandExecutionStatus::Declined);
+        assert_eq!(item.stderr.as_deref(), Some(model_text.as_str()));
+        assert_eq!(item.aggregated_output.as_deref(), Some(model_text.as_str()));
+        assert_eq!(item.formatted_output.as_deref(), Some(model_text.as_str()));
+    }
+
+    #[tokio::test]
+    async fn apply_patch_evidence_uses_selected_environment_and_move_destination() {
+        let temp = tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let selected = repo.join("selected");
+        tokio::fs::create_dir_all(&selected)
+            .await
+            .expect("selected cwd");
+        tokio::fs::write(selected.join("source.txt"), "before source")
+            .await
+            .expect("source fixture");
+        tokio::fs::write(selected.join("dest.txt"), "before destination")
+            .await
+            .expect("destination fixture");
+        tokio::fs::write(repo.join("source.txt"), "primary source")
+            .await
+            .expect("primary source fixture");
+        tokio::fs::write(repo.join("dest.txt"), "primary destination")
+            .await
+            .expect("primary destination fixture");
+
+        let (mut session, mut turn, _rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        enable_task_evidence_for_repo(&mut session, &repo).await;
+        set_turn_environments(
+            &mut turn,
+            &[
+                ("primary", repo.as_path()),
+                ("selected", selected.as_path()),
+            ],
+        );
+        let emitter = ToolEmitter::apply_patch_for_environment(
+            HashMap::from([(
+                PathBuf::from("source.txt"),
+                FileChange::Update {
+                    unified_diff: String::new(),
+                    move_path: Some(PathBuf::from("dest.txt")),
+                },
+            )]),
+            false,
+            "selected".to_string(),
+        );
+
+        emitter
+            .begin(ToolEventCtx::new(
+                session.as_ref(),
+                turn.as_ref(),
+                "move-call",
+                None,
+            ))
+            .await;
+        tokio::fs::remove_file(selected.join("source.txt"))
+            .await
+            .expect("remove source");
+        tokio::fs::write(selected.join("dest.txt"), "after destination")
+            .await
+            .expect("replace destination");
+        emitter
+            .finish(
+                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "move-call", None),
+                Ok(ExecToolCallOutput::default()),
+                None,
+            )
+            .await
+            .expect("successful patch");
+
+        assert_eq!(
+            session
+                .services
+                .task_evidence
+                .take_automatic_verify_plan_request()
+                .await,
+            Some(vec![
+                "selected/dest.txt".to_string(),
+                "selected/source.txt".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_patch_evidence_skips_an_unrepresentable_selected_environment() {
+        let temp = tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        let selected = temp.path().join("other-checkout");
+        tokio::fs::create_dir_all(&selected)
+            .await
+            .expect("selected cwd");
+
+        let (mut session, mut turn, _rx_event) =
+            make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
+        enable_task_evidence_for_repo(&mut session, &repo).await;
+        set_turn_environments(
+            &mut turn,
+            &[
+                ("primary", repo.as_path()),
+                ("selected", selected.as_path()),
+            ],
+        );
+        let emitter = ToolEmitter::apply_patch_for_environment(
+            HashMap::from([(
+                PathBuf::from("target.txt"),
+                FileChange::Add {
+                    content: "selected".to_string(),
+                },
+            )]),
+            false,
+            "selected".to_string(),
+        );
+
+        emitter
+            .begin(ToolEventCtx::new(
+                session.as_ref(),
+                turn.as_ref(),
+                "outside-call",
+                None,
+            ))
+            .await;
+        tokio::fs::write(repo.join("target.txt"), "unrelated primary mutation")
+            .await
+            .expect("primary mutation");
+        tokio::fs::write(selected.join("target.txt"), "selected mutation")
+            .await
+            .expect("selected mutation");
+        emitter
+            .finish(
+                ToolEventCtx::new(session.as_ref(), turn.as_ref(), "outside-call", None),
+                Ok(ExecToolCallOutput::default()),
+                None,
+            )
+            .await
+            .expect("successful patch");
+
+        assert_eq!(
+            session
+                .services
+                .task_evidence
+                .take_automatic_verify_plan_request()
+                .await,
+            None
+        );
     }
 
     #[tokio::test]

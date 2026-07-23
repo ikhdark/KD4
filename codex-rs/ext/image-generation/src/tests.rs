@@ -4,6 +4,7 @@ use codex_api::ImageGenerationRequest;
 use codex_api::ImageQuality;
 use codex_api::ImageUrl;
 use codex_core::context::extension_image_generation_output_hint;
+use codex_extension_api::ConversationHistoryRequirement;
 use codex_extension_api::ToolOutput;
 use codex_extension_api::ToolPayload;
 use codex_extension_api::ToolSpec;
@@ -20,12 +21,33 @@ use pretty_assertions::assert_eq;
 use super::GeneratedImageOutput;
 use super::ImageRequest;
 use super::ImagegenArgs;
+use super::image_history_requirement;
 use super::imagegen_tool_spec;
 use super::request_for_call_args;
 use crate::IMAGE_GEN_NAMESPACE;
 use crate::IMAGEGEN_TOOL_NAME;
 
 const RESULT: &str = "cG5n";
+
+#[test]
+fn requests_history_only_for_history_backed_edits() {
+    let payload = |num_last_images_to_include| ToolPayload::Function {
+        arguments: serde_json::json!({
+            "prompt": "paint a moonlit lake",
+            "num_last_images_to_include": num_last_images_to_include,
+        })
+        .to_string(),
+    };
+
+    assert_eq!(
+        image_history_requirement(&payload(None::<usize>)),
+        ConversationHistoryRequirement::None
+    );
+    assert_eq!(
+        image_history_requirement(&payload(Some(2))),
+        ConversationHistoryRequirement::Full
+    );
+}
 
 #[test]
 fn uses_reserved_image_gen_namespace() {
@@ -47,6 +69,7 @@ async fn omitted_references_generate_with_fixed_defaults() {
                 num_last_images_to_include: None,
             },
             &[],
+            None,
             &[],
         )
         .await
@@ -131,6 +154,7 @@ async fn recent_image_fallback_selects_newest_images_in_chronological_order() {
                 num_last_images_to_include: Some(4),
             },
             &history,
+            None,
             &[],
         )
         .await
@@ -155,6 +179,7 @@ async fn conflicting_image_selectors_return_tool_error() {
             num_last_images_to_include: Some(1),
         },
         &[],
+        None,
         &[],
     )
     .await
@@ -183,6 +208,7 @@ async fn too_many_referenced_image_paths_return_tool_error() {
             num_last_images_to_include: None,
         },
         &[],
+        None,
         &[],
     )
     .await
@@ -209,6 +235,7 @@ async fn recent_image_fallback_requires_requested_count() {
             phase: None,
             internal_chat_message_metadata_passthrough: None,
         }],
+        None,
         &[],
     )
     .await
@@ -217,6 +244,31 @@ async fn recent_image_fallback_requires_requested_count() {
     assert_eq!(
         error.to_string(),
         "requested the last 2 conversation images, but only 1 were available"
+    );
+}
+
+#[tokio::test]
+async fn referenced_paths_reject_an_unreadable_primary_environment() {
+    let error = request_for_call_args(
+        &ImagegenArgs {
+            prompt: "change the lighting".to_string(),
+            referenced_image_paths: Some(vec![
+                "/tmp/image.png"
+                    .try_into()
+                    .expect("test path should be absolute"),
+            ]),
+            num_last_images_to_include: None,
+        },
+        &[],
+        Some("foreign-primary"),
+        &[],
+    )
+    .await
+    .expect_err("an omitted primary environment must not fall back to another environment");
+
+    assert_eq!(
+        error.to_string(),
+        "referenced image paths are unavailable because the primary environment is not extension-readable"
     );
 }
 

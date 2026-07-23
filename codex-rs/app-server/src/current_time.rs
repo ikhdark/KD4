@@ -110,7 +110,7 @@ async fn request_current_time(
             ServerRequestPayload::CurrentTimeRead(CurrentTimeReadParams {
                 thread_id: thread_id.to_string(),
             }),
-            /*thread_id*/ None,
+            Some(thread_id),
         )
         .await;
 
@@ -152,8 +152,20 @@ fn require_single_current_time_connection(connection_ids: &[ConnectionId]) -> Re
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use codex_protocol::ThreadId;
+    use tokio::sync::mpsc;
+    use tokio::time::Duration;
+    use tokio::time::timeout;
+
+    use super::request_current_time;
     use super::require_single_current_time_connection;
     use crate::outgoing_message::ConnectionId;
+    use crate::outgoing_message::OutgoingEnvelope;
+    use crate::outgoing_message::OutgoingMessageSender;
+    use crate::thread_state::ConnectionCapabilities;
+    use crate::thread_state::ThreadStateManager;
 
     #[test]
     fn current_time_connection_must_be_unambiguous() {
@@ -172,6 +184,59 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "expected exactly one client subscribed to the thread, found 2"
+        );
+    }
+
+    #[tokio::test]
+    async fn thread_cleanup_cancels_pending_external_current_time_request() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<OutgoingEnvelope>(1);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            outgoing_tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let thread_state_manager = ThreadStateManager::new();
+        let thread_id = ThreadId::new();
+        let connection_id = ConnectionId(1);
+        thread_state_manager
+            .connection_initialized(connection_id, ConnectionCapabilities::default())
+            .await;
+        assert!(
+            thread_state_manager
+                .try_add_connection_to_thread(thread_id, connection_id)
+                .await
+        );
+
+        let time_read = tokio::spawn(request_current_time(
+            outgoing.clone(),
+            thread_state_manager,
+            thread_id,
+        ));
+        timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .expect("current-time request should be sent before timeout")
+            .expect("current-time request channel should remain open");
+        assert_eq!(
+            outgoing.pending_requests_for_thread(thread_id).await.len(),
+            1
+        );
+
+        outgoing.cancel_requests_for_thread(thread_id, None).await;
+
+        assert!(
+            outgoing
+                .pending_requests_for_thread(thread_id)
+                .await
+                .is_empty()
+        );
+        let error = timeout(Duration::from_secs(1), time_read)
+            .await
+            .expect("current-time task should finish after thread cleanup")
+            .expect("current-time task should not panic")
+            .expect_err("thread cleanup should cancel the current-time request");
+        assert!(
+            error
+                .to_string()
+                .contains("current-time request was canceled")
         );
     }
 }

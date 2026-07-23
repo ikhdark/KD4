@@ -27,9 +27,9 @@ unused placeholder sections instead of filling artifacts for completeness.
 Choose the task lane and apply the implementation, validation, and completion
 rules from the root [`AGENTS.md`](../../AGENTS.md). The harness records durable
 decisions and evidence; it does not define a second implementation discipline.
-For implementation inside a harnessed task, use Wiring Guard/KDWG when required
-by root policy or an active specialist skill. Wiring Guard alone does not
-require a run directory or activate the harness skill.
+For implementation inside a harnessed task, follow any independently active
+specialist skill. Another skill alone does not require a run directory or
+activate the harness skill.
 
 ## Generated Task State
 

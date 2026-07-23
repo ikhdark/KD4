@@ -145,6 +145,30 @@ pub async fn maybe_parse_apply_patch_verified(
     fs: &dyn ExecutorFileSystem,
     sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
 ) -> MaybeApplyPatchVerified {
+    maybe_parse_apply_patch_verified_inner(argv, cwd, fs, sandbox, None).await
+}
+
+/// Parses and verifies an intercepted patch against the environment already selected by the
+/// containing shell command. An explicit patch environment header may confirm that selection, but
+/// it must not redirect the patch to a different environment.
+pub async fn maybe_parse_apply_patch_verified_for_environment(
+    argv: &[String],
+    cwd: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
+    selected_environment_id: &str,
+) -> MaybeApplyPatchVerified {
+    maybe_parse_apply_patch_verified_inner(argv, cwd, fs, sandbox, Some(selected_environment_id))
+        .await
+}
+
+async fn maybe_parse_apply_patch_verified_inner(
+    argv: &[String],
+    cwd: &PathUri,
+    fs: &dyn ExecutorFileSystem,
+    sandbox: Option<&codex_exec_server::FileSystemSandboxContext>,
+    selected_environment_id: Option<&str>,
+) -> MaybeApplyPatchVerified {
     // Detect a raw patch body passed directly as the command or as the body of a shell
     // script. In these cases, report an explicit error rather than applying the patch.
     if let [body] = argv
@@ -159,7 +183,20 @@ pub async fn maybe_parse_apply_patch_verified(
     }
 
     match maybe_parse_apply_patch(argv, cwd) {
-        MaybeApplyPatch::Body(args) => verify_apply_patch_args(args, cwd, fs, sandbox).await,
+        MaybeApplyPatch::Body(args) => {
+            if let Some(selected_environment_id) = selected_environment_id
+                && let Some(patch_environment_id) = args.environment_id.as_deref()
+                && patch_environment_id != selected_environment_id
+            {
+                return MaybeApplyPatchVerified::CorrectnessError(
+                    ApplyPatchError::EnvironmentIdMismatch {
+                        patch_environment_id: patch_environment_id.to_string(),
+                        selected_environment_id: selected_environment_id.to_string(),
+                    },
+                );
+            }
+            verify_apply_patch_args(args, cwd, fs, sandbox).await
+        }
         MaybeApplyPatch::ShellParseError(e) => MaybeApplyPatchVerified::ShellParseError(e),
         MaybeApplyPatch::PatchParseError(e) => MaybeApplyPatchVerified::CorrectnessError(e.into()),
         MaybeApplyPatch::NotApplyPatch => MaybeApplyPatchVerified::NotApplyPatch,

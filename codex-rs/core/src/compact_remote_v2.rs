@@ -9,6 +9,7 @@ use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
 use crate::compact::compaction_status_from_result;
 use crate::compact_model_fallback::record_model_fallback;
+use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote::process_compacted_history;
 use crate::compact_remote::should_keep_compacted_history_item;
 use crate::hook_runtime::PostCompactHookOutcome;
@@ -39,6 +40,7 @@ use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TruncationPolicy;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
+use codex_rollout_trace::CompactionTraceContext;
 use codex_rollout_trace::InferenceTraceContext;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
@@ -231,7 +233,7 @@ async fn run_remote_compact_task_inner_impl(
             let Some(fallback_step_context) = fallback_step_context else {
                 return Err(error);
             };
-            if !matches!(&error, CodexErr::InvalidRequest(_)) {
+            if !should_retry_with_current_model(&error) {
                 return Err(error);
             }
             let fallback_turn_context = &fallback_step_context.turn;
@@ -279,7 +281,7 @@ async fn run_remote_compact_task_inner_impl(
         analytics_details.cached_input_tokens = Some(token_usage.cached_input_tokens);
     }
     let (compacted_history, retained_images) =
-        build_v2_compacted_history(&prompt_input, compaction_output);
+        build_v2_compacted_history(prompt_input, compaction_output);
     analytics_details.retained_image_count = Some(retained_images);
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
     let (new_history, world_state_baseline) = process_compacted_history(
@@ -304,10 +306,12 @@ async fn run_remote_compact_task_inner_impl(
         previous_window_id: new_window_ids.previous_window_id.map(|id| id.to_string()),
         window_id: Some(new_window_ids.window_id.to_string()),
     };
-    compaction_trace.record_installed(&CompactionCheckpointTracePayload {
-        input_history: &trace_input_history,
-        replacement_history: &new_history,
-    });
+    if let Some(trace_input_history) = trace_input_history.as_deref() {
+        compaction_trace.record_installed(&CompactionCheckpointTracePayload {
+            input_history: trace_input_history,
+            replacement_history: &new_history,
+        });
+    }
     sess.replace_compacted_history(
         compaction_turn_context.as_ref(),
         new_history,
@@ -328,12 +332,21 @@ struct RemoteCompactionV2Output {
     token_usage: Option<TokenUsage>,
 }
 
+#[derive(serde::Serialize)]
+struct RemoteCompactionV2TraceRequest<'a> {
+    model: &'a str,
+    instructions: &'a str,
+    input: &'a [ResponseItem],
+    parallel_tool_calls: bool,
+}
+
 async fn run_remote_compaction_request_v2(
     sess: &Session,
     turn_context: &TurnContext,
     client_session: &mut ModelClientSession,
     prompt: &Prompt,
     responses_metadata: &CodexResponsesMetadata,
+    compaction_trace: &CompactionTraceContext,
 ) -> CodexResult<RemoteCompactionV2Output> {
     let max_retries = turn_context
         .provider
@@ -342,6 +355,13 @@ async fn run_remote_compaction_request_v2(
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
     let mut retries = 0;
     loop {
+        sess.ensure_rollout_budget_available()?;
+        let trace_attempt = compaction_trace.start_attempt(&RemoteCompactionV2TraceRequest {
+            model: turn_context.model_info.slug.as_str(),
+            instructions: prompt.base_instructions.text.as_str(),
+            input: &prompt.input,
+            parallel_tool_calls: prompt.parallel_tool_calls,
+        });
         let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
         let stream_result = client_session
             .stream(
@@ -362,6 +382,11 @@ async fn run_remote_compaction_request_v2(
             }
             Err(err) => Err(err),
         };
+        trace_attempt.record_result(
+            result
+                .as_ref()
+                .map(|output| std::slice::from_ref(&output.compaction_output)),
+        );
 
         match result {
             Ok(compaction_output) => return Ok(compaction_output),
@@ -443,17 +468,16 @@ async fn collect_compaction_output(
 }
 
 fn build_v2_compacted_history(
-    prompt_input: &[ResponseItem],
+    mut prompt_input: Vec<ResponseItem>,
     compaction_output: ResponseItem,
 ) -> (Vec<ResponseItem>, usize) {
-    let retained = prompt_input
-        .iter()
-        .filter(|item| is_retained_for_remote_compaction_v2(item))
-        .filter(|item| should_keep_compacted_history_item(item))
-        .cloned()
-        .collect::<Vec<_>>();
-    let mut retained =
-        truncate_retained_messages_for_remote_compaction(retained, RETAINED_MESSAGE_TOKEN_BUDGET);
+    prompt_input.retain(|item| {
+        is_retained_for_remote_compaction_v2(item) && should_keep_compacted_history_item(item)
+    });
+    let mut retained = truncate_retained_messages_for_remote_compaction(
+        prompt_input,
+        RETAINED_MESSAGE_TOKEN_BUDGET,
+    );
     let retained_image_count = retained
         .iter()
         .map(retained_input_image_count)
@@ -578,9 +602,20 @@ fn truncate_message_text_to_token_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ModelClient;
+    use crate::responses_metadata::CodexResponsesRequestKind;
+    use codex_login::auth::AgentIdentityAuthPolicy;
+    use codex_model_provider::create_model_provider;
+    use codex_protocol::models::BaseInstructions;
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::MessagePhase;
+    use codex_rollout_trace::ExecutionStatus;
+    use codex_rollout_trace::RawTraceEventPayload;
+    use codex_rollout_trace::TraceWriter;
+    use codex_rollout_trace::replay_bundle;
+    use core_test_support::responses;
     use pretty_assertions::assert_eq;
+    use tempfile::TempDir;
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
@@ -608,6 +643,179 @@ mod tests {
             rx_event,
             consumer_dropped: CancellationToken::new(),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_compaction_v2_retry_records_distinct_trace_attempts() -> anyhow::Result<()> {
+        core_test_support::skip_if_no_network!(Ok(()));
+
+        let server = responses::start_mock_server().await;
+        let request_log = responses::mount_sse_sequence(
+            &server,
+            vec![
+                responses::sse_failed(
+                    "resp-compact-failed",
+                    "server_error",
+                    "temporary compaction failure",
+                ),
+                responses::sse(vec![
+                    serde_json::json!({
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "compaction",
+                            "encrypted_content": "encrypted replacement context",
+                        }
+                    }),
+                    responses::ev_completed("resp-compact-succeeded"),
+                ]),
+            ],
+        )
+        .await;
+
+        let (mut session, mut turn_context) =
+            crate::session::tests::make_session_and_context().await;
+        let mut config = (*turn_context.config).clone();
+        config.model_provider.base_url = Some(format!("{}/v1", server.uri()));
+        config.model_provider.supports_websockets = false;
+        config.model_provider.request_max_retries = Some(0);
+        config.model_provider.stream_max_retries = Some(1);
+        let config = Arc::new(config);
+        turn_context.provider = create_model_provider(
+            config.model_provider.clone(),
+            turn_context.auth_manager.clone(),
+        );
+        turn_context.config = Arc::clone(&config);
+        session.services.model_client = ModelClient::new(
+            Some(Arc::clone(&session.services.auth_manager)),
+            AgentIdentityAuthPolicy::JwtOnly,
+            session.thread_id,
+            config.model_provider.clone(),
+            turn_context.session_source.clone(),
+            turn_context.originator.clone(),
+            config.model_verbosity,
+            /*enable_request_compression*/ false,
+            /*include_timing_metrics*/ false,
+            /*beta_features_header*/ None,
+            /*item_ids_enabled*/ false,
+            /*concurrent_reasoning_summaries_enabled*/ false,
+            /*attestation_provider*/ None,
+            config.http_client_factory(),
+        );
+
+        let trace_dir = TempDir::new()?;
+        let thread_id = session.thread_id.to_string();
+        let turn_id = turn_context.sub_id.clone();
+        let compaction_id = "compaction-retry-test".to_string();
+        let writer = Arc::new(TraceWriter::create(
+            trace_dir.path(),
+            "trace-retry-test".to_string(),
+            "rollout-retry-test".to_string(),
+            thread_id.clone(),
+        )?);
+        writer.append(RawTraceEventPayload::ThreadStarted {
+            thread_id: thread_id.clone(),
+            agent_path: "/root".to_string(),
+            metadata_payload: None,
+        })?;
+        writer.append(RawTraceEventPayload::CodexTurnStarted {
+            codex_turn_id: turn_id.clone(),
+            thread_id: thread_id.clone(),
+        })?;
+        let compaction_trace = CompactionTraceContext::enabled(
+            writer,
+            thread_id,
+            turn_id,
+            compaction_id.clone(),
+            turn_context.model_info.slug.clone(),
+            turn_context.provider.info().name.clone(),
+        );
+
+        let prompt = Prompt {
+            input: vec![
+                message("user", "compact this history", /*phase*/ None),
+                ResponseItem::CompactionTrigger {},
+            ],
+            base_instructions: BaseInstructions {
+                text: "compact the conversation".to_string(),
+            },
+            ..Default::default()
+        };
+        let compaction_metadata = CompactionTurnMetadata::new(
+            CompactionTrigger::Manual,
+            CompactionReason::UserRequested,
+            CompactionImplementation::ResponsesCompactionV2,
+            CompactionPhase::StandaloneTurn,
+        );
+        let responses_metadata = turn_context.turn_metadata_state.to_responses_metadata(
+            session.installation_id.clone(),
+            session.current_window_id().await,
+            CodexResponsesRequestKind::Compaction(compaction_metadata),
+        );
+        let mut client_session = session.services.model_client.new_session();
+
+        let output = run_remote_compaction_request_v2(
+            &session,
+            &turn_context,
+            &mut client_session,
+            &prompt,
+            &responses_metadata,
+            &compaction_trace,
+        )
+        .await?;
+        let input_history = vec![prompt.input[0].clone()];
+        let replacement_history = vec![output.compaction_output];
+        compaction_trace.record_installed(&CompactionCheckpointTracePayload {
+            input_history: &input_history,
+            replacement_history: &replacement_history,
+        });
+
+        assert_eq!(request_log.requests().len(), 2);
+        let rollout = replay_bundle(trace_dir.path())?;
+        assert_eq!(rollout.compaction_requests.len(), 2);
+        let request_ids = rollout
+            .compaction_requests
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(request_ids.len(), 2);
+        assert!(rollout.compaction_requests.values().all(|request| {
+            request.compaction_id == compaction_id
+                && matches!(
+                    request.execution.status,
+                    ExecutionStatus::Failed | ExecutionStatus::Completed
+                )
+        }));
+        assert_eq!(
+            rollout
+                .compaction_requests
+                .values()
+                .filter(|request| request.execution.status == ExecutionStatus::Failed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            rollout
+                .compaction_requests
+                .values()
+                .filter(|request| request.execution.status == ExecutionStatus::Completed)
+                .count(),
+            1
+        );
+        let installed = rollout
+            .compactions
+            .get(&compaction_id)
+            .expect("successful retry should install one compaction checkpoint");
+        assert_eq!(rollout.compactions.len(), 1);
+        assert_eq!(
+            installed
+                .request_ids
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            request_ids
+        );
+
+        Ok(())
     }
 
     #[test]
@@ -638,7 +846,7 @@ mod tests {
             internal_chat_message_metadata_passthrough: None,
         };
 
-        let (history, _) = build_v2_compacted_history(&input, output.clone());
+        let (history, _) = build_v2_compacted_history(input, output.clone());
 
         assert_eq!(
             history,
@@ -667,7 +875,7 @@ mod tests {
             internal_chat_message_metadata_passthrough: None,
         };
 
-        let (history, _) = build_v2_compacted_history(&input, output.clone());
+        let (history, _) = build_v2_compacted_history(input, output.clone());
 
         assert_eq!(history, vec![old, new, output]);
     }
@@ -699,7 +907,7 @@ mod tests {
             internal_chat_message_metadata_passthrough: None,
         };
 
-        let (_, retained_image_count) = build_v2_compacted_history(&input, output);
+        let (_, retained_image_count) = build_v2_compacted_history(input, output);
 
         assert_eq!(retained_image_count, 2);
     }

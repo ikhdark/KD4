@@ -32,6 +32,8 @@ use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tempfile::TempDir;
 use tokio::sync::Notify;
 
@@ -41,6 +43,9 @@ enum InjectedFailure {
     MetadataBlocked,
     MetadataPending,
     Read(io::ErrorKind),
+    ReadChunked,
+    ReadBlocked,
+    ReadObserved,
 }
 
 struct FailingFileSystem {
@@ -54,6 +59,10 @@ struct MetadataCallCounts {
     paths: Mutex<Vec<PathUri>>,
     started: Notify,
     release: Notify,
+    stream_chunks: AtomicUsize,
+    stream_bytes: AtomicUsize,
+    stream_started: Notify,
+    stream_release: Notify,
 }
 
 impl FailingFileSystem {
@@ -122,7 +131,10 @@ impl FailingFileSystem {
             InjectedFailure::Metadata(_)
             | InjectedFailure::MetadataBlocked
             | InjectedFailure::MetadataPending
-            | InjectedFailure::Read(_) => LOCAL_FS.get_metadata(path, sandbox).await,
+            | InjectedFailure::Read(_)
+            | InjectedFailure::ReadChunked
+            | InjectedFailure::ReadBlocked
+            | InjectedFailure::ReadObserved => LOCAL_FS.get_metadata(path, sandbox).await,
         }
     }
 
@@ -173,14 +185,37 @@ impl ExecutorFileSystem for FailingFileSystem {
 
     fn read_file_stream<'a>(
         &'a self,
-        _path: &'a PathUri,
-        _sandbox: Option<&'a FileSystemSandboxContext>,
+        path: &'a PathUri,
+        sandbox: Option<&'a FileSystemSandboxContext>,
     ) -> ExecutorFileSystemFuture<'a, FileSystemReadStream> {
-        Box::pin(async {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "failing filesystem does not support streaming reads",
-            ))
+        Box::pin(async move {
+            let is_target = path.to_abs_path()? == self.path;
+            match self.failure {
+                InjectedFailure::Read(kind) if is_target => {
+                    Err(io::Error::new(kind, "injected read failure"))
+                }
+                InjectedFailure::ReadChunked if is_target => {
+                    let data = LOCAL_FS.read_file(path, sandbox).await?;
+                    let metadata_calls = Arc::clone(&self.metadata_calls);
+                    let chunks = data.into_iter().map(move |byte| {
+                        metadata_calls.stream_chunks.fetch_add(1, Ordering::Relaxed);
+                        metadata_calls.stream_bytes.fetch_add(1, Ordering::Relaxed);
+                        Ok(vec![byte].into())
+                    });
+                    Ok(FileSystemReadStream::new(futures::stream::iter(chunks)))
+                }
+                InjectedFailure::ReadBlocked if is_target => {
+                    let stream = LOCAL_FS.read_file_stream(path, sandbox).await?;
+                    self.metadata_calls.stream_started.notify_one();
+                    self.metadata_calls.stream_release.notified().await;
+                    Ok(stream)
+                }
+                InjectedFailure::ReadObserved if is_target => {
+                    self.metadata_calls.stream_started.notify_one();
+                    LOCAL_FS.read_file_stream(path, sandbox).await
+                }
+                _ => LOCAL_FS.read_file_stream(path, sandbox).await,
+            }
         })
     }
 
@@ -278,15 +313,24 @@ async fn load_agents_md(config: &TestConfig) -> Option<LoadedAgentsMd> {
         &environments,
     )
     .await
+    .loaded
 }
 
 async fn agents_md_paths(config: &TestConfig) -> std::io::Result<Vec<PathUri>> {
-    super::agents_md_paths(
+    let candidates = super::agents_md_paths(
         &config.config,
         &PathUri::from_abs_path(&config.cwd),
         LOCAL_FS.as_ref(),
     )
-    .await
+    .await?;
+    Ok(project_doc_paths(candidates))
+}
+
+fn project_doc_paths(candidates: Vec<ProjectDocCandidate>) -> Vec<PathUri> {
+    candidates
+        .into_iter()
+        .map(|candidate| candidate.path)
+        .collect()
 }
 
 fn resolved_local_environments<const N: usize>(
@@ -573,6 +617,101 @@ async fn project_doc_invalid_utf8_uses_lossy_text() {
 }
 
 #[tokio::test]
+async fn project_doc_truncation_trims_split_multibyte_code_points() {
+    const PREFIX: &str = "rule:";
+
+    for code_point in ["é", "€", "🦀"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let source = tmp.path().join("AGENTS.md");
+        let contents = format!("{PREFIX}{code_point}tail");
+        fs::write(&source, &contents).unwrap();
+        let source_abs = source.abs();
+        let source_uri = PathUri::from_abs_path(&source_abs);
+        let cwd_uri = PathUri::from_abs_path(&tmp.abs());
+        let stream_counts = Arc::new(MetadataCallCounts::default());
+        let filesystem = FailingFileSystem {
+            path: source_abs,
+            failure: InjectedFailure::ReadChunked,
+            metadata_calls: Arc::clone(&stream_counts),
+        };
+        let limit = PREFIX.len() + 1;
+
+        let loaded = read_discovered_agents_md(
+            &filesystem,
+            "local",
+            &cwd_uri,
+            vec![ProjectDocCandidate {
+                path: source_uri.clone(),
+                size: contents.len() as u64,
+            }],
+            limit,
+        )
+        .await
+        .expect("project doc read")
+        .loaded
+        .expect("project doc expected");
+        let notice =
+            project_doc_truncation_notice(&source_uri, contents.len() as u64, PREFIX.len());
+
+        assert_eq!(
+            loaded.text(),
+            format!("{PREFIX}\n\n{notice}"),
+            "split code point {code_point:?}"
+        );
+        assert_eq!(
+            stream_counts.stream_bytes.load(Ordering::Relaxed),
+            PREFIX.len() + code_point.len(),
+            "lookahead for {code_point:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn project_doc_truncation_preserves_invalid_boundary_bytes_lossily() {
+    const CONTENTS: &[u8] = b"\xC3(";
+    const LIMIT: usize = 1;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("AGENTS.md");
+    fs::write(&source, CONTENTS).unwrap();
+    let source_abs = source.abs();
+    let source_uri = PathUri::from_abs_path(&source_abs);
+    let cwd_uri = PathUri::from_abs_path(&tmp.abs());
+    let stream_counts = Arc::new(MetadataCallCounts::default());
+    let filesystem = FailingFileSystem {
+        path: source_abs,
+        failure: InjectedFailure::ReadChunked,
+        metadata_calls: Arc::clone(&stream_counts),
+    };
+
+    let loaded = read_discovered_agents_md(
+        &filesystem,
+        "local",
+        &cwd_uri,
+        vec![ProjectDocCandidate {
+            path: source_uri.clone(),
+            size: CONTENTS.len() as u64,
+        }],
+        LIMIT,
+    )
+    .await
+    .expect("project doc read")
+    .loaded
+    .expect("project doc expected");
+    let notice = project_doc_truncation_notice(
+        &source_uri,
+        CONTENTS.len() as u64,
+        /*retained_bytes*/ LIMIT,
+    );
+
+    assert_eq!(loaded.text(), format!("\u{FFFD}\n\n{notice}"));
+    assert_eq!(
+        stream_counts.stream_bytes.load(Ordering::Relaxed),
+        CONTENTS.len()
+    );
+}
+
+#[tokio::test]
 async fn doc_larger_than_limit_includes_explicit_truncation_notice() {
     const LIMIT: usize = 1024;
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -584,8 +723,11 @@ async fn doc_larger_than_limit_includes_explicit_truncation_notice() {
     let res = get_user_instructions(&make_config(&tmp, LIMIT, /*instructions*/ None).await)
         .await
         .expect("doc expected");
-    let notice =
-        project_doc_truncation_notice(&PathUri::from_abs_path(&source.abs()), LIMIT * 2, LIMIT);
+    let notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&source.abs()),
+        (LIMIT * 2) as u64,
+        LIMIT,
+    );
 
     assert_eq!(res, format!("{}\n\n{notice}", &huge[..LIMIT]));
 }
@@ -686,6 +828,104 @@ async fn read_agents_md_ignores_files_removed_after_discovery() {
 }
 
 #[tokio::test]
+async fn oversized_project_doc_stream_stops_after_required_prefix() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    fs::write(tmp.path().join("AGENTS.md"), "abcdef").unwrap();
+    let config = make_config(&tmp, /*limit*/ 3, /*instructions*/ None).await;
+    let metadata_calls = Arc::new(MetadataCallCounts::default());
+    let fs = FailingFileSystem {
+        path: config.cwd.join("AGENTS.md"),
+        failure: InjectedFailure::ReadChunked,
+        metadata_calls: Arc::clone(&metadata_calls),
+    };
+
+    let loaded = read_agents_md(
+        &config.config,
+        &fs,
+        "local",
+        &PathUri::from_abs_path(&config.cwd),
+    )
+    .await
+    .expect("streamed read")
+    .expect("project instructions");
+
+    assert!(loaded.text().starts_with("abc\n\n"));
+    assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 3);
+    assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn oversized_whitespace_prefix_stops_at_the_budget_and_keeps_a_notice() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let source = tmp.path().join("AGENTS.md");
+    fs::write(&source, "   content after the retained prefix").unwrap();
+    let config = make_config(&tmp, /*limit*/ 3, /*instructions*/ None).await;
+    let metadata_calls = Arc::new(MetadataCallCounts::default());
+    let fs = FailingFileSystem {
+        path: source.abs(),
+        failure: InjectedFailure::ReadChunked,
+        metadata_calls: Arc::clone(&metadata_calls),
+    };
+
+    let loaded = read_agents_md(
+        &config.config,
+        &fs,
+        "local",
+        &PathUri::from_abs_path(&config.cwd),
+    )
+    .await
+    .expect("streamed read")
+    .expect("conservative truncation notice");
+    let notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&source.abs()),
+        /*original_bytes*/ 36,
+        /*retained_bytes*/ 3,
+    );
+
+    assert_eq!(loaded.text(), format!("   \n\n{notice}"));
+    assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 3);
+    assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 3);
+}
+
+#[tokio::test]
+async fn zero_budget_broader_doc_stops_after_first_non_whitespace_byte() {
+    let repo = tempfile::tempdir().expect("tempdir");
+    fs::write(repo.path().join(".git"), "gitdir: elsewhere").unwrap();
+    let root_doc = repo.path().join("AGENTS.md");
+    fs::write(&root_doc, "broader").unwrap();
+    let nested = repo.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join("AGENTS.md"), "abc").unwrap();
+    let mut config = make_config(&repo, /*limit*/ 3, /*instructions*/ None).await;
+    config.cwd = nested.abs();
+    let metadata_calls = Arc::new(MetadataCallCounts::default());
+    let fs = FailingFileSystem {
+        path: root_doc.abs(),
+        failure: InjectedFailure::ReadChunked,
+        metadata_calls: Arc::clone(&metadata_calls),
+    };
+
+    let loaded = read_agents_md(
+        &config.config,
+        &fs,
+        "local",
+        &PathUri::from_abs_path(&config.cwd),
+    )
+    .await
+    .expect("streamed read")
+    .expect("project instructions");
+    let root_notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&root_doc.abs()),
+        /*original_bytes*/ 7,
+        /*retained_bytes*/ 0,
+    );
+
+    assert_eq!(loaded.text(), format!("{root_notice}\n\nabc"));
+    assert_eq!(metadata_calls.stream_chunks.load(Ordering::Relaxed), 1);
+    assert_eq!(metadata_calls.stream_bytes.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
 async fn marker_search_does_not_wait_for_a_higher_ancestor() {
     let tmp = tempfile::tempdir().expect("tempdir");
     fs::write(tmp.path().join(".git"), "").unwrap();
@@ -715,6 +955,7 @@ async fn marker_search_does_not_wait_for_a_higher_ancestor() {
     .await
     .expect("nearest marker should complete")
     .expect("AGENTS.md discovery");
+    let paths = project_doc_paths(paths);
 
     assert_eq!(
         paths,
@@ -782,6 +1023,7 @@ async fn project_root_marker_search_pipelines_bounded_window_and_continues() {
         .expect("marker search should complete")
         .expect("marker search task")
         .expect("AGENTS.md discovery");
+    let paths = project_doc_paths(paths);
 
     assert_eq!(
         paths,
@@ -818,6 +1060,7 @@ async fn empty_project_root_markers_only_probe_cwd_candidates() {
     let paths = super::agents_md_paths(&config.config, &cwd, &fs)
         .await
         .expect("AGENTS.md discovery");
+    let paths = project_doc_paths(paths);
 
     let override_path = cwd.join(LOCAL_AGENTS_MD_FILENAME).expect("override path");
     let agents_path = cwd.join(DEFAULT_AGENTS_MD_FILENAME).expect("agents path");
@@ -912,6 +1155,7 @@ async fn multiple_environment_docs_use_labeled_layout_and_preserve_source_order(
 
     let loaded = load_project_instructions(&config.config, user_instructions, &environments)
         .await
+        .loaded
         .expect("instructions expected");
     let inner = format!(
         r#"global instructions
@@ -960,6 +1204,84 @@ secondary doc"#,
 }
 
 #[tokio::test]
+async fn independent_environment_reads_overlap_and_preserve_selection_order() {
+    let primary = tempfile::tempdir().expect("primary tempdir");
+    let secondary = tempfile::tempdir().expect("secondary tempdir");
+    let primary_doc = primary.path().join("AGENTS.md");
+    let secondary_doc = secondary.path().join("AGENTS.md");
+    fs::write(&primary_doc, "primary doc").unwrap();
+    fs::write(&secondary_doc, "secondary doc").unwrap();
+    let config = make_config(&primary, /*limit*/ 4096, /*instructions*/ None).await;
+    let primary_control = Arc::new(MetadataCallCounts::default());
+    let secondary_control = Arc::new(MetadataCallCounts::default());
+    let primary_filesystem: Arc<dyn ExecutorFileSystem> = Arc::new(FailingFileSystem {
+        path: primary_doc.abs(),
+        failure: InjectedFailure::ReadBlocked,
+        metadata_calls: Arc::clone(&primary_control),
+    });
+    let secondary_filesystem: Arc<dyn ExecutorFileSystem> = Arc::new(FailingFileSystem {
+        path: secondary_doc.abs(),
+        failure: InjectedFailure::ReadObserved,
+        metadata_calls: Arc::clone(&secondary_control),
+    });
+    let environments = TurnEnvironmentSnapshot {
+        generation: 0,
+        turn_environments: vec![
+            TurnEnvironment::new(
+                "primary".to_string(),
+                Arc::new(Environment::default_for_tests_with_filesystem(
+                    primary_filesystem,
+                )),
+                PathUri::from_abs_path(&config.cwd),
+                /*shell*/ None,
+            ),
+            TurnEnvironment::new(
+                "secondary".to_string(),
+                Arc::new(Environment::default_for_tests_with_filesystem(
+                    secondary_filesystem,
+                )),
+                PathUri::from_abs_path(&secondary.abs()),
+                /*shell*/ None,
+            ),
+        ],
+        starting: Vec::new(),
+    };
+    let config = config.config;
+
+    let load = tokio::spawn(async move {
+        load_project_instructions(&config, /*user_instructions*/ None, &environments).await
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        primary_control.stream_started.notified(),
+    )
+    .await
+    .expect("primary read should start");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        secondary_control.stream_started.notified(),
+    )
+    .await
+    .expect("secondary read should start while primary is blocked");
+    primary_control.stream_release.notify_one();
+
+    let loaded = tokio::time::timeout(std::time::Duration::from_secs(5), load)
+        .await
+        .expect("environment load should complete")
+        .expect("environment load task")
+        .loaded
+        .expect("instructions expected");
+    assert_eq!(
+        loaded.text(),
+        format!(
+            "for `primary` with root {}\n\nprimary doc\n\nfor `secondary` with root {}\n\nsecondary doc",
+            primary.path().display(),
+            secondary.path().display()
+        )
+    );
+}
+
+#[tokio::test]
 async fn secondary_only_project_doc_uses_single_contributor_layout() {
     let primary = tempfile::tempdir().expect("primary tempdir");
     let secondary = tempfile::tempdir().expect("secondary tempdir");
@@ -973,6 +1295,7 @@ async fn secondary_only_project_doc_uses_single_contributor_layout() {
 
     let loaded = load_project_instructions(&config.config, user_instructions, &environments)
         .await
+        .loaded
         .expect("instructions expected");
     let inner = format!("global instructions{AGENTS_MD_SEPARATOR}secondary doc");
 
@@ -1002,6 +1325,7 @@ async fn primary_only_project_doc_preserves_legacy_layout_with_multiple_bound_en
 
     let loaded = load_project_instructions(&config.config, user_instructions, &environments)
         .await
+        .loaded
         .expect("instructions expected");
     let inner = format!("global instructions{AGENTS_MD_SEPARATOR}primary doc");
 
@@ -1018,7 +1342,7 @@ async fn primary_only_project_doc_preserves_legacy_layout_with_multiple_bound_en
 }
 
 #[tokio::test]
-async fn project_doc_byte_limit_is_applied_independently_per_environment() {
+async fn project_doc_byte_limit_is_shared_across_environments() {
     let primary = tempfile::tempdir().expect("primary tempdir");
     let secondary = tempfile::tempdir().expect("secondary tempdir");
     fs::write(primary.path().join("AGENTS.md"), "ABCDE").unwrap();
@@ -1032,6 +1356,7 @@ async fn project_doc_byte_limit_is_applied_independently_per_environment() {
 
     let loaded = load_project_instructions(&config.config, user_instructions, &environments)
         .await
+        .loaded
         .expect("instructions expected");
     let primary_notice = project_doc_truncation_notice(
         &PathUri::from_abs_path(&primary.path().join("AGENTS.md").abs()),
@@ -1041,13 +1366,13 @@ async fn project_doc_byte_limit_is_applied_independently_per_environment() {
     let secondary_notice = project_doc_truncation_notice(
         &PathUri::from_abs_path(&secondary.path().join("AGENTS.md").abs()),
         /*original_bytes*/ 5,
-        /*retained_bytes*/ 3,
+        /*retained_bytes*/ 0,
     );
 
     assert_eq!(
         loaded.text(),
         format!(
-            "for `primary` with root {}\n\nABC\n\n{primary_notice}\n\nfor `secondary` with root {}\n\nVWX\n\n{secondary_notice}",
+            "for `primary` with root {}\n\nABC\n\n{primary_notice}\n\nfor `secondary` with root {}\n\n{secondary_notice}",
             primary.path().display(),
             secondary.path().display()
         )
@@ -1055,9 +1380,7 @@ async fn project_doc_byte_limit_is_applied_independently_per_environment() {
 }
 
 #[tokio::test]
-async fn multiple_environments_can_exceed_single_environment_project_doc_limit() {
-    // TODO(anp): Add an aggregate cap across environments instead of allowing the combined
-    // project instructions to grow by one full per-environment budget for every binding.
+async fn aggregate_project_doc_limit_prefers_environment_selection_order() {
     const LIMIT: usize = 8;
     let primary = tempfile::tempdir().expect("primary tempdir");
     let secondary = tempfile::tempdir().expect("secondary tempdir");
@@ -1077,18 +1400,62 @@ async fn multiple_environments_can_exceed_single_environment_project_doc_limit()
         &environments,
     )
     .await
+    .loaded
     .expect("instructions expected");
-    let project_bytes = loaded
-        .entries
-        .iter()
-        .filter(|entry| matches!(&entry.provenance, InstructionProvenance::Project { .. }))
-        .map(|entry| entry.contents.len())
-        .sum::<usize>();
+    let secondary_notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&secondary.path().join("AGENTS.md").abs()),
+        /*original_bytes*/ LIMIT as u64,
+        /*retained_bytes*/ 0,
+    );
 
-    assert_eq!(project_bytes, LIMIT * 2);
-    assert!(project_bytes > config.project_doc_max_bytes);
-    assert!(loaded.text().contains(&primary_doc));
-    assert!(loaded.text().contains(&secondary_doc));
+    assert_eq!(loaded.entries.len(), 2);
+    assert_eq!(loaded.entries[0].contents, primary_doc);
+    assert_eq!(loaded.entries[1].contents, secondary_notice);
+    assert!(!loaded.text().contains(&secondary_doc));
+}
+
+#[tokio::test]
+async fn aggregate_budget_passes_utf8_boundary_slack_to_a_broader_doc() {
+    const LIMIT: usize = 8;
+    let primary = tempfile::tempdir().expect("primary tempdir");
+    let secondary = tempfile::tempdir().expect("secondary tempdir");
+    fs::write(primary.path().join("AGENTS.md"), "12345").unwrap();
+    fs::create_dir(secondary.path().join(".git")).unwrap();
+    let secondary_root_doc = secondary.path().join("AGENTS.md");
+    fs::write(&secondary_root_doc, "ROOT").unwrap();
+    let secondary_nested = secondary.path().join("nested");
+    fs::create_dir(&secondary_nested).unwrap();
+    let secondary_nested_doc = secondary_nested.join("AGENTS.md");
+    fs::write(&secondary_nested_doc, "🦀tail").unwrap();
+    let config = make_config(&primary, LIMIT, /*instructions*/ None).await;
+    let environments = resolved_local_environments([
+        ("primary", config.cwd.clone()),
+        ("secondary", secondary_nested.abs()),
+    ]);
+
+    let loaded = load_project_instructions(
+        &config.config,
+        /*user_instructions*/ None,
+        &environments,
+    )
+    .await
+    .loaded
+    .expect("instructions expected");
+    let root_notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&secondary_root_doc.abs()),
+        /*original_bytes*/ 4,
+        /*retained_bytes*/ 3,
+    );
+    let nested_notice = project_doc_truncation_notice(
+        &PathUri::from_abs_path(&secondary_nested_doc.abs()),
+        /*original_bytes*/ 8,
+        /*retained_bytes*/ 0,
+    );
+
+    assert_eq!(loaded.entries.len(), 3);
+    assert_eq!(loaded.entries[0].contents, "12345");
+    assert_eq!(loaded.entries[1].contents, format!("ROO\n\n{root_notice}"));
+    assert_eq!(loaded.entries[2].contents, nested_notice);
 }
 
 #[tokio::test]
@@ -1109,6 +1476,7 @@ async fn secondary_environment_invalid_utf8_does_not_suppress_other_docs() {
         &environments,
     )
     .await
+    .loaded
     .expect("instructions expected");
 
     assert!(loaded.text().contains("primary doc"));

@@ -29,6 +29,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use super::ToolCall;
+use super::ToolCallBuildError;
 use super::ToolCallSource;
 use super::ToolRouter;
 use super::ToolRouterParams;
@@ -207,6 +208,26 @@ async fn build_custom_tool_call_uses_namespace_for_registry_name() -> anyhow::Re
     );
 
     Ok(())
+}
+
+#[test]
+fn malformed_client_tool_search_call_retains_output_correlation() {
+    let error = ToolRouter::build_tool_call(ResponseItem::ToolSearchCall {
+        id: None,
+        call_id: Some("search-malformed".to_string()),
+        status: None,
+        execution: "client".to_string(),
+        arguments: json!({"query": 42}),
+        internal_chat_message_metadata_passthrough: None,
+    })
+    .expect_err("malformed tool_search arguments should fail to build");
+
+    let ToolCallBuildError::ToolSearchArguments { call_id, message } = error;
+    assert_eq!(call_id, "search-malformed");
+    assert!(
+        message.starts_with("failed to parse tool_search arguments:"),
+        "unexpected build error: {message}"
+    );
 }
 
 #[tokio::test]

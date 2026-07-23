@@ -1,5 +1,6 @@
 use crate::SkillsService;
 use crate::agent::AgentControl;
+use crate::agent::control::AgentExecutionGuard;
 use crate::attestation::AttestationProvider;
 use crate::codex_thread::CodexThread;
 use crate::config::Config;
@@ -1169,6 +1170,23 @@ impl ThreadManagerState {
         thread.submit(op).await
     }
 
+    pub(crate) async fn send_op_with_execution_guard(
+        &self,
+        thread_id: ThreadId,
+        op: Op,
+        execution_guard: Option<AgentExecutionGuard>,
+    ) -> CodexResult<String> {
+        let thread = self.get_thread(thread_id).await?;
+        if let Some(ops_log) = &self.ops_log
+            && let Ok(mut log) = ops_log.lock()
+        {
+            log.push((thread_id, op.clone()));
+        }
+        thread
+            .submit_with_preacquired_execution_guard(op, execution_guard)
+            .await
+    }
+
     /// Remove a thread from the manager by ID, returning it when present.
     pub(crate) async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
         self.threads.write().await.remove(thread_id)
@@ -1833,6 +1851,17 @@ fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
         };
     }
 
+    if builder.has_active_turn()
+        && let Some(active_turn_start_index) = builder.active_turn_start_index()
+        && implicit_legacy_turn_is_unfinished(rollout_items, active_turn_start_index)
+    {
+        return SnapshotTurnState {
+            ends_mid_turn: true,
+            active_turn_id: None,
+            active_turn_start_index: Some(active_turn_start_index),
+        };
+    }
+
     let Some(last_user_position) = truncation::user_message_positions_in_rollout(rollout_items)
         .last()
         .copied()
@@ -1857,6 +1886,31 @@ fn snapshot_turn_state(history: &InitialHistory) -> SnapshotTurnState {
         active_turn_id: None,
         active_turn_start_index: None,
     }
+}
+
+fn implicit_legacy_turn_is_unfinished(
+    rollout_items: &[RolloutItem],
+    active_turn_start_index: usize,
+) -> bool {
+    if !matches!(
+        rollout_items.get(active_turn_start_index),
+        Some(RolloutItem::EventMsg(EventMsg::UserMessage(_)))
+    ) {
+        return false;
+    }
+
+    !rollout_items[active_turn_start_index + 1..]
+        .iter()
+        .any(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::AgentMessage(message))
+                    if !message.message.is_empty()
+            ) || matches!(
+                item,
+                RolloutItem::EventMsg(EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
+            )
+        })
 }
 
 fn fork_history_from_snapshot(

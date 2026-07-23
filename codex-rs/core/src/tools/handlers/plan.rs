@@ -14,12 +14,82 @@ use codex_protocol::protocol::EventMsg;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 use serde_json::Value as JsonValue;
+#[cfg(test)]
+use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::LazyLock;
+#[cfg(test)]
+use std::sync::Mutex;
+#[cfg(test)]
+use tokio::sync::Notify;
 
 pub struct PlanHandler;
 
-pub struct PlanToolOutput;
+pub struct PlanToolOutput {
+    normalized_plan: Option<UpdatePlanArgs>,
+}
 
 const PLAN_UPDATED_MESSAGE: &str = "Plan updated";
+
+impl PlanToolOutput {
+    fn normalized_result(&self) -> Option<JsonValue> {
+        self.normalized_plan.as_ref().map(|normalized_plan| {
+            serde_json::json!({
+                "message": PLAN_UPDATED_MESSAGE,
+                "normalized_plan": normalized_plan,
+            })
+        })
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct PlanCommitBoundaryHook {
+    reached: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
+static PLAN_COMMIT_BOUNDARY_HOOKS: LazyLock<Mutex<HashMap<String, Arc<PlanCommitBoundaryHook>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(test)]
+impl PlanCommitBoundaryHook {
+    fn install(call_id: &str) -> Arc<Self> {
+        let hook = Arc::new(Self::default());
+        let previous = PLAN_COMMIT_BOUNDARY_HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(call_id.to_string(), Arc::clone(&hook));
+        assert!(
+            previous.is_none(),
+            "plan commit hook call IDs must be unique"
+        );
+        hook
+    }
+
+    async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+async fn pause_at_plan_commit_boundary(call_id: &str) {
+    let hook = PLAN_COMMIT_BOUNDARY_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(call_id);
+    if let Some(hook) = hook {
+        hook.reached.notify_one();
+        hook.release.notified().await;
+    }
+}
 
 impl ToolOutput for PlanToolOutput {
     fn log_preview(&self) -> String {
@@ -31,7 +101,11 @@ impl ToolOutput for PlanToolOutput {
     }
 
     fn to_response_item(&self, call_id: &str, _payload: &ToolPayload) -> ResponseInputItem {
-        let mut output = FunctionCallOutputPayload::from_text(PLAN_UPDATED_MESSAGE.to_string());
+        let text = self.normalized_result().map_or_else(
+            || PLAN_UPDATED_MESSAGE.to_string(),
+            |result| result.to_string(),
+        );
+        let mut output = FunctionCallOutputPayload::from_text(text);
         output.success = Some(true);
 
         ResponseInputItem::FunctionCallOutput {
@@ -41,7 +115,8 @@ impl ToolOutput for PlanToolOutput {
     }
 
     fn code_mode_result(&self, _payload: &ToolPayload) -> JsonValue {
-        JsonValue::Object(serde_json::Map::new())
+        self.normalized_result()
+            .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()))
     }
 }
 
@@ -67,7 +142,8 @@ impl PlanHandler {
         let ToolInvocation {
             session,
             turn,
-            call_id: _,
+            cancellation_token,
+            call_id: _call_id,
             payload,
             ..
         } = invocation;
@@ -87,24 +163,40 @@ impl PlanHandler {
             ));
         }
 
-        let args = parse_update_plan_arguments(&arguments)?;
+        let requested_args = parse_update_plan_arguments(&arguments)?;
+        if cancellation_token.is_cancelled() {
+            return Err(FunctionCallError::RespondToModel(
+                "update_plan was cancelled before the plan update began".to_string(),
+            ));
+        }
+        #[cfg(test)]
+        pause_at_plan_commit_boundary(&_call_id).await;
         let args = session
             .services
             .task_evidence
-            .record_plan_update(&args)
+            .record_plan_update(&requested_args)
             .await;
+        let normalized_plan = (args != requested_args).then(|| args.clone());
         session
             .send_event(turn.as_ref(), EventMsg::PlanUpdate(args))
             .await;
 
-        Ok(boxed_tool_output(PlanToolOutput))
+        Ok(boxed_tool_output(PlanToolOutput { normalized_plan }))
     }
 }
 
-impl CoreToolRuntime for PlanHandler {}
+impl CoreToolRuntime for PlanHandler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        true
+    }
+}
 
 fn parse_update_plan_arguments(arguments: &str) -> Result<UpdatePlanArgs, FunctionCallError> {
     serde_json::from_str::<UpdatePlanArgs>(arguments).map_err(|e| {
         FunctionCallError::RespondToModel(format!("failed to parse function arguments: {e}"))
     })
 }
+
+#[cfg(test)]
+#[path = "plan_tests.rs"]
+mod tests;

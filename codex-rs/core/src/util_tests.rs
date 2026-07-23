@@ -425,6 +425,14 @@ fn emit_feedback_request_tags_preserves_auth_env_fields_for_legacy_emitters() {
 }
 
 #[test]
+fn backoff_is_bounded_at_maximum_configured_retry_attempt() {
+    let delay = backoff(100);
+
+    assert!(!delay.is_zero());
+    assert!(delay <= Duration::from_millis(MAX_DELAY_MS));
+}
+
+#[test]
 fn normalize_thread_name_trims_and_rejects_empty() {
     assert_eq!(normalize_thread_name("   "), None);
     assert_eq!(

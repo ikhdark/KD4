@@ -65,6 +65,22 @@ pub(crate) enum SpawnAgentForkMode {
     LastNTurns(usize),
 }
 
+#[derive(Clone)]
+pub(crate) struct AgentJobBinding {
+    pub(crate) state_db: Arc<codex_state::StateRuntime>,
+    pub(crate) job_id: String,
+    pub(crate) item_id: String,
+}
+
+impl std::fmt::Debug for AgentJobBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentJobBinding")
+            .field("job_id", &self.job_id)
+            .field("item_id", &self.item_id)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SpawnAgentOptions {
     pub(crate) fork_parent_spawn_call_id: Option<String>,
@@ -72,6 +88,7 @@ pub(crate) struct SpawnAgentOptions {
     pub(crate) parent_thread_id: Option<ThreadId>,
     pub(crate) environments: Option<Vec<TurnEnvironmentSelection>>,
     pub(crate) typed_task_binding: Option<codex_agent_task_store::AgentTaskBindingDraft>,
+    pub(crate) agent_job_binding: Option<AgentJobBinding>,
 }
 
 #[derive(Clone, Debug)]
@@ -86,6 +103,70 @@ pub(crate) struct ListedAgent {
     pub(crate) agent_name: String,
     pub(crate) agent_status: AgentStatus,
     pub(crate) last_task_message: Option<String>,
+}
+
+#[cfg(test)]
+struct AgentControlTestBarrier {
+    visits: std::sync::atomic::AtomicUsize,
+    reached: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl Default for AgentControlTestBarrier {
+    fn default() -> Self {
+        Self {
+            visits: std::sync::atomic::AtomicUsize::new(0),
+            reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+impl AgentControlTestBarrier {
+    async fn pause(&self) {
+        self.visits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.reached.add_permits(1);
+        self.release
+            .acquire()
+            .await
+            .expect("test barrier should remain open")
+            .forget();
+    }
+
+    async fn wait_until_reached(&self) {
+        self.reached
+            .acquire()
+            .await
+            .expect("test barrier should remain open")
+            .forget();
+    }
+
+    fn release_one(&self) {
+        self.release.add_permits(1);
+    }
+
+    fn visits(&self) -> usize {
+        self.visits.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct AgentControlTestHooks {
+    before_initial_submission: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
+    before_v2_cold_load: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
+    after_execution_reservation: std::sync::Mutex<Option<Arc<AgentControlTestBarrier>>>,
+}
+
+#[derive(Clone, Debug)]
+enum V2AgentLoadCompletion {
+    Loading,
+    Succeeded,
+    Failed(Arc<str>),
+    Cancelled,
 }
 
 /// Control-plane handle for multi-agent operations.
@@ -105,11 +186,15 @@ pub(crate) struct AgentControl {
     manager: Weak<ThreadManagerState>,
     state: Arc<AgentRegistry>,
     v2_residency: Arc<V2Residency>,
+    v2_load_flights:
+        Arc<std::sync::Mutex<HashMap<ThreadId, Arc<watch::Sender<V2AgentLoadCompletion>>>>>,
     agent_execution_limiter: Arc<AgentExecutionLimiter>,
     /// Session-scoped state shared by the root thread and every cloned sub-agent control handle.
     rollout_budget: Arc<RolloutBudget>,
     /// Durable typed-task state shared by the root thread and all of its sub-agents.
     task_coordinator: AgentTaskCoordinator,
+    #[cfg(test)]
+    test_hooks: Arc<AgentControlTestHooks>,
 }
 
 impl AgentControl {
@@ -155,9 +240,22 @@ impl AgentControl {
         input: Vec<UserInput>,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
-        self.ensure_execution_capacity_for_turn_start(agent_id, /*starts_turn*/ true)
+        let execution_guard = self
+            .reserve_execution_capacity_for_turn_start(agent_id, /*starts_turn*/ true)
             .await?;
-        self.send_input_after_capacity_check(agent_id, &state, input)
+        #[cfg(test)]
+        if execution_guard.is_some() {
+            let barrier = self
+                .test_hooks
+                .after_execution_reservation
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(barrier) = barrier {
+                barrier.pause().await;
+            }
+        }
+        self.send_input_after_capacity_check(agent_id, &state, input, execution_guard)
             .await
     }
 
@@ -166,13 +264,16 @@ impl AgentControl {
         agent_id: ThreadId,
         state: &Arc<ThreadManagerState>,
         input: Vec<UserInput>,
+        execution_guard: Option<AgentExecutionGuard>,
     ) -> CodexResult<String> {
         let last_task_message = non_empty_task_message(render_input_preview(&input));
         let result = self
             .handle_thread_request_result(
                 agent_id,
                 state,
-                state.send_op(agent_id, input.into()).await,
+                state
+                    .send_op_with_execution_guard(agent_id, input.into(), execution_guard)
+                    .await,
             )
             .await;
         if result.is_ok() {
@@ -193,13 +294,15 @@ impl AgentControl {
         agent_communication_context: AgentCommunicationContext,
     ) -> CodexResult<String> {
         let state = self.upgrade()?;
-        self.ensure_execution_capacity_for_turn_start(agent_id, communication.trigger_turn)
+        let execution_guard = self
+            .reserve_execution_capacity_for_turn_start(agent_id, communication.trigger_turn)
             .await?;
         self.send_inter_agent_communication_after_capacity_check(
             agent_id,
             &state,
             communication,
             agent_communication_context,
+            execution_guard,
         )
         .await
     }
@@ -210,9 +313,16 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
+        execution_guard: Option<AgentExecutionGuard>,
     ) -> CodexResult<String> {
-        self.submit_inter_agent_communication(agent_id, state, communication, context)
-            .await
+        self.submit_inter_agent_communication(
+            agent_id,
+            state,
+            communication,
+            context,
+            execution_guard,
+        )
+        .await
     }
 
     async fn submit_inter_agent_communication(
@@ -221,6 +331,7 @@ impl AgentControl {
         state: &Arc<ThreadManagerState>,
         communication: InterAgentCommunication,
         context: AgentCommunicationContext,
+        execution_guard: Option<AgentExecutionGuard>,
     ) -> CodexResult<String> {
         let last_task_message = last_task_message_from_communication(&communication);
         let communication_for_log =
@@ -230,7 +341,11 @@ impl AgentControl {
                 agent_id,
                 state,
                 state
-                    .send_op(agent_id, Op::InterAgentCommunication { communication })
+                    .send_op_with_execution_guard(
+                        agent_id,
+                        Op::InterAgentCommunication { communication },
+                        execution_guard,
+                    )
                     .await,
             )
             .await;
@@ -499,9 +614,14 @@ impl AgentControl {
                 return;
             }
 
-            if let Some(child_agent_path) = child_agent_path.as_ref()
-                && let Err(error) = control
-                    .task_coordinator()
+            let state = control.upgrade().ok();
+            let child_thread = match state.as_ref() {
+                Some(state) => state.get_thread(child_thread_id).await.ok(),
+                None => None,
+            };
+            if let Some(child_agent_path) = child_agent_path.as_ref() {
+                let task_coordinator = control.task_coordinator();
+                match task_coordinator
                     .seal_missing_receipt(
                         child_agent_path,
                         format!(
@@ -509,18 +629,37 @@ impl AgentControl {
                         ),
                     )
                     .await
-            {
-                warn!(
-                    agent_path = %child_agent_path,
-                    %error,
-                    "failed to seal missing typed-agent receipt"
-                );
+                {
+                    Ok(Some(receipt)) => {
+                        if let Some(child_thread) = child_thread.as_ref() {
+                            let session_telemetry = child_thread.session_telemetry();
+                            task_coordinator
+                                .maybe_emit_terminal_metrics(
+                                    receipt.assignment_id,
+                                    &session_telemetry,
+                                )
+                                .await;
+                        } else {
+                            warn!(
+                                agent_path = %child_agent_path,
+                                "could not emit missing-receipt typed-task metrics because the child thread was unavailable"
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(
+                            agent_path = %child_agent_path,
+                            %error,
+                            "failed to seal missing typed-agent receipt"
+                        );
+                    }
+                }
             }
 
-            let Ok(state) = control.upgrade() else {
+            let Some(state) = state else {
                 return;
             };
-            let child_thread = state.get_thread(child_thread_id).await.ok();
             let child_uses_multi_agent_v2 = match child_thread.as_ref() {
                 Some(child_thread) => {
                     child_thread.multi_agent_version() == Some(MultiAgentVersion::V2)
@@ -583,6 +722,7 @@ impl AgentControl {
         if depth == 1 {
             self.state.register_root_thread(parent_thread_id);
         }
+        reservation.reserve_parent_thread(parent_thread_id)?;
         if let Some(agent_path) = agent_path.as_ref() {
             reservation.reserve_agent_path(agent_path)?;
         }

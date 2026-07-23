@@ -215,13 +215,14 @@ SET
     started_at = COALESCE(started_at, ?),
     completed_at = NULL,
     last_error = NULL
-WHERE id = ?
+WHERE id = ? AND status = ?
             "#,
         )
         .bind(AgentJobStatus::Running.as_str())
         .bind(now)
         .bind(now)
         .bind(job_id)
+        .bind(AgentJobStatus::Pending.as_str())
         .execute(self.pool.as_ref())
         .await?;
         Ok(())
@@ -233,13 +234,14 @@ WHERE id = ?
             r#"
 UPDATE agent_jobs
 SET status = ?, updated_at = ?, completed_at = ?, last_error = NULL
-WHERE id = ?
+WHERE id = ? AND status = ?
             "#,
         )
         .bind(AgentJobStatus::Completed.as_str())
         .bind(now)
         .bind(now)
         .bind(job_id)
+        .bind(AgentJobStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
         Ok(())
@@ -255,7 +257,7 @@ WHERE id = ?
             r#"
 UPDATE agent_jobs
 SET status = ?, updated_at = ?, completed_at = ?, last_error = ?
-WHERE id = ?
+WHERE id = ? AND status IN (?, ?)
             "#,
         )
         .bind(AgentJobStatus::Failed.as_str())
@@ -263,6 +265,8 @@ WHERE id = ?
         .bind(now)
         .bind(error_message)
         .bind(job_id)
+        .bind(AgentJobStatus::Pending.as_str())
+        .bind(AgentJobStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
         Ok(())
@@ -326,7 +330,15 @@ SET
     attempt_count = attempt_count + 1,
     updated_at = ?,
     last_error = NULL
-WHERE job_id = ? AND item_id = ? AND status = ?
+WHERE
+    job_id = ?
+    AND item_id = ?
+    AND status = ?
+    AND EXISTS (
+        SELECT 1
+        FROM agent_jobs
+        WHERE agent_jobs.id = agent_job_items.job_id AND agent_jobs.status = ?
+    )
             "#,
         )
         .bind(AgentJobItemStatus::Running.as_str())
@@ -334,6 +346,7 @@ WHERE job_id = ? AND item_id = ? AND status = ?
         .bind(job_id)
         .bind(item_id)
         .bind(AgentJobItemStatus::Pending.as_str())
+        .bind(AgentJobStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
         Ok(result.rows_affected() > 0)
@@ -355,7 +368,15 @@ SET
     attempt_count = attempt_count + 1,
     updated_at = ?,
     last_error = NULL
-WHERE job_id = ? AND item_id = ? AND status = ?
+WHERE
+    job_id = ?
+    AND item_id = ?
+    AND status = ?
+    AND EXISTS (
+        SELECT 1
+        FROM agent_jobs
+        WHERE agent_jobs.id = agent_job_items.job_id AND agent_jobs.status = ?
+    )
             "#,
         )
         .bind(AgentJobItemStatus::Running.as_str())
@@ -364,6 +385,7 @@ WHERE job_id = ? AND item_id = ? AND status = ?
         .bind(job_id)
         .bind(item_id)
         .bind(AgentJobItemStatus::Pending.as_str())
+        .bind(AgentJobStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
         Ok(result.rows_affected() > 0)
@@ -393,6 +415,47 @@ WHERE job_id = ? AND item_id = ? AND status = ?
         .bind(job_id)
         .bind(item_id)
         .bind(AgentJobItemStatus::Running.as_str())
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn mark_agent_job_item_spawn_failed(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        error_message: &str,
+    ) -> anyhow::Result<bool> {
+        let now = Utc::now().timestamp();
+        let result = sqlx::query(
+            r#"
+UPDATE agent_job_items
+SET
+    status = ?,
+    completed_at = ?,
+    updated_at = ?,
+    last_error = ?,
+    assigned_thread_id = NULL
+WHERE
+    job_id = ?
+    AND item_id = ?
+    AND status IN (?, ?)
+    AND EXISTS (
+        SELECT 1
+        FROM agent_jobs
+        WHERE agent_jobs.id = agent_job_items.job_id AND agent_jobs.status = ?
+    )
+            "#,
+        )
+        .bind(AgentJobItemStatus::Failed.as_str())
+        .bind(now)
+        .bind(now)
+        .bind(error_message)
+        .bind(job_id)
+        .bind(item_id)
+        .bind(AgentJobItemStatus::Pending.as_str())
+        .bind(AgentJobItemStatus::Running.as_str())
+        .bind(AgentJobStatus::Running.as_str())
         .execute(self.pool.as_ref())
         .await?;
         Ok(result.rows_affected() > 0)
@@ -429,8 +492,29 @@ WHERE job_id = ? AND item_id = ? AND status = ?
         reporting_thread_id: &str,
         result_json: &Value,
     ) -> anyhow::Result<bool> {
+        self.report_agent_job_item_result_and_maybe_cancel(
+            job_id,
+            item_id,
+            reporting_thread_id,
+            result_json,
+            /*cancel_job*/ false,
+            /*cancellation_reason*/ "",
+        )
+        .await
+    }
+
+    pub async fn report_agent_job_item_result_and_maybe_cancel(
+        &self,
+        job_id: &str,
+        item_id: &str,
+        reporting_thread_id: &str,
+        result_json: &Value,
+        cancel_job: bool,
+        cancellation_reason: &str,
+    ) -> anyhow::Result<bool> {
         let now = Utc::now().timestamp();
         let serialized = serde_json::to_string(result_json)?;
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"
 UPDATE agent_job_items
@@ -447,6 +531,11 @@ WHERE
     AND item_id = ?
     AND status = ?
     AND assigned_thread_id = ?
+    AND EXISTS (
+        SELECT 1
+        FROM agent_jobs
+        WHERE agent_jobs.id = agent_job_items.job_id AND agent_jobs.status = ?
+    )
             "#,
         )
         .bind(AgentJobItemStatus::Completed.as_str())
@@ -458,9 +547,38 @@ WHERE
         .bind(item_id)
         .bind(AgentJobItemStatus::Running.as_str())
         .bind(reporting_thread_id)
-        .execute(self.pool.as_ref())
+        .bind(AgentJobStatus::Running.as_str())
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
+        if cancel_job {
+            let cancellation = sqlx::query(
+                r#"
+UPDATE agent_jobs
+SET status = ?, updated_at = ?, completed_at = ?, last_error = ?
+WHERE id = ? AND status = ?
+                "#,
+            )
+            .bind(AgentJobStatus::Cancelled.as_str())
+            .bind(now)
+            .bind(now)
+            .bind(cancellation_reason)
+            .bind(job_id)
+            .bind(AgentJobStatus::Running.as_str())
+            .execute(&mut *tx)
+            .await?;
+            if cancellation.rows_affected() == 0 {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+        }
+
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn mark_agent_job_item_completed(
@@ -649,6 +767,100 @@ mod tests {
                 failed_items: 0,
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_report_cancels_job_and_rejects_other_running_worker() -> anyhow::Result<()> {
+        let codex_home = unique_temp_dir();
+        let runtime = StateRuntime::init(codex_home, "test-provider".to_string()).await?;
+        let job_id = "job-stop";
+        let first_item_id = "item-1";
+        let second_item_id = "item-2";
+        let first_thread_id = "thread-1";
+        let second_thread_id = "thread-2";
+        runtime
+            .create_agent_job(
+                &AgentJobCreateParams {
+                    id: job_id.to_string(),
+                    name: "stop-job".to_string(),
+                    instruction: "Return a result".to_string(),
+                    auto_export: true,
+                    max_runtime_seconds: None,
+                    output_schema_json: None,
+                    input_headers: vec!["path".to_string()],
+                    input_csv_path: "/tmp/in.csv".to_string(),
+                    output_csv_path: "/tmp/out.csv".to_string(),
+                },
+                &[
+                    AgentJobItemCreateParams {
+                        item_id: first_item_id.to_string(),
+                        row_index: 0,
+                        source_id: None,
+                        row_json: json!({"path":"file-1"}),
+                    },
+                    AgentJobItemCreateParams {
+                        item_id: second_item_id.to_string(),
+                        row_index: 1,
+                        source_id: None,
+                        row_json: json!({"path":"file-2"}),
+                    },
+                ],
+            )
+            .await?;
+        runtime.mark_agent_job_running(job_id).await?;
+        assert!(
+            runtime
+                .mark_agent_job_item_running_with_thread(job_id, first_item_id, first_thread_id,)
+                .await?
+        );
+        assert!(
+            runtime
+                .mark_agent_job_item_running_with_thread(job_id, second_item_id, second_thread_id,)
+                .await?
+        );
+
+        let accepted = runtime
+            .report_agent_job_item_result_and_maybe_cancel(
+                job_id,
+                first_item_id,
+                first_thread_id,
+                &json!({"stop": true}),
+                /*cancel_job*/ true,
+                "cancelled by worker request",
+            )
+            .await?;
+        assert!(accepted);
+        let job = runtime
+            .get_agent_job(job_id)
+            .await?
+            .expect("job should exist");
+        assert_eq!(job.status, AgentJobStatus::Cancelled);
+
+        let late_report_accepted = runtime
+            .report_agent_job_item_result(
+                job_id,
+                second_item_id,
+                second_thread_id,
+                &json!({"late": true}),
+            )
+            .await?;
+        assert!(!late_report_accepted);
+        assert!(
+            runtime
+                .mark_agent_job_item_failed(
+                    job_id,
+                    second_item_id,
+                    "job cancelled before worker completion",
+                )
+                .await?
+        );
+        let second_item = runtime
+            .get_agent_job_item(job_id, second_item_id)
+            .await?
+            .expect("second item should exist");
+        assert_eq!(second_item.status, AgentJobItemStatus::Failed);
+        assert_eq!(second_item.result_json, None);
         Ok(())
     }
 

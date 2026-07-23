@@ -1,13 +1,9 @@
-use std::time::Instant;
-
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
-use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::mcp_resource_spec::create_read_mcp_resource_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
-use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_protocol::protocol::McpInvocation;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -16,10 +12,8 @@ use rmcp::model::ReadResourceRequestParams;
 
 use super::ReadResourceArgs;
 use super::ReadResourcePayload;
-use super::call_tool_result_from_content;
-use super::emit_tool_call_begin;
-use super::emit_tool_call_end;
 use super::ensure_model_can_access_mcp_server;
+use super::execute_resource_call;
 use super::normalize_required_string;
 use super::parse_args;
 use super::parse_arguments;
@@ -53,6 +47,7 @@ impl ReadMcpResourceHandler {
         let ToolInvocation {
             session,
             step_context,
+            cancellation_token,
             call_id,
             payload,
             ..
@@ -81,75 +76,31 @@ impl ReadMcpResourceHandler {
             arguments: arguments.clone(),
         };
 
-        emit_tool_call_begin(&session, turn.as_ref(), &call_id, invocation.clone()).await;
-        let start = Instant::now();
-
-        let payload_result: Result<ReadResourcePayload, FunctionCallError> = async {
-            ensure_model_can_access_mcp_server(turn.as_ref(), &server)?;
-            let result = manager
-                .read_resource(&server, ReadResourceRequestParams::new(uri.clone()))
-                .await
-                .map_err(|err| {
-                    FunctionCallError::RespondToModel(format!("resources/read failed: {err:#}"))
-                })?;
-
-            Ok(ReadResourcePayload {
-                server,
-                uri,
-                result,
-            })
-        }
-        .await;
         let truncation_policy = turn.model_info.truncation_policy.into();
-
-        match payload_result {
-            Ok(payload) => match serialize_function_output(payload, truncation_policy) {
-                Ok(output) => {
-                    let content = function_call_output_content_items_to_text(&output.body)
-                        .unwrap_or_default();
-                    let duration = start.elapsed();
-                    emit_tool_call_end(
-                        &session,
-                        turn.as_ref(),
-                        &call_id,
-                        invocation,
-                        duration,
-                        Ok(call_tool_result_from_content(&content, output.success)),
-                    )
-                    .await;
-                    Ok(boxed_tool_output(output))
-                }
-                Err(err) => {
-                    let duration = start.elapsed();
-                    let message = err.to_string();
-                    emit_tool_call_end(
-                        &session,
-                        turn.as_ref(),
-                        &call_id,
-                        invocation,
-                        duration,
-                        Err(message.clone()),
-                    )
-                    .await;
-                    Err(err)
-                }
+        execute_resource_call(
+            &session,
+            turn.as_ref(),
+            &call_id,
+            invocation,
+            cancellation_token,
+            async {
+                ensure_model_can_access_mcp_server(turn.as_ref(), &server)?;
+                let result = manager
+                    .read_resource(&server, ReadResourceRequestParams::new(uri.clone()))
+                    .await
+                    .map_err(|err| {
+                        FunctionCallError::RespondToModel(format!("resources/read failed: {err:#}"))
+                    })?;
+                let payload = ReadResourcePayload::new(server, uri, result, truncation_policy)?;
+                serialize_function_output(payload, truncation_policy)
             },
-            Err(err) => {
-                let duration = start.elapsed();
-                let message = err.to_string();
-                emit_tool_call_end(
-                    &session,
-                    turn.as_ref(),
-                    &call_id,
-                    invocation,
-                    duration,
-                    Err(message.clone()),
-                )
-                .await;
-                Err(err)
-            }
-        }
+        )
+        .await
     }
 }
 
-impl CoreToolRuntime for ReadMcpResourceHandler {}
+impl CoreToolRuntime for ReadMcpResourceHandler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        true
+    }
+}

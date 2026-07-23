@@ -1,6 +1,7 @@
 use codex_protocol::AgentPath;
 use codex_protocol::protocol::AgentStatus;
 use codex_utils_output_truncation::TruncationPolicy;
+use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
 
 use crate::context::ContextualUserFragment;
@@ -21,7 +22,32 @@ pub(crate) fn format_subagent_notification_message(
     agent_reference: &str,
     status: &AgentStatus,
 ) -> String {
-    SubagentNotification::new(agent_reference, status.clone()).render()
+    match status {
+        AgentStatus::Errored(error) => {
+            format_bounded_subagent_error_notification(agent_reference, error)
+        }
+        status => SubagentNotification::new(agent_reference, status.clone()).render(),
+    }
+}
+
+fn format_bounded_subagent_error_notification(agent_reference: &str, error: &str) -> String {
+    let mut error_budget = ERROR_MAX_TOKENS.min(approx_token_count(error));
+    loop {
+        let error = truncate_text(error, TruncationPolicy::Tokens(error_budget));
+        let message =
+            SubagentNotification::new(agent_reference, AgentStatus::Errored(error)).render();
+        let message_tokens = approx_token_count(&message);
+        if message_tokens < COMPLETION_MESSAGE_MAX_TOKENS || error_budget == 0 {
+            return message;
+        }
+
+        // JSON escaping can expand control characters after raw-text truncation, so tighten the
+        // source budget until the rendered notification itself fits the completion envelope.
+        let next_budget = error_budget
+            .saturating_mul(COMPLETION_MESSAGE_MAX_TOKENS.saturating_sub(1))
+            / message_tokens;
+        error_budget = next_budget.min(error_budget.saturating_sub(1));
+    }
 }
 
 pub(crate) fn format_inter_agent_completion_message(

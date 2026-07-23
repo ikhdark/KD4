@@ -19,6 +19,8 @@ use core_test_support::wait_for_event;
 use pretty_assertions::assert_eq;
 use serde_json::Value;
 
+const COLLABORATION_MODE_RESET_TEXT: &str = "No collaboration-mode-specific instructions are currently active. Any previously provided collaboration-mode instructions no longer apply.";
+
 fn collab_mode_with_mode_and_instructions(
     mode: ModeKind,
     instructions: Option<&str>,
@@ -56,6 +58,79 @@ fn collab_xml(text: &str) -> String {
 
 fn count_messages_containing(texts: &[String], target: &str) -> usize {
     texts.iter().filter(|text| text.contains(target)).count()
+}
+
+async fn assert_clearing_collaboration_instructions_emits_reset(
+    cleared_instructions: Option<&str>,
+) -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let _req1 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
+    )
+    .await;
+    let req2 = mount_sse_once(
+        &server,
+        sse(vec![ev_response_created("resp-2"), ev_completed("resp-2")]),
+    )
+    .await;
+
+    let test = test_codex().build(&server).await?;
+    let active_instructions = "instructions to clear";
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello 1".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                collaboration_mode: Some(collab_mode_with_instructions(Some(active_instructions))),
+                ..Default::default()
+            },
+        })
+        .await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "hello 2".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                collaboration_mode: Some(collab_mode_with_instructions(cleared_instructions)),
+                ..Default::default()
+            },
+        })
+        .await?;
+    wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let dev_texts = developer_texts(&req2.single_request().input());
+    let active_xml = collab_xml(active_instructions);
+    let reset_xml = collab_xml(COLLABORATION_MODE_RESET_TEXT);
+    let active_index = dev_texts
+        .iter()
+        .position(|text| text.contains(&active_xml))
+        .expect("expected original collaboration instructions");
+    let reset_index = dev_texts
+        .iter()
+        .position(|text| text.contains(&reset_xml))
+        .expect("expected collaboration instructions reset");
+    assert!(
+        reset_index > active_index,
+        "reset must supersede the original block"
+    );
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -427,6 +502,13 @@ async fn collaboration_mode_update_emits_new_instruction_message() -> Result<()>
     assert_eq!(count_messages_containing(&dev_texts, &first_text), 1);
     assert_eq!(count_messages_containing(&dev_texts, &second_text), 1);
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clearing_collaboration_mode_instructions_emits_reset() -> Result<()> {
+    assert_clearing_collaboration_instructions_emits_reset(None).await?;
+    assert_clearing_collaboration_instructions_emits_reset(Some("")).await?;
     Ok(())
 }
 

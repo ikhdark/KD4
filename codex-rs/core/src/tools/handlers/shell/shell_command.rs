@@ -22,7 +22,7 @@ use crate::tools::handlers::command_preflight::preflight_invocation_with_equival
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_workdir_base_path;
-use crate::tools::handlers::rewrite_function_script_argument;
+use crate::tools::handlers::rewrite_function_command_argument;
 use crate::tools::handlers::updated_hook_command;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
@@ -36,6 +36,7 @@ use codex_tools::ToolSpec;
 use super::super::shell_spec::CommandToolOptions;
 use super::super::shell_spec::create_shell_command_tool;
 use super::RunExecLikeArgs;
+use super::parse_shell_command_hook_invocation;
 use super::run_exec_like;
 use super::shell_command_payload_command;
 
@@ -251,6 +252,7 @@ impl ShellCommandHandler {
         } else {
             Some(safety_shell.shell_type)
         };
+        let is_powershell_script = command_invocation.is_powershell_script();
         let exec_params = Self::to_exec_params(
             &params,
             &command_invocation,
@@ -302,6 +304,7 @@ impl ShellCommandHandler {
             hook_command,
             safety_command,
             shell_type,
+            is_powershell_script,
             additional_permissions: params.additional_permissions.clone(),
             prefix_rule,
             session,
@@ -377,11 +380,13 @@ impl CoreToolRuntime for ShellCommandHandler {
                 "hook input rewrite received unsupported shell_command payload".to_string(),
             ));
         };
+        let command_invocation = parse_shell_command_hook_invocation(&arguments)?;
         invocation.payload = ToolPayload::Function {
-            arguments: rewrite_function_script_argument(
+            arguments: rewrite_function_command_argument(
                 &arguments,
                 "shell_command",
                 "command",
+                &command_invocation,
                 updated_hook_command(&updated_input)?,
             )?,
         };

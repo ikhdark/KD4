@@ -8299,18 +8299,20 @@ async fn build_settings_update_items_uses_previous_turn_settings_for_realtime_en
 }
 
 #[tokio::test]
-async fn build_initial_context_uses_previous_realtime_state() {
+async fn build_initial_context_restates_realtime_start_for_active_reference() {
     let (session, mut turn_context) = make_session_and_context().await;
     turn_context.realtime_active = true;
     let turn_context = Arc::new(turn_context);
 
     let initial_context = build_initial_context(&session, &turn_context).await;
     let developer_texts = developer_input_texts(&initial_context);
-    assert!(
+    assert_eq!(
         developer_texts
             .iter()
-            .any(|text| text.contains("<realtime_conversation>")),
-        "expected initial context to describe active realtime state, got {developer_texts:?}"
+            .map(|text| text.matches("<realtime_conversation>").count())
+            .sum::<usize>(),
+        1,
+        "expected exactly one realtime start block, got {developer_texts:?}"
     );
 
     let previous_context_item = turn_context.to_turn_context_item();
@@ -8320,11 +8322,13 @@ async fn build_initial_context_uses_previous_realtime_state() {
     }
     let resumed_context = build_initial_context(&session, &turn_context).await;
     let resumed_developer_texts = developer_input_texts(&resumed_context);
-    assert!(
-        !resumed_developer_texts
+    assert_eq!(
+        resumed_developer_texts
             .iter()
-            .any(|text| text.contains("<realtime_conversation>")),
-        "did not expect a duplicate realtime update, got {resumed_developer_texts:?}"
+            .map(|text| text.matches("<realtime_conversation>").count())
+            .sum::<usize>(),
+        1,
+        "expected replacement context to restate exactly one realtime start block, got {resumed_developer_texts:?}"
     );
 }
 
@@ -9838,6 +9842,88 @@ async fn panic_after_terminal_claim_uses_fail_safe_terminal_outcome() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fail_safe_terminal_releases_execution_capacity_before_thread_idle_lifecycle() {
+    struct ExecutionCapacityProbe {
+        control: AgentControl,
+        source: SessionSource,
+        result_tx: async_channel::Sender<bool>,
+    }
+
+    impl codex_extension_api::ThreadLifecycleContributor<crate::config::Config>
+        for ExecutionCapacityProbe
+    {
+        fn on_thread_idle<'a>(
+            &'a self,
+            _input: codex_extension_api::ThreadIdleInput<'a>,
+        ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+            Box::pin(async move {
+                let available = self
+                    .control
+                    .reserve_execution_capacity(MultiAgentVersion::V2, &self.source)
+                    .is_ok();
+                self.result_tx
+                    .send(available)
+                    .await
+                    .expect("capacity probe receiver should remain open");
+            })
+        }
+    }
+
+    let (mut session, turn_context) = make_session_and_context().await;
+    let control = AgentControl::default().with_session_id(SessionId::from(session.thread_id), 1);
+    let source = SessionSource::SubAgent(SubAgentSource::Other("worker".to_string()));
+    let execution_guard = control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &source)
+        .expect("initial execution reservation")
+        .expect("V2 subagent turns should consume execution capacity");
+    let (result_tx, result_rx) = async_channel::bounded(1);
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::<crate::config::Config>::new();
+    builder.thread_lifecycle_contributor(Arc::new(ExecutionCapacityProbe {
+        control,
+        source,
+        result_tx,
+    }));
+    session.services.extensions = Arc::new(builder.build());
+
+    let session = Arc::new(session);
+    session
+        .spawn_task(
+            Arc::new(turn_context),
+            Vec::new(),
+            NeverEndingTask {
+                kind: TaskKind::Regular,
+                listen_to_cancellation_token: true,
+            },
+        )
+        .await;
+    let terminal = {
+        let mut active_turn = session.active_turn.lock().await;
+        let active_turn = active_turn.as_mut().expect("active turn should exist");
+        active_turn
+            .task
+            .as_mut()
+            .expect("running task should exist")
+            ._agent_execution_guard = Some(execution_guard);
+        active_turn
+            .terminal
+            .clone()
+            .expect("active turn should expose terminal coordinator")
+    };
+    terminal.request_panic_before_worker_cancellation();
+
+    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
+
+    assert!(
+        timeout(Duration::from_secs(2), result_rx.recv())
+            .await
+            .expect("thread-idle lifecycle should run")
+            .expect("capacity probe receiver should remain open"),
+        "the terminal task must release its execution permit before idle lifecycle callbacks"
+    );
+    assert!(session.active_turn.lock().await.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminal_task_tracker_shutdown_waits_for_running_finalizer() {
     let (sess, tc, rx) = make_session_and_context_with_rx().await;
     let abort_started = Arc::new(tokio::sync::Notify::new());
@@ -10687,8 +10773,16 @@ async fn abort_review_task_emits_exited_then_aborted_and_records_history() {
         }],
         client_id: None,
     }];
-    sess.spawn_task(Arc::clone(&tc), input, ReviewTask::new())
-        .await;
+    sess.spawn_task(
+        Arc::clone(&tc),
+        input,
+        ReviewTask::new(EnteredReviewModeItem {
+            id: uuid::Uuid::now_v7().to_string(),
+            target: codex_protocol::protocol::ReviewTarget::UncommittedChanges,
+            user_facing_hint: "Reviewing test changes".to_string(),
+        }),
+    )
+    .await;
 
     sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
 

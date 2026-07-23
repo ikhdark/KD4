@@ -455,8 +455,6 @@ impl ToolRegistry {
                 turn_state.tool_calls = turn_state.tool_calls.saturating_add(1);
             }
         }
-        invocation.turn.turn_timing_state.record_tool_call();
-
         let dispatch_trace = ToolDispatchTrace::start(&invocation);
         let tool = match self.tool(&tool_name) {
             Some(tool) => tool,
@@ -706,8 +704,6 @@ async fn handle_any_tool(
     tool: &dyn CoreToolRuntime,
     invocation: ToolInvocation,
 ) -> Result<AnyToolResult, FunctionCallError> {
-    let call_id = invocation.call_id.clone();
-    let payload = invocation.payload.clone();
     let _tool_execution_timing_guard =
         matches!(tool.tool_execution_timing(), ToolExecutionTiming::Handler)
             .then(|| invocation.turn.turn_timing_state.begin_tool_execution());
@@ -725,8 +721,8 @@ async fn handle_any_tool(
     let post_tool_use_payload =
         CoreToolRuntime::post_tool_use_payload(tool, &invocation, output.as_ref());
     Ok(AnyToolResult {
-        call_id,
-        payload,
+        call_id: invocation.call_id,
+        payload: invocation.payload,
         result: output,
         post_tool_use_payload,
     })

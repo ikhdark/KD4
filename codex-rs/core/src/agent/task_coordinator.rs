@@ -317,17 +317,6 @@ impl AgentTaskCoordinator {
         };
         metrics.active.remove(&assignment_id);
         transition_metric_runtimes(&mut metrics);
-        let active_turns = saturating_active_turns(metrics.active.len());
-        let capacity = metric_capacity(&metrics, active_turns);
-        if let Err(error) = runtime.transition_concurrency(active_turns, capacity) {
-            warn!(
-                %assignment_id,
-                ?error,
-                "failed to close typed-task concurrency metrics"
-            );
-            metrics.runtimes.insert(assignment_id, runtime);
-            return;
-        }
         match runtime.finish_and_emit(&task, session_telemetry) {
             Ok(true) => {}
             Ok(false) => {
@@ -516,3 +505,7 @@ async fn binding_no_longer_needs_receipt(
         || task.receipt.is_some()
         || task.current_attempt.state != AttemptState::Active)
 }
+
+#[cfg(test)]
+#[path = "task_coordinator_tests.rs"]
+mod tests;

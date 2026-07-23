@@ -11,7 +11,6 @@ without redefining repository implementation policy.
 - `.codex/harness` owns optional durable task artifacts and lifecycle guidance.
 - `kd4-harness` routes requests for those artifacts; ordinary code changes do
   not need the skill.
-- Wiring Guard/KDWG independently owns static reachability proof when active.
 - Use subagents only when the user or active instructions explicitly request
   delegation or parallel agent work.
 
@@ -37,8 +36,7 @@ to survive later turns.
 
 Follow root `AGENTS.md` and any active specialist skill. The harness may record
 implementation decisions in `IMPLEMENT.md`, but that artifact does not replace
-owner-path inspection, task-scoped validation, or Wiring Guard/KDWG intent when
-the independent proof layer applies.
+owner-path inspection or task-scoped validation.
 
 Keep unrelated dirty changes intact. Keep generated output under its owning
 workflow. Do not add logs, screenshots, binaries, or large transcripts to
@@ -47,8 +45,7 @@ reviewable changes unless requested.
 ## Phase 4: Check
 
 Run the nearest sufficient proof required by root `AGENTS.md`, then record only
-the evidence that matters for resumption or audit. For implementation, include
-the Wiring Guard/KDWG verdict when applicable. Name skipped checks and their
+the evidence that matters for resumption or audit. Name skipped checks and their
 reasons.
 
 Use the completion-gate definitions and final-answer fields from root
@@ -57,9 +54,9 @@ verification and `HARNESS_AUDIT.md` for harness-policy or skill changes.
 
 ## Phase 5: Finish
 
-Summarize the material changes, focused validation, wiring proof when
-applicable, and remaining risk. Write `HANDOFF.md` before stopping only when
-unresolved work or important context must survive.
+Summarize the material changes, focused validation, and remaining risk. Write
+`HANDOFF.md` before stopping only when unresolved work or important context must
+survive.
 
 ## Optional Multi-Agent Mode
 

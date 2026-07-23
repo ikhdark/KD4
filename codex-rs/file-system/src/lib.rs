@@ -541,8 +541,7 @@ async fn walk_via_directory_reads<F: ExecutorFileSystem + ?Sized>(
                     continue;
                 }
             };
-            if metadata.is_symlink && (!options.follow_directory_symlinks || !metadata.is_directory)
-            {
+            if metadata.is_symlink && metadata.is_directory && !options.follow_directory_symlinks {
                 continue;
             }
 

@@ -440,6 +440,8 @@ async fn skills_list_truncates_catalog_descriptions_in_tool_output() -> TestResu
             truncation_policy: TruncationPolicy::Bytes(1_024),
             conversation_history: ConversationHistory::default(),
             turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+            cancellation_token: Default::default(),
+            primary_environment_id: None,
             environments: Vec::new(),
             payload: payload.clone(),
         })

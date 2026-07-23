@@ -202,7 +202,7 @@ impl ToolOrchestrator {
                 }
             }
             ExecApprovalRequirement::Forbidden { reason } => {
-                return Err(ToolError::Rejected(reason.clone()));
+                return Err(ToolError::Denied(reason.clone()));
             }
             ExecApprovalRequirement::NeedsApproval { reason, .. } => {
                 let guardian_review_id = use_guardian.then(new_guardian_review_id);
@@ -565,7 +565,7 @@ impl ToolOrchestrator {
                         &decision,
                         ToolDecisionSource::Config,
                     );
-                    return Err(ToolError::Rejected(message));
+                    return Err(ToolError::Denied(message));
                 }
                 None => {}
             }
@@ -590,7 +590,9 @@ impl ToolOrchestrator {
                 }
                 Err(err) => {
                     tracing::error!(%err, "failed to build guardian approval action");
-                    ReviewDecision::Abort
+                    return Err(ToolError::Rejected(format!(
+                        "failed to build guardian approval action: {err}"
+                    )));
                 }
             }
         } else {
@@ -618,7 +620,7 @@ impl ToolOrchestrator {
                 } else {
                     "rejected by user".to_string()
                 };
-                Err(ToolError::Rejected(reason))
+                Err(ToolError::Denied(reason))
             }
             ReviewDecision::TimedOut => Err(ToolError::Rejected(guardian_timeout_message())),
             ReviewDecision::Approved
@@ -629,7 +631,7 @@ impl ToolOrchestrator {
             } => match network_policy_amendment.action {
                 NetworkPolicyRuleAction::Allow => Ok(()),
                 NetworkPolicyRuleAction::Deny => {
-                    Err(ToolError::Rejected("rejected by user".to_string()))
+                    Err(ToolError::Denied("rejected by user".to_string()))
                 }
             },
         }
@@ -641,7 +643,7 @@ fn sandbox_outcome_from_tool_error(err: &ToolError) -> Option<&'static str> {
         ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { .. })) => Some("denied"),
         ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { .. })) => Some("timed_out"),
         ToolError::Codex(CodexErr::Sandbox(SandboxErr::Signal(_))) => Some("signal"),
-        ToolError::Rejected(_) | ToolError::Codex(_) => None,
+        ToolError::Denied(_) | ToolError::Rejected(_) | ToolError::Codex(_) => None,
     }
 }
 

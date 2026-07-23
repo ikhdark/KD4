@@ -18,8 +18,10 @@ pub fn create_spawn_agents_on_csv_tool() -> ToolSpec {
         /*required*/ None,
         /*additional_properties*/ None,
     );
-    output_schema.description =
-        Some("JSON Schema for each worker result. Omit to accept any result object.".to_string());
+    output_schema.description = Some(
+        "JSON Schema enforced for each worker result. Its root type must allow an object. Omit to accept any result object."
+            .to_string(),
+    );
 
     let properties = BTreeMap::from([
         (
@@ -48,20 +50,20 @@ pub fn create_spawn_agents_on_csv_tool() -> ToolSpec {
         ),
         (
             "max_concurrency".to_string(),
-            JsonSchema::number(Some(
+            JsonSchema::integer(Some(
                 "Maximum concurrent workers for this job. Defaults to 16 and is capped by config."
                     .to_string(),
             )),
         ),
         (
             "max_workers".to_string(),
-            JsonSchema::number(Some(
+            JsonSchema::integer(Some(
                 "Alias for max_concurrency. Defaults to 16 and is capped by config.".to_string(),
             )),
         ),
         (
             "max_runtime_seconds".to_string(),
-            JsonSchema::number(Some(
+            JsonSchema::integer(Some(
                 "Maximum runtime per worker before failure. Defaults to 1800 seconds; config may set a different default."
                     .to_string(),
             )),

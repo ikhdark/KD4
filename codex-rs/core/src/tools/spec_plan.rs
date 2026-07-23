@@ -70,6 +70,7 @@ use crate::tools::router::ToolRouterParams;
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_mcp::ToolInfo;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
@@ -605,12 +606,18 @@ fn add_tool_sources(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plann
                 ),
             }));
             planned_tools.add(WriteStdinHandler);
-            planned_tools.add(ViewImageHandler::new(ViewImageToolOptions {
-                can_request_original_image_detail: can_request_original_image_detail(
-                    &turn_context.model_info,
-                ),
-                include_environment_id,
-            }));
+            if turn_context
+                .model_info
+                .input_modalities
+                .contains(&InputModality::Image)
+            {
+                planned_tools.add(ViewImageHandler::new(ViewImageToolOptions {
+                    can_request_original_image_detail: can_request_original_image_detail(
+                        &turn_context.model_info,
+                    ),
+                    include_environment_id,
+                }));
+            }
         }
         return;
     }
@@ -714,7 +721,9 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.step_context);
 
-    planned_tools.add(PlanHandler);
+    if turn_context.collaboration_mode.mode != ModeKind::Plan {
+        planned_tools.add(PlanHandler);
+    }
 
     if crate::tools::handlers::VerifyLocalHandler::is_available_for_step(context.step_context) {
         planned_tools.add(
@@ -739,7 +748,9 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         planned_tools.add(ReadFileSpanHandler::new(include_environment_id));
     }
 
-    if features.enabled(Feature::DeferredExecutor) {
+    if features.enabled(Feature::DeferredExecutor)
+        && !context.step_context.environments.starting.is_empty()
+    {
         planned_tools.add(WaitForEnvironmentHandler);
     }
 
@@ -804,7 +815,16 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         planned_tools.add(TestSyncHandler);
     }
 
-    if environment_mode.has_environment() {
+    if environment_mode.has_environment()
+        && turn_context
+            .model_info
+            .input_modalities
+            .contains(&InputModality::Image)
+        && !matches!(
+            &turn_context.session_source,
+            SessionSource::SubAgent(SubAgentSource::Review)
+        )
+    {
         let include_environment_id = matches!(environment_mode, ToolEnvironmentMode::Multiple);
         planned_tools.add(ViewImageHandler::new(ViewImageToolOptions {
             can_request_original_image_detail: can_request_original_image_detail(
@@ -971,26 +991,31 @@ fn add_dynamic_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plan
     for spec in context.dynamic_tools {
         match spec {
             DynamicToolSpec::Function(tool) => {
-                let Some(handler) = DynamicToolHandler::new(tool) else {
-                    tracing::error!(
-                        "Failed to convert dynamic tool {:?} to OpenAI tool",
-                        tool.name
-                    );
-                    continue;
+                let handler = match DynamicToolHandler::new(tool) {
+                    Ok(handler) => handler,
+                    Err(err) => {
+                        tracing::error!(
+                            "Failed to convert dynamic tool {:?} to OpenAI tool: {err}",
+                            tool.name,
+                        );
+                        continue;
+                    }
                 };
                 planned_tools.add(handler);
             }
             DynamicToolSpec::Namespace(namespace) => {
                 for tool in &namespace.tools {
                     let DynamicToolNamespaceTool::Function(tool) = tool;
-                    let Some(handler) = DynamicToolHandler::new_in_namespace(namespace, tool)
-                    else {
-                        tracing::error!(
-                            "Failed to convert dynamic tool {:?}.{:?} to OpenAI tool",
-                            namespace.name,
-                            tool.name
-                        );
-                        continue;
+                    let handler = match DynamicToolHandler::new_in_namespace(namespace, tool) {
+                        Ok(handler) => handler,
+                        Err(err) => {
+                            tracing::error!(
+                                "Failed to convert dynamic tool {:?}.{:?} to OpenAI tool: {err}",
+                                namespace.name,
+                                tool.name,
+                            );
+                            continue;
+                        }
                     };
                     planned_tools.add(handler);
                 }

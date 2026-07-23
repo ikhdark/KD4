@@ -1,7 +1,21 @@
 use super::*;
+use chrono::Utc;
+use codex_agent_task_store::AcceptanceCriterion;
+use codex_agent_task_store::AgentGate;
+use codex_agent_task_store::AgentReceipt;
 use codex_agent_task_store::AgentRole;
 use codex_agent_task_store::AgentStatusClaim;
+use codex_agent_task_store::AgentTask;
+use codex_agent_task_store::Assignment;
+use codex_agent_task_store::AssignmentId;
+use codex_agent_task_store::Attempt;
+use codex_agent_task_store::AttemptId;
+use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::CapabilityProfile;
+use codex_agent_task_store::CriterionResult;
+use codex_agent_task_store::CriterionStatus;
+use codex_agent_task_store::ValidationCall;
+use codex_agent_task_store::ValidationCallStatus;
 
 fn metric_input() -> TaskMetricInput {
     TaskMetricInput {
@@ -69,6 +83,150 @@ fn terminal_input() -> TaskMetricTerminalInput {
         violations: input.violations,
         final_outcome: input.final_outcome,
     }
+}
+
+fn completed_task_with_validation(
+    validation_call_ids: &[&str],
+    validation_calls: &[(&str, ValidationCallStatus)],
+) -> AgentTask {
+    let assignment_id = AssignmentId::new();
+    let attempt_id = AttemptId::new();
+    let now = Utc::now();
+    AgentTask {
+        assignment: Assignment {
+            assignment_id,
+            root_session_id: "root-session".to_string(),
+            repository_id: "repository".to_string(),
+            role: AgentRole::Worker,
+            capability_profile: CapabilityProfile::ScopedSourceWrite,
+            objective: "complete the task".to_string(),
+            acceptance_criteria: vec![AcceptanceCriterion {
+                id: "criterion".to_string(),
+                text: "criterion passes".to_string(),
+            }],
+            read_scope: Vec::new(),
+            write_scope: Vec::new(),
+            stop_condition: "task complete".to_string(),
+            dependencies: Vec::new(),
+            risk_hints: Vec::new(),
+            required_evidence: Vec::new(),
+            prohibited_changes: Vec::new(),
+            relation: None,
+            created_at: now,
+        },
+        current_attempt: Attempt {
+            attempt_id,
+            assignment_id,
+            ordinal: 0,
+            amendment: None,
+            state: AttemptState::Completed,
+            created_at: now,
+            sealed_at: Some(now),
+        },
+        gates: Vec::new(),
+        receipt: Some(AgentReceipt {
+            assignment_id,
+            attempt_id,
+            status: AgentStatusClaim::Completed,
+            summary: "completed".to_string(),
+            criterion_results: vec![CriterionResult {
+                criterion_id: "criterion".to_string(),
+                status: CriterionStatus::Passed,
+                evidence: None,
+            }],
+            declared_changes: Vec::new(),
+            validation_call_ids: validation_call_ids
+                .iter()
+                .map(|call_id| (*call_id).to_string())
+                .collect(),
+            blockers: Vec::new(),
+            risks: Vec::new(),
+            next_action: None,
+            sealed_at: now,
+        }),
+        validation_calls: validation_calls
+            .iter()
+            .map(|(call_id, status)| ValidationCall {
+                call_id: (*call_id).to_string(),
+                attempt_id,
+                command_summary: "focused validation".to_string(),
+                status: *status,
+                recorded_at: now,
+            })
+            .collect(),
+        observations: Vec::new(),
+    }
+}
+
+#[test]
+fn completed_receipt_without_validation_is_not_first_pass_success() {
+    let task = completed_task_with_validation(&[], &[]);
+
+    assert!(!super::terminal_input(&task).first_pass_validation_succeeded);
+}
+
+#[test]
+fn completed_receipt_with_succeeded_validation_is_first_pass_success() {
+    let task = completed_task_with_validation(
+        &["validation-1"],
+        &[("validation-1", ValidationCallStatus::Succeeded)],
+    );
+
+    assert!(super::terminal_input(&task).first_pass_validation_succeeded);
+}
+
+#[test]
+fn missing_or_failed_validation_is_not_first_pass_success() {
+    let missing = completed_task_with_validation(&["validation-1"], &[]);
+    let failed = completed_task_with_validation(
+        &["validation-1"],
+        &[("validation-1", ValidationCallStatus::Failed)],
+    );
+
+    assert!(!super::terminal_input(&missing).first_pass_validation_succeeded);
+    assert!(!super::terminal_input(&failed).first_pass_validation_succeeded);
+}
+
+#[test]
+fn drift_telemetry_uses_only_the_exact_observed_risk_reason() {
+    let mut hint_only = completed_task_with_validation(&[], &[]);
+    hint_only.assignment.risk_hints = vec!["watch for concurrent drift".to_string()];
+    assert_eq!(super::terminal_input(&hint_only).drift, 0);
+
+    let mut arbitrary_prose = completed_task_with_validation(&[], &[]);
+    add_gate(
+        &mut arbitrary_prose,
+        GateKind::Risk,
+        "cold review required: no concurrent drift detected",
+    );
+    assert_eq!(super::terminal_input(&arbitrary_prose).drift, 0);
+
+    let mut wrong_gate = completed_task_with_validation(&[], &[]);
+    add_gate(&mut wrong_gate, GateKind::Review, CONCURRENT_DRIFT_REASON);
+    assert_eq!(super::terminal_input(&wrong_gate).drift, 0);
+
+    let mut observed = completed_task_with_validation(&[], &[]);
+    add_gate(
+        &mut observed,
+        GateKind::Risk,
+        &format!(
+            "cold review required: missing successful focused validation; {CONCURRENT_DRIFT_REASON}"
+        ),
+    );
+    assert_eq!(super::terminal_input(&observed).drift, 1);
+}
+
+fn add_gate(task: &mut AgentTask, kind: GateKind, reason: &str) {
+    let now = Utc::now();
+    task.gates.push(AgentGate {
+        assignment_id: task.assignment.assignment_id,
+        kind,
+        status: GateStatus::Passed,
+        reason: reason.to_string(),
+        waiver_reason: None,
+        updated_at: now,
+        sealed_at: Some(now),
+    });
 }
 
 #[test]

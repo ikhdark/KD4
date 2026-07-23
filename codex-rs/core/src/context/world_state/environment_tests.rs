@@ -117,6 +117,7 @@ fn persisted_turn_context_values_render_a_diff() -> Result<()> {
         current_date: Some("2026-06-19".to_string()),
         timezone: Some("UTC".to_string()),
         network: Some(NetworkContext::new(
+            /*enabled*/ true,
             vec!["old.example.com".to_string()],
             vec![],
         )),
@@ -131,6 +132,7 @@ fn persisted_turn_context_values_render_a_diff() -> Result<()> {
         current_date: Some("2026-06-20".to_string()),
         timezone: Some("America/Los_Angeles".to_string()),
         network: Some(NetworkContext::new(
+            /*enabled*/ true,
             vec!["new.example.com".to_string()],
             vec!["blocked.example.com".to_string()],
         )),
@@ -155,6 +157,55 @@ fn persisted_turn_context_values_render_a_diff() -> Result<()> {
         render_fragments(current.render_diff(&previous.snapshot())),
     );
     Ok(())
+}
+
+#[test]
+fn subagent_only_changes_render_a_diff() {
+    let no_subagents = EnvironmentsState::default();
+    let previous = WorldStateSection::snapshot(&no_subagents);
+    let atlas = EnvironmentsState::default().with_subagents("- agent-1: atlas".to_string());
+
+    assert_eq!(
+        Some(user_message(
+            r#"<environment_context>
+  <subagents>
+    - agent-1: atlas
+  </subagents>
+</environment_context>"#,
+        )),
+        render_fragment(WorldStateSection::render_diff(
+            &atlas,
+            PreviousSectionState::Known(&previous),
+        )),
+    );
+
+    let previous = WorldStateSection::snapshot(&atlas);
+    let nova = EnvironmentsState::default().with_subagents("- agent-2: nova".to_string());
+    assert_eq!(
+        Some(user_message(
+            r#"<environment_context>
+  <subagents>
+    - agent-2: nova
+  </subagents>
+</environment_context>"#,
+        )),
+        render_fragment(WorldStateSection::render_diff(
+            &nova,
+            PreviousSectionState::Known(&previous),
+        )),
+    );
+
+    let previous = WorldStateSection::snapshot(&nova);
+    assert_eq!(
+        Some(user_message(
+            r#"<environment_context>
+</environment_context>"#,
+        )),
+        render_fragment(WorldStateSection::render_diff(
+            &no_subagents,
+            PreviousSectionState::Known(&previous),
+        )),
+    );
 }
 
 #[test]

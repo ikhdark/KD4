@@ -1346,6 +1346,8 @@ fn tool_call(tool_name: &str, call_id: &str, arguments: serde_json::Value) -> To
         truncation_policy: TruncationPolicy::Bytes(1024),
         conversation_history: codex_extension_api::ConversationHistory::default(),
         turn_item_emitter: Arc::new(NoopTurnItemEmitter),
+        cancellation_token: Default::default(),
+        primary_environment_id: None,
         environments: Vec::new(),
         payload: ToolPayload::Function {
             arguments: arguments.to_string(),

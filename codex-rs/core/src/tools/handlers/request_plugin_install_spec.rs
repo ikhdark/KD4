@@ -3,6 +3,7 @@ use codex_tools::LIST_AVAILABLE_PLUGINS_TO_INSTALL_TOOL_NAME;
 use codex_tools::REQUEST_PLUGIN_INSTALL_TOOL_NAME;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
+use serde_json::json;
 use std::collections::BTreeMap;
 
 use crate::tools::router::ToolSuggestPresentation;
@@ -15,16 +16,20 @@ pub(crate) fn create_request_plugin_install_tool(
             BTreeMap::from([
                 (
                     "tool_type".to_string(),
-                    JsonSchema::string(Some(
-                        "Type of discoverable tool to suggest. Use \"connector\" or \"plugin\"."
-                            .to_string(),
-                    )),
+                    JsonSchema::string_enum(
+                        vec![json!("connector"), json!("plugin")],
+                        Some(
+                            "Type of discoverable tool to suggest. Use \"connector\" or \"plugin\"."
+                                .to_string(),
+                        ),
+                    ),
                 ),
                 (
                     "action_type".to_string(),
-                    JsonSchema::string(Some(
-                        "Suggested action for the tool. Use \"install\".".to_string(),
-                    )),
+                    JsonSchema::string_enum(
+                        vec![json!("install")],
+                        Some("Suggested action for the tool. Use \"install\".".to_string()),
+                    ),
                 ),
                 (
                     "tool_id".to_string(),
@@ -106,10 +111,13 @@ mod tests {
                 parameters: JsonSchema::object(BTreeMap::from([
                         (
                             "action_type".to_string(),
-                            JsonSchema::string(Some(
+                            JsonSchema::string_enum(
+                                vec![json!("install")],
+                                Some(
                                     "Suggested action for the tool. Use \"install\"."
                                         .to_string(),
-                                ),),
+                                ),
+                            ),
                         ),
                         (
                             "suggest_reason".to_string(),
@@ -127,10 +135,13 @@ mod tests {
                         ),
                         (
                             "tool_type".to_string(),
-                            JsonSchema::string(Some(
+                            JsonSchema::string_enum(
+                                vec![json!("connector"), json!("plugin")],
+                                Some(
                                     "Type of discoverable tool to suggest. Use \"connector\" or \"plugin\"."
                                         .to_string(),
-                                ),),
+                                ),
+                            ),
                         ),
                     ]), Some(vec![
                         "tool_type".to_string(),

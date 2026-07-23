@@ -2,6 +2,7 @@ use super::*;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::is_user_turn_boundary;
 use codex_protocol::protocol::SessionContextWindow;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 // Return value of `Session::reconstruct_history_from_rollout`, bundling the rebuilt history with
@@ -49,8 +50,17 @@ struct ActiveReplaySegment<'a> {
     previous_turn_settings: Option<PreviousTurnSettings>,
     reference_context_item: TurnReferenceContextItem,
     world_state_replay: Vec<&'a RolloutItem>,
-    base_replacement_history: Option<&'a [ResponseItem]>,
+    history_effect_indexes: Vec<usize>,
+    replacement_checkpoint: Option<ReplacementCheckpoint<'a>>,
+    compaction_count: u64,
+    has_legacy_compaction_without_window_number: bool,
     window: Option<ReconstructedWindow>,
+}
+
+#[derive(Debug)]
+struct ReplacementCheckpoint<'a> {
+    history: &'a [ResponseItem],
+    suffix: &'a [RolloutItem],
 }
 
 fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&str>) -> bool {
@@ -61,9 +71,13 @@ fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&s
 fn finalize_active_segment<'a>(
     active_segment: ActiveReplaySegment<'a>,
     base_replacement_history: &mut Option<&'a [ResponseItem]>,
+    rollout_suffix: &mut &'a [RolloutItem],
+    discarded_history_effect_indexes: &mut HashSet<usize>,
     previous_turn_settings: &mut Option<PreviousTurnSettings>,
     reference_context_item: &mut TurnReferenceContextItem,
     world_state_replay: &mut Vec<&'a RolloutItem>,
+    surviving_compaction_count: &mut u64,
+    has_surviving_legacy_compaction_without_window_number: &mut bool,
     window: &mut Option<ReconstructedWindow>,
     pending_rollback_turns: &mut usize,
 ) {
@@ -71,6 +85,7 @@ fn finalize_active_segment<'a>(
     // means skipping the next finalized segments that contain a non-contextual
     // `EventMsg::UserMessage`.
     if *pending_rollback_turns > 0 {
+        discarded_history_effect_indexes.extend(active_segment.history_effect_indexes);
         if active_segment.counts_as_user_turn {
             *pending_rollback_turns -= 1;
         }
@@ -78,13 +93,18 @@ fn finalize_active_segment<'a>(
     }
 
     world_state_replay.extend(active_segment.world_state_replay);
+    *surviving_compaction_count =
+        (*surviving_compaction_count).saturating_add(active_segment.compaction_count);
+    *has_surviving_legacy_compaction_without_window_number |=
+        active_segment.has_legacy_compaction_without_window_number;
 
     // A surviving replacement-history checkpoint is a complete history base. Once we
     // know the newest surviving one, older rollout items do not affect rebuilt history.
     if base_replacement_history.is_none()
-        && let Some(segment_base_replacement_history) = active_segment.base_replacement_history
+        && let Some(checkpoint) = active_segment.replacement_checkpoint
     {
-        *base_replacement_history = Some(segment_base_replacement_history);
+        *base_replacement_history = Some(checkpoint.history);
+        *rollout_suffix = checkpoint.suffix;
     }
 
     if window.is_none() {
@@ -120,30 +140,28 @@ impl Session {
         // stopping once a surviving replacement-history checkpoint and the required resume metadata
         // are both known; then replay only the buffered surviving tail forward to preserve exact
         // history semantics.
-        let has_legacy_compaction_without_window_number =
-            rollout_items.iter().any(|item| {
-                matches!(item, RolloutItem::Compacted(compacted) if compacted.window_number.is_none())
-            });
-        let initial_window = if has_legacy_compaction_without_window_number {
-            None
-        } else {
-            rollout_items.iter().find_map(|item| match item {
-                RolloutItem::SessionMeta(session_meta) => session_meta
-                    .meta
-                    .context_window
-                    .as_ref()
-                    .and_then(reconstructed_window_from_session_context_window),
-                _ => None,
-            })
-        };
+        let initial_window = rollout_items.iter().find_map(|item| match item {
+            RolloutItem::SessionMeta(session_meta) => session_meta
+                .meta
+                .context_window
+                .as_ref()
+                .and_then(reconstructed_window_from_session_context_window),
+            _ => None,
+        });
         let mut base_replacement_history: Option<&[ResponseItem]> = None;
         let mut previous_turn_settings = None;
         let mut reference_context_item = TurnReferenceContextItem::NeverSet;
         let mut world_state_replay = Vec::new();
+        let mut surviving_compaction_count = 0u64;
+        let mut has_surviving_legacy_compaction_without_window_number = false;
         let mut window = None;
         // Rollback is "drop the newest N user turns". While scanning in reverse, that becomes
         // "skip the next N user-turn segments we finalize".
         let mut pending_rollback_turns = 0usize;
+        // Reverse replay owns rollback decisions. Track model-history effects from discarded
+        // segments so the forward materialization pass does not reapply those effects or the
+        // rollback event after metadata replay has already consumed it.
+        let mut discarded_history_effect_indexes = HashSet::new();
         // Borrowed suffix of rollout items newer than the newest surviving replacement-history
         // checkpoint. If no such checkpoint exists, this remains the full rollout.
         let mut rollout_suffix = rollout_items;
@@ -156,7 +174,12 @@ impl Session {
                 RolloutItem::Compacted(compacted) => {
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    active_segment.history_effect_indexes.push(index);
                     active_segment.world_state_replay.push(item);
+                    active_segment.compaction_count =
+                        active_segment.compaction_count.saturating_add(1);
+                    active_segment.has_legacy_compaction_without_window_number |=
+                        compacted.window_number.is_none();
                     if active_segment.window.is_none()
                         && let Some(window_number) = compacted.window_number
                     {
@@ -178,14 +201,17 @@ impl Session {
                     ) {
                         active_segment.reference_context_item = TurnReferenceContextItem::Cleared;
                     }
-                    if active_segment.base_replacement_history.is_none()
+                    if active_segment.replacement_checkpoint.is_none()
                         && let Some(replacement_history) = &compacted.replacement_history
                     {
-                        active_segment.base_replacement_history = Some(replacement_history);
-                        rollout_suffix = &rollout_items[index + 1..];
+                        active_segment.replacement_checkpoint = Some(ReplacementCheckpoint {
+                            history: replacement_history,
+                            suffix: &rollout_items[index + 1..],
+                        });
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
+                    discarded_history_effect_indexes.insert(index);
                     pending_rollback_turns = pending_rollback_turns
                         .saturating_add(usize::try_from(rollback.num_turns).unwrap_or(usize::MAX));
                 }
@@ -260,9 +286,13 @@ impl Session {
                         finalize_active_segment(
                             active_segment,
                             &mut base_replacement_history,
+                            &mut rollout_suffix,
+                            &mut discarded_history_effect_indexes,
                             &mut previous_turn_settings,
                             &mut reference_context_item,
                             &mut world_state_replay,
+                            &mut surviving_compaction_count,
+                            &mut has_surviving_legacy_compaction_without_window_number,
                             &mut window,
                             &mut pending_rollback_turns,
                         );
@@ -271,11 +301,13 @@ impl Session {
                 RolloutItem::ResponseItem(response_item) => {
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    active_segment.history_effect_indexes.push(index);
                     active_segment.counts_as_user_turn |= is_user_turn_boundary(response_item);
                 }
                 RolloutItem::InterAgentCommunication(_) => {
                     let active_segment =
                         active_segment.get_or_insert_with(ActiveReplaySegment::default);
+                    active_segment.history_effect_indexes.push(index);
                     active_segment.counts_as_user_turn = true;
                 }
                 RolloutItem::EventMsg(_)
@@ -286,10 +318,11 @@ impl Session {
             if base_replacement_history.is_some()
                 && previous_turn_settings.is_some()
                 && !matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
+                && window.is_some()
             {
-                // At this point we have both eager resume metadata values and the replacement-
-                // history base for the surviving tail, so older rollout items cannot affect this
-                // result.
+                // At this point we have the eager resume metadata, the replacement-history base,
+                // and an explicit surviving window identity, so older rollout items cannot affect
+                // this result.
                 break;
             }
         }
@@ -298,21 +331,23 @@ impl Session {
             finalize_active_segment(
                 active_segment,
                 &mut base_replacement_history,
+                &mut rollout_suffix,
+                &mut discarded_history_effect_indexes,
                 &mut previous_turn_settings,
                 &mut reference_context_item,
                 &mut world_state_replay,
+                &mut surviving_compaction_count,
+                &mut has_surviving_legacy_compaction_without_window_number,
                 &mut window,
                 &mut pending_rollback_turns,
             );
         }
 
-        let fallback_window_number = u64::try_from(
-            rollout_items
-                .iter()
-                .filter(|item| matches!(item, RolloutItem::Compacted(_)))
-                .count(),
-        )
-        .unwrap_or(u64::MAX);
+        let initial_window = if has_surviving_legacy_compaction_without_window_number {
+            None
+        } else {
+            initial_window
+        };
 
         let mut history = ContextManager::new();
         let mut saw_legacy_compaction_without_replacement_history = false;
@@ -322,7 +357,12 @@ impl Session {
         // Materialize exact history semantics from the replay-derived suffix. The eventual lazy
         // design should keep this same replay shape, but drive it from a resumable reverse source
         // instead of an eagerly loaded `&[RolloutItem]`.
-        for item in rollout_suffix {
+        let rollout_suffix_start = rollout_items.len().saturating_sub(rollout_suffix.len());
+        for (offset, item) in rollout_suffix.iter().enumerate() {
+            let index = rollout_suffix_start + offset;
+            if discarded_history_effect_indexes.contains(&index) {
+                continue;
+            }
             match item {
                 RolloutItem::ResponseItem(response_item) => {
                     history.record_items(
@@ -422,7 +462,7 @@ impl Session {
         }
 
         let window = window.or(initial_window).unwrap_or(ReconstructedWindow {
-            number: fallback_window_number,
+            number: surviving_compaction_count,
             first_id: None,
             previous_id: None,
             id: None,

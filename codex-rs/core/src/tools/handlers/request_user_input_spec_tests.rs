@@ -31,7 +31,7 @@ fn request_user_input_tool_includes_questions_schema() {
             parameters: JsonSchema::object(BTreeMap::from([
                 (
                     "autoResolutionMs".to_string(),
-                    JsonSchema::number(Some(
+                    JsonSchema::integer(Some(
                         "Optional auto-resolution window in milliseconds, from 60000 to 240000. Include this only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required before continuing. Use 60000 for lightly helpful context and up to 240000 when the answer would materially unblock better work."
                             .to_string(),
                     )),
@@ -110,6 +110,26 @@ fn request_user_input_tool_includes_questions_schema() {
             ]), Some(vec!["questions".to_string()]), Some(false.into())),
             output_schema: None,
         })
+    );
+}
+
+#[test]
+fn normalize_request_user_input_args_rejects_missing_options() {
+    let args = RequestUserInputArgs {
+        questions: vec![RequestUserInputQuestion {
+            id: "confirm".to_string(),
+            header: "Confirm".to_string(),
+            question: "Proceed?".to_string(),
+            is_other: false,
+            is_secret: false,
+            options: None,
+        }],
+        auto_resolution_ms: None,
+    };
+
+    assert_eq!(
+        normalize_request_user_input_args(args),
+        Err("request_user_input requires non-empty options for every question".to_string())
     );
 }
 

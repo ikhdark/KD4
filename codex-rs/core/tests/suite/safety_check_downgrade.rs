@@ -68,12 +68,14 @@ fn disabled_text_turn(test: &TestCodex, text: &str) -> Op {
 async fn openai_model_header_mismatch_emits_warning_event() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
+    let requested_model = "requested-model-for-reroute-test";
+    let server_model = "server-model-for-reroute-test";
     let server = start_mock_server().await;
     let response =
-        sse_response(sse_completed("resp-1")).insert_header("OpenAI-Model", SERVER_MODEL);
+        sse_response(sse_completed("resp-1")).insert_header("OpenAI-Model", server_model);
     let _mock = mount_response_once(&server, response).await;
 
-    let mut builder = test_codex().with_model(REQUESTED_MODEL);
+    let mut builder = test_codex().with_model(requested_model);
     let test = builder.build(&server).await?;
 
     test.codex
@@ -87,16 +89,16 @@ async fn openai_model_header_mismatch_emits_warning_event() -> Result<()> {
     let EventMsg::ModelReroute(reroute) = reroute else {
         panic!("expected model reroute event");
     };
-    assert_eq!(reroute.from_model, REQUESTED_MODEL);
-    assert_eq!(reroute.to_model, SERVER_MODEL);
+    assert_eq!(reroute.from_model, requested_model);
+    assert_eq!(reroute.to_model, server_model);
     assert_eq!(reroute.reason, ModelRerouteReason::HighRiskCyberActivity);
 
     let warning = wait_for_event(&test.codex, |event| matches!(event, EventMsg::Warning(_))).await;
     let EventMsg::Warning(warning) = warning else {
         panic!("expected warning event");
     };
-    assert!(warning.message.contains(REQUESTED_MODEL));
-    assert!(warning.message.contains(SERVER_MODEL));
+    assert!(warning.message.contains(requested_model));
+    assert!(warning.message.contains(server_model));
 
     let _ = wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))

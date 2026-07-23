@@ -10,7 +10,6 @@ Keep entries concise and evidence-based.
 - Date:
 - Owner:
 - Crosscheck skill:
-- Wiring Guard session:
 
 ## Decisions
 

@@ -607,6 +607,8 @@ pub struct RiskGateDecision {
     pub reasons: Vec<String>,
 }
 
+pub const CONCURRENT_DRIFT_REASON: &str = "concurrent drift";
+
 pub fn evaluate_risk_gate(facts: &RiskFacts) -> RiskGateDecision {
     let mut reasons = Vec::new();
     if facts.configured_high_risk_path {
@@ -641,7 +643,7 @@ pub fn evaluate_risk_gate(facts: &RiskFacts) -> RiskGateDecision {
         reasons.push("ownership conflict".to_string());
     }
     if facts.drift {
-        reasons.push("concurrent drift".to_string());
+        reasons.push(CONCURRENT_DRIFT_REASON.to_string());
     }
     RiskGateDecision {
         review_required: !reasons.is_empty(),

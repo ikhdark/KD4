@@ -9,7 +9,7 @@ fn list_mcp_resources_tool_matches_expected_spec() {
         create_list_mcp_resources_tool(),
         ToolSpec::Function(ResponsesApiTool {
             name: "list_mcp_resources".to_string(),
-            description: "Lists resources provided by MCP servers. Resources allow servers to share data that provides context to language models, such as files, database schemas, or application-specific information. Prefer resources over web search when possible.".to_string(),
+            description: "Lists resources provided by MCP servers. Resources allow servers to share data that provides context to language models, such as files, database schemas, or application-specific information. Prefer resources over web search when possible. If an aggregate response includes `remainingServers`, list each named server separately without a cursor.".to_string(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([
@@ -23,7 +23,7 @@ fn list_mcp_resources_tool_matches_expected_spec() {
                     (
                         "cursor".to_string(),
                         JsonSchema::string(Some(
-                                "Opaque cursor from a previous list_mcp_resources call; omit for the first page."
+                                "Opaque cursor from a previous list_mcp_resources call; omit for the first page. Aggregate responses expose per-server values in `nextCursors`; pass one back with its matching `server`."
                                     .to_string(),
                             ),),
                     ),
@@ -39,7 +39,7 @@ fn list_mcp_resource_templates_tool_matches_expected_spec() {
         create_list_mcp_resource_templates_tool(),
         ToolSpec::Function(ResponsesApiTool {
             name: "list_mcp_resource_templates".to_string(),
-            description: "Lists resource templates provided by MCP servers. Parameterized resource templates allow servers to share data that takes parameters and provides context to language models, such as files, database schemas, or application-specific information. Prefer resource templates over web search when possible.".to_string(),
+            description: "Lists resource templates provided by MCP servers. Parameterized resource templates allow servers to share data that takes parameters and provides context to language models, such as files, database schemas, or application-specific information. Prefer resource templates over web search when possible. If an aggregate response includes `remainingServers`, list each named server separately without a cursor.".to_string(),
             strict: false,
             defer_loading: None,
             parameters: JsonSchema::object(BTreeMap::from([
@@ -53,7 +53,7 @@ fn list_mcp_resource_templates_tool_matches_expected_spec() {
                     (
                         "cursor".to_string(),
                         JsonSchema::string(Some(
-                                "Opaque cursor from a previous list_mcp_resource_templates call; omit for the first page."
+                                "Opaque cursor from a previous list_mcp_resource_templates call; omit for the first page. Aggregate responses expose per-server values in `nextCursors`; pass one back with its matching `server`."
                                     .to_string(),
                             ),),
                     ),
@@ -70,7 +70,7 @@ fn read_mcp_resource_tool_matches_expected_spec() {
         ToolSpec::Function(ResponsesApiTool {
             name: "read_mcp_resource".to_string(),
             description:
-                "Read a specific resource from an MCP server given the server name and resource URI."
+                "Read a specific resource from an MCP server using either a literal URI discovered by list_mcp_resources or a concrete URI instantiated from a uriTemplate discovered by list_mcp_resource_templates."
                     .to_string(),
             strict: false,
             defer_loading: None,
@@ -78,14 +78,14 @@ fn read_mcp_resource_tool_matches_expected_spec() {
                     (
                         "server".to_string(),
                         JsonSchema::string(Some(
-                                "MCP server name exactly as configured. Must match the 'server' field returned by list_mcp_resources."
+                                "MCP server name exactly as configured. Must match the 'server' field returned by either list_mcp_resources or list_mcp_resource_templates."
                                     .to_string(),
                             ),),
                     ),
                     (
                         "uri".to_string(),
                         JsonSchema::string(Some(
-                                "Resource URI to read. Must be one of the URIs returned by list_mcp_resources."
+                                "Resource URI to read. Use either a literal URI returned by list_mcp_resources or a concrete URI produced by filling every required variable in a uriTemplate returned by list_mcp_resource_templates."
                                     .to_string(),
                             ),),
                     ),

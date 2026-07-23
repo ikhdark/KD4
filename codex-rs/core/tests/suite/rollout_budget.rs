@@ -217,22 +217,16 @@ async fn subagent_usage_draws_from_the_shared_budget() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn exhausted_budget_fails_current_and_later_turns() -> Result<()> {
+async fn exhausted_budget_fails_current_and_later_turns_without_another_request() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    mount_sse_sequence(
+    let responses = mount_sse_sequence(
         &server,
-        vec![
-            sse(vec![
-                ev_response_created("exhaust-budget"),
-                ev_completed_with_tokens("exhaust-budget", /*total_tokens*/ 30),
-            ]),
-            sse(vec![
-                ev_response_created("already-exhausted"),
-                ev_completed_with_tokens("already-exhausted", /*total_tokens*/ 1),
-            ]),
-        ],
+        vec![sse(vec![
+            ev_response_created("exhaust-budget"),
+            ev_completed_with_tokens("exhaust-budget", /*total_tokens*/ 30),
+        ])],
     )
     .await;
     let test = test_codex()
@@ -273,6 +267,11 @@ async fn exhausted_budget_fails_current_and_later_turns() -> Result<()> {
         })
         .await;
     }
+    assert_eq!(
+        responses.requests().len(),
+        1,
+        "known budget exhaustion should fail before another model request"
+    );
 
     Ok(())
 }

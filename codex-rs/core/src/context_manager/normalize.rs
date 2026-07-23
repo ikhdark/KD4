@@ -68,7 +68,7 @@ pub(crate) fn ensure_call_outputs_present(items: &mut Vec<ResponseItem>) {
                     ResponseItem::ToolSearchOutput {
                         id: synthetic_output_id("tso", id.as_deref()),
                         call_id: Some(call_id.clone()),
-                        status: "completed".to_string(),
+                        status: "incomplete".to_string(),
                         execution: "client".to_string(),
                         tools: Vec::new(),
                         internal_chat_message_metadata_passthrough: None,
@@ -326,36 +326,27 @@ pub(crate) fn strip_images_when_unsupported(
     for item in items.iter_mut() {
         match item {
             ResponseItem::Message { content, .. } => {
-                let mut normalized_content = Vec::with_capacity(content.len());
-                for content_item in content.iter() {
-                    match content_item {
-                        ContentItem::InputImage { .. } => {
-                            normalized_content.push(ContentItem::InputText {
-                                text: IMAGE_CONTENT_OMITTED_PLACEHOLDER.to_string(),
-                            });
-                        }
-                        _ => normalized_content.push(content_item.clone()),
+                for content_item in content.iter_mut() {
+                    if matches!(content_item, ContentItem::InputImage { .. }) {
+                        *content_item = ContentItem::InputText {
+                            text: IMAGE_CONTENT_OMITTED_PLACEHOLDER.to_string(),
+                        };
                     }
                 }
-                *content = normalized_content;
             }
             ResponseItem::FunctionCallOutput { output, .. }
             | ResponseItem::CustomToolCallOutput { output, .. } => {
                 if let Some(content_items) = output.content_items_mut() {
-                    let mut normalized_content_items = Vec::with_capacity(content_items.len());
-                    for content_item in content_items.iter() {
-                        match content_item {
-                            FunctionCallOutputContentItem::InputImage { .. } => {
-                                normalized_content_items.push(
-                                    FunctionCallOutputContentItem::InputText {
-                                        text: IMAGE_CONTENT_OMITTED_PLACEHOLDER.to_string(),
-                                    },
-                                );
-                            }
-                            _ => normalized_content_items.push(content_item.clone()),
+                    for content_item in content_items.iter_mut() {
+                        if matches!(
+                            content_item,
+                            FunctionCallOutputContentItem::InputImage { .. }
+                        ) {
+                            *content_item = FunctionCallOutputContentItem::InputText {
+                                text: IMAGE_CONTENT_OMITTED_PLACEHOLDER.to_string(),
+                            };
                         }
                     }
-                    *content_items = normalized_content_items;
                 }
             }
             ResponseItem::ImageGenerationCall { result, .. } => {

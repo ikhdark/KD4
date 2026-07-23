@@ -39,24 +39,28 @@ fn collect_tool_mentions_from_messages_with_sigil(
 }
 
 pub(crate) fn collect_explicit_app_ids(input: &[UserInput]) -> HashSet<String> {
-    let messages = input
-        .iter()
-        .filter_map(|item| match item {
-            UserInput::Text { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<String>>();
+    let mut app_ids = HashSet::new();
+    let mut collect_path = |path: &str| {
+        if tool_kind_for_path(path) == ToolMentionKind::App
+            && let Some(app_id) = app_id_from_path(path)
+        {
+            app_ids.insert(app_id.to_string());
+        }
+    };
 
-    input
-        .iter()
-        .filter_map(|item| match item {
-            UserInput::Mention { path, .. } => Some(path.clone()),
-            _ => None,
-        })
-        .chain(collect_tool_mentions_from_messages(&messages).paths)
-        .filter(|path| tool_kind_for_path(path.as_str()) == ToolMentionKind::App)
-        .filter_map(|path| app_id_from_path(path.as_str()).map(str::to_string))
-        .collect()
+    for item in input {
+        match item {
+            UserInput::Text { text, .. } => {
+                for path in extract_tool_mentions_with_sigil(text, TOOL_MENTION_SIGIL).paths() {
+                    collect_path(path);
+                }
+            }
+            UserInput::Mention { path, .. } => collect_path(path),
+            _ => {}
+        }
+    }
+
+    app_ids
 }
 
 /// Collect explicit structured or linked `plugin://...` mentions.
@@ -68,28 +72,29 @@ pub(crate) fn collect_explicit_plugin_mentions(
         return Vec::new();
     }
 
-    let messages = input
-        .iter()
-        .filter_map(|item| match item {
-            UserInput::Text { text, .. } => Some(text.clone()),
-            _ => None,
-        })
-        .collect::<Vec<String>>();
+    let mut mentioned_config_names = HashSet::new();
+    let mut collect_path = |path: &str| {
+        if tool_kind_for_path(path) == ToolMentionKind::Plugin
+            && let Some(config_name) = plugin_config_name_from_path(path)
+        {
+            mentioned_config_names.insert(config_name.to_string());
+        }
+    };
 
-    let mentioned_config_names: HashSet<String> = input
-        .iter()
-        .filter_map(|item| match item {
-            UserInput::Mention { path, .. } => Some(path.clone()),
-            _ => None,
-        })
-        .chain(
-            // Plugin plaintext links use `@`, not the default `$` tool sigil.
-            collect_tool_mentions_from_messages_with_sigil(&messages, PLUGIN_TEXT_MENTION_SIGIL)
-                .paths,
-        )
-        .filter(|path| tool_kind_for_path(path.as_str()) == ToolMentionKind::Plugin)
-        .filter_map(|path| plugin_config_name_from_path(path.as_str()).map(str::to_string))
-        .collect();
+    for item in input {
+        match item {
+            UserInput::Text { text, .. } => {
+                // Plugin plaintext links use `@`, not the default `$` tool sigil.
+                for path in
+                    extract_tool_mentions_with_sigil(text, PLUGIN_TEXT_MENTION_SIGIL).paths()
+                {
+                    collect_path(path);
+                }
+            }
+            UserInput::Mention { path, .. } => collect_path(path),
+            _ => {}
+        }
+    }
 
     if mentioned_config_names.is_empty() {
         return Vec::new();

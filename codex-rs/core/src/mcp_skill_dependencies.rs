@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::hash_map::Entry;
 
 use codex_config::ConfigEditsBuilder;
 use codex_config::McpServerConfig;
@@ -121,13 +122,7 @@ pub(crate) async fn apply_mcp_dependency_effect(
         elicitation_reviewer,
     )
     .await?;
-    if !inventory_contains_expected(
-        sess,
-        turn_context.config.as_ref(),
-        &effect.expected_inventory_keys,
-    )
-    .await
-    {
+    if !inventory_contains_expected(sess, &effect.expected_inventory_keys).await {
         return Err(format!(
             "completed MCP dependency effect `{}` was not observable in the refreshed inventory",
             effect.id
@@ -140,13 +135,13 @@ pub(crate) async fn apply_mcp_dependency_effect(
 
 pub(crate) async fn inventory_contains_expected(
     sess: &Session,
-    config: &crate::config::Config,
     expected_inventory_keys: &HashSet<String>,
 ) -> bool {
     if expected_inventory_keys.is_empty() {
         return true;
     }
-    let installed = sess.runtime_mcp_servers(config).await;
+    let runtime = sess.services.latest_mcp_runtime();
+    let installed = codex_mcp::configured_mcp_servers(runtime.config());
     let installed_keys = installed
         .iter()
         .map(|(name, config)| canonical_mcp_server_key(name, config))
@@ -193,16 +188,7 @@ async fn install_planned_mcp_dependencies(
         added.push((name.clone(), server_config.clone()));
     }
 
-    if added.is_empty() {
-        return Ok(());
-    }
-    ConfigEditsBuilder::new(&codex_home)
-        .replace_mcp_servers(&servers)
-        .apply()
-        .await
-        .map_err(|err| format!("failed to persist planned MCP dependencies: {err}"))?;
-
-    for (name, server_config) in added {
+    for (name, server_config) in &added {
         let oauth_config = match oauth_login_support(&server_config.transport).await {
             McpOAuthLoginSupport::Supported(config) => config,
             McpOAuthLoginSupport::Unsupported => continue,
@@ -219,7 +205,7 @@ async fn install_planned_mcp_dependencies(
         );
         let oauth_client_id = server_config.oauth_client_id();
         let first_attempt = perform_oauth_login(
-            &name,
+            name,
             &oauth_config.url,
             config.mcp_oauth_credentials_store_mode,
             config.auth_keyring_backend_kind(),
@@ -235,7 +221,7 @@ async fn install_planned_mcp_dependencies(
         if let Err(err) = first_attempt {
             if should_retry_without_scopes(&resolved_scopes, &err) {
                 perform_oauth_login(
-                    &name,
+                    name,
                     &oauth_config.url,
                     config.mcp_oauth_credentials_store_mode,
                     config.auth_keyring_backend_kind(),
@@ -253,6 +239,14 @@ async fn install_planned_mcp_dependencies(
                 return Err(format!("failed to login to MCP dependency {name}: {err}"));
             }
         }
+    }
+
+    if !added.is_empty() {
+        ConfigEditsBuilder::new(&codex_home)
+            .replace_mcp_servers(&servers)
+            .apply()
+            .await
+            .map_err(|err| format!("failed to persist planned MCP dependencies: {err}"))?;
     }
 
     let mut refresh_config = config.clone();
@@ -321,20 +315,28 @@ async fn should_install_planned_mcp_dependencies(
             response.ok_or_else(|| "MCP dependency prompt closed without a response".to_string())?
         }
     };
-    let install = response
+    let answers = response
         .answers
         .get(SKILL_MCP_DEPENDENCY_PROMPT_ID)
-        .is_some_and(|answer| {
-            answer
-                .answers
-                .iter()
-                .any(|entry| entry == MCP_DEPENDENCY_OPTION_INSTALL)
-        });
-    let prompted_keys = missing
+        .map(|answer| answer.answers.as_slice())
+        .ok_or_else(|| "MCP dependency prompt returned no answer".to_string())?;
+    let install = answers
         .iter()
-        .map(|(name, config)| canonical_mcp_server_key(name, config));
-    sess.record_mcp_dependency_prompted(prompted_keys).await;
-    Ok(install)
+        .any(|entry| entry == MCP_DEPENDENCY_OPTION_INSTALL);
+    let skip = answers
+        .iter()
+        .any(|entry| entry == MCP_DEPENDENCY_OPTION_SKIP);
+    match (install, skip) {
+        (true, false) => Ok(true),
+        (false, true) => {
+            let prompted_keys = missing
+                .iter()
+                .map(|(name, config)| canonical_mcp_server_key(name, config));
+            sess.record_mcp_dependency_prompted(prompted_keys).await;
+            Ok(false)
+        }
+        _ => Err("MCP dependency prompt returned an invalid answer".to_string()),
+    }
 }
 
 async fn filter_prompted_mcp_dependencies(
@@ -466,17 +468,69 @@ fn mcp_dependency_to_server_config(
     Err(format!("unsupported transport {transport}"))
 }
 
+struct DeclaredMcpDependency {
+    config: McpServerConfig,
+    skill_names: HashSet<String>,
+}
+
+fn format_mcp_dependency_transport(config: &McpServerConfig) -> String {
+    match &config.transport {
+        McpServerTransportConfig::Stdio { command, .. } => {
+            format!("stdio command {command:?}")
+        }
+        McpServerTransportConfig::StreamableHttp { url, .. } => {
+            format!("streamable_http URL {url:?}")
+        }
+    }
+}
+
+fn format_mcp_dependency_skills(skill_names: &HashSet<String>) -> String {
+    let has_multiple_skills = skill_names.len() > 1;
+    let mut skill_names = skill_names.iter().collect::<Vec<_>>();
+    skill_names.sort();
+    let skill_names = skill_names
+        .into_iter()
+        .map(|skill_name| format!("{skill_name:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if has_multiple_skills {
+        format!("skills {skill_names}")
+    } else {
+        format!("skill {skill_names}")
+    }
+}
+
+fn conflicting_mcp_dependency_warning(
+    name: &str,
+    declarations: &[(String, DeclaredMcpDependency)],
+) -> String {
+    let configurations = declarations
+        .iter()
+        .map(|(_, declaration)| {
+            format!(
+                "{} requests {}",
+                format_mcp_dependency_skills(&declaration.skill_names),
+                format_mcp_dependency_transport(&declaration.config)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "Unable to auto-install MCP dependency {name:?}: the same name has conflicting configurations ({configurations})"
+    )
+}
+
 fn collect_missing_mcp_dependencies(
     mentioned_skills: &[SkillMetadata],
     installed: &HashMap<String, McpServerConfig>,
 ) -> (HashMap<String, McpServerConfig>, Vec<String>) {
-    let mut missing = HashMap::new();
-    let mut warnings = Vec::new();
     let installed_keys: HashSet<String> = installed
         .iter()
         .map(|(name, config)| canonical_mcp_server_key(name, config))
         .collect();
-    let mut seen_canonical_keys = HashSet::new();
+    let mut declared_by_name: HashMap<String, HashMap<String, DeclaredMcpDependency>> =
+        HashMap::new();
+    let mut warnings = Vec::new();
 
     for skill in mentioned_skills {
         let Some(dependencies) = skill.dependencies.as_ref() else {
@@ -498,9 +552,7 @@ fn collect_missing_mcp_dependencies(
                     continue;
                 }
             };
-            if installed_keys.contains(&dependency_key)
-                || seen_canonical_keys.contains(&dependency_key)
-            {
+            if installed_keys.contains(&dependency_key) {
                 continue;
             }
 
@@ -516,10 +568,66 @@ fn collect_missing_mcp_dependencies(
                 }
             };
 
-            missing.insert(tool.value.clone(), config);
-            seen_canonical_keys.insert(dependency_key);
+            let declarations = declared_by_name.entry(tool.value.clone()).or_default();
+            let declaration =
+                declarations
+                    .entry(dependency_key)
+                    .or_insert_with(|| DeclaredMcpDependency {
+                        config,
+                        skill_names: HashSet::new(),
+                    });
+            declaration.skill_names.insert(skill.name.clone());
         }
     }
+
+    let mut seen_canonical_keys = HashSet::new();
+    let mut missing = HashMap::new();
+    let mut names = declared_by_name.into_iter().collect::<Vec<_>>();
+    names.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+    for (name, declarations) in names {
+        let mut declarations = declarations.into_iter().collect::<Vec<_>>();
+        declarations.sort_by(|(left, _), (right, _)| left.cmp(right));
+        if declarations.len() > 1 {
+            warnings.push(conflicting_mcp_dependency_warning(&name, &declarations));
+            continue;
+        }
+
+        let Some((dependency_key, declaration)) = declarations.pop() else {
+            continue;
+        };
+        if let Some(installed_config) = installed.get(&name) {
+            let installed_key = canonical_mcp_server_key(&name, installed_config);
+            if installed_key != dependency_key {
+                let installed_transport = format_mcp_dependency_transport(installed_config);
+                let requested_transport = format_mcp_dependency_transport(&declaration.config);
+                warnings.push(format!(
+                    "Unable to auto-install MCP dependency {name:?}: the installed server uses {installed_transport}, but {} requests {requested_transport}",
+                    format_mcp_dependency_skills(&declaration.skill_names)
+                ));
+            }
+            continue;
+        }
+        if !seen_canonical_keys.insert(dependency_key.clone()) {
+            continue;
+        }
+
+        match missing.entry(name.clone()) {
+            Entry::Vacant(entry) => {
+                entry.insert(declaration.config);
+            }
+            Entry::Occupied(entry) => {
+                let existing_transport = format_mcp_dependency_transport(entry.get());
+                let requested_transport = format_mcp_dependency_transport(&declaration.config);
+                warnings.push(format!(
+                    "Unable to auto-install MCP dependency {name:?}: the same name has conflicting configurations ({existing_transport}; {requested_transport})"
+                ));
+                entry.remove();
+            }
+        }
+    }
+
+    warnings.sort();
 
     (missing, warnings)
 }

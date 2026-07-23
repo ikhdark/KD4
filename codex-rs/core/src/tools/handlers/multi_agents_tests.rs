@@ -1,6 +1,7 @@
 use super::*;
 use crate::ThreadManager;
 use crate::config::AgentRoleConfig;
+use crate::config::Constrained;
 use crate::config::DEFAULT_AGENT_MAX_DEPTH;
 use crate::function_tool::FunctionCallError;
 use crate::init_state_db;
@@ -52,6 +53,7 @@ use codex_protocol::protocol::FileSystemSandboxEntry;
 use codex_protocol::protocol::FileSystemSandboxPolicy;
 use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InterAgentCommunication;
+use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::NetworkSandboxPolicy;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
@@ -99,6 +101,25 @@ fn function_payload(args: serde_json::Value) -> ToolPayload {
     ToolPayload::Function {
         arguments: args.to_string(),
     }
+}
+
+async fn completed_collab_item(
+    rx: &async_channel::Receiver<codex_protocol::protocol::Event>,
+    call_id: &str,
+) -> codex_protocol::items::CollabAgentToolCallItem {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            let event = rx.recv().await.expect("collaboration lifecycle event");
+            if let EventMsg::ItemCompleted(event) = event.msg
+                && let codex_protocol::items::TurnItem::CollabAgentToolCall(item) = event.item
+                && item.id == call_id
+            {
+                break item;
+            }
+        }
+    })
+    .await
+    .expect("completed collaboration item should arrive")
 }
 
 fn parse_agent_id(id: &str) -> ThreadId {
@@ -446,6 +467,53 @@ async fn spawn_agent_role_switches_provider_before_default_reasoning_validation(
     assert_eq!(
         snapshot.reasoning_effort,
         Some(DEFAULT_SPAWN_AGENT_REASONING_EFFORT)
+    );
+}
+
+#[tokio::test]
+async fn spawn_agent_validates_role_locked_reasoning_against_requested_model() {
+    let (session, mut turn) = make_session_and_context().await;
+    tokio::fs::create_dir_all(&turn.config.codex_home)
+        .await
+        .expect("codex home should be created");
+    let role_config_path = turn.config.codex_home.join("ultra-role.toml");
+    tokio::fs::write(
+        &role_config_path,
+        r#"model_reasoning_effort = "ultra"
+"#,
+    )
+    .await
+    .expect("reasoning-only role config should be written");
+    let mut config = (*turn.config).clone();
+    config.agent_roles.insert(
+        "ultra-role".to_string(),
+        AgentRoleConfig {
+            description: Some("Role that locks reasoning only".to_string()),
+            config_file: Some(role_config_path.to_path_buf()),
+            nickname_candidates: None,
+        },
+    );
+    set_turn_config(&mut turn, config);
+
+    let result = SpawnAgentHandler::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo",
+                "agent_type": "ultra-role",
+                "model": "gpt-5.6-luna"
+            })),
+        ))
+        .await;
+
+    assert_eq!(
+        result.err(),
+        Some(FunctionCallError::RespondToModel(
+            "Reasoning effort `ultra` is not supported for model `gpt-5.6-luna`. Supported reasoning efforts: low, medium, high, xhigh, max"
+                .to_string()
+        ))
     );
 }
 
@@ -3446,6 +3514,158 @@ async fn send_input_accepts_structured_items() {
 }
 
 #[tokio::test]
+async fn send_input_completed_item_follows_success_for_errored_live_agent() {
+    let (mut session, turn, rx) = make_session_and_context_with_rx().await;
+    let manager = thread_manager();
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .services
+        .agent_control = manager.agent_control();
+    let thread = manager
+        .start_thread(turn.config.as_ref().clone())
+        .await
+        .expect("start thread");
+    let agent_id = thread.thread_id;
+    let errored_status = AgentStatus::Errored("previous turn failed".to_string());
+    thread
+        .thread
+        .codex
+        .session
+        .send_event_raw(codex_protocol::protocol::Event {
+            id: "target-error".to_string(),
+            msg: EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                message: "previous turn failed".to_string(),
+                codex_error_info: None,
+            }),
+        })
+        .await;
+    assert_eq!(
+        manager.agent_control().get_status(agent_id).await,
+        errored_status
+    );
+
+    let output = SendInputHandler
+        .handle(invocation(
+            session,
+            turn,
+            "send_input",
+            function_payload(json!({
+                "target": agent_id.to_string(),
+                "message": "try again"
+            })),
+        ))
+        .await
+        .expect("follow-up input should be queued successfully");
+    let (content, success) = expect_text_output(output);
+    let result: serde_json::Value =
+        serde_json::from_str(&content).expect("send_input result should be json");
+    assert!(
+        result
+            .get("submission_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|submission_id| !submission_id.is_empty())
+    );
+    assert_eq!(success, Some(true));
+
+    let completed = completed_collab_item(&rx, "call-1").await;
+    assert_eq!(
+        completed.status,
+        codex_protocol::items::CollabAgentToolCallStatus::Completed
+    );
+    assert_eq!(
+        completed.agents_states.get(&agent_id),
+        Some(&errored_status)
+    );
+
+    let _ = manager
+        .agent_control()
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown agent");
+}
+
+#[tokio::test]
+async fn send_input_to_live_v1_agent_skips_resume_config_construction() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    let control = manager.agent_control();
+    session.services.agent_control = control.clone();
+    let mut target_config = turn.config.as_ref().clone();
+    let _ = target_config.features.disable(Feature::MultiAgentV2);
+    let thread = manager
+        .resume_thread_with_history(
+            target_config.clone(),
+            InitialHistory::Forked(vec![RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "persisted".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            })]),
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+        .expect("start persisted thread");
+    let agent_id = thread.thread_id;
+    let _ = control
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown persisted thread");
+    assert_eq!(
+        control
+            .resume_agent_from_rollout(target_config.clone(), agent_id, SessionSource::Exec)
+            .await
+            .expect("resume persisted thread"),
+        agent_id
+    );
+    assert!(control.get_agent_metadata(agent_id).is_some());
+    assert_eq!(
+        manager
+            .get_thread(agent_id)
+            .await
+            .expect("resumed thread should be live")
+            .multi_agent_version(),
+        Some(MultiAgentVersion::V1)
+    );
+
+    let disallowed_approval = if turn.approval_policy.value() == AskForApproval::Never {
+        AskForApproval::OnRequest
+    } else {
+        AskForApproval::Never
+    };
+    target_config.permissions.approval_policy = Constrained::allow_only(disallowed_approval);
+    turn.config = Arc::new(target_config);
+    assert!(
+        build_agent_resume_config(&turn).is_err(),
+        "test precondition should make eager resume-config construction fail"
+    );
+
+    let output = SendInputHandler
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "send_input",
+            function_payload(json!({
+                "target": agent_id.to_string(),
+                "message": "live V1 follow-up"
+            })),
+        ))
+        .await
+        .expect("live V1 send should skip resume-config construction");
+    let (_content, success) = expect_text_output(output);
+    assert_eq!(success, Some(true));
+
+    let _ = control
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown resumed agent");
+}
+
+#[tokio::test]
 async fn resume_agent_rejects_invalid_id() {
     let (session, turn) = make_session_and_context().await;
     let invocation = invocation(
@@ -3465,13 +3685,16 @@ async fn resume_agent_rejects_invalid_id() {
 
 #[tokio::test]
 async fn resume_agent_reports_missing_agent() {
-    let (mut session, turn) = make_session_and_context().await;
+    let (mut session, turn, rx) = make_session_and_context_with_rx().await;
     let manager = thread_manager();
-    session.services.agent_control = manager.agent_control();
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .services
+        .agent_control = manager.agent_control();
     let agent_id = ThreadId::new();
     let invocation = invocation(
-        Arc::new(session),
-        Arc::new(turn),
+        session,
+        turn,
         "resume_agent",
         function_payload(json!({"id": agent_id.to_string()})),
     );
@@ -3481,6 +3704,15 @@ async fn resume_agent_reports_missing_agent() {
     assert_eq!(
         err,
         FunctionCallError::RespondToModel(format!("agent with id {agent_id} not found"))
+    );
+    let completed = completed_collab_item(&rx, "call-1").await;
+    assert_eq!(
+        completed.status,
+        codex_protocol::items::CollabAgentToolCallStatus::Failed
+    );
+    assert_eq!(
+        completed.agents_states.get(&agent_id),
+        Some(&AgentStatus::NotFound)
     );
 }
 
@@ -3521,6 +3753,69 @@ async fn resume_agent_noops_for_active_agent() {
         .submit(Op::Shutdown {})
         .await
         .expect("shutdown should submit");
+}
+
+#[tokio::test]
+async fn resume_agent_completed_item_follows_success_for_active_errored_agent() {
+    let (mut session, turn, rx) = make_session_and_context_with_rx().await;
+    let manager = thread_manager();
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .services
+        .agent_control = manager.agent_control();
+    let thread = manager
+        .start_thread(turn.config.as_ref().clone())
+        .await
+        .expect("start thread");
+    let agent_id = thread.thread_id;
+    let errored_status = AgentStatus::Errored("previous turn failed".to_string());
+    thread
+        .thread
+        .codex
+        .session
+        .send_event_raw(codex_protocol::protocol::Event {
+            id: "target-error".to_string(),
+            msg: EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                message: "previous turn failed".to_string(),
+                codex_error_info: None,
+            }),
+        })
+        .await;
+    assert_eq!(
+        manager.agent_control().get_status(agent_id).await,
+        errored_status
+    );
+
+    let output = ResumeAgentHandler
+        .handle(invocation(
+            session,
+            turn,
+            "resume_agent",
+            function_payload(json!({"id": agent_id.to_string()})),
+        ))
+        .await
+        .expect("active-agent resume should be a successful no-op");
+    let (content, success) = expect_text_output(output);
+    let result: resume_agent::ResumeAgentResult =
+        serde_json::from_str(&content).expect("resume_agent result should be json");
+    assert_eq!(result.status, errored_status);
+    assert_eq!(success, Some(true));
+
+    let completed = completed_collab_item(&rx, "call-1").await;
+    assert_eq!(
+        completed.status,
+        codex_protocol::items::CollabAgentToolCallStatus::Completed
+    );
+    assert_eq!(
+        completed.agents_states.get(&agent_id),
+        Some(&errored_status)
+    );
+
+    let _ = manager
+        .agent_control()
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown agent");
 }
 
 #[tokio::test]
@@ -3574,6 +3869,117 @@ async fn resume_agent_restores_closed_agent_and_accepts_send_input() {
     let result: resume_agent::ResumeAgentResult =
         serde_json::from_str(&content).expect("resume_agent result should be json");
     assert_ne!(result.status, AgentStatus::NotFound);
+    assert_eq!(success, Some(true));
+
+    let send_invocation = invocation(
+        session,
+        turn,
+        "send_input",
+        function_payload(json!({"target": agent_id.to_string(), "message": "hello"})),
+    );
+    let output = SendInputHandler
+        .handle(send_invocation)
+        .await
+        .expect("send_input should succeed after resume");
+    let (content, success) = expect_text_output(output);
+    let result: serde_json::Value =
+        serde_json::from_str(&content).expect("send_input result should be json");
+    let submission_id = result
+        .get("submission_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    assert!(!submission_id.is_empty());
+    assert_eq!(success, Some(true));
+
+    let _ = manager
+        .agent_control()
+        .shutdown_live_agent(agent_id)
+        .await
+        .expect("shutdown resumed agent");
+}
+
+#[tokio::test]
+async fn resume_agent_restores_registered_shutdown_agent_and_accepts_send_input() {
+    let (mut session, turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let config = turn.config.as_ref().clone();
+    let thread = manager
+        .resume_thread_with_history(
+            config.clone(),
+            InitialHistory::Forked(vec![RolloutItem::ResponseItem(ResponseItem::Message {
+                id: None,
+                role: "user".to_string(),
+                content: vec![ContentItem::InputText {
+                    text: "materialized".to_string(),
+                }],
+                phase: None,
+                internal_chat_message_metadata_passthrough: None,
+            })]),
+            AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+            /*parent_trace*/ None,
+            /*supports_openai_form_elicitation*/ false,
+        )
+        .await
+        .expect("start thread");
+    let agent_id = thread.thread_id;
+    thread
+        .thread
+        .codex
+        .session
+        .try_ensure_rollout_materialized()
+        .await
+        .expect("rollout should materialize before direct shutdown");
+    thread
+        .thread
+        .codex
+        .session
+        .flush_rollout()
+        .await
+        .expect("rollout should flush before direct shutdown");
+    let mut status_rx = manager
+        .agent_control()
+        .subscribe_status(agent_id)
+        .await
+        .expect("subscribe should succeed");
+    let _ = thread
+        .thread
+        .submit(Op::Shutdown {})
+        .await
+        .expect("shutdown should submit");
+    timeout(Duration::from_secs(1), async {
+        while !matches!(status_rx.borrow().clone(), AgentStatus::Shutdown) {
+            status_rx
+                .changed()
+                .await
+                .expect("shutdown status channel should stay open");
+        }
+    })
+    .await
+    .expect("shutdown status should arrive");
+    assert_eq!(
+        manager.agent_control().get_status(agent_id).await,
+        AgentStatus::Shutdown
+    );
+    assert_eq!(manager.list_thread_ids().await, vec![agent_id]);
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+
+    let resume_invocation = invocation(
+        session.clone(),
+        turn.clone(),
+        "resume_agent",
+        function_payload(json!({"id": agent_id.to_string()})),
+    );
+    let output = ResumeAgentHandler
+        .handle(resume_invocation)
+        .await
+        .expect("resume_agent should succeed");
+    let (content, success) = expect_text_output(output);
+    let result: resume_agent::ResumeAgentResult =
+        serde_json::from_str(&content).expect("resume_agent result should be json");
+    assert_ne!(result.status, AgentStatus::NotFound);
+    assert_ne!(result.status, AgentStatus::Shutdown);
     assert_eq!(success, Some(true));
 
     let send_invocation = invocation(
@@ -4929,20 +5335,39 @@ async fn multi_agent_v2_interrupt_agent_rejects_self_target_by_task_name() {
 
 #[tokio::test]
 async fn close_agent_submits_shutdown_and_returns_previous_status() {
-    let (mut session, turn) = make_session_and_context().await;
+    let (mut session, turn, rx) = make_session_and_context_with_rx().await;
     let manager = thread_manager();
-    session.services.agent_control = manager.agent_control();
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .services
+        .agent_control = manager.agent_control();
     let config = turn.config.as_ref().clone();
     let thread = manager
         .start_thread(config.clone())
         .await
         .expect("start thread");
     let agent_id = thread.thread_id;
+    thread
+        .thread
+        .codex
+        .session
+        .send_event_raw(codex_protocol::protocol::Event {
+            id: "child-error".to_string(),
+            msg: EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+                message: "child failed".to_string(),
+                codex_error_info: None,
+            }),
+        })
+        .await;
     let status_before = manager.agent_control().get_status(agent_id).await;
+    assert_eq!(
+        status_before,
+        AgentStatus::Errored("child failed".to_string())
+    );
 
     let invocation = invocation(
-        Arc::new(session),
-        Arc::new(turn),
+        session,
+        turn,
         "close_agent",
         function_payload(json!({"target": agent_id.to_string()})),
     );
@@ -4956,6 +5381,25 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
     assert_eq!(result.previous_status, status_before);
     assert_eq!(success, Some(true));
 
+    let completed = timeout(Duration::from_secs(1), async {
+        loop {
+            let event = rx.recv().await.expect("close lifecycle event");
+            if let EventMsg::ItemCompleted(event) = event.msg
+                && let codex_protocol::items::TurnItem::CollabAgentToolCall(item) = event.item
+                && item.id == "call-1"
+            {
+                break item;
+            }
+        }
+    })
+    .await
+    .expect("completed close item should arrive");
+    assert_eq!(
+        completed.status,
+        codex_protocol::items::CollabAgentToolCallStatus::Completed
+    );
+    assert_eq!(completed.agents_states.get(&agent_id), Some(&status_before));
+
     let ops = manager.captured_ops();
     let submitted_shutdown = ops
         .iter()
@@ -4964,6 +5408,103 @@ async fn close_agent_submits_shutdown_and_returns_previous_status() {
 
     let status_after = manager.agent_control().get_status(agent_id).await;
     assert_eq!(status_after, AgentStatus::NotFound);
+}
+
+#[tokio::test]
+async fn close_agent_completed_item_reports_failed_when_durable_close_fails() {
+    let (mut session, turn, rx) = make_session_and_context_with_rx().await;
+    let mut config = turn.config.as_ref().clone();
+    config
+        .features
+        .enable(Feature::Sqlite)
+        .expect("test config should allow sqlite");
+    config.ephemeral = false;
+    let state_db = init_state_db(&config).await;
+    let manager = ThreadManager::new(
+        &config,
+        AuthManager::from_auth_for_testing(CodexAuth::from_api_key("dummy")),
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store_from_config(&config, state_db.clone()),
+        local_agent_graph_store_from_state_db(state_db.as_ref()),
+        "11111111-1111-4111-8111-111111111111".to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+    let parent = manager
+        .start_thread(config.clone())
+        .await
+        .expect("parent thread should start");
+    let agent_control = manager.agent_control();
+    let agent_id = agent_control
+        .spawn_agent(
+            config,
+            vec![UserInput::Text {
+                text: "hello child".to_string(),
+                text_elements: Vec::new(),
+            }],
+            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+                parent_thread_id: parent.thread_id,
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some("worker".to_string()),
+            })),
+        )
+        .await
+        .expect("child spawn should succeed");
+    Arc::get_mut(&mut session)
+        .expect("session should be uniquely owned")
+        .services
+        .agent_control = agent_control;
+    state_db
+        .as_ref()
+        .expect("sqlite state db should be available")
+        .close()
+        .await;
+
+    let result = CloseAgentHandler
+        .handle(invocation(
+            session,
+            turn,
+            "close_agent",
+            function_payload(json!({"target": agent_id.to_string()})),
+        ))
+        .await;
+    let Err(err) = result else {
+        panic!("durable close failure should be reported");
+    };
+    assert!(err.to_string().contains("closed spawn-edge status"));
+
+    let completed = timeout(Duration::from_secs(1), async {
+        loop {
+            let event = rx.recv().await.expect("close lifecycle event");
+            if let EventMsg::ItemCompleted(event) = event.msg
+                && let codex_protocol::items::TurnItem::CollabAgentToolCall(item) = event.item
+                && item.id == "call-1"
+            {
+                break item;
+            }
+        }
+    })
+    .await
+    .expect("completed close item should arrive");
+    assert_eq!(
+        completed.status,
+        codex_protocol::items::CollabAgentToolCallStatus::Failed
+    );
+    assert!(completed.agents_states.contains_key(&agent_id));
+    assert_eq!(
+        manager.agent_control().get_status(agent_id).await,
+        AgentStatus::NotFound
+    );
+
+    let _ = manager
+        .shutdown_all_threads_bounded(Duration::from_secs(5))
+        .await;
 }
 
 #[tokio::test]

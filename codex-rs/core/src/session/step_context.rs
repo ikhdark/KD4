@@ -46,4 +46,11 @@ impl StepContext {
             .get_or_init(|| self.mcp.manager().list_all_tools())
             .await
     }
+
+    #[cfg(test)]
+    pub(crate) async fn seed_mcp_tools_for_test(&self, tools: Vec<ToolInfo>) {
+        self.mcp_tool_snapshot
+            .set(tools)
+            .expect("test MCP tool snapshot should be unset");
+    }
 }

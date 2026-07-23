@@ -2865,6 +2865,185 @@ async fn realtime_v2_noop_tool_call_returns_empty_function_output_without_respon
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn realtime_v2_turn_abort_resolves_and_clears_active_handoff() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let (release_first_turn_tx, release_first_turn_rx) = oneshot::channel();
+    let first_chunks = vec![
+        StreamingSseChunk {
+            gate: None,
+            body: sse_event(responses::ev_response_created("resp-aborted")),
+        },
+        StreamingSseChunk {
+            gate: Some(release_first_turn_rx),
+            body: sse_event(responses::ev_completed("resp-aborted")),
+        },
+    ];
+    let (api_server, completions) = start_streaming_sse_server(vec![first_chunks]).await;
+
+    let first_handoff = json!({
+        "type": "conversation.item.done",
+        "item": {
+            "id": "item-aborted",
+            "type": "function_call",
+            "name": "background_agent",
+            "call_id": "handoff-aborted",
+            "arguments": json!({ "input": "first delegated request" }).to_string()
+        }
+    });
+    let replacement_handoff = json!({
+        "type": "conversation.item.done",
+        "item": {
+            "id": "item-replacement",
+            "type": "function_call",
+            "name": "background_agent",
+            "call_id": "handoff-replacement",
+            "arguments": json!({ "input": "replacement delegated request" }).to_string()
+        }
+    });
+    let realtime_server = start_websocket_server(vec![vec![
+        vec![
+            json!({
+                "type": "session.updated",
+                "session": { "id": "sess-abort", "instructions": "backend prompt" }
+            }),
+            first_handoff,
+        ],
+        vec![],
+        vec![
+            json!({
+                "type": "response.created",
+                "response": { "id": "response-after-abort" }
+            }),
+            json!({
+                "type": "response.done",
+                "response": { "id": "response-after-abort" }
+            }),
+        ],
+        vec![replacement_handoff],
+        vec![],
+        vec![],
+        vec![],
+    ]])
+    .await;
+
+    let mut builder = test_codex().with_model("gpt-5.4").with_config({
+        let realtime_base_url = realtime_server.uri().to_string();
+        move |config| {
+            config.experimental_realtime_ws_base_url = Some(realtime_base_url);
+            config.realtime.version = RealtimeWsVersion::V2;
+        }
+    });
+    let test = builder.build_with_streaming_server(&api_server).await?;
+
+    test.codex
+        .submit(Op::RealtimeConversationStart(ConversationStartParams {
+            client_managed_handoffs: false,
+            flush_transcript_tail_on_session_end: false,
+            codex_responses_as_items: false,
+            codex_response_item_prefix: None,
+            codex_response_handoff_prefix: None,
+            model: None,
+            output_modality: RealtimeOutputModality::Audio,
+            include_startup_context: true,
+            prompt: Some(Some("backend prompt".to_string())),
+            realtime_session_id: None,
+            transport: None,
+            version: None,
+            voice: None,
+        }))
+        .await?;
+
+    let _ = wait_for_event_match(&test.codex, |msg| match msg {
+        EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
+            payload: RealtimeEvent::HandoffRequested(handoff),
+        }) if handoff.handoff_id == "handoff-aborted" => Some(()),
+        _ => None,
+    })
+    .await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnStarted(_))
+    })
+    .await;
+
+    test.codex.submit(Op::Interrupt).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+
+    let abort_output = wait_for_matching_websocket_request(
+        &realtime_server,
+        "aborted handoff function output",
+        |request| {
+            request.body_json()["item"]["type"].as_str() == Some("function_call_output")
+                && request.body_json()["item"]["call_id"].as_str() == Some("handoff-aborted")
+        },
+    )
+    .await;
+    assert_eq!(
+        abort_output.body_json()["item"]["output"].as_str(),
+        Some("Background agent stopped before it finished.")
+    );
+    let _ = wait_for_matching_websocket_request(
+        &realtime_server,
+        "realtime response after aborted handoff",
+        |request| request.body_json()["type"].as_str() == Some("response.create"),
+    )
+    .await;
+
+    test.codex
+        .submit(Op::RealtimeConversationAudio(ConversationAudioParams {
+            frame: RealtimeAudioFrame {
+                data: "AQID".to_string(),
+                sample_rate: 24_000,
+                num_channels: 1,
+                samples_per_channel: Some(480),
+                item_id: None,
+            },
+        }))
+        .await?;
+    let _ = wait_for_event_match(&test.codex, |msg| match msg {
+        EventMsg::RealtimeConversationRealtime(RealtimeConversationRealtimeEvent {
+            payload: RealtimeEvent::HandoffRequested(handoff),
+        }) if handoff.handoff_id == "handoff-replacement" => Some(()),
+        _ => None,
+    })
+    .await;
+
+    let replacement_steer = timeout(Duration::from_millis(200), async {
+        wait_for_matching_websocket_request(
+            &realtime_server,
+            "steering acknowledgement for replacement handoff",
+            |request| {
+                request.body_json()["item"]["type"].as_str() == Some("function_call_output")
+                    && request.body_json()["item"]["call_id"].as_str()
+                        == Some("handoff-replacement")
+            },
+        )
+        .await
+    })
+    .await;
+    assert!(
+        replacement_steer.is_err(),
+        "replacement handoff was incorrectly treated as steering"
+    );
+
+    let completion = completions
+        .into_iter()
+        .next()
+        .expect("missing aborted request completion");
+    drop(release_first_turn_tx);
+    assert!(
+        completion.await.is_err(),
+        "aborted request unexpectedly completed"
+    );
+    realtime_server.shutdown().await;
+    api_server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conversation_mirrors_assistant_message_text_to_realtime_handoff() -> Result<()> {
     skip_if_no_network!(Ok(()));
 

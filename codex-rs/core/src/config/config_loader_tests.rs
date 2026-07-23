@@ -1042,7 +1042,8 @@ personality = true
         .can_set(&WebSearchMode::Cached)?;
     config_requirements
         .web_search_mode
-        .can_set(&WebSearchMode::Cached)?;
+        .can_set(&WebSearchMode::Indexed)
+        .expect_err("cached-only requirements should reject indexed search");
     config_requirements
         .web_search_mode
         .can_set(&WebSearchMode::Disabled)?;

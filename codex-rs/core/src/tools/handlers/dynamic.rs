@@ -36,26 +36,26 @@ pub struct DynamicToolHandler {
 }
 
 impl DynamicToolHandler {
-    pub fn new(tool: &DynamicToolFunctionSpec) -> Option<Self> {
+    pub fn new(tool: &DynamicToolFunctionSpec) -> Result<Self, serde_json::Error> {
         Self::from_parts(tool, /*namespace*/ None)
     }
 
     pub fn new_in_namespace(
         namespace: &DynamicToolNamespaceSpec,
         tool: &DynamicToolFunctionSpec,
-    ) -> Option<Self> {
+    ) -> Result<Self, serde_json::Error> {
         Self::from_parts(tool, Some(namespace))
     }
 
     fn from_parts(
         tool: &DynamicToolFunctionSpec,
         namespace: Option<&DynamicToolNamespaceSpec>,
-    ) -> Option<Self> {
+    ) -> Result<Self, serde_json::Error> {
         let tool_name = ToolName::new(
             namespace.map(|namespace| namespace.name.clone()),
             tool.name.clone(),
         );
-        let mut output_tool = dynamic_tool_to_responses_api_tool(tool).ok()?;
+        let mut output_tool = dynamic_tool_to_responses_api_tool(tool)?;
         // Exposure controls deferral; tool search restores this marker for deferred results.
         output_tool.defer_loading = None;
         let spec = match namespace {
@@ -70,7 +70,7 @@ impl DynamicToolHandler {
             }),
             None => ToolSpec::Function(output_tool),
         };
-        Some(Self {
+        Ok(Self {
             tool_name,
             spec,
             exposure: if tool.defer_loading {
@@ -245,4 +245,29 @@ async fn request_dynamic_tool(
         .await;
 
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_handler_preserves_invalid_schema_error() {
+        let tool = DynamicToolFunctionSpec {
+            name: "invalid_schema".to_string(),
+            description: "Invalid schema fixture".to_string(),
+            input_schema: serde_json::json!({ "type": "null" }),
+            defer_loading: false,
+        };
+
+        let err = DynamicToolHandler::new(&tool)
+            .err()
+            .expect("invalid dynamic schema should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("tool input schema must not be a singleton null type"),
+            "unexpected conversion error: {err}"
+        );
+    }
 }

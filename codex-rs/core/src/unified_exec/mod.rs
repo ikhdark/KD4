@@ -36,6 +36,7 @@ use codex_utils_path_uri::PathUri;
 use rand::Rng;
 use rand::rng;
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
@@ -152,6 +153,33 @@ pub(crate) struct ProcessStore {
     reserved_process_ids: HashSet<i32>,
 }
 
+/// Owns a reserved process id until it is atomically transferred into the
+/// process store. Dropping the transfer sender before then wakes the manager's
+/// cleanup task, including when the calling future is cancelled.
+pub(crate) struct ProcessIdReservation {
+    process_id: i32,
+    transfer_sender: Option<oneshot::Sender<()>>,
+}
+
+impl ProcessIdReservation {
+    fn new(process_id: i32, transfer_sender: oneshot::Sender<()>) -> Self {
+        Self {
+            process_id,
+            transfer_sender: Some(transfer_sender),
+        }
+    }
+
+    pub(crate) fn process_id(&self) -> i32 {
+        self.process_id
+    }
+
+    fn transfer_to_store(&mut self) {
+        if let Some(sender) = self.transfer_sender.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
 impl ProcessStore {
     fn remove(&mut self, process_id: i32) -> Option<ProcessEntry> {
         self.reserved_process_ids.remove(&process_id);
@@ -160,7 +188,7 @@ impl ProcessStore {
 }
 
 pub(crate) struct UnifiedExecProcessManager {
-    process_store: Mutex<ProcessStore>,
+    process_store: Arc<Mutex<ProcessStore>>,
     max_write_stdin_yield_time_ms: u64,
     deferred_executor_enabled: bool,
     executor_ready: AtomicBool,
@@ -179,7 +207,7 @@ impl UnifiedExecProcessManager {
         deferred_executor_enabled: bool,
     ) -> Self {
         Self {
-            process_store: Mutex::new(ProcessStore::default()),
+            process_store: Arc::new(Mutex::new(ProcessStore::default())),
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
             deferred_executor_enabled,
@@ -297,7 +325,6 @@ pub(crate) fn generate_chunk_id() -> String {
 }
 
 #[cfg(test)]
-#[cfg(unix)]
 #[path = "process_tests.rs"]
 mod process_tests;
 #[cfg(test)]

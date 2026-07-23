@@ -36,13 +36,13 @@ pub(crate) fn create_search_source_tool(options: SourceToolOptions) -> ToolSpec 
         ),
         (
             "max_results".to_string(),
-            JsonSchema::number(Some(format!(
+            JsonSchema::integer(Some(format!(
                 "Maximum matches to return; must be between 1 and {SOURCE_SEARCH_MAX_MATCHES}."
             ))),
         ),
         (
             "context_lines".to_string(),
-            JsonSchema::number(Some(format!(
+            JsonSchema::integer(Some(format!(
                 "Context lines before and after each match; must not exceed {SOURCE_SEARCH_MAX_CONTEXT_LINES}."
             ))),
         ),
@@ -67,7 +67,7 @@ pub(crate) fn create_search_source_tool(options: SourceToolOptions) -> ToolSpec 
 
     ToolSpec::Function(ResponsesApiTool {
         name: SEARCH_SOURCE_TOOL_NAME.to_string(),
-        description: "Search repository source with fixed-string matching and hard scan/result limits. Results include repo-relative 1-based line-span evidence citations."
+        description: "Search repository source with fixed-string matching and hard scan/result limits. This tool supports local environments only. Results include repo-relative 1-based line-span evidence citations."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -91,11 +91,11 @@ pub(crate) fn create_read_file_span_tool(options: SourceToolOptions) -> ToolSpec
         ),
         (
             "start_line".to_string(),
-            JsonSchema::number(Some("First 1-based line to return.".to_string())),
+            JsonSchema::integer(Some("First 1-based line to return.".to_string())),
         ),
         (
             "line_count".to_string(),
-            JsonSchema::number(Some(format!(
+            JsonSchema::integer(Some(format!(
                 "Number of lines to return; must be between 1 and {SOURCE_READ_MAX_LINES}."
             ))),
         ),
@@ -104,7 +104,7 @@ pub(crate) fn create_read_file_span_tool(options: SourceToolOptions) -> ToolSpec
 
     ToolSpec::Function(ResponsesApiTool {
         name: READ_FILE_SPAN_TOOL_NAME.to_string(),
-        description: "Read a bounded source-file span confined to the current repository. Output includes an explicit repo-relative 1-based line-span evidence citation."
+        description: "Read a bounded source-file span confined to the current repository. This tool supports local environments only. Output includes an explicit repo-relative 1-based line-span evidence citation."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -122,7 +122,7 @@ fn add_environment_id(properties: &mut BTreeMap<String, JsonSchema>, options: So
         properties.insert(
             "environment_id".to_string(),
             JsonSchema::string(Some(
-                "Environment id from <environment_context>; omit for the primary environment."
+                "Select a local environment id from <environment_context>; omit only when the primary environment is local."
                     .to_string(),
             )),
         );

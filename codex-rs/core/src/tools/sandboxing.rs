@@ -390,6 +390,9 @@ pub(crate) struct ToolCtx {
 
 #[derive(Debug)]
 pub(crate) enum ToolError {
+    /// A deliberate user, reviewer, hook, or policy denial.
+    Denied(String),
+    /// An operational failure that prevents the tool request from running.
     Rejected(String),
     Codex(CodexErr),
 }

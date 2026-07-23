@@ -110,6 +110,7 @@ fn serialize_environment_context_with_foreign_windows_cwd() {
 #[test]
 fn serialize_environment_context_with_network() {
     let network = NetworkContext::new(
+        /*enabled*/ true,
         vec!["api.example.com".to_string(), "*.openai.com".to_string()],
         vec!["blocked.example.com".to_string()],
     );
@@ -137,6 +138,27 @@ fn serialize_environment_context_with_network() {
     );
 
     assert_eq!(context.render(), expected);
+}
+
+#[test]
+fn serialize_disabled_network_context() {
+    assert_eq!(
+        NetworkContext::new(/*enabled*/ false, vec![], vec![]).render(),
+        r#"<network enabled="false"></network>"#
+    );
+}
+
+#[test]
+fn serialize_network_context_escapes_domain_values() {
+    assert_eq!(
+        NetworkContext::new(
+            /*enabled*/ true,
+            vec!["api&<example>.com".to_string()],
+            vec!["\"blocked'.example.com".to_string()],
+        )
+        .render(),
+        r#"<network enabled="true"><allowed>api&amp;&lt;example&gt;.com</allowed><denied>&quot;blocked&apos;.example.com</denied></network>"#
+    );
 }
 
 fn workspace_write_permission_profile_with_private_denials() -> PermissionProfile {
@@ -256,6 +278,26 @@ fn serialize_environment_context_with_subagents() {
     );
 
     assert_eq!(context.render(), expected);
+}
+
+#[test]
+fn serialize_environment_context_escapes_subagents() {
+    let context = environment_state(
+        Vec::new(),
+        /*current_date*/ None,
+        /*timezone*/ None,
+        /*network*/ None,
+        Some("- agent-1: R&D </subagents>".to_string()),
+    );
+
+    assert_eq!(
+        context.render(),
+        r#"<environment_context>
+  <subagents>
+    - agent-1: R&amp;D &lt;/subagents&gt;
+  </subagents>
+</environment_context>"#,
+    );
 }
 
 #[test]

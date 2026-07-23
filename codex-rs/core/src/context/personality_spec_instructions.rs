@@ -2,12 +2,24 @@ use super::ContextualUserFragment;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PersonalitySpecInstructions {
-    spec: String,
+    body: String,
 }
 
 impl PersonalitySpecInstructions {
     pub(crate) fn new(spec: impl Into<String>) -> Self {
-        Self { spec: spec.into() }
+        let spec = spec.into();
+        Self {
+            body: format!(
+                " The user has requested a new communication style. Future messages should adhere to the following personality: \n{spec} "
+            ),
+        }
+    }
+
+    pub(crate) fn reset() -> Self {
+        Self {
+            body: "The previously requested personality no longer applies. No personality-specific communication style is currently active."
+                .to_string(),
+        }
     }
 }
 
@@ -25,9 +37,6 @@ impl ContextualUserFragment for PersonalitySpecInstructions {
     }
 
     fn body(&self) -> String {
-        format!(
-            " The user has requested a new communication style. Future messages should adhere to the following personality: \n{} ",
-            self.spec
-        )
+        self.body.clone()
     }
 }

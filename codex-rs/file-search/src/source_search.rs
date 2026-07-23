@@ -63,11 +63,13 @@ struct DirectoryIgnoreRules {
     git_ignore: Gitignore,
 }
 
-struct SourceIgnoreMatcher {
+pub struct SourceIgnoreMatcher {
     directory_rules: Mutex<HashMap<PathBuf, DirectoryIgnoreRules>>,
     repository_roots: Mutex<HashMap<PathBuf, Option<PathBuf>>>,
     repository_excludes: Mutex<HashMap<PathBuf, Gitignore>>,
-    global_gitignore: Gitignore,
+    global_gitignore: Mutex<Gitignore>,
+    preloaded: bool,
+    preloaded_repository_root: Option<PathBuf>,
 }
 
 impl SourceIgnoreMatcher {
@@ -78,11 +80,83 @@ impl SourceIgnoreMatcher {
             directory_rules: Mutex::new(HashMap::new()),
             repository_roots: Mutex::new(HashMap::new()),
             repository_excludes: Mutex::new(HashMap::new()),
-            global_gitignore,
+            global_gitignore: Mutex::new(global_gitignore),
+            preloaded: false,
+            preloaded_repository_root: None,
         }
     }
 
-    fn is_ignored(&self, path: &Path, is_directory: bool) -> bool {
+    /// Creates an ignore matcher whose rule files are supplied by the caller.
+    ///
+    /// This is used by executor-backed filesystems so ignore files are read
+    /// through the selected filesystem and its active sandbox context. Pass
+    /// `None` when the search root is not inside a Git repository.
+    pub fn new_preloaded(repository_root: Option<&Path>) -> Self {
+        Self {
+            directory_rules: Mutex::new(HashMap::new()),
+            repository_roots: Mutex::new(HashMap::new()),
+            repository_excludes: Mutex::new(HashMap::new()),
+            global_gitignore: Mutex::new(Gitignore::empty()),
+            preloaded: true,
+            preloaded_repository_root: repository_root.map(Path::to_path_buf),
+        }
+    }
+
+    pub fn add_directory_rules(
+        &self,
+        directory: &Path,
+        ignore_contents: Option<&str>,
+        git_ignore_contents: Option<&str>,
+    ) {
+        let rules = DirectoryIgnoreRules {
+            ignore: build_ignore_contents_matcher(
+                directory,
+                &directory.join(".ignore"),
+                ignore_contents,
+            ),
+            git_ignore: build_ignore_contents_matcher(
+                directory,
+                &directory.join(".gitignore"),
+                git_ignore_contents,
+            ),
+        };
+        self.directory_rules
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(directory.to_path_buf(), rules);
+    }
+
+    pub fn has_directory_rules(&self, directory: &Path) -> bool {
+        self.directory_rules
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(directory)
+    }
+
+    pub fn set_repository_exclude(
+        &self,
+        repository_root: &Path,
+        source_path: &Path,
+        contents: &str,
+    ) {
+        self.repository_excludes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                repository_root.to_path_buf(),
+                build_ignore_contents_matcher(repository_root, source_path, Some(contents)),
+            );
+    }
+
+    pub fn set_global_gitignore(&self, base: &Path, source_path: &Path, contents: &str) {
+        *self
+            .global_gitignore
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            build_ignore_contents_matcher(base, source_path, Some(contents));
+    }
+
+    pub fn is_ignored(&self, path: &Path, is_directory: bool) -> bool {
         let Some(parent) = path.parent() else {
             return false;
         };
@@ -111,7 +185,13 @@ impl SourceIgnoreMatcher {
         if let Some(ignored) = ignore_decision(exclude.matched(path, is_directory)) {
             return ignored;
         }
-        ignore_decision(self.global_gitignore.matched(path, is_directory)).unwrap_or(false)
+        ignore_decision(
+            self.global_gitignore
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .matched(path, is_directory),
+        )
+        .unwrap_or(false)
     }
 
     fn rules_for(&self, directory: &Path) -> DirectoryIgnoreRules {
@@ -119,6 +199,12 @@ impl SourceIgnoreMatcher {
             .directory_rules
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.preloaded {
+            return cache
+                .get(directory)
+                .cloned()
+                .unwrap_or_else(DirectoryIgnoreRules::empty);
+        }
         cache
             .entry(directory.to_path_buf())
             .or_insert_with(|| DirectoryIgnoreRules {
@@ -129,6 +215,13 @@ impl SourceIgnoreMatcher {
     }
 
     fn repository_root_for(&self, directory: &Path) -> Option<PathBuf> {
+        if self.preloaded {
+            return self
+                .preloaded_repository_root
+                .as_ref()
+                .filter(|repository_root| directory.starts_with(repository_root))
+                .cloned();
+        }
         let mut cache = self
             .repository_roots
             .lock()
@@ -149,6 +242,12 @@ impl SourceIgnoreMatcher {
             .repository_excludes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.preloaded {
+            return cache
+                .get(repository_root)
+                .cloned()
+                .unwrap_or_else(Gitignore::empty);
+        }
         cache
             .entry(repository_root.to_path_buf())
             .or_insert_with(|| {
@@ -160,9 +259,38 @@ impl SourceIgnoreMatcher {
     }
 }
 
+impl DirectoryIgnoreRules {
+    fn empty() -> Self {
+        Self {
+            ignore: Gitignore::empty(),
+            git_ignore: Gitignore::empty(),
+        }
+    }
+}
+
 fn build_ignore_file_matcher(root: &Path, ignore_file: &Path) -> Gitignore {
     let mut builder = GitignoreBuilder::new(root);
     let _ = builder.add(ignore_file);
+    builder.build().unwrap_or_else(|_| Gitignore::empty())
+}
+
+fn build_ignore_contents_matcher(
+    root: &Path,
+    source_path: &Path,
+    contents: Option<&str>,
+) -> Gitignore {
+    let Some(contents) = contents else {
+        return Gitignore::empty();
+    };
+    let mut builder = GitignoreBuilder::new(root);
+    for (index, line) in contents.lines().enumerate() {
+        let line = if index == 0 {
+            line.trim_start_matches('\u{feff}')
+        } else {
+            line
+        };
+        let _ = builder.add_line(Some(source_path.to_path_buf()), line);
+    }
     builder.build().unwrap_or_else(|_| Gitignore::empty())
 }
 
@@ -466,15 +594,7 @@ fn search_source_with_walk_limits(
 }
 
 pub fn read_file_span(options: ReadFileSpanOptions) -> anyhow::Result<ReadFileSpanOutput> {
-    if options.start_line == 0 {
-        bail!("start_line must be 1 or greater");
-    }
-    if !(1..=SOURCE_READ_MAX_LINES).contains(&options.line_count) {
-        bail!(
-            "line_count must be between 1 and {SOURCE_READ_MAX_LINES} (received {})",
-            options.line_count
-        );
-    }
+    validate_read_file_span_bounds(options.start_line, options.line_count)?;
     let repo_root = canonical_repo_root(&options.repo_root)?;
     let path = resolve_confined_path(&repo_root, &options.path, "source file")?;
     let mut file = open_confined_file(&repo_root, &path)
@@ -512,12 +632,7 @@ pub fn read_file_span_from_bytes(
     start_line: usize,
     line_count: usize,
 ) -> anyhow::Result<ReadFileSpanOutput> {
-    if start_line == 0 {
-        bail!("start_line must be 1 or greater");
-    }
-    if !(1..=SOURCE_READ_MAX_LINES).contains(&line_count) {
-        bail!("line_count must be between 1 and {SOURCE_READ_MAX_LINES} (received {line_count})");
-    }
+    validate_read_file_span_bounds(start_line, line_count)?;
     if bytes.len() > SOURCE_SEARCH_MAX_FILE_BYTES {
         bail!(
             "source file `{relative_path}` is too large ({} bytes, max {})",
@@ -567,6 +682,16 @@ pub fn read_file_span_from_bytes(
         truncated: byte_truncated,
         lines,
     })
+}
+
+pub fn validate_read_file_span_bounds(start_line: usize, line_count: usize) -> anyhow::Result<()> {
+    if start_line == 0 {
+        bail!("start_line must be 1 or greater");
+    }
+    if !(1..=SOURCE_READ_MAX_LINES).contains(&line_count) {
+        bail!("line_count must be between 1 and {SOURCE_READ_MAX_LINES} (received {line_count})");
+    }
+    Ok(())
 }
 
 pub struct SourceSearchAccumulator {

@@ -149,11 +149,18 @@ impl ToolSearchHandler {
         fields(search_info_count = search_infos.len())
     )]
     pub(crate) fn new(search_infos: Vec<ToolSearchInfo>) -> Self {
+        let has_unnamed_tools = search_infos
+            .iter()
+            .any(|search_info| search_info.source_info.is_none());
         let search_source_infos = search_infos
             .iter()
             .filter_map(|search_info| search_info.source_info.clone())
             .collect::<Vec<_>>();
-        let spec = create_tool_search_tool(&search_source_infos, TOOL_SEARCH_DEFAULT_LIMIT);
+        let spec = create_tool_search_tool(
+            &search_source_infos,
+            has_unnamed_tools,
+            TOOL_SEARCH_DEFAULT_LIMIT,
+        );
         let documents: Vec<Document<usize>> = search_infos
             .iter()
             .map(|search_info| search_info.entry.search_text.clone())

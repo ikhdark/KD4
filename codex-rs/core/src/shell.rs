@@ -76,7 +76,7 @@ impl Shell {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 fn ultimate_fallback_shell() -> Shell {
     codex_shell_command::shell_detect::ultimate_fallback_shell().into()
 }
@@ -99,6 +99,5 @@ fn default_user_shell_from_path(user_shell_path: Option<PathBuf>) -> Shell {
 }
 
 #[cfg(test)]
-#[cfg(unix)]
 #[path = "shell_tests.rs"]
 mod tests;

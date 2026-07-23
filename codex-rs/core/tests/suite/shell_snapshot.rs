@@ -380,10 +380,19 @@ fn normalize_newlines(text: &str) -> String {
 }
 
 fn assert_posix_snapshot_sections(snapshot: &str) {
-    assert!(snapshot.contains("# Snapshot file"));
-    assert!(snapshot.contains("aliases "));
-    assert!(snapshot.contains("exports "));
-    assert!(snapshot.contains("setopts "));
+    for section in [
+        "# Snapshot file",
+        "# Codex shell snapshot format: 3",
+        "# Functions",
+        "# setopts",
+        "# aliases",
+        "# exports",
+    ] {
+        assert!(
+            snapshot.lines().any(|line| line == section),
+            "snapshot should contain exact section header {section:?}; snapshot={snapshot:?}"
+        );
+    }
     assert!(
         snapshot.contains("PATH"),
         "snapshot should include PATH exports; snapshot={snapshot:?}"
@@ -732,9 +741,13 @@ async fn windows_unified_exec_uses_shell_snapshot() -> Result<()> {
     assert_eq!(run.begin.command.last(), Some(&command.to_string()));
 
     assert!(run.snapshot_path.starts_with(&run.codex_home));
-    assert!(run.snapshot_content.contains("# Snapshot file"));
-    assert!(run.snapshot_content.contains("# aliases "));
-    assert!(run.snapshot_content.contains("# exports "));
+    for section in ["# Snapshot file", "# Functions", "# aliases", "# exports"] {
+        assert!(
+            run.snapshot_content.lines().any(|line| line == section),
+            "snapshot should contain exact section header {section:?}; snapshot={:?}",
+            run.snapshot_content
+        );
+    }
     assert_eq!(
         normalize_newlines(&run.end.stdout).trim(),
         "snapshot-windows"

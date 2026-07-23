@@ -1,6 +1,7 @@
 #![allow(clippy::module_inception)]
 
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
@@ -33,6 +34,7 @@ use codex_utils_pty::SpawnedPty;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
 use super::head_tail_buffer::HeadTailBuffer;
+use super::head_tail_buffer::omitted_output_marker;
 use super::process_state::ProcessState;
 
 const EARLY_EXIT_GRACE_PERIOD: Duration = Duration::from_millis(150);
@@ -78,12 +80,14 @@ enum ProcessHandle {
 pub(crate) struct UnifiedExecProcess {
     process_handle: ProcessHandle,
     output_tx: broadcast::Sender<Vec<u8>>,
+    initial_output_rx: StdMutex<Option<broadcast::Receiver<Vec<u8>>>>,
     output_buffer: OutputBuffer,
     output_notify: Arc<Notify>,
     output_closed: Arc<AtomicBool>,
     output_closed_notify: Arc<Notify>,
     cancellation_token: CancellationToken,
     output_drained: Arc<Notify>,
+    interaction_lock: Arc<Mutex<()>>,
     state_tx: watch::Sender<ProcessState>,
     state_rx: watch::Receiver<ProcessState>,
     output_task: Option<JoinHandle<()>>,
@@ -115,18 +119,20 @@ impl UnifiedExecProcess {
         let output_closed_notify = Arc::new(Notify::new());
         let cancellation_token = CancellationToken::new();
         let output_drained = Arc::new(Notify::new());
-        let (output_tx, _) = broadcast::channel(64);
+        let (output_tx, output_rx) = broadcast::channel(64);
         let (state_tx, state_rx) = watch::channel(ProcessState::default());
 
         Self {
             process_handle,
             output_tx,
+            initial_output_rx: StdMutex::new(Some(output_rx)),
             output_buffer,
             output_notify,
             output_closed,
             output_closed_notify,
             cancellation_token,
             output_drained,
+            interaction_lock: Arc::new(Mutex::new(())),
             state_tx,
             state_rx,
             output_task: None,
@@ -171,8 +177,12 @@ impl UnifiedExecProcess {
         }
     }
 
-    pub(super) fn output_receiver(&self) -> tokio::sync::broadcast::Receiver<Vec<u8>> {
-        self.output_tx.subscribe()
+    pub(super) fn take_output_receiver(&self) -> broadcast::Receiver<Vec<u8>> {
+        self.initial_output_rx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .expect("unified exec streaming output receiver already taken")
     }
 
     pub(super) fn cancellation_token(&self) -> CancellationToken {
@@ -181,6 +191,19 @@ impl UnifiedExecProcess {
 
     pub(super) fn output_drained_notify(&self) -> Arc<Notify> {
         Arc::clone(&self.output_drained)
+    }
+
+    pub(super) fn interaction_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.interaction_lock)
+    }
+
+    #[cfg(test)]
+    pub(super) async fn publish_output_for_test(&self, chunk: Vec<u8>) {
+        self.output_buffer.lock().await.push_chunk(chunk.clone());
+        self.output_tx
+            .send(chunk)
+            .expect("reserved streaming output receiver should remain subscribed");
+        self.output_notify.notify_waiters();
     }
 
     pub(super) async fn raw_output_artifact(&self) -> Option<RawOutputArtifact> {
@@ -265,9 +288,14 @@ impl UnifiedExecProcess {
         self.terminate();
     }
 
-    async fn snapshot_output(&self) -> Vec<Vec<u8>> {
+    pub(super) async fn snapshot_output(&self) -> Vec<u8> {
         let guard = self.output_buffer.lock().await;
-        guard.snapshot_chunks()
+        let omitted_bytes = guard.omitted_bytes();
+        if omitted_bytes == 0 {
+            guard.to_bytes()
+        } else {
+            guard.to_bytes_with_omission_marker(&omitted_output_marker(omitted_bytes))
+        }
     }
 
     pub(crate) fn sandbox_type(&self) -> SandboxType {
@@ -282,11 +310,7 @@ impl UnifiedExecProcess {
         let _ =
             tokio::time::timeout(Duration::from_millis(20), self.output_notify.notified()).await;
 
-        let collected_chunks = self.snapshot_output().await;
-        let mut aggregated: Vec<u8> = Vec::new();
-        for chunk in collected_chunks {
-            aggregated.extend_from_slice(&chunk);
-        }
+        let aggregated = self.snapshot_output().await;
         let aggregated_text = String::from_utf8_lossy(&aggregated).to_string();
         self.check_for_sandbox_denial_with_text(&aggregated_text)
             .await?;

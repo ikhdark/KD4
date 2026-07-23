@@ -47,7 +47,16 @@ impl Handler {
             .services
             .agent_control
             .get_agent_metadata(receiver_thread_id);
-        if receiver_agent.is_some() {
+        if receiver_agent.is_some()
+            && matches!(
+                session
+                    .services
+                    .agent_control
+                    .get_status(receiver_thread_id)
+                    .await,
+                AgentStatus::NotFound
+            )
+        {
             let resume_config = build_agent_resume_config(turn.as_ref())?;
             session
                 .services
@@ -98,7 +107,11 @@ impl Handler {
                 TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
                     id: call_id,
                     tool: CollabAgentTool::SendInput,
-                    status: collab_tool_call_status(&status, Some(receiver_thread_id)),
+                    status: if result.is_ok() {
+                        CollabAgentToolCallStatus::Completed
+                    } else {
+                        CollabAgentToolCallStatus::Failed
+                    },
                     sender_thread_id: session.thread_id,
                     receiver_thread_ids: vec![receiver_thread_id],
                     receiver_agents: vec![CollabAgentRef {

@@ -6,17 +6,21 @@ use std::collections::BTreeMap;
 
 pub(crate) fn create_tool_search_tool(
     searchable_sources: &[ToolSearchSourceInfo],
+    has_unnamed_tools: bool,
     default_limit: usize,
 ) -> ToolSpec {
     let properties = BTreeMap::from([
         (
             "query".to_string(),
-            JsonSchema::string(Some("Search query for deferred tools.".to_string())),
+            JsonSchema::string(Some(
+                "Search query for deferred tools. Must contain non-whitespace text and must not exceed 4,096 UTF-8 bytes."
+                    .to_string(),
+            )),
         ),
         (
             "limit".to_string(),
-            JsonSchema::number(Some(format!(
-                "Maximum number of tools to return. Defaults to {default_limit}."
+            JsonSchema::integer(Some(format!(
+                "Maximum number of tools to return. Must be an integer from 1 through 64. Defaults to {default_limit}."
             ))),
         ),
     ]);
@@ -34,16 +38,24 @@ pub(crate) fn create_tool_search_tool(
     }
 
     let source_descriptions = if source_descriptions.is_empty() {
-        "None currently enabled.".to_string()
+        if has_unnamed_tools {
+            "- Deferred built-in or extension tools (named source metadata is unavailable; these deferred tools remain searchable)."
+                .to_string()
+        } else {
+            "None currently enabled.".to_string()
+        }
     } else {
-        source_descriptions
+        let mut source_descriptions = source_descriptions
             .into_iter()
             .map(|(name, description)| match description {
                 Some(description) => format!("- {name}: {description}"),
                 None => format!("- {name}"),
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .collect::<Vec<_>>();
+        if has_unnamed_tools {
+            source_descriptions.push("- Deferred built-in or extension tools".to_string());
+        }
+        source_descriptions.join("\n")
     };
 
     let description = format!(
@@ -89,6 +101,7 @@ mod tests {
                         description: None,
                     },
                 ],
+                /*has_unnamed_tools*/ false,
                 /*default_limit*/ 8,
             ),
             ToolSpec::ToolSearch {
@@ -97,17 +110,51 @@ mod tests {
                 parameters: JsonSchema::object(BTreeMap::from([
                         (
                             "limit".to_string(),
-                            JsonSchema::number(Some(
-                                    "Maximum number of tools to return. Defaults to 8."
+                            JsonSchema::integer(Some(
+                                    "Maximum number of tools to return. Must be an integer from 1 through 64. Defaults to 8."
                                         .to_string(),
                                 ),),
                         ),
                         (
                             "query".to_string(),
-                            JsonSchema::string(Some("Search query for deferred tools.".to_string()),),
+                            JsonSchema::string(Some(
+                                    "Search query for deferred tools. Must contain non-whitespace text and must not exceed 4,096 UTF-8 bytes."
+                                        .to_string(),
+                                ),),
                         ),
                     ]), Some(vec!["query".to_string()]), Some(false.into())),
             }
         );
+    }
+
+    #[test]
+    fn create_tool_search_tool_describes_unnamed_deferred_tools() {
+        let ToolSpec::ToolSearch { description, .. } =
+            create_tool_search_tool(&[], /*has_unnamed_tools*/ true, 8)
+        else {
+            panic!("expected tool search specification");
+        };
+
+        assert!(description.contains("- Deferred built-in or extension tools"));
+        assert!(description.contains("named source metadata is unavailable"));
+        assert!(description.contains("these deferred tools remain searchable"));
+        assert!(!description.contains("None currently enabled."));
+    }
+
+    #[test]
+    fn create_tool_search_tool_describes_named_and_unnamed_tools() {
+        let ToolSpec::ToolSearch { description, .. } = create_tool_search_tool(
+            &[ToolSearchSourceInfo {
+                name: "Google Drive".to_string(),
+                description: Some("Search Drive files.".to_string()),
+            }],
+            /*has_unnamed_tools*/ true,
+            8,
+        ) else {
+            panic!("expected tool search specification");
+        };
+
+        assert!(description.contains("- Google Drive: Search Drive files."));
+        assert!(description.contains("- Deferred built-in or extension tools"));
     }
 }

@@ -25,7 +25,7 @@ use crate::tools::runtimes::RuntimePathPrepends;
 use crate::tools::runtimes::apply_package_path_prepend;
 use crate::tools::runtimes::maybe_wrap_shell_lc_with_snapshot;
 use crate::tools::runtimes::strip_managed_proxy_env;
-use crate::user_shell_command::user_shell_command_record_item;
+use crate::user_shell_command::user_shell_command_record_item_from_formatted_output;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use codex_protocol::exec_output::StreamOutput;
 use codex_protocol::items::CommandExecutionItem;
@@ -248,19 +248,13 @@ pub(crate) async fn execute_user_shell_command(
     match exec_result {
         Err(CancelErr::Cancelled) => {
             let aborted_message = "command aborted by user".to_string();
-            let exec_output = ExecToolCallOutput {
-                exit_code: -1,
-                stdout: StreamOutput::new(String::new()),
-                stderr: StreamOutput::new(aborted_message.clone()),
-                aggregated_output: StreamOutput::new(aborted_message.clone()),
-                duration: Duration::ZERO,
-                timed_out: false,
-            };
             persist_user_shell_output(
                 &session,
                 turn_context.as_ref(),
                 &raw_command,
-                &exec_output,
+                -1,
+                Duration::ZERO,
+                aborted_message.clone(),
                 mode,
             )
             .await;
@@ -287,6 +281,8 @@ pub(crate) async fn execute_user_shell_command(
                 .await;
         }
         Ok(Ok(output)) => {
+            let formatted_output =
+                format_exec_output_str(&output, turn_context.model_info.truncation_policy.into());
             session
                 .emit_turn_item_completed(
                     turn_context.as_ref(),
@@ -308,16 +304,21 @@ pub(crate) async fn execute_user_shell_command(
                         aggregated_output: Some(output.aggregated_output.text.clone()),
                         exit_code: Some(output.exit_code),
                         duration: Some(output.duration),
-                        formatted_output: Some(format_exec_output_str(
-                            &output,
-                            turn_context.model_info.truncation_policy.into(),
-                        )),
+                        formatted_output: Some(formatted_output.clone()),
                     }),
                 )
                 .await;
 
-            persist_user_shell_output(&session, turn_context.as_ref(), &raw_command, &output, mode)
-                .await;
+            persist_user_shell_output(
+                &session,
+                turn_context.as_ref(),
+                &raw_command,
+                output.exit_code,
+                output.duration,
+                formatted_output,
+                mode,
+            )
+            .await;
         }
         Ok(Err(err)) => {
             error!("user shell command failed: {err:?}");
@@ -330,6 +331,10 @@ pub(crate) async fn execute_user_shell_command(
                 duration: Duration::ZERO,
                 timed_out: false,
             };
+            let formatted_output = format_exec_output_str(
+                &exec_output,
+                turn_context.model_info.truncation_policy.into(),
+            );
             session
                 .emit_turn_item_completed(
                     turn_context.as_ref(),
@@ -347,10 +352,7 @@ pub(crate) async fn execute_user_shell_command(
                         aggregated_output: Some(exec_output.aggregated_output.text.clone()),
                         exit_code: Some(exec_output.exit_code),
                         duration: Some(exec_output.duration),
-                        formatted_output: Some(format_exec_output_str(
-                            &exec_output,
-                            turn_context.model_info.truncation_policy.into(),
-                        )),
+                        formatted_output: Some(formatted_output.clone()),
                     }),
                 )
                 .await;
@@ -358,7 +360,9 @@ pub(crate) async fn execute_user_shell_command(
                 &session,
                 turn_context.as_ref(),
                 &raw_command,
-                &exec_output,
+                exec_output.exit_code,
+                exec_output.duration,
+                formatted_output,
                 mode,
             )
             .await;
@@ -444,10 +448,18 @@ async fn persist_user_shell_output(
     session: &Session,
     turn_context: &TurnContext,
     raw_command: &str,
-    exec_output: &ExecToolCallOutput,
+    exit_code: i32,
+    duration: Duration,
+    formatted_output: String,
     mode: UserShellCommandMode,
 ) {
-    let output_item = user_shell_command_record_item(raw_command, exec_output, turn_context);
+    let output_item = user_shell_command_record_item_from_formatted_output(
+        raw_command,
+        exit_code,
+        duration,
+        formatted_output,
+        turn_context.model_info.truncation_policy.into(),
+    );
 
     if mode == UserShellCommandMode::StandaloneTurn {
         session

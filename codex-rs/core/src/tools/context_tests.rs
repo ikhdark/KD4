@@ -372,6 +372,29 @@ fn tool_search_payloads_roundtrip_as_tool_search_outputs() {
 }
 
 #[test]
+fn aborted_tool_search_payloads_become_incomplete_outputs() {
+    let payload = ToolPayload::ToolSearch {
+        arguments: SearchToolCallParams {
+            query: "calendar".to_string(),
+            limit: None,
+        },
+    };
+
+    assert_eq!(
+        AbortedToolOutput {
+            message: "cancelled".to_string(),
+        }
+        .to_response_item("search-aborted", &payload),
+        ResponseInputItem::ToolSearchOutput {
+            call_id: "search-aborted".to_string(),
+            status: "incomplete".to_string(),
+            execution: "client".to_string(),
+            tools: Vec::new(),
+        }
+    );
+}
+
+#[test]
 fn log_preview_uses_content_items_when_plain_text_is_missing() {
     let output = FunctionToolOutput::from_content(
         vec![FunctionCallOutputContentItem::InputText {
@@ -462,6 +485,36 @@ fn exec_command_tool_output_formats_truncated_response() {
         }
         other => panic!("expected FunctionCallOutput, got {other:?}"),
     }
+}
+
+#[test]
+fn exec_command_tool_output_preserves_live_process_state_for_large_output() {
+    let raw_output = (0..900)
+        .map(|index| format!("live-process-output-{index:04}-{}", "x".repeat(72)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let response = ExecCommandToolOutput {
+        event_call_id: "call-live".to_string(),
+        chunk_id: "chunk-live".to_string(),
+        wall_time: std::time::Duration::from_millis(25),
+        raw_output: raw_output.as_bytes().to_vec(),
+        truncation_policy: TruncationPolicy::Tokens(10_000),
+        max_output_tokens: Some(256),
+        process_id: Some(42),
+        exit_code: None,
+        original_token_count: Some(20_000),
+        hook_command: Some("cargo test".to_string()),
+        raw_output_artifact: None,
+        repair_notice: None,
+    }
+    .response_text();
+
+    assert!(response.contains("Process running with session ID 42"));
+    assert!(!response.contains("Process exited with code"));
+    assert!(!response.contains("exit_code: 0"));
+    assert!(!response.contains("timed_out: true"));
+    assert!(response.contains("tokens truncated"));
+    assert!(response.len() < raw_output.len());
 }
 
 #[test]

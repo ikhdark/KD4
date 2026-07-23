@@ -3,6 +3,8 @@ use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::protocol::COLLABORATION_MODE_CLOSE_TAG;
 use codex_protocol::protocol::COLLABORATION_MODE_OPEN_TAG;
 
+const RESET_INSTRUCTIONS: &str = "No collaboration-mode-specific instructions are currently active. Any previously provided collaboration-mode instructions no longer apply.";
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CollaborationModeInstructions {
     instructions: String,
@@ -18,6 +20,12 @@ impl CollaborationModeInstructions {
             .map(|instructions| Self {
                 instructions: instructions.clone(),
             })
+    }
+
+    pub(crate) fn reset() -> Self {
+        Self {
+            instructions: RESET_INSTRUCTIONS.to_string(),
+        }
     }
 }
 

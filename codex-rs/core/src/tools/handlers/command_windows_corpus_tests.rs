@@ -42,7 +42,8 @@ async fn windows_command_corpus_measures_phase2_exit_gate() {
         shell_type: ShellType::Cmd,
         shell_path: "cmd.exe".into(),
     };
-    let long_path_argument = format!(r"C:\{}\file.txt", "segment".repeat(42));
+    let long_argument = "long argument segment ".repeat(16);
+    assert!(long_argument.len() > 260);
     let exact_arguments = vec![
         "space value".to_string(),
         "snow 雪".to_string(),
@@ -50,7 +51,7 @@ async fn windows_command_corpus_measures_phase2_exit_gate() {
         "*.rs".to_string(),
         "a>b".to_string(),
         "x|y".to_string(),
-        long_path_argument.clone(),
+        long_argument.clone(),
     ];
     let mut python_args = vec![
         "-c".to_string(),
@@ -109,9 +110,9 @@ async fn windows_command_corpus_measures_phase2_exit_gate() {
            sum = $sum\n\
            wildcard_count = $wildcards\n\
            quoted = '\"quoted\"'\n\
-           long_path_length = {long_path_length}\n\
+           long_argument_length = {long_argument_length}\n\
          }} | ConvertTo-Json -Compress",
-        long_path_length = long_path_argument.len(),
+        long_argument_length = long_argument.len(),
     );
     let powershell_invocation = CommandInvocation::PowerShellScript(script.clone());
     let encoded_args = powershell_invocation.to_exec_args(&powershell, false);
@@ -132,8 +133,8 @@ async fn windows_command_corpus_measures_phase2_exit_gate() {
     assert_eq!(powershell_json["wildcard_count"].as_u64(), Some(2));
     assert_eq!(powershell_json["quoted"], "\"quoted\"");
     assert_eq!(
-        powershell_json["long_path_length"].as_u64(),
-        Some(long_path_argument.len() as u64)
+        powershell_json["long_argument_length"].as_u64(),
+        Some(long_argument.len() as u64)
     );
 
     let repair_source = CommandInvocation::Argv {
@@ -242,7 +243,7 @@ async fn windows_command_corpus_measures_phase2_exit_gate() {
             "wildcards",
             "redirection",
             "pipelines",
-            "long_paths",
+            "long_arguments",
             "nonzero_native_exit",
         ],
     });

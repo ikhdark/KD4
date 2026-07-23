@@ -103,7 +103,6 @@ impl ToolCallRuntime {
         let step_context = Arc::clone(&self.step_context);
         let turn = Arc::clone(&step_context.turn);
         turn.turn_timing_state.record_tool_call();
-        let turn_tool_execution_guard = turn.turn_timing_state.begin_tool_execution();
         let tracker = Arc::clone(&self.tracker);
         let lock = Arc::clone(&self.parallel_execution);
         let invocation_cancellation_token = cancellation_token.clone();
@@ -159,7 +158,6 @@ impl ToolCallRuntime {
 
         async move {
             let _tool_call_timing_guard = tool_call_timing_guard;
-            let _turn_tool_execution_guard = turn_tool_execution_guard;
             tokio::select! {
                 res = &mut dispatch_handle => res.map_err(Self::tool_task_join_error)?,
                 _ = cancellation_token.cancelled() => {
@@ -215,7 +213,7 @@ impl ToolCallRuntime {
         match call.payload {
             ToolPayload::ToolSearch { .. } => ResponseInputItem::ToolSearchOutput {
                 call_id: call.call_id,
-                status: "completed".to_string(),
+                status: "incomplete".to_string(),
                 execution: "client".to_string(),
                 tools: Vec::new(),
             },
@@ -353,6 +351,7 @@ mod tests {
     use crate::tools::context::FunctionToolOutput;
     use crate::tools::context::ToolInvocation;
     use crate::tools::registry::CoreToolRuntime;
+    use crate::tools::registry::ToolExecutionTiming;
     use crate::tools::registry::ToolExecutor;
     use crate::tools::registry::ToolRegistry;
     use crate::turn_diff_tracker::TurnDiffTracker;
@@ -363,6 +362,33 @@ mod tests {
     use tokio::sync::Notify;
     use tokio::sync::oneshot;
     use tracing_test::internal::MockWriter;
+
+    #[test]
+    fn tool_search_failure_response_is_incomplete() {
+        let call = ToolCall {
+            tool_name: codex_tools::ToolName::plain("tool_search"),
+            call_id: "search-failed".to_string(),
+            payload: ToolPayload::ToolSearch {
+                arguments: codex_protocol::models::SearchToolCallParams {
+                    query: "calendar".to_string(),
+                    limit: None,
+                },
+            },
+        };
+
+        assert_eq!(
+            ToolCallRuntime::failure_response(
+                call,
+                FunctionCallError::RespondToModel("failed".to_string()),
+            ),
+            ResponseInputItem::ToolSearchOutput {
+                call_id: "search-failed".to_string(),
+                status: "incomplete".to_string(),
+                execution: "client".to_string(),
+                tools: Vec::new(),
+            }
+        );
+    }
 
     #[test]
     fn tool_call_timing_guard_ignores_code_mode_source() {
@@ -511,6 +537,59 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn runtime_respects_non_handler_tool_execution_timing() {
+        let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        let interactive_tool = codex_tools::ToolName::plain("interactive_timing_tool");
+        let nested_runtime_tool = codex_tools::ToolName::plain("nested_runtime_timing_tool");
+        let handlers = [
+            Arc::new(DeclaredTimingHandler {
+                tool_name: interactive_tool.clone(),
+                timing: ToolExecutionTiming::Interactive,
+            }) as Arc<dyn CoreToolRuntime>,
+            Arc::new(DeclaredTimingHandler {
+                tool_name: nested_runtime_tool.clone(),
+                timing: ToolExecutionTiming::NestedRuntime,
+            }) as Arc<dyn CoreToolRuntime>,
+        ];
+        let step_context = StepContext::for_test(Arc::clone(&turn_context));
+        let router = Arc::new(ToolRouter::from_parts(
+            ToolRegistry::from_tools(handlers),
+            Vec::new(),
+        ));
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let runtime = ToolCallRuntime::new(router, session, step_context, tracker);
+        turn_context.turn_timing_state.mark_turn_started();
+
+        for (index, tool_name) in [interactive_tool, nested_runtime_tool]
+            .into_iter()
+            .enumerate()
+        {
+            runtime
+                .clone()
+                .handle_tool_call(
+                    ToolCall {
+                        tool_name,
+                        call_id: format!("timing-call-{index}"),
+                        payload: ToolPayload::Function {
+                            arguments: "{}".to_string(),
+                        },
+                    },
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("non-handler timing tool should complete");
+        }
+
+        let profile = turn_context.turn_timing_state.complete_snapshot().profile;
+        assert_eq!(
+            profile.unions.tool_active_ns, 0,
+            "ToolCallRuntime must not override Interactive or NestedRuntime timing ownership"
+        );
+    }
+
     struct ImmediateHandler {
         tool_name: codex_tools::ToolName,
     }
@@ -542,6 +621,44 @@ mod tests {
     }
 
     impl CoreToolRuntime for ImmediateHandler {}
+
+    struct DeclaredTimingHandler {
+        tool_name: codex_tools::ToolName,
+        timing: ToolExecutionTiming,
+    }
+
+    impl ToolExecutor<ToolInvocation> for DeclaredTimingHandler {
+        fn tool_name(&self) -> codex_tools::ToolName {
+            self.tool_name.clone()
+        }
+
+        fn spec(&self) -> codex_tools::ToolSpec {
+            codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+                name: self.tool_name.name.clone(),
+                description: "Declared timing test tool.".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+            })
+        }
+
+        fn handle(&self, _invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(
+                    Box::new(FunctionToolOutput::from_text("ok".to_string(), Some(true)))
+                        as Box<dyn crate::tools::context::ToolOutput>,
+                )
+            })
+        }
+    }
+
+    impl CoreToolRuntime for DeclaredTimingHandler {
+        fn tool_execution_timing(&self) -> ToolExecutionTiming {
+            self.timing
+        }
+    }
 
     struct CancellationCleanupHandler {
         tool_name: codex_tools::ToolName,

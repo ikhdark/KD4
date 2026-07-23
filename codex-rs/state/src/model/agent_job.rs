@@ -79,7 +79,7 @@ pub struct AgentJob {
     pub instruction: String,
     pub auto_export: bool,
     pub max_runtime_seconds: Option<u64>,
-    // TODO(jif-oai): Convert to JSON Schema and enforce structured outputs.
+    /// JSON Schema enforced by the agent-job tool handlers.
     pub output_schema_json: Option<Value>,
     pub input_headers: Vec<String>,
     pub input_csv_path: String,

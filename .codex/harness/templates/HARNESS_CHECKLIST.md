@@ -12,8 +12,6 @@
 
 - [ ] Root `AGENTS.md` and any active specialist skill applied for
       implementation or repo-behavior work
-- [ ] Wiring Guard/KDWG intent declared before implementation-shaped edits when
-      active
 - [ ] Owner files inspected
 - [ ] Relevant call path inspected
 - [ ] Relevant config, schema, or generated artifact ownership checked
@@ -33,8 +31,6 @@
 ## Validation
 
 - [ ] Focused validation ran
-- [ ] Wiring Guard/KDWG check ran when active and applicable, or
-      `--no-wiring-targets` was explicitly justified
 - [ ] Changed code and its intended path were swept for placeholders or stubs
 - [ ] New public symbols, config fields, commands, or workflow entries were
       checked against their expected callers

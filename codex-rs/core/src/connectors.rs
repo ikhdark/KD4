@@ -57,6 +57,7 @@ struct CachedAccessibleConnectors {
     key: AccessibleConnectorsCacheKey,
     expires_at: Instant,
     connectors: Vec<AppInfo>,
+    codex_apps_ready: bool,
 }
 
 static ACCESSIBLE_CONNECTORS_CACHE: LazyLock<StdMutex<Option<CachedAccessibleConnectors>>> =
@@ -128,7 +129,7 @@ pub async fn list_cached_accessible_connectors_from_mcp_tools(
         return Some(Vec::new());
     }
     let cache_key = accessible_connectors_cache_key(config, auth.as_ref());
-    read_cached_accessible_connectors(&cache_key)
+    read_cached_accessible_connectors(&cache_key).map(|status| status.connectors)
 }
 
 pub(crate) fn refresh_accessible_connectors_cache_from_mcp_tools(
@@ -142,7 +143,11 @@ pub(crate) fn refresh_accessible_connectors_cache_from_mcp_tools(
 
     let cache_key = accessible_connectors_cache_key(config, auth);
     let accessible_connectors = accessible_connectors_for_app_list_from_mcp_tools(mcp_tools);
-    write_cached_accessible_connectors(cache_key, &accessible_connectors);
+    write_cached_accessible_connectors(
+        cache_key,
+        &accessible_connectors,
+        /*codex_apps_ready*/ true,
+    );
 }
 
 pub async fn list_accessible_connectors_from_mcp_tools_with_options(
@@ -215,13 +220,11 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
     let cache_key = accessible_connectors_cache_key(config, auth.as_ref());
     let mcp_config = mcp_manager.runtime_config(config).await;
     let tool_plugin_provenance = tool_plugin_provenance(&mcp_config);
-    if !force_refetch && let Some(cached_connectors) = read_cached_accessible_connectors(&cache_key)
+    if !force_refetch && let Some(mut cached_status) = read_cached_accessible_connectors(&cache_key)
     {
-        let cached_connectors = with_app_plugin_sources(cached_connectors, &tool_plugin_provenance);
-        return Ok(AccessibleConnectorsStatus {
-            connectors: cached_connectors,
-            codex_apps_ready: true,
-        });
+        cached_status.connectors =
+            with_app_plugin_sources(cached_status.connectors, &tool_plugin_provenance);
+        return Ok(cached_status);
     }
 
     let mut mcp_servers = effective_mcp_servers(&mcp_config, auth.as_ref());
@@ -336,7 +339,7 @@ pub async fn list_accessible_connectors_from_mcp_tools_with_mcp_manager(
 
     let accessible_connectors = accessible_connectors_for_app_list_from_mcp_tools(&tools);
     if codex_apps_ready || !accessible_connectors.is_empty() {
-        write_cached_accessible_connectors(cache_key, &accessible_connectors);
+        write_cached_accessible_connectors(cache_key, &accessible_connectors, codex_apps_ready);
     }
     let accessible_connectors =
         with_app_plugin_sources(accessible_connectors, &tool_plugin_provenance);
@@ -364,7 +367,7 @@ fn accessible_connectors_cache_key(
 
 fn read_cached_accessible_connectors(
     cache_key: &AccessibleConnectorsCacheKey,
-) -> Option<Vec<AppInfo>> {
+) -> Option<AccessibleConnectorsStatus> {
     let mut cache_guard = ACCESSIBLE_CONNECTORS_CACHE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -372,7 +375,10 @@ fn read_cached_accessible_connectors(
 
     if let Some(cached) = cache_guard.as_ref() {
         if now < cached.expires_at && cached.key == *cache_key {
-            return Some(cached.connectors.clone());
+            return Some(AccessibleConnectorsStatus {
+                connectors: cached.connectors.clone(),
+                codex_apps_ready: cached.codex_apps_ready,
+            });
         }
         if now >= cached.expires_at {
             *cache_guard = None;
@@ -385,6 +391,7 @@ fn read_cached_accessible_connectors(
 fn write_cached_accessible_connectors(
     cache_key: AccessibleConnectorsCacheKey,
     connectors: &[AppInfo],
+    codex_apps_ready: bool,
 ) {
     let mut cache_guard = ACCESSIBLE_CONNECTORS_CACHE
         .lock()
@@ -393,6 +400,7 @@ fn write_cached_accessible_connectors(
         key: cache_key,
         expires_at: Instant::now() + codex_connectors::CONNECTORS_CACHE_TTL,
         connectors: connectors.to_vec(),
+        codex_apps_ready,
     });
 }
 

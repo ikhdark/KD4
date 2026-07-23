@@ -78,6 +78,10 @@ fn codex_app_tool(
 }
 
 fn with_accessible_connectors_cache_cleared<R>(f: impl FnOnce() -> R) -> R {
+    static TEST_MUTEX: LazyLock<StdMutex<()>> = LazyLock::new(|| StdMutex::new(()));
+    let _test_guard = TEST_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let previous = {
         let mut cache_guard = ACCESSIBLE_CONNECTORS_CACHE
             .lock()
@@ -243,43 +247,89 @@ async fn refresh_accessible_connectors_cache_from_mcp_tools_writes_latest_instal
     });
 
     assert_eq!(
-        cached,
-        vec![
-            AppInfo {
-                id: "calendar".to_string(),
-                name: "Google Calendar".to_string(),
-                description: None,
-                logo_url: None,
-                logo_url_dark: None,
-                icon_assets: None,
-                icon_dark_assets: None,
-                distribution_channel: None,
-                install_url: Some(connector_install_url("Google Calendar", "calendar")),
-                branding: None,
-                app_metadata: None,
-                labels: None,
-                is_accessible: true,
-                is_enabled: true,
-                plugin_display_names: plugin_names(&["calendar-plugin"]),
-            },
-            AppInfo {
-                id: "connector_openai_hidden".to_string(),
-                name: "Hidden".to_string(),
-                description: None,
-                logo_url: None,
-                logo_url_dark: None,
-                icon_assets: None,
-                icon_dark_assets: None,
-                distribution_channel: None,
-                install_url: Some(connector_install_url("Hidden", "connector_openai_hidden")),
-                branding: None,
-                app_metadata: None,
-                labels: None,
-                is_accessible: true,
-                is_enabled: true,
-                plugin_display_names: Vec::new(),
-            }
-        ]
+        (cached.connectors, cached.codex_apps_ready),
+        (
+            vec![
+                AppInfo {
+                    id: "calendar".to_string(),
+                    name: "Google Calendar".to_string(),
+                    description: None,
+                    logo_url: None,
+                    logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
+                    distribution_channel: None,
+                    install_url: Some(connector_install_url("Google Calendar", "calendar")),
+                    branding: None,
+                    app_metadata: None,
+                    labels: None,
+                    is_accessible: true,
+                    is_enabled: true,
+                    plugin_display_names: plugin_names(&["calendar-plugin"]),
+                },
+                AppInfo {
+                    id: "connector_openai_hidden".to_string(),
+                    name: "Hidden".to_string(),
+                    description: None,
+                    logo_url: None,
+                    logo_url_dark: None,
+                    icon_assets: None,
+                    icon_dark_assets: None,
+                    distribution_channel: None,
+                    install_url: Some(connector_install_url("Hidden", "connector_openai_hidden")),
+                    branding: None,
+                    app_metadata: None,
+                    labels: None,
+                    is_accessible: true,
+                    is_enabled: true,
+                    plugin_display_names: Vec::new(),
+                }
+            ],
+            true,
+        )
+    );
+}
+
+#[tokio::test]
+async fn accessible_connectors_cache_preserves_not_ready_startup_snapshot() {
+    let codex_home = tempdir().expect("tempdir should succeed");
+    let config = ConfigBuilder::default()
+        .codex_home(codex_home.path().to_path_buf())
+        .build()
+        .await
+        .expect("config should load");
+    let cache_key = accessible_connectors_cache_key(&config, /*auth*/ None);
+    let connector_a = app("connector-a");
+    let connector_b = app("connector-b");
+
+    let (cache_hit, refreshed) = with_accessible_connectors_cache_cleared(|| {
+        write_cached_accessible_connectors(
+            cache_key.clone(),
+            std::slice::from_ref(&connector_a),
+            /*codex_apps_ready*/ false,
+        );
+        let cache_hit = read_cached_accessible_connectors(&cache_key)
+            .expect("startup cache should be populated");
+
+        write_cached_accessible_connectors(
+            cache_key.clone(),
+            &[connector_a.clone(), connector_b.clone()],
+            /*codex_apps_ready*/ true,
+        );
+        let refreshed = read_cached_accessible_connectors(&cache_key)
+            .expect("refreshed cache should be populated");
+        (cache_hit, refreshed)
+    });
+
+    assert_eq!(
+        (
+            (cache_hit.connectors, cache_hit.codex_apps_ready),
+            (refreshed.connectors, refreshed.codex_apps_ready),
+        ),
+        (
+            (vec![connector_a.clone()], false),
+            (vec![connector_a, connector_b], true),
+        )
     );
 }
 

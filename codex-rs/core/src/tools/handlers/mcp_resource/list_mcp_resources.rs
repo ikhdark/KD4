@@ -1,13 +1,9 @@
-use std::time::Instant;
-
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
-use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::mcp_resource_spec::create_list_mcp_resources_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
-use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_protocol::protocol::McpInvocation;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -16,12 +12,9 @@ use rmcp::model::PaginatedRequestParams;
 
 use super::ListResourcesArgs;
 use super::ListResourcesPayload;
-use super::call_tool_result_from_content;
-use super::emit_tool_call_begin;
-use super::emit_tool_call_end;
 use super::ensure_model_can_access_mcp_server;
+use super::execute_resource_call;
 use super::model_can_access_mcp_server;
-use super::normalize_optional_string;
 use super::parse_args_with_default;
 use super::parse_arguments;
 use super::serialize_function_output;
@@ -54,6 +47,7 @@ impl ListMcpResourcesHandler {
         let ToolInvocation {
             session,
             step_context,
+            cancellation_token,
             call_id,
             payload,
             ..
@@ -72,9 +66,8 @@ impl ListMcpResourcesHandler {
 
         let arguments = parse_arguments(arguments.as_str())?;
         let args: ListResourcesArgs = parse_args_with_default(arguments.clone())?;
+        let args = args.normalize()?;
         let ListResourcesArgs { server, cursor } = args;
-        let server = normalize_optional_string(server);
-        let cursor = normalize_optional_string(cursor);
 
         let invocation = McpInvocation {
             server: server.clone().unwrap_or_else(|| "codex".to_string()),
@@ -82,91 +75,56 @@ impl ListMcpResourcesHandler {
             arguments: arguments.clone(),
         };
 
-        emit_tool_call_begin(&session, turn.as_ref(), &call_id, invocation.clone()).await;
-        let start = Instant::now();
-
-        let payload_result: Result<ListResourcesPayload, FunctionCallError> = async {
-            if let Some(server_name) = server.clone() {
-                ensure_model_can_access_mcp_server(turn.as_ref(), &server_name)?;
-                let params = cursor
-                    .clone()
-                    .map(|value| PaginatedRequestParams::default().with_cursor(Some(value)));
-                let result = manager
-                    .list_resources(&server_name, params)
-                    .await
-                    .map_err(|err| {
-                        FunctionCallError::RespondToModel(format!("resources/list failed: {err:#}"))
-                    })?;
-                Ok(ListResourcesPayload::from_single_server(
-                    server_name,
-                    result,
-                ))
-            } else {
-                if cursor.is_some() {
-                    return Err(FunctionCallError::RespondToModel(
-                        "cursor can only be used when a server is specified".to_string(),
-                    ));
-                }
-
-                let resources = manager
-                    .list_all_resources(|server_name| {
-                        model_can_access_mcp_server(turn.as_ref(), server_name)
-                    })
-                    .await;
-                Ok(ListResourcesPayload::from_all_servers(resources))
-            }
-        }
-        .await;
         let truncation_policy = turn.model_info.truncation_policy.into();
+        execute_resource_call(
+            &session,
+            turn.as_ref(),
+            &call_id,
+            invocation,
+            cancellation_token,
+            async {
+                let payload = if let Some(server_name) = server.clone() {
+                    ensure_model_can_access_mcp_server(turn.as_ref(), &server_name)?;
+                    let params = cursor
+                        .clone()
+                        .map(|value| PaginatedRequestParams::default().with_cursor(Some(value)));
+                    let result =
+                        manager
+                            .list_resources(&server_name, params)
+                            .await
+                            .map_err(|err| {
+                                FunctionCallError::RespondToModel(format!(
+                                    "resources/list failed: {err:#}"
+                                ))
+                            })?;
+                    ListResourcesPayload::from_single_server(
+                        server_name,
+                        result,
+                        truncation_policy,
+                    )?
+                } else {
+                    if cursor.is_some() {
+                        return Err(FunctionCallError::RespondToModel(
+                            "cursor can only be used when a server is specified".to_string(),
+                        ));
+                    }
 
-        match payload_result {
-            Ok(payload) => match serialize_function_output(payload, truncation_policy) {
-                Ok(output) => {
-                    let content = function_call_output_content_items_to_text(&output.body)
-                        .unwrap_or_default();
-                    let duration = start.elapsed();
-                    emit_tool_call_end(
-                        &session,
-                        turn.as_ref(),
-                        &call_id,
-                        invocation,
-                        duration,
-                        Ok(call_tool_result_from_content(&content, output.success)),
-                    )
-                    .await;
-                    Ok(boxed_tool_output(output))
-                }
-                Err(err) => {
-                    let duration = start.elapsed();
-                    let message = err.to_string();
-                    emit_tool_call_end(
-                        &session,
-                        turn.as_ref(),
-                        &call_id,
-                        invocation,
-                        duration,
-                        Err(message.clone()),
-                    )
-                    .await;
-                    Err(err)
-                }
+                    let pages = manager
+                        .list_resource_pages(|server_name| {
+                            model_can_access_mcp_server(turn.as_ref(), server_name)
+                        })
+                        .await;
+                    ListResourcesPayload::from_all_servers(pages, truncation_policy)?
+                };
+                serialize_function_output(payload, truncation_policy)
             },
-            Err(err) => {
-                let duration = start.elapsed();
-                let message = err.to_string();
-                emit_tool_call_end(
-                    &session,
-                    turn.as_ref(),
-                    &call_id,
-                    invocation,
-                    duration,
-                    Err(message.clone()),
-                )
-                .await;
-                Err(err)
-            }
-        }
+        )
+        .await
     }
 }
 
-impl CoreToolRuntime for ListMcpResourcesHandler {}
+impl CoreToolRuntime for ListMcpResourcesHandler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        true
+    }
+}

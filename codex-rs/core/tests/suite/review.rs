@@ -84,7 +84,13 @@ async fn review_op_emits_lifecycle_and_review_output() {
         .await
         .unwrap();
 
-    // Item lifecycle events are emitted first, then the legacy review event is fanned out
+    let turn_started = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnStarted(_))).await;
+    let review_turn_id = match turn_started {
+        EventMsg::TurnStarted(event) => event.turn_id,
+        other => panic!("expected TurnStarted(..), got {other:?}"),
+    };
+
+    // Item lifecycle events follow TurnStarted, then the legacy review event is fanned out
     // with the same stable IDs for compatibility consumers.
     let entered_started = wait_for_event(&codex, |ev| {
         matches!(
@@ -94,8 +100,11 @@ async fn review_op_emits_lifecycle_and_review_output() {
         )
     })
     .await;
-    let (review_turn_id, entered_item_id) = match entered_started {
-        EventMsg::ItemStarted(event) => (event.turn_id, event.item.id()),
+    let entered_item_id = match entered_started {
+        EventMsg::ItemStarted(event) => {
+            assert_eq!(event.turn_id, review_turn_id);
+            event.item.id()
+        }
         other => panic!("expected entered review item start, got {other:?}"),
     };
     let entered_completed = wait_for_event(&codex, |ev| {
@@ -122,12 +131,15 @@ async fn review_op_emits_lifecycle_and_review_output() {
         other => panic!("expected EnteredReviewMode(..), got {other:?}"),
     }
 
-    let exited_started = wait_for_event(&codex, |ev| {
-        matches!(
-            ev,
-            EventMsg::ItemStarted(event)
-                if matches!(event.item, TurnItem::ExitedReviewMode(_))
-        )
+    let exited_started = wait_for_event(&codex, |ev| match ev {
+        EventMsg::TurnStarted(event) => {
+            panic!(
+                "review forwarded duplicate TurnStarted for {}",
+                event.turn_id
+            )
+        }
+        EventMsg::ItemStarted(event) if matches!(event.item, TurnItem::ExitedReviewMode(_)) => true,
+        _ => false,
     })
     .await;
     let exited_item_id = match exited_started {
@@ -180,7 +192,11 @@ async fn review_op_emits_lifecycle_and_review_output() {
         overall_confidence_score: 0.8,
     };
     assert_eq!(expected, review);
-    let _complete = wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event(&codex, |ev| match ev {
+        EventMsg::TurnComplete(event) => event.turn_id == review_turn_id,
+        _ => false,
+    })
+    .await;
 
     let path = codex.rollout_path().expect("rollout path");
     let text = std::fs::read_to_string(&path).expect("read rollout file");

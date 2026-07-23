@@ -1,13 +1,22 @@
 use super::*;
 use crate::config::ConfigBuilder;
 use crate::config::ManagedFeatures;
+use crate::session::McpRuntimeSnapshot;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnEnvironment;
 use crate::state::ActiveTurn;
 use crate::test_support::models_manager_with_provider;
+use crate::tools::context::ToolPayload;
+use crate::tools::handlers::McpHandler;
 use crate::tools::hook_names::HookToolName;
+use crate::tools::parallel::ToolCallRuntime;
+use crate::tools::registry::CoreToolRuntime;
+use crate::tools::registry::ToolRegistry;
+use crate::tools::router::ToolCall;
+use crate::tools::router::ToolRouter;
+use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::turn_metadata::McpTurnMetadataContext;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::config_toml::ConfigToml;
@@ -21,6 +30,7 @@ use codex_config::types::McpServerToolConfig;
 use codex_features::Features;
 use codex_hooks::Hooks;
 use codex_hooks::HooksConfig;
+use codex_mcp::ToolInfo;
 use codex_model_provider::create_model_provider;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::protocol::AskForApproval;
@@ -34,6 +44,10 @@ use codex_rollout_trace::ToolDispatchPayload;
 use codex_rollout_trace::ToolDispatchRequester;
 use codex_rollout_trace::replay_bundle;
 use codex_utils_path_uri::PathUri;
+use core_test_support::apps_test_server::AppsTestServer;
+use core_test_support::apps_test_server::AppsTestToolLoading;
+use core_test_support::apps_test_server::CALENDAR_EXTRACT_TEXT_TOOL_NAME;
+use core_test_support::apps_test_server::recorded_apps_tool_calls;
 use core_test_support::hooks::trusted_config_layer_stack;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
@@ -48,12 +62,22 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::tempdir;
+use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing::Level;
 use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_test::internal::MockWriter;
+use wiremock::Mock;
+use wiremock::Request;
+use wiremock::Respond;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::body_partial_json;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
 fn annotations(
     read_only: Option<bool>,
@@ -97,6 +121,184 @@ fn mcp_turn_metadata_context(turn_context: &TurnContext) -> McpTurnMetadataConte
     McpTurnMetadataContext {
         model: turn_context.model_info.slug.as_str(),
         reasoning_effort: turn_context.effective_reasoning_effort(),
+    }
+}
+
+async fn step_context_with_live_apps(
+    turn: &Arc<TurnContext>,
+    apps_base_url: &str,
+) -> (Arc<StepContext>, CancellationToken) {
+    let base_mcp = McpRuntimeSnapshot::new_uninitialized_for_test(turn.config.as_ref());
+    let runtime_context = base_mcp.runtime_context().clone();
+    let cache_home = turn
+        .config
+        .codex_home
+        .join(format!("phase-28-apps-fixture-{}", uuid::Uuid::now_v7()));
+    let (tx_event, _rx_event) = async_channel::unbounded();
+    let startup_cancellation_token = CancellationToken::new();
+    let mcp_servers = HashMap::from([(
+        CODEX_APPS_MCP_SERVER_NAME.to_string(),
+        codex_mcp::EffectiveMcpServer::configured(codex_mcp::codex_apps_mcp_server_config(
+            apps_base_url,
+            /*apps_mcp_product_sku*/ None,
+            Some(&turn.originator),
+        )),
+    )]);
+    let manager = codex_mcp::McpConnectionManager::new(
+        &mcp_servers,
+        turn.config.mcp_oauth_credentials_store_mode,
+        turn.config.auth_keyring_backend_kind(),
+        HashMap::new(),
+        &turn.approval_policy,
+        turn.sub_id.clone(),
+        tx_event,
+        startup_cancellation_token.clone(),
+        turn.permission_profile(),
+        runtime_context.clone(),
+        cache_home.to_path_buf(),
+        codex_mcp::CodexAppsToolsCache::default(),
+        codex_mcp::codex_apps_tools_cache_key(None),
+        turn.config.prefix_mcp_tool_names(),
+        rmcp::model::ElicitationCapability::default(),
+        /*supports_openai_form_elicitation*/ false,
+        codex_mcp::ToolPluginProvenance::default(),
+        /*auth*/ None,
+        /*codex_apps_auth_manager*/ None,
+        /*elicitation_reviewer*/ None,
+        /*elicitation_lifecycle*/ None,
+        codex_mcp::ElicitationRequestRouter::default(),
+    )
+    .await;
+    assert!(
+        manager
+            .wait_for_server_ready(CODEX_APPS_MCP_SERVER_NAME, Duration::from_secs(2))
+            .await,
+        "Codex Apps MCP fixture should become ready"
+    );
+
+    let mcp = Arc::new(McpRuntimeSnapshot::new(
+        Arc::new(base_mcp.config().clone()),
+        base_mcp.plugins_available(),
+        Arc::new(manager),
+        runtime_context,
+        base_mcp.available_environment_ids().to_vec(),
+    ));
+    let step_context = Arc::new(StepContext::new(
+        Arc::clone(turn),
+        turn.environments.clone(),
+        Vec::new(),
+        mcp,
+        /*loaded_agents_md*/ None,
+    ));
+
+    (step_context, startup_cancellation_token)
+}
+
+fn runtime_for_sampled_mcp_tool(
+    session: Arc<Session>,
+    step_context: Arc<StepContext>,
+    tool_info: ToolInfo,
+) -> ToolCallRuntime {
+    let handler = Arc::new(McpHandler::new(tool_info).expect("sampled MCP tool should be valid"))
+        as Arc<dyn CoreToolRuntime>;
+    let router = Arc::new(ToolRouter::from_parts(
+        ToolRegistry::from_tools([handler]),
+        Vec::new(),
+    ));
+    ToolCallRuntime::new(
+        router,
+        session,
+        step_context,
+        Arc::new(Mutex::new(TurnDiffTracker::new())),
+    )
+}
+
+async fn recv_mcp_item_started(
+    rx_event: &async_channel::Receiver<codex_protocol::protocol::Event>,
+    call_id: &str,
+) -> McpToolCallItem {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = rx_event.recv().await.expect("session event channel closed");
+            if let EventMsg::ItemStarted(item_started) = event.msg
+                && let TurnItem::McpToolCall(item) = item_started.item
+                && item.id == call_id
+            {
+                return item;
+            }
+        }
+    })
+    .await
+    .expect("MCP ItemStarted event timed out")
+}
+
+async fn recv_mcp_item_completed(
+    rx_event: &async_channel::Receiver<codex_protocol::protocol::Event>,
+    call_id: &str,
+) -> (McpToolCallItem, usize) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let mut request_user_input_count = 0;
+        loop {
+            let event = rx_event.recv().await.expect("session event channel closed");
+            match event.msg {
+                EventMsg::RequestUserInput(_) => request_user_input_count += 1,
+                EventMsg::ItemCompleted(item_completed) => {
+                    if let TurnItem::McpToolCall(item) = item_completed.item
+                        && item.id == call_id
+                    {
+                        return (item, request_user_input_count);
+                    }
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("MCP ItemCompleted event timed out")
+}
+
+fn drain_terminal_mcp_items(
+    rx_event: &async_channel::Receiver<codex_protocol::protocol::Event>,
+    call_id: &str,
+) -> Vec<McpToolCallItem> {
+    let mut terminal_items = Vec::new();
+    while let Ok(event) = rx_event.try_recv() {
+        if let EventMsg::ItemCompleted(item_completed) = event.msg
+            && let TurnItem::McpToolCall(item) = item_completed.item
+            && item.id == call_id
+        {
+            terminal_items.push(item);
+        }
+    }
+    terminal_items
+}
+
+#[derive(Clone)]
+struct DelayedAppsToolCallResponder {
+    request_started: Arc<Notify>,
+    delay: Duration,
+}
+
+impl Respond for DelayedAppsToolCallResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let body: serde_json::Value = serde_json::from_slice(&request.body)
+            .expect("tools/call request should contain valid JSON");
+        let id = body.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        self.request_started.notify_one();
+
+        ResponseTemplate::new(200)
+            .set_body_json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{
+                        "type": "text",
+                        "text": "delayed MCP result",
+                    }],
+                    "isError": false,
+                },
+            }))
+            .set_delay(self.delay)
     }
 }
 
@@ -345,6 +547,462 @@ fn mcp_app_resource_uri_reads_known_tool_meta_keys() {
         get_mcp_app_resource_uri(output_template.as_object()),
         Some("ui://widget/output-template.html".to_string())
     );
+}
+
+#[tokio::test]
+async fn metadata_derivation_uses_the_supplied_live_tool_info() {
+    let (session, turn_context) = make_session_and_context().await;
+    let manager = session.services.latest_mcp_runtime().manager_arc();
+    let mut tool = rmcp::model::Tool::new_with_raw(
+        "advertised_tool".to_string(),
+        Some("Advertised description".into()),
+        Arc::new(rmcp::model::object(serde_json::json!({
+            "type": "object",
+        }))),
+    );
+    tool.title = Some("Advertised title".to_string());
+    tool.annotations = Some(annotations(Some(true), Some(false), Some(false)));
+    tool.meta = Some(rmcp::model::Meta(
+        serde_json::json!({
+            "ui": {
+                "resourceUri": "ui://snapshot/widget.html",
+            },
+        })
+        .as_object()
+        .expect("tool metadata object")
+        .clone(),
+    ));
+    let tool_info = ToolInfo {
+        server_name: "snapshot_server".to_string(),
+        supports_parallel_tool_calls: false,
+        server_origin: Some("streamable_http".to_string()),
+        callable_name: "advertised_tool".to_string(),
+        callable_namespace: "mcp__snapshot_server".to_string(),
+        namespace_description: Some("Snapshot connector".to_string()),
+        tool,
+        connector_id: Some("snapshot-connector".to_string()),
+        connector_name: Some("Snapshot App".to_string()),
+        plugin_display_names: Vec::new(),
+    };
+
+    let metadata =
+        mcp_tool_metadata_from_tool_info(&session, &turn_context, manager.as_ref(), &tool_info)
+            .await;
+
+    assert_eq!(metadata.connector_id.as_deref(), Some("snapshot-connector"));
+    assert_eq!(metadata.connector_name.as_deref(), Some("Snapshot App"));
+    assert_eq!(metadata.tool_title.as_deref(), Some("Advertised title"));
+    assert_eq!(
+        metadata.tool_description.as_deref(),
+        Some("Advertised description")
+    );
+    assert_eq!(
+        metadata.mcp_app_resource_uri.as_deref(),
+        Some("ui://snapshot/widget.html")
+    );
+    assert_eq!(
+        metadata
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint),
+        Some(true)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancellation_after_mcp_item_started_emits_one_terminal_item() {
+    let server = start_mock_server().await;
+    AppsTestServer::mount(&server)
+        .await
+        .expect("mount Codex Apps MCP fixture");
+    let request_started = Arc::new(Notify::new());
+    Mock::given(method("POST"))
+        .and(path_regex("^/api/codex/apps/?$"))
+        .and(body_partial_json(serde_json::json!({
+            "method": "tools/call",
+            "params": {
+                "name": "calendar_list_events",
+            },
+        })))
+        .respond_with(DelayedAppsToolCallResponder {
+            request_started: Arc::clone(&request_started),
+            delay: Duration::from_secs(1),
+        })
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let (step_context, startup_cancellation_token) =
+        step_context_with_live_apps(&turn_context, &server.uri()).await;
+    let tools = step_context.mcp.manager().list_all_tools().await;
+    let sampled_tool = tools
+        .iter()
+        .find(|tool| tool.tool.name.as_ref() == "calendar_list_events")
+        .cloned()
+        .expect("read-only calendar tool should be listed");
+    step_context.seed_mcp_tools_for_test(tools).await;
+    let tool_name = sampled_tool.canonical_tool_name();
+    let runtime = runtime_for_sampled_mcp_tool(
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        sampled_tool,
+    );
+    let invocation_cancellation_token = CancellationToken::new();
+    let call_id = "phase-28-cancelled-mcp-call";
+    let invocation = tokio::spawn(runtime.handle_tool_call(
+        ToolCall {
+            tool_name,
+            call_id: call_id.to_string(),
+            payload: ToolPayload::Function {
+                arguments: serde_json::json!({ "query": "today" }).to_string(),
+            },
+        },
+        invocation_cancellation_token.clone(),
+    ));
+
+    let started = recv_mcp_item_started(&rx_event, call_id).await;
+    assert_eq!(started.status, McpToolCallStatus::InProgress);
+    tokio::time::timeout(Duration::from_secs(2), request_started.notified())
+        .await
+        .expect("MCP tools/call request should start");
+
+    invocation_cancellation_token.cancel();
+    let response = tokio::time::timeout(Duration::from_millis(750), invocation)
+        .await
+        .expect("outer invocation should return before the delayed server response")
+        .expect("outer invocation task should not panic")
+        .expect("outer invocation should return a model response");
+    let codex_protocol::models::ResponseInputItem::FunctionCallOutput { output, .. } = response
+    else {
+        panic!("MCP cancellation should return a function-call output");
+    };
+    assert_ne!(output.success, Some(true));
+    let codex_protocol::models::FunctionCallOutputBody::Text(message) = output.body else {
+        panic!("MCP cancellation should return text output");
+    };
+    assert!(
+        message.contains("aborted by user"),
+        "unexpected cancellation output: {message}"
+    );
+
+    let (completed, request_user_input_count) = recv_mcp_item_completed(&rx_event, call_id).await;
+    assert_eq!(request_user_input_count, 0);
+    assert_eq!(completed.status, McpToolCallStatus::Failed);
+    assert_eq!(
+        completed.error.as_ref().map(|error| error.message.as_str()),
+        Some(MCP_TOOL_CALL_CANCELLED_MESSAGE)
+    );
+
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(
+        drain_terminal_mcp_items(&rx_event, call_id).is_empty(),
+        "a delayed server response must not emit a second terminal MCP item"
+    );
+    assert_eq!(recorded_apps_tool_calls(&server).await.len(), 1);
+    startup_cancellation_token.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sampled_mcp_tool_missing_from_live_catalog_skips_before_file_upload() {
+    let sampled_server = start_mock_server().await;
+    AppsTestServer::mount(&sampled_server)
+        .await
+        .expect("mount sampled Codex Apps MCP fixture");
+    let live_server = start_mock_server().await;
+    AppsTestServer::mount_without_tools(&live_server)
+        .await
+        .expect("mount empty live Codex Apps MCP fixture");
+
+    let (mut session, mut turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let auth_manager = codex_login::AuthManager::from_auth_for_testing(
+        codex_login::CodexAuth::create_dummy_chatgpt_auth_for_testing(),
+    );
+    Arc::get_mut(&mut session)
+        .expect("test session should be uniquely owned")
+        .services
+        .auth_manager = Arc::clone(&auth_manager);
+    let turn = Arc::get_mut(&mut turn_context).expect("test turn should be uniquely owned");
+    turn.auth_manager = Some(auth_manager);
+    Arc::make_mut(&mut turn.config).chatgpt_base_url = live_server.uri();
+    let upload_dir = tempdir().expect("create sampled file input directory");
+    let upload_dir_path = codex_utils_absolute_path::AbsolutePathBuf::try_from(upload_dir.path())
+        .expect("sampled file input directory should be absolute");
+    let primary_environment = turn.environments.turn_environments[0].clone();
+    turn.environments.turn_environments[0] = TurnEnvironment::new(
+        primary_environment.environment_id,
+        primary_environment.environment,
+        PathUri::from_abs_path(&upload_dir_path),
+        primary_environment.shell,
+    );
+    let upload_candidate = upload_dir_path.join("phase-28-missing-live-tool.txt");
+    std::fs::write(&upload_candidate, b"must not be uploaded")
+        .expect("write sampled file input fixture");
+    let (sampled_step_context, sampled_startup_token) =
+        step_context_with_live_apps(&turn_context, &sampled_server.uri()).await;
+    let mut sampled_tool = sampled_step_context
+        .mcp
+        .manager()
+        .list_all_tools()
+        .await
+        .into_iter()
+        .find(|tool| tool.tool.name.as_ref() == CALENDAR_EXTRACT_TEXT_TOOL_NAME)
+        .expect("sampled file-input tool should be listed");
+    assert_eq!(
+        codex_mcp::declared_openai_file_input_param_names(sampled_tool.tool.meta.as_deref()),
+        vec!["file".to_string()]
+    );
+    sampled_tool.tool.annotations = Some(annotations(Some(true), Some(false), Some(false)));
+
+    let (live_step_context, live_startup_token) =
+        step_context_with_live_apps(&turn_context, &live_server.uri()).await;
+    assert!(
+        live_step_context
+            .mcp
+            .manager()
+            .list_all_tools()
+            .await
+            .is_empty(),
+        "live manager should not contain the sampled tool"
+    );
+    live_step_context
+        .seed_mcp_tools_for_test(vec![sampled_tool.clone()])
+        .await;
+
+    let tool_name = sampled_tool.canonical_tool_name();
+    let runtime = runtime_for_sampled_mcp_tool(
+        Arc::clone(&session),
+        Arc::clone(&live_step_context),
+        sampled_tool,
+    );
+    let call_id = "phase-28-missing-live-tool";
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.handle_tool_call(
+            ToolCall {
+                tool_name,
+                call_id: call_id.to_string(),
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "file": "phase-28-missing-live-tool.txt",
+                    })
+                    .to_string(),
+                },
+            },
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("missing live tool should fail without waiting for approval")
+    .expect("missing live tool should return a model response");
+
+    let started = recv_mcp_item_started(&rx_event, call_id).await;
+    assert_eq!(started.status, McpToolCallStatus::InProgress);
+    let (completed, request_user_input_count) = recv_mcp_item_completed(&rx_event, call_id).await;
+    assert_eq!(request_user_input_count, 0);
+    assert_eq!(completed.status, McpToolCallStatus::Failed);
+    let error = completed
+        .error
+        .expect("missing live tool should report an error");
+    assert!(
+        error.message.contains("no longer available"),
+        "unexpected missing-tool error: {}",
+        error.message
+    );
+    assert!(recorded_apps_tool_calls(&live_server).await.is_empty());
+    let live_requests = live_server
+        .received_requests()
+        .await
+        .expect("live Apps server should record requests");
+    assert!(
+        live_requests
+            .iter()
+            .all(|request| !request.url.path().starts_with("/backend-api/files")),
+        "availability rejection must run before the file-upload flow"
+    );
+    assert!(drain_terminal_mcp_items(&rx_event, call_id).is_empty());
+    sampled_startup_token.cancel();
+    live_startup_token.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_tool_call_authorizes_and_reports_from_live_tool_metadata() {
+    let server = start_mock_server().await;
+    AppsTestServer::mount(&server)
+        .await
+        .expect("mount Codex Apps MCP fixture");
+
+    let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let (step_context, startup_cancellation_token) =
+        step_context_with_live_apps(&turn_context, &server.uri()).await;
+    let live_tools = step_context.mcp.manager().list_all_tools().await;
+    let live_tool = live_tools
+        .iter()
+        .find(|tool| tool.tool.name.as_ref() == "calendar_list_events")
+        .cloned()
+        .expect("read-only calendar tool should be listed");
+    assert_eq!(live_tool.connector_id.as_deref(), Some("calendar"));
+    assert_eq!(live_tool.connector_name.as_deref(), Some("Calendar"));
+    assert_eq!(
+        live_tool
+            .tool
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint),
+        Some(true)
+    );
+
+    let mut sampled_tool = live_tool.clone();
+    sampled_tool.connector_id = Some("stale-connector".to_string());
+    sampled_tool.connector_name = Some("Stale Connector".to_string());
+    sampled_tool.tool.annotations = Some(annotations(Some(false), Some(true), Some(true)));
+    let mut sampled_meta = sampled_tool
+        .tool
+        .meta
+        .as_deref()
+        .cloned()
+        .unwrap_or_default();
+    sampled_meta.insert("openai/fileParams".to_string(), serde_json::json!(["file"]));
+    sampled_tool.tool.meta = Some(rmcp::model::Meta(sampled_meta));
+    step_context.seed_mcp_tools_for_test(live_tools).await;
+
+    let tool_name = sampled_tool.canonical_tool_name();
+    let runtime = runtime_for_sampled_mcp_tool(
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        sampled_tool,
+    );
+    let call_id = "phase-28-live-metadata";
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.handle_tool_call(
+            ToolCall {
+                tool_name,
+                call_id: call_id.to_string(),
+                payload: ToolPayload::Function {
+                    arguments: serde_json::json!({
+                        "query": "today",
+                        "file": "must-not-upload.txt",
+                    })
+                    .to_string(),
+                },
+            },
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("live read-only metadata should avoid a stale approval wait")
+    .expect("live MCP tool call should return a model response");
+
+    let started = recv_mcp_item_started(&rx_event, call_id).await;
+    assert_eq!(started.connector_id.as_deref(), Some("calendar"));
+    assert_eq!(started.app_name.as_deref(), Some("Calendar"));
+    let (completed, request_user_input_count) = recv_mcp_item_completed(&rx_event, call_id).await;
+    assert_eq!(request_user_input_count, 0);
+    assert_eq!(completed.status, McpToolCallStatus::Completed);
+    assert_eq!(completed.connector_id.as_deref(), Some("calendar"));
+    assert_eq!(completed.app_name.as_deref(), Some("Calendar"));
+
+    let calls = recorded_apps_tool_calls(&server).await;
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0]
+            .pointer("/params/arguments/file")
+            .and_then(serde_json::Value::as_str),
+        Some("must-not-upload.txt")
+    );
+    let requests = server
+        .received_requests()
+        .await
+        .expect("Apps server should record requests");
+    assert!(
+        requests
+            .iter()
+            .all(|request| !request.url.path().starts_with("/backend-api/files")),
+        "live file-input metadata must control whether uploads run"
+    );
+    startup_cancellation_token.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sampled_mcp_tool_newly_hidden_from_model_skips_before_approval_or_execution() {
+    let server = start_mock_server().await;
+    AppsTestServer::mount_with_app_only_tool(&server, AppsTestToolLoading::Direct)
+        .await
+        .expect("mount app-only Codex Apps MCP fixture");
+
+    let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
+    let (step_context, startup_cancellation_token) =
+        step_context_with_live_apps(&turn_context, &server.uri()).await;
+    let live_tools = step_context.mcp.manager().list_all_tools().await;
+    let live_tool = live_tools
+        .iter()
+        .find(|tool| tool.tool.name.as_ref() == "calendar_app_only_action")
+        .cloned()
+        .expect("app-only calendar tool should be listed by the live manager");
+    assert!(!codex_mcp::tool_is_model_visible(&live_tool));
+
+    let mut sampled_tool = live_tool;
+    let mut sampled_meta = sampled_tool
+        .tool
+        .meta
+        .as_deref()
+        .cloned()
+        .unwrap_or_default();
+    sampled_meta.insert(
+        "ui".to_string(),
+        serde_json::json!({ "visibility": ["model"] }),
+    );
+    sampled_tool.tool.meta = Some(rmcp::model::Meta(sampled_meta));
+    sampled_tool.tool.annotations = Some(annotations(Some(false), Some(true), Some(true)));
+    assert!(codex_mcp::tool_is_model_visible(&sampled_tool));
+    assert!(requires_mcp_tool_approval(
+        sampled_tool.tool.annotations.as_ref()
+    ));
+    step_context
+        .seed_mcp_tools_for_test(vec![sampled_tool.clone()])
+        .await;
+
+    let tool_name = sampled_tool.canonical_tool_name();
+    let runtime = runtime_for_sampled_mcp_tool(
+        Arc::clone(&session),
+        Arc::clone(&step_context),
+        sampled_tool,
+    );
+    let call_id = "phase-28-newly-hidden-live-tool";
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        runtime.handle_tool_call(
+            ToolCall {
+                tool_name,
+                call_id: call_id.to_string(),
+                payload: ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+            },
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("newly hidden live tool should fail without waiting for approval")
+    .expect("newly hidden live tool should return a model response");
+
+    let started = recv_mcp_item_started(&rx_event, call_id).await;
+    assert_eq!(started.status, McpToolCallStatus::InProgress);
+    let (completed, request_user_input_count) = recv_mcp_item_completed(&rx_event, call_id).await;
+    assert_eq!(request_user_input_count, 0);
+    assert_eq!(completed.status, McpToolCallStatus::Failed);
+    let error = completed
+        .error
+        .expect("newly hidden live tool should report an error");
+    assert!(
+        error.message.contains("no longer available"),
+        "unexpected hidden-tool error: {}",
+        error.message
+    );
+    assert!(recorded_apps_tool_calls(&server).await.is_empty());
+    assert!(drain_terminal_mcp_items(&rx_event, call_id).is_empty());
+    startup_cancellation_token.cancel();
 }
 
 #[test]

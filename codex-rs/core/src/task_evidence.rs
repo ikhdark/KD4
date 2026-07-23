@@ -1,5 +1,3 @@
-use chrono::DateTime;
-use chrono::Duration as ChronoDuration;
 use chrono::Utc;
 use codex_git_utils::collect_git_info;
 use codex_protocol::ThreadId;
@@ -14,7 +12,6 @@ use serde::Serialize;
 use serde_json::Value;
 use sha1::Digest;
 use sha1::Sha1;
-use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io;
@@ -32,27 +29,12 @@ const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 const MAX_COMMAND_RECEIPTS: usize = 256;
 const MAX_EDIT_RECEIPTS: usize = 256;
 const MAX_VALIDATION_RECEIPTS: usize = 64;
-const WIRING_GUARD_PLUGIN_VERSION: &str = "0.1.16";
-const WIRING_GUARD_LEDGER_SCHEMA_VERSION: &str = "1.3.0";
-const WIRING_GUARD_REPORT_SCHEMA_VERSION: &str = "1.5.0";
-const WIRING_GUARD_PROOF_GRAPH_SCHEMA_VERSION: &str = "1.0.0";
-const WIRING_GUARD_EDITOR_SCHEMA_VERSION: &str = "1.0.0";
-
 pub(crate) struct TaskEvidenceLedger {
     evidence_path: Option<PathBuf>,
     repo_root: Option<PathBuf>,
-    trusted_wiring_guard_root: Option<PathBuf>,
     document: Mutex<Option<TaskEvidenceDocument>>,
     persistence_gate: Semaphore,
     last_persisted_revision: AtomicU64,
-    wiring_ledger_starts: Mutex<BTreeMap<String, WiringLedgerFingerprint>>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct WiringLedgerFingerprint {
-    entry_count: usize,
-    last_entry_sha1: Option<String>,
-    trusted_launcher: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +76,6 @@ struct TaskEvidenceDocument {
     risks: Vec<EvidenceRisk>,
     verify_plan_epoch: Option<u64>,
     validation_epoch: Option<u64>,
-    wiring_receipt: Option<EpochReceipt>,
     desktop_activation_receipt: Option<DesktopActivationReceipt>,
     #[serde(default)]
     automatic_plan_attempt_epoch: Option<u64>,
@@ -226,26 +207,6 @@ struct EvidenceRisk {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct EpochReceipt {
-    receipt_id: String,
-    epoch: u64,
-    recorded_at: String,
-    #[serde(default)]
-    wiring_proof: Option<WiringProof>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WiringProof {
-    schema_id: String,
-    schema_version: String,
-    report_schema_version: String,
-    timestamp: String,
-    diff_hash: String,
-    checked_changed_files: Vec<String>,
-    proof_graph_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 struct DesktopActivationReceipt {
     epoch: u64,
     recorded_at: String,
@@ -262,7 +223,6 @@ impl TaskEvidenceLedger {
         let evidence_path = codex_home
             .join("task-evidence")
             .join(format!("{thread_id}.json"));
-        let trusted_wiring_guard_root = find_trusted_wiring_guard_root(&codex_home);
         let now = timestamp();
         let thread_id_text = thread_id.to_string();
         let repository_root = repo_root.to_string_lossy().into_owned();
@@ -335,7 +295,6 @@ impl TaskEvidenceLedger {
                     .unwrap_or_default(),
                 verify_plan_epoch: None,
                 validation_epoch: None,
-                wiring_receipt: None,
                 desktop_activation_receipt: None,
                 automatic_plan_attempt_epoch: None,
                 repair_turns_used: 0,
@@ -349,11 +308,9 @@ impl TaskEvidenceLedger {
         let ledger = Self {
             evidence_path: writable_evidence_path,
             repo_root: Some(repo_root),
-            trusted_wiring_guard_root,
             document: Mutex::new(Some(document.clone())),
             persistence_gate: Semaphore::new(1),
             last_persisted_revision: AtomicU64::new(0),
-            wiring_ledger_starts: Mutex::new(BTreeMap::new()),
         };
         if storage_failure_reason.is_none() {
             let _ = ledger.persist_document(&document).await;
@@ -365,12 +322,23 @@ impl TaskEvidenceLedger {
         Self {
             evidence_path: None,
             repo_root: None,
-            trusted_wiring_guard_root: None,
             document: Mutex::new(None),
             persistence_gate: Semaphore::new(1),
             last_persisted_revision: AtomicU64::new(0),
-            wiring_ledger_starts: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub(crate) fn matches_repo_root(&self, candidate: &Path) -> bool {
+        let Some(repo_root) = self.repo_root.as_ref() else {
+            return false;
+        };
+        let Ok(repo_root) = std::fs::canonicalize(repo_root) else {
+            return false;
+        };
+        let Ok(candidate) = std::fs::canonicalize(candidate) else {
+            return false;
+        };
+        repo_root == candidate
     }
 
     pub(crate) async fn begin_verify_local_validation(
@@ -649,32 +617,9 @@ impl TaskEvidenceLedger {
         self.persist_document(&snapshot).await;
     }
 
-    pub(crate) async fn record_command_intent(&self, call_id: &str, command: &[String]) {
-        let Some(repo_root) = self.repo_root.as_ref() else {
-            return;
-        };
-        let Some(trusted_launcher) = trusted_wiring_guard_check_invocation(
-            command,
-            self.trusted_wiring_guard_root.as_deref(),
-        ) else {
-            self.wiring_ledger_starts.lock().await.remove(call_id);
-            return;
-        };
-        let Some(mut fingerprint) = wiring_ledger_fingerprint(repo_root).await else {
-            self.wiring_ledger_starts.lock().await.remove(call_id);
-            return;
-        };
-        fingerprint.trusted_launcher = Some(trusted_launcher);
-        self.wiring_ledger_starts
-            .lock()
-            .await
-            .insert(call_id.to_string(), fingerprint);
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_command(
         &self,
-        call_id: &str,
         command: &[String],
         cwd: &PathUri,
         exit_code: i32,
@@ -682,28 +627,10 @@ impl TaskEvidenceLedger {
         duration_ms: u64,
         possible_mutation: bool,
     ) {
-        let Some(repo_root) = self.repo_root.as_ref() else {
+        if self.repo_root.is_none() {
             return;
-        };
-        let wiring_ledger_start = self.wiring_ledger_starts.lock().await.remove(call_id);
+        }
         let command_succeeded = exit_code == 0 && !timed_out;
-        let trusted_launcher = trusted_wiring_guard_check_invocation(
-            command,
-            self.trusted_wiring_guard_root.as_deref(),
-        );
-        let wiring_proof = if command_succeeded {
-            if let Some(before) = wiring_ledger_start.as_ref() {
-                if before.trusted_launcher.as_ref() == trusted_launcher.as_ref() {
-                    read_fresh_wiring_proof(repo_root, duration_ms, before).await
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         let Some((_, snapshot)) = self
             .update_document(|document| {
                 if possible_mutation {
@@ -750,15 +677,6 @@ impl TaskEvidenceLedger {
                     possible_mutation,
                 });
                 trim_to_last(&mut document.command_receipts, MAX_COMMAND_RECEIPTS);
-                if let Some(wiring_proof) = wiring_proof {
-                    document.wiring_receipt = Some(EpochReceipt {
-                        receipt_id,
-                        epoch: document.evidence_epoch,
-                        recorded_at: timestamp(),
-                        wiring_proof: Some(wiring_proof),
-                    });
-                    promote_steps_with_fresh_evidence(document);
-                }
                 document.updated_at = timestamp();
                 document.completion = None;
             })
@@ -1387,7 +1305,7 @@ fn migrate_document(document: &mut TaskEvidenceDocument) {
         let id = next_receipt_id("edit", &mut document.next_edit_receipt_sequence);
         document.edit_receipts[index].id = id;
     }
-    let (duplicate_command_indices, duplicate_command_ids) = duplicate_receipt_indices(
+    let (duplicate_command_indices, _) = duplicate_receipt_indices(
         document
             .command_receipts
             .iter()
@@ -1397,13 +1315,6 @@ fn migrate_document(document: &mut TaskEvidenceDocument) {
     for index in duplicate_command_indices {
         let id = next_receipt_id("command", &mut document.next_command_receipt_sequence);
         document.command_receipts[index].id = id;
-    }
-    if document
-        .wiring_receipt
-        .as_ref()
-        .is_some_and(|receipt| duplicate_command_ids.contains(&receipt.receipt_id))
-    {
-        document.wiring_receipt = None;
     }
     let (duplicate_validation_indices, duplicate_validation_ids) = duplicate_receipt_indices(
         document
@@ -1840,17 +1751,6 @@ fn step_has_fresh_evidence(document: &TaskEvidenceDocument, index: usize) -> boo
     }) {
         return false;
     }
-    if step_requires_wiring(step) {
-        let Some(receipt) = document.wiring_receipt.as_ref() else {
-            return false;
-        };
-        let Some(proof) = receipt.wiring_proof.as_ref() else {
-            return false;
-        };
-        if receipt.epoch != document.evidence_epoch || !wiring_proof_covers_step(proof, step) {
-            return false;
-        }
-    }
     if step.requires_desktop_activation
         && document
             .desktop_activation_receipt
@@ -1998,21 +1898,6 @@ fn derive_completion_gate(
     if document.validation_epoch != Some(document.evidence_epoch) {
         partial.push("proof-bearing verify_local validation is missing or stale".to_string());
     }
-    if document.plan.iter().any(|step| {
-        step_requires_wiring(step)
-            && document.wiring_receipt.as_ref().is_none_or(|receipt| {
-                receipt.epoch != document.evidence_epoch
-                    || receipt
-                        .wiring_proof
-                        .as_ref()
-                        .is_none_or(|proof| !wiring_proof_covers_step(proof, step))
-            })
-    }) {
-        partial.push(
-            "structured static wiring proof is missing, stale, or out of scope for changed code"
-                .to_string(),
-        );
-    }
     if document
         .plan
         .iter()
@@ -2093,7 +1978,6 @@ fn invalidate_evidence(
     }
     document.verify_plan_epoch = None;
     document.validation_epoch = None;
-    document.wiring_receipt = None;
     document.desktop_activation_receipt = None;
     document.automatic_plan_attempt_epoch = None;
     if reset_repair_budget {
@@ -2122,591 +2006,6 @@ fn task_is_tracked(document: &TaskEvidenceDocument) -> bool {
             .risks
             .iter()
             .any(|risk| risk.source == "task_evidence_storage" && !risk.resolved)
-}
-
-fn step_requires_wiring(step: &EvidencePlanStep) -> bool {
-    step.edit_paths.iter().any(|path| is_code_path(path))
-        || step.runtime_paths.iter().any(|path| is_code_path(path))
-}
-
-fn is_code_path(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "rs" | "py"
-                    | "js"
-                    | "jsx"
-                    | "ts"
-                    | "tsx"
-                    | "go"
-                    | "java"
-                    | "kt"
-                    | "c"
-                    | "cc"
-                    | "cpp"
-                    | "h"
-                    | "hpp"
-                    | "cs"
-                    | "rb"
-                    | "swift"
-            )
-        })
-}
-
-fn find_trusted_wiring_guard_root(codex_home: &Path) -> Option<PathBuf> {
-    let relative_root = Path::new("plugins")
-        .join("cache")
-        .join("local-wiring-guards")
-        .join("wiring-guard")
-        .join(WIRING_GUARD_PLUGIN_VERSION);
-    let mut candidates = vec![codex_home.join(&relative_root)];
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(parent) = executable.parent()
-    {
-        candidates.push(parent.join(relative_root));
-    }
-    candidates
-        .into_iter()
-        .find_map(|candidate| validate_trusted_wiring_guard_root(&candidate))
-}
-
-fn validate_trusted_wiring_guard_root(candidate: &Path) -> Option<PathBuf> {
-    let canonical = std::fs::canonicalize(candidate).ok()?;
-    let manifest = serde_json::from_slice::<Value>(
-        &std::fs::read(canonical.join("bundle-manifest.json")).ok()?,
-    )
-    .ok()?;
-    if manifest.get("schema_id")?.as_str()? != "wiring-guard/bundle-manifest"
-        || manifest.get("schema_version")?.as_str()? != "1.0.0"
-        || manifest.pointer("/plugin/name")?.as_str()? != "wiring-guard"
-        || manifest.pointer("/plugin/version")?.as_str()? != WIRING_GUARD_PLUGIN_VERSION
-    {
-        return None;
-    }
-    let ledger_schema = serde_json::from_slice::<Value>(
-        &std::fs::read(canonical.join("schemas").join("ledger.schema.json")).ok()?,
-    )
-    .ok()?;
-    if ledger_schema
-        .pointer("/$defs/entry/properties/schema_version/const")?
-        .as_str()?
-        != WIRING_GUARD_LEDGER_SCHEMA_VERSION
-        || ledger_schema
-            .pointer("/$defs/entry/properties/report_schema_version/const")?
-            .as_str()?
-            != WIRING_GUARD_REPORT_SCHEMA_VERSION
-    {
-        return None;
-    }
-    Some(canonical)
-}
-
-fn trusted_wiring_guard_check_invocation(
-    command: &[String],
-    trusted_root: Option<&Path>,
-) -> Option<PathBuf> {
-    let trusted_root = trusted_root?;
-    if command
-        .iter()
-        .any(|argument| argument.contains('\r') || argument.contains('\n'))
-    {
-        return None;
-    }
-    let words = command
-        .iter()
-        .flat_map(|argument| argument.split_whitespace())
-        .map(|word| {
-            word.trim_matches(|character| matches!(character, '\'' | '"'))
-                .to_string()
-        })
-        .filter(|word| !word.is_empty())
-        .collect::<Vec<_>>();
-    let executable_index = words.iter().position(|word| {
-        let name = word.rsplit(['/', '\\']).next().unwrap_or(word);
-        matches!(
-            name.to_ascii_lowercase().as_str(),
-            "wiring_guard.py" | "wiring_guard.cmd" | "wiring_guard.sh"
-        )
-    })?;
-    if words.iter().enumerate().any(|(index, word)| {
-        if word == "&" {
-            return index + 1 != executable_index;
-        }
-        word.chars()
-            .any(|character| matches!(character, '&' | ';' | '|' | '>' | '<' | '`'))
-            || word.contains("$(")
-    }) {
-        return None;
-    }
-    if !wiring_guard_prefix_executes(&words[..executable_index]) {
-        return None;
-    }
-    let launcher =
-        validate_trusted_wiring_guard_launcher(Path::new(&words[executable_index]), trusted_root)?;
-    let arguments = &words[executable_index + 1..];
-    let check_index = arguments
-        .iter()
-        .position(|word| word.eq_ignore_ascii_case("check"))?;
-    arguments[check_index + 1..]
-        .iter()
-        .any(|word| word.eq_ignore_ascii_case("--ledger"))
-        .then_some(launcher)
-}
-
-fn validate_trusted_wiring_guard_launcher(path: &Path, trusted_root: &Path) -> Option<PathBuf> {
-    if !path.is_absolute() {
-        return None;
-    }
-    let canonical = std::fs::canonicalize(path).ok()?;
-    if canonical.parent()? != trusted_root.join("runtime") {
-        return None;
-    }
-    let file_name = canonical.file_name()?.to_str()?;
-    if !matches!(
-        file_name.to_ascii_lowercase().as_str(),
-        "wiring_guard.py" | "wiring_guard.cmd" | "wiring_guard.sh"
-    ) {
-        return None;
-    }
-    let relative_path = format!("runtime/{}", file_name.replace('\\', "/"));
-    let manifest = serde_json::from_slice::<Value>(
-        &std::fs::read(trusted_root.join("bundle-manifest.json")).ok()?,
-    )
-    .ok()?;
-    let metadata = std::fs::metadata(&canonical).ok()?;
-    let declared = manifest
-        .get("files")?
-        .as_array()?
-        .iter()
-        .find(|entry| entry.get("path").and_then(Value::as_str) == Some(&relative_path))?;
-    let digest = declared.get("sha256")?.as_str()?;
-    let launcher_bytes = std::fs::read(&canonical).ok()?;
-    if declared.get("size")?.as_u64()? != metadata.len()
-        || digest.len() != 64
-        || !digest
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || sha256_hex(&launcher_bytes) != digest
-    {
-        return None;
-    }
-    Some(canonical)
-}
-
-fn wiring_guard_prefix_executes(prefix: &[String]) -> bool {
-    if prefix.is_empty() {
-        return true;
-    }
-    prefix.iter().all(|word| {
-        let normalized = word.to_ascii_lowercase();
-        let name = normalized.rsplit(['/', '\\']).next().unwrap_or(&normalized);
-        matches!(
-            name,
-            "python"
-                | "python.exe"
-                | "python3"
-                | "python3.exe"
-                | "py"
-                | "py.exe"
-                | "bash"
-                | "bash.exe"
-                | "sh"
-                | "sh.exe"
-                | "pwsh"
-                | "pwsh.exe"
-                | "powershell"
-                | "powershell.exe"
-                | "cmd"
-                | "cmd.exe"
-                | "env"
-                | "call"
-                | "-c"
-                | "/c"
-                | "--command"
-                | "-command"
-                | "-noprofile"
-                | "-noninteractive"
-                | "-executionpolicy"
-                | "bypass"
-                | "-u"
-                | "--"
-                | "&"
-        )
-    })
-}
-
-async fn wiring_ledger_fingerprint(repo_root: &Path) -> Option<WiringLedgerFingerprint> {
-    let ledger_path = wiring_guard_ledger_path(repo_root).await?;
-    let bytes = match tokio::fs::read(ledger_path).await {
-        Ok(bytes) => bytes,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return Some(WiringLedgerFingerprint::default());
-        }
-        Err(_) => return None,
-    };
-    let entries = serde_json::from_slice::<Vec<Value>>(&bytes).ok()?;
-    fingerprint_wiring_entries(&entries)
-}
-
-fn fingerprint_wiring_entries(entries: &[Value]) -> Option<WiringLedgerFingerprint> {
-    let last_entry_sha1 = entries
-        .last()
-        .map(serde_json::to_vec)
-        .transpose()
-        .ok()?
-        .map(|bytes| sha1_hex(&bytes));
-    Some(WiringLedgerFingerprint {
-        entry_count: entries.len(),
-        last_entry_sha1,
-        trusted_launcher: None,
-    })
-}
-
-async fn read_fresh_wiring_proof(
-    repo_root: &Path,
-    duration_ms: u64,
-    before: &WiringLedgerFingerprint,
-) -> Option<WiringProof> {
-    let ledger_path = wiring_guard_ledger_path(repo_root).await?;
-    let bytes = tokio::fs::read(ledger_path).await.ok()?;
-    let entries = serde_json::from_slice::<Vec<Value>>(&bytes).ok()?;
-    let after = fingerprint_wiring_entries(&entries)?;
-    if after.entry_count <= before.entry_count || after.last_entry_sha1 == before.last_entry_sha1 {
-        return None;
-    }
-    let entry = entries.last()?.as_object()?;
-    let schema_id = entry.get("schema_id")?.as_str()?;
-    let schema_version = entry.get("schema_version")?.as_str()?;
-    let report_schema_version = entry.get("report_schema_version")?.as_str()?;
-    let timestamp = entry.get("timestamp")?.as_str()?;
-    let diff_hash = entry.get("diff_hash")?.as_str()?;
-    if schema_id != "wiring-guard/ledger-entry"
-        || schema_version != WIRING_GUARD_LEDGER_SCHEMA_VERSION
-        || report_schema_version != WIRING_GUARD_REPORT_SCHEMA_VERSION
-        || entry.get("verdict")?.as_str()? != "WIRED"
-        || !is_lower_hex_id(diff_hash, 64, "")
-        || !matches!(entry.get("mode")?.as_str()?, "summary" | "full")
-        || !valid_wiring_findings(entry.get("findings")?)
-        || !json_object_array(entry.get("normalized_findings")?)?.is_empty()
-        || !valid_runtime_evidence(entry.get("runtime_evidence")?)
-        || !entry.get("finding_policy")?.is_object()
-        || !valid_suggested_fixes(entry.get("suggested_fixes")?)
-    {
-        return None;
-    }
-    let changed_files = json_string_array(entry.get("changed_files")?)?;
-    let checked_changed_files = json_string_array(entry.get("checked_changed_files")?)?;
-    if checked_changed_files.is_empty()
-        || checked_changed_files
-            .iter()
-            .any(|checked| !changed_files.contains(checked))
-    {
-        return None;
-    }
-    let proof_graph = entry.get("proof_graph")?.as_object()?;
-    let proof_graph_id = proof_graph.get("graph_id")?.as_str()?;
-    if proof_graph.get("schema_id")?.as_str()? != "wiring-guard/proof-graph"
-        || proof_graph.get("schema_version")?.as_str()? != WIRING_GUARD_PROOF_GRAPH_SCHEMA_VERSION
-        || !is_lower_hex_id(proof_graph_id, 24, "PG-")
-        || json_object_array(proof_graph.get("nodes")?)?.is_empty()
-        || json_object_array(proof_graph.get("edges")?).is_none()
-        || !valid_wiring_traces(proof_graph.get("traces")?)
-        || proof_graph
-            .get("summary")?
-            .as_object()?
-            .get("open_findings")?
-            .as_u64()?
-            != 0
-        || proof_graph
-            .get("verdict")
-            .and_then(Value::as_str)
-            .is_some_and(|verdict| verdict != "WIRED")
-    {
-        return None;
-    }
-    let editor = entry.get("editor")?.as_object()?;
-    if editor.get("schema_id")?.as_str()? != "wiring-guard/editor"
-        || editor.get("schema_version")?.as_str()? != WIRING_GUARD_EDITOR_SCHEMA_VERSION
-        || editor.get("graph_id")?.as_str()? != proof_graph_id
-        || json_object_array(editor.get("diagnostics")?).is_none()
-        || json_object_array(editor.get("code_lenses")?).is_none()
-    {
-        return None;
-    }
-    let recorded_at = DateTime::parse_from_rfc3339(timestamp)
-        .ok()?
-        .with_timezone(&Utc);
-    let now = Utc::now();
-    let bounded_duration_ms = duration_ms.min(24 * 60 * 60 * 1_000);
-    let earliest = now
-        - ChronoDuration::milliseconds(i64::try_from(bounded_duration_ms).ok()?)
-        - ChronoDuration::seconds(2);
-    if recorded_at < earliest || recorded_at > now + ChronoDuration::seconds(2) {
-        return None;
-    }
-    Some(WiringProof {
-        schema_id: schema_id.to_string(),
-        schema_version: schema_version.to_string(),
-        report_schema_version: report_schema_version.to_string(),
-        timestamp: timestamp.to_string(),
-        diff_hash: diff_hash.to_string(),
-        checked_changed_files: checked_changed_files
-            .into_iter()
-            .map(|path| normalize_slashes(&path))
-            .collect(),
-        proof_graph_id: proof_graph_id.to_string(),
-    })
-}
-
-fn json_object_array(value: &Value) -> Option<&Vec<Value>> {
-    let values = value.as_array()?;
-    values.iter().all(Value::is_object).then_some(values)
-}
-
-fn is_lower_hex_id(value: &str, hex_length: usize, prefix: &str) -> bool {
-    value.len() == prefix.len() + hex_length
-        && value.starts_with(prefix)
-        && value[prefix.len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
-
-fn valid_wiring_traces(value: &Value) -> bool {
-    value.as_array().is_some_and(|traces| {
-        traces.iter().all(|trace| {
-            let Some(trace) = trace.as_object() else {
-                return false;
-            };
-            trace
-                .get("finding_id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| is_lower_hex_id(id, 16, "WG-"))
-                && trace
-                    .get("locations")
-                    .and_then(Value::as_array)
-                    .is_some_and(|locations| {
-                        locations.iter().all(|location| {
-                            let Some(location) = location.as_object() else {
-                                return false;
-                            };
-                            location
-                                .get("file")
-                                .and_then(Value::as_str)
-                                .is_some_and(|path| !path.is_empty())
-                                && location
-                                    .get("line")
-                                    .and_then(Value::as_u64)
-                                    .is_some_and(|line| line > 0)
-                        })
-                    })
-        })
-    })
-}
-
-fn valid_wiring_findings(value: &Value) -> bool {
-    let Some(findings) = value.as_object() else {
-        return false;
-    };
-    let connected = |name: &str| {
-        findings
-            .get(name)
-            .and_then(json_object_array)
-            .is_some_and(|entries| {
-                entries
-                    .iter()
-                    .all(|entry| entry.get("status").and_then(Value::as_str) == Some("connected"))
-            })
-    };
-    connected("must_reach")
-        && connected("runtime_contracts")
-        && [
-            "deleted_callers",
-            "orphans",
-            "stubs",
-            "bad_code",
-            "stale_arms",
-            "inconclusive",
-        ]
-        .iter()
-        .all(|name| {
-            findings
-                .get(*name)
-                .and_then(json_object_array)
-                .is_some_and(std::vec::Vec::is_empty)
-        })
-        && findings
-            .get("replaces")
-            .and_then(json_object_array)
-            .is_some()
-}
-
-fn valid_runtime_evidence(value: &Value) -> bool {
-    value.as_array().is_some_and(|entries| {
-        entries.iter().all(|entry| {
-            let Some(entry) = entry.as_object() else {
-                return false;
-            };
-            entry.get("schema_version").and_then(Value::as_str) == Some("1.0.0")
-                && entry
-                    .get("evidence_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| is_lower_hex_id(id, 24, "runtime-evidence-"))
-                && entry
-                    .get("provider_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty())
-                && entry
-                    .get("provider_version")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty())
-                && entry
-                    .get("tool_version")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty())
-                && entry.get("contract_id").is_some_and(json_string_or_null)
-                && entry
-                    .get("diff_hash")
-                    .and_then(Value::as_str)
-                    .is_some_and(|hash| is_lower_hex_id(hash, 64, ""))
-                && entry
-                    .get("command")
-                    .and_then(Value::as_array)
-                    .is_some_and(|command| {
-                        !command.is_empty() && command.iter().all(Value::is_string)
-                    })
-                && entry.get("working_directory").is_some_and(Value::is_string)
-                && entry
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .is_some_and(|status| {
-                        matches!(status, "connected" | "missing" | "inconclusive" | "error")
-                    })
-                && entry
-                    .get("timestamp")
-                    .and_then(Value::as_str)
-                    .is_some_and(|timestamp| DateTime::parse_from_rfc3339(timestamp).is_ok())
-                && entry
-                    .get("duration_ms")
-                    .and_then(Value::as_f64)
-                    .is_some_and(|duration| duration >= 0.0)
-                && entry
-                    .get("exit_code")
-                    .is_some_and(|value| value.is_null() || value.as_i64().is_some())
-                && entry.get("execution_policy").is_some_and(Value::is_object)
-                && entry.get("reference").is_none_or(json_string_or_null)
-                && entry.get("reason").is_none_or(json_string_or_null)
-                && entry.get("stdout_sha256").is_none_or(|value| {
-                    value.is_null()
-                        || value
-                            .as_str()
-                            .is_some_and(|hash| is_lower_hex_id(hash, 64, ""))
-                })
-        })
-    })
-}
-
-fn json_string_or_null(value: &Value) -> bool {
-    value.is_string() || value.is_null()
-}
-
-fn valid_suggested_fixes(value: &Value) -> bool {
-    value.as_array().is_some_and(|fixes| {
-        fixes.iter().all(|fix| {
-            let Some(fix) = fix.as_object() else {
-                return false;
-            };
-            fix.get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| is_lower_hex_id(id, 16, "PGX-"))
-                && fix
-                    .get("finding_id")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| is_lower_hex_id(id, 16, "WG-"))
-                && fix
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .is_some_and(|title| !title.is_empty())
-                && fix.get("kind").and_then(Value::as_str) == Some("command")
-                && fix
-                    .get("command")
-                    .and_then(Value::as_array)
-                    .is_some_and(|command| {
-                        !command.is_empty() && command.iter().all(Value::is_string)
-                    })
-                && fix
-                    .get("safe_to_apply_automatically")
-                    .and_then(Value::as_bool)
-                    == Some(false)
-        })
-    })
-}
-
-async fn wiring_guard_ledger_path(repo_root: &Path) -> Option<PathBuf> {
-    let dot_git = repo_root.join(".git");
-    let git_dir = match tokio::fs::metadata(&dot_git).await {
-        Ok(metadata) if metadata.is_dir() => Some(dot_git),
-        Ok(_) => tokio::fs::read_to_string(&dot_git)
-            .await
-            .ok()
-            .and_then(|contents| {
-                contents
-                    .trim()
-                    .strip_prefix("gitdir:")
-                    .map(str::trim)
-                    .map(PathBuf::from)
-            })
-            .map(|path| {
-                if path.is_absolute() {
-                    path
-                } else {
-                    repo_root.join(path)
-                }
-            }),
-        Err(_) => None,
-    };
-    if let Some(git_dir) = git_dir {
-        return Some(
-            git_dir
-                .join("codex")
-                .join("wiring-guard")
-                .join("ledger.json"),
-        );
-    }
-    Some(
-        repo_root
-            .join(".codex")
-            .join("wiring-guard")
-            .join("ledger.json"),
-    )
-}
-
-fn json_string_array(value: &Value) -> Option<Vec<String>> {
-    value
-        .as_array()?
-        .iter()
-        .map(|item| item.as_str().map(str::to_string))
-        .collect()
-}
-
-fn wiring_proof_covers_step(proof: &WiringProof, step: &EvidencePlanStep) -> bool {
-    let mut paths = step
-        .edit_paths
-        .iter()
-        .filter(|path| is_code_path(path))
-        .collect::<Vec<_>>();
-    if paths.is_empty() {
-        paths.extend(step.runtime_paths.iter().filter(|path| is_code_path(path)));
-    }
-    !paths.is_empty()
-        && paths.iter().all(|path| {
-            proof
-                .checked_changed_files
-                .iter()
-                .any(|checked| path_is_covered(path, checked))
-        })
 }
 
 fn resolve_risks_by_source(document: &mut TaskEvidenceDocument, source: &str) {
@@ -2827,10 +2126,6 @@ fn sha1_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha1::digest(bytes))
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 fn timestamp() -> String {
     Utc::now().to_rfc3339()
 }
@@ -2856,57 +2151,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use tempfile::TempDir;
 
-    async fn install_wiring_guard_fixture(codex_home: &Path) -> PathBuf {
-        let root = codex_home
-            .join("plugins/cache/local-wiring-guards/wiring-guard")
-            .join(WIRING_GUARD_PLUGIN_VERSION);
-        tokio::fs::create_dir_all(root.join("runtime"))
-            .await
-            .expect("wiring runtime");
-        tokio::fs::create_dir_all(root.join("schemas"))
-            .await
-            .expect("wiring schemas");
-        let launcher = root.join("runtime/wiring_guard.py");
-        let launcher_bytes = b"# trusted wiring guard fixture\n";
-        tokio::fs::write(&launcher, launcher_bytes)
-            .await
-            .expect("wiring launcher");
-        tokio::fs::write(
-            root.join("bundle-manifest.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "schema_id": "wiring-guard/bundle-manifest",
-                "schema_version": "1.0.0",
-                "plugin": {"name": "wiring-guard", "version": WIRING_GUARD_PLUGIN_VERSION},
-                "files": [{
-                    "path": "runtime/wiring_guard.py",
-                    "sha256": sha256_hex(launcher_bytes),
-                    "size": launcher_bytes.len()
-                }]
-            }))
-            .expect("wiring manifest json"),
-        )
-        .await
-        .expect("wiring manifest");
-        tokio::fs::write(
-            root.join("schemas/ledger.schema.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "$defs": {"entry": {"properties": {
-                    "schema_version": {"const": WIRING_GUARD_LEDGER_SCHEMA_VERSION},
-                    "report_schema_version": {"const": WIRING_GUARD_REPORT_SCHEMA_VERSION}
-                }}}
-            }))
-            .expect("wiring schema json"),
-        )
-        .await
-        .expect("wiring schema");
-        launcher
-    }
-
     async fn ledger_fixture() -> (TempDir, TaskEvidenceLedger) {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         let codex_home = temp.path().join("home");
-        install_wiring_guard_fixture(&codex_home).await;
         tokio::fs::create_dir_all(repo.join("scripts"))
             .await
             .expect("scripts");
@@ -2925,53 +2173,6 @@ mod tests {
         (temp, ledger)
     }
 
-    fn wiring_ledger_entry(path: &str) -> Value {
-        let graph_id = format!("PG-{}", "b".repeat(24));
-        serde_json::json!({
-            "schema_id": "wiring-guard/ledger-entry",
-            "schema_version": WIRING_GUARD_LEDGER_SCHEMA_VERSION,
-            "report_schema_version": WIRING_GUARD_REPORT_SCHEMA_VERSION,
-            "timestamp": timestamp(),
-            "verdict": "WIRED",
-            "diff_hash": "a".repeat(64),
-            "changed_files": [path],
-            "checked_changed_files": [path],
-            "mode": "summary",
-            "findings": {
-                "must_reach": [{"status": "connected"}],
-                "runtime_contracts": [],
-                "replaces": [],
-                "deleted_callers": [],
-                "orphans": [],
-                "stubs": [],
-                "bad_code": [],
-                "stale_arms": [],
-                "inconclusive": []
-            },
-            "normalized_findings": [],
-            "runtime_evidence": [],
-            "finding_policy": {},
-            "proof_graph": {
-                "schema_id": "wiring-guard/proof-graph",
-                "schema_version": WIRING_GUARD_PROOF_GRAPH_SCHEMA_VERSION,
-                "graph_id": graph_id,
-                "verdict": "WIRED",
-                "nodes": [{}],
-                "edges": [],
-                "traces": [],
-                "summary": {"open_findings": 0}
-            },
-            "suggested_fixes": [],
-            "editor": {
-                "schema_id": "wiring-guard/editor",
-                "schema_version": WIRING_GUARD_EDITOR_SCHEMA_VERSION,
-                "graph_id": graph_id,
-                "diagnostics": [],
-                "code_lenses": []
-            }
-        })
-    }
-
     fn plan(status: StepStatus) -> UpdatePlanArgs {
         UpdatePlanArgs {
             explanation: None,
@@ -2987,44 +2188,6 @@ mod tests {
                 requires_desktop_activation: false,
             }],
         }
-    }
-
-    #[tokio::test]
-    async fn minimal_or_legacy_wiring_ledger_entry_is_rejected() {
-        let (temp, _ledger) = ledger_fixture().await;
-        let repo = temp.path().join("repo");
-        let before = wiring_ledger_fingerprint(&repo)
-            .await
-            .expect("initial fingerprint");
-        let ledger_path = wiring_guard_ledger_path(&repo).await.expect("ledger path");
-        tokio::fs::create_dir_all(ledger_path.parent().expect("ledger parent"))
-            .await
-            .expect("ledger parent");
-        tokio::fs::write(
-            &ledger_path,
-            serde_json::to_vec(&vec![serde_json::json!({
-                "schema_id": "wiring-guard/ledger-entry",
-                "schema_version": "1.0.0",
-                "report_schema_version": "1.0.0",
-                "timestamp": timestamp(),
-                "verdict": "WIRED",
-                "diff_hash": "a".repeat(64),
-                "checked_changed_files": ["src/lib.rs"],
-                "findings": {},
-                "normalized_findings": [],
-                "runtime_evidence": [],
-                "proof_graph": {
-                    "schema_id": "wiring-guard/proof-graph",
-                    "schema_version": "1.0.0",
-                    "graph_id": format!("PG-{}", "b".repeat(24))
-                }
-            })])
-            .expect("legacy ledger json"),
-        )
-        .await
-        .expect("legacy ledger");
-
-        assert!(read_fresh_wiring_proof(&repo, 1, &before).await.is_none());
     }
 
     #[tokio::test]
@@ -3057,7 +2220,6 @@ mod tests {
             .record_plan_update(&plan(StepStatus::InProgress))
             .await;
         let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo");
-        let cwd_uri = PathUri::from_abs_path(&cwd);
         ledger
             .record_edit_intent("patch-1", cwd.as_path(), &[PathBuf::from("src/lib.rs")])
             .await;
@@ -3096,37 +2258,6 @@ mod tests {
                 &[],
                 Some(&serde_json::json!({"verdict": "VERIFIED"})),
             )
-            .await;
-        let wiring_launcher = temp
-            .path()
-            .join("home/plugins/cache/local-wiring-guards/wiring-guard")
-            .join(WIRING_GUARD_PLUGIN_VERSION)
-            .join("runtime/wiring_guard.py");
-        let wiring_command = [
-            "python".to_string(),
-            wiring_launcher.to_string_lossy().into_owned(),
-            "check".to_string(),
-            "--ledger".to_string(),
-        ];
-        ledger
-            .record_command_intent("wiring-1", &wiring_command)
-            .await;
-        let ledger_path = repo
-            .join(".git")
-            .join("codex")
-            .join("wiring-guard")
-            .join("ledger.json");
-        tokio::fs::create_dir_all(ledger_path.parent().expect("ledger parent"))
-            .await
-            .expect("ledger parent");
-        tokio::fs::write(
-            &ledger_path,
-            serde_json::to_vec(&vec![wiring_ledger_entry("src/lib.rs")]).expect("serialize ledger"),
-        )
-        .await
-        .expect("write ledger");
-        ledger
-            .record_command("wiring-1", &wiring_command, &cwd_uri, 0, false, 10, false)
             .await;
         assert_eq!(
             ledger.completion_gate().await.expect("gate").status,

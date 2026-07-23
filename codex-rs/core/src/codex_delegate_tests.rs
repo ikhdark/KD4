@@ -33,6 +33,7 @@ use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::time::timeout;
 
@@ -179,6 +180,154 @@ async fn forward_ops_preserves_submission_trace_context() {
         .await
         .expect("forward_ops did not exit")
         .expect("forward_ops join error");
+}
+
+#[tokio::test]
+async fn session_loop_termination_closes_proxy_with_live_child_event_sender() {
+    let (tx_child_sub, rx_child_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (tx_child_events, rx_child_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+    let (session, ctx, _rx_evt) = crate::session::tests::make_session_and_context_with_rx().await;
+    let (termination_tx, termination_rx) = oneshot::channel();
+    let session_loop_termination =
+        crate::session::session_loop_termination_from_handle(tokio::spawn(async move {
+            let _ = termination_rx.await;
+        }));
+    let child = Arc::new(Codex {
+        tx_sub: tx_child_sub,
+        rx_event: rx_child_events,
+        agent_status,
+        session: Arc::clone(&session),
+        session_loop_termination: session_loop_termination.clone(),
+    });
+
+    let (tx_outer_events, rx_outer_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (tx_outer_ops, rx_outer_ops) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let delegate_liveness = CancellationToken::new();
+    cancel_delegate_when_session_loop_terminates(&child, delegate_liveness.clone());
+    let events = tokio::spawn(forward_events(
+        Arc::clone(&child),
+        tx_outer_events,
+        Arc::clone(&session),
+        ctx,
+        Arc::new(Mutex::new(HashMap::new())),
+        delegate_liveness.clone(),
+    ));
+    let ops = tokio::spawn(forward_ops(
+        Arc::clone(&child),
+        rx_outer_ops,
+        delegate_liveness,
+    ));
+    let outer = Codex {
+        tx_sub: tx_outer_ops,
+        rx_event: rx_outer_events,
+        agent_status: child.agent_status.clone(),
+        session,
+        session_loop_termination,
+    };
+
+    drop(rx_child_sub);
+    termination_tx.send(()).expect("termination receiver alive");
+    timeout(Duration::from_secs(1), async {
+        events.await.expect("forward_events join error");
+        ops.await.expect("forward_ops join error");
+    })
+    .await
+    .expect("delegate proxy did not close after child termination");
+
+    assert!(matches!(
+        outer.submit(Op::Interrupt).await,
+        Err(CodexErr::InternalAgentDied)
+    ));
+    assert!(matches!(
+        outer.next_event().await,
+        Err(CodexErr::InternalAgentDied)
+    ));
+    let (tx_bridge, rx_bridge) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let ops_tx = outer.tx_sub.clone();
+    let bridge = tokio::spawn(bridge_one_shot_events(
+        outer,
+        tx_bridge,
+        ops_tx,
+        CancellationToken::new(),
+    ));
+    timeout(Duration::from_secs(1), bridge)
+        .await
+        .expect("one-shot bridge did not observe proxy closure")
+        .expect("one-shot bridge join error");
+    assert!(matches!(
+        rx_bridge.recv().await,
+        Err(async_channel::RecvError)
+    ));
+    drop(tx_child_events);
+}
+
+#[tokio::test]
+async fn failed_op_forwarding_closes_proxy_before_session_loop_termination() {
+    let (tx_child_sub, rx_child_sub) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (tx_child_events, rx_child_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (_agent_status_tx, agent_status) = watch::channel(AgentStatus::PendingInit);
+    let (session, ctx, _rx_evt) = crate::session::tests::make_session_and_context_with_rx().await;
+    let (termination_tx, termination_rx) = oneshot::channel();
+    let session_loop_termination =
+        crate::session::session_loop_termination_from_handle(tokio::spawn(async move {
+            let _ = termination_rx.await;
+        }));
+    let child = Arc::new(Codex {
+        tx_sub: tx_child_sub,
+        rx_event: rx_child_events,
+        agent_status,
+        session: Arc::clone(&session),
+        session_loop_termination: session_loop_termination.clone(),
+    });
+
+    let (tx_outer_events, rx_outer_events) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let (tx_outer_ops, rx_outer_ops) = bounded(SUBMISSION_CHANNEL_CAPACITY);
+    let delegate_liveness = CancellationToken::new();
+    cancel_delegate_when_session_loop_terminates(&child, delegate_liveness.clone());
+    let events = tokio::spawn(forward_events(
+        Arc::clone(&child),
+        tx_outer_events,
+        Arc::clone(&session),
+        ctx,
+        Arc::new(Mutex::new(HashMap::new())),
+        delegate_liveness.clone(),
+    ));
+    let ops = tokio::spawn(forward_ops(
+        Arc::clone(&child),
+        rx_outer_ops,
+        delegate_liveness,
+    ));
+    let outer = Codex {
+        tx_sub: tx_outer_ops,
+        rx_event: rx_outer_events,
+        agent_status: child.agent_status.clone(),
+        session,
+        session_loop_termination,
+    };
+
+    drop(rx_child_sub);
+    outer
+        .submit(Op::Interrupt)
+        .await
+        .expect("outer proxy should accept the racing operation");
+    timeout(Duration::from_secs(1), async {
+        ops.await.expect("forward_ops join error");
+        events.await.expect("forward_events join error");
+    })
+    .await
+    .expect("delegate proxy did not close after failed op forwarding");
+
+    assert!(matches!(
+        outer.submit(Op::Interrupt).await,
+        Err(CodexErr::InternalAgentDied)
+    ));
+    assert!(matches!(
+        outer.next_event().await,
+        Err(CodexErr::InternalAgentDied)
+    ));
+    termination_tx.send(()).expect("termination receiver alive");
+    drop(tx_child_events);
 }
 
 #[tokio::test]

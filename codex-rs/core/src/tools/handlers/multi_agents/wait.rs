@@ -9,6 +9,7 @@ use futures::FutureExt;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch::Receiver;
@@ -62,7 +63,9 @@ impl Handler {
         } = invocation;
         let arguments = function_arguments(payload)?;
         let args: WaitArgs = parse_arguments(&arguments)?;
-        let receiver_thread_ids = parse_agent_id_targets(args.targets)?;
+        let mut receiver_thread_ids = parse_agent_id_targets(args.targets)?;
+        let mut seen_thread_ids = HashSet::with_capacity(receiver_thread_ids.len());
+        receiver_thread_ids.retain(|thread_id| seen_thread_ids.insert(*thread_id));
         let mut receiver_agents = Vec::with_capacity(receiver_thread_ids.len());
         let mut target_by_thread_id = HashMap::with_capacity(receiver_thread_ids.len());
         for receiver_thread_id in &receiver_thread_ids {
@@ -137,7 +140,7 @@ impl Handler {
                             TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
                                 id: call_id.clone(),
                                 tool: CollabAgentTool::Wait,
-                                status: wait_tool_call_status(&statuses),
+                                status: CollabAgentToolCallStatus::Failed,
                                 sender_thread_id: session.thread_id,
                                 receiver_thread_ids: statuses.keys().copied().collect(),
                                 receiver_agents: wait_receiver_agents(&statuses, &receiver_agents),
@@ -206,7 +209,7 @@ impl Handler {
                 TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
                     id: call_id,
                     tool: CollabAgentTool::Wait,
-                    status: wait_tool_call_status(&statuses_by_id),
+                    status: CollabAgentToolCallStatus::Completed,
                     sender_thread_id: session.thread_id,
                     receiver_thread_ids: statuses_by_id.keys().copied().collect(),
                     receiver_agents: wait_receiver_agents(&statuses_by_id, &receiver_agents),
@@ -219,17 +222,6 @@ impl Handler {
             .await;
 
         Ok(boxed_tool_output(result))
-    }
-}
-
-fn wait_tool_call_status(statuses: &HashMap<ThreadId, AgentStatus>) -> CollabAgentToolCallStatus {
-    if statuses
-        .values()
-        .any(|status| matches!(status, AgentStatus::Errored(_) | AgentStatus::NotFound))
-    {
-        CollabAgentToolCallStatus::Failed
-    } else {
-        CollabAgentToolCallStatus::Completed
     }
 }
 

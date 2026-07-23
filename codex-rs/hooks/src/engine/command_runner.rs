@@ -1,8 +1,12 @@
+use std::collections::VecDeque;
+use std::io;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 
+use tokio::io::AsyncRead;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -18,6 +22,9 @@ use super::dispatcher::hook_source_label;
 use super::dispatcher::scope_for_event;
 use codex_protocol::protocol::HookExecutionMode;
 use codex_protocol::protocol::HookHandlerType;
+
+const HOOK_STREAM_CAPTURE_MAX_BYTES: usize = 1024 * 1024;
+const HOOK_STREAM_READ_BUFFER_BYTES: usize = 16 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct CommandRunResult {
@@ -98,41 +105,162 @@ pub(crate) async fn run_command(
         );
     }
 
-    let timeout_duration = Duration::from_secs(handler.timeout_sec);
-    match timeout(timeout_duration, child.wait_with_output()).await {
-        Ok(Ok(output)) => finish_command_run(
-            started_at,
-            started,
-            CommandRunCompletion {
-                exit_code: output.status.code(),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-                error: None,
-                outcome: "completed",
-            },
-        ),
-        Ok(Err(err)) => finish_command_run(
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill().await;
+        return finish_command_run(
             started_at,
             started,
             CommandRunCompletion {
                 exit_code: None,
                 stdout: String::new(),
                 stderr: String::new(),
-                error: Some(err.to_string()),
+                error: Some("hook stdout pipe was unavailable".to_string()),
                 outcome: "wait_error",
             },
-        ),
-        Err(_) => finish_command_run(
+        );
+    };
+    let Some(stderr) = child.stderr.take() else {
+        let _ = child.kill().await;
+        return finish_command_run(
             started_at,
             started,
             CommandRunCompletion {
                 exit_code: None,
                 stdout: String::new(),
                 stderr: String::new(),
-                error: Some(format!("hook timed out after {}s", handler.timeout_sec)),
-                outcome: "timeout",
+                error: Some("hook stderr pipe was unavailable".to_string()),
+                outcome: "wait_error",
             },
-        ),
+        );
+    };
+
+    let timeout_duration = Duration::from_secs(handler.timeout_sec);
+    let wait_for_output =
+        async { tokio::try_join!(child.wait(), capture_output(stdout), capture_output(stderr)) };
+    match timeout(timeout_duration, wait_for_output).await {
+        Ok(Ok((status, stdout, stderr))) => {
+            let exit_code = status.code();
+            // A successful hook's stdout can be structured JSON, so never parse a
+            // partial document as if it were complete. Exit-code-2 denials use
+            // stderr and can safely retain the bounded head/tail preview.
+            let stdout_exceeded_limit = exit_code == Some(0) && stdout.was_truncated();
+            let error = stdout_exceeded_limit.then(|| {
+                format!(
+                    "hook stdout exceeded the {HOOK_STREAM_CAPTURE_MAX_BYTES}-byte capture limit"
+                )
+            });
+            finish_command_run(
+                started_at,
+                started,
+                CommandRunCompletion {
+                    exit_code,
+                    stdout: stdout.into_string(),
+                    stderr: stderr.into_string(),
+                    error,
+                    outcome: if stdout_exceeded_limit {
+                        "output_limit"
+                    } else {
+                        "completed"
+                    },
+                },
+            )
+        }
+        Ok(Err(err)) => {
+            let _ = child.kill().await;
+            finish_command_run(
+                started_at,
+                started,
+                CommandRunCompletion {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some(err.to_string()),
+                    outcome: "wait_error",
+                },
+            )
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            finish_command_run(
+                started_at,
+                started,
+                CommandRunCompletion {
+                    exit_code: None,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    error: Some(format!("hook timed out after {}s", handler.timeout_sec)),
+                    outcome: "timeout",
+                },
+            )
+        }
+    }
+}
+
+#[derive(Default)]
+struct CapturedOutput {
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
+    total_bytes: u64,
+}
+
+impl CapturedOutput {
+    fn push(&mut self, bytes: &[u8]) {
+        self.total_bytes = self
+            .total_bytes
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+
+        let head_limit = HOOK_STREAM_CAPTURE_MAX_BYTES / 2;
+        let head_bytes = bytes.len().min(head_limit.saturating_sub(self.head.len()));
+        self.head.extend_from_slice(&bytes[..head_bytes]);
+
+        let tail_bytes = &bytes[head_bytes..];
+        let tail_limit = HOOK_STREAM_CAPTURE_MAX_BYTES.saturating_sub(head_limit);
+        if tail_bytes.len() >= tail_limit {
+            self.tail.clear();
+            self.tail
+                .extend(&tail_bytes[tail_bytes.len().saturating_sub(tail_limit)..]);
+            return;
+        }
+
+        let overflow = self
+            .tail
+            .len()
+            .saturating_add(tail_bytes.len())
+            .saturating_sub(tail_limit);
+        self.tail.drain(..overflow);
+        self.tail.extend(tail_bytes);
+    }
+
+    fn was_truncated(&self) -> bool {
+        self.total_bytes > u64::try_from(HOOK_STREAM_CAPTURE_MAX_BYTES).unwrap_or(u64::MAX)
+    }
+
+    fn into_string(self) -> String {
+        let retained_bytes = self.head.len().saturating_add(self.tail.len());
+        let was_truncated = self.was_truncated();
+        let omitted_bytes = self
+            .total_bytes
+            .saturating_sub(u64::try_from(retained_bytes).unwrap_or(u64::MAX));
+        let mut bytes = self.head;
+        if was_truncated {
+            bytes.extend_from_slice(
+                format!("\n... {omitted_bytes} bytes truncated from hook output ...\n").as_bytes(),
+            );
+        }
+        bytes.extend(self.tail);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+async fn capture_output(mut output: impl AsyncRead + Unpin) -> io::Result<CapturedOutput> {
+    let mut captured = CapturedOutput::default();
+    let mut buffer = [0_u8; HOOK_STREAM_READ_BUFFER_BYTES];
+    loop {
+        let bytes_read = output.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            return Ok(captured);
+        }
+        captured.push(&buffer[..bytes_read]);
     }
 }
 

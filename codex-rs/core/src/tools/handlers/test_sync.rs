@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde::Deserialize;
-use tokio::sync::Barrier;
+use tokio::sync::watch;
 use tokio::time::sleep;
 
 use crate::function_tool::FunctionCallError;
@@ -24,14 +24,26 @@ pub struct TestSyncHandler;
 
 const DEFAULT_TIMEOUT_MS: u64 = 1_000;
 
-static BARRIERS: OnceLock<tokio::sync::Mutex<HashMap<String, BarrierState>>> = OnceLock::new();
+static BARRIERS: OnceLock<Mutex<HashMap<String, BarrierState>>> = OnceLock::new();
 
 struct BarrierState {
-    barrier: Arc<Barrier>,
+    generation: Arc<BarrierGeneration>,
+    waiters: usize,
+}
+
+struct BarrierGeneration {
     participants: usize,
+    released: watch::Sender<bool>,
+}
+
+struct BarrierWaiter {
+    id: String,
+    generation: Arc<BarrierGeneration>,
+    released: watch::Receiver<bool>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct BarrierArgs {
     id: String,
     participants: usize,
@@ -40,6 +52,7 @@ struct BarrierArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TestSyncArgs {
     #[serde(default)]
     sleep_before_ms: Option<u64>,
@@ -53,8 +66,43 @@ fn default_timeout_ms() -> u64 {
     DEFAULT_TIMEOUT_MS
 }
 
-fn barrier_map() -> &'static tokio::sync::Mutex<HashMap<String, BarrierState>> {
-    BARRIERS.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+fn barrier_map() -> &'static Mutex<HashMap<String, BarrierState>> {
+    BARRIERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_barrier_map() -> std::sync::MutexGuard<'static, HashMap<String, BarrierState>> {
+    barrier_map()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl BarrierWaiter {
+    async fn wait(mut self) -> Result<(), watch::error::RecvError> {
+        self.released.wait_for(|released| *released).await?;
+        Ok(())
+    }
+}
+
+impl Drop for BarrierWaiter {
+    fn drop(&mut self) {
+        let mut map = lock_barrier_map();
+        let remove_generation = if let Some(state) = map.get_mut(&self.id)
+            && Arc::ptr_eq(&state.generation, &self.generation)
+        {
+            debug_assert!(state.waiters > 0);
+            if state.waiters <= 1 {
+                true
+            } else {
+                state.waiters -= 1;
+                false
+            }
+        } else {
+            false
+        };
+        if remove_generation {
+            map.remove(&self.id);
+        }
+    }
 }
 
 impl ToolExecutor<ToolInvocation> for TestSyncHandler {
@@ -131,46 +179,174 @@ async fn wait_on_barrier(args: BarrierArgs) -> Result<(), FunctionCallError> {
         ));
     }
 
-    let barrier_id = args.id.clone();
-    let barrier = {
-        let mut map = barrier_map().lock().await;
-        match map.entry(barrier_id.clone()) {
-            Entry::Occupied(entry) => {
-                let state = entry.get();
-                if state.participants != args.participants {
-                    let existing = state.participants;
-                    return Err(FunctionCallError::RespondToModel(format!(
-                        "barrier {barrier_id} already registered with {existing} participants"
-                    )));
-                }
-                state.barrier.clone()
-            }
-            Entry::Vacant(entry) => {
-                let barrier = Arc::new(Barrier::new(args.participants));
-                entry.insert(BarrierState {
-                    barrier: barrier.clone(),
-                    participants: args.participants,
-                });
-                barrier
-            }
-        }
-    };
-
     let timeout = Duration::from_millis(args.timeout_ms);
-    let wait_result = tokio::time::timeout(timeout, barrier.wait())
+    let waiter = register_barrier(&args)?;
+    tokio::time::timeout(timeout, waiter.wait())
         .await
         .map_err(|_| {
             FunctionCallError::RespondToModel("test_sync_tool barrier wait timed out".to_string())
+        })?
+        .map_err(|_| {
+            FunctionCallError::RespondToModel(
+                "test_sync_tool barrier generation ended unexpectedly".to_string(),
+            )
         })?;
 
-    if wait_result.is_leader() {
-        let mut map = barrier_map().lock().await;
-        if let Some(state) = map.get(&barrier_id)
-            && Arc::ptr_eq(&state.barrier, &barrier)
-        {
-            map.remove(&barrier_id);
+    Ok(())
+}
+
+fn register_barrier(args: &BarrierArgs) -> Result<BarrierWaiter, FunctionCallError> {
+    let barrier_id = args.id.clone();
+    let mut map = lock_barrier_map();
+    let generation = if let Some(state) = map.get_mut(&barrier_id) {
+        if state.generation.participants != args.participants {
+            let existing = state.generation.participants;
+            return Err(FunctionCallError::RespondToModel(format!(
+                "barrier {barrier_id} already registered with {existing} participants"
+            )));
+        }
+        state.waiters += 1;
+        Arc::clone(&state.generation)
+    } else {
+        let (released, _) = watch::channel(false);
+        let generation = Arc::new(BarrierGeneration {
+            participants: args.participants,
+            released,
+        });
+        map.insert(
+            barrier_id.clone(),
+            BarrierState {
+                generation: Arc::clone(&generation),
+                waiters: 1,
+            },
+        );
+        generation
+    };
+    let released = generation.released.subscribe();
+    let should_release = map
+        .get(&barrier_id)
+        .is_some_and(|state| state.waiters == state.generation.participants);
+    if should_release {
+        let removed = map
+            .remove(&barrier_id)
+            .expect("registered barrier generation must be present");
+        debug_assert!(Arc::ptr_eq(&removed.generation, &generation));
+    }
+    drop(map);
+
+    if should_release {
+        generation.released.send_replace(true);
+    }
+
+    Ok(BarrierWaiter {
+        id: barrier_id,
+        generation,
+        released,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+
+    static NEXT_BARRIER_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn unique_barrier_id(label: &str) -> String {
+        let suffix = NEXT_BARRIER_ID.fetch_add(1, Ordering::Relaxed);
+        format!("test-{label}-{suffix}")
+    }
+
+    fn barrier_args(id: &str, participants: usize, timeout_ms: u64) -> BarrierArgs {
+        BarrierArgs {
+            id: id.to_string(),
+            participants,
+            timeout_ms,
         }
     }
 
-    Ok(())
+    fn registered_waiters(id: &str) -> Option<usize> {
+        lock_barrier_map().get(id).map(|state| state.waiters)
+    }
+
+    async fn wait_until_registered(id: &str, waiters: usize) {
+        for _ in 0..1_000 {
+            if registered_waiters(id) == Some(waiters) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("barrier {id} did not register {waiters} waiter(s)");
+    }
+
+    async fn assert_fresh_pair_rendezvous(id: &str) {
+        let first_id = id.to_string();
+        let first =
+            tokio::spawn(async move { wait_on_barrier(barrier_args(&first_id, 2, 5_000)).await });
+        wait_until_registered(id, 1).await;
+        assert!(!first.is_finished());
+
+        let second_id = id.to_string();
+        let second =
+            tokio::spawn(async move { wait_on_barrier(barrier_args(&second_id, 2, 5_000)).await });
+        let (first, second) = tokio::join!(first, second);
+        assert!(first.expect("first rendezvous task").is_ok());
+        assert!(second.expect("second rendezvous task").is_ok());
+        assert_eq!(registered_waiters(id), None);
+    }
+
+    #[tokio::test]
+    async fn timed_out_waiter_does_not_satisfy_a_later_rendezvous() {
+        let id = unique_barrier_id("timeout");
+        let error = wait_on_barrier(barrier_args(&id, 2, 10))
+            .await
+            .expect_err("single waiter must time out");
+        assert!(error.to_string().contains("barrier wait timed out"));
+        assert_eq!(registered_waiters(&id), None);
+
+        assert_fresh_pair_rendezvous(&id).await;
+    }
+
+    #[tokio::test]
+    async fn aborted_waiter_does_not_satisfy_a_later_rendezvous() {
+        let id = unique_barrier_id("abort");
+        let aborted_id = id.clone();
+        let task =
+            tokio::spawn(async move { wait_on_barrier(barrier_args(&aborted_id, 2, 5_000)).await });
+        wait_until_registered(&id, 1).await;
+
+        task.abort();
+        assert!(task.await.expect_err("task must be aborted").is_cancelled());
+        assert_eq!(registered_waiters(&id), None);
+
+        assert_fresh_pair_rendezvous(&id).await;
+    }
+
+    #[tokio::test]
+    async fn consecutive_same_id_generations_are_disjoint() {
+        let id = unique_barrier_id("generation");
+        let first = register_barrier(&barrier_args(&id, 2, 5_000)).expect("first waiter");
+        let first_generation = Arc::clone(&first.generation);
+        let second = register_barrier(&barrier_args(&id, 2, 5_000)).expect("second waiter");
+        assert_eq!(registered_waiters(&id), None);
+
+        let next_first = register_barrier(&barrier_args(&id, 2, 5_000)).expect("next first waiter");
+        assert!(!Arc::ptr_eq(&first_generation, &next_first.generation));
+        assert_eq!(registered_waiters(&id), Some(1));
+        let next_second =
+            register_barrier(&barrier_args(&id, 2, 5_000)).expect("next second waiter");
+        assert_eq!(registered_waiters(&id), None);
+
+        let (first, second, next_first, next_second) = tokio::join!(
+            first.wait(),
+            second.wait(),
+            next_first.wait(),
+            next_second.wait(),
+        );
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert!(next_first.is_ok());
+        assert!(next_second.is_ok());
+    }
 }

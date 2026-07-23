@@ -1,3 +1,4 @@
+use codex_tools::JsonToolOutput;
 use codex_tools::LIST_AVAILABLE_PLUGINS_TO_INSTALL_TOOL_NAME;
 use codex_tools::ListAvailablePluginsToInstallResult;
 use codex_tools::RequestPluginInstallEntry;
@@ -5,7 +6,6 @@ use codex_tools::ToolName;
 use codex_tools::ToolSpec;
 
 use crate::function_tool::FunctionCallError;
-use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
@@ -52,6 +52,16 @@ impl ListAvailablePluginsToInstallHandler {
                 .collect(),
         }
     }
+
+    fn output(&self) -> Result<JsonToolOutput, FunctionCallError> {
+        let value = serde_json::to_value(self.result()).map_err(|err| {
+            FunctionCallError::Fatal(format!(
+                "failed to serialize {LIST_AVAILABLE_PLUGINS_TO_INSTALL_TOOL_NAME} response: {err}"
+            ))
+        })?;
+
+        Ok(JsonToolOutput::new(value))
+    }
 }
 
 impl ToolExecutor<ToolInvocation> for ListAvailablePluginsToInstallHandler {
@@ -87,16 +97,7 @@ impl ListAvailablePluginsToInstallHandler {
             }
         }
 
-        let content = serde_json::to_string(&self.result()).map_err(|err| {
-            FunctionCallError::Fatal(format!(
-                "failed to serialize {LIST_AVAILABLE_PLUGINS_TO_INSTALL_TOOL_NAME} response: {err}"
-            ))
-        })?;
-
-        Ok(boxed_tool_output(FunctionToolOutput::from_text(
-            content,
-            Some(true),
-        )))
+        Ok(boxed_tool_output(self.output()?))
     }
 }
 
@@ -120,6 +121,21 @@ mod tests {
         assert!(
             !ListAvailablePluginsToInstallHandler::new(Vec::new()).supports_parallel_tool_calls()
         );
+    }
+
+    #[test]
+    fn code_mode_result_is_a_structured_tools_object() {
+        let output = ListAvailablePluginsToInstallHandler::new(Vec::new())
+            .output()
+            .expect("serialize result");
+        let result = codex_tools::ToolOutput::code_mode_result(
+            &output,
+            &ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+        );
+
+        assert_eq!(result, serde_json::json!({ "tools": [] }));
     }
 
     #[test]

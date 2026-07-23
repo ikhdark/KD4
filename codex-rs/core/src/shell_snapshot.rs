@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Stdio;
@@ -10,7 +12,6 @@ use crate::rollout::list::find_thread_path_by_id_str;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::Shell;
 use crate::shell::ShellType;
-use crate::shell::get_shell;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -19,6 +20,7 @@ use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::fs;
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::Instrument;
@@ -34,6 +36,7 @@ struct ShellSnapshotConfig {
     session_id: ThreadId,
     session_telemetry: SessionTelemetry,
     state_db: Option<StateDbHandle>,
+    environment_variables: HashMap<String, String>,
 }
 
 pub(crate) struct ShellSnapshotFile {
@@ -44,6 +47,7 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(10);
 const SNAPSHOT_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 3); // 3 days retention.
 const SNAPSHOT_DIR: &str = "shell_snapshots";
 const EXCLUDED_EXPORT_VARS: &[&str] = &["PWD", "OLDPWD"];
+pub(crate) const POSIX_SNAPSHOT_FORMAT_HEADER: &str = "# Codex shell snapshot format: 3";
 
 impl ShellSnapshot {
     pub(crate) fn new(
@@ -51,6 +55,7 @@ impl ShellSnapshot {
         session_id: ThreadId,
         session_telemetry: SessionTelemetry,
         state_db: Option<StateDbHandle>,
+        environment_variables: HashMap<String, String>,
     ) -> Self {
         Self {
             config: Some(Arc::new(ShellSnapshotConfig {
@@ -58,6 +63,7 @@ impl ShellSnapshot {
                 session_id,
                 session_telemetry,
                 state_db,
+                environment_variables,
             })),
         }
     }
@@ -97,6 +103,7 @@ impl ShellSnapshot {
                 config.session_id,
                 &cwd,
                 &shell,
+                &config.environment_variables,
                 config.state_db.clone(),
             )
             .await;
@@ -120,6 +127,7 @@ impl ShellSnapshot {
         session_id: ThreadId,
         session_cwd: &AbsolutePathBuf,
         shell: &Shell,
+        environment_variables: &HashMap<String, String>,
         state_db: Option<StateDbHandle>,
     ) -> std::result::Result<ShellSnapshotFile, &'static str> {
         // File to store the snapshot
@@ -150,7 +158,9 @@ impl ShellSnapshot {
         });
 
         // Make the new snapshot.
-        if let Err(err) = write_shell_snapshot(shell.shell_type, &temp_path, session_cwd).await {
+        if let Err(err) =
+            write_shell_snapshot(shell, &temp_path, session_cwd, environment_variables).await
+        {
             tracing::warn!(
                 "Failed to create shell snapshot for {}: {err:?}",
                 shell.name()
@@ -162,7 +172,9 @@ impl ShellSnapshot {
             temp_path.display()
         );
 
-        if let Err(err) = validate_snapshot(shell, &temp_path, session_cwd).await {
+        if let Err(err) =
+            validate_snapshot(shell, &temp_path, session_cwd, environment_variables).await
+        {
             tracing::error!("Shell snapshot validation failed: {err:?}");
             remove_snapshot_file(&temp_path).await;
             return Err("validation_failed");
@@ -196,18 +208,25 @@ impl Drop for ShellSnapshotFile {
 }
 
 async fn write_shell_snapshot(
-    shell_type: ShellType,
+    shell: &Shell,
     output_path: &AbsolutePathBuf,
     cwd: &AbsolutePathBuf,
+    environment_variables: &HashMap<String, String>,
 ) -> Result<()> {
+    let shell_type = shell.shell_type;
     if shell_type == ShellType::PowerShell || shell_type == ShellType::Cmd {
         bail!("Shell snapshot not supported yet for {shell_type:?}");
     }
-    let shell = get_shell(shell_type, /*path*/ None)
-        .with_context(|| format!("No available shell for {shell_type:?}"))?;
 
-    let raw_snapshot = capture_snapshot(&shell, cwd).await?;
+    let raw_snapshot = capture_snapshot(shell, cwd, environment_variables).await?;
     let snapshot = strip_snapshot_preamble(&raw_snapshot)?;
+    if matches!(shell_type, ShellType::Bash | ShellType::Zsh | ShellType::Sh)
+        && !snapshot
+            .lines()
+            .any(|line| line == POSIX_SNAPSHOT_FORMAT_HEADER)
+    {
+        bail!("Snapshot output missing format marker {POSIX_SNAPSHOT_FORMAT_HEADER}");
+    }
 
     if let Some(parent) = output_path.parent() {
         let parent_display = parent.display();
@@ -224,13 +243,31 @@ async fn write_shell_snapshot(
     Ok(())
 }
 
-async fn capture_snapshot(shell: &Shell, cwd: &AbsolutePathBuf) -> Result<String> {
+async fn capture_snapshot(
+    shell: &Shell,
+    cwd: &AbsolutePathBuf,
+    environment_variables: &HashMap<String, String>,
+) -> Result<String> {
     let shell_type = shell.shell_type;
     match shell_type {
-        ShellType::Zsh => run_shell_script(shell, &zsh_snapshot_script(), cwd).await,
-        ShellType::Bash => run_shell_script(shell, &bash_snapshot_script(), cwd).await,
-        ShellType::Sh => run_shell_script(shell, &sh_snapshot_script(), cwd).await,
-        ShellType::PowerShell => run_shell_script(shell, powershell_snapshot_script(), cwd).await,
+        ShellType::Zsh => {
+            run_shell_script(shell, &zsh_snapshot_script(), cwd, environment_variables).await
+        }
+        ShellType::Bash => {
+            run_shell_script(shell, &bash_snapshot_script(), cwd, environment_variables).await
+        }
+        ShellType::Sh => {
+            run_shell_script(shell, &sh_snapshot_script(), cwd, environment_variables).await
+        }
+        ShellType::PowerShell => {
+            run_shell_script(
+                shell,
+                powershell_snapshot_script(),
+                cwd,
+                environment_variables,
+            )
+            .await
+        }
         ShellType::Cmd => bail!("Shell snapshotting is not yet supported for {shell_type:?}"),
     }
 }
@@ -248,27 +285,38 @@ async fn validate_snapshot(
     shell: &Shell,
     snapshot_path: &AbsolutePathBuf,
     cwd: &AbsolutePathBuf,
+    environment_variables: &HashMap<String, String>,
 ) -> Result<()> {
-    let snapshot_path_display = snapshot_path.display();
-    let script = format!("set -e; . \"{snapshot_path_display}\"");
-    run_script_with_timeout(
+    let positional_args = [
+        OsStr::new("codex-shell-snapshot-validation"),
+        snapshot_path.as_os_str(),
+    ];
+    run_script_with_timeout_with_args(
         shell,
-        &script,
+        r#"\command set -e; \command . "$1""#,
+        &positional_args,
         SNAPSHOT_TIMEOUT,
         /*use_login_shell*/ false,
         cwd,
+        environment_variables,
     )
     .await
     .map(|_| ())
 }
 
-async fn run_shell_script(shell: &Shell, script: &str, cwd: &AbsolutePathBuf) -> Result<String> {
+async fn run_shell_script(
+    shell: &Shell,
+    script: &str,
+    cwd: &AbsolutePathBuf,
+    environment_variables: &HashMap<String, String>,
+) -> Result<String> {
     run_script_with_timeout(
         shell,
         script,
         SNAPSHOT_TIMEOUT,
         /*use_login_shell*/ true,
         cwd,
+        environment_variables,
     )
     .await
 }
@@ -279,6 +327,28 @@ async fn run_script_with_timeout(
     snapshot_timeout: Duration,
     use_login_shell: bool,
     cwd: &AbsolutePathBuf,
+    environment_variables: &HashMap<String, String>,
+) -> Result<String> {
+    run_script_with_timeout_with_args(
+        shell,
+        script,
+        &[],
+        snapshot_timeout,
+        use_login_shell,
+        cwd,
+        environment_variables,
+    )
+    .await
+}
+
+async fn run_script_with_timeout_with_args(
+    shell: &Shell,
+    script: &str,
+    script_args: &[&OsStr],
+    snapshot_timeout: Duration,
+    use_login_shell: bool,
+    cwd: &AbsolutePathBuf,
+    environment_variables: &HashMap<String, String>,
 ) -> Result<String> {
     let args = shell.derive_exec_args(script, use_login_shell);
     let shell_name = shell.name();
@@ -287,8 +357,11 @@ async fn run_script_with_timeout(
     // returns a ref of handler.
     let mut handler = Command::new(&args[0]);
     handler.args(&args[1..]);
+    handler.args(script_args);
     handler.stdin(Stdio::null());
     handler.current_dir(cwd);
+    handler.env_clear();
+    handler.envs(environment_variables);
     #[cfg(unix)]
     unsafe {
         handler.pre_exec(|| {
@@ -297,18 +370,69 @@ async fn run_script_with_timeout(
         });
     }
     handler.kill_on_drop(true);
-    let output = timeout(snapshot_timeout, handler.output())
-        .await
-        .map_err(|_| anyhow!("Snapshot command timed out for {shell_name}"))?
-        .with_context(|| format!("Failed to execute {shell_name}"))?;
+    handler.stdout(Stdio::piped());
+    handler.stderr(Stdio::piped());
 
-    if !output.status.success() {
-        let status = output.status;
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut child = handler
+        .spawn()
+        .with_context(|| format!("Failed to execute {shell_name}"))?;
+    let process_group_id = child.id();
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("Snapshot command stdout was not piped")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("Snapshot command stderr was not piped")?;
+
+    let output = timeout(snapshot_timeout, async {
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let (status, stdout_read, stderr_read) = tokio::join!(
+            child.wait(),
+            stdout.read_to_end(&mut stdout_bytes),
+            stderr.read_to_end(&mut stderr_bytes),
+        );
+        let status = status.with_context(|| format!("Failed to execute {shell_name}"))?;
+        stdout_read.context("Failed to read snapshot command stdout")?;
+        stderr_read.context("Failed to read snapshot command stderr")?;
+        Ok::<_, anyhow::Error>((status, stdout_bytes, stderr_bytes))
+    })
+    .await;
+
+    let (status, stdout, stderr) = match output {
+        Ok(output) => output?,
+        Err(_) => {
+            if let Some(process_group_id) = process_group_id
+                && let Err(err) =
+                    codex_utils_pty::process_group::kill_process_group(process_group_id)
+            {
+                tracing::warn!(
+                    "Failed to kill timed-out snapshot process group {process_group_id}: {err:?}"
+                );
+            }
+            if let Err(err) = child.start_kill()
+                && err.kind() != ErrorKind::InvalidInput
+                && err.kind() != ErrorKind::NotFound
+            {
+                tracing::warn!("Failed to kill timed-out snapshot shell: {err:?}");
+            }
+            drop(stdout);
+            drop(stderr);
+            if let Err(err) = child.wait().await {
+                tracing::warn!("Failed to reap timed-out snapshot shell: {err:?}");
+            }
+            return Err(anyhow!("Snapshot command timed out for {shell_name}"));
+        }
+    };
+
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
         bail!("Snapshot command exited with status {status}: {stderr}");
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(String::from_utf8_lossy(&stdout).into_owned())
 }
 
 fn excluded_exports_regex() -> String {
@@ -317,43 +441,62 @@ fn excluded_exports_regex() -> String {
 
 fn zsh_snapshot_script() -> String {
     let excluded = excluded_exports_regex();
-    let script = r##"if [[ -n "$ZDOTDIR" ]]; then
-  rc="$ZDOTDIR/.zshrc"
-else
-  rc="$HOME/.zshrc"
-fi
-[[ -r "$rc" ]] && . "$rc"
-print '# Snapshot file'
-print '# Unset all aliases to avoid conflicts with functions'
-print 'unalias -a 2>/dev/null || true'
-print '# Functions'
-functions
-print ''
-setopt_count=$(setopt | wc -l | tr -d ' ')
-print "# setopts $setopt_count"
-setopt | sed 's/^/setopt /'
-print ''
-alias_count=$(alias -L | wc -l | tr -d ' ')
-print "# aliases $alias_count"
-alias -L
-print ''
-export_lines=$(export -p | awk '
+    let script = r##"if [[ "${(t)functions}" == association* && -z "${functions[builtin]-}" && -z "${functions[command]-}" ]]; then
+  __CODEX_SNAPSHOT_RC="${ZDOTDIR:-$HOME}/.zshrc"
+  \builtin test ! -r "$__CODEX_SNAPSHOT_RC" || \builtin source "$__CODEX_SNAPSHOT_RC"
+  if [[ "${(t)functions}" == association* && -z "${functions[builtin]-}" && -z "${functions[command]-}" ]]; then
+    __CODEX_SNAPSHOT_FUNCTIONS=$(\builtin functions)
+    __CODEX_SNAPSHOT_ALIAS_LINES=$(\builtin alias -L 2>/dev/null) || __CODEX_SNAPSHOT_ALIAS_LINES=
+    \builtin unalias -a 2>/dev/null || \builtin true
+    \builtin print '# Snapshot file'
+    \builtin print '# Codex shell snapshot format: 3'
+    \builtin print '# Unset all aliases to avoid conflicts with functions'
+    \builtin print -r -- '\builtin unalias -a 2>/dev/null || \builtin true'
+    \builtin print '# setopts'
+    while IFS= \builtin read -r __CODEX_SNAPSHOT_ZSH_OPT; do
+      \builtin print -r -- "\\builtin setopt $__CODEX_SNAPSHOT_ZSH_OPT"
+    done < <(\builtin setopt)
+    \builtin print ''
+    \builtin print '# Functions'
+    __CODEX_SNAPSHOT_FUNCTIONS_ESCAPED=$(\builtin print -rn -- "$__CODEX_SNAPSHOT_FUNCTIONS" | \command sed "s/'/'\"'\"'/g")
+    \builtin print -r -- "__CODEX_SNAPSHOT_FUNCTIONS='$__CODEX_SNAPSHOT_FUNCTIONS_ESCAPED'"
+    \builtin print ''
+    \builtin print '# aliases'
+    __CODEX_SNAPSHOT_ALIASES=$(
+      if [[ -n "$__CODEX_SNAPSHOT_ALIAS_LINES" ]]; then
+        while IFS= \builtin read -r __CODEX_SNAPSHOT_ALIAS_LINE; do
+          \builtin print -r -- "\\builtin $__CODEX_SNAPSHOT_ALIAS_LINE"
+        done <<< "$__CODEX_SNAPSHOT_ALIAS_LINES"
+      fi
+    )
+    __CODEX_SNAPSHOT_ALIASES_ESCAPED=$(\builtin print -rn -- "$__CODEX_SNAPSHOT_ALIASES" | \command sed "s/'/'\"'\"'/g")
+    \builtin print -r -- "__CODEX_SNAPSHOT_ALIASES='$__CODEX_SNAPSHOT_ALIASES_ESCAPED'"
+    \builtin print ''
+    __CODEX_SNAPSHOT_EXPORT_LINES=$(\builtin export -p | \command awk '
 /^(export|declare -x|typeset -x) / {
   line=$0
   name=line
   sub(/^(export|declare -x|typeset -x) /, "", name)
   sub(/=.*/, "", name)
-  if (name ~ /^(EXCLUDED_EXPORTS)$/) {
+  if (name ~ /^__CODEX_SNAPSHOT_/ || name ~ /^(EXCLUDED_EXPORTS)$/) {
     next
   }
   if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
     print line
   }
 }')
-export_count=$(printf '%s\n' "$export_lines" | sed '/^$/d' | wc -l | tr -d ' ')
-print "# exports $export_count"
-if [[ -n "$export_lines" ]]; then
-  print -r -- "$export_lines"
+    \builtin print '# exports'
+    if [[ -n "$__CODEX_SNAPSHOT_EXPORT_LINES" ]]; then
+      while IFS= \builtin read -r __CODEX_SNAPSHOT_EXPORT_LINE; do
+        \builtin print -r -- "\\builtin $__CODEX_SNAPSHOT_EXPORT_LINE"
+      done <<< "$__CODEX_SNAPSHOT_EXPORT_LINES"
+    fi
+    \builtin true
+  else
+    [[ 1 == 0 ]]
+  fi
+else
+  [[ 1 == 0 ]]
 fi
 "##;
     script.replace("EXCLUDED_EXPORTS", &excluded)
@@ -361,41 +504,94 @@ fi
 
 fn bash_snapshot_script() -> String {
     let excluded = excluded_exports_regex();
-    let script = r##"if [ -z "$BASH_ENV" ] && [ -r "$HOME/.bashrc" ]; then
-  . "$HOME/.bashrc"
+    let script = r##"if [[ -o posix ]]; then
+  __CODEX_SNAPSHOT_POSIX_WAS_SET=1
+else
+  __CODEX_SNAPSHOT_POSIX_WAS_SET=0
 fi
-echo '# Snapshot file'
-echo '# Unset all aliases to avoid conflicts with functions'
-unalias -a 2>/dev/null || true
-echo '# Functions'
-declare -f
-echo ''
-bash_opts=$(set -o | awk '$2=="on"{print $1}')
-bash_opt_count=$(printf '%s\n' "$bash_opts" | sed '/^$/d' | wc -l | tr -d ' ')
-echo "# setopts $bash_opt_count"
-if [ -n "$bash_opts" ]; then
-  printf 'set -o %s\n' $bash_opts
-fi
-echo ''
-alias_count=$(alias -p | wc -l | tr -d ' ')
-echo "# aliases $alias_count"
-alias -p
-echo ''
-export_lines=$(
-  while IFS= read -r name; do
-    if [[ "$name" =~ ^(EXCLUDED_EXPORTS)$ ]]; then
-      continue
+\set -o posix
+if [[ -o posix ]] && ! \readonly -f builtin 2>/dev/null && ! \readonly -f command 2>/dev/null; then
+  if [[ "$__CODEX_SNAPSHOT_POSIX_WAS_SET" != 1 ]]; then
+    \set +o posix
+  fi
+  \builtin test -n "$BASH_ENV" || \builtin test ! -r "$HOME/.bashrc" || \builtin source "$HOME/.bashrc"
+  if [[ -o posix ]]; then
+    __CODEX_SNAPSHOT_POSIX_WAS_SET=1
+  else
+    __CODEX_SNAPSHOT_POSIX_WAS_SET=0
+  fi
+  \set -o posix
+  if [[ -o posix ]] && ! \readonly -f builtin 2>/dev/null && ! \readonly -f command 2>/dev/null; then
+    if [[ "$__CODEX_SNAPSHOT_POSIX_WAS_SET" != 1 ]]; then
+      \set +o posix
     fi
-    if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-      continue
+    if \builtin declare -xp BASH_ENV >/dev/null 2>&1; then
+      __CODEX_SNAPSHOT_BASH_ENV_PRESENT=1
+    else
+      __CODEX_SNAPSHOT_BASH_ENV_PRESENT=0
     fi
-    declare -xp "$name" 2>/dev/null || true
-  done < <(compgen -e)
-)
-export_count=$(printf '%s\n' "$export_lines" | sed '/^$/d' | wc -l | tr -d ' ')
-echo "# exports $export_count"
-if [ -n "$export_lines" ]; then
-  printf '%s\n' "$export_lines"
+    __CODEX_SNAPSHOT_FUNCTIONS=$(\builtin declare -f)
+    __CODEX_SNAPSHOT_ALIAS_LINES=$(\builtin alias -p 2>/dev/null) || __CODEX_SNAPSHOT_ALIAS_LINES=
+    \builtin unalias -a 2>/dev/null || \builtin true
+    \builtin printf '%s\n' '# Snapshot file'
+    \builtin printf '%s\n' '# Codex shell snapshot format: 3'
+    \builtin printf '__CODEX_SNAPSHOT_BASH_ENV_PRESENT=%s\n' "$__CODEX_SNAPSHOT_BASH_ENV_PRESENT"
+    \builtin printf '%s\n' '# Unset all aliases to avoid conflicts with functions'
+    \builtin printf '%s\n' '\builtin unalias -a 2>/dev/null || \builtin true'
+    \builtin printf '%s\n' '# shopts'
+    while IFS= \builtin read -r __CODEX_SNAPSHOT_SHOPT_LINE; do
+      \builtin printf '%s %s\n' '\builtin' "$__CODEX_SNAPSHOT_SHOPT_LINE"
+    done < <(\builtin shopt -p)
+    \builtin printf '\n'
+    __CODEX_SNAPSHOT_BASH_OPTS=$(\builtin set -o | \command awk '$2=="on"{print $1}')
+    \builtin printf '%s\n' '# setopts'
+    if [[ -n "$__CODEX_SNAPSHOT_BASH_OPTS" ]]; then
+      for __CODEX_SNAPSHOT_BASH_OPT in $__CODEX_SNAPSHOT_BASH_OPTS; do
+        \builtin printf '%s set -o %s\n' '\builtin' "$__CODEX_SNAPSHOT_BASH_OPT"
+      done
+    fi
+    \builtin printf '\n'
+    \builtin printf '%s\n' '# Functions'
+    \builtin printf '__CODEX_SNAPSHOT_FUNCTIONS=%q\n' "$__CODEX_SNAPSHOT_FUNCTIONS"
+    \builtin printf '\n'
+    \builtin printf '%s\n' '# aliases'
+    __CODEX_SNAPSHOT_ALIASES=$(
+      if [[ -n "$__CODEX_SNAPSHOT_ALIAS_LINES" ]]; then
+        while IFS= \builtin read -r __CODEX_SNAPSHOT_ALIAS_LINE; do
+          \builtin printf '%s %s\n' '\builtin' "$__CODEX_SNAPSHOT_ALIAS_LINE"
+        done <<< "$__CODEX_SNAPSHOT_ALIAS_LINES"
+      fi
+    )
+    \builtin printf '__CODEX_SNAPSHOT_ALIASES=%q\n' "$__CODEX_SNAPSHOT_ALIASES"
+    \builtin printf '\n'
+    \builtin printf '%s\n' '# exports'
+    while IFS= \builtin read -r __CODEX_SNAPSHOT_NAME; do
+      if [[ "$__CODEX_SNAPSHOT_NAME" == __CODEX_SNAPSHOT_* || "$__CODEX_SNAPSHOT_NAME" =~ ^(EXCLUDED_EXPORTS)$ ]]; then
+        \builtin continue
+      fi
+      if [[ ! "$__CODEX_SNAPSHOT_NAME" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+        \builtin continue
+      fi
+      if ! __CODEX_SNAPSHOT_EXPORT_DECLARATION=$(\builtin declare -xp "$__CODEX_SNAPSHOT_NAME" 2>/dev/null); then
+        \builtin continue
+      fi
+      __CODEX_SNAPSHOT_EXPORT_REST=${__CODEX_SNAPSHOT_EXPORT_DECLARATION#declare }
+      __CODEX_SNAPSHOT_EXPORT_FLAGS=${__CODEX_SNAPSHOT_EXPORT_REST%% *}
+      # Exported environment bytes must not replay Bash-only attributes that
+      # can reject or transform a later explicit policy restore. Bash arrays
+      # are not representable in the child-process environment.
+      case "$__CODEX_SNAPSHOT_EXPORT_FLAGS" in
+        *a*|*A*) \builtin continue ;;
+      esac
+      __CODEX_SNAPSHOT_EXPORT_ASSIGNMENT=${__CODEX_SNAPSHOT_EXPORT_REST#* }
+      \builtin printf '%s export %s\n' '\builtin' "$__CODEX_SNAPSHOT_EXPORT_ASSIGNMENT"
+    done < <(\builtin compgen -e)
+    \builtin true
+  else
+    [[ 1 == 0 ]]
+  fi
+else
+  [[ 1 == 0 ]]
 fi
 "##;
     script.replace("EXCLUDED_EXPORTS", &excluded)
@@ -403,68 +599,92 @@ fi
 
 fn sh_snapshot_script() -> String {
     let excluded = excluded_exports_regex();
-    let script = r##"if [ -n "$ENV" ] && [ -r "$ENV" ]; then
-  . "$ENV"
-fi
-echo '# Snapshot file'
-echo '# Unset all aliases to avoid conflicts with functions'
-unalias -a 2>/dev/null || true
-echo '# Functions'
-if command -v typeset >/dev/null 2>&1; then
-  typeset -f
-elif command -v declare >/dev/null 2>&1; then
-  declare -f
-fi
-echo ''
-if set -o >/dev/null 2>&1; then
-  sh_opts=$(set -o | awk '$2=="on"{print $1}')
-  sh_opt_count=$(printf '%s\n' "$sh_opts" | sed '/^$/d' | wc -l | tr -d ' ')
-  echo "# setopts $sh_opt_count"
-  if [ -n "$sh_opts" ]; then
-    printf 'set -o %s\n' $sh_opts
-  fi
-else
-  echo '# setopts 0'
-fi
-echo ''
-if alias >/dev/null 2>&1; then
-  alias_count=$(alias | wc -l | tr -d ' ')
-  echo "# aliases $alias_count"
-  alias
-  echo ''
-else
-  echo '# aliases 0'
-fi
-if export -p >/dev/null 2>&1; then
-  export_lines=$(export -p | awk '
+    let script = r##"case "$(\command printf '%s' __CODEX_SNAPSHOT_COMMAND_OK)" in
+  __CODEX_SNAPSHOT_COMMAND_OK)
+    \command test -z "$ENV" || \command test ! -r "$ENV" || \command . "$ENV"
+    case "$(\command printf '%s' __CODEX_SNAPSHOT_COMMAND_OK)" in
+      __CODEX_SNAPSHOT_COMMAND_OK)
+        if \command -v typeset >/dev/null 2>&1; then
+          __CODEX_SNAPSHOT_FUNCTIONS=$(\command typeset -f)
+        elif \command -v declare >/dev/null 2>&1; then
+          __CODEX_SNAPSHOT_FUNCTIONS=$(\command declare -f)
+        else
+          __CODEX_SNAPSHOT_FUNCTIONS=
+        fi
+        __CODEX_SNAPSHOT_ALIAS_LINES=$(\command alias 2>/dev/null) || __CODEX_SNAPSHOT_ALIAS_LINES=
+        \command unalias -a 2>/dev/null || \command true
+        \command printf '%s\n' '# Snapshot file'
+        \command printf '%s\n' '# Codex shell snapshot format: 3'
+        \command printf '%s\n' '# Unset all aliases to avoid conflicts with functions'
+        \command printf '%s\n' '\command unalias -a 2>/dev/null || \command true'
+        \command printf '%s\n' '# setopts'
+        if __CODEX_SNAPSHOT_SH_OPTS_OUTPUT=$(\command set -o 2>/dev/null); then
+          __CODEX_SNAPSHOT_SH_OPTS=$(\command printf '%s\n' "$__CODEX_SNAPSHOT_SH_OPTS_OUTPUT" | \command awk '$2=="on"{print $1}')
+          if \command [ -n "$__CODEX_SNAPSHOT_SH_OPTS" ]; then
+            for __CODEX_SNAPSHOT_SH_OPT in $__CODEX_SNAPSHOT_SH_OPTS; do
+              \command printf '%s set -o %s\n' '\command' "$__CODEX_SNAPSHOT_SH_OPT"
+            done
+          fi
+        fi
+        \command printf '\n'
+        \command printf '%s\n' '# Functions'
+        __CODEX_SNAPSHOT_FUNCTIONS_ESCAPED=$(\command printf '%s' "$__CODEX_SNAPSHOT_FUNCTIONS" | \command sed "s/'/'\"'\"'/g")
+        \command printf "__CODEX_SNAPSHOT_FUNCTIONS='%s'\n" "$__CODEX_SNAPSHOT_FUNCTIONS_ESCAPED"
+        \command printf '\n'
+        \command printf '%s\n' '# aliases'
+        if \command [ -n "$__CODEX_SNAPSHOT_ALIAS_LINES" ]; then
+          __CODEX_SNAPSHOT_ALIASES=$(
+            \command printf '%s\n' "$__CODEX_SNAPSHOT_ALIAS_LINES" |
+              while IFS= \command read -r __CODEX_SNAPSHOT_ALIAS_LINE; do
+                \command printf '%s alias %s\n' '\command' "$__CODEX_SNAPSHOT_ALIAS_LINE"
+              done
+          )
+        else
+          __CODEX_SNAPSHOT_ALIASES=
+        fi
+        __CODEX_SNAPSHOT_ALIASES_ESCAPED=$(\command printf '%s' "$__CODEX_SNAPSHOT_ALIASES" | \command sed "s/'/'\"'\"'/g")
+        \command printf "__CODEX_SNAPSHOT_ALIASES='%s'\n" "$__CODEX_SNAPSHOT_ALIASES_ESCAPED"
+        \command printf '\n'
+        \command printf '%s\n' '# exports'
+        if __CODEX_SNAPSHOT_EXPORT_OUTPUT=$(\command export -p 2>/dev/null); then
+          __CODEX_SNAPSHOT_EXPORT_LINES=$(\command printf '%s\n' "$__CODEX_SNAPSHOT_EXPORT_OUTPUT" | \command awk '
 /^(export|declare -x|typeset -x) / {
   line=$0
   name=line
   sub(/^(export|declare -x|typeset -x) /, "", name)
   sub(/=.*/, "", name)
-  if (name ~ /^(EXCLUDED_EXPORTS)$/) {
+  if (name ~ /^__CODEX_SNAPSHOT_/ || name ~ /^(EXCLUDED_EXPORTS)$/) {
     next
   }
   if (name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
     print line
   }
 }')
-  export_count=$(printf '%s\n' "$export_lines" | sed '/^$/d' | wc -l | tr -d ' ')
-  echo "# exports $export_count"
-  if [ -n "$export_lines" ]; then
-    printf '%s\n' "$export_lines"
-  fi
-else
-  export_count=$(env | sort | awk -F= '$1 ~ /^[A-Za-z_][A-Za-z0-9_]*$/ { count++ } END { print count }')
-  echo "# exports $export_count"
-  env | sort | while IFS='=' read -r key value; do
-    case "$key" in
-      ""|[0-9]*|*[!A-Za-z0-9_]*|EXCLUDED_EXPORTS) continue ;;
+          if \command [ -n "$__CODEX_SNAPSHOT_EXPORT_LINES" ]; then
+            \command printf '%s\n' "$__CODEX_SNAPSHOT_EXPORT_LINES" |
+              while IFS= \command read -r __CODEX_SNAPSHOT_EXPORT_LINE; do
+                \command printf '%s %s\n' '\command' "$__CODEX_SNAPSHOT_EXPORT_LINE"
+              done
+          fi
+        else
+          \command env | \command sort | while IFS='=' \command read -r __CODEX_SNAPSHOT_KEY __CODEX_SNAPSHOT_VALUE; do
+            case "$__CODEX_SNAPSHOT_KEY" in
+              ""|[0-9]*|*[!A-Za-z0-9_]*|__CODEX_SNAPSHOT_*|EXCLUDED_EXPORTS) \command continue ;;
+            esac
+            __CODEX_SNAPSHOT_ESCAPED=$(\command printf "%s" "$__CODEX_SNAPSHOT_VALUE" | \command sed "s/'/'\"'\"'/g")
+            \command printf "%s export %s='%s'\n" '\command' "$__CODEX_SNAPSHOT_KEY" "$__CODEX_SNAPSHOT_ESCAPED"
+          done
+        fi
+        ;;
+      *)
+        \exit 86
+        ;;
     esac
-    escaped=$(printf "%s" "$value" | sed "s/'/'\"'\"'/g")
-    printf "export %s='%s'\n" "$key" "$escaped"
-  done
-fi
+    ;;
+  *)
+    \exit 86
+    ;;
+esac
 "##;
     script.replace("EXCLUDED_EXPORTS", &excluded)
 }
@@ -480,13 +700,13 @@ Get-ChildItem Function: | ForEach-Object {
 }
 Write-Output ''
 $aliases = Get-Alias
-Write-Output ("# aliases " + $aliases.Count)
+Write-Output '# aliases'
 $aliases | ForEach-Object {
     "Set-Alias -Name {0} -Value {1}" -f $_.Name, $_.Definition
 }
 Write-Output ''
 $envVars = Get-ChildItem Env:
-Write-Output ("# exports " + $envVars.Count)
+Write-Output '# exports'
 $envVars | ForEach-Object {
     $escaped = $_.Value -replace "'", "''"
     "`$env:{0}='{1}'" -f $_.Name, $escaped

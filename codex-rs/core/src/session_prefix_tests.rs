@@ -5,6 +5,7 @@ use codex_utils_output_truncation::approx_token_count;
 use super::COMPLETION_MESSAGE_MAX_TOKENS;
 use super::ERROR_NEXT_ACTION;
 use super::format_inter_agent_completion_message;
+use super::format_subagent_notification_message;
 
 #[test]
 fn error_completion_message_stays_below_manual_review_threshold() {
@@ -17,4 +18,12 @@ fn error_completion_message_stays_below_manual_review_threshold() {
 
     assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);
     assert!(message.contains(ERROR_NEXT_ACTION));
+}
+
+#[test]
+fn legacy_error_completion_message_stays_below_manual_review_threshold() {
+    let message =
+        format_subagent_notification_message("worker", &AgentStatus::Errored("\0".repeat(10_000)));
+
+    assert!(approx_token_count(&message) < COMPLETION_MESSAGE_MAX_TOKENS);
 }

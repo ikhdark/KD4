@@ -430,18 +430,6 @@ pub(crate) async fn run_turn(
                             .await;
                         }
                     }
-                    if let Some(warning) = sess
-                        .services
-                        .task_evidence
-                        .take_finalization_warning()
-                        .await
-                    {
-                        sess.send_event(
-                            &turn_context,
-                            EventMsg::Warning(WarningEvent { message: warning }),
-                        )
-                        .await;
-                    }
                     let stop_outcome = run_turn_stop_hooks(
                         &sess,
                         &turn_context,
@@ -469,6 +457,18 @@ pub(crate) async fn run_turn(
                             )
                             .await;
                         }
+                    }
+                    if let Some(warning) = sess
+                        .services
+                        .task_evidence
+                        .take_finalization_warning()
+                        .await
+                    {
+                        sess.send_event(
+                            &turn_context,
+                            EventMsg::Warning(WarningEvent { message: warning }),
+                        )
+                        .await;
                     }
                     if stop_outcome.should_stop {
                         break;
@@ -645,7 +645,7 @@ async fn build_pure_pending_turn_plan(
             first_router,
             injection_items: Vec::new(),
             explicitly_enabled_connectors: HashSet::new(),
-            pending_token_estimate: estimate_pending_tokens(&user_input, &[]),
+            pending_token_estimate: estimate_pending_tokens(input, &[]),
             mcp_dependency_effect: None,
             warnings: Vec::new(),
             skill_plan: PlannedSkillInjections::default(),
@@ -672,13 +672,11 @@ async fn build_pure_pending_turn_plan(
     let connector_snapshot = step_context.mcp.config().connector_snapshot.clone();
     let mcp_tools = if turn_context.apps_enabled() || !mentioned_plugins.is_empty() {
         step_context
-            .mcp
-            .manager_arc()
-            .list_all_tools()
+            .mcp_tools()
             .or_cancel(cancellation_token)
             .await?
     } else {
-        Vec::new()
+        &[]
     };
     let available_connectors = if turn_context.apps_enabled() {
         let connectors = codex_connectors::merge::merge_plugin_connectors_with_accessible(
@@ -686,7 +684,7 @@ async fn build_pure_pending_turn_plan(
                 .connector_ids()
                 .iter()
                 .map(|connector_id| connector_id.0.clone()),
-            connectors::accessible_connectors_from_mcp_tools(&mcp_tools),
+            connectors::accessible_connectors_from_mcp_tools(mcp_tools),
         );
         connectors::with_app_enabled_state(connectors, &turn_context.config)
     } else {
@@ -723,7 +721,7 @@ async fn build_pure_pending_turn_plan(
     );
     let plugin_items = build_plugin_injections(
         &mentioned_plugins,
-        &mcp_tools,
+        mcp_tools,
         &available_connectors,
         &step_context.mcp.config().mcp_server_catalog,
         &connector_snapshot,
@@ -786,7 +784,7 @@ async fn build_pure_pending_turn_plan(
         generation,
         state_digest: planning_state_digest(PlanningStateDigestInput {
             step_context: step_context.as_ref(),
-            mcp_tools: &mcp_tools,
+            mcp_tools,
             connectors: &available_connectors,
             plugins: &mentioned_plugins,
             injection_items: &injection_items,
@@ -799,7 +797,7 @@ async fn build_pure_pending_turn_plan(
         identity,
         step_context,
         first_router,
-        pending_token_estimate: estimate_pending_tokens(&user_input, &injection_items),
+        pending_token_estimate: estimate_pending_tokens(input, &injection_items),
         injection_items,
         explicitly_enabled_connectors,
         mcp_dependency_effect: planned_mcp.effect,
@@ -818,8 +816,25 @@ async fn stabilize_pending_turn_plan(
     client_session: &mut ModelClientSession,
     cancellation_token: &CancellationToken,
 ) -> CodexResult<PendingTurnPlan> {
+    if cancellation_token.is_cancelled() {
+        return Err(CodexErr::TurnAborted);
+    }
+    if !turn_context
+        .config
+        .features
+        .enabled(Feature::DeferredExecutor)
+    {
+        // Normal turns freeze their environment selection, so refresh project instructions once
+        // at the turn boundary. Fixed-point retries reuse this published snapshot.
+        sess.services
+            .agents_md_manager
+            .refresh(&turn_context.config, &turn_context.environments)
+            .await;
+    }
+
     let mut fixed_point = FixedPointPlanningState::default();
     let mut check_previous_model_compaction = true;
+    let mut incoming_precompaction_completed = false;
     loop {
         if cancellation_token.is_cancelled() {
             return Err(CodexErr::TurnAborted);
@@ -830,13 +845,7 @@ async fn stabilize_pending_turn_plan(
             .map(|(id, effect)| (id.to_string(), effect.expected_inventory_keys.clone()))
             .collect::<Vec<_>>();
         for (effect_id, expected_inventory_keys) in completed_inventory_effects {
-            if !inventory_contains_expected(
-                sess,
-                turn_context.config.as_ref(),
-                &expected_inventory_keys,
-            )
-            .await
-            {
+            if !inventory_contains_expected(sess, &expected_inventory_keys).await {
                 return Err(planning_failure(format!(
                     "completed inventory effect `{effect_id}` is missing its expected model-visible state"
                 )));
@@ -860,17 +869,24 @@ async fn stabilize_pending_turn_plan(
         let compaction_timing_guard = turn_context
             .turn_timing_state
             .begin_local_phase(TurnLocalPhase::Compaction);
-        let compacted = run_pre_sampling_compact(
+        let compaction_reason = run_pre_sampling_compact(
             sess,
             turn_context,
             client_session,
             check_previous_model_compaction,
             plan.pending_token_estimate,
+            !incoming_precompaction_completed,
         )
         .await?;
         drop(compaction_timing_guard);
         check_previous_model_compaction = false;
-        if compacted {
+        if matches!(
+            compaction_reason,
+            Some(PreSamplingCompactionReason::PendingInputLimit)
+        ) {
+            incoming_precompaction_completed = true;
+        }
+        if compaction_reason.is_some() {
             client_session.invalidate_incremental_history("compaction");
             sess.services.bump_planning_generation();
             continue;
@@ -1132,15 +1148,24 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn estimate_pending_tokens(user_input: &[UserInput], injection_items: &[ResponseItem]) -> i64 {
-    let bytes = serde_json::to_vec(user_input)
+fn estimate_pending_tokens(input: &[TurnInput], injection_items: &[ResponseItem]) -> i64 {
+    let input_bytes = input.iter().fold(0usize, |bytes, item| {
+        let item_bytes = match item {
+            TurnInput::UserInput { content, .. } => serde_json::to_vec(content),
+            TurnInput::ResponseItem(item) => serde_json::to_vec(item),
+            TurnInput::InterAgentCommunication(communication) => {
+                serde_json::to_vec(&communication.to_model_input_item())
+            }
+        }
         .map(|value| value.len())
-        .unwrap_or_default()
-        .saturating_add(
-            serde_json::to_vec(injection_items)
-                .map(|value| value.len())
-                .unwrap_or_default(),
-        );
+        .unwrap_or_default();
+        bytes.saturating_add(item_bytes)
+    });
+    let bytes = input_bytes.saturating_add(
+        serde_json::to_vec(injection_items)
+            .map(|value| value.len())
+            .unwrap_or_default(),
+    );
     i64::try_from(bytes.div_ceil(4)).unwrap_or(i64::MAX)
 }
 
@@ -1274,6 +1299,13 @@ async fn track_turn_resolved_config_analytics(
         });
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreSamplingCompactionReason {
+    PreviousModel,
+    CommittedHistoryLimit,
+    PendingInputLimit,
+}
+
 #[instrument(level = "trace", skip_all)]
 async fn run_pre_sampling_compact(
     sess: &Arc<Session>,
@@ -1281,21 +1313,30 @@ async fn run_pre_sampling_compact(
     client_session: &mut ModelClientSession,
     check_previous_model: bool,
     pending_token_estimate: i64,
-) -> CodexResult<bool> {
+    allow_pending_input_compaction: bool,
+) -> CodexResult<Option<PreSamplingCompactionReason>> {
     if check_previous_model
         && maybe_run_previous_model_inline_compact(sess, turn_context, client_session).await?
     {
-        return Ok(true);
+        return Ok(Some(PreSamplingCompactionReason::PreviousModel));
     }
     let token_status =
         super::context_window::context_window_token_status(sess.as_ref(), turn_context.as_ref())
             .await;
     // Include the pure plan's incoming user/plugin/skill contribution. This
     // closes the old gap where pre-turn compaction considered only committed history.
-    let incoming_reaches_limit = token_status
-        .tokens_until_compaction
-        .is_some_and(|remaining| pending_token_estimate >= remaining);
-    if token_status.token_limit_reached || incoming_reaches_limit {
+    let incoming_reaches_limit = allow_pending_input_compaction
+        && token_status
+            .tokens_until_compaction
+            .is_some_and(|remaining| pending_token_estimate >= remaining);
+    let compaction_reason = if incoming_reaches_limit {
+        Some(PreSamplingCompactionReason::PendingInputLimit)
+    } else if token_status.token_limit_reached {
+        Some(PreSamplingCompactionReason::CommittedHistoryLimit)
+    } else {
+        None
+    };
+    if let Some(compaction_reason) = compaction_reason {
         // Pre-turn compaction runs before run_turn creates the normal sampling step.
         let step_context = sess.capture_step_context(Arc::clone(turn_context)).await;
         run_auto_compact(
@@ -1308,9 +1349,9 @@ async fn run_pre_sampling_compact(
             CompactionPhase::PreTurn,
         )
         .await?;
-        return Ok(true);
+        return Ok(Some(compaction_reason));
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// Returns true only when both turns declare compaction compatibility hashes and they differ.
@@ -1360,6 +1401,9 @@ async fn maybe_run_previous_model_inline_compact(
         turn_context.model_info.comp_hash.as_deref(),
     );
     let previous_model = previous_turn_settings.model;
+    if !should_compact_for_comp_hash_change && previous_model == turn_context.model_info.slug {
+        return Ok(false);
+    }
     let previous_model_turn_context = Arc::new(
         turn_context
             .with_model(previous_model.clone(), &sess.services.models_manager)
@@ -2401,6 +2445,7 @@ async fn drain_in_flight(
     sess: Arc<Session>,
     turn_context: Arc<TurnContext>,
 ) -> CodexResult<()> {
+    let mut first_error = None;
     while let Some(res) = in_flight.next().await {
         match res {
             Ok(response_input) => {
@@ -2415,11 +2460,14 @@ async fn drain_in_flight(
                 .await;
             }
             Err(err) => {
-                error_or_panic(format!("in-flight tool future failed during drain: {err}"));
+                error!("in-flight tool future failed during drain: {err}");
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
             }
         }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 fn assign_missing_streamed_response_item_id(
@@ -2457,6 +2505,7 @@ async fn try_run_sampling_request(
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
+    sess.ensure_rollout_budget_available()?;
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy.value(),
@@ -2520,6 +2569,7 @@ async fn try_run_sampling_request(
     )> = None;
     let mut should_emit_turn_diff = false;
     let mut should_emit_token_count = false;
+    let mut latest_models_etag = None;
     let reasoning_effort = turn_context.effective_reasoning_effort_for_tracing();
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
@@ -2803,11 +2853,7 @@ async fn try_run_sampling_request(
                 should_emit_token_count = true;
             }
             ResponseEvent::ModelsEtag(etag) => {
-                // Update internal state with latest models etag
-                sess.services
-                    .models_manager
-                    .refresh_if_new_etag(etag, turn_context.config.http_client_factory())
-                    .await;
+                latest_models_etag = Some(etag);
             }
             ResponseEvent::Completed {
                 token_usage,
@@ -3046,6 +3092,15 @@ async fn try_run_sampling_request(
             sess.send_event(&turn_context, EventMsg::Warning(WarningEvent { message }))
                 .await;
         }
+    }
+
+    if let Some(etag) = latest_models_etag {
+        let _ = sess
+            .services
+            .models_manager
+            .refresh_if_new_etag(etag, turn_context.config.http_client_factory())
+            .or_cancel(&cancellation_token)
+            .await;
     }
 
     outcome

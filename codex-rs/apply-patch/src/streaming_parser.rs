@@ -50,6 +50,10 @@ impl StreamingPatchParser {
         self.state.environment_id.as_deref()
     }
 
+    pub fn hunks(&self) -> &[Hunk] {
+        &self.state.hunks
+    }
+
     fn ensure_update_hunk_is_not_empty(&self, line: &str) -> Result<(), ParseError> {
         if let Some(UpdateFile {
             path,
@@ -142,7 +146,7 @@ impl StreamingPatchParser {
         Ok(false)
     }
 
-    pub fn push_delta(&mut self, delta: &str) -> Result<Vec<Hunk>, ParseError> {
+    pub fn push_delta_in_place(&mut self, delta: &str) -> Result<(), ParseError> {
         for ch in delta.chars() {
             if ch == '\n' {
                 let mut line = std::mem::take(&mut self.line_buffer);
@@ -154,10 +158,15 @@ impl StreamingPatchParser {
             }
         }
 
-        Ok(self.state.hunks.clone())
+        Ok(())
     }
 
-    pub fn finish(&mut self) -> Result<Vec<Hunk>, ParseError> {
+    pub fn push_delta(&mut self, delta: &str) -> Result<Vec<Hunk>, ParseError> {
+        self.push_delta_in_place(delta)?;
+        Ok(self.hunks().to_vec())
+    }
+
+    pub fn finish_in_place(&mut self) -> Result<(), ParseError> {
         if !self.line_buffer.is_empty() {
             let line = std::mem::take(&mut self.line_buffer);
             self.line_number += 1;
@@ -175,7 +184,12 @@ impl StreamingPatchParser {
             ));
         }
 
-        Ok(self.state.hunks.clone())
+        Ok(())
+    }
+
+    pub fn finish(&mut self) -> Result<Vec<Hunk>, ParseError> {
+        self.finish_in_place()?;
+        Ok(self.hunks().to_vec())
     }
 
     fn process_line(&mut self, line: &str) -> Result<(), ParseError> {

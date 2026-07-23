@@ -836,6 +836,111 @@ fn replace_last_turn_images_replaces_tool_output_images() {
 }
 
 #[test]
+fn replace_last_turn_images_finds_image_before_later_text_output() {
+    let later_text_output = ResponseItem::FunctionCallOutput {
+        id: None,
+        call_id: "call-2".to_string(),
+        output: FunctionCallOutputPayload::from_text("later output".to_string()),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut history = create_history_with_items(vec![
+        user_input_text_msg("hi"),
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/png;base64,AAA".to_string(),
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
+            ]),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        later_text_output.clone(),
+    ]);
+
+    assert!(history.replace_last_turn_images("Invalid image"));
+    assert_eq!(
+        history.raw_items(),
+        vec![
+            user_input_text_msg("hi"),
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload::from_content_items(vec![
+                    FunctionCallOutputContentItem::InputText {
+                        text: "Invalid image".to_string(),
+                    },
+                ]),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            later_text_output,
+        ]
+    );
+}
+
+#[test]
+fn replace_last_turn_images_replaces_images_in_every_output_once() {
+    let mut history = create_history_with_items(vec![
+        user_input_text_msg("hi"),
+        ResponseItem::FunctionCallOutput {
+            id: None,
+            call_id: "call-1".to_string(),
+            output: FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/png;base64,AAA".to_string(),
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
+            ]),
+            internal_chat_message_metadata_passthrough: None,
+        },
+        ResponseItem::CustomToolCallOutput {
+            id: None,
+            call_id: "call-2".to_string(),
+            name: None,
+            output: FunctionCallOutputPayload::from_content_items(vec![
+                FunctionCallOutputContentItem::InputImage {
+                    image_url: "data:image/png;base64,BBB".to_string(),
+                    detail: Some(DEFAULT_IMAGE_DETAIL),
+                },
+            ]),
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ]);
+    let previous_history_version = history.history_version();
+
+    assert!(history.replace_last_turn_images("Invalid image"));
+    assert_eq!(
+        history.raw_items(),
+        vec![
+            user_input_text_msg("hi"),
+            ResponseItem::FunctionCallOutput {
+                id: None,
+                call_id: "call-1".to_string(),
+                output: FunctionCallOutputPayload::from_content_items(vec![
+                    FunctionCallOutputContentItem::InputText {
+                        text: "Invalid image".to_string(),
+                    },
+                ]),
+                internal_chat_message_metadata_passthrough: None,
+            },
+            ResponseItem::CustomToolCallOutput {
+                id: None,
+                call_id: "call-2".to_string(),
+                name: None,
+                output: FunctionCallOutputPayload::from_content_items(vec![
+                    FunctionCallOutputContentItem::InputText {
+                        text: "Invalid image".to_string(),
+                    },
+                ]),
+                internal_chat_message_metadata_passthrough: None,
+            },
+        ]
+    );
+    assert_eq!(history.history_version(), previous_history_version + 1);
+}
+
+#[test]
 fn replace_last_turn_images_does_not_touch_user_images() {
     let items = vec![ResponseItem::Message {
         id: None,
@@ -1709,7 +1814,7 @@ fn normalize_adds_missing_output_for_tool_search_call() {
             ResponseItem::ToolSearchOutput {
                 id: None,
                 call_id: Some("search-call-x".to_string()),
-                status: "completed".to_string(),
+                status: "incomplete".to_string(),
                 execution: "client".to_string(),
                 tools: Vec::new(),
                 internal_chat_message_metadata_passthrough: None,

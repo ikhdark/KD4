@@ -23,6 +23,13 @@ pub(super) async fn maybe_record_reminder(
 }
 
 impl Session {
+    pub(crate) fn ensure_rollout_budget_available(&self) -> CodexResult<()> {
+        if self.services.agent_control.rollout_budget().is_exhausted() {
+            return Err(CodexErr::SessionBudgetExceeded);
+        }
+        Ok(())
+    }
+
     pub(crate) fn record_rollout_budget_usage(&self, usage: &TokenUsage) -> CodexResult<()> {
         if self
             .services

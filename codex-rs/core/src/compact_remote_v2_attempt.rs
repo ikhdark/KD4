@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 pub(super) struct RemoteCompactV2Attempt {
-    pub(super) trace_input_history: Vec<ResponseItem>,
+    pub(super) trace_input_history: Option<Vec<ResponseItem>>,
     pub(super) prompt_input: Vec<ResponseItem>,
     pub(super) compaction_output: ResponseItem,
     pub(super) token_usage: Option<TokenUsage>,
@@ -63,15 +63,16 @@ pub(super) async fn run_remote_compact_v2_attempt(
             });
     }
 
-    let trace_input_history = history.raw_items().to_vec();
-    let prompt_input = history.for_prompt(&turn_context.model_info.input_modalities);
+    let trace_input_history = compaction_trace
+        .is_enabled()
+        .then(|| history.raw_items().to_vec());
+    let mut input = history.for_prompt(&turn_context.model_info.input_modalities);
     let tool_router = built_tools(
         sess.as_ref(),
         step_context.as_ref(),
         &CancellationToken::new(),
     )
     .await?;
-    let mut input = prompt_input.clone();
     input.push(ResponseItem::CompactionTrigger {});
     let prompt = Prompt {
         input,
@@ -88,12 +89,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
-    let trace_attempt = compaction_trace.start_attempt(&serde_json::json!({
-        "model": turn_context.model_info.slug.as_str(),
-        "instructions": prompt.base_instructions.text.as_str(),
-        "input": &prompt.input,
-        "parallel_tool_calls": prompt.parallel_tool_calls,
-    }));
     let mut owned_client_session = None;
     let client_session = match client_session {
         Some(client_session) => client_session,
@@ -105,17 +100,17 @@ pub(super) async fn run_remote_compact_v2_attempt(
         client_session,
         &prompt,
         &responses_metadata,
+        compaction_trace,
     )
     .await;
-    trace_attempt.record_result(
-        compaction_output_result
-            .as_ref()
-            .map(|output| std::slice::from_ref(&output.compaction_output)),
-    );
     let RemoteCompactionV2Output {
         compaction_output,
         token_usage,
     } = compaction_output_result?;
+    let mut prompt_input = prompt.input;
+    let Some(ResponseItem::CompactionTrigger {}) = prompt_input.pop() else {
+        unreachable!("remote compaction v2 prompt must end with its synthetic trigger");
+    };
     Ok(RemoteCompactV2Attempt {
         trace_input_history,
         prompt_input,

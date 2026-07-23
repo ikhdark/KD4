@@ -30,6 +30,8 @@ struct ActiveAgents {
     agent_tree: HashMap<String, AgentMetadata>,
     used_agent_nicknames: HashSet<String>,
     nickname_reset_count: usize,
+    closing_threads: HashMap<ThreadId, usize>,
+    parent_spawn_reservations: HashMap<ThreadId, usize>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -93,7 +95,20 @@ impl AgentRegistry {
             active: true,
             reserved_agent_nickname: None,
             reserved_agent_path: None,
+            parent_thread_id: None,
         })
+    }
+
+    pub(crate) fn begin_closing_agent_tree(
+        self: &Arc<Self>,
+        root_thread_id: ThreadId,
+    ) -> AgentTreeClosingGuard {
+        let mut guard = AgentTreeClosingGuard {
+            state: Arc::clone(self),
+            thread_ids: HashSet::new(),
+        };
+        guard.mark_threads([root_thread_id]);
+        guard
     }
 
     pub(crate) fn release_spawned_thread(&self, thread_id: ThreadId) {
@@ -194,14 +209,25 @@ impl AgentRegistry {
         }
     }
 
-    fn register_spawned_thread(&self, agent_metadata: AgentMetadata) {
+    fn register_spawned_thread(
+        &self,
+        agent_metadata: AgentMetadata,
+        parent_thread_id: Option<ThreadId>,
+    ) -> Result<()> {
         let Some(thread_id) = agent_metadata.agent_id else {
-            return;
+            return Ok(());
         };
         let mut active_agents = self
             .active_agents
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(parent_thread_id) = parent_thread_id
+            && active_agents
+                .closing_threads
+                .contains_key(&parent_thread_id)
+        {
+            return Err(parent_closing_error(parent_thread_id));
+        }
         let key = agent_metadata
             .agent_path
             .as_ref()
@@ -211,6 +237,91 @@ impl AgentRegistry {
             active_agents.used_agent_nicknames.insert(agent_nickname);
         }
         active_agents.agent_tree.insert(key, agent_metadata);
+        Ok(())
+    }
+
+    fn ensure_parent_open(&self, parent_thread_id: ThreadId) -> Result<()> {
+        let mut active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if active_agents
+            .closing_threads
+            .contains_key(&parent_thread_id)
+        {
+            return Err(parent_closing_error(parent_thread_id));
+        }
+        let count = active_agents
+            .parent_spawn_reservations
+            .entry(parent_thread_id)
+            .or_default();
+        *count = count.saturating_add(1);
+        Ok(())
+    }
+
+    fn release_parent_spawn_reservation(&self, parent_thread_id: ThreadId) {
+        let mut active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove_reservation = match active_agents
+            .parent_spawn_reservations
+            .entry(parent_thread_id)
+        {
+            Entry::Occupied(mut entry) if *entry.get() > 1 => {
+                *entry.get_mut() -= 1;
+                false
+            }
+            Entry::Occupied(entry) => {
+                entry.remove();
+                true
+            }
+            Entry::Vacant(_) => false,
+        };
+        if remove_reservation
+            && active_agents
+                .closing_threads
+                .get(&parent_thread_id)
+                .is_some_and(|guard_count| *guard_count == 0)
+        {
+            active_agents.closing_threads.remove(&parent_thread_id);
+        }
+    }
+
+    fn mark_threads_closing(&self, thread_ids: &[ThreadId]) {
+        let mut active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for thread_id in thread_ids {
+            let count = active_agents.closing_threads.entry(*thread_id).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+
+    fn release_closing_threads(&self, thread_ids: &HashSet<ThreadId>) {
+        let mut active_agents = self
+            .active_agents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for thread_id in thread_ids {
+            let has_pending_spawn = active_agents
+                .parent_spawn_reservations
+                .contains_key(thread_id);
+            match active_agents.closing_threads.entry(*thread_id) {
+                Entry::Occupied(mut entry) if *entry.get() > 1 => {
+                    *entry.get_mut() -= 1;
+                }
+                Entry::Occupied(mut entry) => {
+                    if has_pending_spawn {
+                        *entry.get_mut() = 0;
+                    } else {
+                        entry.remove();
+                    }
+                }
+                Entry::Vacant(_) => {}
+            }
+        }
     }
 
     fn reserve_agent_nickname(&self, names: &[&str], preferred: Option<&str>) -> Option<String> {
@@ -305,11 +416,41 @@ impl AgentRegistry {
     }
 }
 
+fn parent_closing_error(parent_thread_id: ThreadId) -> CodexErr {
+    CodexErr::UnsupportedOperation(format!(
+        "cannot spawn a child agent while parent agent {parent_thread_id} is closing"
+    ))
+}
+
+pub(crate) struct AgentTreeClosingGuard {
+    state: Arc<AgentRegistry>,
+    thread_ids: HashSet<ThreadId>,
+}
+
+impl AgentTreeClosingGuard {
+    pub(crate) fn mark_threads(&mut self, thread_ids: impl IntoIterator<Item = ThreadId>) {
+        let newly_marked = thread_ids
+            .into_iter()
+            .filter(|thread_id| self.thread_ids.insert(*thread_id))
+            .collect::<Vec<_>>();
+        if !newly_marked.is_empty() {
+            self.state.mark_threads_closing(&newly_marked);
+        }
+    }
+}
+
+impl Drop for AgentTreeClosingGuard {
+    fn drop(&mut self) {
+        self.state.release_closing_threads(&self.thread_ids);
+    }
+}
+
 pub(crate) struct SpawnReservation {
     state: Arc<AgentRegistry>,
     active: bool,
     reserved_agent_nickname: Option<String>,
     reserved_agent_path: Option<AgentPath>,
+    parent_thread_id: Option<ThreadId>,
 }
 
 impl SpawnReservation {
@@ -334,17 +475,35 @@ impl SpawnReservation {
         Ok(())
     }
 
-    pub(crate) fn commit(mut self, agent_metadata: AgentMetadata) {
+    pub(crate) fn reserve_parent_thread(&mut self, parent_thread_id: ThreadId) -> Result<()> {
+        self.state.ensure_parent_open(parent_thread_id)?;
+        self.parent_thread_id = Some(parent_thread_id);
+        Ok(())
+    }
+
+    pub(crate) fn commit(mut self, agent_metadata: AgentMetadata) -> Result<()> {
+        let result = self
+            .state
+            .register_spawned_thread(agent_metadata, self.parent_thread_id);
+        if let Some(parent_thread_id) = self.parent_thread_id.take() {
+            self.state
+                .release_parent_spawn_reservation(parent_thread_id);
+        }
+        result?;
         self.reserved_agent_nickname = None;
         self.reserved_agent_path = None;
-        self.state.register_spawned_thread(agent_metadata);
         self.active = false;
+        Ok(())
     }
 }
 
 impl Drop for SpawnReservation {
     fn drop(&mut self) {
         if self.active {
+            if let Some(parent_thread_id) = self.parent_thread_id.take() {
+                self.state
+                    .release_parent_spawn_reservation(parent_thread_id);
+            }
             if let Some(agent_path) = self.reserved_agent_path.take() {
                 self.state.release_reserved_agent_path(&agent_path);
             }

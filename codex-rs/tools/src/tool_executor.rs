@@ -1,6 +1,7 @@
 use crate::FunctionCallError;
 use crate::ToolName;
 use crate::ToolOutput;
+use crate::ToolPayload;
 use crate::ToolSearchInfo;
 use crate::ToolSpec;
 use std::future::Future;
@@ -9,6 +10,16 @@ use std::pin::Pin;
 /// The boxed future returned by [`ToolExecutor::handle`].
 pub type ToolExecutorFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Box<dyn ToolOutput>, FunctionCallError>> + Send + 'a>>;
+
+/// Conversation history an extension needs for one tool invocation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ConversationHistoryRequirement {
+    /// Preserve compatibility by exposing the complete retained history.
+    #[default]
+    Full,
+    /// Skip the history snapshot entirely for payloads that cannot read it.
+    None,
+}
 
 /// Controls where a tool is exposed to the model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +73,20 @@ pub trait ToolExecutor<Invocation>: Send + Sync {
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {
+        false
+    }
+
+    /// Returns the history needed for this payload before the invocation is built.
+    fn conversation_history_requirement(
+        &self,
+        _payload: &ToolPayload,
+    ) -> ConversationHistoryRequirement {
+        ConversationHistoryRequirement::Full
+    }
+
+    /// Whether this executor observes the invocation cancellation token and
+    /// completes any runtime-owned lifecycle cleanup before returning.
+    fn handles_runtime_cancellation(&self) -> bool {
         false
     }
 

@@ -19,12 +19,14 @@ use codex_file_search::source_search::SOURCE_SEARCH_MAX_ROOTS;
 use codex_file_search::source_search::SOURCE_SEARCH_MAX_WALK_DEPTH;
 use codex_file_search::source_search::SOURCE_SEARCH_MAX_WALK_DIRECTORIES;
 use codex_file_search::source_search::SOURCE_SEARCH_MAX_WALK_ENTRIES;
+use codex_file_search::source_search::SourceIgnoreMatcher;
 use codex_file_search::source_search::SourceSearchAccumulator;
 use codex_file_search::source_search::SourceSearchOptions;
 use codex_file_search::source_search::SourceSearchOutput;
 use codex_file_search::source_search::read_file_span_from_bytes;
 use codex_file_search::source_search::should_descend_source_path;
 use codex_file_search::source_search::should_scan_source_file;
+use codex_file_search::source_search::validate_read_file_span_bounds;
 use codex_file_system::ExecutorFileSystem;
 use codex_file_system::FileMetadata;
 use codex_file_system::FileSystemSandboxContext;
@@ -42,6 +44,7 @@ use std::sync::Arc;
 const SOURCE_TOOL_MAX_RENDERED_BYTES: usize = 8 * 1024;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchSourceArgs {
     query: String,
     #[serde(default)]
@@ -63,6 +66,7 @@ struct SearchSourceArgs {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadFileSpanArgs {
     path: String,
     #[serde(default)]
@@ -115,7 +119,7 @@ impl ToolExecutor<ToolInvocation> for SearchSourceHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(handle_search_source(invocation))
+        Box::pin(handle_search_source(invocation, self.options))
     }
 }
 
@@ -135,7 +139,7 @@ impl ToolExecutor<ToolInvocation> for ReadFileSpanHandler {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(handle_read_file_span(invocation))
+        Box::pin(handle_read_file_span(invocation, self.options))
     }
 }
 
@@ -143,6 +147,7 @@ impl CoreToolRuntime for ReadFileSpanHandler {}
 
 async fn handle_search_source(
     invocation: ToolInvocation,
+    tool_options: SourceToolOptions,
 ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
     let ToolPayload::Function { ref arguments } = invocation.payload else {
         return Err(FunctionCallError::RespondToModel(
@@ -152,7 +157,11 @@ async fn handle_search_source(
     let args: SearchSourceArgs = serde_json::from_str(arguments).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to parse search_source arguments: {err}"))
     })?;
-    let source_context = local_source_context(&invocation, args.environment_id.as_deref()).await?;
+    reject_unadvertised_environment_id(
+        SEARCH_SOURCE_TOOL_NAME,
+        tool_options,
+        args.environment_id.as_deref(),
+    )?;
     let mut options = SourceSearchOptions::new(PathBuf::new(), args.query);
     options.roots = args.paths.into_iter().map(PathBuf::from).collect();
     options.max_matches = args
@@ -163,14 +172,24 @@ async fn handle_search_source(
     options.include_generated = args.include_generated;
     options.include_vendor = args.include_vendor;
     options.include_locks = args.include_locks;
-    let recover_explicit_root_failures = !options.roots.is_empty();
-    let roots = resolve_search_roots(&source_context, &options.roots).await?;
+    validate_search_root_count(&options.roots)?;
     let mut accumulator = SourceSearchAccumulator::new(&options)
         .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+    let source_context = local_source_context(&invocation, args.environment_id.as_deref()).await?;
+    let recover_explicit_root_failures = !options.roots.is_empty();
+    let roots = resolve_search_roots(&source_context, &options.roots).await?;
+    let ignore_matcher = SourceIgnoreMatcher::new_preloaded(
+        source_context
+            .is_git_repository
+            .then_some(source_context.repo_root_abs.as_path()),
+    );
+    load_repository_exclude_rules(&source_context, &ignore_matcher).await?;
+    load_global_ignore_rules(&source_context, &ignore_matcher).await;
     scan_source_roots(
         &source_context,
         &roots,
         &options,
+        &ignore_matcher,
         &mut accumulator,
         recover_explicit_root_failures,
     )
@@ -190,6 +209,7 @@ async fn handle_search_source(
 
 async fn handle_read_file_span(
     invocation: ToolInvocation,
+    tool_options: SourceToolOptions,
 ) -> Result<Box<dyn crate::tools::context::ToolOutput>, FunctionCallError> {
     let ToolPayload::Function { ref arguments } = invocation.payload else {
         return Err(FunctionCallError::RespondToModel(
@@ -201,6 +221,15 @@ async fn handle_read_file_span(
             "failed to parse read_file_span arguments: {err}"
         ))
     })?;
+    reject_unadvertised_environment_id(
+        READ_FILE_SPAN_TOOL_NAME,
+        tool_options,
+        args.environment_id.as_deref(),
+    )?;
+    let start_line = args.start_line.unwrap_or(1);
+    let line_count = args.line_count.unwrap_or(SOURCE_READ_DEFAULT_LINES);
+    validate_read_file_span_bounds(start_line, line_count)
+        .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
     let source_context = local_source_context(&invocation, args.environment_id.as_deref()).await?;
     let path = resolve_confined_path(&source_context, &args.path, "source file").await?;
     let metadata = source_context
@@ -228,13 +257,8 @@ async fn handle_read_file_span(
         )));
     };
     let relative_path = relative_source_path(&source_context, &path)?;
-    let output = read_file_span_from_bytes(
-        relative_path,
-        bytes,
-        args.start_line.unwrap_or(1),
-        args.line_count.unwrap_or(SOURCE_READ_DEFAULT_LINES),
-    )
-    .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+    let output = read_file_span_from_bytes(relative_path, bytes, start_line, line_count)
+        .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
 
     Ok(boxed_tool_output(FunctionToolOutput::from_text(
         render_read_output(&output),
@@ -242,11 +266,25 @@ async fn handle_read_file_span(
     )))
 }
 
+fn reject_unadvertised_environment_id(
+    tool_name: &str,
+    options: SourceToolOptions,
+    environment_id: Option<&str>,
+) -> Result<(), FunctionCallError> {
+    if !options.include_environment_id && environment_id.is_some() {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "failed to parse {tool_name} arguments: unknown field `environment_id`"
+        )));
+    }
+    Ok(())
+}
+
 struct LocalSourceContext {
     fs: Arc<dyn ExecutorFileSystem>,
     sandbox: FileSystemSandboxContext,
     repo_root: PathUri,
     repo_root_abs: AbsolutePathBuf,
+    is_git_repository: bool,
 }
 
 async fn local_source_context(
@@ -284,7 +322,7 @@ async fn local_source_context(
             cwd.inferred_native_path_string()
         )));
     }
-    let repo_root = find_repo_root(fs.as_ref(), &sandbox, &cwd).await?;
+    let (repo_root, is_git_repository) = find_repo_root(fs.as_ref(), &sandbox, &cwd).await?;
     let repo_root_abs = repo_root.to_abs_path().map_err(|err| {
         FunctionCallError::RespondToModel(format!("source repo root is not host-native: {err}"))
     })?;
@@ -293,6 +331,7 @@ async fn local_source_context(
         sandbox,
         repo_root,
         repo_root_abs,
+        is_git_repository,
     })
 }
 
@@ -300,7 +339,7 @@ async fn find_repo_root(
     fs: &dyn ExecutorFileSystem,
     sandbox: &FileSystemSandboxContext,
     cwd: &PathUri,
-) -> Result<PathUri, FunctionCallError> {
+) -> Result<(PathUri, bool), FunctionCallError> {
     for ancestor in cwd.ancestors() {
         let dot_git = ancestor.join(".git").map_err(|err| {
             FunctionCallError::RespondToModel(format!(
@@ -309,26 +348,22 @@ async fn find_repo_root(
             ))
         })?;
         match fs.get_metadata(&dot_git, Some(sandbox)).await {
-            Ok(metadata) if metadata.is_directory || metadata.is_file => return Ok(ancestor),
+            Ok(metadata) if metadata.is_directory || metadata.is_file => {
+                return Ok((ancestor, true));
+            }
             Ok(_) => {}
             Err(err) if err.kind() == ErrorKind::NotFound => {}
             Err(err) => return Err(source_fs_error("inspect", &dot_git, err)),
         }
     }
-    Ok(cwd.clone())
+    Ok((cwd.clone(), false))
 }
 
 async fn resolve_search_roots(
     context: &LocalSourceContext,
     roots: &[PathBuf],
 ) -> Result<Vec<PathUri>, FunctionCallError> {
-    if roots.len() > SOURCE_SEARCH_MAX_ROOTS {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "too many source roots ({} provided, max {})",
-            roots.len(),
-            SOURCE_SEARCH_MAX_ROOTS
-        )));
-    }
+    validate_search_root_count(roots)?;
     let mut roots = if roots.is_empty() {
         vec![context.repo_root.clone()]
     } else {
@@ -357,6 +392,17 @@ async fn resolve_search_roots(
     Ok(deduped)
 }
 
+fn validate_search_root_count(roots: &[PathBuf]) -> Result<(), FunctionCallError> {
+    if roots.len() > SOURCE_SEARCH_MAX_ROOTS {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "too many source roots ({} provided, max {})",
+            roots.len(),
+            SOURCE_SEARCH_MAX_ROOTS
+        )));
+    }
+    Ok(())
+}
+
 async fn resolve_confined_path(
     context: &LocalSourceContext,
     path: &str,
@@ -379,10 +425,228 @@ async fn resolve_confined_path(
     Ok(canonical)
 }
 
+async fn load_repository_exclude_rules(
+    context: &LocalSourceContext,
+    ignore_matcher: &SourceIgnoreMatcher,
+) -> Result<(), FunctionCallError> {
+    if !context.is_git_repository {
+        return Ok(());
+    }
+    let dot_git = context.repo_root.join(".git").map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "unable to resolve repository ignore metadata: {err}"
+        ))
+    })?;
+    let git_common_directory = match context
+        .fs
+        .get_metadata(&dot_git, Some(&context.sandbox))
+        .await
+    {
+        Ok(metadata) if metadata.is_directory => Some(dot_git),
+        Ok(metadata) if metadata.is_file => resolve_git_common_directory(context, &dot_git).await,
+        Ok(_) | Err(_) => None,
+    };
+    let Some(git_common_directory) = git_common_directory else {
+        return Ok(());
+    };
+    let Some(exclude_path) = git_common_directory.join("info/exclude").ok() else {
+        return Ok(());
+    };
+    let Some(contents) = read_optional_ignore_text(context, &exclude_path).await else {
+        return Ok(());
+    };
+    let source_path = exclude_path.to_abs_path().map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "repository exclude path is not host-native: {err}"
+        ))
+    })?;
+    ignore_matcher.set_repository_exclude(
+        context.repo_root_abs.as_path(),
+        source_path.as_path(),
+        &contents,
+    );
+    Ok(())
+}
+
+async fn load_global_ignore_rules(
+    context: &LocalSourceContext,
+    ignore_matcher: &SourceIgnoreMatcher,
+) {
+    if !context.is_git_repository {
+        return;
+    }
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let config_root = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let config_paths = [home.join(".gitconfig"), config_root.join("git/config")];
+    let mut ignore_path = None;
+    for config_path in config_paths {
+        let Some(contents) = read_optional_host_ignore_text(context, &config_path).await else {
+            continue;
+        };
+        if let Some(configured_path) = parse_global_excludes_path(&contents, &home) {
+            ignore_path = Some(configured_path);
+            break;
+        }
+    }
+    let ignore_path = ignore_path.unwrap_or_else(|| config_root.join("git/ignore"));
+    let Some(contents) = read_optional_host_ignore_text(context, &ignore_path).await else {
+        return;
+    };
+    ignore_matcher.set_global_gitignore(context.repo_root_abs.as_path(), &ignore_path, &contents);
+}
+
+fn parse_global_excludes_path(contents: &str, home: &Path) -> Option<PathBuf> {
+    let value = contents.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        key.trim()
+            .eq_ignore_ascii_case("excludesfile")
+            .then(|| value.trim().trim_matches('"'))
+    })?;
+    if value.is_empty() {
+        return None;
+    }
+    if value == "~" {
+        return Some(home.to_path_buf());
+    }
+    if let Some(relative) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
+    {
+        return Some(home.join(relative));
+    }
+    let path = PathBuf::from(value);
+    path.is_absolute().then_some(path)
+}
+
+async fn read_optional_host_ignore_text(
+    context: &LocalSourceContext,
+    path: &Path,
+) -> Option<String> {
+    let path = AbsolutePathBuf::from_absolute_path(path).ok()?;
+    let path = PathUri::from_abs_path(&path);
+    read_optional_ignore_text(context, &path).await
+}
+
+async fn resolve_git_common_directory(
+    context: &LocalSourceContext,
+    dot_git: &PathUri,
+) -> Option<PathUri> {
+    let contents = read_optional_ignore_text(context, dot_git).await?;
+    let git_dir_target = contents.strip_prefix("gitdir:")?.trim();
+    if git_dir_target.is_empty() {
+        return None;
+    }
+    let git_directory = context.repo_root.join(git_dir_target).ok()?;
+    let git_directory = context
+        .fs
+        .canonicalize(&git_directory, Some(&context.sandbox))
+        .await
+        .ok()?;
+    let common_dir_path = git_directory.join("commondir").ok()?;
+    let Some(common_dir) = read_optional_ignore_text(context, &common_dir_path).await else {
+        return Some(git_directory);
+    };
+    let common_dir = common_dir.trim();
+    if common_dir.is_empty() {
+        return Some(git_directory);
+    }
+    let common_directory = git_directory.join(common_dir).ok()?;
+    context
+        .fs
+        .canonicalize(&common_directory, Some(&context.sandbox))
+        .await
+        .ok()
+        .or(Some(git_directory))
+}
+
+async fn read_optional_ignore_text(context: &LocalSourceContext, path: &PathUri) -> Option<String> {
+    let bytes = if path.starts_with(&context.repo_root) {
+        context
+            .fs
+            .read_file_bounded_confined(
+                path,
+                &context.repo_root,
+                SOURCE_SEARCH_MAX_FILE_BYTES,
+                Some(&context.sandbox),
+            )
+            .await
+            .ok()??
+    } else {
+        context
+            .fs
+            .read_file_bounded(path, SOURCE_SEARCH_MAX_FILE_BYTES, Some(&context.sandbox))
+            .await
+            .ok()??
+    };
+    String::from_utf8(bytes).ok()
+}
+
+async fn load_directory_ignore_rules(
+    context: &LocalSourceContext,
+    directory: &PathUri,
+    ignore_matcher: &SourceIgnoreMatcher,
+) -> Result<(), FunctionCallError> {
+    let directory_path = directory.to_abs_path().map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "source ignore directory is not host-native: {err}"
+        ))
+    })?;
+    if ignore_matcher.has_directory_rules(directory_path.as_path()) {
+        return Ok(());
+    }
+    let ignore_path = directory.join(".ignore").map_err(|err| {
+        FunctionCallError::RespondToModel(format!("unable to resolve .ignore path: {err}"))
+    })?;
+    let git_ignore_path = directory.join(".gitignore").map_err(|err| {
+        FunctionCallError::RespondToModel(format!("unable to resolve .gitignore path: {err}"))
+    })?;
+    let ignore_contents = read_optional_ignore_text(context, &ignore_path).await;
+    let git_ignore_contents = read_optional_ignore_text(context, &git_ignore_path).await;
+    ignore_matcher.add_directory_rules(
+        directory_path.as_path(),
+        ignore_contents.as_deref(),
+        git_ignore_contents.as_deref(),
+    );
+    Ok(())
+}
+
+async fn load_ignore_rules_through(
+    context: &LocalSourceContext,
+    directory: &PathUri,
+    ignore_matcher: &SourceIgnoreMatcher,
+) -> Result<(), FunctionCallError> {
+    let mut ancestors = directory
+        .ancestors()
+        .take_while(|ancestor| ancestor.starts_with(&context.repo_root))
+        .collect::<Vec<_>>();
+    ancestors.reverse();
+    for ancestor in ancestors {
+        load_directory_ignore_rules(context, &ancestor, ignore_matcher).await?;
+    }
+    Ok(())
+}
+
+fn source_path_is_ignored(
+    path: &PathUri,
+    is_directory: bool,
+    ignore_matcher: &SourceIgnoreMatcher,
+) -> Result<bool, FunctionCallError> {
+    let path = path.to_abs_path().map_err(|err| {
+        FunctionCallError::RespondToModel(format!("source ignore path is not host-native: {err}"))
+    })?;
+    Ok(ignore_matcher.is_ignored(path.as_path(), is_directory))
+}
+
 async fn scan_source_root(
     context: &LocalSourceContext,
     root: &PathUri,
     options: &SourceSearchOptions,
+    ignore_matcher: &SourceIgnoreMatcher,
     accumulator: &mut SourceSearchAccumulator,
 ) -> Result<(), FunctionCallError> {
     let metadata = context
@@ -399,6 +663,10 @@ async fn scan_source_root(
             root.inferred_native_path_string()
         )));
     }
+    load_ignore_rules_through(context, root, ignore_matcher).await?;
+    if root != &context.repo_root && source_path_is_ignored(root, true, ignore_matcher)? {
+        return Ok(());
+    }
 
     let mut queue = VecDeque::from([(root.clone(), 0usize)]);
     while let Some((directory, depth)) = queue.pop_front() {
@@ -408,6 +676,7 @@ async fn scan_source_root(
         if !accumulator.reserve_walk_directory(SOURCE_SEARCH_MAX_WALK_DIRECTORIES) {
             break;
         }
+        load_directory_ignore_rules(context, &directory, ignore_matcher).await?;
         let remaining_entries = accumulator.remaining_walk_entries(SOURCE_SEARCH_MAX_WALK_ENTRIES);
         if remaining_entries == 0 {
             accumulator.mark_walk_limit();
@@ -445,28 +714,29 @@ async fn scan_source_root(
             else {
                 continue;
             };
-            let Some(child_metadata) = recover_scan_result(
-                context
-                    .fs
-                    .get_metadata(&child, Some(&context.sandbox))
-                    .await,
-                accumulator,
-            ) else {
-                continue;
-            };
-
-            if child_metadata.is_directory {
+            if entry.is_directory {
+                let Some(child_metadata) = recover_scan_result(
+                    context
+                        .fs
+                        .get_metadata(&child, Some(&context.sandbox))
+                        .await,
+                    accumulator,
+                ) else {
+                    continue;
+                };
                 let Some(relative) =
                     recover_scan_result(relative_source_path(context, &child), accumulator)
                 else {
                     continue;
                 };
-                if child_metadata.is_symlink
+                if !child_metadata.is_directory
+                    || child_metadata.is_symlink
                     || !should_descend_source_path(
                         Path::new(&relative),
                         options.include_generated,
                         options.include_vendor,
                     )
+                    || source_path_is_ignored(&child, true, ignore_matcher)?
                 {
                     continue;
                 }
@@ -477,7 +747,7 @@ async fn scan_source_root(
                 queue.push_back((child, depth.saturating_add(1)));
                 continue;
             }
-            if !child_metadata.is_file {
+            if !entry.is_file {
                 continue;
             }
             let Some(relative) =
@@ -490,7 +760,8 @@ async fn scan_source_root(
                 options.include_generated,
                 options.include_vendor,
                 options.include_locks,
-            ) {
+            ) || source_path_is_ignored(&child, false, ignore_matcher)?
+            {
                 continue;
             }
             let Some(canonical) = recover_scan_result(
@@ -523,6 +794,7 @@ async fn scan_source_roots(
     context: &LocalSourceContext,
     roots: &[PathUri],
     options: &SourceSearchOptions,
+    ignore_matcher: &SourceIgnoreMatcher,
     accumulator: &mut SourceSearchAccumulator,
     recover_root_failures: bool,
 ) -> Result<(), FunctionCallError> {
@@ -530,7 +802,7 @@ async fn scan_source_roots(
         if accumulator.should_stop() {
             break;
         }
-        let result = scan_source_root(context, root, options, accumulator).await;
+        let result = scan_source_root(context, root, options, ignore_matcher, accumulator).await;
         if recover_root_failures {
             let _ = recover_scan_result(result, accumulator);
         } else {
@@ -656,114 +928,225 @@ fn source_fs_error(action: &str, path: &PathUri, err: std::io::Error) -> Functio
 }
 
 fn render_search_output(output: &SourceSearchOutput) -> String {
-    let rendered = render_search_output_inner(output, false);
-    if rendered.len() <= SOURCE_TOOL_MAX_RENDERED_BYTES {
-        return rendered;
+    let mut rendered = BoundedSourceOutput::new();
+    let _ = rendered.push_line("Source search evidence:".to_string());
+    let _ = rendered.push_line(format!("query: {}", output.query));
+    let coverage_line_index = rendered.line_count();
+    let _ = rendered.push_line(render_search_coverage(output, output.truncated));
+    if let Some(reason) = output.truncated_reason {
+        let _ = rendered.push_line(format!("truncated_reason: {reason:?}"));
     }
-    bound_model_output(render_search_output_inner(output, true))
+    let render_reason_index = rendered.line_count();
+
+    'matches: for source_match in &output.matches {
+        let mut metadata = vec![
+            String::new(),
+            format!(
+                "citation: {}:{}-{} (match line {})",
+                source_match.path,
+                source_match.start_line,
+                source_match.end_line,
+                source_match.line_number
+            ),
+        ];
+        if let Some(route) = &source_match.source_map_route {
+            metadata.push(format!("source_route: {route}"));
+        }
+        if !rendered.push_lines(metadata) {
+            break;
+        }
+        for line in &source_match.lines {
+            if !rendered.push_source_line(line.line_number, &line.text, line.text_truncated) {
+                break 'matches;
+            }
+        }
+    }
+
+    rendered.finish(
+        coverage_line_index,
+        render_search_coverage(output, true),
+        render_reason_index,
+    )
 }
 
-fn render_search_output_inner(output: &SourceSearchOutput, render_truncated: bool) -> String {
-    let mut rendered = vec![
-        "Source search evidence:".to_string(),
-        format!("query: {}", output.query),
-        format!(
-            "coverage: files={} skipped_too_large={} skipped_non_utf8={} changed_during_read={} filesystem_errors={} bytes={} total_matches={} returned={} truncated={}",
-            output.coverage.files_scanned,
-            output.coverage.files_skipped_too_large,
-            output.coverage.files_skipped_non_utf8,
-            output.coverage.files_changed_during_read,
-            output.coverage.filesystem_errors,
-            output.coverage.bytes_scanned,
-            output.coverage.total_matches,
-            output.coverage.matches_returned,
-            output.truncated || render_truncated
-        ),
-    ];
-    if let Some(reason) = output.truncated_reason {
-        rendered.push(format!("truncated_reason: {reason:?}"));
-    }
-    if render_truncated {
-        rendered.push("render_truncated_reason: MaxRenderedBytes".to_string());
-    }
-    for source_match in &output.matches {
-        rendered.push(String::new());
-        rendered.push(format!(
-            "citation: {}:{}-{} (match line {})",
-            source_match.path,
-            source_match.start_line,
-            source_match.end_line,
-            source_match.line_number
-        ));
-        if let Some(route) = &source_match.source_map_route {
-            rendered.push(format!("source_route: {route}"));
-        }
-        rendered.extend(source_match.lines.iter().map(|line| {
-            let suffix = if line.text_truncated {
-                " [line truncated]"
-            } else {
-                ""
-            };
-            format!("{:>6} | {}{suffix}", line.line_number, line.text)
-        }));
-    }
-    rendered.join("\n")
+fn render_search_coverage(output: &SourceSearchOutput, truncated: bool) -> String {
+    format!(
+        "coverage: files={} skipped_too_large={} skipped_non_utf8={} changed_during_read={} filesystem_errors={} bytes={} total_matches={} returned={} truncated={truncated}",
+        output.coverage.files_scanned,
+        output.coverage.files_skipped_too_large,
+        output.coverage.files_skipped_non_utf8,
+        output.coverage.files_changed_during_read,
+        output.coverage.filesystem_errors,
+        output.coverage.bytes_scanned,
+        output.coverage.total_matches,
+        output.coverage.matches_returned,
+    )
 }
 
 fn render_read_output(output: &ReadFileSpanOutput) -> String {
-    let rendered = render_read_output_inner(output, false);
-    if rendered.len() <= SOURCE_TOOL_MAX_RENDERED_BYTES {
-        return rendered;
-    }
-    bound_model_output(render_read_output_inner(output, true))
-}
-
-fn render_read_output_inner(output: &ReadFileSpanOutput, render_truncated: bool) -> String {
     let citation = match (output.start_line, output.end_line) {
         (Some(start), Some(end)) => format!("{}:{start}-{end}", output.path),
         _ => format!("{}:<empty>", output.path),
     };
-    let mut rendered = vec![
-        "Source file evidence:".to_string(),
-        format!("citation: {citation}"),
-        format!(
-            "total_lines: {} bytes_returned: {} truncated: {}",
-            output.total_lines,
-            output.bytes_returned,
-            output.truncated || render_truncated
-        ),
-    ];
-    if render_truncated {
-        rendered.push("render_truncated_reason: MaxRenderedBytes".to_string());
+    let mut rendered = BoundedSourceOutput::new();
+    let _ = rendered.push_line("Source file evidence:".to_string());
+    let _ = rendered.push_line(format!("citation: {citation}"));
+    let summary_line_index = rendered.line_count();
+    let _ = rendered.push_line(render_read_summary(output, output.truncated));
+    let render_reason_index = rendered.line_count();
+    if let Some(route) = &output.source_map_route
+        && !rendered.push_line(format!("source_route: {route}"))
+    {
+        return rendered.finish(
+            summary_line_index,
+            render_read_summary(output, true),
+            render_reason_index,
+        );
     }
-    if let Some(route) = &output.source_map_route {
-        rendered.push(format!("source_route: {route}"));
+    for line in &output.lines {
+        if !rendered.push_source_line(line.line_number, &line.text, line.text_truncated) {
+            break;
+        }
     }
-    rendered.extend(output.lines.iter().map(|line| {
-        let suffix = if line.text_truncated {
+
+    rendered.finish(
+        summary_line_index,
+        render_read_summary(output, true),
+        render_reason_index,
+    )
+}
+
+fn render_read_summary(output: &ReadFileSpanOutput, truncated: bool) -> String {
+    format!(
+        "total_lines: {} bytes_returned: {} truncated: {truncated}",
+        output.total_lines, output.bytes_returned,
+    )
+}
+
+struct BoundedSourceOutput {
+    lines: Vec<String>,
+    rendered_bytes: usize,
+    content_limit: usize,
+    render_truncated: bool,
+}
+
+impl BoundedSourceOutput {
+    fn new() -> Self {
+        let marker = source_output_truncation_marker();
+        let reserved_bytes = "\nrender_truncated_reason: MaxRenderedBytes"
+            .len()
+            .saturating_add(1)
+            .saturating_add(marker.len());
+        Self {
+            lines: Vec::new(),
+            rendered_bytes: 0,
+            content_limit: SOURCE_TOOL_MAX_RENDERED_BYTES.saturating_sub(reserved_bytes),
+            render_truncated: false,
+        }
+    }
+
+    fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn push_line(&mut self, line: String) -> bool {
+        let separator_bytes = usize::from(!self.lines.is_empty());
+        let additional_bytes = separator_bytes.saturating_add(line.len());
+        if self.rendered_bytes.saturating_add(additional_bytes) > self.content_limit {
+            self.render_truncated = true;
+            return false;
+        }
+        self.rendered_bytes = self.rendered_bytes.saturating_add(additional_bytes);
+        self.lines.push(line);
+        true
+    }
+
+    fn push_lines(&mut self, lines: Vec<String>) -> bool {
+        let additional_bytes = lines
+            .iter()
+            .enumerate()
+            .fold(0usize, |total, (index, line)| {
+                total
+                    .saturating_add(usize::from(!self.lines.is_empty() || index > 0))
+                    .saturating_add(line.len())
+            });
+        if self.rendered_bytes.saturating_add(additional_bytes) > self.content_limit {
+            self.render_truncated = true;
+            return false;
+        }
+        self.rendered_bytes = self.rendered_bytes.saturating_add(additional_bytes);
+        self.lines.extend(lines);
+        true
+    }
+
+    fn push_source_line(&mut self, line_number: usize, text: &str, text_truncated: bool) -> bool {
+        let prefix = format!("{line_number:>6} | ");
+        let suffix = if text_truncated {
             " [line truncated]"
         } else {
             ""
         };
-        format!("{:>6} | {}{suffix}", line.line_number, line.text)
-    }));
-    rendered.join("\n")
+        let separator_bytes = usize::from(!self.lines.is_empty());
+        let full_bytes = separator_bytes
+            .saturating_add(prefix.len())
+            .saturating_add(text.len())
+            .saturating_add(suffix.len());
+        if self.rendered_bytes.saturating_add(full_bytes) <= self.content_limit {
+            let mut line = String::with_capacity(prefix.len() + text.len() + suffix.len());
+            line.push_str(&prefix);
+            line.push_str(text);
+            line.push_str(suffix);
+            return self.push_line(line);
+        }
+
+        self.render_truncated = true;
+        let remaining = self
+            .content_limit
+            .saturating_sub(self.rendered_bytes)
+            .saturating_sub(separator_bytes);
+        let truncated_suffix = " [line truncated]";
+        let fixed_bytes = prefix.len().saturating_add(truncated_suffix.len());
+        if remaining < fixed_bytes {
+            return false;
+        }
+        let mut text_end = remaining.saturating_sub(fixed_bytes).min(text.len());
+        while text_end > 0 && !text.is_char_boundary(text_end) {
+            text_end -= 1;
+        }
+        let mut line = String::with_capacity(prefix.len() + text_end + truncated_suffix.len());
+        line.push_str(&prefix);
+        line.push_str(&text[..text_end]);
+        line.push_str(truncated_suffix);
+        let _ = self.push_line(line);
+        false
+    }
+
+    fn finish(
+        mut self,
+        truncated_line_index: usize,
+        truncated_line: String,
+        render_reason_index: usize,
+    ) -> String {
+        if !self.render_truncated {
+            return self.lines.join("\n");
+        }
+        if let Some(line) = self.lines.get_mut(truncated_line_index) {
+            *line = truncated_line;
+        }
+        self.lines.insert(
+            render_reason_index.min(self.lines.len()),
+            "render_truncated_reason: MaxRenderedBytes".to_string(),
+        );
+        let mut rendered = self.lines.join("\n");
+        rendered.push('\n');
+        rendered.push_str(&source_output_truncation_marker());
+        debug_assert!(rendered.len() <= SOURCE_TOOL_MAX_RENDERED_BYTES);
+        rendered
+    }
 }
 
-fn bound_model_output(rendered: String) -> String {
-    if rendered.len() <= SOURCE_TOOL_MAX_RENDERED_BYTES {
-        return rendered;
-    }
-    let marker =
-        format!("\n[source tool output truncated at {SOURCE_TOOL_MAX_RENDERED_BYTES} bytes]");
-    let max_content_bytes = SOURCE_TOOL_MAX_RENDERED_BYTES.saturating_sub(marker.len());
-    let mut end = max_content_bytes.min(rendered.len());
-    while end > 0 && !rendered.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut bounded = rendered[..end].to_string();
-    bounded.push_str(&marker);
-    bounded
+fn source_output_truncation_marker() -> String {
+    format!("[source tool output truncated at {SOURCE_TOOL_MAX_RENDERED_BYTES} bytes]")
 }
 
 #[cfg(test)]

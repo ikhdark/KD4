@@ -7,6 +7,7 @@ use tokio::time::Instant;
 use tokio::time::Sleep;
 
 use super::UnifiedExecContext;
+pub(super) use super::head_tail_buffer::omitted_output_marker;
 use super::process::UnifiedExecProcess;
 use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
 use crate::session::session::Session;
@@ -44,7 +45,7 @@ pub(crate) fn start_streaming_output(
     context: &UnifiedExecContext,
     transcript: Arc<Mutex<HeadTailBuffer>>,
 ) {
-    let mut receiver = process.output_receiver();
+    let mut receiver = process.take_output_receiver();
     let output_drained = process.output_drained_notify();
     let exit_token = process.cancellation_token();
 
@@ -72,6 +73,14 @@ pub(crate) fn start_streaming_output(
                         sleep.as_mut().await;
                     }
                 }, if grace_sleep.is_some() => {
+                    flush_pending(
+                        &mut pending,
+                        &transcript,
+                        &call_id,
+                        &session_ref,
+                        &turn_ref,
+                        &mut emitted_deltas,
+                    ).await;
                     output_drained.notify_one();
                     break;
                 }
@@ -80,6 +89,16 @@ pub(crate) fn start_streaming_output(
                     let chunk = match received {
                         Ok(chunk) => chunk,
                         Err(RecvError::Lagged(skipped)) => {
+                            // A lag creates a gap in the byte stream, so an incomplete
+                            // code point cannot be completed by a later received chunk.
+                            flush_pending(
+                                &mut pending,
+                                &transcript,
+                                &call_id,
+                                &session_ref,
+                                &turn_ref,
+                                &mut emitted_deltas,
+                            ).await;
                             {
                                 let mut guard = transcript.lock().await;
                                 guard.record_lagged_chunks(skipped);
@@ -94,6 +113,14 @@ pub(crate) fn start_streaming_output(
                             continue;
                         },
                         Err(RecvError::Closed) => {
+                            flush_pending(
+                                &mut pending,
+                                &transcript,
+                                &call_id,
+                                &session_ref,
+                                &turn_ref,
+                                &mut emitted_deltas,
+                            ).await;
                             output_drained.notify_one();
                             break;
                         }
@@ -117,13 +144,6 @@ pub(crate) fn start_streaming_output(
 pub(super) fn lagged_output_marker(skipped: u64) -> Vec<u8> {
     format!("\n[output unavailable: streaming receiver lagged by {skipped} chunk(s)]\n")
         .into_bytes()
-}
-
-pub(super) fn omitted_output_marker(omitted_bytes: usize) -> Vec<u8> {
-    format!(
-        "\n[output truncated: {omitted_bytes} byte(s) omitted from the middle by the output retention limit]\n"
-    )
-    .into_bytes()
 }
 
 /// Spawn a background watcher that waits for the PTY to exit and then emits a
@@ -239,10 +259,56 @@ async fn process_chunk(
     chunk: Vec<u8>,
 ) {
     pending.extend_from_slice(&chunk);
-    while let Some(prefix) = split_valid_utf8_prefix(pending) {
+    emit_pending(
+        pending,
+        transcript,
+        call_id,
+        session_ref,
+        turn_ref,
+        emitted_deltas,
+        false,
+    )
+    .await;
+}
+
+async fn flush_pending(
+    pending: &mut Vec<u8>,
+    transcript: &Arc<Mutex<HeadTailBuffer>>,
+    call_id: &str,
+    session_ref: &Arc<Session>,
+    turn_ref: &Arc<TurnContext>,
+    emitted_deltas: &mut usize,
+) {
+    emit_pending(
+        pending,
+        transcript,
+        call_id,
+        session_ref,
+        turn_ref,
+        emitted_deltas,
+        true,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn emit_pending(
+    pending: &mut Vec<u8>,
+    transcript: &Arc<Mutex<HeadTailBuffer>>,
+    call_id: &str,
+    session_ref: &Arc<Session>,
+    turn_ref: &Arc<TurnContext>,
+    emitted_deltas: &mut usize,
+    flush_incomplete: bool,
+) {
+    while let Some(prefix) = split_valid_utf8_prefix_with_max(
+        pending,
+        UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES,
+        flush_incomplete,
+    ) {
         {
             let mut guard = transcript.lock().await;
-            guard.push_chunk(prefix.to_vec());
+            guard.push_chunk(prefix.clone());
         }
         emit_output_delta(call_id, session_ref, turn_ref, emitted_deltas, prefix).await;
     }
@@ -379,34 +445,34 @@ pub(crate) async fn emit_failed_exec_end_for_unified_exec(
         .await;
 }
 
-fn split_valid_utf8_prefix(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
-    split_valid_utf8_prefix_with_max(buffer, UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES)
-}
-
-fn split_valid_utf8_prefix_with_max(buffer: &mut Vec<u8>, max_bytes: usize) -> Option<Vec<u8>> {
-    if buffer.is_empty() {
+fn split_valid_utf8_prefix_with_max(
+    buffer: &mut Vec<u8>,
+    max_bytes: usize,
+    flush_incomplete: bool,
+) -> Option<Vec<u8>> {
+    if buffer.is_empty() || max_bytes == 0 {
         return None;
     }
 
     let max_len = buffer.len().min(max_bytes);
-    let mut split = max_len;
-    while split > 0 {
-        if std::str::from_utf8(&buffer[..split]).is_ok() {
-            let prefix = buffer[..split].to_vec();
-            buffer.drain(..split);
-            return Some(prefix);
+    let split = match std::str::from_utf8(&buffer[..max_len]) {
+        Ok(_) => max_len,
+        Err(error) => {
+            let valid_up_to = error.valid_up_to();
+            if valid_up_to > 0 {
+                valid_up_to
+            } else if error.error_len().is_some() || flush_incomplete {
+                // Definitively invalid bytes must make progress immediately. At the
+                // end of the stream, treat a permanently incomplete sequence the
+                // same way so every received byte is emitted exactly once.
+                1
+            } else {
+                return None;
+            }
         }
+    };
 
-        if max_len - split > 4 {
-            break;
-        }
-        split -= 1;
-    }
-
-    // If no valid UTF-8 prefix was found, emit the first byte so the stream
-    // keeps making progress and the transcript reflects all bytes.
-    let byte = buffer.drain(..1).collect();
-    Some(byte)
+    Some(buffer.drain(..split).collect())
 }
 
 pub(super) async fn resolve_aggregated_output(
@@ -414,8 +480,12 @@ pub(super) async fn resolve_aggregated_output(
     fallback: String,
 ) -> String {
     let guard = transcript.lock().await;
-    let retained = guard.to_bytes();
     let omitted_bytes = guard.omitted_bytes();
+    let retained = if omitted_bytes == 0 {
+        guard.to_bytes()
+    } else {
+        guard.to_bytes_with_omission_marker(&omitted_output_marker(omitted_bytes))
+    };
     let lagged_chunks = guard.lagged_chunks();
     drop(guard);
 

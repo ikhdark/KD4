@@ -33,6 +33,7 @@ use crate::AttemptAmendment;
 use crate::AttemptId;
 use crate::AttemptState;
 use crate::AttributionConfidence;
+use crate::CONCURRENT_DRIFT_REASON;
 use crate::CriterionStatus;
 use crate::DEFAULT_BINDING_LIMIT;
 use crate::DEFAULT_MUTATION_EVIDENCE_LIMIT;
@@ -74,6 +75,7 @@ use crate::scope::normalize_repo_scopes;
 use crate::scope::repository_identity;
 
 const COORDINATION_DIR: &str = "agent-task-coordination";
+const COLD_REVIEW_REASON_PREFIX: &str = "cold review required: ";
 const DATABASE_FILENAME: &str = "agent_tasks.sqlite";
 const NONEXISTENT_SENTINEL: &[u8] = b"CODEX_AGENT_TASK_STORE_NONEXISTENT\n";
 
@@ -2323,7 +2325,29 @@ async fn insert_risk_review_gates_tx(
     .map(|value| decode::<AgentGate>(&value))
     .transpose()?;
     match existing_risk {
-        Some(existing) if existing.status == GateStatus::Passed => {}
+        Some(mut existing) if existing.status == GateStatus::Passed => {
+            if cold_review_reason_contains(review_reason, CONCURRENT_DRIFT_REASON)
+                && !cold_review_reason_contains(&existing.reason, CONCURRENT_DRIFT_REASON)
+            {
+                existing.reason = format!("{}; {CONCURRENT_DRIFT_REASON}", existing.reason);
+                existing.updated_at = now;
+                existing.sealed_at = Some(now);
+                let updated = sqlx::query("UPDATE gates SET body_json = ?, updated_at = ?, sealed_at = ? WHERE assignment_id = ? AND kind = ? AND status = ?")
+                    .bind(encode(&existing)?)
+                    .bind(encode(&now)?)
+                    .bind(encode(&now)?)
+                    .bind(assignment_id.to_string())
+                    .bind(encode(&GateKind::Risk)?)
+                    .bind(encode(&GateStatus::Passed)?)
+                    .execute(&mut **transaction)
+                    .await?;
+                if updated.rows_affected() != 1 {
+                    return Err(StoreError::CorruptData(format!(
+                        "assignment {assignment_id} risk gate changed while aggregating correction-attempt drift"
+                    )));
+                }
+            }
+        }
         Some(existing) => {
             return Err(StoreError::CorruptData(format!(
                 "assignment {assignment_id} has incompatible risk gate {:?}",
@@ -2391,6 +2415,14 @@ async fn insert_risk_review_gates_tx(
         }
     }
     Ok(())
+}
+
+fn cold_review_reason_contains(reason: &str, expected: &str) -> bool {
+    reason
+        .strip_prefix(COLD_REVIEW_REASON_PREFIX)
+        .unwrap_or(reason)
+        .split("; ")
+        .any(|reason| reason == expected)
 }
 
 async fn ensure_pending_verification_for_risk_review_tx(

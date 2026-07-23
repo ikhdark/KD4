@@ -26,6 +26,7 @@ pub use streaming_parser::StreamingPatchParser;
 use thiserror::Error;
 
 pub use invocation::maybe_parse_apply_patch_verified;
+pub use invocation::maybe_parse_apply_patch_verified_for_environment;
 pub use invocation::verify_apply_patch_args;
 pub use standalone_executable::main;
 
@@ -57,6 +58,13 @@ pub enum ApplyPatchError {
         "patch detected without explicit call to apply_patch. Rerun as [\"apply_patch\", \"<patch>\"]"
     )]
     ImplicitInvocation,
+    #[error(
+        "patch environment id `{patch_environment_id}` does not match selected shell environment `{selected_environment_id}`"
+    )]
+    EnvironmentIdMismatch {
+        patch_environment_id: String,
+        selected_environment_id: String,
+    },
 }
 
 impl From<std::io::Error> for ApplyPatchError {

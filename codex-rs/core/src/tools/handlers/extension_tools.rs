@@ -5,6 +5,7 @@ use codex_protocol::items::TurnItem;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_tools::ConversationHistory;
+use codex_tools::ConversationHistoryRequirement;
 use codex_tools::ExtensionTurnItem;
 use codex_tools::ToolCall as ExtensionToolCall;
 use codex_tools::ToolEnvironment;
@@ -53,13 +54,28 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
     }
 
     fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
-        Box::pin(async move { self.0.handle(to_extension_call(&invocation).await).await })
+        let history_requirement = self.0.conversation_history_requirement(&invocation.payload);
+        Box::pin(async move {
+            let call = tokio::select! {
+                _ = invocation.cancellation_token.cancelled() => {
+                    return Err(crate::function_tool::FunctionCallError::RespondToModel(
+                        "extension tool call cancelled".to_string(),
+                    ));
+                }
+                call = to_extension_call(&invocation, history_requirement) => call,
+            };
+            self.0.handle(call).await
+        })
     }
 }
 
 impl CoreToolRuntime for ExtensionToolAdapter {
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
+    }
+
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        self.0.handles_runtime_cancellation()
     }
 }
 
@@ -111,9 +127,25 @@ impl TurnItemEmitter for CoreTurnItemEmitter {
     }
 }
 
-async fn to_extension_call(invocation: &ToolInvocation) -> ExtensionToolCall {
-    let conversation_history =
-        ConversationHistory::new(invocation.session.clone_history().await.into_raw_items());
+async fn to_extension_call(
+    invocation: &ToolInvocation,
+    history_requirement: ConversationHistoryRequirement,
+) -> ExtensionToolCall {
+    let conversation_history = match history_requirement {
+        ConversationHistoryRequirement::Full => ConversationHistory::from_shared_items(
+            invocation
+                .session
+                .clone_history()
+                .await
+                .into_shared_raw_items(),
+        ),
+        ConversationHistoryRequirement::None => ConversationHistory::default(),
+    };
+    let primary_environment_id = invocation
+        .step_context
+        .environments
+        .primary()
+        .map(|environment| environment.environment_id.clone());
     let mut environments =
         Vec::with_capacity(invocation.step_context.environments.turn_environments.len());
     for environment in &invocation.step_context.environments.turn_environments {
@@ -152,6 +184,8 @@ async fn to_extension_call(invocation: &ToolInvocation) -> ExtensionToolCall {
             session: Arc::downgrade(&invocation.session),
             turn: Arc::downgrade(&invocation.turn),
         }),
+        cancellation_token: invocation.cancellation_token.clone(),
+        primary_environment_id,
         environments,
         payload: invocation.payload.clone(),
     }
@@ -173,6 +207,7 @@ mod tests {
     use codex_tools::ExtensionTurnItem;
     use codex_utils_absolute_path::test_support::PathExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
+    use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
     use serde_json::json;
     use tokio::sync::Mutex;
@@ -180,6 +215,7 @@ mod tests {
     use super::CoreTurnItemEmitter;
     use super::ExtensionToolAdapter;
     use crate::session::step_context::StepContext;
+    use crate::session::turn_context::TurnEnvironment;
     use crate::tools::context::ToolCallSource;
     use crate::tools::context::ToolInvocation;
     use crate::tools::context::ToolPayload;
@@ -227,6 +263,7 @@ mod tests {
 
     struct CapturingExtensionExecutor {
         captured_call: Arc<Mutex<Option<codex_tools::ToolCall>>>,
+        history_requirement: codex_tools::ConversationHistoryRequirement,
     }
 
     impl codex_extension_api::ToolExecutor<codex_tools::ToolCall> for CapturingExtensionExecutor {
@@ -243,6 +280,13 @@ mod tests {
                 output_schema: None,
                 defer_loading: None,
             })
+        }
+
+        fn conversation_history_requirement(
+            &self,
+            _payload: &ToolPayload,
+        ) -> codex_tools::ConversationHistoryRequirement {
+            self.history_requirement
         }
 
         fn handle(&self, call: codex_tools::ToolCall) -> codex_tools::ToolExecutorFuture<'_> {
@@ -270,6 +314,88 @@ mod tests {
                 Box::new(codex_tools::JsonToolOutput::new(json!({ "ok": true })))
                     as Box<dyn codex_tools::ToolOutput>,
             )
+        }
+    }
+
+    struct CancellationAwareExtensionExecutor;
+
+    impl codex_extension_api::ToolExecutor<codex_tools::ToolCall>
+        for CancellationAwareExtensionExecutor
+    {
+        fn tool_name(&self) -> codex_tools::ToolName {
+            codex_tools::ToolName::plain("extension_cancel")
+        }
+
+        fn spec(&self) -> codex_tools::ToolSpec {
+            codex_tools::ToolSpec::Function(codex_tools::ResponsesApiTool {
+                name: "extension_cancel".to_string(),
+                description: "Waits for cancellation.".to_string(),
+                strict: true,
+                parameters: codex_tools::parse_tool_input_schema(&json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }))
+                .expect("extension schema should parse"),
+                output_schema: None,
+                defer_loading: None,
+            })
+        }
+
+        fn conversation_history_requirement(
+            &self,
+            _payload: &ToolPayload,
+        ) -> codex_tools::ConversationHistoryRequirement {
+            codex_tools::ConversationHistoryRequirement::None
+        }
+
+        fn handles_runtime_cancellation(&self) -> bool {
+            true
+        }
+
+        fn handle(&self, call: codex_tools::ToolCall) -> codex_tools::ToolExecutorFuture<'_> {
+            Box::pin(async move {
+                call.turn_item_emitter
+                    .emit_started(ExtensionTurnItem {
+                        item: ExtensionItem::ImageGeneration(ImageGenerationItem {
+                            id: call.call_id.clone(),
+                            status: "in_progress".to_string(),
+                            revised_prompt: None,
+                            result: String::new(),
+                            saved_path: None,
+                        }),
+                        legacy_events: vec![EventMsg::ImageGenerationBegin(
+                            ImageGenerationBeginEvent {
+                                call_id: call.call_id.clone(),
+                            },
+                        )],
+                    })
+                    .await;
+                call.cancellation_token.cancelled().await;
+                call.turn_item_emitter
+                    .emit_completed(ExtensionTurnItem {
+                        item: ExtensionItem::ImageGeneration(ImageGenerationItem {
+                            id: call.call_id.clone(),
+                            status: "failed".to_string(),
+                            revised_prompt: None,
+                            result: String::new(),
+                            saved_path: None,
+                        }),
+                        legacy_events: vec![EventMsg::ImageGenerationEnd(
+                            ImageGenerationEndEvent {
+                                call_id: call.call_id,
+                                status: "failed".to_string(),
+                                revised_prompt: None,
+                                result: String::new(),
+                                saved_path: None,
+                            },
+                        )],
+                    })
+                    .await;
+                Err(codex_tools::FunctionCallError::RespondToModel(
+                    "extension cancelled".to_string(),
+                ))
+            })
         }
     }
 
@@ -316,6 +442,7 @@ mod tests {
         let captured_call = Arc::new(Mutex::new(None));
         let handler = ExtensionToolAdapter::new(Arc::new(CapturingExtensionExecutor {
             captured_call: Arc::clone(&captured_call),
+            history_requirement: codex_tools::ConversationHistoryRequirement::Full,
         }));
         let (session, turn, rx) = crate::session::tests::make_session_and_context_with_rx().await;
         let weak_session = Arc::downgrade(&session);
@@ -323,6 +450,10 @@ mod tests {
         let turn_id = turn.sub_id.clone();
         let model = turn.model_info.slug.clone();
         let truncation_policy = turn.model_info.truncation_policy.into();
+        let expected_primary_environment_id = turn
+            .environments
+            .primary()
+            .map(|environment| environment.environment_id.clone());
         let expected_sandbox_cwds = turn
             .environments
             .turn_environments
@@ -349,11 +480,13 @@ mod tests {
         };
         assert_eq!(raw_history_item.item, expected_history_item);
         let step_context = StepContext::for_test(Arc::clone(&turn));
+        let cancellation_token = tokio_util::sync::CancellationToken::new();
+        let forwarded_cancellation_token = cancellation_token.clone();
         let invocation = ToolInvocation {
-            session,
+            session: session.into(),
             step_context,
             turn,
-            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            cancellation_token,
             tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
             call_id: "call-extension".to_string(),
             tool_name: codex_tools::ToolName::plain("extension_echo"),
@@ -378,6 +511,12 @@ mod tests {
         );
         assert_eq!(captured_call.model, model);
         assert_eq!(captured_call.truncation_policy, truncation_policy);
+        forwarded_cancellation_token.cancel();
+        assert!(captured_call.cancellation_token.is_cancelled());
+        assert_eq!(
+            captured_call.primary_environment_id,
+            expected_primary_environment_id
+        );
         assert_eq!(
             captured_call
                 .environments
@@ -412,6 +551,167 @@ mod tests {
                 action: None,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn skips_history_for_payloads_that_do_not_require_it() {
+        let captured_call = Arc::new(Mutex::new(None));
+        let handler = ExtensionToolAdapter::new(Arc::new(CapturingExtensionExecutor {
+            captured_call: Arc::clone(&captured_call),
+            history_requirement: codex_tools::ConversationHistoryRequirement::None,
+        }));
+        let (session, turn) = crate::session::tests::make_session_and_context().await;
+        let turn = Arc::new(turn);
+        session
+            .record_conversation_items(
+                turn.as_ref(),
+                &[ResponseItem::Message {
+                    id: None,
+                    role: "user".to_string(),
+                    content: vec![ContentItem::InputText {
+                        text: "history that should not be copied".to_string(),
+                    }],
+                    phase: None,
+                    internal_chat_message_metadata_passthrough: None,
+                }],
+            )
+            .await;
+        let invocation = ToolInvocation {
+            session: session.into(),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-no-history".to_string(),
+            tool_name: codex_tools::ToolName::plain("extension_echo"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({ "message": "hello" }).to_string(),
+            },
+        };
+
+        crate::tools::registry::ToolExecutor::handle(&handler, invocation)
+            .await
+            .expect("extension call should succeed");
+
+        let captured_call = captured_call.lock().await.clone().expect("captured call");
+        assert!(captured_call.conversation_history.items().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancellation_aware_extension_emits_terminal_item_before_returning() {
+        let handler = Arc::new(ExtensionToolAdapter::new(Arc::new(
+            CancellationAwareExtensionExecutor,
+        )));
+        assert!(CoreToolRuntime::waits_for_runtime_cancellation(
+            handler.as_ref()
+        ));
+        let (session, turn, rx) = crate::session::tests::make_session_and_context_with_rx().await;
+        let cancellation_token = tokio_util::sync::CancellationToken::new();
+        let invocation = ToolInvocation {
+            session,
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: cancellation_token.clone(),
+            tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-extension-cancel".to_string(),
+            tool_name: codex_tools::ToolName::plain("extension_cancel"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+        };
+        let task = tokio::spawn({
+            let handler = Arc::clone(&handler);
+            async move {
+                crate::tools::registry::ToolExecutor::handle(handler.as_ref(), invocation).await
+            }
+        });
+
+        let started = rx.recv().await.expect("item started event");
+        assert!(matches!(started.msg, EventMsg::ItemStarted(_)));
+        let begin = rx.recv().await.expect("legacy begin event");
+        assert!(matches!(
+            begin.msg,
+            EventMsg::ImageGenerationBegin(ImageGenerationBeginEvent { .. })
+        ));
+
+        cancellation_token.cancel();
+        let error = match task.await.expect("extension task should join") {
+            Ok(_) => panic!("cancelled extension should return an error"),
+            Err(error) => error,
+        };
+        assert_eq!(error.to_string(), "extension cancelled");
+
+        let completed = rx.recv().await.expect("item completed event");
+        let EventMsg::ItemCompleted(completed) = completed.msg else {
+            panic!("expected item completed event");
+        };
+        let TurnItem::Extension(ExtensionItem::ImageGeneration(completed_item)) = completed.item
+        else {
+            panic!("expected completed image generation item");
+        };
+        assert_eq!(completed_item.status, "failed");
+        let end = rx.recv().await.expect("legacy end event");
+        let EventMsg::ImageGenerationEnd(end) = end.msg else {
+            panic!("expected image generation end event");
+        };
+        assert_eq!(end.status, "failed");
+    }
+
+    #[tokio::test]
+    async fn skipped_foreign_primary_environment_is_not_rebound_to_secondary() {
+        let (session, mut turn) = crate::session::tests::make_session_and_context().await;
+        let native_secondary = turn.environments.turn_environments[0].clone();
+        let native_secondary_id = native_secondary.environment_id.clone();
+        let foreign_cwd = if cfg!(windows) {
+            PathUri::parse("file:///tmp/foreign-primary")
+        } else {
+            PathUri::parse("file:///C:/foreign-primary")
+        }
+        .expect("foreign cwd should be a valid file URI");
+        let foreign_primary = TurnEnvironment::new(
+            "foreign-primary".to_string(),
+            Arc::clone(&native_secondary.environment),
+            foreign_cwd,
+            native_secondary.shell.clone(),
+        );
+        turn.environments.turn_environments = vec![foreign_primary, native_secondary];
+        let turn = Arc::new(turn);
+        let invocation = ToolInvocation {
+            session: session.into(),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-extension".to_string(),
+            tool_name: codex_tools::ToolName::plain("extension_echo"),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({ "message": "hello" }).to_string(),
+            },
+        };
+
+        let call = super::to_extension_call(
+            &invocation,
+            codex_tools::ConversationHistoryRequirement::Full,
+        )
+        .await;
+
+        assert_eq!(
+            call.primary_environment_id.as_deref(),
+            Some("foreign-primary")
+        );
+        assert_eq!(
+            call.environments
+                .iter()
+                .map(|environment| environment.environment_id.clone())
+                .collect::<Vec<_>>(),
+            vec![native_secondary_id]
+        );
+        assert!(!call.environments.iter().any(|environment| {
+            call.primary_environment_id.as_deref() == Some(environment.environment_id.as_str())
+        }));
     }
 
     #[tokio::test]

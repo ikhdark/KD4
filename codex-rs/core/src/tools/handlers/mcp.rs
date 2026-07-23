@@ -126,6 +126,7 @@ impl McpHandler {
         let ToolInvocation {
             session,
             step_context,
+            cancellation_token,
             call_id,
             payload,
             ..
@@ -147,10 +148,10 @@ impl McpHandler {
             Arc::clone(&session),
             &step_context,
             call_id.clone(),
-            self.tool_info.server_name.clone(),
-            self.tool_info.tool.name.to_string(),
-            self.hook_tool_name(),
+            &self.tool_info.server_name,
+            self.tool_info.tool.name.as_ref(),
             payload,
+            cancellation_token,
         )
         .await;
 
@@ -165,18 +166,35 @@ impl McpHandler {
 }
 
 impl CoreToolRuntime for McpHandler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        true
+    }
+
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         ToolExecutionTiming::NestedRuntime
     }
 
     fn telemetry_tags<'a>(
         &'a self,
-        _invocation: &'a ToolInvocation,
+        invocation: &'a ToolInvocation,
     ) -> futures::future::BoxFuture<'a, ToolTelemetryTags> {
-        Box::pin(async {
-            let mut tags = vec![("mcp_server", self.tool_info.server_name.clone())];
-            if let Some(origin) = &self.tool_info.server_origin {
-                tags.push(("mcp_server_origin", origin.clone()));
+        Box::pin(async move {
+            let manager = invocation.step_context.mcp.manager();
+            let live_tool_info = tokio::select! {
+                biased;
+                _ = invocation.cancellation_token.cancelled() => None,
+                live_tool_info = manager.tool_info(
+                    &self.tool_info.server_name,
+                    self.tool_info.tool.name.as_ref(),
+                ) => live_tool_info,
+            };
+            let server_name = live_tool_info
+                .as_ref()
+                .map(|tool_info| tool_info.server_name.clone())
+                .unwrap_or_else(|| self.tool_info.server_name.clone());
+            let mut tags = vec![("mcp_server", server_name)];
+            if let Some(origin) = live_tool_info.and_then(|tool_info| tool_info.server_origin) {
+                tags.push(("mcp_server_origin", origin));
             }
             tags
         })

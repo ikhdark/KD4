@@ -4,6 +4,19 @@ use codex_otel::SessionTelemetry;
 use codex_protocol::error::CodexErr;
 use tracing::warn;
 
+pub(crate) fn should_retry_with_current_model(error: &CodexErr) -> bool {
+    matches!(
+        error,
+        CodexErr::InvalidRequest(_)
+            | CodexErr::UnexpectedStatus(_)
+            | CodexErr::ContextWindowExceeded
+            | CodexErr::UsageLimitReached(_)
+            | CodexErr::ServerOverloaded
+            | CodexErr::InternalServerError
+            | CodexErr::RetryLimit(_)
+    )
+}
+
 pub(crate) fn record_model_fallback(
     session_telemetry: &SessionTelemetry,
     previous_model: &str,
@@ -47,3 +60,7 @@ pub(crate) fn record_model_fallback(
         "previous-model compaction failed; retried with current model"
     );
 }
+
+#[cfg(test)]
+#[path = "compact_model_fallback_tests.rs"]
+mod tests;

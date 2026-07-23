@@ -7,6 +7,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ImageDetail;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::openai_models::InputModality;
+use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
 use codex_utils_image::data_url_from_bytes;
 use serde::Deserialize;
 
@@ -167,12 +168,23 @@ impl ViewImageHandler {
                 "image path `{model_visible_path}` is not a file"
             )));
         }
+        if metadata.size > MAX_PROMPT_IMAGE_SOURCE_BYTES as u64 {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "image at `{model_visible_path}` is too large: {} bytes exceeds the view_image limit of {MAX_PROMPT_IMAGE_SOURCE_BYTES} bytes",
+                metadata.size
+            )));
+        }
         let file_bytes = fs
-            .read_file(&path_uri, Some(&sandbox))
+            .read_file_bounded(&path_uri, MAX_PROMPT_IMAGE_SOURCE_BYTES, Some(&sandbox))
             .await
             .map_err(|error| {
                 FunctionCallError::RespondToModel(format!(
                     "unable to read image at `{model_visible_path}`: {error}"
+                ))
+            })?
+            .ok_or_else(|| {
+                FunctionCallError::RespondToModel(format!(
+                    "unable to read image at `{model_visible_path}`: the file changed while being read or exceeds the view_image limit of {MAX_PROMPT_IMAGE_SOURCE_BYTES} bytes"
                 ))
             })?;
 
@@ -402,5 +414,48 @@ mod tests {
             .await;
 
         result.expect("explicit high detail should be accepted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handle_rejects_oversized_images_before_encoding() {
+        let (session, mut turn) = make_session_and_context().await;
+        let image_dir = tempfile::tempdir().expect("create image temp dir");
+        let image_cwd = image_dir.abs();
+
+        replace_primary_environment_cwd(&mut turn, image_cwd.clone());
+        let image_path = image_cwd.join("oversized.png");
+        std::fs::File::create(image_path.as_path())
+            .and_then(|file| file.set_len(MAX_PROMPT_IMAGE_SOURCE_BYTES as u64 + 1))
+            .expect("create oversized test image");
+        turn.permission_profile = PermissionProfile::Disabled;
+        let turn = Arc::new(turn);
+
+        let result = ViewImageHandler::default()
+            .handle(ToolInvocation {
+                session: Arc::new(session),
+                step_context: StepContext::for_test(Arc::clone(&turn)),
+                turn,
+                cancellation_token: tokio_util::sync::CancellationToken::new(),
+                tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+                call_id: "call-view-image".to_string(),
+                tool_name: codex_tools::ToolName::plain("view_image"),
+                source: ToolCallSource::Direct,
+                payload: ToolPayload::Function {
+                    arguments: json!({ "path": "oversized.png" }).to_string(),
+                },
+            })
+            .await;
+
+        let Err(FunctionCallError::RespondToModel(message)) = result else {
+            panic!("expected oversized image error");
+        };
+        assert_eq!(
+            message,
+            format!(
+                "image at `{}` is too large: {} bytes exceeds the view_image limit of {MAX_PROMPT_IMAGE_SOURCE_BYTES} bytes",
+                image_path.display(),
+                MAX_PROMPT_IMAGE_SOURCE_BYTES + 1
+            )
+        );
     }
 }

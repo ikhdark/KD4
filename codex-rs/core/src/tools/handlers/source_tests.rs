@@ -257,6 +257,13 @@ fn search_render_is_capped_below_model_context_limit() {
     assert!(rendered.contains("truncated=true"));
     assert!(rendered.contains("render_truncated_reason: MaxRenderedBytes"));
     assert!(!rendered.contains("truncated=false"));
+    assert!(rendered.contains("citation: src/lib.rs:7-9 (match line 8)"));
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line.starts_with("     8 | ") && line.ends_with(" [line truncated]"))
+    );
+    assert!(rendered.ends_with("[source tool output truncated at 8192 bytes]"));
 }
 
 #[test]
@@ -285,6 +292,13 @@ fn read_render_is_capped_below_model_context_limit() {
     assert!(rendered.contains("truncated: true"));
     assert!(rendered.contains("render_truncated_reason: MaxRenderedBytes"));
     assert!(!rendered.contains("truncated: false"));
+    assert!(rendered.contains("citation: src/lib.rs:1-1"));
+    assert!(
+        rendered
+            .lines()
+            .any(|line| line.starts_with("     1 | ") && line.ends_with(" [line truncated]"))
+    );
+    assert!(rendered.ends_with("[source tool output truncated at 8192 bytes]"));
 }
 
 #[tokio::test]
@@ -339,12 +353,14 @@ async fn source_scan_preserves_partial_results_across_filesystem_failures() {
             sandbox: FileSystemSandboxContext::from_permission_profile(PermissionProfile::Disabled),
             repo_root: root.clone(),
             repo_root_abs: repo_root_abs.clone(),
+            is_git_repository: false,
         };
         let options = SourceSearchOptions::new(PathBuf::new(), "needle".to_string());
         let mut accumulator =
             SourceSearchAccumulator::new(&options).expect("create source accumulator");
+        let ignore_matcher = SourceIgnoreMatcher::new_preloaded(None);
 
-        scan_source_root(&context, &root, &options, &mut accumulator)
+        scan_source_root(&context, &root, &options, &ignore_matcher, &mut accumulator)
             .await
             .expect("recoverable source scan");
         let output = accumulator.finish(vec![".".to_string()]);
@@ -383,12 +399,14 @@ async fn source_scan_rejects_a_root_directory_read_failure() {
         }),
         sandbox: FileSystemSandboxContext::from_permission_profile(PermissionProfile::Disabled),
         repo_root: root.clone(),
-        repo_root_abs,
+        repo_root_abs: repo_root_abs.clone(),
+        is_git_repository: false,
     };
     let options = SourceSearchOptions::new(PathBuf::new(), "needle".to_string());
     let mut accumulator = SourceSearchAccumulator::new(&options).expect("source accumulator");
+    let ignore_matcher = SourceIgnoreMatcher::new_preloaded(None);
 
-    let error = scan_source_root(&context, &root, &options, &mut accumulator)
+    let error = scan_source_root(&context, &root, &options, &ignore_matcher, &mut accumulator)
         .await
         .expect_err("root directory failure must be terminal");
 
@@ -431,14 +449,17 @@ async fn explicit_source_roots_preserve_partial_results_when_one_root_inspect_or
             sandbox: FileSystemSandboxContext::from_permission_profile(PermissionProfile::Disabled),
             repo_root: PathUri::from_abs_path(&repo_root_abs),
             repo_root_abs: repo_root_abs.clone(),
+            is_git_repository: false,
         };
         let options = SourceSearchOptions::new(PathBuf::new(), "needle".to_string());
         let mut accumulator = SourceSearchAccumulator::new(&options).expect("source accumulator");
+        let ignore_matcher = SourceIgnoreMatcher::new_preloaded(None);
 
         scan_source_roots(
             &context,
             &roots,
             &options,
+            &ignore_matcher,
             &mut accumulator,
             /*recover_root_failures*/ true,
         )
@@ -545,4 +566,217 @@ async fn search_handler_reads_through_selected_local_filesystem() {
     let text = output.body.to_text().expect("text output");
     assert!(text.contains("citation: src/lib.rs:2-2 (match line 2)"));
     assert!(text.contains("     2 | needle"));
+}
+
+#[tokio::test]
+async fn search_handler_honors_repository_gitignore_rules() {
+    let (session, mut turn) = make_session_and_context().await;
+    let source_dir = tempfile::tempdir().expect("create source temp dir");
+    let source_cwd = source_dir.abs();
+    std::fs::create_dir(source_cwd.join(".git").as_path()).expect("create git marker");
+    std::fs::write(source_cwd.join(".gitignore").as_path(), "ignored/\n").expect("write gitignore");
+    std::fs::create_dir(source_cwd.join("src").as_path()).expect("create source directory");
+    std::fs::write(
+        source_cwd.join("src/visible.rs").as_path(),
+        "needle visible\n",
+    )
+    .expect("write visible source");
+    std::fs::create_dir(source_cwd.join("ignored").as_path()).expect("create ignored directory");
+    std::fs::write(
+        source_cwd.join("ignored/hidden.rs").as_path(),
+        "needle hidden\n",
+    )
+    .expect("write ignored source");
+    replace_primary_environment_cwd(&mut turn, source_cwd);
+    turn.permission_profile = PermissionProfile::Disabled;
+    let turn = Arc::new(turn);
+    let payload = ToolPayload::Function {
+        arguments: json!({ "query": "needle", "paths": ["src", "ignored"] }).to_string(),
+    };
+
+    let output = SearchSourceHandler::new(false)
+        .handle(ToolInvocation {
+            session: Arc::new(session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-search-source-ignore".to_string(),
+            tool_name: ToolName::plain(SEARCH_SOURCE_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: payload.clone(),
+        })
+        .await
+        .expect("source search should succeed");
+
+    let ResponseInputItem::FunctionCallOutput { output, .. } =
+        output.to_response_item("call-search-source-ignore", &payload)
+    else {
+        panic!("expected function call output");
+    };
+    let text = output.body.to_text().expect("text output");
+    assert!(text.contains("coverage: files=1 "), "{text}");
+    assert!(text.contains("citation: src/visible.rs:1-1 (match line 1)"));
+    assert!(!text.contains("ignored/hidden.rs"), "{text}");
+}
+
+#[tokio::test]
+async fn source_handlers_validate_bounds_before_environment_resolution() {
+    let (search_session, search_turn) = make_session_and_context().await;
+    let search_turn = Arc::new(search_turn);
+    let search_result = SearchSourceHandler::new(true)
+        .handle(ToolInvocation {
+            session: Arc::new(search_session),
+            step_context: StepContext::for_test(Arc::clone(&search_turn)),
+            turn: search_turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-search-source-invalid-bounds".to_string(),
+            tool_name: ToolName::plain(SEARCH_SOURCE_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({
+                    "query": "needle",
+                    "max_results": 0,
+                    "environment_id": "missing-environment"
+                })
+                .to_string(),
+            },
+        })
+        .await;
+    let Err(FunctionCallError::RespondToModel(search_message)) = search_result else {
+        panic!("expected search bound validation error");
+    };
+    assert!(search_message.contains("max_matches must be between 1 and 500"));
+    assert!(!search_message.contains("environment"), "{search_message}");
+
+    let (read_session, read_turn) = make_session_and_context().await;
+    let read_turn = Arc::new(read_turn);
+    let read_result = ReadFileSpanHandler::new(true)
+        .handle(ToolInvocation {
+            session: Arc::new(read_session),
+            step_context: StepContext::for_test(Arc::clone(&read_turn)),
+            turn: read_turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-read-file-span-invalid-bounds".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({
+                    "path": "missing.rs",
+                    "line_count": 401,
+                    "environment_id": "missing-environment"
+                })
+                .to_string(),
+            },
+        })
+        .await;
+    let Err(FunctionCallError::RespondToModel(read_message)) = read_result else {
+        panic!("expected read bound validation error");
+    };
+    assert!(read_message.contains("line_count must be between 1 and 400"));
+    assert!(!read_message.contains("environment"), "{read_message}");
+}
+
+#[tokio::test]
+async fn source_handlers_reject_unknown_argument_names() {
+    let (search_session, search_turn) = make_session_and_context().await;
+    let search_turn = Arc::new(search_turn);
+    let search_result = SearchSourceHandler::new(false)
+        .handle(ToolInvocation {
+            session: Arc::new(search_session),
+            step_context: StepContext::for_test(Arc::clone(&search_turn)),
+            turn: search_turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-search-source-unknown-field".to_string(),
+            tool_name: ToolName::plain(SEARCH_SOURCE_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({ "query": "needle", "context_line": 1 }).to_string(),
+            },
+        })
+        .await;
+    let Err(FunctionCallError::RespondToModel(search_message)) = search_result else {
+        panic!("expected search parse error");
+    };
+    assert!(search_message.contains("unknown field `context_line`"));
+
+    let (read_session, read_turn) = make_session_and_context().await;
+    let read_turn = Arc::new(read_turn);
+    let read_result = ReadFileSpanHandler::new(false)
+        .handle(ToolInvocation {
+            session: Arc::new(read_session),
+            step_context: StepContext::for_test(Arc::clone(&read_turn)),
+            turn: read_turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-read-file-span-unknown-field".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({ "path": "src/lib.rs", "environment_ide": "local" }).to_string(),
+            },
+        })
+        .await;
+    let Err(FunctionCallError::RespondToModel(read_message)) = read_result else {
+        panic!("expected read parse error");
+    };
+    assert!(read_message.contains("unknown field `environment_ide`"));
+}
+
+#[tokio::test]
+async fn source_handlers_reject_environment_id_when_not_advertised() {
+    let (search_session, search_turn) = make_session_and_context().await;
+    let search_turn = Arc::new(search_turn);
+    let search_result = SearchSourceHandler::new(false)
+        .handle(ToolInvocation {
+            session: Arc::new(search_session),
+            step_context: StepContext::for_test(Arc::clone(&search_turn)),
+            turn: search_turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-search-source-unadvertised-environment".to_string(),
+            tool_name: ToolName::plain(SEARCH_SOURCE_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({
+                    "query": "needle",
+                    "environment_id": "missing-environment"
+                })
+                .to_string(),
+            },
+        })
+        .await;
+    let Err(FunctionCallError::RespondToModel(search_message)) = search_result else {
+        panic!("expected search parse error");
+    };
+    assert!(search_message.contains("unknown field `environment_id`"));
+
+    let (read_session, read_turn) = make_session_and_context().await;
+    let read_turn = Arc::new(read_turn);
+    let read_result = ReadFileSpanHandler::new(false)
+        .handle(ToolInvocation {
+            session: Arc::new(read_session),
+            step_context: StepContext::for_test(Arc::clone(&read_turn)),
+            turn: read_turn,
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "call-read-file-span-unadvertised-environment".to_string(),
+            tool_name: ToolName::plain(READ_FILE_SPAN_TOOL_NAME),
+            source: ToolCallSource::Direct,
+            payload: ToolPayload::Function {
+                arguments: json!({
+                    "path": "src/lib.rs",
+                    "environment_id": "missing-environment"
+                })
+                .to_string(),
+            },
+        })
+        .await;
+    let Err(FunctionCallError::RespondToModel(read_message)) = read_result else {
+        panic!("expected read parse error");
+    };
+    assert!(read_message.contains("unknown field `environment_id`"));
 }

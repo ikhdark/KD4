@@ -89,6 +89,58 @@ fn tagged_script_and_legacy_shapes_are_explicit() {
 }
 
 #[test]
+fn script_mode_preserves_exact_nonblank_body() {
+    let script_body = "printf '<%s>\\n' foo\\ ";
+    let invocation = parse(Some(script_body), Some("script"), None, None, None)
+        .expect("nonblank script should be accepted without normalization");
+    let shell = Shell {
+        shell_type: ShellType::Bash,
+        shell_path: PathBuf::from("bash"),
+    };
+
+    assert_eq!(
+        invocation,
+        CommandInvocation::Script(script_body.to_string())
+    );
+    assert_eq!(
+        invocation
+            .to_exec_args(&shell, /*use_login_shell*/ false)
+            .last()
+            .map(String::as_str),
+        Some(script_body)
+    );
+}
+
+#[test]
+fn powershell_script_mode_preserves_exact_nonblank_body() {
+    let script_body = "Write-Output foo` ";
+    let invocation = parse(
+        None,
+        Some("powershell_script"),
+        None,
+        None,
+        Some(script_body),
+    )
+    .expect("nonblank PowerShell script should be accepted without normalization");
+    let shell = Shell {
+        shell_type: ShellType::PowerShell,
+        shell_path: PathBuf::from("pwsh"),
+    };
+
+    assert_eq!(
+        invocation,
+        CommandInvocation::PowerShellScript(script_body.to_string())
+    );
+    assert_eq!(
+        invocation
+            .to_safety_args(&shell, /*use_login_shell*/ false)
+            .last()
+            .map(String::as_str),
+        Some(script_body)
+    );
+}
+
+#[test]
 fn powershell_script_mode_builds_encoded_args_without_host_powershell() {
     let script_body = "$value = 'quoted value'; Write-Output $value";
     let invocation = parse(
@@ -170,6 +222,7 @@ fn failure_advisory_only_mentions_powershell_parser_failures() {
         powershell_script_failure_advisory(
             Some(ShellType::PowerShell),
             Some(1),
+            false,
             "ParserError: Unexpected token 'foo'",
         )
         .is_some()
@@ -179,6 +232,7 @@ fn failure_advisory_only_mentions_powershell_parser_failures() {
         powershell_script_failure_advisory(
             Some(ShellType::PowerShell),
             Some(0),
+            false,
             "ParserError: Unexpected token 'foo'",
         ),
         None
@@ -187,6 +241,7 @@ fn failure_advisory_only_mentions_powershell_parser_failures() {
         powershell_script_failure_advisory(
             Some(ShellType::Bash),
             Some(1),
+            false,
             "ParserError: Unexpected token 'foo'",
         ),
         None
@@ -194,10 +249,21 @@ fn failure_advisory_only_mentions_powershell_parser_failures() {
 }
 
 #[test]
-fn failure_advisory_mentions_measure_object_shape_failures() {
+fn failure_advisory_respects_the_active_powershell_script_mode() {
+    assert_eq!(
+        powershell_script_failure_advisory(
+            Some(ShellType::PowerShell),
+            Some(1),
+            true,
+            "ParserError: Unexpected token 'foo'",
+        ),
+        None
+    );
+
     let advisory = powershell_script_failure_advisory(
         Some(ShellType::PowerShell),
         Some(1),
+        true,
         "Measure-Object : Cannot bind parameter 'Property'. Cannot convert the \"{ $_.Length }\" value of type \"System.Management.Automation.ScriptBlock\" to type \"System.String\".",
     )
     .expect("Measure-Object binding failures should get a targeted hint");

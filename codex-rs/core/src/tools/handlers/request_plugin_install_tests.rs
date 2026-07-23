@@ -3,6 +3,10 @@ use crate::plugins::test_support::load_plugins_config;
 use crate::plugins::test_support::write_curated_plugin_sha;
 use crate::plugins::test_support::write_openai_curated_marketplace;
 use crate::plugins::test_support::write_plugins_feature_config;
+use crate::session::tests::make_session_and_context_with_rx;
+use codex_app_server_protocol::PluginAuthPolicy;
+use codex_app_server_protocol::PluginAvailability;
+use codex_app_server_protocol::PluginInstallPolicy;
 use codex_config::CONFIG_TOML_FILE;
 use codex_config::config_toml::ConfigToml;
 use codex_config::types::ToolSuggestConfig;
@@ -11,6 +15,8 @@ use codex_config::types::ToolSuggestDiscoverable;
 use codex_config::types::ToolSuggestDiscoverableType;
 use codex_core_plugins::PluginInstallRequest;
 use codex_core_plugins::PluginsManager;
+use codex_core_plugins::remote::RemoteMarketplace;
+use codex_core_plugins::remote::RemotePluginSummary;
 use codex_core_plugins::startup_sync::curated_plugins_repo_path;
 use codex_rmcp_client::ElicitationResponse;
 use codex_tools::DiscoverablePluginInfo;
@@ -29,6 +35,86 @@ fn request_plugin_install_does_not_support_parallel_tool_calls() {
     );
 
     assert!(!handler.supports_parallel_tool_calls());
+}
+
+fn remote_marketplace_with_plugin(
+    config_id: &str,
+    remote_plugin_id: &str,
+    installed: bool,
+) -> RemoteMarketplace {
+    RemoteMarketplace {
+        name: REMOTE_GLOBAL_MARKETPLACE_NAME.to_string(),
+        display_name: "OpenAI Curated Remote".to_string(),
+        plugins: vec![RemotePluginSummary {
+            id: config_id.to_string(),
+            remote_plugin_id: remote_plugin_id.to_string(),
+            version: None,
+            local_version: None,
+            name: "Calendar".to_string(),
+            share_context: None,
+            installed,
+            enabled: true,
+            install_policy: PluginInstallPolicy::Available,
+            install_policy_source: None,
+            auth_policy: PluginAuthPolicy::OnUse,
+            availability: PluginAvailability::Available,
+            interface: None,
+            keywords: Vec::new(),
+        }],
+    }
+}
+
+#[test]
+fn remote_plugin_completion_requires_requested_plugin_even_without_connectors() {
+    let marketplaces = vec![remote_marketplace_with_plugin(
+        "other@openai-curated-remote",
+        "plugin_other",
+        true,
+    )];
+
+    assert!(!verified_remote_plugin_install_completed(
+        Some(&marketplaces),
+        "calendar@openai-curated-remote",
+        Some("plugin_calendar"),
+        true,
+    ));
+}
+
+#[test]
+fn remote_plugin_completion_accepts_present_plugin_without_connectors() {
+    let matching_config_id = vec![remote_marketplace_with_plugin(
+        "calendar@openai-curated-remote",
+        "plugin_other",
+        true,
+    )];
+    let matching_remote_id = vec![remote_marketplace_with_plugin(
+        "renamed-calendar@openai-curated-remote",
+        "plugin_calendar",
+        true,
+    )];
+
+    assert!(verified_remote_plugin_install_completed(
+        Some(&matching_config_id),
+        "calendar@openai-curated-remote",
+        Some("plugin_calendar"),
+        true,
+    ));
+    assert!(verified_remote_plugin_install_completed(
+        Some(&matching_remote_id),
+        "calendar@openai-curated-remote",
+        Some("plugin_calendar"),
+        true,
+    ));
+}
+
+#[test]
+fn remote_plugin_completion_rejects_catalog_refresh_failure_with_connectors_accessible() {
+    assert!(!verified_remote_plugin_install_completed(
+        None,
+        "calendar@openai-curated-remote",
+        Some("plugin_calendar"),
+        true,
+    ));
 }
 
 #[tokio::test]
@@ -183,6 +269,37 @@ async fn persist_disabled_install_request_writes_plugin_config() {
             disabled_tools: vec![ToolSuggestDisabledTool::plugin("slack@openai-curated")],
         })
     );
+}
+
+#[tokio::test]
+async fn persistent_disable_write_failure_produces_nonfatal_warning_feedback() {
+    let parent = tempdir().expect("tempdir should succeed");
+    let codex_home_file = parent.path().join("codex-home-file");
+    std::fs::write(&codex_home_file, "not a directory").expect("write codex home file");
+    let (session, turn, events) = make_session_and_context_with_rx().await;
+    let tool = connector_tool("connector_calendar", "Google Calendar");
+    let response = ElicitationResponse {
+        action: ElicitationAction::Decline,
+        content: None,
+        meta: Some(json!({
+            REQUEST_PLUGIN_INSTALL_PERSIST_KEY: REQUEST_PLUGIN_INSTALL_PERSIST_ALWAYS_VALUE
+        })),
+    };
+
+    handle_disabled_install_persistence(&session, &turn, &codex_home_file.abs(), &tool, &response)
+        .await;
+
+    let warning = events
+        .try_recv()
+        .expect("persistence failure should emit a warning event");
+    assert_eq!(warning.id, turn.sub_id);
+
+    assert!(matches!(
+        warning.msg,
+        EventMsg::Warning(WarningEvent { message })
+            if message
+                == "Could not save the do-not-suggest-again preference for Google Calendar. This suggestion may appear again in a future turn."
+    ));
 }
 
 #[tokio::test]

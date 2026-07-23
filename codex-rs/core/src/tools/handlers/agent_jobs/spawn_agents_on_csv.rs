@@ -36,6 +36,7 @@ impl SpawnAgentsOnCsvHandler {
         let ToolInvocation {
             session,
             turn,
+            cancellation_token,
             payload,
             ..
         } = invocation;
@@ -49,7 +50,7 @@ impl SpawnAgentsOnCsvHandler {
             }
         };
 
-        handle(session, turn, arguments)
+        handle(session, turn, arguments, cancellation_token)
             .await
             .map(boxed_tool_output)
     }
@@ -58,6 +59,10 @@ impl SpawnAgentsOnCsvHandler {
 impl CoreToolRuntime for SpawnAgentsOnCsvHandler {
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
+    }
+
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        true
     }
 }
 
@@ -70,12 +75,16 @@ pub async fn handle(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
     arguments: String,
+    cancellation_token: CancellationToken,
 ) -> Result<FunctionToolOutput, FunctionCallError> {
     let args: SpawnAgentsOnCsvArgs = parse_arguments(arguments.as_str())?;
     if args.instruction.trim().is_empty() {
         return Err(FunctionCallError::RespondToModel(
             "instruction must be non-empty".to_string(),
         ));
+    }
+    if let Some(schema) = args.output_schema.as_ref() {
+        validate_agent_job_output_schema(schema)?;
     }
 
     let cwd = single_local_environment_cwd(&turn)?;
@@ -183,7 +192,24 @@ pub async fn handle(
 
     let requested_concurrency = args.max_concurrency.or(args.max_workers);
     let options = match build_runner_options(&session, &turn, requested_concurrency).await {
-        Ok(options) => options,
+        Ok(options) => Some(options),
+        Err(_) if cancellation_token.is_cancelled() => {
+            db.mark_agent_job_cancelled(job_id.as_str(), PARENT_TOOL_CANCELLATION_REASON)
+                .await
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "failed to cancel agent job {job_id}: {error}"
+                    ))
+                })?;
+            export_job_csv_snapshot(db.clone(), &_job)
+                .await
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "failed to export cancelled agent job {job_id}: {error}"
+                    ))
+                })?;
+            None
+        }
         Err(err) => {
             let error_message = err.to_string();
             let _ = db
@@ -192,29 +218,66 @@ pub async fn handle(
             return Err(err);
         }
     };
-    db.mark_agent_job_running(job_id.as_str())
+    if let Some(options) = options {
+        if !cancellation_token.is_cancelled() {
+            db.mark_agent_job_running(job_id.as_str())
+                .await
+                .map_err(|err| {
+                    FunctionCallError::RespondToModel(format!(
+                        "failed to transition agent job {job_id} to running: {err}"
+                    ))
+                })?;
+        }
+        if let Err(err) = run_agent_job_loop(
+            session.clone(),
+            turn.clone(),
+            db.clone(),
+            job_id.clone(),
+            options,
+            cancellation_token,
+        )
         .await
-        .map_err(|err| {
-            FunctionCallError::RespondToModel(format!(
-                "failed to transition agent job {job_id} to running: {err}"
-            ))
-        })?;
-    if let Err(err) = run_agent_job_loop(
-        session.clone(),
-        turn.clone(),
-        db.clone(),
-        job_id.clone(),
-        options,
-    )
-    .await
-    {
-        let error_message = format!("job runner failed: {err}");
-        let _ = db
-            .mark_agent_job_failed(job_id.as_str(), error_message.as_str())
-            .await;
-        return Err(FunctionCallError::RespondToModel(format!(
-            "agent job {job_id} failed: {err}"
-        )));
+        {
+            let error_message = format!("job runner failed: {err}");
+            let cancelled = db
+                .is_agent_job_cancelled(job_id.as_str())
+                .await
+                .unwrap_or(false);
+            if !cancelled {
+                let _ = db
+                    .mark_agent_job_failed(job_id.as_str(), error_message.as_str())
+                    .await;
+            }
+            let cleanup_reason = if cancelled {
+                "job cancelled before worker completion"
+            } else {
+                error_message.as_str()
+            };
+            let mut active_items = HashMap::new();
+            let cleanup_error = terminate_agent_job_workers(
+                session.clone(),
+                db.clone(),
+                job_id.as_str(),
+                &mut active_items,
+                cleanup_reason,
+            )
+            .await
+            .err();
+            let export_error = export_job_csv_snapshot(db.clone(), &_job).await.err();
+            let cleanup_details = match (cleanup_error, export_error) {
+                (Some(cleanup_error), Some(export_error)) => format!(
+                    "; worker cleanup failed: {cleanup_error}; final export failed: {export_error}"
+                ),
+                (Some(cleanup_error), None) => {
+                    format!("; worker cleanup failed: {cleanup_error}")
+                }
+                (None, Some(export_error)) => format!("; final export failed: {export_error}"),
+                (None, None) => String::new(),
+            };
+            return Err(FunctionCallError::RespondToModel(format!(
+                "agent job {job_id} failed: {err}{cleanup_details}"
+            )));
+        }
     }
 
     let job = db

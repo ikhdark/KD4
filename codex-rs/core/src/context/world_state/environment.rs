@@ -108,6 +108,7 @@ impl WorldStateSection for EnvironmentsState {
             || current.timezone != previous.timezone
             || current.network != previous.network
             || current.filesystem != previous.filesystem;
+        let subagents_changed = current.subagents != previous.subagents;
         let mut updates = self
             .environments
             .iter()
@@ -131,7 +132,7 @@ impl WorldStateSection for EnvironmentsState {
             && updates
                 .values()
                 .all(|update| matches!(update, EnvironmentUpdate::Current(_)));
-        (!updates.is_empty() || turn_context_values_changed).then(|| {
+        (!updates.is_empty() || turn_context_values_changed || subagents_changed).then(|| {
             Box::new(RenderedEnvironments {
                 updates,
                 legacy_single,
@@ -234,7 +235,7 @@ impl ContextualUserFragment for RenderedEnvironments {
             rendered.push_str("  <subagents>\n");
             for line in subagents.lines() {
                 rendered.push_str("    ");
-                rendered.push_str(line);
+                push_xml_escaped_text(&mut rendered, line);
                 rendered.push('\n');
             }
             rendered.push_str("  </subagents>\n");
@@ -361,20 +362,27 @@ fn environment_context_markers() -> (&'static str, &'static str) {
 }
 
 fn network_from_turn_context(turn_context: &TurnContext) -> Option<NetworkContext> {
-    let network = turn_context
+    let network_requirements = turn_context
         .config
         .config_layer_stack
         .requirements()
         .network
         .as_ref()?;
+    let enabled = turn_context
+        .config
+        .permissions
+        .network
+        .as_ref()
+        .is_some_and(|network| network.enabled());
 
     Some(NetworkContext::new(
-        network
+        enabled,
+        network_requirements
             .domains
             .as_ref()
             .and_then(codex_config::NetworkDomainPermissionsToml::allowed_domains)
             .unwrap_or_default(),
-        network
+        network_requirements
             .domains
             .as_ref()
             .and_then(codex_config::NetworkDomainPermissionsToml::denied_domains)

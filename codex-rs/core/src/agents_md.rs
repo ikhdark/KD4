@@ -29,6 +29,7 @@ use codex_file_system::FindUpErrorPolicy;
 use codex_file_system::find_nearest_ancestor_with_markers;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
+use futures::StreamExt;
 use sha2::Digest;
 use sha2::Sha256;
 use std::io;
@@ -43,6 +44,43 @@ pub const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
 /// When both user and project AGENTS.md docs are present, they will be
 /// concatenated with the following separator.
 const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
+const MAX_CONCURRENT_ENVIRONMENT_LOADS: usize = 4;
+const MAX_CONCURRENT_DIRECTORY_SEARCHES: usize = 8;
+const MAX_UTF8_BOUNDARY_LOOKAHEAD_BYTES: usize = 3;
+
+pub(crate) struct ProjectInstructionsLoad {
+    pub(crate) loaded: Option<LoadedAgentsMd>,
+    pub(crate) complete: bool,
+}
+
+struct EnvironmentProjectInstructions {
+    loaded: Option<LoadedAgentsMd>,
+    retained_bytes: usize,
+}
+
+struct LoadedProjectDoc {
+    candidate: ProjectDocCandidate,
+    read: ProjectDocRead,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProjectDocCandidate {
+    path: PathUri,
+    size: u64,
+}
+
+struct ProjectDocRead {
+    retained_data: Vec<u8>,
+    original_bytes: u64,
+    utf8_boundary_truncation: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RetainedUtf8Boundary {
+    CompleteOrInvalid,
+    NeedsMore(usize),
+    ValidSplit(usize),
+}
 
 /// Loads project AGENTS.md content and combines it with host-provided user
 /// instructions.
@@ -50,30 +88,68 @@ pub(crate) async fn load_project_instructions(
     config: &Config,
     user_instructions: Option<UserInstructions>,
     environments: &TurnEnvironmentSnapshot,
-) -> Option<LoadedAgentsMd> {
+) -> ProjectInstructionsLoad {
     let mut loaded = LoadedAgentsMd::from_user_instructions(user_instructions);
-    for turn_environment in &environments.turn_environments {
-        let filesystem = turn_environment.environment.get_filesystem();
-        match read_agents_md(
-            config,
-            filesystem.as_ref(),
-            &turn_environment.environment_id,
-            turn_environment.cwd(),
-        )
-        .await
-        {
-            Ok(Some(docs)) => loaded.entries.extend(docs.entries),
-            Ok(None) => {}
-            Err(e) => {
+    let mut remaining = config.project_doc_max_bytes;
+    let mut complete = true;
+    if remaining == 0 {
+        return ProjectInstructionsLoad {
+            loaded: (!loaded.is_empty()).then_some(loaded),
+            complete,
+        };
+    }
+
+    let max_total = config.project_doc_max_bytes;
+    let mut environment_loads = Vec::with_capacity(environments.turn_environments.len());
+    for (environment_index, turn_environment) in environments.turn_environments.iter().enumerate() {
+        let environment_id = turn_environment.environment_id.clone();
+        let environment = turn_environment.environment.clone();
+        let cwd = turn_environment.cwd().clone();
+        let prefetch_utf8_boundary_slack = environment_index > 0;
+        environment_loads.push(async move {
+            let filesystem = environment.get_filesystem();
+            let result = async {
+                let candidates = agents_md_paths(config, &cwd, filesystem.as_ref()).await?;
+                read_discovered_project_docs(
+                    filesystem.as_ref(),
+                    candidates,
+                    max_total,
+                    prefetch_utf8_boundary_slack,
+                )
+                .await
+            }
+            .await;
+            (environment_id, cwd, result)
+        });
+    }
+    // Independent environment discovery and file reads overlap, while `buffered` preserves
+    // selection order for the aggregate-budget allocation below.
+    let mut environment_loads =
+        futures::stream::iter(environment_loads).buffered(MAX_CONCURRENT_ENVIRONMENT_LOADS);
+    while let Some((environment_id, cwd, result)) = environment_loads.next().await {
+        match result {
+            Ok(project_docs) => {
+                let environment_load =
+                    render_project_docs(&environment_id, &cwd, project_docs, remaining);
+                remaining = remaining.saturating_sub(environment_load.retained_bytes);
+                if let Some(docs) = environment_load.loaded {
+                    loaded.entries.extend(docs.entries);
+                }
+            }
+            Err(err) => {
+                complete = false;
                 error!(
-                    environment_id = turn_environment.environment_id,
-                    "error trying to find AGENTS.md docs: {e:#}"
+                    environment_id,
+                    "error trying to find AGENTS.md docs: {err:#}"
                 );
             }
         }
     }
 
-    (!loaded.is_empty()).then_some(loaded)
+    ProjectInstructionsLoad {
+        loaded: (!loaded.is_empty()).then_some(loaded),
+        complete,
+    }
 }
 
 /// Attempt to locate and load AGENTS.md documentation.
@@ -95,45 +171,110 @@ async fn read_agents_md(
     }
 
     let paths = agents_md_paths(config, cwd, fs).await?;
+    Ok(
+        read_discovered_agents_md(fs, environment_id, cwd, paths, max_total)
+            .await?
+            .loaded,
+    )
+}
+
+async fn read_discovered_agents_md(
+    fs: &dyn ExecutorFileSystem,
+    environment_id: &str,
+    cwd: &PathUri,
+    paths: Vec<ProjectDocCandidate>,
+    max_total: usize,
+) -> io::Result<EnvironmentProjectInstructions> {
+    let project_docs = read_discovered_project_docs(
+        fs, paths, max_total, /*prefetch_utf8_boundary_slack*/ false,
+    )
+    .await?;
+    Ok(render_project_docs(
+        environment_id,
+        cwd,
+        project_docs,
+        max_total,
+    ))
+}
+
+async fn read_discovered_project_docs(
+    fs: &dyn ExecutorFileSystem,
+    paths: Vec<ProjectDocCandidate>,
+    max_total: usize,
+    prefetch_utf8_boundary_slack: bool,
+) -> io::Result<Vec<LoadedProjectDoc>> {
     if paths.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
+    let mut remaining = max_total;
+    let mut project_docs = Vec::new();
+
+    // Allocate the byte budget from the nearest scope outward, then restore the
+    // root-to-cwd order used when the aggregate environment budget is applied.
+    for candidate in paths.into_iter().rev() {
+        // Retain up to one UTF-8 boundary's lookahead beyond this environment's current
+        // allocation. A smaller aggregate allocation can trim a split code point and pass those
+        // bytes to a broader document without requiring a second filesystem read.
+        let prefetch_bytes = if prefetch_utf8_boundary_slack {
+            remaining
+                .saturating_add(MAX_UTF8_BOUNDARY_LOOKAHEAD_BYTES)
+                .min(max_total)
+        } else {
+            remaining
+        };
+        let Some(mut project_doc) = read_project_doc(fs, &candidate, prefetch_bytes).await? else {
+            continue;
+        };
+
+        if let Some(valid_up_to) = project_doc.utf8_boundary_truncation {
+            project_doc.retained_data.truncate(valid_up_to);
+        }
+        let retained_bytes = retained_project_doc_bytes(&project_doc.retained_data, remaining);
+        project_docs.push(LoadedProjectDoc {
+            candidate,
+            read: project_doc,
+        });
+        remaining = remaining.saturating_sub(retained_bytes);
+    }
+    project_docs.reverse();
+    Ok(project_docs)
+}
+
+fn render_project_docs(
+    environment_id: &str,
+    cwd: &PathUri,
+    project_docs: Vec<LoadedProjectDoc>,
+    max_total: usize,
+) -> EnvironmentProjectInstructions {
     let mut remaining = max_total;
     let mut loaded = LoadedAgentsMd::default();
     let mut entries = Vec::new();
 
-    // Allocate the byte budget from the nearest scope outward, then restore the
-    // root-to-cwd presentation order expected by instruction precedence.
-    for p in paths.into_iter().rev() {
-        let data = match fs.read_file(&p, /*sandbox*/ None).await {
-            Ok(data) => data,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
-        };
-        if String::from_utf8_lossy(&data).trim().is_empty() {
-            continue;
-        }
-
-        let original_bytes = data.len();
-        let retained_bytes = original_bytes.min(remaining);
-        let omitted_bytes = original_bytes.saturating_sub(retained_bytes);
-        let mut retained_data = data;
-        retained_data.truncate(retained_bytes);
-        let mut text = String::from_utf8_lossy(&retained_data).to_string();
+    // Reapply the shared budget nearest-first. Each environment was prefetched with at least
+    // this much local capacity, so narrowing a retained prefix never requires more I/O.
+    for LoadedProjectDoc {
+        candidate,
+        mut read,
+    } in project_docs.into_iter().rev()
+    {
+        truncate_project_doc_to_budget(&mut read, remaining);
+        let retained_bytes = read.retained_data.len();
+        let omitted_bytes = read.original_bytes.saturating_sub(retained_bytes as u64);
+        let mut text = String::from_utf8_lossy(&read.retained_data).to_string();
 
         if omitted_bytes > 0 {
             if !text.is_empty() {
                 text.push_str("\n\n");
             }
             text.push_str(&project_doc_truncation_notice(
-                &p,
-                original_bytes,
+                &candidate.path,
+                read.original_bytes,
                 retained_bytes,
             ));
             tracing::warn!(
-                path = %p,
-                original_bytes,
+                path = %candidate.path,
+                original_bytes = read.original_bytes,
                 retained_bytes,
                 omitted_bytes,
                 "project doc exceeds remaining budget; truncation notice added"
@@ -143,7 +284,7 @@ async fn read_agents_md(
         entries.push(InstructionEntry {
             contents: text,
             provenance: InstructionProvenance::Project {
-                source_path: p,
+                source_path: candidate.path,
                 environment_id: environment_id.to_string(),
                 cwd: cwd.clone(),
             },
@@ -153,19 +294,213 @@ async fn read_agents_md(
     entries.reverse();
     loaded.entries.extend(entries);
 
-    if loaded.is_empty() {
-        Ok(None)
+    EnvironmentProjectInstructions {
+        loaded: (!loaded.is_empty()).then_some(loaded),
+        retained_bytes: max_total.saturating_sub(remaining),
+    }
+}
+
+fn truncate_project_doc_to_budget(project_doc: &mut ProjectDocRead, max_bytes: usize) {
+    let retained_bytes = retained_project_doc_bytes(&project_doc.retained_data, max_bytes);
+    project_doc.retained_data.truncate(retained_bytes);
+}
+
+fn retained_project_doc_bytes(retained_data: &[u8], max_bytes: usize) -> usize {
+    if retained_data.len() <= max_bytes {
+        return retained_data.len();
+    }
+    let lookahead_end = max_bytes
+        .saturating_add(MAX_UTF8_BOUNDARY_LOOKAHEAD_BYTES)
+        .min(retained_data.len());
+    match classify_retained_utf8_boundary(
+        &retained_data[..max_bytes],
+        &retained_data[max_bytes..lookahead_end],
+    ) {
+        RetainedUtf8Boundary::ValidSplit(valid_up_to) => valid_up_to,
+        RetainedUtf8Boundary::CompleteOrInvalid | RetainedUtf8Boundary::NeedsMore(_) => max_bytes,
+    }
+}
+
+async fn read_project_doc(
+    fs: &dyn ExecutorFileSystem,
+    candidate: &ProjectDocCandidate,
+    max_bytes: usize,
+) -> io::Result<Option<ProjectDocRead>> {
+    let mut stream = match fs.read_file_stream(&candidate.path, /*sandbox*/ None).await {
+        Ok(stream) => stream,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    let mut retained_data = Vec::new();
+    let mut observed_bytes = 0_u64;
+    let mut pending_utf8 = Vec::with_capacity(4);
+    let mut boundary_lookahead = Vec::with_capacity(MAX_UTF8_BOUNDARY_LOOKAHEAD_BYTES);
+    let mut utf8_boundary_truncation = None;
+    let mut has_non_whitespace = false;
+    let mut reached_eof = false;
+
+    loop {
+        let Some(chunk) = stream.next().await else {
+            reached_eof = true;
+            break;
+        };
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(err),
+        };
+        observed_bytes = observed_bytes.saturating_add(chunk.len() as u64);
+
+        let retain = max_bytes
+            .saturating_sub(retained_data.len())
+            .min(chunk.len());
+        retained_data.extend_from_slice(&chunk[..retain]);
+        let mut retained_utf8_boundary = RetainedUtf8Boundary::CompleteOrInvalid;
+        if retained_data.len() == max_bytes {
+            // A retained prefix can end up to three bytes short of a complete code point. Trim
+            // only when bounded lookahead proves a valid split; invalid bytes stay lossy-visible.
+            retained_utf8_boundary =
+                classify_retained_utf8_boundary(&retained_data, &boundary_lookahead);
+            if let RetainedUtf8Boundary::NeedsMore(needed) = retained_utf8_boundary {
+                let available = &chunk[retain..];
+                let take = needed.min(available.len());
+                boundary_lookahead.extend_from_slice(&available[..take]);
+                retained_utf8_boundary =
+                    classify_retained_utf8_boundary(&retained_data, &boundary_lookahead);
+            }
+            utf8_boundary_truncation = match retained_utf8_boundary {
+                RetainedUtf8Boundary::ValidSplit(valid_up_to) => Some(valid_up_to),
+                RetainedUtf8Boundary::CompleteOrInvalid | RetainedUtf8Boundary::NeedsMore(_) => {
+                    None
+                }
+            };
+        }
+        if !has_non_whitespace {
+            has_non_whitespace = chunk_has_non_whitespace(&mut pending_utf8, &chunk);
+        }
+
+        let known_oversized = candidate.size > max_bytes_u64 || observed_bytes > max_bytes_u64;
+        if retained_data.len() == max_bytes
+            && known_oversized
+            && !matches!(retained_utf8_boundary, RetainedUtf8Boundary::NeedsMore(_))
+        {
+            break;
+        }
+    }
+
+    if reached_eof && !has_non_whitespace && !pending_utf8.is_empty() {
+        // An incomplete UTF-8 sequence is rendered lossily as U+FFFD, which is
+        // non-whitespace and therefore makes the document nonempty.
+        has_non_whitespace = true;
+    }
+    if reached_eof && !has_non_whitespace {
+        return Ok(None);
+    }
+
+    let original_bytes = if reached_eof {
+        observed_bytes
     } else {
-        Ok(Some(loaded))
+        candidate.size.max(observed_bytes)
+    };
+    Ok(Some(ProjectDocRead {
+        retained_data,
+        original_bytes,
+        utf8_boundary_truncation,
+    }))
+}
+
+fn chunk_has_non_whitespace(pending_utf8: &mut Vec<u8>, chunk: &[u8]) -> bool {
+    let mut offset = 0;
+    if let Some(&first_byte) = pending_utf8.first() {
+        let expected_len = utf8_sequence_len(first_byte);
+        let take = expected_len
+            .saturating_sub(pending_utf8.len())
+            .min(chunk.len());
+        pending_utf8.extend_from_slice(&chunk[..take]);
+        match std::str::from_utf8(pending_utf8) {
+            Ok(text) => {
+                if text.chars().any(|ch| !ch.is_whitespace()) {
+                    return true;
+                }
+                pending_utf8.clear();
+                offset = take;
+            }
+            Err(err) if err.error_len().is_some() => return true,
+            Err(_) => return false,
+        }
+    }
+
+    let remaining = &chunk[offset..];
+    match std::str::from_utf8(remaining) {
+        Ok(text) => text.chars().any(|ch| !ch.is_whitespace()),
+        Err(err) => {
+            let valid = std::str::from_utf8(&remaining[..err.valid_up_to()])
+                .expect("valid_up_to must delimit a valid UTF-8 prefix");
+            if valid.chars().any(|ch| !ch.is_whitespace()) {
+                return true;
+            }
+            if err.error_len().is_some() {
+                return true;
+            }
+            pending_utf8.extend_from_slice(&remaining[err.valid_up_to()..]);
+            false
+        }
+    }
+}
+
+fn utf8_sequence_len(first_byte: u8) -> usize {
+    match first_byte {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 1,
+    }
+}
+
+fn classify_retained_utf8_boundary(
+    retained_data: &[u8],
+    boundary_lookahead: &[u8],
+) -> RetainedUtf8Boundary {
+    let Err(err) = std::str::from_utf8(retained_data) else {
+        return RetainedUtf8Boundary::CompleteOrInvalid;
+    };
+    if err.error_len().is_some() {
+        return RetainedUtf8Boundary::CompleteOrInvalid;
+    }
+
+    let valid_up_to = err.valid_up_to();
+    let incomplete_suffix = &retained_data[valid_up_to..];
+    let Some(&first_byte) = incomplete_suffix.first() else {
+        return RetainedUtf8Boundary::CompleteOrInvalid;
+    };
+    let expected_len = utf8_sequence_len(first_byte);
+    let missing = expected_len.saturating_sub(incomplete_suffix.len());
+    let lookahead_len = missing.min(boundary_lookahead.len());
+    let boundary_len = incomplete_suffix.len() + lookahead_len;
+    let mut boundary = [0_u8; 4];
+    boundary[..incomplete_suffix.len()].copy_from_slice(incomplete_suffix);
+    boundary[incomplete_suffix.len()..boundary_len]
+        .copy_from_slice(&boundary_lookahead[..lookahead_len]);
+
+    match std::str::from_utf8(&boundary[..boundary_len]) {
+        Ok(_) if boundary_len == expected_len => RetainedUtf8Boundary::ValidSplit(valid_up_to),
+        Ok(_) => RetainedUtf8Boundary::NeedsMore(expected_len - boundary_len),
+        Err(err) if err.error_len().is_some() => RetainedUtf8Boundary::CompleteOrInvalid,
+        Err(_) if boundary_len < expected_len => {
+            RetainedUtf8Boundary::NeedsMore(expected_len - boundary_len)
+        }
+        Err(_) => RetainedUtf8Boundary::CompleteOrInvalid,
     }
 }
 
 fn project_doc_truncation_notice(
     source_path: &PathUri,
-    original_bytes: usize,
+    original_bytes: u64,
     retained_bytes: usize,
 ) -> String {
-    let omitted_bytes = original_bytes.saturating_sub(retained_bytes);
+    let omitted_bytes = original_bytes.saturating_sub(retained_bytes as u64);
     format!(
         "[Project documentation truncation notice: source path: {}; original byte count: {original_bytes}; retained byte count: {retained_bytes}; omitted byte count: {omitted_bytes}.]",
         source_path.inferred_native_path_string()
@@ -178,7 +513,7 @@ async fn agents_md_paths(
     config: &Config,
     cwd: &PathUri,
     fs: &dyn ExecutorFileSystem,
-) -> io::Result<Vec<PathUri>> {
+) -> io::Result<Vec<ProjectDocCandidate>> {
     let dir = cwd.clone();
 
     let project_root_markers = effective_project_root_markers(config);
@@ -208,22 +543,37 @@ async fn agents_md_paths(
     } else {
         vec![dir]
     };
-    let mut found = Vec::new();
     let candidate_filenames = candidate_filenames(config);
-    for directory in search_dirs {
-        for name in &candidate_filenames {
-            let candidate = directory
-                .join(name)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-            match fs.get_metadata(&candidate, /*sandbox*/ None).await {
-                Ok(metadata) if metadata.is_file => {
-                    found.push(candidate);
-                    break;
+    let directory_searches = search_dirs.into_iter().map(|directory| {
+        let candidate_filenames = &candidate_filenames;
+        async move {
+            for name in candidate_filenames {
+                let candidate = directory
+                    .join(name)
+                    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+                match fs.get_metadata(&candidate, /*sandbox*/ None).await {
+                    Ok(metadata) if metadata.is_file => {
+                        return Ok(Some(ProjectDocCandidate {
+                            path: candidate,
+                            size: metadata.size,
+                        }));
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => return Err(err),
                 }
-                Ok(_) => {}
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err),
             }
+            Ok(None)
+        }
+    });
+    // Directories can be probed independently. `buffered` keeps results in root-to-cwd order,
+    // while each directory still checks override/default/fallback filenames sequentially.
+    let mut directory_searches =
+        futures::stream::iter(directory_searches).buffered(MAX_CONCURRENT_DIRECTORY_SEARCHES);
+    let mut found = Vec::new();
+    while let Some(path) = directory_searches.next().await {
+        if let Some(path) = path? {
+            found.push(path);
         }
     }
     Ok(found)

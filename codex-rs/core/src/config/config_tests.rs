@@ -1291,7 +1291,7 @@ async fn permissions_profiles_proxy_policy_does_not_start_managed_network_proxy_
 }
 
 #[tokio::test]
-async fn permissions_profiles_proxy_policy_starts_managed_network_proxy() -> std::io::Result<()> {
+async fn profile_proxy_url_still_requires_network_proxy_feature() -> std::io::Result<()> {
     let codex_home = TempDir::new()?;
     let cwd = TempDir::new()?;
     std::fs::write(cwd.path().join(".git"), "gitdir: nowhere")?;
@@ -7961,6 +7961,66 @@ developer_instructions = "Write carefully"
             .and_then(|role| role.nickname_candidates.as_ref())
             .map(|candidates| candidates.iter().map(String::as_str).collect::<Vec<_>>()),
         Some(vec!["Sagan"])
+    );
+
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn agent_role_discovery_terminates_on_directory_symlink_cycle() -> std::io::Result<()> {
+    let codex_home = TempDir::new()?;
+    let repo_root = TempDir::new()?;
+    let nested_cwd = repo_root.path().join("packages").join("app");
+    std::fs::create_dir_all(repo_root.path().join(".git"))?;
+    std::fs::create_dir_all(&nested_cwd)?;
+
+    let workspace_key = repo_root.path().to_string_lossy().replace('\\', "\\\\");
+    std::fs::write(
+        codex_home.path().join(CONFIG_TOML_FILE),
+        format!(
+            r#"[projects."{workspace_key}"]
+trust_level = "trusted"
+"#
+        ),
+    )?;
+
+    let agents_dir = repo_root.path().join(".codex").join("agents");
+    std::fs::create_dir_all(&agents_dir)?;
+    std::fs::write(
+        agents_dir.join("researcher.toml"),
+        r#"
+name = "researcher"
+description = "from cycle"
+developer_instructions = "Research carefully"
+"#,
+    )?;
+    std::os::unix::fs::symlink(&agents_dir, agents_dir.join("loop"))?;
+
+    let config = ConfigBuilder::without_managed_config_for_tests()
+        .codex_home(codex_home.path().to_path_buf())
+        .harness_overrides(ConfigOverrides {
+            cwd: Some(nested_cwd),
+            ..Default::default()
+        })
+        .build()
+        .await?;
+
+    assert_eq!(config.agent_roles.len(), 1);
+    assert_eq!(
+        config
+            .agent_roles
+            .get("researcher")
+            .and_then(|role| role.description.as_deref()),
+        Some("from cycle")
+    );
+    assert!(
+        !config
+            .startup_warnings
+            .iter()
+            .any(|warning| warning.contains("duplicate agent role name `researcher`")),
+        "{:?}",
+        config.startup_warnings
     );
 
     Ok(())

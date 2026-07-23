@@ -7,9 +7,10 @@ description: Create, maintain, audit, or use durable KD4 workflow artifacts unde
 
 Use this skill only for KD4's durable workflow layer. Root `AGENTS.md` owns task
 lanes, repository implementation discipline, validation, and completion
-reporting. Wiring Guard/KDWG owns static reachability proof when it is active.
-The harness may record those decisions and results, but must not redefine them
-or trigger merely because ordinary implementation work is in scope.
+reporting. Independently applicable specialist skills keep their own triggers
+and evidence requirements. The harness may record their results, but must not
+redefine or activate them merely because ordinary implementation work is in
+scope.
 
 ## Required Reading
 
@@ -35,10 +36,9 @@ or trigger merely because ordinary implementation work is in scope.
 - Do not create a run directory unless durable state will help a broad,
   resumable, multi-step, multi-agent, or explicitly auditable task.
 - For implementation inside an already harnessed task, follow root `AGENTS.md`
-  and any active specialist skill. Record Wiring Guard/KDWG evidence when that
-  independent proof layer applies.
-- Do not activate this skill solely because Wiring Guard/KDWG or an
-  implementation-oriented skill is active.
+  and any active specialist skill. Record only evidence useful to the durable
+  task state.
+- Do not activate this skill solely because another specialist skill is active.
 - Use subagents only when the user or active instructions explicitly ask for
   delegation or parallel agent work.
 - Follow KD4's no-commit, no-publish default unless the user asks.
@@ -61,7 +61,7 @@ or trigger merely because ordinary implementation work is in scope.
 3. Copy relevant templates from `.codex/harness/templates`.
 4. Fill only the sections that materially help the task.
 5. For implementation, record the owner path, validation intent, and any
-   Wiring Guard/KDWG session required by root policy or an active skill.
+   independently applicable proof requirements.
 6. Keep generated logs and bulky runtime evidence out of reviewable changes
    unless requested.
 7. Add `EVAL.md`, `HARNESS_AUDIT.md`, or `HANDOFF.md` only when the task needs
@@ -70,7 +70,7 @@ or trigger merely because ordinary implementation work is in scope.
 ### Finish A Harnessed Task
 
 1. Apply the completion and reporting gate from root `AGENTS.md`.
-2. Record the focused validation and Wiring Guard/KDWG verdict when applicable.
+2. Record focused validation and any independently applicable specialist result.
 3. Record skipped checks and remaining risk.
 4. Write `HANDOFF.md` only when unresolved work or context must survive.
 5. Keep final claims within the evidence actually recorded.

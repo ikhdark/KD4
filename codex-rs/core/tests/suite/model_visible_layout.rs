@@ -46,14 +46,6 @@ fn format_labeled_requests_snapshot(
     )
 }
 
-fn user_instructions_wrapper_count(request: &ResponsesRequest) -> usize {
-    request
-        .message_input_texts("user")
-        .iter()
-        .filter(|text| text.starts_with("# AGENTS.md instructions"))
-        .count()
-}
-
 fn format_environment_context_subagents_snapshot(subagents: &[&str]) -> String {
     let subagents_block = if subagents.is_empty() {
         String::new()
@@ -199,9 +191,7 @@ async fn snapshot_model_visible_layout_turn_overrides() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// TODO(ccunningham): Diff `user_instructions` and emit updates when AGENTS.md content changes
-// (for example after cwd changes), then update this test to assert refreshed AGENTS content.
-async fn snapshot_model_visible_layout_cwd_change_does_not_refresh_agents() -> Result<()> {
+async fn snapshot_model_visible_layout_refreshes_agents_between_turns() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -218,6 +208,11 @@ async fn snapshot_model_visible_layout_cwd_change_does_not_refresh_agents() -> R
                 ev_assistant_message("msg-2", "turn two complete"),
                 ev_completed("resp-2"),
             ]),
+            sse(vec![
+                ev_response_created("resp-3"),
+                ev_assistant_message("msg-3", "turn three complete"),
+                ev_completed("resp-3"),
+            ]),
         ],
     )
     .await;
@@ -232,10 +227,12 @@ async fn snapshot_model_visible_layout_cwd_change_does_not_refresh_agents() -> R
         cwd_one.join("AGENTS.md"),
         "# AGENTS one\n\n<INSTRUCTIONS>\nTurn one agents instructions.\n</INSTRUCTIONS>\n",
     )?;
-    fs::write(
-        cwd_two.join("AGENTS.md"),
-        "# AGENTS two\n\n<INSTRUCTIONS>\nTurn two agents instructions.\n</INSTRUCTIONS>\n",
-    )?;
+    let second_agents =
+        "# AGENTS two\n\n<INSTRUCTIONS>\nTurn blue agents instructions.\n</INSTRUCTIONS>\n";
+    let edited_agents =
+        "# AGENTS two\n\n<INSTRUCTIONS>\nTurn gold agents instructions.\n</INSTRUCTIONS>\n";
+    assert_eq!(second_agents.len(), edited_agents.len());
+    fs::write(cwd_two.join("AGENTS.md"), second_agents)?;
     let cwd_one = cwd_one.abs();
     let cwd_two = cwd_two.abs();
     let (first_sandbox_policy, first_permission_profile) =
@@ -284,7 +281,7 @@ async fn snapshot_model_visible_layout_cwd_change_does_not_refresh_agents() -> R
             responsesapi_client_metadata: None,
             additional_context: Default::default(),
             thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
-                environments: Some(local_selections(cwd_two)),
+                environments: Some(local_selections(cwd_two.clone())),
                 approval_policy: Some(AskForApproval::Never),
                 sandbox_policy: Some(second_sandbox_policy),
                 permission_profile: second_permission_profile,
@@ -305,25 +302,75 @@ async fn snapshot_model_visible_layout_cwd_change_does_not_refresh_agents() -> R
     })
     .await;
 
+    fs::write(cwd_two.join("AGENTS.md"), edited_agents)?;
+    let (third_sandbox_policy, third_permission_profile) =
+        turn_permission_fields(PermissionProfile::read_only(), cwd_two.as_path());
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "third turn after same-cwd AGENTS edit".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                environments: Some(local_selections(cwd_two)),
+                approval_policy: Some(AskForApproval::Never),
+                sandbox_policy: Some(third_sandbox_policy),
+                permission_profile: third_permission_profile,
+                collaboration_mode: Some(codex_protocol::config_types::CollaborationMode {
+                    mode: codex_protocol::config_types::ModeKind::Default,
+                    settings: codex_protocol::config_types::Settings {
+                        model: test.session_configured.model.clone(),
+                        reasoning_effort: test.config.model_reasoning_effort.clone(),
+                        developer_instructions: None,
+                    },
+                }),
+                ..Default::default()
+            },
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
     let requests = responses.requests();
-    assert_eq!(requests.len(), 2, "expected two requests");
-    assert_eq!(
-        user_instructions_wrapper_count(&requests[0]),
-        0,
-        "expected first request to omit the serialized user-instructions wrapper when cwd-only project docs are introduced after session init"
+    assert_eq!(requests.len(), 3, "expected three requests");
+    let first_agents = requests[0].message_input_texts("user");
+    assert!(
+        first_agents
+            .iter()
+            .any(|text| text.contains("Turn one agents instructions.")),
+        "first request should include the first cwd's AGENTS.md instructions"
     );
-    assert_eq!(
-        user_instructions_wrapper_count(&requests[1]),
-        0,
-        "expected second request to keep omitting the serialized user-instructions wrapper after cwd change with the current session-scoped project doc behavior"
+    let second_agents = requests[1].message_input_texts("user");
+    assert!(
+        second_agents.iter().any(|text| {
+            text.contains(
+                "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.",
+            ) && text.contains("Turn blue agents instructions.")
+        }),
+        "second request should replace AGENTS.md after the cwd changes"
+    );
+    let edited_agents = requests[2].message_input_texts("user");
+    assert!(
+        edited_agents.iter().any(|text| {
+            text.contains(
+                "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.",
+            ) && text.contains("Turn gold agents instructions.")
+        }),
+        "third request should replace AGENTS.md after a same-cwd, same-length edit"
     );
     insta::assert_snapshot!(
-        "model_visible_layout_cwd_change_does_not_refresh_agents",
+        "model_visible_layout_refreshes_agents_between_turns",
         format_labeled_requests_snapshot(
-            "Second turn changes cwd to a directory with different AGENTS.md; current behavior does not emit refreshed AGENTS instructions.",
+            "Normal turns refresh AGENTS.md after a cwd change and after a same-cwd, same-length content edit.",
             &[
                 ("First Request (agents_one)", &requests[0]),
                 ("Second Request (agents_two cwd)", &requests[1]),
+                ("Third Request (agents_two edited)", &requests[2]),
             ]
         )
     );

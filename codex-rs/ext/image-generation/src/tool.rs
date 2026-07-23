@@ -13,6 +13,7 @@ use codex_core::image_generation_artifact_path;
 use codex_exec_server::CreateDirectoryOptions;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
+use codex_extension_api::ConversationHistoryRequirement;
 use codex_extension_api::ExtensionTurnItem;
 use codex_extension_api::FunctionCallError;
 use codex_extension_api::ToolCall;
@@ -57,6 +58,7 @@ use crate::backend::CodexImagesBackend;
 const IMAGE_MODEL: &str = "gpt-image-2";
 const MAX_EDIT_IMAGES: usize = 5;
 const IMAGEGEN_DESCRIPTION: &str = include_str!("../imagegen_description.md");
+const IMAGE_GENERATION_CANCELLED_MESSAGE: &str = "image generation cancelled";
 
 #[derive(Clone)]
 pub(crate) struct ImageGenerationTool {
@@ -123,6 +125,17 @@ impl ToolExecutor<ToolCall> for ImageGenerationTool {
         ToolExposure::Direct
     }
 
+    fn conversation_history_requirement(
+        &self,
+        payload: &ToolPayload,
+    ) -> ConversationHistoryRequirement {
+        image_history_requirement(payload)
+    }
+
+    fn handles_runtime_cancellation(&self) -> bool {
+        true
+    }
+
     /// Executes the selected image operation and returns the completed image result.
     fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
         Box::pin(self.handle_call(call))
@@ -132,9 +145,19 @@ impl ToolExecutor<ToolCall> for ImageGenerationTool {
 impl ImageGenerationTool {
     async fn handle_call(&self, call: ToolCall) -> Result<Box<dyn ToolOutput>, FunctionCallError> {
         let args = parse_args(&call)?;
-        let request =
-            request_for_call_args(&args, call.conversation_history.items(), &call.environments)
-                .await?;
+        let Some(request) = call
+            .cancellation_token
+            .run_until_cancelled(request_for_call_args(
+                &args,
+                call.conversation_history.items(),
+                call.primary_environment_id.as_deref(),
+                &call.environments,
+            ))
+            .await
+        else {
+            return Err(cancelled_error());
+        };
+        let request = request?;
         call.turn_item_emitter
             .emit_started(extension_turn_item(
                 ImageGenerationItem {
@@ -149,60 +172,61 @@ impl ImageGenerationTool {
                 }),
             ))
             .await;
-        let result = match request {
-            ImageRequest::Generate(request) => self.backend.generate(request).await,
-            ImageRequest::Edit(request) => self.backend.edit(request).await,
-        }
-        .map_err(|err| format!("image generation failed: {err}"))
-        .and_then(|response| {
-            response
-                .data
-                .into_iter()
-                .next()
-                .map(|data| data.b64_json)
-                .ok_or_else(|| "image generation returned no image data".to_string())
-        });
-        let result = match result {
-            Ok(result) => result,
-            Err(message) => {
-                let item = ImageGenerationItem {
-                    id: call.call_id.clone(),
-                    status: "failed".to_string(),
-                    revised_prompt: Some(args.prompt),
-                    result: String::new(),
-                    saved_path: None,
-                };
-                let legacy_event = legacy_end_event(&item);
-                call.turn_item_emitter
-                    .emit_completed(extension_turn_item(item, legacy_event))
-                    .await;
+        let operation = async {
+            let result = match request {
+                ImageRequest::Generate(request) => self.backend.generate(request).await,
+                ImageRequest::Edit(request) => self.backend.edit(request).await,
+            }
+            .map_err(|err| format!("image generation failed: {err}"))
+            .and_then(|response| {
+                response
+                    .data
+                    .into_iter()
+                    .next()
+                    .map(|data| data.b64_json)
+                    .ok_or_else(|| "image generation returned no image data".to_string())
+            })?;
+            let saved_path = match self.save_root.as_ref() {
+                Some(save_root) => match save_image_generation_result(
+                    LOCAL_FS.as_ref(),
+                    save_root,
+                    &self.thread_id,
+                    &call.call_id,
+                    &result,
+                )
+                .await
+                {
+                    Ok(path) => Some(path),
+                    Err(error) => {
+                        let output_path = image_generation_artifact_path(
+                            save_root,
+                            &self.thread_id,
+                            &call.call_id,
+                        );
+                        let output_dir = output_path.parent().unwrap_or_else(|| save_root.clone());
+                        tracing::warn!(
+                            call_id = %call.call_id,
+                            output_dir = %output_dir.display(),
+                            "failed to save generated image: {error}"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            Ok::<_, String>((result, saved_path))
+        };
+        let operation_result = call.cancellation_token.run_until_cancelled(operation).await;
+        let (result, saved_path) = match operation_result {
+            None => {
+                emit_failed_item(&call, &args.prompt).await;
+                return Err(cancelled_error());
+            }
+            Some(Err(message)) => {
+                emit_failed_item(&call, &args.prompt).await;
                 return Err(FunctionCallError::RespondToModel(message));
             }
-        };
-        let saved_path = match self.save_root.as_ref() {
-            Some(save_root) => match save_image_generation_result(
-                LOCAL_FS.as_ref(),
-                save_root,
-                &self.thread_id,
-                &call.call_id,
-                &result,
-            )
-            .await
-            {
-                Ok(path) => Some(path),
-                Err(error) => {
-                    let output_path =
-                        image_generation_artifact_path(save_root, &self.thread_id, &call.call_id);
-                    let output_dir = output_path.parent().unwrap_or_else(|| save_root.clone());
-                    tracing::warn!(
-                        call_id = %call.call_id,
-                        output_dir = %output_dir.display(),
-                        "failed to save generated image: {error}"
-                    );
-                    None
-                }
-            },
-            None => None,
+            Some(Ok(result)) => result,
         };
         let item = ImageGenerationItem {
             id: call.call_id.clone(),
@@ -224,6 +248,36 @@ impl ImageGenerationTool {
             output_hint,
         }))
     }
+}
+
+fn cancelled_error() -> FunctionCallError {
+    FunctionCallError::RespondToModel(IMAGE_GENERATION_CANCELLED_MESSAGE.to_string())
+}
+
+fn image_history_requirement(payload: &ToolPayload) -> ConversationHistoryRequirement {
+    let ToolPayload::Function { arguments } = payload else {
+        return ConversationHistoryRequirement::Full;
+    };
+    match serde_json::from_str::<ImagegenArgs>(arguments) {
+        Ok(args) if args.num_last_images_to_include.is_none() => {
+            ConversationHistoryRequirement::None
+        }
+        Ok(_) | Err(_) => ConversationHistoryRequirement::Full,
+    }
+}
+
+async fn emit_failed_item(call: &ToolCall, prompt: &str) {
+    let item = ImageGenerationItem {
+        id: call.call_id.clone(),
+        status: "failed".to_string(),
+        revised_prompt: Some(prompt.to_string()),
+        result: String::new(),
+        saved_path: None,
+    };
+    let legacy_event = legacy_end_event(&item);
+    call.turn_item_emitter
+        .emit_completed(extension_turn_item(item, legacy_event))
+        .await;
 }
 
 async fn save_image_generation_result(
@@ -259,6 +313,7 @@ enum ImageRequest {
 async fn request_for_call_args(
     args: &ImagegenArgs,
     history: &[ResponseItem],
+    primary_environment_id: Option<&str>,
     environments: &[ToolEnvironment],
 ) -> Result<ImageRequest, FunctionCallError> {
     let paths = args.referenced_image_paths.as_deref().unwrap_or_default();
@@ -279,9 +334,18 @@ async fn request_for_call_args(
             }));
         }
         (false, None) => {
-            let Some(environment) = environments.first() else {
+            let Some(primary_environment_id) = primary_environment_id else {
                 return Err(FunctionCallError::RespondToModel(
                     "referenced image paths are unavailable in this session".to_string(),
+                ));
+            };
+            let Some(environment) = environments
+                .iter()
+                .find(|environment| environment.environment_id == primary_environment_id)
+            else {
+                return Err(FunctionCallError::RespondToModel(
+                    "referenced image paths are unavailable because the primary environment is not extension-readable"
+                        .to_string(),
                 ));
             };
             let mut images = Vec::with_capacity(paths.len());

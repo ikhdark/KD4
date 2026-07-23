@@ -42,6 +42,12 @@ pub struct ToolCall {
     pub payload: ToolPayload,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ToolCallBuildError {
+    #[error("{message}")]
+    ToolSearchArguments { call_id: String, message: String },
+}
+
 pub struct ToolRouter {
     registry: ToolRegistry,
     model_visible_specs: Vec<ToolSpec>,
@@ -128,7 +134,7 @@ impl ToolRouter {
     }
 
     #[instrument(level = "trace", skip_all, err)]
-    pub fn build_tool_call(item: ResponseItem) -> Result<Option<ToolCall>, FunctionCallError> {
+    pub fn build_tool_call(item: ResponseItem) -> Result<Option<ToolCall>, ToolCallBuildError> {
         match item {
             ResponseItem::FunctionCall {
                 name,
@@ -150,12 +156,15 @@ impl ToolRouter {
                 arguments,
                 ..
             } if execution == "client" => {
-                let arguments: SearchToolCallParams =
-                    serde_json::from_value(arguments).map_err(|err| {
-                        FunctionCallError::RespondToModel(format!(
-                            "failed to parse tool_search arguments: {err}"
-                        ))
-                    })?;
+                let arguments: SearchToolCallParams = match serde_json::from_value(arguments) {
+                    Ok(arguments) => arguments,
+                    Err(err) => {
+                        return Err(ToolCallBuildError::ToolSearchArguments {
+                            call_id,
+                            message: format!("failed to parse tool_search arguments: {err}"),
+                        });
+                    }
+                };
                 Ok(Some(ToolCall {
                     tool_name: ToolName::plain("tool_search"),
                     call_id,

@@ -1153,6 +1153,84 @@ fn assignments_without_repository_identity_still_deserialize() {
     assert!(decoded.repository_id.is_empty());
 }
 
+#[tokio::test]
+async fn correction_attempt_drift_updates_current_risk_gate() {
+    let fixture = Fixture::new().await;
+    let (worker, initial_attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("drift-root", "src"))
+        .await
+        .expect("worker assignment");
+    fixture
+        .store
+        .submit_agent_receipt_with_review(
+            initial_attempt.attempt_id,
+            completed_receipt(Vec::new()),
+            "cold review required: missing successful focused validation".to_string(),
+        )
+        .await
+        .expect("initial risk-gated receipt");
+    let (_, reviewer_attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            relation_draft("drift-root", AgentRole::Reviewer, worker.assignment_id),
+        )
+        .await
+        .expect("reviewer assignment");
+    fixture
+        .store
+        .set_agent_gate(
+            TaskActor::Attempt(reviewer_attempt.attempt_id),
+            worker.assignment_id,
+            GateKind::Review,
+            GateStatus::ChangesRequested,
+            "one correction is required".to_string(),
+        )
+        .await
+        .expect("review requests correction");
+    let correction = fixture
+        .store
+        .amend_agent_task(
+            TaskActor::Root,
+            worker.assignment_id,
+            AttemptAmendment {
+                reason: "address the review finding".to_string(),
+                objective: None,
+                acceptance_criteria: None,
+                stop_condition: None,
+            },
+        )
+        .await
+        .expect("single correction attempt");
+    fixture
+        .store
+        .submit_agent_receipt_with_review(
+            correction.attempt_id,
+            completed_receipt(Vec::new()),
+            format!("cold review required: {CONCURRENT_DRIFT_REASON}"),
+        )
+        .await
+        .expect("correction receipt with observed drift");
+
+    let task = fixture
+        .store
+        .get_agent_task(worker.assignment_id, Some(10))
+        .await
+        .expect("task with correction receipt");
+    let risk_gate = task
+        .gates
+        .iter()
+        .find(|gate| gate.kind == GateKind::Risk)
+        .expect("current risk gate");
+    assert_eq!(
+        risk_gate.reason,
+        format!(
+            "cold review required: missing successful focused validation; {CONCURRENT_DRIFT_REASON}"
+        )
+    );
+}
+
 #[test]
 fn risk_gate_and_waiver_rules_are_deterministic() {
     let facts = RiskFacts {
@@ -1169,4 +1247,15 @@ fn risk_gate_and_waiver_rules_are_deterministic() {
     assert!(GateKind::Verification.is_waivable());
     assert!(!GateKind::Mutation.is_waivable());
     assert!(!GateKind::Ownership.is_waivable());
+}
+
+#[test]
+fn risk_gate_uses_canonical_concurrent_drift_reason() {
+    let decision = evaluate_risk_gate(&RiskFacts {
+        focused_validation_succeeded: true,
+        drift: true,
+        ..RiskFacts::default()
+    });
+
+    assert_eq!(decision.reasons, vec![CONCURRENT_DRIFT_REASON.to_string()]);
 }

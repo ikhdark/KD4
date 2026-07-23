@@ -3,6 +3,7 @@ use crate::agent::next_thread_spawn_depth;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::tools::handlers::multi_agents_spec::create_resume_agent_tool;
+use codex_protocol::error::CodexErr;
 use codex_tools::ToolSpec;
 use std::sync::Arc;
 
@@ -84,7 +85,34 @@ async fn handle_resume_agent(
         .agent_control
         .get_status(receiver_thread_id)
         .await;
-    let (receiver_agent, error) = if matches!(status, AgentStatus::NotFound) {
+    let shutdown_cleanup_error = if matches!(status, AgentStatus::Shutdown) {
+        let cleanup_error = match session
+            .services
+            .agent_control
+            .shutdown_live_agent(receiver_thread_id)
+            .await
+        {
+            Ok(_) => None,
+            Err(err) if stale_shutdown_cleanup_error_is_tolerable(&err) => None,
+            Err(err) => Some(collab_agent_error(receiver_thread_id, err)),
+        };
+        status = session
+            .services
+            .agent_control
+            .get_status(receiver_thread_id)
+            .await;
+        cleanup_error
+    } else {
+        None
+    };
+    let (receiver_agent, error) = if let Some(err) = shutdown_cleanup_error {
+        status = session
+            .services
+            .agent_control
+            .get_status(receiver_thread_id)
+            .await;
+        (receiver_agent, Some(err))
+    } else if matches!(status, AgentStatus::NotFound | AgentStatus::Shutdown) {
         match Box::pin(try_resume_closed_agent(
             &session,
             &turn,
@@ -126,7 +154,11 @@ async fn handle_resume_agent(
             TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
                 id: call_id,
                 tool: CollabAgentTool::ResumeAgent,
-                status: collab_tool_call_status(&status, Some(receiver_thread_id)),
+                status: if error.is_none() {
+                    CollabAgentToolCallStatus::Completed
+                } else {
+                    CollabAgentToolCallStatus::Failed
+                },
                 sender_thread_id: session.thread_id(),
                 receiver_thread_ids: vec![receiver_thread_id],
                 receiver_agents: vec![CollabAgentRef {
@@ -149,6 +181,22 @@ async fn handle_resume_agent(
         .counter("codex.multi_agent.resume", /*inc*/ 1, &[]);
 
     Ok(ResumeAgentResult { status })
+}
+
+fn stale_shutdown_cleanup_error_is_tolerable(err: &CodexErr) -> bool {
+    match err {
+        CodexErr::ThreadNotFound(_) | CodexErr::InternalAgentDied => true,
+        CodexErr::Io(err) => err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<codex_thread_store::ThreadStoreError>())
+            .is_some_and(|source| {
+                matches!(
+                    source,
+                    codex_thread_store::ThreadStoreError::ThreadNotFound { .. }
+                )
+            }),
+        _ => false,
+    }
 }
 
 impl CoreToolRuntime for Handler {

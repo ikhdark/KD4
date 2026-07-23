@@ -1,6 +1,10 @@
 use super::*;
+use futures::StreamExt;
+use std::collections::HashSet;
+use std::future::Future;
 
 const AGENT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const AGENT_TREE_SHUTDOWN_CONCURRENCY: usize = 8;
 
 impl AgentControl {
     /// Submit a shutdown request for a live agent without marking it explicitly closed in
@@ -150,10 +154,45 @@ impl AgentControl {
 
     /// Shut down `agent_id` and any live descendants reachable from the in-memory spawn tree.
     pub(crate) async fn shutdown_agent_tree(&self, agent_id: ThreadId) -> CodexResult<String> {
-        let descendant_ids = self.live_thread_spawn_descendants(agent_id).await?;
-        let mut result = self.shutdown_live_agent(agent_id).await;
-        for descendant_id in descendant_ids {
-            match self.shutdown_live_agent(descendant_id).await {
+        let mut closing_guard = self.state.begin_closing_agent_tree(agent_id);
+        let mut known_thread_ids = HashSet::from([agent_id]);
+        let mut descendant_ids = Vec::new();
+        loop {
+            let snapshot = self.live_thread_spawn_descendants(agent_id).await?;
+            let newly_discovered = snapshot
+                .into_iter()
+                .filter(|thread_id| known_thread_ids.insert(*thread_id))
+                .collect::<Vec<_>>();
+            if newly_discovered.is_empty() {
+                break;
+            }
+            closing_guard.mark_threads(newly_discovered.iter().copied());
+            descendant_ids.extend(newly_discovered);
+        }
+
+        let mut shutdown_ids = Vec::with_capacity(descendant_ids.len().saturating_add(1));
+        shutdown_ids.push(agent_id);
+        shutdown_ids.extend(descendant_ids);
+
+        let state = self.upgrade()?;
+        let mut closing_threads = Vec::new();
+        for thread_id in shutdown_ids.iter().copied() {
+            if let Ok(thread) = state.get_thread(thread_id).await {
+                closing_threads.push(thread);
+            }
+        }
+
+        let mut shutdown_results = run_tree_shutdowns(&shutdown_ids, |thread_id| {
+            self.shutdown_live_agent(thread_id)
+        })
+        .await
+        .into_iter();
+        let mut result = shutdown_results
+            .next()
+            .map(|(_, result)| result)
+            .unwrap_or_else(|| Ok(String::new()));
+        for (descendant_id, descendant_result) in shutdown_results {
+            match descendant_result {
                 Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => {}
                 Err(err)
                     if matches!(
@@ -170,6 +209,39 @@ impl AgentControl {
                 }
             }
         }
+        tokio::spawn(async move {
+            for thread in closing_threads {
+                thread.wait_until_terminated().await;
+            }
+            drop(closing_guard);
+        });
         result
     }
 }
+
+async fn run_tree_shutdowns<F, Fut>(
+    shutdown_ids: &[ThreadId],
+    shutdown: F,
+) -> Vec<(ThreadId, CodexResult<String>)>
+where
+    F: Fn(ThreadId) -> Fut,
+    Fut: Future<Output = CodexResult<String>>,
+{
+    let mut results = futures::stream::iter(shutdown_ids.iter().copied().enumerate())
+        .map(|(index, thread_id)| {
+            let shutdown = shutdown(thread_id);
+            async move { (index, thread_id, shutdown.await) }
+        })
+        .buffer_unordered(AGENT_TREE_SHUTDOWN_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+    results.sort_by_key(|(index, _, _)| *index);
+    results
+        .into_iter()
+        .map(|(_, thread_id, result)| (thread_id, result))
+        .collect()
+}
+
+#[cfg(test)]
+#[path = "legacy_tests.rs"]
+mod tests;

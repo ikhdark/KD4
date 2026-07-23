@@ -3,6 +3,7 @@ use std::sync::Arc;
 use codex_prompts::render_review_exit_interrupted;
 use codex_prompts::render_review_exit_success;
 use codex_protocol::config_types::WebSearchMode;
+use codex_protocol::items::EnteredReviewModeItem;
 use codex_protocol::items::ExitedReviewModeItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
@@ -14,6 +15,7 @@ use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::ReviewOutputEvent;
 use codex_protocol::protocol::SubAgentSource;
+use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::review_format::format_review_findings_block;
 use codex_protocol::review_format::render_review_output_text;
 use tokio_util::sync::CancellationToken;
@@ -31,12 +33,16 @@ use super::SessionTask;
 use super::SessionTaskContext;
 use super::SessionTaskResult;
 
-#[derive(Clone, Copy)]
-pub(crate) struct ReviewTask;
+#[derive(Clone)]
+pub(crate) struct ReviewTask {
+    entered_review_mode: EnteredReviewModeItem,
+}
 
 impl ReviewTask {
-    pub(crate) fn new() -> Self {
-        Self
+    pub(crate) fn new(entered_review_mode: EnteredReviewModeItem) -> Self {
+        Self {
+            entered_review_mode,
+        }
     }
 }
 
@@ -56,6 +62,20 @@ impl SessionTask for ReviewTask {
         input: Vec<TurnInput>,
         cancellation_token: CancellationToken,
     ) -> SessionTaskResult {
+        let sess = session.clone_session();
+        let start_event = EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: ctx.sub_id.clone(),
+            trace_id: ctx.trace_id.clone(),
+            started_at: ctx.turn_timing_state.started_at_unix_secs().await,
+            model_context_window: ctx.model_context_window(),
+            collaboration_mode_kind: ctx.collaboration_mode.mode,
+        });
+        sess.send_event(ctx.as_ref(), start_event).await;
+
+        let item = TurnItem::EnteredReviewMode(self.entered_review_mode.clone());
+        sess.emit_turn_item_started(ctx.as_ref(), &item).await;
+        sess.emit_turn_item_completed(ctx.as_ref(), item).await;
+
         session.session.services.session_telemetry.counter(
             "codex.task.review",
             /*inc*/ 1,
@@ -166,6 +186,9 @@ async fn process_review_events(
                 ..
             })
             | EventMsg::AgentMessageContentDelta(AgentMessageContentDeltaEvent { .. }) => {}
+            // The parent review task owns the visible turn lifecycle. Forwarding the
+            // delegate's start would expose two `TurnStarted` events for one review turn.
+            EventMsg::TurnStarted(_) => {}
             EventMsg::TurnComplete(task_complete) => {
                 // Parse review output from the last agent message (if present).
                 let out = task_complete

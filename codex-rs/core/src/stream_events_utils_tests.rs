@@ -308,6 +308,71 @@ async fn handle_output_item_done_returns_contributed_last_agent_message() {
 }
 
 #[tokio::test]
+async fn malformed_client_tool_search_records_correlated_tool_search_output() {
+    let (session, turn_context) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let router = Arc::new(ToolRouter::from_context(
+        step_context.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            mcp_tools: None,
+            deferred_mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: turn_context.dynamic_tools.as_slice(),
+        },
+        &Default::default(),
+    ));
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let tool_runtime = ToolCallRuntime::new(router, Arc::clone(&session), step_context, tracker);
+    let item = ResponseItem::ToolSearchCall {
+        id: None,
+        call_id: Some("search-malformed".to_string()),
+        status: None,
+        execution: "client".to_string(),
+        arguments: serde_json::json!({"query": 42}),
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut ctx = HandleOutputCtx {
+        sess: Arc::clone(&session),
+        turn_context: Arc::clone(&turn_context),
+        turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
+        tool_runtime,
+        cancellation_token: CancellationToken::new(),
+    };
+
+    let output = handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None)
+        .await
+        .expect("malformed tool_search call should be recorded for model recovery");
+
+    assert!(output.needs_follow_up);
+    assert!(output.tool_future.is_none());
+    let history = session.clone_history().await;
+    let [
+        ResponseItem::ToolSearchCall {
+            call_id: Some(request_call_id),
+            ..
+        },
+        ResponseItem::ToolSearchOutput {
+            call_id: Some(output_call_id),
+            status,
+            execution,
+            tools,
+            ..
+        },
+    ] = history.raw_items()
+    else {
+        panic!("expected a tool_search call followed by its failure output")
+    };
+    assert_eq!(request_call_id, "search-malformed");
+    assert_eq!(output_call_id, request_call_id);
+    assert_eq!(status, "incomplete");
+    assert_eq!(execution, "client");
+    assert!(tools.is_empty());
+}
+
+#[tokio::test]
 async fn finalized_turn_item_defers_mailbox_for_contributed_visible_text() {
     let (mut session, turn_context) = make_session_and_context().await;
     let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();

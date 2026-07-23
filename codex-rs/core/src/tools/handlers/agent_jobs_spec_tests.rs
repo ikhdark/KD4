@@ -54,21 +54,21 @@ fn spawn_agents_on_csv_tool_requires_csv_and_instruction() {
                     ),
                     (
                         "max_concurrency".to_string(),
-                        JsonSchema::number(Some(
+                        JsonSchema::integer(Some(
                             "Maximum concurrent workers for this job. Defaults to 16 and is capped by config."
                                 .to_string(),
                         )),
                     ),
                     (
                         "max_workers".to_string(),
-                        JsonSchema::number(Some(
+                        JsonSchema::integer(Some(
                             "Alias for max_concurrency. Defaults to 16 and is capped by config."
                                 .to_string(),
                         )),
                     ),
                     (
                         "max_runtime_seconds".to_string(),
-                        JsonSchema::number(Some(
+                        JsonSchema::integer(Some(
                             "Maximum runtime per worker before failure. Defaults to 1800 seconds; config may set a different default."
                                 .to_string(),
                         )),
@@ -76,7 +76,7 @@ fn spawn_agents_on_csv_tool_requires_csv_and_instruction() {
                     (
                         "output_schema".to_string(),
                         described_object(
-                            "JSON Schema for each worker result. Omit to accept any result object.",
+                            "JSON Schema enforced for each worker result. Its root type must allow an object. Omit to accept any result object.",
                         ),
                     ),
                 ]), Some(vec!["csv_path".to_string(), "instruction".to_string()]), Some(false.into())),

@@ -2,57 +2,10 @@ use super::*;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 
-async fn install_wiring_guard_fixture(codex_home: &Path) -> PathBuf {
-    let root = codex_home
-        .join("plugins/cache/local-wiring-guards/wiring-guard")
-        .join(WIRING_GUARD_PLUGIN_VERSION);
-    tokio::fs::create_dir_all(root.join("runtime"))
-        .await
-        .expect("wiring runtime");
-    tokio::fs::create_dir_all(root.join("schemas"))
-        .await
-        .expect("wiring schemas");
-    let launcher = root.join("runtime/wiring_guard.py");
-    let launcher_bytes = b"# trusted wiring guard fixture\n";
-    tokio::fs::write(&launcher, launcher_bytes)
-        .await
-        .expect("wiring launcher");
-    tokio::fs::write(
-        root.join("bundle-manifest.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "schema_id": "wiring-guard/bundle-manifest",
-            "schema_version": "1.0.0",
-            "plugin": {"name": "wiring-guard", "version": WIRING_GUARD_PLUGIN_VERSION},
-            "files": [{
-                "path": "runtime/wiring_guard.py",
-                "sha256": sha256_hex(launcher_bytes),
-                "size": launcher_bytes.len()
-            }]
-        }))
-        .expect("wiring manifest json"),
-    )
-    .await
-    .expect("wiring manifest");
-    tokio::fs::write(
-        root.join("schemas/ledger.schema.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "$defs": {"entry": {"properties": {
-                "schema_version": {"const": WIRING_GUARD_LEDGER_SCHEMA_VERSION},
-                "report_schema_version": {"const": WIRING_GUARD_REPORT_SCHEMA_VERSION}
-            }}}
-        }))
-        .expect("wiring schema json"),
-    )
-    .await
-    .expect("wiring schema");
-    launcher
-}
-
 async fn ledger_fixture() -> (tempfile::TempDir, PathBuf, TaskEvidenceLedger) {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     let codex_home = temp.path().join("home");
-    install_wiring_guard_fixture(&codex_home).await;
     tokio::fs::create_dir_all(repo.join("scripts"))
         .await
         .expect("scripts");
@@ -68,6 +21,20 @@ async fn ledger_fixture() -> (tempfile::TempDir, PathBuf, TaskEvidenceLedger) {
     let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("absolute repo");
     let ledger = TaskEvidenceLedger::load_or_new(codex_home, ThreadId::new(), cwd.as_path()).await;
     (temp, repo, ledger)
+}
+
+#[tokio::test]
+async fn verifier_repo_root_must_match_the_task_evidence_root() {
+    let (temp, repo, ledger) = ledger_fixture().await;
+    let other_repo = temp.path().join("other-repo");
+    tokio::fs::create_dir_all(&other_repo)
+        .await
+        .expect("other repo");
+
+    assert!(ledger.matches_repo_root(&repo));
+    assert!(ledger.matches_repo_root(&repo.join(".")));
+    assert!(!ledger.matches_repo_root(&other_repo));
+    assert!(!TaskEvidenceLedger::disabled().matches_repo_root(&repo));
 }
 
 async fn initialize_git_repo(repo: &Path) {
@@ -213,7 +180,6 @@ async fn failed_mutating_command_does_not_promote_the_active_step() {
     let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo");
     ledger
         .record_command(
-            "failed-command",
             &["touch".to_string(), "src/step.rs".to_string()],
             &PathUri::from_abs_path(&cwd),
             1,
@@ -389,13 +355,6 @@ async fn migration_repairs_duplicate_receipts_and_invalidates_ambiguous_links() 
         validation_receipt("validation-1"),
         validation_receipt("validation-1"),
     ];
-    document.wiring_receipt = Some(EpochReceipt {
-        receipt_id: "command-1".to_string(),
-        epoch: 0,
-        recorded_at: timestamp(),
-        wiring_proof: None,
-    });
-
     migrate_document(&mut document);
 
     assert_ne!(
@@ -408,7 +367,6 @@ async fn migration_repairs_duplicate_receipts_and_invalidates_ambiguous_links() 
     );
     assert!(document.plan[0].validation_receipt_ids.is_empty());
     assert_eq!(document.plan[0].status, StepStatus::Implemented);
-    assert!(document.wiring_receipt.is_none());
 }
 
 #[tokio::test]
@@ -612,107 +570,6 @@ async fn older_persistence_snapshot_is_reported_as_superseded() {
     assert_eq!(
         ledger.persist_document(&older).await,
         PersistOutcome::Superseded
-    );
-}
-
-#[tokio::test]
-async fn wiring_invocation_requires_the_trusted_current_launcher() {
-    let (_temp, repo, ledger) = ledger_fixture().await;
-    let trusted_root = ledger
-        .trusted_wiring_guard_root
-        .as_deref()
-        .expect("trusted wiring root");
-    let trusted_launcher = trusted_root.join("runtime/wiring_guard.py");
-    assert!(
-        trusted_wiring_guard_check_invocation(
-            &[
-                "echo".to_string(),
-                trusted_launcher.to_string_lossy().into_owned(),
-                "check".to_string(),
-                "--ledger".to_string(),
-            ],
-            Some(trusted_root),
-        )
-        .is_none()
-    );
-    assert!(
-        trusted_wiring_guard_check_invocation(
-            &[
-                "python".to_string(),
-                trusted_launcher.to_string_lossy().into_owned(),
-                "check".to_string(),
-                "--ledger".to_string(),
-            ],
-            Some(trusted_root),
-        )
-        .is_some()
-    );
-    assert!(
-        trusted_wiring_guard_check_invocation(
-            &[
-                "powershell.exe".to_string(),
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                "&".to_string(),
-                trusted_launcher.to_string_lossy().into_owned(),
-                "check".to_string(),
-                "--ledger".to_string(),
-            ],
-            Some(trusted_root),
-        )
-        .is_some()
-    );
-    assert!(
-        trusted_wiring_guard_check_invocation(
-            &[
-                "python".to_string(),
-                trusted_launcher.to_string_lossy().into_owned(),
-                "check".to_string(),
-                "--ledger".to_string(),
-                ";".to_string(),
-                "python".to_string(),
-                "forge_ledger.py".to_string(),
-            ],
-            Some(trusted_root),
-        )
-        .is_none()
-    );
-
-    let trusted_size = tokio::fs::metadata(&trusted_launcher)
-        .await
-        .expect("trusted launcher metadata")
-        .len();
-    tokio::fs::write(&trusted_launcher, vec![b'x'; trusted_size as usize])
-        .await
-        .expect("tampered trusted launcher");
-    assert!(
-        trusted_wiring_guard_check_invocation(
-            &[
-                "python".to_string(),
-                trusted_launcher.to_string_lossy().into_owned(),
-                "check".to_string(),
-                "--ledger".to_string(),
-            ],
-            Some(trusted_root),
-        )
-        .is_none()
-    );
-
-    let untrusted_launcher = repo.join("wiring_guard.py");
-    tokio::fs::write(&untrusted_launcher, "# untrusted")
-        .await
-        .expect("untrusted launcher");
-    assert!(
-        trusted_wiring_guard_check_invocation(
-            &[
-                "python".to_string(),
-                untrusted_launcher.to_string_lossy().into_owned(),
-                "check".to_string(),
-                "--ledger".to_string(),
-            ],
-            Some(trusted_root),
-        )
-        .is_none()
     );
 }
 

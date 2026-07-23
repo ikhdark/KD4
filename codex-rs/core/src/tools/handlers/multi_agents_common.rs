@@ -270,19 +270,28 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     };
 
     config.model = Some(selected_model_name.clone());
-    if !role_model_locks.reasoning_effort {
-        let reasoning_effort =
-            requested_reasoning_effort.unwrap_or(DEFAULT_SPAWN_AGENT_REASONING_EFFORT);
-        let selected_model_info = models_manager
-            .get_model_info(&selected_model_name, &config.to_models_manager_config())
-            .await;
+    let reasoning_effort = if role_model_locks.reasoning_effort {
+        config.model_reasoning_effort.clone().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "spawn_agent role did not resolve its configured reasoning effort".to_string(),
+            )
+        })?
+    } else {
+        requested_reasoning_effort.unwrap_or(DEFAULT_SPAWN_AGENT_REASONING_EFFORT)
+    };
+    let selected_model_info = models_manager
+        .get_model_info(&selected_model_name, &config.to_models_manager_config())
+        .await;
+    // Fallback metadata has no authoritative effort list. Preserve an explicit role-owned effort
+    // for custom models while still validating every catalog-backed final pair.
+    if !role_model_locks.reasoning_effort || !selected_model_info.used_fallback_model_metadata {
         validate_spawn_agent_reasoning_effort(
             &selected_model_name,
             &selected_model_info.supported_reasoning_levels,
             &reasoning_effort,
         )?;
-        config.model_reasoning_effort = Some(reasoning_effort);
     }
+    config.model_reasoning_effort = Some(reasoning_effort);
 
     Ok(())
 }

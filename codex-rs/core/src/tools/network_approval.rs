@@ -179,9 +179,9 @@ fn network_approval_outcome_to_result(
 ) -> Result<(), ToolError> {
     match outcome {
         Some(NetworkApprovalOutcome::DeniedByUser) => {
-            Err(ToolError::Rejected("rejected by user".to_string()))
+            Err(ToolError::Denied("rejected by user".to_string()))
         }
-        Some(NetworkApprovalOutcome::DeniedByPolicy(message)) => Err(ToolError::Rejected(message)),
+        Some(NetworkApprovalOutcome::DeniedByPolicy(message)) => Err(ToolError::Denied(message)),
         None => Ok(()),
     }
 }

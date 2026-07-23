@@ -1,3 +1,5 @@
+use codex_plugin::PluginId;
+
 #[cfg(test)]
 use crate::context::AvailablePluginsInstructions;
 #[cfg(test)]
@@ -20,9 +22,10 @@ pub(crate) fn render_explicit_plugin_instructions(
     )];
 
     if plugin.has_skills {
+        let plugin_id = PluginId::parse(&plugin.config_name).ok()?;
         lines.push(format!(
             "- Skills from this plugin are prefixed with `{}:`.",
-            plugin.display_name
+            plugin_id.plugin_name()
         ));
     }
 

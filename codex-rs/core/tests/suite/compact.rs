@@ -3487,7 +3487,8 @@ async fn manual_compact_retries_after_context_window_error() {
         set_test_compact_prompt(config);
         config.model_auto_compact_token_limit = Some(200_000);
     });
-    let codex = builder.build(&server).await.unwrap().codex;
+    let test = builder.build(&server).await.unwrap();
+    let codex = &test.codex;
 
     codex
         .submit(Op::UserInput {
@@ -3502,15 +3503,15 @@ async fn manual_compact_retries_after_context_window_error() {
         })
         .await
         .unwrap();
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex.submit(Op::Compact).await.unwrap();
-    let warning_event = wait_for_event(&codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
+    let warning_event = wait_for_event(codex, |ev| matches!(ev, EventMsg::Warning(_))).await;
     let EventMsg::Warning(WarningEvent { message }) = warning_event else {
         panic!("expected warning event after compact retry");
     };
     assert_eq!(message, COMPACT_WARNING_MESSAGE);
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let requests = request_log.requests();
     assert_eq!(
@@ -3554,10 +3555,7 @@ async fn manual_compact_retries_after_context_window_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-// TODO(ccunningham): Re-enable after the follow-up compaction behavior PR lands.
-// Current main behavior around non-context manual /compact failures is known-incorrect.
-#[ignore = "behavior change covered in follow-up compaction PR"]
-async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
+async fn manual_compact_context_window_error_batches_history_repair() {
     skip_if_no_network!();
 
     let server = start_mock_server().await;
@@ -3566,32 +3564,31 @@ async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
         ev_assistant_message("m1", FIRST_REPLY),
         ev_completed("r1"),
     ]);
-    let compact_failed_1 = sse_failed(
-        "resp-fail-1",
-        "server_error",
-        "temporary compact failure one",
+    let compact_failed = sse_failed(
+        "resp-fail",
+        "context_length_exceeded",
+        CONTEXT_LIMIT_MESSAGE,
     );
-    let compact_failed_2 = sse_failed(
-        "resp-fail-2",
-        "server_error",
-        "temporary compact failure two",
-    );
+    let compact_succeeds = sse(vec![
+        ev_assistant_message("m2", SUMMARY_TEXT),
+        ev_completed("r2"),
+    ]);
 
-    mount_sse_sequence(&server, vec![user_turn, compact_failed_1, compact_failed_2]).await;
+    let request_log =
+        mount_sse_sequence(&server, vec![user_turn, compact_failed, compact_succeeds]).await;
 
-    let mut model_provider = non_openai_model_provider(&server);
-    model_provider.stream_max_retries = Some(1);
-
-    let codex = test_codex()
+    let model_provider = non_openai_model_provider(&server);
+    let test = test_codex()
         .with_config(move |config| {
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
+            config.model_context_window = Some(100);
             config.model_auto_compact_token_limit = Some(200_000);
         })
         .build(&server)
         .await
-        .expect("build codex")
-        .codex;
+        .expect("build codex");
+    let codex = &test.codex;
 
     codex
         .submit(Op::UserInput {
@@ -3606,11 +3603,154 @@ async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
         })
         .await
         .expect("submit user input");
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    let requests = request_log.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "expected user turn and two compact attempts"
+    );
+    let compact_attempt = requests[1].body_json();
+    let retry_attempt = requests[2].body_json();
+    let compact_input = compact_attempt["input"]
+        .as_array()
+        .expect("compact attempt missing input array");
+    let retry_input = retry_attempt["input"]
+        .as_array()
+        .expect("retry attempt missing input array");
+    assert!(
+        compact_input.len() > 2,
+        "expected several history items before repair, got {}",
+        compact_input.len()
+    );
+    assert_eq!(
+        retry_input.len(),
+        1,
+        "known context overage should be repaired in one local batch"
+    );
+    assert!(
+        body_contains_text(&retry_attempt.to_string(), SUMMARIZATION_PROMPT),
+        "batch repair must preserve the synthesized compaction prompt"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_non_retryable_failure_is_not_retried() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let user_turn = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed("r1"),
+    ]);
+    let request_log = mount_response_sequence(
+        &server,
+        vec![
+            sse_response(user_turn),
+            invalid_request_response("permanent compact failure"),
+        ],
+    )
+    .await;
+
+    let mut model_provider = non_openai_model_provider(&server);
+    model_provider.stream_max_retries = Some(2);
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_auto_compact_token_limit = Some(200_000);
+        })
+        .build(&server)
+        .await
+        .expect("build codex");
+    let codex = &test.codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "first turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit user input");
+    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    codex.submit(Op::Compact).await.expect("trigger compact");
+    wait_for_event(codex, |ev| matches!(ev, EventMsg::Error(_))).await;
+    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    assert_eq!(
+        request_log.requests().len(),
+        2,
+        "non-retryable compact failure should make exactly one compact request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_compact_retryable_failure_retries_then_succeeds() {
+    skip_if_no_network!();
+
+    let server = start_mock_server().await;
+
+    let user_turn = sse(vec![
+        ev_assistant_message("m1", FIRST_REPLY),
+        ev_completed("r1"),
+    ]);
+    let compact_failed_1 = sse_failed(
+        "resp-fail-1",
+        "server_error",
+        "temporary compact failure one",
+    );
+    let compact_succeeds = sse(vec![
+        ev_assistant_message("m2", SUMMARY_TEXT),
+        ev_completed("r2"),
+    ]);
+
+    let request_log =
+        mount_sse_sequence(&server, vec![user_turn, compact_failed_1, compact_succeeds]).await;
+
+    let mut model_provider = non_openai_model_provider(&server);
+    model_provider.stream_max_retries = Some(1);
+
+    let test = test_codex()
+        .with_config(move |config| {
+            config.model_provider = model_provider;
+            set_test_compact_prompt(config);
+            config.model_auto_compact_token_limit = Some(200_000);
+        })
+        .build(&server)
+        .await
+        .expect("build codex");
+    let codex = &test.codex;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "first turn".into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await
+        .expect("submit user input");
+    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     codex.submit(Op::Compact).await.expect("trigger compact");
 
-    let reconnect_message = wait_for_event_match(&codex, |event| match event {
+    let reconnect_message = wait_for_event_match(codex, |event| match event {
         EventMsg::StreamError(stream_error) => Some(stream_error.message.clone()),
         _ => None,
     })
@@ -3620,16 +3760,13 @@ async fn manual_compact_non_context_failure_retries_then_emits_task_error() {
         "expected reconnect stream error message, got {reconnect_message}"
     );
 
-    let task_error_message = wait_for_event_match(&codex, |event| match event {
-        EventMsg::Error(err) => Some(err.message.clone()),
-        _ => None,
-    })
-    .await;
-    assert!(
-        task_error_message.contains("Error running local compact task"),
-        "expected local compact task error prefix, got {task_error_message}"
+    wait_for_event(codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
+
+    assert_eq!(
+        request_log.requests().len(),
+        3,
+        "retryable compact failure should be retried once before success"
     );
-    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

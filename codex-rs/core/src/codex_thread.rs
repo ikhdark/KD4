@@ -1,4 +1,5 @@
 use crate::agent::AgentStatus;
+use crate::agent::control::AgentExecutionGuard;
 use crate::config::ConstraintResult;
 use crate::elicitation::ElicitationRegistration;
 use crate::session::Codex;
@@ -200,7 +201,7 @@ impl CodexThread {
     }
 
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
-        self.codex.submit(op).await
+        self.submit_with_trace(op, /*trace*/ None).await
     }
 
     /// Returns the session telemetry handle for thread-scoped production instrumentation.
@@ -256,7 +257,14 @@ impl CodexThread {
         op: Op,
         trace: Option<W3cTraceContext>,
     ) -> CodexResult<String> {
-        self.codex.submit_with_trace(op, trace).await
+        let execution_guard = self.reserve_execution_guard(&op).await?;
+        self.submit_op_with_execution_guard(
+            op,
+            trace,
+            /*client_user_message_id*/ None,
+            execution_guard,
+        )
+        .await
     }
 
     pub async fn submit_user_input_with_client_user_message_id(
@@ -265,14 +273,9 @@ impl CodexThread {
         trace: Option<W3cTraceContext>,
         client_user_message_id: Option<String>,
     ) -> CodexResult<String> {
-        self.codex
-            .session
-            .services
-            .agent_control
-            .ensure_execution_capacity_for_op(self.session_configured.thread_id, &op)
-            .await?;
-        self.codex
-            .submit_user_input_with_client_user_message_id(op, trace, client_user_message_id)
+        debug_assert!(matches!(op, Op::UserInput { .. }));
+        let execution_guard = self.reserve_execution_guard(&op).await?;
+        self.submit_op_with_execution_guard(op, trace, client_user_message_id, execution_guard)
             .await
     }
 
@@ -289,15 +292,18 @@ impl CodexThread {
         trace: Option<W3cTraceContext>,
         client_user_message_id: Option<String>,
     ) -> CodexResult<()> {
-        self.codex
-            .session
-            .services
-            .agent_control
-            .ensure_execution_capacity_for_op(self.session_configured.thread_id, &op)
-            .await?;
-        self.codex
-            .submit_user_input_with_reserved_turn_id(turn_id, op, trace, client_user_message_id)
-            .await
+        debug_assert!(matches!(op, Op::UserInput { .. }));
+        let execution_guard = self.reserve_execution_guard(&op).await?;
+        self.submit_submission_with_execution_guard(
+            Submission {
+                id: turn_id,
+                op,
+                client_user_message_id,
+                trace,
+            },
+            execution_guard,
+        )
+        .await
     }
 
     /// Persist whether this thread is eligible for future memory generation.
@@ -438,7 +444,73 @@ impl CodexThread {
 
     /// Use sparingly: this is intended to be removed soon.
     pub async fn submit_with_id(&self, sub: Submission) -> CodexResult<()> {
-        self.codex.submit_with_id(sub).await
+        let execution_guard = self.reserve_execution_guard(&sub.op).await?;
+        self.submit_submission_with_execution_guard(sub, execution_guard)
+            .await
+    }
+
+    pub(crate) async fn submit_with_preacquired_execution_guard(
+        &self,
+        op: Op,
+        execution_guard: Option<AgentExecutionGuard>,
+    ) -> CodexResult<String> {
+        self.submit_op_with_execution_guard(
+            op,
+            /*trace*/ None,
+            /*client_user_message_id*/ None,
+            execution_guard,
+        )
+        .await
+    }
+
+    async fn reserve_execution_guard(&self, op: &Op) -> CodexResult<Option<AgentExecutionGuard>> {
+        self.codex
+            .session
+            .services
+            .agent_control
+            .reserve_execution_capacity_for_op(self.session_configured.thread_id, op)
+            .await
+    }
+
+    async fn submit_op_with_execution_guard(
+        &self,
+        op: Op,
+        trace: Option<W3cTraceContext>,
+        client_user_message_id: Option<String>,
+        execution_guard: Option<AgentExecutionGuard>,
+    ) -> CodexResult<String> {
+        let id = self.codex.reserve_turn_id();
+        self.submit_submission_with_execution_guard(
+            Submission {
+                id: id.clone(),
+                op,
+                client_user_message_id,
+                trace,
+            },
+            execution_guard,
+        )
+        .await?;
+        Ok(id)
+    }
+
+    async fn submit_submission_with_execution_guard(
+        &self,
+        sub: Submission,
+        execution_guard: Option<AgentExecutionGuard>,
+    ) -> CodexResult<()> {
+        let registration = self
+            .codex
+            .session
+            .services
+            .agent_control
+            .register_execution_permit(
+                self.session_configured.thread_id,
+                &sub.id,
+                execution_guard,
+            )?;
+        self.codex.submit_with_id(sub).await?;
+        registration.commit();
+        Ok(())
     }
 
     pub async fn next_event(&self) -> CodexResult<Event> {

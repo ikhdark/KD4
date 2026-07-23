@@ -1,25 +1,32 @@
 # Repository policy
 
-Shared policy revision: `2026-07-20`.
+Shared policy revision: `2026-07-22`.
 
 ## Synchronization contract
 
-This root policy is synchronized with:
+The canonical shared-policy source is:
 
 - `C:\Users\kuh\Desktop\kd4\AGENTS.md`
+
+Its synchronized targets are:
+
 - `C:\Users\kuh\Desktop\KDWG\AGENTS.md`
-- `C:\Users\kuh\Desktop\mdpwa-main\AGENTS.md`
 - `C:\Users\kuh\Desktop\kds-main\AGENTS.md`
+- `C:\Users\kuh\Desktop\mdpwa-main\AGENTS.md`
+- `C:\Users\kuh\Desktop\kdsb-main\AGENTS.md`
+- `C:\Users\kuh\Desktop\kdpc-main\AGENTS.md`
+- `C:\Users\kuh\Desktop\kdgma-main\AGENTS.md`
 
 Every byte outside the project-context block below must remain identical across
-all four files. Only that block may contain repository-specific identity,
+all seven files. Only that block may contain repository-specific identity,
 ownership, commands, validation, runtime, installation, safety, or protected
 path details.
 
-When a shared rule changes, update all four files in the same task, align the
-shared revision, and compare normalized copies after replacing each
-project-context block with the same sentinel. Do not place repository-specific
-exceptions outside that block.
+Change shared rules only in the canonical KD4 source. When a shared rule
+changes, update its revision, copy the shared portion to all six targets in the
+same task, and compare normalized copies after replacing each project-context
+block with the same sentinel. Do not place repository-specific exceptions
+outside that block or edit a target's shared portion independently.
 
 ## Project context
 
@@ -150,28 +157,10 @@ completes the request.
   installation, and compatibility behavior unless the user requests a change.
 - Do not alter approval, permission, sandbox, patch-guard, stale-read,
   validation-gating, or execution-safety behavior as part of unrelated work.
-- Use durable plans, harnesses, logs, evals, QA artifacts, handoffs, or
-  multi-agent workflows only when the user asks or a nearer instruction file
-  requires them.
-- Parallel agents should not edit overlapping contract surfaces. Three agents
-  changing the runtime, lifecycle scripts, schemas, and documentation
-  simultaneously can each be locally correct while collectively inconsistent.
-  Use one implementation owner for a contract. Other agents should map or audit
-  it, not independently redefine it.
-- Agents may work in parallel on independent fixes or non-overlapping contract
-  surfaces. Establish explicit ownership boundaries before editing, and if an
-  overlap appears, stop editing the overlapping surface until ownership is
-  resolved through cross-task coordination.
 - Read-only agents may investigate in parallel to help other busy agents. They
   may inspect relevant or adjacent contract surfaces but must not edit them;
   report findings to the busy agent, who retains edit ownership for the owned
   surface.
-- When task-relevant files change concurrently in a shared checkout, inspect
-  active Codex tasks for overlapping contract ownership. Use cross-task
-  messaging to establish one implementation owner, tell competing tasks which
-  behavior and files to stop editing, and request a source-freeze notice before
-  shared validation. Do not create new tasks or sub-agents solely for
-  coordination, and do not send repeated messages without new overlap or state.
 
 ## Fast implementation path
 
@@ -218,35 +207,26 @@ For implementation work:
 - For broad claims such as “all,” “every,” “complete,” or “repo-wide,” perform a
   closure search appropriate to that claim. Do not perform a repo-wide closure
   sweep for a bounded request.
-
-Use Wiring Guard/KDWG when a change adds, moves, removes, replaces, or reconnects
-executable paths, commands, hooks, registrations, configuration-driven
-discovery, or installation wiring. Run its check after the final relevant edit.
-
-Do not run Wiring Guard for:
-
-- documentation, instructions, templates, plans, or other text-only changes;
-- internal logic-only changes whose runtime path and registration are
-  unchanged and whose behavior is proven by focused tests; or
-- generated output that is owned and verified by its generator.
-
-A nearer instruction file may require Wiring Guard for additional cases. Static
-wiring proof does not replace behavior validation.
+- When checking for bugs, do not stop at the first bug found, continue to collect all bugs then report/fix.
 
 ## Validation
 
 Use the nearest sufficient proof and stop when it passes.
 
+For lifecycle changes, run focused validation during implementation, then one appropriate broad validation and a normal disposable-host installation check after the final edit.
+
 - Documentation or instruction wording: review the focused diff and use
   `git diff --check` only when whitespace or patch integrity is relevant.
 - Behavior changes: run the closest owner test, focused test selection, or
   direct runtime reproduction.
+- Tests do not automatically mean working code, do not assume tests equals success.
 - Schema, protocol, package, lockfile, generated artifact, or installation
   changes: use the owning generator or official recipe.
 - Do not stack build, test, lint, format, audit, install, smoke, and runtime
   checks unless each proves a distinct claim required by the task.
 - Do not rerun an already-green source check unless a covered source or input
   changed.
+- When possible, perform smoke-tests to make sure the new code actually works.
 - Documentation, installation, generated inventory updates, and unrelated dirty
   paths do not invalidate a green source check unless they are declared inputs
   to that check.
@@ -262,30 +242,5 @@ Final responses should state only:
 - the validation that ran; and
 - any known task-scope risk that remains.
 
-Do not add a formal lane, completion-gate classification, wiring report, or
-risk section when there is no unresolved risk.
-
-## Tool use
-
-- Use `search_source` and `read_file_span` when available for bounded,
-  citation-friendly repository source lookup and targeted span reads. Use `rg`
-  or `rg --files` for regular-expression searches, exhaustive or closure
-  searches, file discovery, and advanced filtering. Use `fd`, `ast-grep`,
-  `jq`, `yq`, or another purpose-built tool only when it materially simplifies
-  the task.
-- Prefer repository-owned recipes such as `just`, configured formatters,
-  generators, and focused test commands over improvised equivalents.
-- Use `apply_patch` for manual edits. Use an owning formatter or generator for
-  clearly mechanical rewrites.
-- Never publish, install globally, stage, commit, push, or open a pull request
-  unless the user asks.
-
-## Protected and sensitive material
-
-Do not hand-edit generated files, vendored code, lockfiles, build outputs,
-installed caches, or private runtime data unless the source change or owning
-workflow requires it.
-
-Never expose secrets, tokens, environment values, private resident or user data,
-raw logs, or sensitive runtime state in source, documentation, issues, pull
-requests, or chat. Reference variable names and privacy-safe summaries instead.
+Do not add a formal lane, completion-gate classification, or risk section when
+there is no unresolved risk.

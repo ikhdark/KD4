@@ -9,6 +9,7 @@ use crate::exec_env::CODEX_THREAD_ID_ENV_VAR;
 use crate::sandboxing::SandboxPermissions;
 use crate::shell::Shell;
 use crate::shell::ShellType;
+use crate::shell_snapshot::POSIX_SNAPSHOT_FORMAT_HEADER;
 use crate::tools::sandboxing::ToolError;
 #[cfg(unix)]
 use codex_install_context::InstallContext;
@@ -150,7 +151,7 @@ impl RuntimePathPrepends {
             .map(|entry| {
                 let entry = shell_single_quote(entry);
                 format!(
-                    "if [ -n \"${{PATH:-}}\" ]; then export PATH='{entry}':\"$PATH\"; else export PATH='{entry}'; fi"
+                    "if \\command [ -n \"${{PATH:-}}\" ]; then \\command export PATH='{entry}':\"$PATH\"; else \\command export PATH='{entry}'; fi"
                 )
             })
             .collect::<Vec<_>>()
@@ -229,15 +230,16 @@ pub(crate) fn disable_powershell_profile_for_elevated_windows_sandbox(
 /// POSIX-only helper: for commands produced by `Shell::derive_exec_args`
 /// for Bash/Zsh/sh of the form `[shell_path, "-lc", "<script>"]`, and
 /// when a snapshot is configured on the session shell, rewrite the argv
-/// to a single non-login shell that sources the snapshot before running
-/// the original script:
+/// to a clean login shell that sources the snapshot before running the
+/// original script in that initialized shell when the executables match:
 ///
 ///   shell -lc "<script>"
-///   => user_shell -c ". SNAPSHOT (best effort); exec shell -c <script>"
+///   => user_shell <clean-startup flags> -lc ". SNAPSHOT (best effort); eval <script>"
 ///
-/// This wrapper script uses POSIX constructs (`if`, `.`, `exec`) so it can
-/// be run by Bash/Zsh/sh. On non-matching commands, or when command cwd does
-/// not match the snapshot cwd, this is a no-op.
+/// This wrapper script uses POSIX constructs so it can be run by Bash/Zsh/sh.
+/// A non-matching command is left unchanged because shell-local snapshot state
+/// can only be reused safely by the matching executable. Cwd mismatch is
+/// filtered by the caller before a snapshot path reaches this helper.
 ///
 /// `explicit_env_overrides` and `env` are intentionally separate inputs.
 /// `explicit_env_overrides` contains policy-driven shell env overrides that
@@ -280,6 +282,25 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
 
     let snapshot_path = snapshot.to_string_lossy();
     let shell_path = session_shell.shell_path.to_string_lossy();
+    let reuse_initialized_shell = command[0].as_str() == shell_path.as_ref();
+    if !reuse_initialized_shell {
+        return command.to_vec();
+    }
+    let Ok(snapshot_contents) = std::fs::read_to_string(snapshot) else {
+        return command.to_vec();
+    };
+    let has_functions_section = snapshot_contents
+        .lines()
+        .any(|line| line.starts_with("# Functions"));
+    let has_supported_snapshot_format = snapshot_contents
+        .lines()
+        .any(|line| line == POSIX_SNAPSHOT_FORMAT_HEADER);
+    if has_functions_section && !has_supported_snapshot_format {
+        // Older formats can execute functions inline or replay Bash declaration
+        // attributes that conflict with live policy restoration. Let the original
+        // login command rebuild state instead.
+        return command.to_vec();
+    }
     let original_shell = shell_single_quote(&command[0]);
     let original_script = shell_single_quote(&command[2]);
     let snapshot_path = shell_single_quote(snapshot_path.as_ref());
@@ -305,17 +326,86 @@ pub(crate) fn maybe_wrap_shell_lc_with_snapshot(
         proxy_exports,
         runtime_path_prepend_exports,
     ]);
-    let rewritten_script = if override_exports.is_empty() {
+    let activate_snapshot_state = "\\command eval '\\command unset __CODEX_SNAPSHOT_FUNCTIONS __CODEX_SNAPSHOT_ALIASES __CODEX_SNAPSHOT_BASH_ENV_PRESENT\n'\"${__CODEX_SNAPSHOT_FUNCTIONS-}\"'\n'\"${__CODEX_SNAPSHOT_ALIASES-}\"";
+    let command_invocation =
+        format!("{activate_snapshot_state} &&\n\\command eval '{original_script}'");
+    let post_snapshot_restore = if session_shell.shell_type == ShellType::Bash {
+        "case \"${__CODEX_SNAPSHOT_BASH_ENV_PRESENT-0}\" in\n  1) ;;\n  *) \\command unset BASH_ENV ;;\nesac"
+    } else {
+        ""
+    };
+    let rewritten_body = if override_exports.is_empty() {
         format!(
-            "if . '{snapshot_path}' >/dev/null 2>&1; then :; fi\n\nexec '{original_shell}' -c '{original_script}'{trailing_args}"
+            "\\command . '{snapshot_path}' >/dev/null 2>&1 || \\command true\n\n{post_snapshot_restore}\n\n{command_invocation}"
         )
     } else {
         format!(
-            "{override_captures}\n\nif . '{snapshot_path}' >/dev/null 2>&1; then :; fi\n\n{override_exports}\n\nexec '{original_shell}' -c '{original_script}'{trailing_args}"
+            "{override_captures}\n\n\\command . '{snapshot_path}' >/dev/null 2>&1 || \\command true\n\n{post_snapshot_restore}\n\n{override_exports}\n\n{command_invocation}"
+        )
+    };
+    // Parse Codex's control block with aliases disabled. Functions and aliases
+    // stay encoded as data until the activation eval, whose first command removes
+    // the transport variables before defining the captured functions and aliases.
+    // The trusted second eval then parses the user script after aliases are live;
+    // `command`/`builtin` functions are rejected during capture, so captured
+    // dispatcher functions cannot intercept either boundary.
+    // Privileged startup makes Bash ignore BASH_ENV and imported functions while
+    // preserving the caller's BASH_ENV value for the override capture below.
+    // Leave privileged mode before replaying any snapshot state or user code.
+    let shell_bootstrap = if session_shell.shell_type == ShellType::Bash {
+        "\\command set +p\n"
+    } else {
+        ""
+    };
+    let zsh_option_baseline = if session_shell.shell_type == ShellType::Zsh {
+        "\\command setopt RCS\n"
+    } else {
+        ""
+    };
+    let control_script = format!(
+        "{shell_bootstrap}\\command unalias -a 2>/dev/null || \\command true\n{{\n{zsh_option_baseline}{rewritten_body}\n}}"
+    );
+    let rewritten_script = if session_shell.shell_type == ShellType::Bash {
+        control_script
+    } else if session_shell.shell_type == ShellType::Zsh {
+        let fallback_invocation =
+            format!("'{original_shell}' -lc '{original_script}'{trailing_args}");
+        format!(
+            "if [[ \"${{(t)functions}}\" == association* && -z \"${{functions[builtin]-}}\" && -z \"${{functions[command]-}}\" ]]; then\n{control_script}\nelse\n  {fallback_invocation}\nfi"
+        )
+    } else {
+        let fallback_invocation =
+            format!("'{original_shell}' -lc '{original_script}'{trailing_args}");
+        format!(
+            "\\unset -f command 2>/dev/null\ncase \"$(\\command printf '%s' __CODEX_SNAPSHOT_COMMAND_OK)\" in\n  __CODEX_SNAPSHOT_COMMAND_OK)\n{control_script}\n    ;;\n  *)\n    {fallback_invocation}\n    ;;\nesac"
         )
     };
 
-    vec![shell_path.to_string(), "-c".to_string(), rewritten_script]
+    let mut rewritten = match session_shell.shell_type {
+        ShellType::Bash => vec![
+            "/usr/bin/env".to_string(),
+            "-u".to_string(),
+            "BASH_FUNC_command%%".to_string(),
+            "-u".to_string(),
+            "BASH_FUNC_builtin%%".to_string(),
+            shell_path.to_string(),
+            "--noprofile".to_string(),
+            "--norc".to_string(),
+            "-p".to_string(),
+            "-lc".to_string(),
+            rewritten_script,
+        ],
+        ShellType::Zsh => vec![
+            shell_path.to_string(),
+            "-f".to_string(),
+            "-lc".to_string(),
+            rewritten_script,
+        ],
+        ShellType::Sh => vec![shell_path.to_string(), "-lc".to_string(), rewritten_script],
+        ShellType::PowerShell | ShellType::Cmd => return command.to_vec(),
+    };
+    rewritten.extend(command[3..].iter().cloned());
+    rewritten
 }
 
 fn build_override_exports(
@@ -350,7 +440,7 @@ fn build_proxy_env_exports() -> (String, String) {
     let proxy_blocks = (
         format!("{captures}\n__CODEX_SNAPSHOT_PROXY_ENV_SET=\"${{{key}+x}}\""),
         format!(
-            "if [ -n \"$__CODEX_SNAPSHOT_PROXY_ENV_SET\" ] || [ -n \"${{{key}+x}}\" ]; then\n{restores}\nfi"
+            "if \\command [ -n \"$__CODEX_SNAPSHOT_PROXY_ENV_SET\" ] || \\command [ -n \"${{{key}+x}}\" ]; then\n{restores}\nfi"
         ),
     );
     let git_blocks = build_codex_proxy_git_ssh_command_exports();
@@ -369,7 +459,7 @@ fn build_codex_proxy_git_ssh_command_exports() -> (String, String) {
             "__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_SET=\"${{{key}+x}}\"\n__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND=\"${{{key}-}}\"\ncase \"$__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND\" in\n  {marker_pattern}) __CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_LIVE_MARKED=1 ;;\n  *) __CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_LIVE_MARKED= ;;\nesac"
         ),
         format!(
-            "case \"${{{key}-}}\" in\n  {marker_pattern}) __CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_AFTER_MARKED=1 ;;\n  *) __CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_AFTER_MARKED= ;;\nesac\nif [ -n \"$__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_LIVE_MARKED\" ]; then\n  if [ -z \"${{{key}+x}}\" ] || [ -n \"$__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_AFTER_MARKED\" ]; then\n    export {key}=\"$__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND\"\n  fi\nelif [ -n \"$__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_AFTER_MARKED\" ]; then\n  if [ -n \"$__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_SET\" ]; then\n    export {key}=\"$__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND\"\n  else\n    unset {key}\n  fi\nfi"
+            "case \"${{{key}-}}\" in\n  {marker_pattern}) __CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_AFTER_MARKED=1 ;;\n  *) __CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_AFTER_MARKED= ;;\nesac\nif \\command [ -n \"$__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_LIVE_MARKED\" ]; then\n  if \\command [ -z \"${{{key}+x}}\" ] || \\command [ -n \"$__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_AFTER_MARKED\" ]; then\n    \\command export {key}=\"$__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND\"\n  fi\nelif \\command [ -n \"$__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_AFTER_MARKED\" ]; then\n  if \\command [ -n \"$__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND_SET\" ]; then\n    \\command export {key}=\"$__CODEX_SNAPSHOT_PROXY_GIT_SSH_COMMAND\"\n  else\n    \\command unset {key}\n  fi\nfi"
         ),
     )
 }
@@ -401,7 +491,7 @@ fn build_override_exports_for_keys(variable_prefix: &str, keys: &[&str]) -> (Str
             let set_var = format!("{variable_prefix}_SET_{idx}");
             let value_var = format!("{variable_prefix}_{idx}");
             format!(
-                "if [ -n \"${{{set_var}}}\" ]; then export {key}=\"${{{value_var}}}\"; else unset {key}; fi"
+                "if \\command [ -n \"${{{set_var}}}\" ]; then \\command export {key}=\"${{{value_var}}}\"; else \\command unset {key}; fi"
             )
         })
         .collect::<Vec<_>>()

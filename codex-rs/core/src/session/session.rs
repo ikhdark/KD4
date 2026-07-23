@@ -4,6 +4,7 @@ use crate::agents_md_manager::AgentsMdManager;
 use crate::config::ConstraintError;
 use crate::environment_selection::ThreadEnvironments;
 use crate::environment_selection::TurnEnvironmentSnapshot;
+use crate::exec_env::create_env;
 use crate::git_workspace::GitWorkspaceCache;
 use crate::shell_snapshot::ShellSnapshot;
 use crate::skills::SkillError;
@@ -900,6 +901,10 @@ impl Session {
                     thread_id,
                     session_telemetry.clone(),
                     state_db_ctx.clone(),
+                    create_env(
+                        &config.permissions.shell_environment_policy,
+                        Some(thread_id),
+                    ),
                 )
             } else {
                 ShellSnapshot::disabled()

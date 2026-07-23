@@ -421,7 +421,7 @@ async fn finish_call_returns_denial_and_unregisters_active_call() {
         .await
         .expect_err("denial should be returned");
 
-    assert!(matches!(err, ToolError::Rejected(message) if message == "network denied"));
+    assert!(matches!(err, ToolError::Denied(message) if message == "network denied"));
     assert!(service.resolve_single_active_call().await.is_none());
     assert_eq!(service.take_call_outcome("registration-1").await, None);
 }
@@ -453,8 +453,8 @@ async fn deferred_finish_reuses_denial_result_after_first_consumer() {
         .await
         .expect_err("second consumer should reuse denial");
 
-    assert!(matches!(first, ToolError::Rejected(message) if message == "network denied"));
-    assert!(matches!(second, ToolError::Rejected(message) if message == "network denied"));
+    assert!(matches!(first, ToolError::Denied(message) if message == "network denied"));
+    assert!(matches!(second, ToolError::Denied(message) if message == "network denied"));
 }
 
 #[tokio::test]

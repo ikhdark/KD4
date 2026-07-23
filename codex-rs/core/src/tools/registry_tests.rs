@@ -317,6 +317,7 @@ async fn write_stdin_does_not_expose_default_pre_tool_use_payload() {
     );
 
     assert_eq!(write_stdin.pre_tool_use_payload(&invocation), None);
+    assert!(write_stdin.supports_parallel_tool_calls());
 }
 
 #[test]

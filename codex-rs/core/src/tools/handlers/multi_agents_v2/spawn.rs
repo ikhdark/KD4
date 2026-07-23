@@ -233,6 +233,7 @@ async fn handle_spawn_agent(
                             thread_id: None,
                         }
                     }),
+                    agent_job_binding: None,
                 },
             ),
     )

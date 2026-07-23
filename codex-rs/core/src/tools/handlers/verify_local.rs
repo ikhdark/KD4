@@ -6,6 +6,8 @@ use crate::function_tool::FunctionCallError;
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
+use crate::task_evidence::TaskEvidenceLedger;
+use crate::task_evidence::TaskEvidenceValidationStart;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolCallSource;
@@ -21,6 +23,7 @@ use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::runtimes::shell::ShellRuntimeBackend;
 use codex_protocol::exec_output::ExecToolCallOutput;
+use codex_protocol::models::FunctionCallOutputContentItem;
 use codex_protocol::models::ResponseInputItem;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -87,6 +90,14 @@ impl VerifyLocalRun {
                 .as_ref()
                 .is_some_and(self::is_versioned_verify_local_json)
             && self.scope.is_some()
+    }
+
+    fn has_invalid_proof_contract(&self) -> bool {
+        let Some(json) = self.json.as_ref() else {
+            return false;
+        };
+        !is_versioned_verify_local_json(json)
+            || (self.verdict_text.as_deref() == Some("VERIFIED") && self.scope.is_none())
     }
 }
 
@@ -190,6 +201,12 @@ impl VerifyLocalHandler {
                     .to_string(),
             )
         })?;
+        if !session.services.task_evidence.matches_repo_root(&repo_root) {
+            return Err(FunctionCallError::RespondToModel(
+                "verify_local cannot validate the selected environment because its repository root does not match the session task-evidence root"
+                    .to_string(),
+            ));
+        }
 
         let argv = build_verify_local_argv(&args);
         let raw_json = args.json;
@@ -251,6 +268,7 @@ impl VerifyLocalHandler {
             hook_command,
             safety_command: argv,
             shell_type: None,
+            is_powershell_script: false,
             additional_permissions: None,
             prefix_rule: None,
             session: Arc::clone(&session),
@@ -265,48 +283,78 @@ impl VerifyLocalHandler {
             capture_exec_output: true,
         })
         .await?;
-        let (output, run) = finalize_verify_local_output(
+        let (mut output, run) = finalize_verify_local_output(
             result.output,
             result.exec_output.as_ref(),
             result.exit_code,
             raw_json,
         );
-        let (active_files, stale_reasons) = run
-            .scope
-            .as_ref()
-            .map(|scope| {
-                (
-                    scope.active_files.as_slice(),
-                    scope.stale_reasons.as_slice(),
-                )
-            })
-            .unwrap_or((&[], &[]));
-        let proof_accepted = session
-            .services
-            .task_evidence
-            .record_verify_local(
-                args.mode(),
-                run.verdict_text.as_deref(),
-                run.tool_success,
-                run.is_proof_bearing(),
-                validation_start.as_ref(),
-                active_files,
-                stale_reasons,
-                run.json.as_ref(),
-            )
-            .await;
-        if proof_accepted && let Some(scope) = &run.scope {
-            let mut tracker = validation_tracker.lock().await;
-            crate::turn_diff_tracker::TurnDiffTracker::record_verified_validation(
-                &mut tracker,
-                validation_command,
-                &validation_environment_id,
-                &scope.active_files,
-                /*clear_unknown_mutation*/ false,
-            );
-        }
+        apply_verify_local_evidence_decision(
+            &session.services.task_evidence,
+            &mut output,
+            &run,
+            args.mode(),
+            validation_start.as_ref(),
+            &validation_tracker,
+            validation_command,
+            &validation_environment_id,
+        )
+        .await;
         Ok(boxed_tool_output(output))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_verify_local_evidence_decision(
+    task_evidence: &TaskEvidenceLedger,
+    output: &mut FunctionToolOutput,
+    run: &VerifyLocalRun,
+    mode: &str,
+    validation_start: Option<&TaskEvidenceValidationStart>,
+    validation_tracker: &SharedTurnDiffTracker,
+    validation_command: Vec<String>,
+    validation_environment_id: &str,
+) -> bool {
+    let (active_files, stale_reasons) = run
+        .scope
+        .as_ref()
+        .map(|scope| {
+            (
+                scope.active_files.as_slice(),
+                scope.stale_reasons.as_slice(),
+            )
+        })
+        .unwrap_or((&[], &[]));
+    let proof_accepted = task_evidence
+        .record_verify_local(
+            mode,
+            run.verdict_text.as_deref(),
+            run.tool_success,
+            run.is_proof_bearing(),
+            validation_start,
+            active_files,
+            stale_reasons,
+            run.json.as_ref(),
+        )
+        .await;
+    if run.is_proof_bearing() && !proof_accepted {
+        output.success = Some(false);
+        output.body.push(FunctionCallOutputContentItem::InputText {
+            text: "The verifier process passed, but its freshness evidence was rejected because the validated files or evidence state changed during the run. Rerun verify_local before treating this result as proof."
+                .to_string(),
+        });
+    }
+    if proof_accepted && let Some(scope) = &run.scope {
+        let mut tracker = validation_tracker.lock().await;
+        crate::turn_diff_tracker::TurnDiffTracker::record_verified_validation(
+            &mut tracker,
+            validation_command,
+            validation_environment_id,
+            &scope.active_files,
+            /*clear_unknown_mutation*/ false,
+        );
+    }
+    proof_accepted
 }
 
 pub(crate) async fn run_automatic_verify_local_plan(
@@ -535,6 +583,10 @@ fn parse_verify_local_run(
     } else {
         parse_text_verdict(&stdout, &stderr)
     };
+    let scope = json
+        .as_ref()
+        .filter(|_| has_versioned_json)
+        .and_then(self::parse_json_scope_value);
     let (semantic_success, guidance) = if json.is_some() && !has_versioned_json {
         (
             false,
@@ -544,6 +596,18 @@ fn parse_verify_local_run(
         )
     } else {
         match verdict_text.as_deref() {
+            Some("VERIFIED") if !has_versioned_json => (
+                false,
+                Some(
+                    "The verifier returned VERIFIED without the required versioned JSON proof contract; rerun verify_local.",
+                ),
+            ),
+            Some("VERIFIED") if scope.is_none() => (
+                false,
+                Some(
+                    "The verifier returned VERIFIED with a missing or malformed proof scope; rerun verify_local.",
+                ),
+            ),
             Some("VERIFIED") => (true, None),
             Some("VERIFIED (no proof needed)") => (
                 true,
@@ -578,10 +642,6 @@ fn parse_verify_local_run(
         }
     };
     let tool_success = semantic_success && exit_code == Some(0);
-    let scope = json
-        .as_ref()
-        .filter(|_| has_versioned_json)
-        .and_then(self::parse_json_scope_value);
     VerifyLocalRun {
         exit_code,
         stdout,
@@ -672,7 +732,7 @@ fn finalize_verify_local_output(
 }
 
 fn render_verify_local_output(run: &VerifyLocalRun, raw_json: bool) -> String {
-    if raw_json {
+    if raw_json && !run.has_invalid_proof_contract() {
         if let Some(value) = &run.json {
             return serde_json::to_string_pretty(value).unwrap_or_else(|_| render_raw_output(run));
         }

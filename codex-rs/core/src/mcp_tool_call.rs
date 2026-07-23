@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -39,10 +40,12 @@ use codex_mcp::MCP_TOOL_CODEX_APPS_META_KEY;
 use codex_mcp::McpConnectionManager;
 use codex_mcp::McpPermissionPromptAutoApproveContext;
 use codex_mcp::SandboxState;
+use codex_mcp::ToolInfo;
 use codex_mcp::auth_elicitation_completed_result;
 use codex_mcp::build_auth_elicitation_plan;
 use codex_mcp::declared_openai_file_input_param_names;
 use codex_mcp::mcp_permission_prompt_is_auto_approved;
+use codex_mcp::tool_is_model_visible;
 use codex_protocol::approvals::ElicitationRequest;
 use codex_protocol::items::McpToolCallError;
 use codex_protocol::items::McpToolCallItem;
@@ -85,6 +88,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use toml_edit::value;
 use tracing::Instrument;
 use tracing::Span;
@@ -108,6 +112,7 @@ const MCP_RESULT_TELEMETRY_SERVER_USER_FLOW_SPAN_ATTR: &str =
     "codex.mcp.server_user_flow.triggered";
 const MCP_RESULT_TELEMETRY_TARGET_ID_MAX_CHARS: usize = 256;
 const MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES: usize = DEFAULT_OUTPUT_BYTES_CAP;
+const MCP_TOOL_CALL_CANCELLED_MESSAGE: &str = "MCP tool call cancelled";
 
 /// Handles the specified tool call and dispatches the appropriate MCP tool-call
 /// item lifecycle events to the `Session`.
@@ -115,13 +120,15 @@ pub(crate) async fn handle_mcp_tool_call(
     sess: Arc<Session>,
     step_context: &Arc<StepContext>,
     call_id: String,
-    server: String,
-    tool_name: String,
-    hook_tool_name: HookToolName,
+    sampled_server: &str,
+    sampled_tool_name: &str,
     arguments: String,
+    cancellation_token: CancellationToken,
 ) -> HandledMcpToolCall {
     let turn_context = &step_context.turn;
     let manager = step_context.mcp.manager();
+    let sampled_server = sampled_server.to_string();
+    let sampled_tool_name = sampled_tool_name.to_string();
     // Parse the `arguments` as JSON. An empty string is OK, but invalid JSON
     // is not.
     let arguments_value = if arguments.trim().is_empty() {
@@ -139,21 +146,84 @@ pub(crate) async fn handle_mcp_tool_call(
         }
     };
 
+    let live_tool_info = tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => {
+            return HandledMcpToolCall {
+                result: CallToolResult::from_error_text(
+                    MCP_TOOL_CALL_CANCELLED_MESSAGE.to_string(),
+                ),
+                tool_input: arguments_value
+                    .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
+            };
+        }
+        live_tool_info = manager.tool_info(&sampled_server, &sampled_tool_name) => live_tool_info,
+    };
+    let Some(live_tool_info) = live_tool_info.filter(tool_is_model_visible) else {
+        let invocation = McpInvocation {
+            server: sampled_server.clone(),
+            tool: sampled_tool_name.clone(),
+            arguments: arguments_value.clone(),
+        };
+        let result = notify_mcp_tool_call_skip(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            &call_id,
+            invocation,
+            McpToolCallItemMetadata::from_tool_metadata(&sampled_server, None),
+            format!(
+                "MCP tool `{sampled_server}/{sampled_tool_name}` is no longer available to the model"
+            ),
+            /*already_started*/ false,
+        )
+        .await;
+        let status = if result.is_ok() { "ok" } else { "error" };
+        let outcome = McpCallMetricOutcome::from_status(status);
+        emit_mcp_call_metrics(
+            turn_context.as_ref(),
+            &outcome,
+            &sampled_server,
+            &sampled_tool_name,
+            /*connector_id*/ None,
+            /*connector_name*/ None,
+            /*duration*/ None,
+        );
+        return HandledMcpToolCall {
+            result: CallToolResult::from_result(result),
+            tool_input: arguments_value
+                .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
+        };
+    };
+
+    let server = live_tool_info.server_name.clone();
+    let tool_name = live_tool_info.tool.name.to_string();
+    let hook_tool_name = live_mcp_hook_tool_name(&live_tool_info);
     let invocation = McpInvocation {
         server: server.clone(),
         tool: tool_name.clone(),
         arguments: arguments_value.clone(),
     };
-
-    let metadata = lookup_mcp_tool_metadata(
-        sess.as_ref(),
-        turn_context.as_ref(),
-        manager,
-        &server,
-        &tool_name,
-    )
-    .await;
+    let metadata = tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => {
+            return HandledMcpToolCall {
+                result: CallToolResult::from_error_text(
+                    MCP_TOOL_CALL_CANCELLED_MESSAGE.to_string(),
+                ),
+                tool_input: arguments_value
+                    .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
+            };
+        }
+        metadata = mcp_tool_metadata_from_tool_info(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            manager,
+            &live_tool_info,
+        ) => Some(metadata),
+    };
     let item_metadata = McpToolCallItemMetadata::from_tool_metadata(&server, metadata.as_ref());
+    let connector_id = live_tool_info.connector_id.clone();
+    let connector_name = live_tool_info.connector_name.clone();
     let app_tool_policy = if server == CODEX_APPS_MCP_SERVER_NAME {
         let annotations = metadata
             .as_ref()
@@ -174,28 +244,6 @@ pub(crate) async fn handle_mcp_tool_call(
     } else {
         AppToolPolicy::default()
     };
-    let approval_mode = if server == CODEX_APPS_MCP_SERVER_NAME {
-        app_tool_policy.approval
-    } else if let Some(approval_mode) = {
-        // Selected-plugin registrations are absent from config.toml and the legacy plugin manager,
-        // so their resolved catalog entry is the authoritative source for tool approval policy.
-        manager
-            .is_selected_plugin_mcp_server(&server)
-            .then(|| manager.tool_approval_mode(&server, &tool_name))
-    } {
-        approval_mode
-    } else {
-        custom_mcp_tool_approval_mode(sess.as_ref(), turn_context.as_ref(), &server, &tool_name)
-            .await
-    };
-
-    let connector_id = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.connector_id.clone());
-    let connector_name = metadata
-        .as_ref()
-        .and_then(|metadata| metadata.connector_name.clone());
-
     if server == CODEX_APPS_MCP_SERVER_NAME && !app_tool_policy.enabled {
         let result = notify_mcp_tool_call_skip(
             sess.as_ref(),
@@ -232,93 +280,168 @@ pub(crate) async fn handle_mcp_tool_call(
         item_metadata.clone(),
     )
     .await;
-
-    if let Some(decision) = maybe_request_mcp_tool_approval(
-        &sess,
-        step_context,
-        &call_id,
-        &invocation,
-        &hook_tool_name,
-        metadata.as_ref(),
-        approval_mode,
-    )
-    .await
-    {
-        let result = match decision {
-            McpToolApprovalDecision::Accept
-            | McpToolApprovalDecision::AcceptForSession
-            | McpToolApprovalDecision::AcceptAndRemember => {
-                return handle_approved_mcp_tool_call(
-                    sess.as_ref(),
-                    step_context.as_ref(),
-                    &call_id,
-                    invocation,
-                    metadata.as_ref(),
-                    item_metadata,
-                )
-                .await;
-            }
-            McpToolApprovalDecision::Decline { message } => {
-                let message = message.unwrap_or_else(|| "user rejected MCP tool call".to_string());
-                notify_mcp_tool_call_skip(
-                    sess.as_ref(),
-                    turn_context.as_ref(),
-                    &call_id,
-                    invocation,
-                    item_metadata.clone(),
-                    message,
-                    /*already_started*/ true,
-                )
+    let lifecycle_started = Instant::now();
+    let default_tool_input = arguments_value
+        .clone()
+        .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new()));
+    let skipped_tool_input = default_tool_input.clone();
+    let operation_invocation = invocation.clone();
+    let operation = async {
+        let approval_mode = if server == CODEX_APPS_MCP_SERVER_NAME {
+            app_tool_policy.approval
+        } else if let Some(approval_mode) = {
+            // Selected-plugin registrations are absent from config.toml and the legacy plugin manager,
+            // so their resolved catalog entry is the authoritative source for tool approval policy.
+            manager
+                .is_selected_plugin_mcp_server(&server)
+                .then(|| manager.tool_approval_mode(&server, &tool_name))
+        } {
+            approval_mode
+        } else {
+            custom_mcp_tool_approval_mode(sess.as_ref(), turn_context.as_ref(), &server, &tool_name)
                 .await
-            }
-            McpToolApprovalDecision::Cancel => {
-                let message = "user cancelled MCP tool call".to_string();
-                notify_mcp_tool_call_skip(
-                    sess.as_ref(),
-                    turn_context.as_ref(),
-                    &call_id,
-                    invocation,
-                    item_metadata.clone(),
-                    message,
-                    /*already_started*/ true,
-                )
-                .await
-            }
         };
 
-        let status = if result.is_ok() { "ok" } else { "error" };
-        let outcome = McpCallMetricOutcome::from_status(status);
-        emit_mcp_call_metrics(
-            turn_context.as_ref(),
-            &outcome,
-            &server,
-            &tool_name,
-            connector_id.as_deref(),
-            connector_name.as_deref(),
-            /*duration*/ None,
-        );
+        if let Some(decision) = maybe_request_mcp_tool_approval(
+            &sess,
+            step_context,
+            &call_id,
+            &operation_invocation,
+            &hook_tool_name,
+            metadata.as_ref(),
+            approval_mode,
+        )
+        .await
+        {
+            match decision {
+                McpToolApprovalDecision::Accept
+                | McpToolApprovalDecision::AcceptForSession
+                | McpToolApprovalDecision::AcceptAndRemember => {}
+                McpToolApprovalDecision::Decline { message } => {
+                    return McpToolCallOutcome::skipped(
+                        message.unwrap_or_else(|| "user rejected MCP tool call".to_string()),
+                        skipped_tool_input.clone(),
+                    );
+                }
+                McpToolApprovalDecision::Cancel => {
+                    return McpToolCallOutcome::skipped(
+                        "user cancelled MCP tool call".to_string(),
+                        skipped_tool_input.clone(),
+                    );
+                }
+            }
+        }
 
-        return HandledMcpToolCall {
-            result: CallToolResult::from_result(result),
-            tool_input: arguments_value
-                .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
-        };
-    }
+        execute_approved_mcp_tool_call(
+            sess.as_ref(),
+            step_context.as_ref(),
+            &call_id,
+            operation_invocation,
+            &live_tool_info,
+            metadata.as_ref(),
+        )
+        .await
+    };
+    tokio::pin!(operation);
 
-    handle_approved_mcp_tool_call(
+    let outcome = tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => McpToolCallOutcome::cancelled(
+            default_tool_input.clone(),
+            lifecycle_started.elapsed(),
+        ),
+        outcome = &mut operation => outcome,
+    };
+
+    notify_mcp_tool_call_completed(
         sess.as_ref(),
-        step_context.as_ref(),
+        turn_context.as_ref(),
         &call_id,
         invocation,
-        metadata.as_ref(),
         item_metadata,
+        outcome.duration,
+        truncate_mcp_tool_result_for_event(&outcome.result),
     )
-    .await
+    .await;
+
+    if outcome.track_codex_app_usage {
+        maybe_track_codex_app_used(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            &server,
+            connector_id.as_deref(),
+            connector_name.as_deref(),
+        )
+        .await;
+    }
+
+    let metric_outcome = mcp_call_metric_outcome(&outcome.result);
+    emit_mcp_call_metrics(
+        turn_context.as_ref(),
+        &metric_outcome,
+        &server,
+        &tool_name,
+        connector_id.as_deref(),
+        connector_name.as_deref(),
+        outcome.metric_duration,
+    );
+
+    HandledMcpToolCall {
+        result: CallToolResult::from_result(outcome.result),
+        tool_input: outcome.tool_input,
+    }
+}
+
+fn live_mcp_hook_tool_name(tool_info: &ToolInfo) -> HookToolName {
+    let tool_name = tool_info.canonical_tool_name();
+    let joined_name = match tool_name.namespace.as_deref() {
+        Some(namespace) => format!(
+            "{}__{}",
+            namespace.trim_end_matches('_'),
+            tool_name.name.trim_start_matches('_')
+        ),
+        None => tool_name.name,
+    };
+    HookToolName::new(if joined_name.starts_with("mcp__") {
+        joined_name
+    } else {
+        format!("mcp__{joined_name}")
+    })
 }
 
 pub(crate) struct HandledMcpToolCall {
     pub(crate) result: CallToolResult,
     pub(crate) tool_input: JsonValue,
+}
+
+struct McpToolCallOutcome {
+    result: Result<CallToolResult, String>,
+    tool_input: JsonValue,
+    duration: Duration,
+    metric_duration: Option<Duration>,
+    track_codex_app_usage: bool,
+}
+
+impl McpToolCallOutcome {
+    fn skipped(message: String, tool_input: JsonValue) -> Self {
+        Self {
+            result: Err(message),
+            tool_input,
+            duration: Duration::ZERO,
+            metric_duration: None,
+            track_codex_app_usage: false,
+        }
+    }
+
+    fn cancelled(tool_input: JsonValue, duration: Duration) -> Self {
+        Self {
+            result: Err(MCP_TOOL_CALL_CANCELLED_MESSAGE.to_string()),
+            tool_input,
+            duration,
+            metric_duration: Some(duration),
+            track_codex_app_usage: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -359,28 +482,28 @@ impl McpToolCallItemMetadata {
     }
 }
 
-async fn handle_approved_mcp_tool_call(
+async fn execute_approved_mcp_tool_call(
     sess: &Session,
     step_context: &StepContext,
     call_id: &str,
     invocation: McpInvocation,
+    tool_info: &ToolInfo,
     metadata: Option<&McpToolApprovalMetadata>,
-    item_metadata: McpToolCallItemMetadata,
-) -> HandledMcpToolCall {
+) -> McpToolCallOutcome {
     let turn_context = step_context.turn.as_ref();
     let manager = step_context.mcp.manager();
     let server = invocation.server.clone();
     maybe_mark_thread_memory_mode_polluted(sess, turn_context, manager, &server).await;
     let tool_name = invocation.tool.clone();
     let arguments_value = invocation.arguments.clone();
-    let connector_id = metadata.and_then(|metadata| metadata.connector_id.as_deref());
-    let connector_name = metadata.and_then(|metadata| metadata.connector_name.as_deref());
-    let server_origin = manager.server_origin(&server).map(str::to_string);
+    let connector_id = tool_info.connector_id.as_deref();
+    let connector_name = tool_info.connector_name.as_deref();
+    let server_origin = tool_info.server_origin.as_deref();
 
     let start = Instant::now();
     let rewrite = rewrite_mcp_tool_arguments_for_openai_files(
         sess,
-        turn_context,
+        step_context,
         arguments_value.clone(),
         metadata.and_then(|metadata| metadata.openai_file_input_params.as_deref()),
     )
@@ -418,7 +541,7 @@ async fn handle_approved_mcp_tool_call(
             server_name: &server,
             tool_name: &tool_name,
             call_id,
-            server_origin: server_origin.as_deref(),
+            server_origin,
             connector_id,
             connector_name,
         },
@@ -428,32 +551,12 @@ async fn handle_approved_mcp_tool_call(
         tracing::warn!("MCP tool call error: {error:?}");
     }
     let duration = start.elapsed();
-    notify_mcp_tool_call_completed(
-        sess,
-        turn_context,
-        call_id,
-        invocation,
-        item_metadata,
-        duration,
-        truncate_mcp_tool_result_for_event(&result),
-    )
-    .await;
-    maybe_track_codex_app_used(sess, turn_context, manager, &server, &tool_name).await;
-
-    let outcome = mcp_call_metric_outcome(&result);
-    emit_mcp_call_metrics(
-        turn_context,
-        &outcome,
-        &server,
-        &tool_name,
-        connector_id,
-        connector_name,
-        Some(duration),
-    );
-
-    HandledMcpToolCall {
-        result: CallToolResult::from_result(result),
+    McpToolCallOutcome {
+        result,
         tool_input,
+        duration,
+        metric_duration: Some(duration),
+        track_codex_app_usage: true,
     }
 }
 
@@ -838,10 +941,9 @@ fn truncate_mcp_tool_result_for_event(
         Ok(call_tool_result) => {
             // The app-server rebuilds `ThreadItem::McpToolCall` from this item,
             // so avoid persisting multi-megabyte results in rollout storage.
-            let Ok(serialized) = serde_json::to_string(call_tool_result) else {
-                return Ok(call_tool_result.clone());
-            };
-            if serialized.len() <= MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES {
+            let mut writer = CappedMcpEventResultWriter::new(MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES);
+            let serialized = serde_json::to_writer(&mut writer, call_tool_result);
+            if serialized.is_err() || !writer.exceeded_limit() {
                 return Ok(call_tool_result.clone());
             }
 
@@ -854,10 +956,7 @@ fn truncate_mcp_tool_result_for_event(
             // The preview is itself serialized into a JSON string, so quotes and
             // backslashes can be escaped again and the stored event may end up
             // somewhat larger than this byte budget.
-            let truncated = truncate_text(
-                &serialized,
-                TruncationPolicy::Bytes(MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES),
-            );
+            let truncated = writer.into_truncated_preview();
             Ok(CallToolResult {
                 content: vec![serde_json::json!({
                     "type": "text",
@@ -872,6 +971,115 @@ fn truncate_mcp_tool_result_for_event(
             message,
             TruncationPolicy::Bytes(MCP_TOOL_CALL_EVENT_RESULT_MAX_BYTES),
         )),
+    }
+}
+
+struct CappedMcpEventResultWriter {
+    prefix: Vec<u8>,
+    suffix: VecDeque<u8>,
+    limit: usize,
+    total_bytes: usize,
+    total_chars: usize,
+}
+
+impl CappedMcpEventResultWriter {
+    fn new(limit: usize) -> Self {
+        Self {
+            prefix: Vec::new(),
+            suffix: VecDeque::new(),
+            limit,
+            total_bytes: 0,
+            total_chars: 0,
+        }
+    }
+
+    fn exceeded_limit(&self) -> bool {
+        self.total_bytes > self.limit
+    }
+
+    fn prefix_limit(&self) -> usize {
+        self.limit / 2
+    }
+
+    fn suffix_limit(&self) -> usize {
+        self.limit.saturating_sub(self.prefix_limit())
+    }
+
+    fn into_truncated_preview(mut self) -> String {
+        let valid_prefix_len = match std::str::from_utf8(&self.prefix) {
+            Ok(_) => self.prefix.len(),
+            Err(error) => error.valid_up_to(),
+        };
+        self.prefix.truncate(valid_prefix_len);
+
+        let suffix_target = self.total_bytes.saturating_sub(self.suffix_limit());
+        let suffix_buffer_start = self.total_bytes.saturating_sub(self.suffix.len());
+        let mut suffix_start = suffix_target.saturating_sub(suffix_buffer_start);
+        while self
+            .suffix
+            .get(suffix_start)
+            .is_some_and(|byte| *byte & 0b1100_0000 == 0b1000_0000)
+        {
+            suffix_start = suffix_start.saturating_add(1);
+        }
+
+        let prefix = String::from_utf8(self.prefix).unwrap_or_default();
+        let suffix_bytes = self.suffix.into_iter().collect::<Vec<_>>();
+        let suffix = std::str::from_utf8(&suffix_bytes[suffix_start..]).unwrap_or_default();
+        let kept_chars = prefix
+            .chars()
+            .count()
+            .saturating_add(suffix.chars().count());
+        let removed_chars = self.total_chars.saturating_sub(kept_chars);
+        let removed_chars = u64::try_from(removed_chars).unwrap_or(u64::MAX);
+        let marker = format!("…{removed_chars} chars truncated…");
+
+        let mut preview = String::with_capacity(prefix.len() + marker.len() + suffix.len());
+        preview.push_str(&prefix);
+        preview.push_str(&marker);
+        preview.push_str(suffix);
+        preview
+    }
+}
+
+impl std::io::Write for CappedMcpEventResultWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.total_bytes = self.total_bytes.saturating_add(buffer.len());
+        self.total_chars = self.total_chars.saturating_add(
+            buffer
+                .iter()
+                .filter(|byte| **byte & 0b1100_0000 != 0b1000_0000)
+                .count(),
+        );
+
+        let prefix_remaining = self.prefix_limit().saturating_sub(self.prefix.len());
+        if prefix_remaining > 0 {
+            self.prefix
+                .extend_from_slice(&buffer[..buffer.len().min(prefix_remaining)]);
+        }
+
+        let suffix_limit = self.suffix_limit();
+        if suffix_limit > 0 {
+            if buffer.len() >= suffix_limit {
+                self.suffix.clear();
+                self.suffix
+                    .extend(buffer[buffer.len() - suffix_limit..].iter().copied());
+            } else {
+                let excess = self
+                    .suffix
+                    .len()
+                    .saturating_add(buffer.len())
+                    .saturating_sub(suffix_limit);
+                drop(self.suffix.drain(..excess));
+                self.suffix.extend(buffer.iter().copied());
+            }
+        }
+
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -952,25 +1160,18 @@ async fn notify_mcp_tool_call_completed(
     sess.emit_turn_item_completed(turn_context, item).await;
 }
 
-struct McpAppUsageMetadata {
-    connector_id: Option<String>,
-    app_name: Option<String>,
-}
-
 async fn maybe_track_codex_app_used(
     sess: &Session,
     turn_context: &TurnContext,
-    manager: &McpConnectionManager,
     server: &str,
-    tool_name: &str,
+    connector_id: Option<&str>,
+    app_name: Option<&str>,
 ) {
     if server != CODEX_APPS_MCP_SERVER_NAME {
         return;
     }
-    let metadata = lookup_mcp_app_usage_metadata(manager, server, tool_name).await;
-    let (connector_id, app_name) = metadata
-        .map(|metadata| (metadata.connector_id, metadata.app_name))
-        .unwrap_or((None, None));
+    let connector_id = connector_id.map(str::to_string);
+    let app_name = app_name.map(str::to_string);
     let invocation_type = if let Some(connector_id) = connector_id.as_deref() {
         let mentioned_connector_ids = sess.get_connector_selection().await;
         if mentioned_connector_ids.contains(connector_id) {
@@ -1480,13 +1681,20 @@ pub(crate) async fn lookup_mcp_tool_metadata(
     server: &str,
     tool_name: &str,
 ) -> Option<McpToolApprovalMetadata> {
+    let tool_info = manager.tool_info(server, tool_name).await?;
+    Some(mcp_tool_metadata_from_tool_info(sess, turn_context, manager, &tool_info).await)
+}
+
+async fn mcp_tool_metadata_from_tool_info(
+    sess: &Session,
+    turn_context: &TurnContext,
+    manager: &McpConnectionManager,
+    tool_info: &ToolInfo,
+) -> McpToolApprovalMetadata {
+    let server = tool_info.server_name.as_str();
     let plugin_id = manager
         .plugin_id_for_mcp_server_name(server)
         .map(str::to_string);
-    let tools = manager.list_all_tools().await;
-    let tool_info = tools
-        .into_iter()
-        .find(|tool_info| tool_info.server_name == server && tool_info.tool.name == tool_name)?;
     let connector_description = if server == CODEX_APPS_MCP_SERVER_NAME {
         let connectors = match connectors::list_cached_accessible_connectors_from_mcp_tools(
             turn_context.config.as_ref(),
@@ -1536,9 +1744,9 @@ pub(crate) async fn lookup_mcp_tool_metadata(
         None
     };
 
-    Some(McpToolApprovalMetadata {
-        annotations: tool_info.tool.annotations,
-        connector_id: tool_info.connector_id,
+    McpToolApprovalMetadata {
+        annotations: tool_info.tool.annotations.clone(),
+        connector_id: tool_info.connector_id.clone(),
         link_id: tool_info
             .tool
             .meta
@@ -1546,12 +1754,16 @@ pub(crate) async fn lookup_mcp_tool_metadata(
             .and_then(|meta| meta.get(MCP_TOOL_LINK_ID_META_KEY))
             .and_then(serde_json::Value::as_str)
             .map(str::to_string),
-        connector_name: tool_info.connector_name,
+        connector_name: tool_info.connector_name.clone(),
         connector_description,
         connected_account_email,
         plugin_id,
-        tool_title: tool_info.tool.title,
-        tool_description: tool_info.tool.description.map(std::borrow::Cow::into_owned),
+        tool_title: tool_info.tool.title.clone(),
+        tool_description: tool_info
+            .tool
+            .description
+            .clone()
+            .map(std::borrow::Cow::into_owned),
         mcp_app_resource_uri: get_mcp_app_resource_uri(tool_info.tool.meta.as_deref()),
         template_id: codex_apps_meta
             .as_ref()
@@ -1564,7 +1776,7 @@ pub(crate) async fn lookup_mcp_tool_metadata(
             server,
             tool_info.tool.meta.as_deref(),
         ),
-    })
+    }
 }
 
 fn openai_file_input_params_for_server(
@@ -1593,25 +1805,6 @@ fn get_mcp_app_resource_uri(
                     .and_then(serde_json::Value::as_str)
             })
             .map(str::to_string)
-    })
-}
-
-async fn lookup_mcp_app_usage_metadata(
-    manager: &McpConnectionManager,
-    server: &str,
-    tool_name: &str,
-) -> Option<McpAppUsageMetadata> {
-    let tools = manager.list_all_tools().await;
-
-    tools.into_iter().find_map(|tool_info| {
-        if tool_info.server_name == server && tool_info.tool.name == tool_name {
-            Some(McpAppUsageMetadata {
-                connector_id: tool_info.connector_id,
-                app_name: tool_info.connector_name,
-            })
-        } else {
-            None
-        }
     })
 }
 

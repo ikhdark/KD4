@@ -11,6 +11,7 @@ use codex_agent_task_store::AgentStatusClaim;
 use codex_agent_task_store::AgentTask;
 use codex_agent_task_store::Assignment;
 use codex_agent_task_store::AttemptState;
+use codex_agent_task_store::CONCURRENT_DRIFT_REASON;
 use codex_agent_task_store::CapabilityProfile;
 use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::GateKind;
@@ -22,7 +23,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 const MAX_METRIC_ROWS: usize = 256;
-const MAX_RECORDED_EVENTS: usize = 4_096;
+pub(super) const MAX_RECORDED_EVENTS: usize = 4_096;
 
 const TASK_DURATION_METRIC: &str = "codex.multi_agent.task.duration_ms";
 const TASK_CRITICAL_PATH_IDLE_DURATION_METRIC: &str =
@@ -774,6 +775,7 @@ fn terminal_input(task: &AgentTask) -> TaskMetricTerminalInput {
     let first_pass_validation_succeeded = task.current_attempt.ordinal == 0
         && receipt.is_some_and(|receipt| {
             receipt.status == AgentStatusClaim::Completed
+                && !receipt.validation_call_ids.is_empty()
                 && receipt.validation_call_ids.iter().all(|call_id| {
                     task.validation_calls.iter().any(|call| {
                         call.call_id == *call_id && call.status == ValidationCallStatus::Succeeded
@@ -807,13 +809,18 @@ fn terminal_input(task: &AgentTask) -> TaskMetricTerminalInput {
             })
             .count(),
     );
-    let drift = u32::from(
-        task.assignment
-            .risk_hints
-            .iter()
-            .chain(task.gates.iter().map(|gate| &gate.reason))
-            .any(|value| value.to_ascii_lowercase().contains("drift")),
-    );
+    let drift = u32::from(task.gates.iter().any(|gate| {
+        if gate.kind != GateKind::Risk || gate.status != GateStatus::Passed {
+            return false;
+        }
+        let reasons = gate
+            .reason
+            .strip_prefix("cold review required: ")
+            .unwrap_or(&gate.reason);
+        reasons
+            .split("; ")
+            .any(|reason| reason == CONCURRENT_DRIFT_REASON)
+    }));
     let waivers = saturating_u32(
         task.gates
             .iter()

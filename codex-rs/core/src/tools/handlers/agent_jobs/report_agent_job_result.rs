@@ -66,13 +66,31 @@ pub async fn handle(
         ));
     }
     let db = required_state_db(&session)?;
+    let job = db
+        .get_agent_job(args.job_id.as_str())
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to load agent job {} before recording result: {error}",
+                args.job_id
+            ))
+        })?;
+    if let Some(job) = job
+        && job.status == codex_state::AgentJobStatus::Running
+        && let Some(schema) = job.output_schema_json.as_ref()
+    {
+        validate_agent_job_result(schema, &args.result)?;
+    }
     let reporting_thread_id = session.thread_id.to_string();
+    let stop = args.stop.unwrap_or(false);
     let accepted = db
-        .report_agent_job_item_result(
+        .report_agent_job_item_result_and_maybe_cancel(
             args.job_id.as_str(),
             args.item_id.as_str(),
             reporting_thread_id.as_str(),
             &args.result,
+            stop,
+            "cancelled by worker request",
         )
         .await
         .map_err(|err| {
@@ -82,12 +100,6 @@ pub async fn handle(
                 "failed to record agent job result for {job_id} / {item_id}: {err}"
             ))
         })?;
-    if accepted && args.stop.unwrap_or(false) {
-        let message = "cancelled by worker request";
-        let _ = db
-            .mark_agent_job_cancelled(args.job_id.as_str(), message)
-            .await;
-    }
     let content =
         serde_json::to_string(&ReportAgentJobResultToolResult { accepted }).map_err(|err| {
             FunctionCallError::Fatal(format!(

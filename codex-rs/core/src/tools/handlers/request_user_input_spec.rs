@@ -68,7 +68,7 @@ pub fn create_request_user_input_tool(description: String) -> ToolSpec {
         Some("Questions to show the user. Prefer 1 and do not exceed 3".to_string()),
     );
 
-    let auto_resolution_ms_schema = JsonSchema::number(Some(format!(
+    let auto_resolution_ms_schema = JsonSchema::integer(Some(format!(
         "Optional auto-resolution window in milliseconds, from {MIN_AUTO_RESOLUTION_MS} to {MAX_AUTO_RESOLUTION_MS}. Include this only when the question is useful but non-blocking and continuing with best judgment is acceptable if the user does not answer; omit it when explicit user input is required before continuing. Use {MIN_AUTO_RESOLUTION_MS} for lightly helpful context and up to {MAX_AUTO_RESOLUTION_MS} when the answer would materially unblock better work."
     )));
 

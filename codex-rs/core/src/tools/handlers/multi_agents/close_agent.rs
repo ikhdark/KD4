@@ -77,7 +77,7 @@ async fn handle_close_agent(
                     TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
                         id: call_id.clone(),
                         tool: CollabAgentTool::CloseAgent,
-                        status: collab_tool_call_status(&status, Some(agent_id)),
+                        status: CollabAgentToolCallStatus::Failed,
                         sender_thread_id: session.thread_id(),
                         receiver_thread_ids: vec![agent_id],
                         receiver_agents: vec![CollabAgentRef {
@@ -99,13 +99,18 @@ async fn handle_close_agent(
         .await
         .map_err(|err| collab_agent_error(agent_id, err))
         .map(|_| ());
+    let completed_status = if result.is_ok() {
+        CollabAgentToolCallStatus::Completed
+    } else {
+        CollabAgentToolCallStatus::Failed
+    };
     session
         .emit_turn_item_completed(
             &turn,
             TurnItem::CollabAgentToolCall(CollabAgentToolCallItem {
                 id: call_id,
                 tool: CollabAgentTool::CloseAgent,
-                status: collab_tool_call_status(&status, Some(agent_id)),
+                status: completed_status,
                 sender_thread_id: session.thread_id,
                 receiver_thread_ids: vec![agent_id],
                 receiver_agents: vec![CollabAgentRef {

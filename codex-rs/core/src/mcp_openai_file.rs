@@ -3,8 +3,8 @@
 //! Strategy:
 //! - Inspect `_meta["openai/fileParams"]` to discover which tool arguments are
 //!   file inputs.
-//! - At tool execution time, read those files from the primary environment,
-//!   upload them to OpenAI file storage,
+//! - At tool execution time, read those files from the current sampling step's
+//!   primary environment and upload them to OpenAI file storage,
 //!   and rewrite only the declared arguments into the provided-file payload
 //!   shape expected by the downstream Apps tool.
 //!
@@ -12,6 +12,8 @@
 //! module only handles uploading the files and rewriting the execution-time arguments.
 
 use crate::session::session::Session;
+use crate::session::step_context::StepContext;
+#[cfg(test)]
 use crate::session::turn_context::TurnContext;
 use codex_api::OPENAI_FILE_UPLOAD_LIMIT_BYTES;
 use codex_api::upload_openai_file;
@@ -21,7 +23,7 @@ use serde_json::Value as JsonValue;
 
 pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
     sess: &Session,
-    turn_context: &TurnContext,
+    step_context: &StepContext,
     arguments_value: Option<JsonValue>,
     openai_file_input_params: Option<&[String]>,
 ) -> Result<Option<JsonValue>, String> {
@@ -43,7 +45,7 @@ pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
             continue;
         };
         let Some(uploaded_value) =
-            rewrite_argument_value_for_openai_files(turn_context, auth.as_ref(), field_name, value)
+            rewrite_argument_value_for_openai_files(step_context, auth.as_ref(), field_name, value)
                 .await?
         else {
             continue;
@@ -59,7 +61,7 @@ pub(crate) async fn rewrite_mcp_tool_arguments_for_openai_files(
 }
 
 async fn rewrite_argument_value_for_openai_files(
-    turn_context: &TurnContext,
+    step_context: &StepContext,
     auth: Option<&CodexAuth>,
     field_name: &str,
     value: &JsonValue,
@@ -67,7 +69,7 @@ async fn rewrite_argument_value_for_openai_files(
     match value {
         JsonValue::String(file_path) => {
             let rewritten = build_uploaded_argument_value(
-                turn_context,
+                step_context,
                 auth,
                 field_name,
                 /*index*/ None,
@@ -77,13 +79,17 @@ async fn rewrite_argument_value_for_openai_files(
             Ok(Some(rewritten))
         }
         JsonValue::Array(values) => {
-            let mut rewritten_values = Vec::with_capacity(values.len());
-            for (index, item) in values.iter().enumerate() {
-                let Some(file_path) = item.as_str() else {
-                    return Ok(None);
-                };
+            let Some(file_paths) = values
+                .iter()
+                .map(JsonValue::as_str)
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(None);
+            };
+            let mut rewritten_values = Vec::with_capacity(file_paths.len());
+            for (index, file_path) in file_paths.into_iter().enumerate() {
                 let rewritten = build_uploaded_argument_value(
-                    turn_context,
+                    step_context,
                     auth,
                     field_name,
                     Some(index),
@@ -99,7 +105,7 @@ async fn rewrite_argument_value_for_openai_files(
 }
 
 async fn build_uploaded_argument_value(
-    turn_context: &TurnContext,
+    step_context: &StepContext,
     auth: Option<&CodexAuth>,
     field_name: &str,
     index: Option<usize>,
@@ -117,9 +123,9 @@ async fn build_uploaded_argument_value(
     if !auth.uses_codex_backend() {
         return Err("ChatGPT auth is required to upload files for Codex Apps tools".to_string());
     }
-    let Some(turn_environment) = turn_context.environments.primary() else {
+    let Some(turn_environment) = step_context.environments.primary() else {
         return Err(contextualize_error(
-            "no primary turn environment is available".to_string(),
+            "no primary sampling-step environment is available".to_string(),
         ));
     };
     // TODO(anp): Resolve app tool file arguments using the selected environment's native path
@@ -159,6 +165,7 @@ async fn build_uploaded_argument_value(
         .unwrap_or("file")
         .to_string();
     let upload_auth = codex_model_provider::auth_provider_from_auth(auth);
+    let turn_context = step_context.turn.as_ref();
     let http_client_factory = turn_context.config.http_client_factory();
     let uploaded = upload_openai_file(
         turn_context.config.chatgpt_base_url.trim_end_matches('/'),
@@ -212,10 +219,11 @@ mod tests {
         let arguments = Some(serde_json::json!({
             "file": "/tmp/codex-smoke-file.txt"
         }));
+        let step_context = StepContext::for_test(Arc::new(turn_context));
 
         let rewritten = rewrite_mcp_tool_arguments_for_openai_files(
             &session,
-            &Arc::new(turn_context),
+            &step_context,
             arguments.clone(),
             /*openai_file_input_params*/ None,
         )
@@ -282,9 +290,10 @@ mod tests {
         let mut config = (*turn_context.config).clone();
         config.chatgpt_base_url = format!("{}/backend-api", server.uri());
         turn_context.config = Arc::new(config);
+        let step_context = StepContext::for_test(Arc::new(turn_context));
 
         let rewritten = build_uploaded_argument_value(
-            &turn_context,
+            &step_context,
             Some(&auth),
             "file",
             /*index*/ None,
@@ -314,9 +323,10 @@ mod tests {
         file.set_len(OPENAI_FILE_UPLOAD_LIMIT_BYTES + 1)
             .expect("size sparse file");
         set_primary_environment_cwd(&mut turn_context, dir.path());
+        let step_context = StepContext::for_test(Arc::new(turn_context));
 
         let error = build_uploaded_argument_value(
-            &turn_context,
+            &step_context,
             Some(&auth),
             "file",
             /*index*/ None,
@@ -386,8 +396,9 @@ mod tests {
         let mut config = (*turn_context.config).clone();
         config.chatgpt_base_url = format!("{}/backend-api", server.uri());
         turn_context.config = Arc::new(config);
+        let step_context = StepContext::for_test(Arc::new(turn_context));
         let rewritten = rewrite_argument_value_for_openai_files(
-            &turn_context,
+            &step_context,
             Some(&auth),
             "file",
             &serde_json::json!("file_report.csv"),
@@ -498,8 +509,9 @@ mod tests {
         let mut config = (*turn_context.config).clone();
         config.chatgpt_base_url = format!("{}/backend-api", server.uri());
         turn_context.config = Arc::new(config);
+        let step_context = StepContext::for_test(Arc::new(turn_context));
         let rewritten = rewrite_argument_value_for_openai_files(
-            &turn_context,
+            &step_context,
             Some(&auth),
             "files",
             &serde_json::json!(["one.csv", "two.csv"]),
@@ -532,9 +544,10 @@ mod tests {
         session.services.auth_manager = crate::test_support::auth_manager_from_auth(
             CodexAuth::create_dummy_chatgpt_auth_for_testing(),
         );
+        let step_context = StepContext::for_test(Arc::new(turn_context));
         let error = rewrite_mcp_tool_arguments_for_openai_files(
             &session,
-            &turn_context,
+            &step_context,
             Some(serde_json::json!({
                 "file": "/definitely/missing/file.csv",
             })),

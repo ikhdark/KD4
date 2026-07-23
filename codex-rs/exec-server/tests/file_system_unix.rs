@@ -273,7 +273,7 @@ async fn file_system_get_metadata_reports_symlink_targets(
 #[test_case(FileSystemImplementation::Local ; "local")]
 #[test_case(FileSystemImplementation::Remote ; "remote")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn file_system_walk_handles_directory_symlinks(
+async fn file_system_walk_handles_file_and_directory_symlinks(
     implementation: FileSystemImplementation,
 ) -> Result<()> {
     let context = create_file_system_context(implementation).await?;
@@ -283,11 +283,13 @@ async fn file_system_walk_handles_directory_symlinks(
     let root = tmp.path().join("root");
     let target = tmp.path().join("target");
     let target_file = target.join("note.txt");
+    let target_file_link = root.join("note-link.txt");
     let target_link = root.join("target-link");
     let root_link = target.join("root-link");
     std::fs::create_dir_all(&root)?;
     std::fs::create_dir_all(&target)?;
     std::fs::write(&target_file, "target")?;
+    symlink(&target_file, &target_file_link)?;
     symlink(&target, &target_link)?;
     symlink(&root, &root_link)?;
 
@@ -308,7 +310,10 @@ async fn file_system_walk_handles_directory_symlinks(
     assert_eq!(
         outcome,
         WalkOutcome {
-            entries: Vec::new(),
+            entries: vec![WalkEntry {
+                path: PathUri::from_host_native_path(&target_file_link)?,
+                kind: WalkEntryKind::File,
+            }],
             errors: Vec::new(),
             truncated: false,
         }
@@ -332,6 +337,10 @@ async fn file_system_walk_handles_directory_symlinks(
         outcome,
         WalkOutcome {
             entries: vec![
+                WalkEntry {
+                    path: PathUri::from_host_native_path(&target_file_link)?,
+                    kind: WalkEntryKind::File,
+                },
                 WalkEntry {
                     path: PathUri::from_host_native_path(&target_link)?,
                     kind: WalkEntryKind::Directory,

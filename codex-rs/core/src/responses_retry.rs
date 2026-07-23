@@ -14,6 +14,7 @@ use tracing::warn;
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ResponsesStreamRequest {
     Sampling,
+    LocalCompaction,
     RemoteCompactionV2,
 }
 
@@ -92,6 +93,15 @@ fn log_retry(
         ResponsesStreamRequest::Sampling => {
             warn!(
                 "stream disconnected - retrying sampling request ({retries}/{max_retries} in {delay:?})...",
+            );
+        }
+        ResponsesStreamRequest::LocalCompaction => {
+            warn!(
+                turn_id = %turn_context.sub_id,
+                retries,
+                max_retries,
+                compact_error = %err,
+                "local compaction stream failed; retrying request after delay"
             );
         }
         ResponsesStreamRequest::RemoteCompactionV2 => {

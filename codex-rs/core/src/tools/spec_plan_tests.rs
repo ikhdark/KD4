@@ -9,6 +9,7 @@ use codex_mcp::ToolInfo;
 use codex_model_provider::create_model_provider;
 use codex_model_provider_info::AMAZON_BEDROCK_PROVIDER_ID;
 use codex_model_provider_info::ModelProviderInfo;
+use codex_protocol::config_types::ModeKind;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::openai_models::ApplyPatchToolType;
@@ -200,6 +201,20 @@ async fn probe_with(
 
 async fn probe(configure_turn: impl FnOnce(&mut TurnContext)) -> ToolPlanProbe {
     probe_with(configure_turn, ToolPlanInputs::default()).await
+}
+
+#[tokio::test]
+async fn update_plan_is_not_exposed_or_registered_in_plan_mode() {
+    let default_mode = probe(|_| {}).await;
+    default_mode.assert_visible_contains(&["update_plan"]);
+    default_mode.assert_registered_contains(&["update_plan"]);
+
+    let plan_mode = probe(|turn| {
+        turn.collaboration_mode.mode = ModeKind::Plan;
+    })
+    .await;
+    plan_mode.assert_visible_lacks(&["update_plan"]);
+    plan_mode.assert_registered_lacks(&["update_plan"]);
 }
 
 fn set_feature(turn: &mut TurnContext, feature: Feature, enabled: bool) {
@@ -723,6 +738,53 @@ async fn environment_count_controls_environment_backed_tools() {
         multiple_environments.visible_spec("view_image"),
         "environment_id"
     ));
+}
+
+#[tokio::test]
+async fn view_image_registration_requires_image_input_support() {
+    let image_capable = probe(|turn| {
+        turn.model_info.input_modalities = vec![InputModality::Text, InputModality::Image];
+    })
+    .await;
+    image_capable.assert_visible_contains(&["view_image"]);
+    image_capable.assert_registered_contains(&["view_image"]);
+
+    let review_image_capable = probe(|turn| {
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::Review);
+        turn.model_info.input_modalities = vec![InputModality::Text, InputModality::Image];
+    })
+    .await;
+    review_image_capable.assert_visible_lacks(&["view_image"]);
+    review_image_capable.assert_registered_lacks(&["view_image"]);
+
+    let text_only = probe(|turn| {
+        turn.model_info.input_modalities = vec![InputModality::Text];
+    })
+    .await;
+    text_only.assert_visible_lacks(&["view_image"]);
+    text_only.assert_registered_lacks(&["view_image"]);
+
+    let guardian_image_capable = probe(|turn| {
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::Other(
+            crate::guardian::GUARDIAN_REVIEWER_NAME.to_string(),
+        ));
+        turn.model_info.input_modalities = vec![InputModality::Text, InputModality::Image];
+    })
+    .await;
+    guardian_image_capable.assert_visible_contains(&["view_image"]);
+    guardian_image_capable.assert_registered_contains(&["view_image"]);
+
+    let guardian_text_only = probe(|turn| {
+        turn.session_source = SessionSource::SubAgent(SubAgentSource::Other(
+            crate::guardian::GUARDIAN_REVIEWER_NAME.to_string(),
+        ));
+        turn.model_info.input_modalities = vec![InputModality::Text];
+    })
+    .await;
+    guardian_text_only.assert_visible_contains(&["exec_command", "write_stdin"]);
+    guardian_text_only.assert_registered_contains(&["exec_command", "write_stdin"]);
+    guardian_text_only.assert_visible_lacks(&["view_image"]);
+    guardian_text_only.assert_registered_lacks(&["view_image"]);
 }
 
 #[tokio::test]

@@ -1,4 +1,6 @@
 pub use connection_manager::McpConnectionManager;
+pub use connection_manager::McpServerCollection;
+pub use connection_manager::McpServerCollectionError;
 pub use connection_manager::tool_is_model_visible;
 pub use elicitation::ElicitationLifecycle;
 pub use elicitation::ElicitationRequestRouter;

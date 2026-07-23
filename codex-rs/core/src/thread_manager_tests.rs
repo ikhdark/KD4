@@ -1543,6 +1543,59 @@ fn completed_legacy_event_history_is_not_mid_turn() {
 }
 
 #[test]
+fn user_only_legacy_event_history_is_mid_turn_and_forked_safely() {
+    let user_item = RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
+        client_id: None,
+        message: "hello".to_string(),
+        images: None,
+        text_elements: Vec::new(),
+        local_images: Vec::new(),
+        ..Default::default()
+    }));
+    let legacy_history = InitialHistory::Forked(vec![user_item.clone()]);
+
+    assert_eq!(
+        snapshot_turn_state(&legacy_history),
+        SnapshotTurnState {
+            ends_mid_turn: true,
+            active_turn_id: None,
+            active_turn_start_index: Some(0),
+        },
+    );
+
+    let interrupted = fork_history_from_snapshot(
+        ForkSnapshot::Interrupted,
+        legacy_history.clone(),
+        InterruptedTurnHistoryMarker::ContextualUser,
+    );
+    assert_eq!(
+        serde_json::to_value(interrupted.get_rollout_items())
+            .expect("serialize interrupted legacy fork history"),
+        serde_json::to_value(vec![
+            user_item,
+            RolloutItem::ResponseItem(contextual_user_interrupted_marker()),
+            RolloutItem::EventMsg(EventMsg::TurnAborted(TurnAbortedEvent {
+                turn_id: None,
+                reason: TurnAbortReason::Interrupted,
+                completed_at: None,
+                duration_ms: None,
+                timing: None,
+            })),
+        ])
+        .expect("serialize expected interrupted legacy fork history"),
+    );
+
+    assert!(matches!(
+        fork_history_from_snapshot(
+            ForkSnapshot::TruncateBeforeNthUserMessage(usize::MAX),
+            legacy_history,
+            InterruptedTurnHistoryMarker::ContextualUser,
+        ),
+        InitialHistory::New
+    ));
+}
+
+#[test]
 fn mixed_response_and_legacy_user_event_history_is_mid_turn() {
     let mixed_history = InitialHistory::Forked(vec![
         RolloutItem::ResponseItem(user_msg("hello")),
@@ -1561,7 +1614,7 @@ fn mixed_response_and_legacy_user_event_history_is_mid_turn() {
         SnapshotTurnState {
             ends_mid_turn: true,
             active_turn_id: None,
-            active_turn_start_index: None,
+            active_turn_start_index: Some(1),
         },
     );
 }

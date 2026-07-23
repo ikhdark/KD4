@@ -8,8 +8,10 @@ use crate::compact::build_compaction_initial_context;
 use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
 use crate::compact_model_fallback::record_model_fallback;
+use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::context::world_state::WorldState;
 use crate::context_manager::ContextManager;
+use crate::context_manager::estimate_item_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
@@ -34,6 +36,7 @@ use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::TurnStartedEvent;
 use codex_rollout_trace::CompactionCheckpointTracePayload;
+use codex_utils_output_truncation::approx_token_count;
 
 #[path = "compact_remote_request.rs"]
 mod request;
@@ -218,7 +221,7 @@ async fn run_remote_compact_task_inner_impl(
             let Some(fallback_step_context) = fallback_step_context else {
                 return Err(error);
             };
-            if !matches!(&error, CodexErr::InvalidRequest(_)) {
+            if !should_retry_with_current_model(&error) {
                 return Err(error);
             }
             let fallback_turn_context = &fallback_step_context.turn;
@@ -283,10 +286,12 @@ async fn run_remote_compact_task_inner_impl(
     // Install is the semantic boundary where the compact endpoint's output becomes live
     // thread history. Keep it distinct from the later inference request so the reducer can
     // still represent repeated developer/context prefix items exactly as the model saw them.
-    compaction_trace.record_installed(&CompactionCheckpointTracePayload {
-        input_history: &trace_input_history,
-        replacement_history: &new_history,
-    });
+    if let Some(trace_input_history) = trace_input_history {
+        compaction_trace.record_installed(&CompactionCheckpointTracePayload {
+            input_history: &trace_input_history,
+            replacement_history: &new_history,
+        });
+    }
     sess.replace_compacted_history(
         compaction_turn_context.as_ref(),
         new_history,
@@ -374,17 +379,22 @@ pub(crate) fn trim_function_call_history_to_fit_context_window(
     let Some(context_window) = turn_context.model_context_window() else {
         return (0, 0);
     };
-    let mut rewritten_outputs = 0usize;
-    let mut estimated_deleted_tokens = 0i64;
-    let item_count = history.raw_items().len();
+    let item_token_counts = history
+        .raw_items()
+        .iter()
+        .map(estimate_item_token_count)
+        .collect::<Vec<_>>();
+    let mut estimated_tokens =
+        i128::try_from(approx_token_count(&base_instructions.text)).unwrap_or(i128::MAX);
+    for item_tokens in &item_token_counts {
+        estimated_tokens = estimated_tokens.saturating_add(i128::from(*item_tokens));
+    }
+    let estimated_tokens_before = estimated_tokens;
+    let context_window = i128::from(context_window);
+    let mut replacements = Vec::new();
 
-    for index in (0..item_count).rev() {
-        let Some(estimated_tokens_before) =
-            history.estimate_token_count_with_base_instructions(base_instructions)
-        else {
-            break;
-        };
-        if estimated_tokens_before <= context_window {
+    for index in (0..history.raw_items().len()).rev() {
+        if estimated_tokens <= context_window {
             break;
         }
         let Some(rewritten_item) = history
@@ -394,17 +404,30 @@ pub(crate) fn trim_function_call_history_to_fit_context_window(
         else {
             break;
         };
-        let mut items = history.raw_items().to_vec();
-        items[index] = rewritten_item;
-        history.replace(items);
-        let estimated_tokens_after = history
-            .estimate_token_count_with_base_instructions(base_instructions)
-            .unwrap_or_default();
-        rewritten_outputs += 1;
-        estimated_deleted_tokens = estimated_deleted_tokens
-            .saturating_add(estimated_tokens_before.saturating_sub(estimated_tokens_after));
+        let rewritten_tokens = estimate_item_token_count(&rewritten_item);
+        estimated_tokens = estimated_tokens
+            .saturating_sub(i128::from(item_token_counts[index]))
+            .saturating_add(i128::from(rewritten_tokens));
+        replacements.push((index, rewritten_item));
     }
 
+    let rewritten_outputs = replacements.len();
+    if rewritten_outputs > 0 {
+        let mut items = history.raw_items().to_vec();
+        for (index, rewritten_item) in replacements {
+            items[index] = rewritten_item;
+        }
+        history.replace(items);
+    }
+
+    let estimated_deleted_tokens = estimated_tokens_before.saturating_sub(estimated_tokens);
+    let estimated_deleted_tokens = i64::try_from(estimated_deleted_tokens).unwrap_or_else(|_| {
+        if estimated_deleted_tokens.is_negative() {
+            i64::MIN
+        } else {
+            i64::MAX
+        }
+    });
     (rewritten_outputs, estimated_deleted_tokens)
 }
 
@@ -458,3 +481,7 @@ fn truncated_output_payload(output: &FunctionCallOutputPayload) -> FunctionCallO
         success: output.success,
     }
 }
+
+#[cfg(test)]
+#[path = "compact_remote_tests.rs"]
+mod tests;

@@ -5,6 +5,8 @@ use codex_config::config_toml::AgentRoleToml;
 use codex_config::config_toml::AgentsToml;
 use codex_config::config_toml::ConfigToml;
 use codex_exec_server::ExecutorFileSystem;
+use codex_exec_server::WalkEntryKind;
+use codex_exec_server::WalkOptions;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
 use codex_utils_path_uri::PathUri;
@@ -15,6 +17,10 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 use toml::Value as TomlValue;
+
+const MAX_AGENT_ROLE_SCAN_DEPTH: usize = 6;
+const MAX_AGENT_ROLE_DIRECTORIES: usize = 2_000;
+const MAX_AGENT_ROLE_ENTRIES: usize = 20_000;
 
 pub(crate) async fn load_agent_roles(
     fs: &dyn ExecutorFileSystem,
@@ -31,6 +37,8 @@ pub(crate) async fn load_agent_roles(
     }
 
     let mut roles: BTreeMap<String, AgentRoleConfig> = BTreeMap::new();
+    let mut agent_role_files_by_dir: BTreeMap<AbsolutePathBuf, Vec<AbsolutePathBuf>> =
+        BTreeMap::new();
     for layer in layers {
         let mut layer_roles: BTreeMap<String, AgentRoleConfig> = BTreeMap::new();
         let mut declared_role_files = BTreeSet::new();
@@ -72,9 +80,18 @@ pub(crate) async fn load_agent_roles(
         }
 
         if let Some(config_folder) = layer.config_folder() {
+            let agents_dir = config_folder.join("agents");
+            if !agent_role_files_by_dir.contains_key(&agents_dir) {
+                let agent_role_files = collect_agent_role_files(fs, &agents_dir).await?;
+                agent_role_files_by_dir.insert(agents_dir.clone(), agent_role_files);
+            }
+            let agent_role_files = agent_role_files_by_dir
+                .get(&agents_dir)
+                .expect("agent role file inventory should be cached");
             for (role_name, role) in discover_agent_roles_in_dir(
                 fs,
-                &config_folder.join("agents"),
+                &agents_dir,
+                agent_role_files,
                 &declared_role_files,
                 startup_warnings,
             )
@@ -474,12 +491,13 @@ fn normalize_agent_role_nickname_candidates(
 async fn discover_agent_roles_in_dir(
     fs: &dyn ExecutorFileSystem,
     agents_dir: &AbsolutePathBuf,
+    agent_role_files: &[AbsolutePathBuf],
     declared_role_files: &BTreeSet<PathBuf>,
     startup_warnings: &mut Vec<String>,
 ) -> std::io::Result<BTreeMap<String, AgentRoleConfig>> {
     let mut roles = BTreeMap::new();
 
-    for agent_file in collect_agent_role_files(fs, agents_dir).await? {
+    for agent_file in agent_role_files {
         if declared_role_files.contains(agent_file.as_path()) {
             continue;
         }
@@ -522,33 +540,58 @@ async fn collect_agent_role_files(
     fs: &dyn ExecutorFileSystem,
     dir: &AbsolutePathBuf,
 ) -> std::io::Result<Vec<AbsolutePathBuf>> {
-    let mut files = Vec::new();
-    let mut dirs = vec![dir.clone()];
-    while let Some(dir) = dirs.pop() {
-        let dir_uri = PathUri::from_abs_path(&dir);
-        let entries = match fs.read_directory(&dir_uri, /*sandbox*/ None).await {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == ErrorKind::NotFound => continue,
-            Err(err) => return Err(err),
-        };
-
-        for entry in entries {
-            let path = dir.join(entry.file_name);
-            if entry.is_directory {
-                dirs.push(path);
-                continue;
-            }
-            if entry.is_file
-                && path
-                    .as_path()
-                    .extension()
-                    .is_some_and(|extension| extension == "toml")
-            {
-                files.push(path);
-            }
-        }
+    let root = PathUri::from_abs_path(dir);
+    let walk = match fs
+        .walk(
+            &root,
+            WalkOptions {
+                max_depth: MAX_AGENT_ROLE_SCAN_DEPTH,
+                max_directories: MAX_AGENT_ROLE_DIRECTORIES,
+                max_entries: MAX_AGENT_ROLE_ENTRIES,
+                follow_directory_symlinks: true,
+                prune_hidden_directories: false,
+            },
+            /*sandbox*/ None,
+        )
+        .await
+    {
+        Ok(walk) => walk,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    if walk.truncated {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            format!(
+                "agent role discovery reached its traversal limit under {}",
+                dir.as_path().display()
+            ),
+        ));
+    }
+    if !walk.errors.is_empty() {
+        let details = walk
+            .errors
+            .iter()
+            .map(|error| format!("{}: {}", error.path, error.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(std::io::Error::other(format!(
+            "agent role discovery was incomplete under {}: {details}",
+            dir.as_path().display()
+        )));
     }
 
+    let mut files = walk
+        .entries
+        .into_iter()
+        .filter(|entry| entry.kind == WalkEntryKind::File)
+        .map(|entry| entry.path.to_abs_path())
+        .collect::<std::io::Result<Vec<_>>>()?;
+    files.retain(|path| {
+        path.as_path()
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+    });
     files.sort();
     Ok(files)
 }

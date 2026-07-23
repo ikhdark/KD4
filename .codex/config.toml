@@ -14,7 +14,7 @@ description = "Implements one bounded, owner-isolated KD4 item or lane."
 config_file = "./agents/kd4_worker.toml"
 
 [agents.kd4_verifier]
-description = "Reviews and validates KD4 changes with focused KDS evidence."
+description = "Reviews and validates KD4 changes with focused evidence."
 config_file = "./agents/kd4_verifier.toml"
 
 [agents.kd4_integrator]

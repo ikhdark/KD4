@@ -565,12 +565,20 @@ impl ServerHandler for TestToolServer {
                     .ok_or_else(|| {
                         McpError::invalid_params("missing threadId metadata".to_string(), None)
                     })?;
-                Ok(CallToolResult::success(vec![
-                    rmcp::model::Content::text(format!(
-                        "manual history hint for thread {thread_id}"
-                    )),
-                    rmcp::model::Content::text("unstructured notes/thread_hint fixture result"),
-                ]))
+                let content = match std::env::var("MCP_TEST_THREAD_HINT") {
+                    Ok(thread_hint) => vec![rmcp::model::Content::text(thread_hint)],
+                    Err(_) => vec![
+                        rmcp::model::Content::text(format!(
+                            "manual history hint for thread {thread_id}"
+                        )),
+                        rmcp::model::Content::text("unstructured notes/thread_hint fixture result"),
+                    ],
+                };
+                if std::env::var_os("MCP_TEST_THREAD_HINT_IS_ERROR").is_some() {
+                    Ok(CallToolResult::error(content))
+                } else {
+                    Ok(CallToolResult::success(content))
+                }
             }
             "echo" | "echo-tool" => {
                 let args: EchoArgs = match request.arguments {

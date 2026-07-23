@@ -60,8 +60,19 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
         mut env,
     } = request;
 
-    trace!(
-        "spawn_child_async: {program:?} {args:?} {arg0:?} {cwd:?} {network_sandbox_policy:?} {stdio_policy:?} {env:?}"
+    if let Some(network) = network {
+        network.apply_to_env(&mut env);
+    }
+
+    apply_network_sandbox_policy_to_env(&mut env, network_sandbox_policy);
+    trace_spawn_child(
+        &program,
+        &args,
+        arg0,
+        &cwd,
+        network_sandbox_policy,
+        stdio_policy,
+        &env,
     );
 
     let mut cmd = Command::new(&program);
@@ -69,15 +80,8 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
     cmd.arg0(arg0.map_or_else(|| program.to_string_lossy().to_string(), String::from));
     cmd.args(args);
     cmd.current_dir(cwd);
-    if let Some(network) = network {
-        network.apply_to_env(&mut env);
-    }
     cmd.env_clear();
     cmd.envs(env);
-
-    if !network_sandbox_policy.is_enabled() {
-        cmd.env(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR, "1");
-    }
 
     // If this Codex process dies (including being killed via SIGKILL), we want
     // any child processes that were spawned as part of a `"shell"` tool call
@@ -124,3 +128,45 @@ pub(crate) async fn spawn_child_async(request: SpawnChildRequest<'_>) -> std::io
 
     cmd.kill_on_drop(true).spawn()
 }
+
+fn apply_network_sandbox_policy_to_env(
+    env: &mut HashMap<String, String>,
+    network_sandbox_policy: NetworkSandboxPolicy,
+) {
+    if cfg!(windows) {
+        env.retain(|key, _| !key.eq_ignore_ascii_case(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR));
+    } else {
+        env.remove(CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR);
+    }
+    if !network_sandbox_policy.is_enabled() {
+        env.insert(
+            CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR.to_string(),
+            "1".to_string(),
+        );
+    }
+}
+
+fn trace_spawn_child(
+    program: &PathBuf,
+    args: &[String],
+    arg0: Option<&str>,
+    cwd: &AbsolutePathBuf,
+    network_sandbox_policy: NetworkSandboxPolicy,
+    stdio_policy: StdioPolicy,
+    env: &HashMap<String, String>,
+) {
+    trace!(
+        ?program,
+        ?args,
+        ?arg0,
+        ?cwd,
+        ?network_sandbox_policy,
+        ?stdio_policy,
+        env_count = env.len(),
+        "spawn_child_async"
+    );
+}
+
+#[cfg(test)]
+#[path = "spawn_tests.rs"]
+mod tests;

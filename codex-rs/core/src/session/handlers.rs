@@ -209,15 +209,15 @@ pub(super) async fn user_input_or_turn_inner(
         unreachable!();
     };
     let emit_thread_settings_applied = thread_settings != ThreadSettingsOverrides::default();
-    let mut updates = if emit_thread_settings_applied {
+    let updates = if emit_thread_settings_applied {
         thread_settings_update(sess, thread_settings).await
     } else {
         SessionSettingsUpdate::default()
     };
-    updates.final_output_json_schema = Some(final_output_json_schema);
+    let final_output_json_schema = Some(final_output_json_schema);
 
-    let Ok(current_context) = sess.new_turn_with_sub_id(sub_id.clone(), updates).await else {
-        // new_turn_with_sub_id already emits the error event.
+    let Ok(session_configuration) = sess.apply_turn_settings(&sub_id, &updates).await else {
+        // apply_turn_settings already emits the error event.
         return;
     };
     if emit_thread_settings_applied {
@@ -227,11 +227,9 @@ pub(super) async fn user_input_or_turn_inner(
         })
         .await;
     }
-    sess.maybe_emit_model_warnings_for_turn(current_context.as_ref())
-        .await;
     match sess
         .steer_input(
-            items.clone(),
+            items,
             additional_context.clone(),
             /*expected_turn_id*/ None,
             client_user_message_id.clone(),
@@ -239,10 +237,17 @@ pub(super) async fn user_input_or_turn_inner(
         )
         .await
     {
-        Ok(_) => {
-            current_context.session_telemetry.user_prompt(&items);
-        }
+        Ok(_) => {}
         Err(SteerInputError::NoActiveTurn(items)) => {
+            let current_context = sess
+                .new_turn_from_configuration(
+                    sub_id.clone(),
+                    session_configuration,
+                    final_output_json_schema,
+                )
+                .await;
+            sess.maybe_emit_model_warnings_for_turn(current_context.as_ref())
+                .await;
             if let Some(responsesapi_client_metadata) = responsesapi_client_metadata {
                 current_context
                     .turn_metadata_state
@@ -725,9 +730,17 @@ pub(super) async fn submission_loop(
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
 ) {
+    let _execution_permit_thread_cleanup = sess
+        .services
+        .agent_control
+        .execution_permit_thread_cleanup(sess.thread_id);
     // To break out of this loop, send Op::Shutdown.
     let mut shutdown_received = false;
     while let Ok(sub) = rx_sub.recv().await {
+        let _execution_permit_cleanup = sess
+            .services
+            .agent_control
+            .execution_permit_cleanup(sess.thread_id, &sub.id);
         debug!(?sub, "Submission");
         let dispatch_span = submission_dispatch_span(&sub);
         let should_exit = async {

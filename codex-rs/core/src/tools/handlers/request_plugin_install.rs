@@ -7,7 +7,10 @@ use codex_analytics::PluginInstallRequestedPlugin;
 use codex_analytics::build_track_events_context;
 use codex_config::types::ToolSuggestDisabledTool;
 use codex_core_plugins::remote::REMOTE_GLOBAL_MARKETPLACE_NAME;
+use codex_core_plugins::remote::RemoteMarketplace;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::WarningEvent;
 use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
 use codex_tools::DiscoverableTool;
@@ -222,14 +225,21 @@ impl RequestPluginInstallHandler {
             .await;
         let response = elicitation.response;
         if let Some(response) = response.as_ref() {
-            maybe_persist_disabled_install_request(&session, &turn, &tool, response).await;
+            handle_disabled_install_persistence(
+                &session,
+                &turn,
+                &turn.config.codex_home,
+                &tool,
+                response,
+            )
+            .await;
         }
         let user_confirmed = response
             .as_ref()
             .is_some_and(|response| response.action == ElicitationAction::Accept);
 
-        let auth = session.services.auth_manager.auth().await;
         let completed = if user_confirmed {
+            let auth = session.services.auth_manager.auth().await;
             verify_request_plugin_install_completed(&session, &turn, manager, &tool, auth.as_ref())
                 .await
         } else {
@@ -288,25 +298,47 @@ impl RequestPluginInstallHandler {
 impl CoreToolRuntime for RequestPluginInstallHandler {}
 
 async fn maybe_persist_disabled_install_request(
+    codex_home: &codex_utils_absolute_path::AbsolutePathBuf,
+    tool: &DiscoverableTool,
+    response: &ElicitationResponse,
+) -> anyhow::Result<bool> {
+    if !request_plugin_install_response_requests_persistent_disable(response) {
+        return Ok(false);
+    }
+
+    persist_disabled_install_request(codex_home, tool).await?;
+    Ok(true)
+}
+
+async fn handle_disabled_install_persistence(
     session: &crate::session::session::Session,
     turn: &crate::session::turn_context::TurnContext,
+    codex_home: &codex_utils_absolute_path::AbsolutePathBuf,
     tool: &DiscoverableTool,
     response: &ElicitationResponse,
 ) {
-    if !request_plugin_install_response_requests_persistent_disable(response) {
-        return;
+    match maybe_persist_disabled_install_request(codex_home, tool, response).await {
+        Ok(true) => session.reload_user_config_layer().await,
+        Ok(false) => {}
+        Err(err) => {
+            warn!(
+                error = %err,
+                tool_id = tool.id(),
+                "failed to persist disabled tool suggestion"
+            );
+            session
+                .send_event(
+                    turn,
+                    EventMsg::Warning(WarningEvent {
+                        message: format!(
+                            "Could not save the do-not-suggest-again preference for {}. This suggestion may appear again in a future turn.",
+                            tool.name()
+                        ),
+                    }),
+                )
+                .await;
+        }
     }
-
-    if let Err(err) = persist_disabled_install_request(&turn.config.codex_home, tool).await {
-        warn!(
-            error = %err,
-            tool_id = tool.id(),
-            "failed to persist disabled tool suggestion"
-        );
-        return;
-    }
-
-    session.reload_user_config_layer().await;
 }
 
 fn request_plugin_install_response_requests_persistent_disable(
@@ -367,7 +399,7 @@ async fn verify_request_plugin_install_completed(
         }),
         DiscoverableTool::Plugin(plugin) => {
             if is_remote_plugin_install_suggestion(&plugin.id) {
-                let (_, accessible_connectors) = tokio::join!(
+                let (remote_marketplaces, accessible_connectors) = tokio::join!(
                     refresh_remote_installed_plugins_cache_after_install(
                         session,
                         turn,
@@ -382,12 +414,19 @@ async fn verify_request_plugin_install_completed(
                         plugin.id.as_str(),
                     )
                 );
-                return accessible_connectors.is_some_and(|accessible_connectors| {
-                    all_requested_connectors_picked_up(
-                        &plugin.app_connector_ids,
-                        &accessible_connectors,
-                    )
-                });
+                let connectors_completed =
+                    accessible_connectors.is_some_and(|accessible_connectors| {
+                        all_requested_connectors_picked_up(
+                            &plugin.app_connector_ids,
+                            &accessible_connectors,
+                        )
+                    });
+                return verified_remote_plugin_install_completed(
+                    remote_marketplaces.as_deref(),
+                    plugin.id.as_str(),
+                    plugin.remote_plugin_id.as_deref(),
+                    connectors_completed,
+                );
             }
 
             session.reload_user_config_layer().await;
@@ -415,10 +454,10 @@ async fn refresh_remote_installed_plugins_cache_after_install(
     turn: &crate::session::turn_context::TurnContext,
     auth: Option<&codex_login::CodexAuth>,
     tool_id: &str,
-) {
+) -> Option<Vec<RemoteMarketplace>> {
     let plugins_manager = &session.services.plugins_manager;
     let plugins_config = turn.config.plugins_config_input();
-    if let Err(err) = plugins_manager
+    match plugins_manager
         .build_and_cache_remote_installed_plugin_marketplaces(
             &plugins_config,
             auth,
@@ -427,10 +466,35 @@ async fn refresh_remote_installed_plugins_cache_after_install(
         )
         .await
     {
-        warn!(
-            "failed to refresh remote installed plugins cache after plugin install request for {tool_id}: {err:#}"
-        );
+        Ok(marketplaces) => Some(marketplaces),
+        Err(err) => {
+            warn!(
+                "failed to refresh remote installed plugins cache after plugin install request for {tool_id}: {err:#}"
+            );
+            None
+        }
     }
+}
+
+fn verified_remote_plugin_install_completed(
+    remote_marketplaces: Option<&[RemoteMarketplace]>,
+    requested_config_id: &str,
+    requested_remote_plugin_id: Option<&str>,
+    connectors_completed: bool,
+) -> bool {
+    connectors_completed
+        && remote_marketplaces.is_some_and(|marketplaces| {
+            marketplaces
+                .iter()
+                .flat_map(|marketplace| marketplace.plugins.iter())
+                .any(|plugin| {
+                    plugin.installed
+                        && (plugin.id == requested_config_id
+                            || requested_remote_plugin_id.is_some_and(|remote_plugin_id| {
+                                plugin.remote_plugin_id == remote_plugin_id
+                            }))
+                })
+        })
 }
 
 fn is_remote_plugin_install_suggestion(plugin_id: &str) -> bool {
