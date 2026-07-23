@@ -483,7 +483,7 @@ mod tests {
         let cancellation_token = tokio_util::sync::CancellationToken::new();
         let forwarded_cancellation_token = cancellation_token.clone();
         let invocation = ToolInvocation {
-            session: session.into(),
+            session,
             step_context,
             turn,
             cancellation_token,

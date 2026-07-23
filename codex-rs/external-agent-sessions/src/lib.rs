@@ -52,34 +52,25 @@ pub fn prepare_validated_session_import(
     if has_been_imported {
         return Ok(None);
     }
-    let Some((source_path, imported_session, source_content_sha256, source_modified_at)) =
-        load_importable_session(&session.path)?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(PendingSessionImport {
-        source_path,
-        source_content_sha256,
-        source_modified_at,
-        session: imported_session,
-    }))
+    load_importable_session(&session.path)
 }
 
-fn load_importable_session(
-    path: &Path,
-) -> io::Result<Option<(PathBuf, ImportedExternalAgentSession, String, Option<i64>)>> {
+fn load_importable_session(path: &Path) -> io::Result<Option<PendingSessionImport>> {
     let source_path = std::fs::canonicalize(path)?;
     let Some((imported_session, source_content_sha256, source_modified_at)) =
         load_session_for_import_with_content_sha256(&source_path)?
     else {
         return Ok(None);
     };
-    Ok(imported_session.cwd.is_dir().then_some((
-        source_path,
-        imported_session,
-        source_content_sha256,
-        source_modified_at,
-    )))
+    Ok(imported_session
+        .cwd
+        .is_dir()
+        .then_some(PendingSessionImport {
+            source_path,
+            source_content_sha256,
+            source_modified_at,
+            session: imported_session,
+        }))
 }
 
 #[derive(Debug, Clone)]

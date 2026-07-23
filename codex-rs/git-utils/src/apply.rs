@@ -850,44 +850,44 @@ pub fn parse_git_apply_output(
 
         // === Status lines ===
         if let Some(c) = APPLIED_CLEAN.captures(line) {
-            if let Some(m) = c.name("path") {
-                if let Some(p) = add(&mut applied, m.as_str()) {
-                    conflicted.remove(&p);
-                    skipped.remove(&p);
-                    last_seen_path = Some(p);
-                }
+            if let Some(m) = c.name("path")
+                && let Some(p) = add(&mut applied, m.as_str())
+            {
+                conflicted.remove(&p);
+                skipped.remove(&p);
+                last_seen_path = Some(p);
             }
             continue;
         }
         if let Some(c) = APPLIED_CONFLICTS.captures(line) {
-            if let Some(m) = c.name("path") {
-                if let Some(p) = add(&mut conflicted, m.as_str()) {
-                    applied.remove(&p);
-                    skipped.remove(&p);
-                    last_seen_path = Some(p);
-                }
+            if let Some(m) = c.name("path")
+                && let Some(p) = add(&mut conflicted, m.as_str())
+            {
+                applied.remove(&p);
+                skipped.remove(&p);
+                last_seen_path = Some(p);
             }
             continue;
         }
         if let Some(c) = APPLYING_WITH_REJECTS.captures(line) {
-            if let Some(m) = c.name("path") {
-                if let Some(p) = add(&mut conflicted, m.as_str()) {
-                    applied.remove(&p);
-                    skipped.remove(&p);
-                    last_seen_path = Some(p);
-                }
+            if let Some(m) = c.name("path")
+                && let Some(p) = add(&mut conflicted, m.as_str())
+            {
+                applied.remove(&p);
+                skipped.remove(&p);
+                last_seen_path = Some(p);
             }
             continue;
         }
 
         // === “U <path>” after conflicts ===
         if let Some(c) = UNMERGED_LINE.captures(line) {
-            if let Some(m) = c.name("path") {
-                if let Some(p) = add(&mut conflicted, m.as_str()) {
-                    applied.remove(&p);
-                    skipped.remove(&p);
-                    last_seen_path = Some(p);
-                }
+            if let Some(m) = c.name("path")
+                && let Some(p) = add(&mut conflicted, m.as_str())
+            {
+                applied.remove(&p);
+                skipped.remove(&p);
+                last_seen_path = Some(p);
             }
             continue;
         }
@@ -932,24 +932,24 @@ pub fn parse_git_apply_output(
             .or_else(|| CANNOT_READ_CURRENT.captures(line))
             .or_else(|| SKIPPED_PATCH.captures(line))
         {
-            if let Some(m) = c.name("path") {
-                if let Some(p) = add(&mut skipped, m.as_str()) {
-                    applied.remove(&p);
-                    conflicted.remove(&p);
-                    last_seen_path = Some(p);
-                }
+            if let Some(m) = c.name("path")
+                && let Some(p) = add(&mut skipped, m.as_str())
+            {
+                applied.remove(&p);
+                conflicted.remove(&p);
+                last_seen_path = Some(p);
             }
             continue;
         }
 
         // === Warnings that imply conflicts ===
         if let Some(c) = CANNOT_MERGE_BINARY_WARN.captures(line) {
-            if let Some(m) = c.name("path") {
-                if let Some(p) = add(&mut conflicted, m.as_str()) {
-                    applied.remove(&p);
-                    skipped.remove(&p);
-                    last_seen_path = Some(p);
-                }
+            if let Some(m) = c.name("path")
+                && let Some(p) = add(&mut conflicted, m.as_str())
+            {
+                applied.remove(&p);
+                skipped.remove(&p);
+                last_seen_path = Some(p);
             }
             continue;
         }

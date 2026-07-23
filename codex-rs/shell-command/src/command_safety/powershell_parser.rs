@@ -185,14 +185,32 @@ impl PowershellParserProcess {
             .stderr(Stdio::null())
             .spawn()?;
         let mut child = Some(child);
-        let stdin = match take_child_stdin(child.as_mut().expect("parser child exists")) {
+        let stdin_result = child
+            .as_mut()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "PowerShell parser child was unavailable",
+                )
+            })
+            .and_then(take_child_stdin);
+        let stdin = match stdin_result {
             Ok(stdin) => stdin,
             Err(error) => {
                 kill_child(&mut child);
                 return Err(error);
             }
         };
-        let stdout = match take_child_stdout(child.as_mut().expect("parser child exists")) {
+        let stdout_result = child
+            .as_mut()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "PowerShell parser child was unavailable",
+                )
+            })
+            .and_then(take_child_stdout);
+        let stdout = match stdout_result {
             Ok(stdout) => stdout,
             Err(error) => {
                 kill_child(&mut child);
@@ -454,7 +472,7 @@ fn trusted_parser_executable(flavor: PowershellFlavor) -> Option<PathBuf> {
         ),
         PowershellFlavor::Pwsh => ["ProgramW6432", "ProgramFiles"]
             .into_iter()
-            .filter_map(|name| std::env::var_os(name))
+            .filter_map(std::env::var_os)
             .find_map(|root| {
                 trusted_executable_under(PathBuf::from(root), &["PowerShell", "7", "pwsh.exe"])
             }),

@@ -901,10 +901,9 @@ fn render_instruction_template(instruction: &str, row_json: &Value) -> String {
             }
         }
 
-        let character = remaining
-            .chars()
-            .next()
-            .expect("cursor should remain on a character boundary");
+        let Some(character) = remaining.chars().next() else {
+            break;
+        };
         rendered.push(character);
         cursor += character.len_utf8();
     }

@@ -630,7 +630,7 @@ fn render_snapshot_diff(
         std::str::from_utf8(after_bytes),
     ) else {
         return (
-            format!("diff --git a/{0} b/{0}\nBinary files differ\n", path),
+            format!("diff --git a/{path} b/{path}\nBinary files differ\n"),
             401,
             generated,
         );
@@ -642,15 +642,17 @@ fn render_snapshot_diff(
         .count()
         .try_into()
         .unwrap_or(u32::MAX);
-    let old_header = before
-        .existed
-        .then(|| format!("a/{path}"))
-        .unwrap_or_else(|| "/dev/null".to_string());
-    let new_header = after
-        .existed
-        .then(|| format!("b/{path}"))
-        .unwrap_or_else(|| "/dev/null".to_string());
-    let mut section = format!("diff --git a/{0} b/{0}\n", path);
+    let old_header = if before.existed {
+        format!("a/{path}")
+    } else {
+        "/dev/null".to_string()
+    };
+    let new_header = if after.existed {
+        format!("b/{path}")
+    } else {
+        "/dev/null".to_string()
+    };
+    let mut section = format!("diff --git a/{path} b/{path}\n");
     section.push_str(
         &text_diff
             .unified_diff()

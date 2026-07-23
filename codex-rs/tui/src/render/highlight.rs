@@ -17,9 +17,10 @@
 //! swap/snapshot the theme for live preview.  All highlighting functions read
 //! the theme via `theme_lock()`.
 //!
-//! **Guardrails:** inputs exceeding 512 KB or 10 000 lines are rejected early
-//! (returns `None`) to prevent pathological CPU/memory usage.  Callers must
-//! fall back to plain unstyled text.
+//! **Guardrails:** inputs exceeding 512 KB or 10 000 lines, or containing an
+//! individual line longer than 4 KiB, are rejected early (returns `None`) to
+//! prevent pathological CPU/memory usage.  Callers must fall back to plain
+//! unstyled text.
 
 use ratatui::style::Color as RtColor;
 use ratatui::style::Modifier;
@@ -569,6 +570,9 @@ const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
 /// Skip highlighting for inputs with more than 10,000 lines.
 const MAX_HIGHLIGHT_LINES: usize = 10_000;
 
+/// Skip highlighting when an individual line is longer than 4 KiB.
+const MAX_HIGHLIGHT_LINE_BYTES: usize = 4 * 1024;
+
 /// Check whether an input exceeds the safe highlighting limits.
 ///
 /// Callers that highlight content in a loop (e.g. per diff-line) should
@@ -599,7 +603,12 @@ fn highlight_to_line_spans_with_theme(
     // Bail out early for oversized inputs to avoid excessive resource usage.
     // Count actual lines (not newline bytes) to avoid an off-by-one when
     // the input does not end with a newline.
-    if code.len() > MAX_HIGHLIGHT_BYTES || code.lines().count() > MAX_HIGHLIGHT_LINES {
+    if code.len() > MAX_HIGHLIGHT_BYTES
+        || code.lines().count() > MAX_HIGHLIGHT_LINES
+        || code
+            .lines()
+            .any(|line| line.len() > MAX_HIGHLIGHT_LINE_BYTES)
+    {
         return None;
     }
 

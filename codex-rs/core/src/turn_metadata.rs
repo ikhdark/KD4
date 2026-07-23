@@ -126,7 +126,7 @@ impl TurnMetadataState {
         windows_sandbox_level: WindowsSandboxLevel,
         enforce_managed_network: bool,
     ) -> Self {
-        let git_metadata_source = GitWorkspaceMetadataSource::discover_local(cwd.clone());
+        let git_metadata_source = GitWorkspaceMetadataSource::discover_local(cwd);
         Self::new_with_git_metadata_source(
             session_id,
             thread_id,

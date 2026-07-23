@@ -373,7 +373,7 @@ fn network_from_turn_context(turn_context: &TurnContext) -> Option<NetworkContex
         .permissions
         .network
         .as_ref()
-        .is_some_and(|network| network.enabled());
+        .is_some_and(crate::config::NetworkProxySpec::enabled);
 
     Some(NetworkContext::new(
         enabled,

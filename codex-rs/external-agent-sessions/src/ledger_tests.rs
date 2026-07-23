@@ -141,7 +141,7 @@ fn stale_source_refresh_does_not_reorder_a_newer_completed_import() {
         &codex_home,
         vec![CompletedExternalAgentSessionImport {
             source_path: source_path.clone(),
-            source_content_sha256: version_a_hash.clone(),
+            source_content_sha256: version_a_hash,
             source_modified_at: Some(1),
             imported_thread_id: ThreadId::new(),
         }],
@@ -168,7 +168,7 @@ fn stale_source_refresh_does_not_reorder_a_newer_completed_import() {
     record_completed_session_imports(
         &codex_home,
         vec![CompletedExternalAgentSessionImport {
-            source_path: source_path.clone(),
+            source_path,
             source_content_sha256: version_c_hash.clone(),
             source_modified_at: Some(3),
             imported_thread_id: ThreadId::new(),

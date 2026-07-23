@@ -150,11 +150,10 @@ impl ApplyPatchArgumentDiffConsumer {
 
         if let Err(err) = self.parser.finish_in_place() {
             self.pending = None;
+            let response =
+                FunctionCallError::RespondToModel(format!("failed to parse apply_patch: {err}"));
             self.parse_error = Some(err);
-            let err = self.parse_error.as_ref().expect("parse error was stored");
-            return Err(FunctionCallError::RespondToModel(format!(
-                "failed to parse apply_patch: {err}"
-            )));
+            return Err(response);
         }
 
         let event = self.pending.take().map(|call_id| PatchApplyUpdatedEvent {

@@ -767,38 +767,8 @@ impl Codex {
         Ok(id)
     }
 
-    pub async fn submit_user_input_with_client_user_message_id(
-        &self,
-        op: Op,
-        trace: Option<W3cTraceContext>,
-        client_user_message_id: Option<String>,
-    ) -> CodexResult<String> {
-        debug_assert!(matches!(op, Op::UserInput { .. }));
-        let id = self.reserve_turn_id();
-        self.submit_user_input_with_reserved_turn_id(id.clone(), op, trace, client_user_message_id)
-            .await?;
-        Ok(id)
-    }
-
     pub fn reserve_turn_id(&self) -> String {
         new_submission_id()
-    }
-
-    pub async fn submit_user_input_with_reserved_turn_id(
-        &self,
-        id: String,
-        op: Op,
-        trace: Option<W3cTraceContext>,
-        client_user_message_id: Option<String>,
-    ) -> CodexResult<()> {
-        debug_assert!(matches!(op, Op::UserInput { .. }));
-        let sub = Submission {
-            id,
-            op,
-            client_user_message_id,
-            trace,
-        };
-        self.submit_with_id(sub).await
     }
 
     /// Use sparingly: prefer `submit()` so Codex is responsible for generating

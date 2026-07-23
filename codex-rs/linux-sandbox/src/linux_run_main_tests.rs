@@ -258,20 +258,16 @@ fn root_write_read_only_carveout_requires_direct_runtime_enforcement() {
 }
 
 #[test]
-fn managed_proxy_preflight_argv_is_wrapped_for_full_access_policy() {
+fn managed_proxy_preflight_argv_unshares_network() {
     let mode = bwrap_network_mode(
         NetworkSandboxPolicy::Enabled,
         /*allow_network_for_proxy*/ true,
     );
-    let argv = build_preflight_bwrap_argv(
-        Path::new("/"),
-        Path::new("/"),
-        &FileSystemSandboxPolicy::unrestricted(),
-        mode,
-    )
-    .expect("build preflight argv")
-    .args;
+    let argv = build_preflight_bwrap_argv(mode)
+        .expect("build preflight argv")
+        .args;
     assert!(argv.iter().any(|arg| arg == "--"));
+    assert!(argv.iter().any(|arg| arg == "--unshare-net"));
 }
 
 #[test]

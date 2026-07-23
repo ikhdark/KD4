@@ -251,6 +251,7 @@ fn with_import_ledger_lock<T>(
     let lock_path = codex_home.join(SESSION_IMPORT_LEDGER_LOCK_FILE);
     let lock_file = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(lock_path)?;

@@ -158,6 +158,7 @@ pub(crate) async fn load_project_instructions(
 /// discovered doc. If no documentation file is found the function returns
 /// `Ok(None)`. Unexpected I/O failures bubble up as `Err` so callers can
 /// decide how to handle them.
+#[cfg(test)]
 async fn read_agents_md(
     config: &Config,
     fs: &dyn ExecutorFileSystem,
@@ -178,6 +179,7 @@ async fn read_agents_md(
     )
 }
 
+#[cfg(test)]
 async fn read_discovered_agents_md(
     fs: &dyn ExecutorFileSystem,
     environment_id: &str,
@@ -435,8 +437,9 @@ fn chunk_has_non_whitespace(pending_utf8: &mut Vec<u8>, chunk: &[u8]) -> bool {
     match std::str::from_utf8(remaining) {
         Ok(text) => text.chars().any(|ch| !ch.is_whitespace()),
         Err(err) => {
-            let valid = std::str::from_utf8(&remaining[..err.valid_up_to()])
-                .expect("valid_up_to must delimit a valid UTF-8 prefix");
+            let Ok(valid) = std::str::from_utf8(&remaining[..err.valid_up_to()]) else {
+                return true;
+            };
             if valid.chars().any(|ch| !ch.is_whitespace()) {
                 return true;
             }

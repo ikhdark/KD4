@@ -177,12 +177,11 @@ impl UnifiedExecProcess {
         }
     }
 
-    pub(super) fn take_output_receiver(&self) -> broadcast::Receiver<Vec<u8>> {
+    pub(super) fn take_output_receiver(&self) -> Option<broadcast::Receiver<Vec<u8>>> {
         self.initial_output_rx
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
-            .expect("unified exec streaming output receiver already taken")
     }
 
     pub(super) fn cancellation_token(&self) -> CancellationToken {

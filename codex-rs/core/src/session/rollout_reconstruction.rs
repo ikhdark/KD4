@@ -63,6 +63,19 @@ struct ReplacementCheckpoint<'a> {
     suffix: &'a [RolloutItem],
 }
 
+struct FinalizedReplayState<'items, 'state> {
+    base_replacement_history: &'state mut Option<&'items [ResponseItem]>,
+    rollout_suffix: &'state mut &'items [RolloutItem],
+    discarded_history_effect_indexes: &'state mut HashSet<usize>,
+    previous_turn_settings: &'state mut Option<PreviousTurnSettings>,
+    reference_context_item: &'state mut TurnReferenceContextItem,
+    world_state_replay: &'state mut Vec<&'items RolloutItem>,
+    surviving_compaction_count: &'state mut u64,
+    has_surviving_legacy_compaction_without_window_number: &'state mut bool,
+    window: &'state mut Option<ReconstructedWindow>,
+    pending_rollback_turns: &'state mut usize,
+}
+
 fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&str>) -> bool {
     active_turn_id
         .is_none_or(|turn_id| item_turn_id.is_none_or(|item_turn_id| item_turn_id == turn_id))
@@ -70,17 +83,20 @@ fn turn_ids_are_compatible(active_turn_id: Option<&str>, item_turn_id: Option<&s
 
 fn finalize_active_segment<'a>(
     active_segment: ActiveReplaySegment<'a>,
-    base_replacement_history: &mut Option<&'a [ResponseItem]>,
-    rollout_suffix: &mut &'a [RolloutItem],
-    discarded_history_effect_indexes: &mut HashSet<usize>,
-    previous_turn_settings: &mut Option<PreviousTurnSettings>,
-    reference_context_item: &mut TurnReferenceContextItem,
-    world_state_replay: &mut Vec<&'a RolloutItem>,
-    surviving_compaction_count: &mut u64,
-    has_surviving_legacy_compaction_without_window_number: &mut bool,
-    window: &mut Option<ReconstructedWindow>,
-    pending_rollback_turns: &mut usize,
+    state: FinalizedReplayState<'a, '_>,
 ) {
+    let FinalizedReplayState {
+        base_replacement_history,
+        rollout_suffix,
+        discarded_history_effect_indexes,
+        previous_turn_settings,
+        reference_context_item,
+        world_state_replay,
+        surviving_compaction_count,
+        has_surviving_legacy_compaction_without_window_number,
+        window,
+        pending_rollback_turns,
+    } = state;
     // Thread rollback drops the newest surviving real user-message boundaries. In replay, that
     // means skipping the next finalized segments that contain a non-contextual
     // `EventMsg::UserMessage`.
@@ -285,16 +301,20 @@ impl Session {
                     {
                         finalize_active_segment(
                             active_segment,
-                            &mut base_replacement_history,
-                            &mut rollout_suffix,
-                            &mut discarded_history_effect_indexes,
-                            &mut previous_turn_settings,
-                            &mut reference_context_item,
-                            &mut world_state_replay,
-                            &mut surviving_compaction_count,
-                            &mut has_surviving_legacy_compaction_without_window_number,
-                            &mut window,
-                            &mut pending_rollback_turns,
+                            FinalizedReplayState {
+                                base_replacement_history: &mut base_replacement_history,
+                                rollout_suffix: &mut rollout_suffix,
+                                discarded_history_effect_indexes:
+                                    &mut discarded_history_effect_indexes,
+                                previous_turn_settings: &mut previous_turn_settings,
+                                reference_context_item: &mut reference_context_item,
+                                world_state_replay: &mut world_state_replay,
+                                surviving_compaction_count: &mut surviving_compaction_count,
+                                has_surviving_legacy_compaction_without_window_number:
+                                    &mut has_surviving_legacy_compaction_without_window_number,
+                                window: &mut window,
+                                pending_rollback_turns: &mut pending_rollback_turns,
+                            },
                         );
                     }
                 }
@@ -330,16 +350,19 @@ impl Session {
         if let Some(active_segment) = active_segment.take() {
             finalize_active_segment(
                 active_segment,
-                &mut base_replacement_history,
-                &mut rollout_suffix,
-                &mut discarded_history_effect_indexes,
-                &mut previous_turn_settings,
-                &mut reference_context_item,
-                &mut world_state_replay,
-                &mut surviving_compaction_count,
-                &mut has_surviving_legacy_compaction_without_window_number,
-                &mut window,
-                &mut pending_rollback_turns,
+                FinalizedReplayState {
+                    base_replacement_history: &mut base_replacement_history,
+                    rollout_suffix: &mut rollout_suffix,
+                    discarded_history_effect_indexes: &mut discarded_history_effect_indexes,
+                    previous_turn_settings: &mut previous_turn_settings,
+                    reference_context_item: &mut reference_context_item,
+                    world_state_replay: &mut world_state_replay,
+                    surviving_compaction_count: &mut surviving_compaction_count,
+                    has_surviving_legacy_compaction_without_window_number:
+                        &mut has_surviving_legacy_compaction_without_window_number,
+                    window: &mut window,
+                    pending_rollback_turns: &mut pending_rollback_turns,
+                },
             );
         }
 

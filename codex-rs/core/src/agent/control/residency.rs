@@ -224,9 +224,7 @@ impl V2Residency {
                 continue;
             }
             let (completion, _) = watch::channel(false);
-            state
-                .evicting
-                .insert(candidate_thread_id, completion.clone());
+            state.evicting.insert(candidate_thread_id, completion);
             return Some(V2EvictionClaim {
                 residency: Arc::clone(self),
                 thread_id: candidate_thread_id,

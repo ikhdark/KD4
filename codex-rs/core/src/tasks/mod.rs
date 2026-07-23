@@ -404,14 +404,15 @@ impl Session {
         ) {
             Ok(guard) => guard,
             Err(err) => {
-                let mut active_turn = self.active_turn.lock().await;
-                if active_turn
-                    .as_ref()
-                    .is_some_and(|active_turn| active_turn.task.is_none())
                 {
-                    *active_turn = None;
+                    let mut active_turn = self.active_turn.lock().await;
+                    if active_turn
+                        .as_ref()
+                        .is_some_and(|active_turn| active_turn.task.is_none())
+                    {
+                        *active_turn = None;
+                    }
                 }
-                drop(active_turn);
                 self.send_event(
                     turn_context.as_ref(),
                     EventMsg::Error(err.to_error_event(None)),

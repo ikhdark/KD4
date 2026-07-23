@@ -85,9 +85,10 @@ pub(crate) async fn load_agent_roles(
                 let agent_role_files = collect_agent_role_files(fs, &agents_dir).await?;
                 agent_role_files_by_dir.insert(agents_dir.clone(), agent_role_files);
             }
-            let agent_role_files = agent_role_files_by_dir
-                .get(&agents_dir)
-                .expect("agent role file inventory should be cached");
+            let agent_role_files = agent_role_files_by_dir.get(&agents_dir);
+            let Some(agent_role_files) = agent_role_files else {
+                continue;
+            };
             for (role_name, role) in discover_agent_roles_in_dir(
                 fs,
                 &agents_dir,
@@ -502,7 +503,7 @@ async fn discover_agent_roles_in_dir(
             continue;
         }
         let parsed_file =
-            match read_resolved_agent_role_file(fs, &agent_file, /*role_name_hint*/ None).await {
+            match read_resolved_agent_role_file(fs, agent_file, /*role_name_hint*/ None).await {
                 Ok(parsed_file) => parsed_file,
                 Err(err) => {
                     push_agent_role_warning(startup_warnings, err);

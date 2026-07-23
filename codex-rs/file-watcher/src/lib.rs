@@ -553,10 +553,11 @@ impl FileWatcher {
                 return Err(err);
             }
 
-            let subscriber = state
-                .subscribers
-                .get_mut(&subscriber_id)
-                .expect("subscriber is retained while registering paths");
+            let Some(subscriber) = state.subscribers.get_mut(&subscriber_id) else {
+                return Err(notify::Error::generic(
+                    "file watcher subscriber was removed",
+                ));
+            };
             match subscriber.watched_paths.entry(registration.key.clone()) {
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
                     let watch = entry.get_mut();
@@ -610,29 +611,21 @@ impl FileWatcher {
         subscriber_watch: &SubscriberWatchKey,
         inner_guard: &mut Option<std::sync::MutexGuard<'a, FileWatcherInner>>,
     ) {
-        let Some(subscriber_watch_state) = state
-            .subscribers
-            .get(&subscriber_id)
-            .and_then(|subscriber| subscriber.watched_paths.get(subscriber_watch))
-        else {
-            return;
-        };
-        let actual = subscriber_watch_state.actual.clone();
-
-        {
-            let subscriber = state
-                .subscribers
-                .get_mut(&subscriber_id)
-                .expect("subscriber exists while unregistering paths");
-            let subscriber_watch_state = subscriber
-                .watched_paths
-                .get_mut(subscriber_watch)
-                .expect("registered watch exists while unregistering paths");
+        let actual = {
+            let Some(subscriber) = state.subscribers.get_mut(&subscriber_id) else {
+                return;
+            };
+            let Some(subscriber_watch_state) = subscriber.watched_paths.get_mut(subscriber_watch)
+            else {
+                return;
+            };
+            let actual = subscriber_watch_state.actual.clone();
             subscriber_watch_state.count -= 1;
             if subscriber_watch_state.count == 0 {
                 subscriber.watched_paths.remove(subscriber_watch);
             }
-        }
+            actual
+        };
         self.decrement_actual_watch_locked(state, &actual, 1, inner_guard);
     }
 

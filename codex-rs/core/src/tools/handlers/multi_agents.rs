@@ -83,17 +83,6 @@ mod send_input;
 mod spawn;
 pub(crate) mod wait;
 
-pub(crate) fn collab_tool_call_status(
-    status: &AgentStatus,
-    receiver_thread_id: Option<ThreadId>,
-) -> CollabAgentToolCallStatus {
-    match status {
-        AgentStatus::Errored(_) | AgentStatus::NotFound => CollabAgentToolCallStatus::Failed,
-        _ if receiver_thread_id.is_some() => CollabAgentToolCallStatus::Completed,
-        _ => CollabAgentToolCallStatus::Failed,
-    }
-}
-
 #[cfg(test)]
 #[path = "multi_agents_tests.rs"]
 mod tests;

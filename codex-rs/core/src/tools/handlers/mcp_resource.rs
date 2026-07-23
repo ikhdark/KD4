@@ -226,10 +226,9 @@ impl ListResourcesPayload {
             }
         }
         for (server, page) in entries {
-            let remaining_index = payload
-                .remaining_servers
-                .binary_search(&server)
-                .expect("aggregate server originated from remaining_servers");
+            let Ok(remaining_index) = payload.remaining_servers.binary_search(&server) else {
+                continue;
+            };
             payload.remaining_servers.remove(remaining_index);
             let resources_start = payload.resources.len();
             let page_resource_count = page.resources.len();
@@ -374,10 +373,9 @@ impl ListResourceTemplatesPayload {
         }
 
         for (server, page) in entries {
-            let remaining_index = payload
-                .remaining_servers
-                .binary_search(&server)
-                .expect("aggregate server originated from remaining_servers");
+            let Ok(remaining_index) = payload.remaining_servers.binary_search(&server) else {
+                continue;
+            };
             payload.remaining_servers.remove(remaining_index);
             let templates_start = payload.resource_templates.len();
             let page_template_count = page.resource_templates.len();
@@ -597,10 +595,12 @@ fn truncation_policy_with_limit(policy: TruncationPolicy, limit: usize) -> Trunc
     }
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(value: &bool) -> bool {
     !*value
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(value: &usize) -> bool {
     *value == 0
 }

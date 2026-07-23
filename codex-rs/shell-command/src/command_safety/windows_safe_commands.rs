@@ -205,14 +205,16 @@ mod tests {
         args.iter().map(ToString::to_string).collect()
     }
 
-    fn windows_powershell_path() -> String {
-        std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
-            .join("System32")
-            .join("WindowsPowerShell")
-            .join("v1.0")
-            .join("powershell.exe")
-            .to_string_lossy()
-            .into_owned()
+    fn windows_powershell_path() -> Option<String> {
+        Some(
+            std::path::PathBuf::from(std::env::var_os("SystemRoot")?)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 
     #[test]
@@ -269,7 +271,9 @@ mod tests {
             }
         }
 
-        let powershell = windows_powershell_path();
+        let Some(powershell) = windows_powershell_path() else {
+            return;
+        };
         assert!(is_safe_command_windows(&vec_str(&[
             powershell.as_str(),
             "-NoProfile",

@@ -105,8 +105,8 @@ pub const DEFAULT_IN_PROCESS_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
 type PendingClientRequestResponse = std::result::Result<Result, JSONRPCErrorError>;
 
 enum ServerRequestDeliveryError {
-    Full(ServerRequest),
-    Closed(ServerRequest),
+    Full(Box<ServerRequest>),
+    Closed(Box<ServerRequest>),
 }
 
 async fn forward_server_notification(
@@ -172,10 +172,10 @@ fn forward_server_request(
             Ok(()) => *skipped_events = 0,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 *skipped_events = skipped_events.saturating_add(1);
-                return Err(ServerRequestDeliveryError::Full(request));
+                return Err(ServerRequestDeliveryError::Full(Box::new(request)));
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
-                return Err(ServerRequestDeliveryError::Closed(request));
+                return Err(ServerRequestDeliveryError::Closed(Box::new(request)));
             }
         }
     }
@@ -187,13 +187,13 @@ fn forward_server_request(
             let InProcessServerEvent::ServerRequest(request) = event else {
                 unreachable!("forwarded event should remain a server request");
             };
-            Err(ServerRequestDeliveryError::Full(request))
+            Err(ServerRequestDeliveryError::Full(Box::new(request)))
         }
         Err(mpsc::error::TrySendError::Closed(event)) => {
             let InProcessServerEvent::ServerRequest(request) = event else {
                 unreachable!("forwarded event should remain a server request");
             };
-            Err(ServerRequestDeliveryError::Closed(request))
+            Err(ServerRequestDeliveryError::Closed(Box::new(request)))
         }
     }
 }

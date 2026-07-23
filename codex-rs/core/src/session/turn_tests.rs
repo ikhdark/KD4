@@ -437,7 +437,10 @@ async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot() -> Resu
     let command = match core_test_support::stdio_server_bin() {
         Ok(command) => command,
         Err(err) => {
-            eprintln!("test_stdio_server unavailable; skipping MCP snapshot regression: {err}");
+            tracing::warn!(
+                %err,
+                "test_stdio_server unavailable; skipping MCP snapshot regression"
+            );
             return Ok(());
         }
     };

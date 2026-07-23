@@ -22,6 +22,7 @@ use codex_windows_sandbox::is_command_cwd_root;
 use codex_windows_sandbox::log_note;
 use codex_windows_sandbox::log_writer;
 use codex_windows_sandbox::path_mask_allows;
+use codex_windows_sandbox::path_mask_has_explicit_allow_ace;
 use codex_windows_sandbox::sandbox_bin_dir;
 use codex_windows_sandbox::sandbox_dir;
 use codex_windows_sandbox::sandbox_secrets_dir;
@@ -169,12 +170,7 @@ fn write_root_needs_refresh(root: &Path, psid: *mut c_void) -> Result<bool> {
     )? {
         return Ok(true);
     }
-    path_mask_allows(
-        root,
-        &[psid],
-        FILE_DELETE_CHILD,
-        /*require_all_bits*/ false,
-    )
+    path_mask_has_explicit_allow_ace(root, &[psid], FILE_DELETE_CHILD)
 }
 
 fn spawn_read_acl_helper(payload: &Payload, _log: &mut dyn Write) -> Result<()> {

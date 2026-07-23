@@ -86,20 +86,16 @@ pub(crate) fn fork_turn_positions_in_rollout(items: &[RolloutItem]) -> Vec<usize
             rollback_turn_positions.push(idx);
         }
         match item {
-            RolloutItem::ResponseItem(item) => {
-                if is_real_user_message_boundary(item) || is_trigger_turn_boundary(item) {
-                    fork_turn_positions.push(idx);
-                }
+            RolloutItem::ResponseItem(item)
+                if is_real_user_message_boundary(item) || is_trigger_turn_boundary(item) =>
+            {
+                fork_turn_positions.push(idx);
             }
-            RolloutItem::InterAgentCommunication(communication) => {
-                if communication.trigger_turn {
-                    fork_turn_positions.push(idx);
-                }
+            RolloutItem::InterAgentCommunication(communication) if communication.trigger_turn => {
+                fork_turn_positions.push(idx);
             }
-            RolloutItem::InterAgentCommunicationMetadata { trigger_turn } => {
-                if *trigger_turn {
-                    fork_turn_positions.push(idx);
-                }
+            RolloutItem::InterAgentCommunicationMetadata { trigger_turn } if *trigger_turn => {
+                fork_turn_positions.push(idx);
             }
             RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
                 let num_turns = usize::try_from(rollback.num_turns).unwrap_or(usize::MAX);

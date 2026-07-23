@@ -100,7 +100,7 @@ fn map_additional_context(
 
     let longest_source_bytes = additional_context
         .keys()
-        .map(|source| source.len())
+        .map(String::len)
         .max()
         .unwrap_or_default();
     if longest_source_bytes > MAX_ADDITIONAL_CONTEXT_SOURCE_BYTES {

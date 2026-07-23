@@ -117,6 +117,7 @@ impl HeadTailBuffer {
     ///
     /// The returned chunks are ordered as: head chunks first, then tail chunks.
     /// Omitted bytes are not represented in the snapshot.
+    #[cfg(test)]
     pub(crate) fn snapshot_chunks(&self) -> Vec<Vec<u8>> {
         let mut out = Vec::with_capacity(2);
         if !self.head.is_empty() {
@@ -159,6 +160,7 @@ impl HeadTailBuffer {
     /// are discarded along with the retained content. Cumulative and pending
     /// omission/lag accounting are preserved until the caller explicitly
     /// consumes their pending counts.
+    #[cfg(test)]
     pub(crate) fn drain_chunks(&mut self) -> Vec<Vec<u8>> {
         self.drain_chunks_with_omission_marker(None)
     }

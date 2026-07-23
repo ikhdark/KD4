@@ -10,11 +10,12 @@ use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_utils_path_uri::PathUri;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 
 /// Owns the inputs and cached result of AGENTS.md discovery for a session.
 pub(crate) struct AgentsMdManager {
     user_instructions: Option<UserInstructions>,
-    refresh_gate: Mutex<()>,
+    refresh_gate: Semaphore,
     cache: Mutex<AgentsMdCache>,
 }
 
@@ -70,7 +71,7 @@ impl AgentsMdManager {
         Self {
             user_instructions: user_instructions
                 .filter(|instructions| !instructions.text.trim().is_empty()),
-            refresh_gate: Mutex::new(()),
+            refresh_gate: Semaphore::new(1),
             cache: Mutex::new(AgentsMdCache::default()),
         }
     }
@@ -87,7 +88,9 @@ impl AgentsMdManager {
         // Serialize key capture, filesystem loading, and publication so an older refresh cannot
         // finish after and overwrite a newer request. Clone the request's published value before
         // releasing the gate so a later refresh cannot replace it between refresh and capture.
-        let _refresh_guard = self.refresh_gate.lock().await;
+        let Ok(_refresh_permit) = self.refresh_gate.acquire().await else {
+            return self.get_loaded().await;
+        };
         self.refresh_with_gate_held(config, environments).await
     }
 
@@ -98,7 +101,11 @@ impl AgentsMdManager {
     ) -> (TurnEnvironmentSnapshot, Option<Arc<LoadedAgentsMd>>) {
         // Enter serialization before capturing live environments so an older snapshot cannot be
         // delayed until after a newer one publishes and then overwrite the newer cache entry.
-        let _refresh_guard = self.refresh_gate.lock().await;
+        let Ok(_refresh_permit) = self.refresh_gate.acquire().await else {
+            let environments = environments.snapshot().await;
+            let loaded = self.get_loaded().await;
+            return (environments, loaded);
+        };
         let environments = environments.snapshot().await;
         let loaded = self.refresh_with_gate_held(config, &environments).await;
         (environments, loaded)

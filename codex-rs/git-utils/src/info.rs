@@ -748,11 +748,8 @@ async fn branch_merge_base_and_distance(
             continue;
         }
 
-        let Some(merge_base_output) =
-            run_git_command_with_timeout(&["merge-base", "HEAD", &remote_ref], cwd).await
-        else {
-            return None;
-        };
+        let merge_base_output =
+            run_git_command_with_timeout(&["merge-base", "HEAD", &remote_ref], cwd).await?;
         if !merge_base_output.status.success() {
             continue;
         }
@@ -762,11 +759,8 @@ async fn branch_merge_base_and_distance(
         let merge_base = GitSha::new(merge_base_text.trim());
 
         let range = format!("{}..HEAD", merge_base.0);
-        let Some(count_output) =
-            run_git_command_with_timeout(&["rev-list", "--count", &range], cwd).await
-        else {
-            return None;
-        };
+        let count_output =
+            run_git_command_with_timeout(&["rev-list", "--count", &range], cwd).await?;
         if !count_output.status.success() {
             return None;
         }

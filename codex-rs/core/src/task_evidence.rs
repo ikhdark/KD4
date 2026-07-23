@@ -665,7 +665,7 @@ impl TaskEvidenceLedger {
                     &mut document.next_command_receipt_sequence,
                 );
                 document.command_receipts.push(CommandReceipt {
-                    id: receipt_id.clone(),
+                    id: receipt_id,
                     recorded_at: timestamp(),
                     epoch: document.evidence_epoch,
                     step_id: document.active_step_id.clone(),

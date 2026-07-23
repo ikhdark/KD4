@@ -229,9 +229,9 @@ impl RemoteAppServerClient {
                         let Ok(permit) = permit else {
                             break;
                         };
-                        let event = pending_delivery
-                            .pop_front()
-                            .expect("pending delivery should contain an event");
+                        let Some(event) = pending_delivery.pop_front() else {
+                            continue;
+                        };
                         permit.send(event);
                     }
                     command = command_rx.recv() => {

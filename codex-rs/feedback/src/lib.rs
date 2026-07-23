@@ -18,6 +18,7 @@ use codex_protocol::protocol::SessionSource;
 use tracing::Event;
 use tracing::Level;
 use tracing::field::Visit;
+use tracing::level_filters::LevelFilter;
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::writer::MakeWriter;
@@ -205,7 +206,11 @@ impl CodexFeedback {
             .with_target(false)
             // Capture everything, regardless of the caller's `RUST_LOG`, so feedback includes the
             // full trace when the user uploads a report.
-            .with_filter(Targets::new().with_default(Level::TRACE))
+            .with_filter(
+                Targets::new()
+                    .with_default(Level::TRACE)
+                    .with_target("codex_core::post_sampling_token_estimate", LevelFilter::OFF),
+            )
     }
 
     /// Returns a [`tracing_subscriber`] layer that collects structured metadata for feedback.

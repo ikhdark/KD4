@@ -42,20 +42,11 @@ struct BindingIndex {
     by_assignment: HashMap<AssignmentId, AgentTaskBinding>,
 }
 
+#[derive(Default)]
 struct TaskMetricIndex {
     runtimes: HashMap<AssignmentId, TaskMetricRuntime>,
     active: HashSet<AssignmentId>,
     configured_capacity: Option<u32>,
-}
-
-impl Default for TaskMetricIndex {
-    fn default() -> Self {
-        Self {
-            runtimes: HashMap::new(),
-            active: HashSet::new(),
-            configured_capacity: None,
-        }
-    }
 }
 
 /// Shared typed-task persistence and identity index for one root agent tree.
@@ -102,7 +93,7 @@ impl AgentTaskCoordinator {
         let mut bindings = self
             .bindings
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for binding in persisted {
             bindings
                 .by_agent_path
@@ -127,7 +118,7 @@ impl AgentTaskCoordinator {
         let mut metrics = self
             .metrics
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         metrics.configured_capacity.get_or_insert(capacity);
     }
 
@@ -182,7 +173,7 @@ impl AgentTaskCoordinator {
     ) -> Option<AgentTaskBinding> {
         self.bindings
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .by_agent_path
             .get(agent_path.as_str())
             .cloned()
@@ -194,7 +185,7 @@ impl AgentTaskCoordinator {
     ) -> Option<AgentTaskBinding> {
         self.bindings
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .by_assignment
             .get(&assignment_id)
             .cloned()
@@ -269,7 +260,7 @@ impl AgentTaskCoordinator {
         let mut metrics = self
             .metrics
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(runtime) = metrics.runtimes.get_mut(&binding.assignment_id) else {
             return false;
         };
@@ -311,7 +302,7 @@ impl AgentTaskCoordinator {
         let mut metrics = self
             .metrics
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(mut runtime) = metrics.runtimes.remove(&assignment_id) else {
             return;
         };
@@ -408,7 +399,7 @@ impl AgentTaskCoordinator {
         let mut bindings = self
             .bindings
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         bindings
             .by_agent_path
             .insert(binding.agent_path.clone(), binding.clone());
@@ -421,7 +412,7 @@ impl AgentTaskCoordinator {
         let mut bindings = self
             .bindings
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(binding) = bindings.by_assignment.remove(&assignment_id) else {
             return;
         };
@@ -438,7 +429,7 @@ impl AgentTaskCoordinator {
         let mut metrics = self
             .metrics
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let active_turns = saturating_active_turns(metrics.active.len());
         let capacity = metric_capacity(&metrics, active_turns);
         match TaskMetricRuntime::new(assignment, active_turns, capacity) {
@@ -459,7 +450,7 @@ impl AgentTaskCoordinator {
         let mut metrics = self
             .metrics
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !metrics.runtimes.contains_key(&assignment_id) {
             return;
         }

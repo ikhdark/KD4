@@ -66,7 +66,7 @@ async fn terminal_emission_uses_the_reserved_event_at_the_recorder_boundary() {
         let mut metrics = coordinator
             .metrics
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let runtime = metrics
             .runtimes
             .get_mut(&assignment.assignment_id)
@@ -113,6 +113,6 @@ async fn terminal_emission_uses_the_reserved_event_at_the_recorder_boundary() {
     let metrics = coordinator
         .metrics
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert!(!metrics.runtimes.contains_key(&assignment.assignment_id));
 }

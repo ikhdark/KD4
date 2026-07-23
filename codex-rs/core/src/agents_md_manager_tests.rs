@@ -324,7 +324,11 @@ async fn step_refresh_captures_environments_after_entering_refresh_gate() {
         /*non_blocking_snapshots*/ false,
     );
     let manager = AgentsMdManager::new(/*user_instructions*/ None);
-    let refresh_guard = manager.refresh_gate.lock().await;
+    let refresh_guard = manager
+        .refresh_gate
+        .acquire()
+        .await
+        .expect("refresh gate should remain open");
     let mut refresh = Box::pin(manager.refresh_for_step(&config, &thread_environments));
 
     assert!(futures::poll!(refresh.as_mut()).is_pending());

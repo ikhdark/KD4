@@ -7,6 +7,7 @@ use tokio::time::Instant;
 use tokio::time::Sleep;
 
 use super::UnifiedExecContext;
+use super::UnifiedExecError;
 pub(super) use super::head_tail_buffer::omitted_output_marker;
 use super::process::UnifiedExecProcess;
 use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
@@ -44,8 +45,12 @@ pub(crate) fn start_streaming_output(
     process: &UnifiedExecProcess,
     context: &UnifiedExecContext,
     transcript: Arc<Mutex<HeadTailBuffer>>,
-) {
-    let mut receiver = process.take_output_receiver();
+) -> Result<(), UnifiedExecError> {
+    let Some(mut receiver) = process.take_output_receiver() else {
+        return Err(UnifiedExecError::process_failed(
+            "unified exec streaming output receiver was already taken".to_string(),
+        ));
+    };
     let output_drained = process.output_drained_notify();
     let exit_token = process.cancellation_token();
 
@@ -139,6 +144,7 @@ pub(crate) fn start_streaming_output(
             }
         }
     });
+    Ok(())
 }
 
 pub(super) fn lagged_output_marker(skipped: u64) -> Vec<u8> {

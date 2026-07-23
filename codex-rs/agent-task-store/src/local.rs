@@ -2933,10 +2933,9 @@ async fn capture_snapshot_atomic(
     })
     .await
     .map_err(|error| {
-        StoreError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("snapshot capture task failed: {error}"),
-        ))
+        StoreError::Io(std::io::Error::other(format!(
+            "snapshot capture task failed: {error}"
+        )))
     })?
 }
 
@@ -3016,10 +3015,9 @@ async fn read_verified_snapshot_chunk(
     })
     .await
     .map_err(|error| {
-        StoreError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("snapshot read task failed: {error}"),
-        ))
+        StoreError::Io(std::io::Error::other(format!(
+            "snapshot read task failed: {error}"
+        )))
     })?
 }
 
@@ -3058,10 +3056,9 @@ async fn verify_nonexistent_snapshot_marker(
     })
     .await
     .map_err(|error| {
-        StoreError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("snapshot marker verification task failed: {error}"),
-        ))
+        StoreError::Io(std::io::Error::other(format!(
+            "snapshot marker verification task failed: {error}"
+        )))
     })?
 }
 

@@ -585,16 +585,20 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     pub(crate) async fn new_turn_with_sub_id(
         &self,
         sub_id: String,
         updates: SessionSettingsUpdate,
     ) -> CodexResult<Arc<TurnContext>> {
-        let final_output_json_schema = updates.final_output_json_schema.clone();
         let session_configuration = self.apply_turn_settings(&sub_id, &updates).await?;
 
         Ok(self
-            .new_turn_from_configuration(sub_id, session_configuration, final_output_json_schema)
+            .new_turn_from_configuration(
+                sub_id,
+                session_configuration,
+                /*final_output_json_schema*/ None,
+            )
             .await)
     }
 

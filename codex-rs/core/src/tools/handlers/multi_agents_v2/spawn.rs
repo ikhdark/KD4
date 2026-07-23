@@ -159,7 +159,11 @@ async fn handle_spawn_agent(
         )
     })?;
     let typed_task = if let Some(assignment_args) = args.assignment.take() {
-        let role = typed_role.expect("typed role is resolved when assignment is present");
+        let role = typed_role.ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "spawn_agent: typed assignments require a supported agent_type".to_string(),
+            )
+        })?;
         let coordinator = session.services.agent_control.task_coordinator();
         if coordinator.store().is_none() {
             let state_runtime = session.services.state_db.as_ref().ok_or_else(|| {
@@ -202,7 +206,11 @@ async fn handle_spawn_agent(
     };
     let message = match typed_task.as_ref() {
         Some((assignment, attempt)) => typed_assignment_message(assignment, attempt),
-        None => legacy_message.expect("legacy message was validated above"),
+        None => legacy_message.ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "spawn_agent: either assignment or message is required".to_string(),
+            )
+        })?,
     };
     let author = turn
         .session_source

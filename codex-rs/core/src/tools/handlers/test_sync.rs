@@ -227,9 +227,11 @@ fn register_barrier(args: &BarrierArgs) -> Result<BarrierWaiter, FunctionCallErr
         .get(&barrier_id)
         .is_some_and(|state| state.waiters == state.generation.participants);
     if should_release {
-        let removed = map
-            .remove(&barrier_id)
-            .expect("registered barrier generation must be present");
+        let Some(removed) = map.remove(&barrier_id) else {
+            return Err(FunctionCallError::RespondToModel(
+                "registered barrier generation disappeared".to_string(),
+            ));
+        };
         debug_assert!(Arc::ptr_eq(&removed.generation, &generation));
     }
     drop(map);

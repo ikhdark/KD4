@@ -666,13 +666,8 @@ impl RealtimeConversationManager {
             return Ok(());
         };
 
-        let handoff_id = {
-            let mut active_handoff = handoff.active_handoff.lock().await;
-            let mut last_output_text = handoff.last_output_text.lock().await;
-            let handoff_id = active_handoff.take();
-            *last_output_text = None;
-            handoff_id
-        };
+        let handoff_id = handoff.active_handoff.lock().await.take();
+        *handoff.last_output_text.lock().await = None;
         if handoff.client_managed_handoffs || handoff.session_kind == RealtimeSessionKind::V1 {
             return Ok(());
         }

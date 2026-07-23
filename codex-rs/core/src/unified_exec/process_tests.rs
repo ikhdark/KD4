@@ -265,7 +265,9 @@ async fn output_published_before_streaming_starts_is_retained() {
     let marker = b"startup-output".to_vec();
 
     process.publish_output_for_test(marker.clone()).await;
-    let mut receiver = process.take_output_receiver();
+    let mut receiver = process
+        .take_output_receiver()
+        .expect("reserved output receiver");
 
     assert_eq!(receiver.recv().await.expect("reserved output"), marker);
 }
@@ -283,7 +285,8 @@ async fn startup_output_reaches_initial_and_final_transcripts_once() {
     );
 
     process.publish_output_for_test(marker.clone()).await;
-    start_streaming_output(&process, &context, Arc::clone(&transcript));
+    start_streaming_output(&process, &context, Arc::clone(&transcript))
+        .expect("start output streaming");
 
     let handles = process.output_handles();
     let initial = UnifiedExecProcessManager::collect_output_until_deadline(
