@@ -50,6 +50,21 @@ impl ChildTerminator for PipeChildTerminator {
         }
     }
 
+    fn terminate_gracefully(&mut self) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            crate::process_group::terminate_process_group(self.process_group_id).map(|_| ())
+        }
+
+        #[cfg(not(unix))]
+        {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "graceful process-tree termination is unavailable",
+            ))
+        }
+    }
+
     fn kill(&mut self) -> io::Result<()> {
         #[cfg(unix)]
         {
@@ -223,11 +238,21 @@ async fn spawn_process_with_stdin_mode(
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
     let exit_status = Arc::new(AtomicBool::new(false));
     let wait_exit_status = Arc::clone(&exit_status);
+    let termination_confirmed = Arc::new(AtomicBool::new(false));
+    let wait_termination_confirmed = Arc::clone(&termination_confirmed);
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
     let wait_handle: JoinHandle<()> = tokio::spawn(async move {
         let code = match child.wait().await {
-            Ok(status) => exit_code_from_status(status),
+            Ok(status) => {
+                #[cfg(unix)]
+                if status.code().is_some() {
+                    wait_termination_confirmed.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                #[cfg(not(unix))]
+                wait_termination_confirmed.store(true, std::sync::atomic::Ordering::SeqCst);
+                exit_code_from_status(status)
+            }
             Err(_) => -1,
         };
         wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -250,6 +275,7 @@ async fn spawn_process_with_stdin_mode(
         writer_handle,
         wait_handle,
         exit_status,
+        termination_confirmed,
         exit_code,
         /*pty_handles*/ None,
         /*resizer*/ None,

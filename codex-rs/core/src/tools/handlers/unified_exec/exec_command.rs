@@ -13,7 +13,8 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::context::boxed_tool_output;
 use crate::tools::handlers::apply_granted_turn_permissions;
-use crate::tools::handlers::apply_patch::intercept_apply_patch;
+use crate::tools::handlers::apply_patch::execute_intercepted_apply_patch;
+use crate::tools::handlers::apply_patch::preflight_intercept_apply_patch;
 use crate::tools::handlers::command_preflight::preflight_invocation_with_equivalent_repair;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
@@ -23,6 +24,8 @@ use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_tool_environment;
 use crate::tools::handlers::rewrite_function_command_argument;
+use crate::tools::handlers::task_evidence_network_is_unbounded;
+use crate::tools::handlers::task_evidence_writable_roots;
 use crate::tools::handlers::updated_hook_command;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
@@ -41,6 +44,8 @@ use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
+use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
+use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_shell_command::shell_detect::detect_shell_type;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -432,6 +437,96 @@ impl ExecCommandHandler {
                 return Err(FunctionCallError::RespondToModel(err));
             }
         };
+        let base_file_system_policy = turn.file_system_sandbox_policy();
+        let effective_file_system_policy = effective_file_system_sandbox_policy(
+            &base_file_system_policy,
+            normalized_additional_permissions.as_ref(),
+        );
+        let network_is_unbounded = task_evidence_network_is_unbounded(
+            turn.network_sandbox_policy(),
+            normalized_additional_permissions.as_ref(),
+        );
+        let has_unbounded_mutation_authority = effective_additional_permissions
+            .sandbox_permissions
+            .requires_escalated_permissions()
+            || effective_file_system_policy.has_full_disk_write_access()
+            || network_is_unbounded;
+        let review_delegate = matches!(
+            turn.session_source,
+            codex_protocol::protocol::SessionSource::SubAgent(
+                codex_protocol::protocol::SubAgentSource::Review
+            )
+        );
+        let mut reserved_mutation_guard = if !is_known_safe_command(&safety_command) {
+            session
+                .services
+                .task_evidence
+                .reserve_tool_dispatch(
+                    &ToolName::plain("normalized_shell_mutation"),
+                    &turn.sub_id,
+                    /*declared_read_only*/ false,
+                    /*trusted_external_read_only*/ false,
+                    review_delegate,
+                    /*trusted_mutator*/ false,
+                    /*trusted_builtin*/ true,
+                )
+                .await
+                .map_err(FunctionCallError::RespondToModel)?
+        } else {
+            None
+        };
+        if reserved_mutation_guard.is_some() && has_unbounded_mutation_authority {
+            return Err(FunctionCallError::RespondToModel(
+                "command rejected: its effective permissions allow mutations outside bounded registered roots"
+                    .to_string(),
+            ));
+        }
+        if reserved_mutation_guard.is_some() && native_cwd.is_none() {
+            return Err(FunctionCallError::RespondToModel(
+                "command rejected: external mutation ownership is unresolvable".to_string(),
+            ));
+        }
+
+        let interception_started_at = std::time::Instant::now();
+        let intercepted_preflight = preflight_intercept_apply_patch(
+            &command,
+            &cwd,
+            fs.as_ref(),
+            &turn_environment,
+            context.session.as_ref(),
+            context.turn.as_ref(),
+        )
+        .await;
+        let mutation_guard = if matches!(&intercepted_preflight, Ok(None)) {
+            let guard = session
+                .services
+                .task_evidence
+                .guard_normalized_command(
+                    &safety_command,
+                    native_cwd.as_ref().map(|cwd| cwd.as_path()),
+                    &turn.sub_id,
+                    review_delegate,
+                    has_unbounded_mutation_authority,
+                )
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+            reserved_mutation_guard = None;
+            guard
+        } else {
+            None
+        };
+        if mutation_guard.is_some()
+            && let Some(native_cwd) = native_cwd.as_ref()
+        {
+            let writable_roots =
+                task_evidence_writable_roots(&effective_file_system_policy, native_cwd.as_path());
+            session
+                .services
+                .task_evidence
+                .register_mutation_targets(native_cwd.as_path(), &writable_roots)
+                .await
+                .map_err(FunctionCallError::RespondToModel)?;
+        }
 
         let sandbox_context = format!(
             "requested={sandbox_permissions:?};effective={:?};additional={normalized_additional_permissions:?};preapproved={};approval={:?};windows={:?}",
@@ -471,19 +566,53 @@ impl ExecCommandHandler {
             .begin_attempt(&attempt_key, repair_notice.is_some())
             .await
             .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
-        let interception_started_at = std::time::Instant::now();
-        let intercepted = intercept_apply_patch(
-            &command,
-            &cwd,
-            fs.as_ref(),
-            turn_environment.clone(),
-            context.session.clone(),
-            context.turn.clone(),
-            Some(&tracker),
-            &context.call_id,
-            "exec_command",
-        )
-        .await;
+        let intercepted = match intercepted_preflight {
+            Ok(Some(changes)) => {
+                if let Some(reservation) = reserved_mutation_guard.as_ref()
+                    && let Err(message) = session
+                        .services
+                        .task_evidence
+                        .start_reserved_tool_dispatch(&turn.sub_id, reservation)
+                        .await
+                {
+                    session
+                        .services
+                        .command_execution
+                        .record_exit(&attempt_key, -1)
+                        .await;
+                    return Err(FunctionCallError::RespondToModel(message));
+                }
+                let result = execute_intercepted_apply_patch(
+                    changes,
+                    &cwd,
+                    turn_environment.clone(),
+                    context.session.clone(),
+                    context.turn.clone(),
+                    Some(&tracker),
+                    &context.call_id,
+                    "exec_command",
+                )
+                .await
+                .map(Some);
+                if let Some(reservation) = reserved_mutation_guard.as_ref()
+                    && let Err(message) = session
+                        .services
+                        .task_evidence
+                        .finish_reserved_tool_dispatch(&turn.sub_id, reservation)
+                        .await
+                {
+                    session
+                        .services
+                        .command_execution
+                        .record_exit(&attempt_key, -1)
+                        .await;
+                    return Err(FunctionCallError::RespondToModel(message));
+                }
+                result
+            }
+            Ok(None) => Ok(None),
+            Err(err) => Err(err),
+        };
         let interception_wall_time = interception_started_at.elapsed();
         let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
         session
@@ -567,6 +696,7 @@ impl ExecCommandHandler {
                         .permissions_preapproved,
                     justification,
                     prefix_rule,
+                    mutation_guard,
                 },
                 process_id_reservation,
                 &context,
@@ -682,6 +812,15 @@ impl ExecCommandHandler {
 impl CoreToolRuntime for ExecCommandHandler {
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         ToolExecutionTiming::NestedRuntime
+    }
+
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        // A cancellation can race the interval after the sandboxed process is
+        // spawned but before its TaskMutationGuard is transferred into the
+        // process store. Let the handler finish that ownership transfer (or
+        // confirmed teardown) instead of aborting the future and dropping the
+        // last containment-aware process handle.
+        true
     }
 
     fn matches_kind(&self, payload: &ToolPayload) -> bool {

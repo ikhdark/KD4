@@ -2103,7 +2103,7 @@ async fn skills_use_aliases_in_developer_message_under_budget_pressure() {
     std::fs::create_dir_all(&long_home_parent).expect("create long home parent");
     let codex_home = Arc::new(TempDir::new_in(long_home_parent).unwrap());
     let skill_root = codex_home.path().join("skills");
-    for index in 0..12 {
+    for index in 0..88 {
         let skill_dir = skill_root.join(format!("s{index:02}"));
         std::fs::create_dir_all(&skill_dir).expect("create skill dir");
         std::fs::write(
@@ -2124,13 +2124,14 @@ async fn skills_use_aliases_in_developer_message_under_budget_pressure() {
                 &user_config_path,
                 toml! { skills = { bundled = { enabled = false } } }.into(),
             );
-            config.model_context_window = Some(12_000);
+            config.model_context_window = Some(128_000);
+            config.model_auto_compact_token_limit = Some(12_000);
         });
-    let codex = builder
+    let test = builder
         .build(&server)
         .await
-        .expect("create new conversation")
-        .codex;
+        .expect("create new conversation");
+    let codex = Arc::clone(&test.codex);
 
     codex
         .submit(Op::UserInput {
@@ -2173,6 +2174,7 @@ async fn skills_use_aliases_in_developer_message_under_budget_pressure() {
     );
     let _codex_home_guard = codex_home;
     let _codex_home_parent_guard = codex_home_parent;
+    let _test_guard = test;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

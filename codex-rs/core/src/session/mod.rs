@@ -226,6 +226,7 @@ use self::config_lock::validate_config_lock_if_configured;
 #[cfg(test)]
 use self::handlers::submission_dispatch_span;
 use self::handlers::submission_loop;
+pub(crate) use self::input_queue::FinalCommitBoundary;
 pub(crate) use self::input_queue::InputQueueActivity;
 pub(crate) use self::input_queue::TurnInput;
 pub(crate) use self::input_queue::TurnInputQueue;
@@ -250,6 +251,7 @@ pub enum SteerInputError {
     NoActiveTurn(Vec<UserInput>),
     ExpectedTurnMismatch { expected: String, actual: String },
     ActiveTurnNotSteerable { turn_kind: NonSteerableTurnKind },
+    TaskState(String),
     EmptyInput,
 }
 
@@ -276,6 +278,10 @@ impl SteerInputError {
                     }),
                 }
             }
+            Self::TaskState(message) => ErrorEvent {
+                message: message.clone(),
+                codex_error_info: Some(CodexErrorInfo::BadRequest),
+            },
             Self::EmptyInput => ErrorEvent {
                 message: "input must not be empty".to_string(),
                 codex_error_info: Some(CodexErrorInfo::BadRequest),
@@ -1774,6 +1780,137 @@ impl Session {
 
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, turn_context: &TurnContext, msg: EventMsg) {
+        let _ = self
+            .send_event_impl(turn_context, msg, /*require_durable_primary*/ false)
+            .await;
+    }
+
+    pub(crate) async fn send_event_checked(
+        &self,
+        turn_context: &TurnContext,
+        msg: EventMsg,
+    ) -> Result<(), String> {
+        self.send_events_checked(turn_context, vec![msg]).await
+    }
+
+    pub(crate) async fn send_events_checked(
+        &self,
+        turn_context: &TurnContext,
+        messages: Vec<EventMsg>,
+    ) -> Result<(), String> {
+        self.send_events_checked_impl(turn_context, messages, /*require_each_durable*/ true)
+            .await
+    }
+
+    async fn send_events_checked_impl(
+        &self,
+        turn_context: &TurnContext,
+        messages: Vec<EventMsg>,
+        require_each_durable: bool,
+    ) -> Result<(), String> {
+        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+        let expanded = messages
+            .into_iter()
+            .map(|message| {
+                let legacy = message.as_legacy_events(show_raw_agent_reasoning);
+                (message, legacy)
+            })
+            .collect::<Vec<_>>();
+        let mut durable_events = Vec::new();
+        for (message, legacy) in &expanded {
+            let durable_start = durable_events.len();
+            durable_events.extend(
+                std::iter::once(message)
+                    .chain(legacy.iter())
+                    .map(|event| RolloutItem::EventMsg(event.clone()))
+                    .filter(|item| {
+                        codex_rollout::is_persisted_rollout_item(item, turn_context.history_mode)
+                    }),
+            );
+            if require_each_durable && durable_events.len() == durable_start {
+                return Err(
+                    "lifecycle event has no durable representation in this history mode"
+                        .to_string(),
+                );
+            }
+        }
+        if durable_events.is_empty() {
+            return Err(
+                "lifecycle event batch has no durable representation in this history mode"
+                    .to_string(),
+            );
+        }
+        if !turn_context.config.ephemeral {
+            let Some(live_thread) = self.live_thread() else {
+                return Err(
+                    "cannot durably emit lifecycle event because rollout persistence is disabled"
+                        .to_string(),
+                );
+            };
+            live_thread
+                .append_items(&durable_events)
+                .await
+                .map_err(|err| format!("failed to durably emit lifecycle event: {err:#}"))?;
+        }
+
+        for (message, legacy_events) in expanded {
+            if let EventMsg::Error(error) = &message
+                && error
+                    .codex_error_info
+                    .as_ref()
+                    .is_some_and(CodexErrorInfo::affects_turn_status)
+            {
+                turn_context
+                    .terminal_error
+                    .lock()
+                    .await
+                    .replace(error.message.clone());
+            }
+            self.services
+                .rollout_thread_trace
+                .record_codex_turn_event(&turn_context.sub_id, &message);
+            self.services
+                .rollout_thread_trace
+                .record_tool_call_event(turn_context.sub_id.clone(), &message);
+            self.services
+                .rollout_thread_trace
+                .record_protocol_event(&message);
+            self.deliver_event_raw(Event {
+                id: turn_context.sub_id.clone(),
+                msg: message.clone(),
+            })
+            .await;
+            self.maybe_notify_parent_of_terminal_turn(turn_context, &message)
+                .await;
+            self.maybe_mirror_event_text_to_realtime(&message).await;
+            self.maybe_clear_realtime_handoff_for_event(&message).await;
+
+            for legacy in legacy_events {
+                self.services
+                    .rollout_thread_trace
+                    .record_tool_call_event(turn_context.sub_id.clone(), &legacy);
+                self.services
+                    .rollout_thread_trace
+                    .record_protocol_event(&legacy);
+                self.deliver_event_raw(Event {
+                    id: turn_context.sub_id.clone(),
+                    msg: legacy,
+                })
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_event_impl(
+        &self,
+        turn_context: &TurnContext,
+        msg: EventMsg,
+        require_durable_primary: bool,
+    ) -> Result<(), String> {
+        if require_durable_primary {
+            return self.send_events_checked(turn_context, vec![msg]).await;
+        }
         let legacy_source = msg.clone();
         if let EventMsg::Error(error) = &legacy_source
             && error
@@ -1793,6 +1930,8 @@ impl Session {
         self.services
             .rollout_thread_trace
             .record_tool_call_event(turn_context.sub_id.clone(), &legacy_source);
+        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
+        let legacy_events = legacy_source.as_legacy_events(show_raw_agent_reasoning);
         let event = Event {
             id: turn_context.sub_id.clone(),
             msg,
@@ -1805,8 +1944,7 @@ impl Session {
         self.maybe_clear_realtime_handoff_for_event(&legacy_source)
             .await;
 
-        let show_raw_agent_reasoning = self.show_raw_agent_reasoning();
-        for legacy in legacy_source.as_legacy_events(show_raw_agent_reasoning) {
+        for legacy in legacy_events {
             self.services
                 .rollout_thread_trace
                 .record_tool_call_event(turn_context.sub_id.clone(), &legacy);
@@ -1816,6 +1954,7 @@ impl Session {
             };
             self.send_event_raw(legacy_event).await;
         }
+        Ok(())
     }
 
     /// Forwards terminal turn events from spawned MultiAgentV2 children to their direct parent.
@@ -2050,6 +2189,61 @@ impl Session {
             }),
         )
         .await;
+    }
+
+    pub(crate) async fn emit_turn_item_completed_checked(
+        &self,
+        turn_context: &TurnContext,
+        item: TurnItem,
+    ) -> Result<(), String> {
+        record_turn_ttfm_metric(turn_context, &item).await;
+        self.send_event_checked(
+            turn_context,
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: self.thread_id,
+                turn_id: turn_context.sub_id.clone(),
+                item,
+                completed_at_ms: now_unix_timestamp_ms(),
+            }),
+        )
+        .await
+    }
+
+    pub(crate) async fn emit_managed_final_items_checked(
+        &self,
+        turn_context: &TurnContext,
+        items: Vec<TurnItem>,
+    ) -> Result<(), String> {
+        if items.is_empty() {
+            return Err("managed final has no lifecycle item to complete".to_string());
+        }
+        for item in &items {
+            record_turn_ttfm_metric(turn_context, item).await;
+        }
+        let started_at_ms = now_unix_timestamp_ms();
+        let completed_at_ms = now_unix_timestamp_ms();
+        let mut events = items
+            .iter()
+            .cloned()
+            .map(|item| {
+                EventMsg::ItemStarted(ItemStartedEvent {
+                    thread_id: self.thread_id,
+                    turn_id: turn_context.sub_id.clone(),
+                    item,
+                    started_at_ms,
+                })
+            })
+            .collect::<Vec<_>>();
+        events.extend(items.into_iter().map(|item| {
+            EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: self.thread_id,
+                turn_id: turn_context.sub_id.clone(),
+                item,
+                completed_at_ms,
+            })
+        }));
+        self.send_events_checked_impl(turn_context, events, /*require_each_durable*/ false)
+            .await
     }
 
     /// Adds an execpolicy amendment to both the in-memory and on-disk policies so future
@@ -2883,20 +3077,110 @@ impl Session {
     ) {
         let items = self.prepare_conversation_items_for_history(turn_context, items);
         let items = items.as_ref();
-        {
+        let tool_output_bytes = {
             let mut state = self.state.lock().await;
             state.current_time_reminder.note_recorded_items(items);
+            let previous_history_len = state.history.raw_items().len();
             state.record_items(
                 items.iter(),
                 turn_context.model_info.truncation_policy.into(),
             );
-        }
+            model_visible_tool_output_bytes(&state.history.raw_items()[previous_history_len..])
+        };
+        self.services
+            .agent_control
+            .rollout_budget()
+            .record_tool_output_bytes(tool_output_bytes);
         let persistence_timing_guard = turn_context
             .turn_timing_state
             .begin_local_phase(TurnLocalPhase::Persistence);
         self.persist_rollout_response_items(items).await;
         drop(persistence_timing_guard);
         self.send_raw_response_items(turn_context, items).await;
+    }
+
+    pub(crate) async fn record_conversation_items_checked(
+        &self,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+    ) -> Result<(), String> {
+        let items = self.prepare_conversation_items_for_history(turn_context, items);
+        let items = items.as_ref();
+        if !turn_context.config.ephemeral {
+            let rollout_items = items
+                .iter()
+                .cloned()
+                .map(RolloutItem::ResponseItem)
+                .collect::<Vec<_>>();
+            let Some(live_thread) = self.live_thread() else {
+                return Err(
+                    "cannot durably persist final response because rollout persistence is disabled"
+                        .to_string(),
+                );
+            };
+            let persistence_timing_guard = turn_context
+                .turn_timing_state
+                .begin_local_phase(TurnLocalPhase::Persistence);
+            live_thread
+                .append_items(&rollout_items)
+                .await
+                .map_err(|err| format!("failed to durably persist final response: {err:#}"))?;
+            drop(persistence_timing_guard);
+        }
+        let tool_output_bytes = {
+            let mut state = self.state.lock().await;
+            state.current_time_reminder.note_recorded_items(items);
+            let previous_history_len = state.history.raw_items().len();
+            state.record_items(
+                items.iter(),
+                turn_context.model_info.truncation_policy.into(),
+            );
+            model_visible_tool_output_bytes(&state.history.raw_items()[previous_history_len..])
+        };
+        self.services
+            .agent_control
+            .rollout_budget()
+            .record_tool_output_bytes(tool_output_bytes);
+        self.send_raw_response_items(turn_context, items).await;
+        Ok(())
+    }
+
+    pub(crate) async fn record_conversation_items_for_model_history_and_rollout_only(
+        &self,
+        turn_context: &TurnContext,
+        items: &[ResponseItem],
+    ) -> bool {
+        let items = self.prepare_conversation_items_for_history(turn_context, items);
+        let persisted = if turn_context.config.ephemeral {
+            true
+        } else if let Some(live_thread) = self.live_thread() {
+            let rollout_items = items
+                .iter()
+                .cloned()
+                .map(RolloutItem::ResponseItem)
+                .collect::<Vec<_>>();
+            match live_thread.append_items(&rollout_items).await {
+                Ok(()) => true,
+                Err(err) => {
+                    error!("failed to durably persist model-history-only response items: {err:#}");
+                    false
+                }
+            }
+        } else {
+            error!(
+                "cannot durably persist model-history-only response items: rollout persistence is disabled"
+            );
+            false
+        };
+        let mut state = self.state.lock().await;
+        state
+            .current_time_reminder
+            .note_recorded_items(items.as_ref());
+        state.record_items(
+            items.iter(),
+            turn_context.model_info.truncation_policy.into(),
+        );
+        persisted
     }
 
     pub(crate) async fn record_step_world_state_if_changed(
@@ -3771,7 +4055,7 @@ impl Session {
                 }
                 state.token_info()
             };
-            let budget_result = self.record_rollout_budget_usage(token_usage);
+            let budget_result = self.record_rollout_budget_usage(turn_context, token_usage);
             if let Some(token_info) = token_info.as_ref() {
                 for contributor in self.services.extensions.token_usage_contributors() {
                     contributor
@@ -3992,6 +4276,21 @@ impl Session {
         if input.is_empty() {
             return Err(SteerInputError::EmptyInput);
         }
+        if active_task.task_evidence_managed {
+            let task_contract_fragment = turn::task_contract_from_user_input(&input);
+            match self
+                .services
+                .task_evidence
+                .extend_task_contract(&active_turn_id, &task_contract_fragment)
+                .await
+            {
+                Ok(crate::task_evidence::TaskContractUpdate::Extended) => {}
+                Ok(crate::task_evidence::TaskContractUpdate::FinalCommitted) => {
+                    return Err(SteerInputError::NoActiveTurn(input));
+                }
+                Err(err) => return Err(SteerInputError::TaskState(err)),
+            }
+        }
         let input_for_telemetry = input.clone();
 
         let additional_context_input = {
@@ -4152,6 +4451,30 @@ async fn build_hooks_for_config(
         plugin_hook_load_warnings,
         shell_program: hook_shell_program,
         shell_args: hook_shell_argv,
+    })
+}
+
+fn model_visible_tool_output_bytes(items: &[ResponseItem]) -> usize {
+    items.iter().fold(0usize, |total, item| {
+        let bytes = match item {
+            ResponseItem::FunctionCallOutput { output, .. }
+            | ResponseItem::CustomToolCallOutput { output, .. } => {
+                output.text_content().map_or_else(
+                    || {
+                        output
+                            .content_items()
+                            .and_then(|items| serde_json::to_vec(items).ok())
+                            .map_or(0, |items| items.len())
+                    },
+                    str::len,
+                )
+            }
+            ResponseItem::ToolSearchOutput { tools, .. } => {
+                serde_json::to_vec(tools).map_or(0, |tools| tools.len())
+            }
+            _ => return total,
+        };
+        total.saturating_add(bytes)
     })
 }
 

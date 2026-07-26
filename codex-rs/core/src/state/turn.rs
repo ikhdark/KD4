@@ -85,6 +85,7 @@ pub(crate) struct RunningTask {
     pub(crate) task_span: Span,
     pub(crate) turn_context: Arc<TurnContext>,
     pub(crate) turn_extension_data: Arc<ExtensionData>,
+    pub(crate) task_evidence_managed: bool,
     pub(crate) _agent_execution_guard: Option<AgentExecutionGuard>,
 }
 

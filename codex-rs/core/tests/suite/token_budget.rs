@@ -522,7 +522,8 @@ async fn token_budget_reminder_emits_after_crossing_compaction_threshold() -> Re
     .await;
     let test = test_codex()
         .with_config(|config| {
-            config.model_context_window = Some(10_000);
+            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
+            config.model_auto_compact_token_limit = Some(9_000);
             config.token_budget = Some(TokenBudgetConfig {
                 reminder_threshold_tokens: Some(2_000),
                 ..TokenBudgetConfig::default()
@@ -578,7 +579,7 @@ async fn token_budget_reminder_uses_body_after_prefix_window() -> Result<()> {
     .await;
     let test = test_codex()
         .with_config(|config| {
-            config.model_context_window = Some(10_000);
+            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
             config.model_auto_compact_token_limit = Some(1_000);
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
@@ -649,7 +650,8 @@ async fn get_context_remaining_returns_token_budget_remaining_fragment() -> Resu
     .await;
     let test = test_codex()
         .with_config(|config| {
-            config.model_context_window = Some(10_000);
+            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
+            config.model_auto_compact_token_limit = Some(9_000);
             config
                 .features
                 .enable(Feature::TokenBudget)
@@ -714,7 +716,7 @@ async fn get_context_remaining_uses_body_after_prefix_window() -> Result<()> {
     .await;
     let test = test_codex()
         .with_config(|config| {
-            config.model_context_window = Some(10_000);
+            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
             config.model_auto_compact_token_limit = Some(7_000);
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
@@ -748,7 +750,7 @@ async fn get_context_remaining_uses_body_after_prefix_window() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn get_context_remaining_returns_unknown_when_threshold_is_unbounded() -> Result<()> {
+async fn get_context_remaining_uses_local_cap_when_model_window_is_unbounded() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -799,7 +801,7 @@ async fn get_context_remaining_returns_unknown_when_threshold_is_unbounded() -> 
     assert_eq!(
         requests[1].function_call_output_content_and_success(call_id),
         Some((
-            Some("You have unknown tokens left in this context window.".to_string()),
+            Some("You have 272000 tokens left in this context window.".to_string()),
             None,
         ))
     );
@@ -968,7 +970,8 @@ async fn token_budget_mid_turn_auto_compaction_resets_before_active_follow_up() 
     let test = test_codex()
         .with_config(move |config| {
             config.model_provider = model_provider;
-            config.model_context_window = Some(10_000);
+            config.model_context_window = Some(CONFIGURED_CONTEXT_WINDOW);
+            config.model_auto_compact_token_limit = Some(9_000);
             config
                 .features
                 .enable(Feature::TokenBudget)
@@ -1028,7 +1031,11 @@ async fn new_context_tool_starts_new_window_before_follow_up() -> Result<()> {
     let continue_call_id = "continue-call";
     let continue_args = json!({
         "plan": [
-            {"step": "Continue in the new context window", "status": "in_progress"}
+            {
+                "id": "continue-in-new-window",
+                "step": "Continue in the new context window",
+                "status": "in_progress"
+            }
         ],
     })
     .to_string();

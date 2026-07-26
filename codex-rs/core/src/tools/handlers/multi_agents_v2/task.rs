@@ -62,7 +62,15 @@ pub(crate) struct WaiveAgentGateHandler;
 pub(crate) struct AbandonAgentTaskHandler;
 
 macro_rules! define_handler {
-    ($handler:ident, $tool_name:expr, $spec:ident, $handle:ident, $parallel:expr) => {
+    (
+        $handler:ident,
+        $tool_name:expr,
+        $spec:ident,
+        $handle:ident,
+        $parallel:expr,
+        $read_only:expr,
+        $trusted_mutator:expr
+    ) => {
         impl ToolExecutor<ToolInvocation> for $handler {
             fn tool_name(&self) -> ToolName {
                 ToolName::plain($tool_name)
@@ -82,6 +90,14 @@ macro_rules! define_handler {
         }
 
         impl CoreToolRuntime for $handler {
+            fn task_evidence_read_only(&self) -> bool {
+                $read_only
+            }
+
+            fn task_evidence_trusted_mutator(&self) -> bool {
+                $trusted_mutator
+            }
+
             fn matches_kind(&self, payload: &ToolPayload) -> bool {
                 matches!(payload, ToolPayload::Function { .. })
             }
@@ -94,42 +110,54 @@ define_handler!(
     GET_AGENT_TASK_TOOL,
     get_agent_task_spec,
     handle_get_agent_task,
-    true
+    true,
+    true,
+    false
 );
 define_handler!(
     SubmitAgentReceiptHandler,
     SUBMIT_AGENT_RECEIPT_TOOL,
     submit_agent_receipt_spec,
     handle_submit_agent_receipt,
-    false
+    false,
+    false,
+    true
 );
 define_handler!(
     SetAgentGateHandler,
     SET_AGENT_GATE_TOOL,
     set_agent_gate_spec,
     handle_set_agent_gate,
-    false
+    false,
+    false,
+    true
 );
 define_handler!(
     AmendAgentTaskHandler,
     AMEND_AGENT_TASK_TOOL,
     amend_agent_task_spec,
     handle_amend_agent_task,
-    false
+    false,
+    false,
+    true
 );
 define_handler!(
     WaiveAgentGateHandler,
     WAIVE_AGENT_GATE_TOOL,
     waive_agent_gate_spec,
     handle_waive_agent_gate,
-    false
+    false,
+    false,
+    true
 );
 define_handler!(
     AbandonAgentTaskHandler,
     ABANDON_AGENT_TASK_TOOL,
     abandon_agent_task_spec,
     handle_abandon_agent_task,
-    false
+    false,
+    false,
+    true
 );
 
 async fn handle_get_agent_task(

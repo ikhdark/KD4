@@ -71,6 +71,8 @@ pub struct SpawnRequest {
     pub stdin_open: bool,
     #[serde(default)]
     pub use_private_desktop: bool,
+    #[serde(default)]
+    pub require_confirmed_descendant_exit: bool,
 }
 
 /// Ack from runner after it spawns the child process.
@@ -228,6 +230,7 @@ mod tests {
                     tty: false,
                     stdin_open: false,
                     use_private_desktop: false,
+                    require_confirmed_descendant_exit: false,
                 }),
             },
         };

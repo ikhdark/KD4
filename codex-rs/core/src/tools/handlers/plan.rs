@@ -174,8 +174,9 @@ impl PlanHandler {
         let args = session
             .services
             .task_evidence
-            .record_plan_update(&requested_args)
-            .await;
+            .try_record_plan_update(&requested_args)
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
         let normalized_plan = (args != requested_args).then(|| args.clone());
         session
             .send_event(turn.as_ref(), EventMsg::PlanUpdate(args))

@@ -8,6 +8,7 @@ use super::last_assistant_message_from_item;
 use super::response_item_may_include_external_context;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
+use crate::session::tests::make_session_and_context_with_rx;
 use crate::tools::ToolRouter;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::turn_diff_tracker::TurnDiffTracker;
@@ -23,8 +24,11 @@ use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::EventMsg;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tokio_util::sync::CancellationToken;
 
 fn assistant_output_text(text: &str) -> ResponseItem {
@@ -216,6 +220,50 @@ impl TurnItemContributor for RewriteAgentMessageContributor {
     }
 }
 
+struct MutateThenFailAgentMessageContributor;
+
+impl TurnItemContributor for MutateThenFailAgentMessageContributor {
+    fn contribute<'a>(
+        &'a self,
+        _thread_store: &'a ExtensionData,
+        _turn_store: &'a ExtensionData,
+        item: &'a mut TurnItem,
+    ) -> codex_extension_api::ExtensionFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            if let TurnItem::AgentMessage(agent_message) = item {
+                agent_message.content = vec![AgentMessageContent::Text {
+                    text: "failed contributor mutation".to_string(),
+                }];
+                agent_message.phase = Some(MessagePhase::Commentary);
+            }
+            Err("intentional contributor failure".to_string())
+        })
+    }
+}
+
+struct CountingRewriteAgentMessageContributor {
+    calls: Arc<AtomicUsize>,
+}
+
+impl TurnItemContributor for CountingRewriteAgentMessageContributor {
+    fn contribute<'a>(
+        &'a self,
+        _thread_store: &'a ExtensionData,
+        _turn_store: &'a ExtensionData,
+        item: &'a mut TurnItem,
+    ) -> codex_extension_api::ExtensionFuture<'a, Result<(), String>> {
+        Box::pin(async move {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if let TurnItem::AgentMessage(agent_message) = item {
+                agent_message.content = vec![AgentMessageContent::Text {
+                    text: "prefinalized contributed assistant text".to_string(),
+                }];
+            }
+            Ok(())
+        })
+    }
+}
+
 #[tokio::test]
 async fn handle_non_tool_response_item_runs_turn_item_contributors_only_when_requested() {
     let (mut session, turn_context) = make_session_and_context().await;
@@ -267,6 +315,49 @@ async fn handle_non_tool_response_item_runs_turn_item_contributors_only_when_req
 }
 
 #[tokio::test]
+async fn failed_turn_item_contributor_rolls_back_only_its_own_mutation() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.turn_item_contributor(Arc::new(RewriteAgentMessageContributor));
+    builder.turn_item_contributor(Arc::new(MutateThenFailAgentMessageContributor));
+    session.services.extensions = Arc::new(builder.build());
+    let turn_store = ExtensionData::new(turn_context.sub_id.clone());
+    let item = assistant_output_text_with_phase(
+        "original assistant text",
+        Some(MessagePhase::FinalAnswer),
+    );
+
+    let finalized = finalize_non_tool_response_item(
+        &session,
+        TurnItemContributorPolicy::Run(&turn_store),
+        &item,
+        /*plan_mode*/ false,
+    )
+    .await
+    .expect("assistant message should finalize");
+
+    let TurnItem::AgentMessage(agent_message) = finalized.turn_item else {
+        panic!("expected agent message");
+    };
+    assert_eq!(agent_message.phase, Some(MessagePhase::FinalAnswer));
+    let text = agent_message
+        .content
+        .iter()
+        .map(|entry| match entry {
+            AgentMessageContent::Text { text } => text.as_str(),
+        })
+        .collect::<String>();
+    assert_eq!(
+        text, "contributed assistant text",
+        "the successful contributor mutation should survive the later rollback"
+    );
+    assert_eq!(
+        finalized.facts.last_agent_message.as_deref(),
+        Some("contributed assistant text")
+    );
+}
+
+#[tokio::test]
 async fn handle_output_item_done_returns_contributed_last_agent_message() {
     let (mut session, turn_context) = make_session_and_context().await;
     let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
@@ -297,14 +388,143 @@ async fn handle_output_item_done_returns_contributed_last_agent_message() {
         cancellation_token: CancellationToken::new(),
     };
 
-    let output = handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None)
-        .await
-        .expect("assistant message should complete");
+    let output = handle_output_item_done(
+        &mut ctx, item, /*previously_active_item*/ None,
+        /*suppress_external_effects*/ false, /*require_durable_lifecycle*/ false,
+        /*prefinalized_non_tool_item*/ None,
+    )
+    .await
+    .expect("assistant message should complete");
 
     assert_eq!(
         output.last_agent_message.as_deref(),
         Some("contributed assistant text")
     );
+}
+
+#[tokio::test]
+async fn handle_output_item_done_uses_prefinalized_item_without_rerunning_contributors() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.turn_item_contributor(Arc::new(CountingRewriteAgentMessageContributor {
+        calls: Arc::clone(&calls),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+    let turn_context = Arc::new(turn_context);
+    let turn_store = Arc::new(ExtensionData::new(turn_context.sub_id.clone()));
+    let item = assistant_output_text("original assistant text");
+    let prefinalized = finalize_non_tool_response_item(
+        session.as_ref(),
+        TurnItemContributorPolicy::Run(turn_store.as_ref()),
+        &item,
+        /*plan_mode*/ false,
+    )
+    .await
+    .expect("assistant message should prefinalize");
+    let expected_facts = prefinalized.facts.clone();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let router = Arc::new(ToolRouter::from_context(
+        step_context.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            mcp_tools: None,
+            deferred_mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: turn_context.dynamic_tools.as_slice(),
+        },
+        &Default::default(),
+    ));
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let tool_runtime = ToolCallRuntime::new(router, Arc::clone(&session), step_context, tracker);
+    let mut ctx = HandleOutputCtx {
+        sess: session,
+        turn_context: Arc::clone(&turn_context),
+        turn_store,
+        tool_runtime,
+        cancellation_token: CancellationToken::new(),
+    };
+
+    let output = handle_output_item_done(
+        &mut ctx,
+        item,
+        /*previously_active_item*/ None,
+        /*suppress_external_effects*/ false,
+        /*require_durable_lifecycle*/ false,
+        Some(prefinalized),
+    )
+    .await
+    .expect("prefinalized assistant message should complete");
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(output.last_agent_message, expected_facts.last_agent_message);
+    assert_eq!(
+        output.last_agent_message.as_deref(),
+        Some("prefinalized contributed assistant text")
+    );
+    assert_eq!(output.last_agent_message_item_id.as_deref(), Some("msg-1"));
+}
+
+#[tokio::test]
+async fn provisional_final_is_persisted_without_item_lifecycle_events() {
+    let (session, turn_context, rx) = make_session_and_context_with_rx().await;
+    let step_context = StepContext::for_test(Arc::clone(&turn_context));
+    let router = Arc::new(ToolRouter::from_context(
+        step_context.as_ref(),
+        crate::tools::router::ToolRouterParams {
+            tool_suggest_candidates: None,
+            mcp_tools: None,
+            deferred_mcp_tools: None,
+            extension_tool_executors: Vec::new(),
+            dynamic_tools: turn_context.dynamic_tools.as_slice(),
+        },
+        &Default::default(),
+    ));
+    let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+    let tool_runtime = ToolCallRuntime::new(router, Arc::clone(&session), step_context, tracker);
+    let item =
+        assistant_output_text_with_phase("provisional final", Some(MessagePhase::FinalAnswer));
+    let mut ctx = HandleOutputCtx {
+        sess: Arc::clone(&session),
+        turn_context: Arc::clone(&turn_context),
+        turn_store: Arc::new(ExtensionData::new(turn_context.sub_id.clone())),
+        tool_runtime,
+        cancellation_token: CancellationToken::new(),
+    };
+
+    handle_output_item_done(
+        &mut ctx,
+        item.clone(),
+        /*previously_active_item*/ None,
+        /*suppress_external_effects*/ true,
+        /*require_durable_lifecycle*/ false,
+        /*prefinalized_non_tool_item*/ None,
+    )
+    .await
+    .expect("provisional final should persist");
+
+    let history = session.clone_history().await;
+    let mut history_items = history.raw_items().to_vec();
+    history_items
+        .iter_mut()
+        .for_each(ResponseItem::clear_internal_chat_message_metadata_passthrough);
+    assert_eq!(history_items, vec![item]);
+    while let Ok(event) = rx.try_recv() {
+        assert!(
+            !matches!(
+                event.msg,
+                EventMsg::ItemStarted(_)
+                    | EventMsg::ItemCompleted(_)
+                    | EventMsg::AgentMessage(_)
+                    | EventMsg::RawResponseItem(_)
+            ),
+            "provisional final leaked an external item event: {:?}",
+            event.msg
+        );
+    }
 }
 
 #[tokio::test]
@@ -342,9 +562,13 @@ async fn malformed_client_tool_search_records_correlated_tool_search_output() {
         cancellation_token: CancellationToken::new(),
     };
 
-    let output = handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None)
-        .await
-        .expect("malformed tool_search call should be recorded for model recovery");
+    let output = handle_output_item_done(
+        &mut ctx, item, /*previously_active_item*/ None,
+        /*suppress_external_effects*/ false, /*require_durable_lifecycle*/ false,
+        /*prefinalized_non_tool_item*/ None,
+    )
+    .await
+    .expect("malformed tool_search call should be recorded for model recovery");
 
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_none());

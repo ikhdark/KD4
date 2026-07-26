@@ -78,6 +78,7 @@ use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_rmcp_client::ElicitationAction;
 use codex_rmcp_client::ElicitationResponse;
 use codex_rollout::state_db;
+use codex_tools::ToolName;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
@@ -122,6 +123,8 @@ pub(crate) async fn handle_mcp_tool_call(
     call_id: String,
     sampled_server: &str,
     sampled_tool_name: &str,
+    sampled_canonical_tool_name: ToolName,
+    sampled_read_only_authorization: bool,
     arguments: String,
     cancellation_token: CancellationToken,
 ) -> HandledMcpToolCall {
@@ -203,6 +206,41 @@ pub(crate) async fn handle_mcp_tool_call(
         tool: tool_name.clone(),
         arguments: arguments_value.clone(),
     };
+    if sampled_read_only_authorization {
+        if let Err(message) = authorize_sampled_read_only_mcp_tool(
+            sess.as_ref(),
+            turn_context.as_ref(),
+            &live_tool_info,
+            &sampled_server,
+            &sampled_tool_name,
+            &sampled_canonical_tool_name,
+        )
+        .await
+        {
+            let result = notify_mcp_tool_call_skip(
+                sess.as_ref(),
+                turn_context.as_ref(),
+                &call_id,
+                invocation,
+                McpToolCallItemMetadata::from_tool_metadata(&server, None),
+                message,
+                /*already_started*/ false,
+            )
+            .await;
+            return HandledMcpToolCall {
+                result: CallToolResult::from_result(result),
+                tool_input: arguments_value
+                    .unwrap_or_else(|| JsonValue::Object(serde_json::Map::new())),
+            };
+        }
+    }
+    let managed_read_only_authorization = (sampled_read_only_authorization
+        && sess.services.task_evidence.inspect_status().await.is_some())
+    .then(|| ManagedMcpReadOnlyAuthorization {
+        sampled_server: sampled_server.clone(),
+        sampled_tool_name: sampled_tool_name.clone(),
+        sampled_canonical_tool_name: sampled_canonical_tool_name.clone(),
+    });
     let metadata = tokio::select! {
         biased;
         _ = cancellation_token.cancelled() => {
@@ -332,13 +370,32 @@ pub(crate) async fn handle_mcp_tool_call(
             }
         }
 
+        let execution_tool_info =
+            if let Some(authorization) = managed_read_only_authorization.as_ref() {
+                match resolve_authorized_read_only_mcp_tool(
+                    sess.as_ref(),
+                    turn_context.as_ref(),
+                    manager,
+                    authorization,
+                )
+                .await
+                {
+                    Ok(execution_tool_info) => execution_tool_info,
+                    Err(message) => {
+                        return McpToolCallOutcome::skipped(message, skipped_tool_input.clone());
+                    }
+                }
+            } else {
+                live_tool_info.clone()
+            };
         execute_approved_mcp_tool_call(
             sess.as_ref(),
             step_context.as_ref(),
             &call_id,
             operation_invocation,
-            &live_tool_info,
+            &execution_tool_info,
             metadata.as_ref(),
+            managed_read_only_authorization.as_ref(),
         )
         .await
     };
@@ -390,6 +447,95 @@ pub(crate) async fn handle_mcp_tool_call(
         result: CallToolResult::from_result(outcome.result),
         tool_input: outcome.tool_input,
     }
+}
+
+#[derive(Clone, Debug)]
+struct ManagedMcpReadOnlyAuthorization {
+    sampled_server: String,
+    sampled_tool_name: String,
+    sampled_canonical_tool_name: ToolName,
+}
+
+async fn resolve_authorized_read_only_mcp_tool(
+    sess: &Session,
+    turn_context: &TurnContext,
+    manager: &McpConnectionManager,
+    authorization: &ManagedMcpReadOnlyAuthorization,
+) -> Result<ToolInfo, String> {
+    let live_tool_info = manager
+        .tool_info(
+            &authorization.sampled_server,
+            &authorization.sampled_tool_name,
+        )
+        .await
+        .filter(tool_is_model_visible)
+        .ok_or_else(|| {
+            format!(
+                "MCP tool `{}/{}` is no longer available to the model",
+                authorization.sampled_server, authorization.sampled_tool_name
+            )
+        })?;
+    authorize_sampled_read_only_mcp_tool(
+        sess,
+        turn_context,
+        &live_tool_info,
+        &authorization.sampled_server,
+        &authorization.sampled_tool_name,
+        &authorization.sampled_canonical_tool_name,
+    )
+    .await?;
+    Ok(live_tool_info)
+}
+
+async fn authorize_sampled_read_only_mcp_tool(
+    sess: &Session,
+    turn_context: &TurnContext,
+    live_tool_info: &ToolInfo,
+    sampled_server: &str,
+    sampled_tool_name: &str,
+    sampled_canonical_tool_name: &ToolName,
+) -> Result<(), String> {
+    let live_authorized_read_only = live_tool_satisfies_sampled_read_only_authorization(
+        live_tool_info,
+        sampled_server,
+        sampled_tool_name,
+        sampled_canonical_tool_name,
+    );
+    sess.services
+        .task_evidence
+        .guard_tool_dispatch(
+            sampled_canonical_tool_name,
+            &turn_context.sub_id,
+            live_authorized_read_only,
+            live_authorized_read_only,
+            /*force_read_only*/ false,
+            /*trusted_mutator*/ false,
+            /*trusted_builtin*/ false,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|reason| {
+            format!(
+                "MCP tool `{sampled_server}/{sampled_tool_name}` no longer satisfies its sampled read-only authorization: {reason}"
+            )
+        })
+}
+
+fn live_tool_satisfies_sampled_read_only_authorization(
+    live_tool_info: &ToolInfo,
+    sampled_server: &str,
+    sampled_tool_name: &str,
+    sampled_canonical_tool_name: &ToolName,
+) -> bool {
+    live_tool_info.server_name == sampled_server
+        && live_tool_info.tool.name.as_ref() == sampled_tool_name
+        && live_tool_info.canonical_tool_name() == *sampled_canonical_tool_name
+        && live_tool_info
+            .tool
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint)
+            == Some(true)
 }
 
 fn live_mcp_hook_tool_name(tool_info: &ToolInfo) -> HookToolName {
@@ -489,6 +635,7 @@ async fn execute_approved_mcp_tool_call(
     invocation: McpInvocation,
     tool_info: &ToolInfo,
     metadata: Option<&McpToolApprovalMetadata>,
+    managed_read_only_authorization: Option<&ManagedMcpReadOnlyAuthorization>,
 ) -> McpToolCallOutcome {
     let turn_context = step_context.turn.as_ref();
     let manager = step_context.mcp.manager();
@@ -527,6 +674,7 @@ async fn execute_approved_mcp_tool_call(
                 rewritten_arguments,
                 metadata,
                 request_meta,
+                managed_read_only_authorization,
             )
             .await
         }
@@ -674,6 +822,7 @@ async fn execute_mcp_tool_call(
     rewritten_arguments: Option<JsonValue>,
     metadata: Option<&McpToolApprovalMetadata>,
     request_meta: Option<JsonValue>,
+    managed_read_only_authorization: Option<&ManagedMcpReadOnlyAuthorization>,
 ) -> Result<CallToolResult, String> {
     let turn_context = step_context.turn.as_ref();
     let manager = step_context.mcp.manager();
@@ -691,6 +840,9 @@ async fn execute_mcp_tool_call(
         .rollout_thread_trace
         .start_mcp_call_trace(call_id);
     let request_meta = mcp_call_trace.add_request_meta(request_meta);
+    if let Some(authorization) = managed_read_only_authorization {
+        resolve_authorized_read_only_mcp_tool(sess, turn_context, manager, authorization).await?;
+    }
     let tool_execution_timing_guard = turn_context.turn_timing_state.begin_tool_execution();
     let result = manager
         .call_tool(

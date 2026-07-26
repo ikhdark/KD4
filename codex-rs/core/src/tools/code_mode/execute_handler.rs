@@ -36,6 +36,13 @@ impl CodeModeExecuteHandler {
         let args =
             codex_code_mode::parse_exec_source(&code).map_err(FunctionCallError::RespondToModel)?;
         let exec = ExecContext { session, turn };
+        let yield_time_ms = args.yield_time_ms.or_else(|| {
+            matches!(
+                exec.turn.config.code_mode.waiting_policy,
+                codex_features::CodeModeWaitingPolicy::RunToCompletion
+            )
+            .then_some(codex_code_mode::RUN_TO_COMPLETION_YIELD_TIME_MS)
+        });
         let enabled_tools =
             codex_tools::collect_code_mode_tool_definitions(&self.nested_tool_specs);
         let started_at = std::time::Instant::now();
@@ -47,7 +54,7 @@ impl CodeModeExecuteHandler {
                 tool_call_id: call_id.clone(),
                 enabled_tools,
                 source: args.code.clone(),
-                yield_time_ms: args.yield_time_ms,
+                yield_time_ms,
                 max_output_tokens: args.max_output_tokens,
             })
             .await

@@ -70,6 +70,18 @@ impl ChildTerminator for PtyChildTerminator {
         }
     }
 
+    fn terminate_gracefully(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if let Some(process_group_id) = self.process_group_id {
+            return crate::process_group::terminate_process_group(process_group_id).map(|_| ());
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "graceful process-tree termination is unavailable",
+        ))
+    }
+
     fn kill(&mut self) -> std::io::Result<()> {
         #[cfg(unix)]
         if let Some(process_group_id) = self.process_group_id {
@@ -103,6 +115,10 @@ impl ChildTerminator for RawPidTerminator {
                 crate::process_group::interrupt_process_group(self.process_group_id)
             }
         }
+    }
+
+    fn terminate_gracefully(&mut self) -> std::io::Result<()> {
+        crate::process_group::terminate_process_group(self.process_group_id).map(|_| ())
     }
 
     fn kill(&mut self) -> std::io::Result<()> {
@@ -182,6 +198,11 @@ async fn spawn_process_portable(
         command_builder.env(key, value);
     }
 
+    // Acquire every fallible master-side handle before the child exists. An
+    // FD-exhaustion error after spawn would otherwise lose ProcessHandle
+    // ownership before containment teardown can be acknowledged.
+    let mut reader = pair.master.try_clone_reader()?;
+    let writer = pair.master.take_writer()?;
     let mut child = pair.slave.spawn_command(command_builder)?;
     #[cfg(unix)]
     // portable-pty establishes the spawned PTY child as a new session leader on
@@ -193,7 +214,6 @@ async fn spawn_process_portable(
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
-    let mut reader = pair.master.try_clone_reader()?;
     let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8_192];
         loop {
@@ -212,7 +232,6 @@ async fn spawn_process_portable(
         }
     });
 
-    let writer = pair.master.take_writer()?;
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let writer_handle: JoinHandle<()> = tokio::spawn({
         let writer = Arc::clone(&writer);
@@ -233,11 +252,18 @@ async fn spawn_process_portable(
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
     let exit_status = Arc::new(AtomicBool::new(false));
     let wait_exit_status = Arc::clone(&exit_status);
+    let termination_confirmed = Arc::new(AtomicBool::new(false));
+    let wait_termination_confirmed = Arc::clone(&termination_confirmed);
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
     let wait_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let code = match child.wait() {
-            Ok(status) => status.exit_code() as i32,
+            Ok(status) => {
+                if status.signal().is_none() {
+                    wait_termination_confirmed.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                status.exit_code() as i32
+            }
             Err(_) => -1,
         };
         wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -268,6 +294,7 @@ async fn spawn_process_portable(
         writer_handle,
         wait_handle,
         exit_status,
+        termination_confirmed,
         exit_code,
         Some(handles),
         /*resizer*/ None,
@@ -311,6 +338,8 @@ async fn spawn_process_preserving_fds(
     let stdin = slave.try_clone()?;
     let stdout = slave.try_clone()?;
     let stderr = slave.try_clone()?;
+    let mut reader = master.try_clone()?;
+    let writer = master.try_clone()?;
     let inherited_fds = inherited_fds.to_vec();
 
     unsafe {
@@ -357,7 +386,6 @@ async fn spawn_process_preserving_fds(
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
-    let mut reader = master.try_clone()?;
     let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8_192];
         loop {
@@ -376,7 +404,7 @@ async fn spawn_process_preserving_fds(
         }
     });
 
-    let writer = Arc::new(tokio::sync::Mutex::new(master.try_clone()?));
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let writer_handle: JoinHandle<()> = tokio::spawn({
         let writer = Arc::clone(&writer);
         async move {
@@ -392,11 +420,18 @@ async fn spawn_process_preserving_fds(
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
     let exit_status = Arc::new(AtomicBool::new(false));
     let wait_exit_status = Arc::clone(&exit_status);
+    let termination_confirmed = Arc::new(AtomicBool::new(false));
+    let wait_termination_confirmed = Arc::clone(&termination_confirmed);
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
     let wait_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let code = match child.wait() {
-            Ok(status) => exit_code_from_status(status),
+            Ok(status) => {
+                if status.code().is_some() {
+                    wait_termination_confirmed.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                exit_code_from_status(status)
+            }
             Err(_) => -1,
         };
         wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -422,6 +457,7 @@ async fn spawn_process_preserving_fds(
         writer_handle,
         wait_handle,
         exit_status,
+        termination_confirmed,
         exit_code,
         Some(handles),
         /*resizer*/ None,

@@ -16,6 +16,7 @@ use codex_network_proxy::NetworkProxy;
 use codex_protocol::approvals::ExecPolicyAmendment;
 use codex_protocol::approvals::NetworkApprovalContext;
 use codex_protocol::error::CodexErr;
+use codex_protocol::models::AdditionalPermissionProfile;
 use codex_protocol::permissions::FileSystemSandboxKind;
 use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::protocol::AskForApproval;
@@ -434,6 +435,55 @@ pub(crate) struct SandboxAttempt<'a> {
 }
 
 impl<'a> SandboxAttempt<'a> {
+    pub(crate) fn has_strong_descendant_containment(
+        &self,
+        additional_permissions: Option<&AdditionalPermissionProfile>,
+    ) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            let effective_permissions =
+                effective_permission_profile(self.permissions, additional_permissions);
+            let (file_system_sandbox_policy, _) = effective_permissions.to_runtime_permissions();
+            return self.sandbox == SandboxType::LinuxSeccomp
+                && codex_sandboxing::linux_sandbox_uses_bubblewrap(
+                    &file_system_sandbox_policy,
+                    self.use_legacy_landlock,
+                    self.enforce_managed_network,
+                );
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = additional_permissions;
+            return self.sandbox == SandboxType::WindowsRestrictedToken
+                && self.windows_sandbox_level
+                    == codex_protocol::config_types::WindowsSandboxLevel::Elevated;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            let _ = additional_permissions;
+            false
+        }
+    }
+
+    pub(crate) fn require_strong_descendant_containment(
+        &self,
+        required: bool,
+        environment_is_remote: bool,
+        additional_permissions: Option<&AdditionalPermissionProfile>,
+    ) -> Result<(), ToolError> {
+        if !required {
+            return Ok(());
+        }
+        if !environment_is_remote && self.has_strong_descendant_containment(additional_permissions)
+        {
+            return Ok(());
+        }
+        Err(ToolError::Rejected(
+            "managed mutation rejected: this runtime cannot guarantee descendant containment; use a local Linux bubblewrap sandbox or the Windows elevated Job Object sandbox"
+                .to_string(),
+        ))
+    }
+
     pub(crate) fn network_proxy<'b>(
         &'b self,
         fallback: Option<&'b NetworkProxy>,
@@ -449,6 +499,8 @@ impl<'a> SandboxAttempt<'a> {
         environment_id: Option<&str>,
     ) -> Result<crate::sandboxing::ExecRequest, CodexErr> {
         let network = self.network_proxy(network);
+        let descendant_containment_established =
+            self.has_strong_descendant_containment(command.additional_permissions.as_ref());
         let request = self
             .manager
             .transform(SandboxTransformRequest {
@@ -467,11 +519,13 @@ impl<'a> SandboxAttempt<'a> {
                 windows_sandbox_private_desktop: self.windows_sandbox_private_desktop,
             })
             .map_err(CodexErr::from)?;
-        Ok(crate::sandboxing::ExecRequest::from_sandbox_exec_request(
+        let mut request = crate::sandboxing::ExecRequest::from_sandbox_exec_request(
             request,
             options,
             self.workspace_roots.to_vec(),
-        ))
+        );
+        request.descendant_containment_established = descendant_containment_established;
+        Ok(request)
     }
 
     pub fn env_for_exec_server(

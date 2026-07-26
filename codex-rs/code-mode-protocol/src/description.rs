@@ -17,8 +17,8 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - Runs raw JavaScript -- no Node, no file system, no network access, no console.
 - Accepts raw JavaScript source text, not JSON, quoted strings, or markdown code fences.
 - You may optionally start the tool input with a first-line pragma like `// @exec: {"yield_time_ms": 10000, "max_output_tokens": 1000}`.
-- `yield_time_ms` asks `exec` to yield early if the script is still running. Defaults to 10000 ms.
-- `max_output_tokens` sets the token budget for direct `exec` results. Defaults to 10000 tokens.
+- `yield-time_ms` asks `exec` to yield early if the script is still running. If omitted, Codex uses the configured waiting policy (run-to-completion by default).
+- `max_output_tokens` sets the token budget for direct `exec` results. Defaults adaptively to 2000 tokens for success, 4000 for failure or yielded output, and up to 6000 for diagnostic output.
 - When the JS code is fully evaluated, the isolate's lifetime ends and unawaited promises are silently discarded.
 
 - Global helpers:
@@ -35,8 +35,8 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - `yield_control()`: yields the accumulated output to the model immediately while the script keeps running."#;
 const WAIT_DESCRIPTION_TEMPLATE: &str = r#"- Use `wait` only after `exec` returns `Script running with cell ID ...`.
 - `cell_id` identifies the running `exec` cell to resume.
-- `yield_time_ms` controls how long to wait for more output before yielding again. Defaults to 10000 ms.
-- `max_tokens` limits how much new output this wait call returns. Defaults to 10000 tokens.
+- `yield-time_ms` controls how long to wait for more output before yielding again. If omitted, Codex uses the configured waiting policy (run-to-completion by default).
+- `max_tokens` limits how much new output this wait call returns. Defaults adaptively to 2000 tokens for completed success, 4000 for failure or yielded output, and up to 6000 for diagnostic output.
 - `terminate: true` stops the running cell; false or omitted waits for output.
 - `wait` returns only the new output since the last yield, or the final completion or termination result for that cell.
 - If the cell is still running, `wait` may yield again with the same `cell_id`.
@@ -714,6 +714,7 @@ mod tests {
     use super::ToolNamespaceDescription;
     use super::augment_tool_definition;
     use super::build_exec_tool_description;
+    use super::build_wait_tool_description;
     use super::normalize_code_mode_identifier;
     use super::parse_exec_source;
     use codex_protocol::ToolName;
@@ -882,6 +883,18 @@ bar"
             build_exec_tool_description(&[], &[], &BTreeMap::new(), /*code_mode_only*/ false);
         assert!(description.contains("`setTimeout(callback: () => void, delayMs?: number)`"));
         assert!(description.contains("`clearTimeout(timeoutId?: number)`"));
+    }
+
+    #[test]
+    fn code_mode_descriptions_match_adaptive_output_defaults() {
+        let exec_description =
+            build_exec_tool_description(&[], &[], &BTreeMap::new(), /*code_mode_only*/ false);
+        assert!(exec_description.contains(
+            "Defaults adaptively to 2000 tokens for success, 4000 for failure or yielded output, and up to 6000 for diagnostic output."
+        ));
+        assert!(build_wait_tool_description().contains(
+            "Defaults adaptively to 2000 tokens for completed success, 4000 for failure or yielded output, and up to 6000 for diagnostic output."
+        ));
     }
 
     #[test]

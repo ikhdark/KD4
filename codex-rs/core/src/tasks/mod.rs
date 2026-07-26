@@ -2,6 +2,7 @@ mod compact;
 mod lifecycle;
 mod regular;
 mod review;
+pub(crate) use review::run_task_evidence_review;
 mod user_shell;
 
 use std::panic::AssertUnwindSafe;
@@ -30,6 +31,8 @@ use crate::hook_runtime::record_additional_contexts;
 use crate::hook_runtime::record_pending_input;
 use crate::session::TurnInput;
 use crate::session::session::Session;
+use crate::session::turn::emit_managed_final_terminal_checked;
+use crate::session::turn::recover_pending_managed_final_outbox;
 use crate::session::turn_context::TurnContext;
 use crate::state::ActiveTurn;
 use crate::state::RunningTask;
@@ -37,6 +40,7 @@ use crate::state::TaskKind;
 use crate::state::TurnState;
 use crate::state::TurnTerminalCoordinator;
 use crate::state::TurnTerminalPermit;
+use crate::task_evidence::ManagedFinalState;
 use codex_analytics::TurnProfileFact;
 use codex_analytics::TurnTokenUsageFact;
 use codex_login::AuthManager;
@@ -224,6 +228,14 @@ pub(crate) trait SessionTask: Send + Sync + 'static {
     /// Returns the tracing name for a spawned task span.
     fn span_name(&self) -> &'static str;
 
+    /// Returns the task contract when this task owns the correctness-closure
+    /// ledger. Most session tasks do not participate; the regular model turn
+    /// opts in explicitly.
+    fn task_evidence_contract(&self, input: &[TurnInput]) -> Option<String> {
+        let _ = input;
+        None
+    }
+
     /// Executes the task until completion or cancellation.
     ///
     /// Implementations typically stream protocol events using `session` and
@@ -263,6 +275,8 @@ pub(crate) trait AnySessionTask: Send + Sync + 'static {
 
     fn span_name(&self) -> &'static str;
 
+    fn task_evidence_contract(&self, input: &[TurnInput]) -> Option<String>;
+
     fn run(
         self: Arc<Self>,
         session: Arc<SessionTaskContext>,
@@ -288,6 +302,10 @@ where
 
     fn span_name(&self) -> &'static str {
         SessionTask::span_name(self)
+    }
+
+    fn task_evidence_contract(&self, input: &[TurnInput]) -> Option<String> {
+        SessionTask::task_evidence_contract(self, input)
     }
 
     fn run(
@@ -354,6 +372,7 @@ struct TerminalFinalization {
     coordinator: Arc<TurnTerminalCoordinator>,
     outcome: TurnTerminalOutcome,
     permit: Option<TurnTerminalPermit>,
+    terminal_lifecycle_started: bool,
 }
 
 struct WorkerDoneNotifier(Arc<Notify>);
@@ -396,6 +415,32 @@ impl Session {
             }
             return;
         }
+        // Recover a committed final before any kind of new task can emit,
+        // compact, or mutate history. Keeping this outside the task worker also
+        // prevents a recovery failure from being finalized as the new turn.
+        if let Err(err) = recover_pending_managed_final_outbox(self.as_ref()).await {
+            {
+                let mut active_turn = self.active_turn.lock().await;
+                if active_turn
+                    .as_ref()
+                    .is_some_and(|active_turn| active_turn.task.is_none())
+                {
+                    *active_turn = None;
+                }
+            }
+            self.send_event(
+                turn_context.as_ref(),
+                EventMsg::Error(ErrorEvent {
+                    message: format!(
+                        "Could not recover the prior committed final before starting this turn: {err}"
+                    ),
+                    codex_error_info: Some(CodexErrorInfo::InternalServerError),
+                }),
+            )
+            .await;
+            self.emit_thread_idle_lifecycle_if_idle().await;
+            return;
+        }
         let agent_execution_guard = match self.services.agent_control.execution_guard_for_task(
             self.thread_id,
             &turn_context.sub_id,
@@ -423,6 +468,8 @@ impl Session {
         };
         let task: Arc<dyn AnySessionTask> = Arc::new(task);
         let task_kind = task.kind();
+        let task_evidence_contract = task.task_evidence_contract(&input);
+        let task_evidence_managed = task_evidence_contract.is_some();
         let span_name = task.span_name();
         let turn_started_at_unix_ms = turn_context.turn_timing_state.mark_turn_started();
         turn_context
@@ -458,6 +505,20 @@ impl Session {
         let mut active = self.active_turn.lock().await;
         let turn = active.get_or_insert_with(ActiveTurn::default);
         debug_assert!(turn.task.is_none());
+        // A regular task must not become steerable until its evidence ledger
+        // owns this turn. Steering extends the same task contract and
+        // serializes against final commit, so exposing the RunningTask first
+        // would leave a window where otherwise valid input is rejected as
+        // belonging to a different turn.
+        let task_evidence_initialization = if let Some(task_contract) = task_evidence_contract {
+            self.services
+                .task_evidence
+                .begin_turn(&turn_context.sub_id, &task_contract)
+                .await
+                .map_err(CodexErr::InvalidRequest)
+        } else {
+            Ok(())
+        };
         let done_clone = Arc::clone(&done);
         let session_ctx = Arc::new(SessionTaskContext::new(
             Arc::clone(self),
@@ -491,6 +552,7 @@ impl Session {
                 // Do not let a fast worker finish before its RunningTask and terminal
                 // coordinator are visible under the active-turn lock.
                 let _ = start_rx.await;
+                task_evidence_initialization?;
                 task_for_run
                     .run(
                         session_ctx,
@@ -524,6 +586,7 @@ impl Session {
             task_span,
             turn_context: Arc::clone(&turn_context),
             turn_extension_data,
+            task_evidence_managed,
             _agent_execution_guard: agent_execution_guard,
         };
         turn.task = Some(running_task);
@@ -633,6 +696,13 @@ impl Session {
                     return TerminalSchedule::NotFound;
                 };
                 let Some(coordinator) = active_turn.terminal.as_ref().cloned() else {
+                    // An empty ActiveTurn is only an idle-work reservation. It
+                    // has no worker or terminal lifecycle to finalize, but an
+                    // abort must still release the reservation without
+                    // consuming the pending input attached to its TurnState.
+                    if active_turn.task.is_none() {
+                        *active = None;
+                    }
                     return TerminalSchedule::NotFound;
                 };
                 if expected_turn_id.is_some_and(|turn_id| coordinator.turn_id() != turn_id) {
@@ -669,6 +739,7 @@ impl Session {
                     coordinator: finalizer_coordinator,
                     outcome,
                     permit: Some(permit),
+                    terminal_lifecycle_started: false,
                 };
                 let result = AssertUnwindSafe(
                     session.finalize_turn_terminal(&mut finalization),
@@ -725,6 +796,14 @@ impl Session {
                 "quiescing task before terminal finalization"
             );
             finalization.task.cancellation_token.cancel();
+            if let Err(err) = self
+                .services
+                .task_evidence
+                .abort_uncommitted_final_reservations_for_turn(&turn_context.sub_id)
+                .await
+            {
+                warn!("failed to durably cancel an uncommitted managed final: {err}");
+            }
             tokio::select! {
                 _ = finalization.task.done.notified() => {},
                 _ = tokio::time::sleep(Duration::from_millis(GRACEFULL_INTERRUPTION_TIMEOUT_MS)) => {
@@ -749,9 +828,50 @@ impl Session {
 
         turn_context.turn_timing_state.begin_finalization();
 
-        let explicit_abort_reason = match &finalization.outcome {
-            TurnTerminalOutcome::Aborted(reason) => Some(reason.clone()),
-            _ => None,
+        let mut managed_final_state = self
+            .services
+            .task_evidence
+            .managed_final_state_for_turn(&turn_context.sub_id)
+            .await;
+        if managed_final_state == Some(ManagedFinalState::ItemsPending) {
+            if let Err(err) = recover_pending_managed_final_outbox(self.as_ref()).await {
+                warn!(
+                    "failed to recover committed final items during terminal finalization: {err}"
+                );
+            }
+            managed_final_state = self
+                .services
+                .task_evidence
+                .managed_final_state_for_turn(&turn_context.sub_id)
+                .await;
+        }
+        let committed_final_won = matches!(
+            managed_final_state,
+            Some(
+                ManagedFinalState::ItemsPending
+                    | ManagedFinalState::TerminalPending
+                    | ManagedFinalState::Completed
+            )
+        );
+        let explicit_abort_reason = match (&managed_final_state, &finalization.outcome) {
+            (
+                Some(
+                    ManagedFinalState::ItemsPending
+                    | ManagedFinalState::TerminalPending
+                    | ManagedFinalState::Completed,
+                ),
+                _,
+            ) => None,
+            (Some(ManagedFinalState::AwaitingCommit), TurnTerminalOutcome::Aborted(reason)) => {
+                Some(reason.clone())
+            }
+            (Some(ManagedFinalState::AwaitingCommit), _) => Some(TurnAbortReason::Interrupted),
+            (Some(ManagedFinalState::NoFinalCandidate), TurnTerminalOutcome::Aborted(reason)) => {
+                Some(reason.clone())
+            }
+            (Some(ManagedFinalState::NoFinalCandidate), _) => None,
+            (None, TurnTerminalOutcome::Aborted(reason)) => Some(reason.clone()),
+            (None, _) => None,
         };
         if explicit_abort_reason == Some(TurnAbortReason::Interrupted)
             && let Some(marker) = interrupted_turn_history_marker(
@@ -768,20 +888,37 @@ impl Session {
             }
         }
 
-        let (last_agent_message, abort_reason) = match &finalization.outcome {
-            TurnTerminalOutcome::Completed { last_agent_message } => {
-                (last_agent_message.clone(), None)
+        let (last_agent_message, outcome_abort_reason) = if committed_final_won {
+            (
+                match &finalization.outcome {
+                    TurnTerminalOutcome::Completed { last_agent_message } => {
+                        last_agent_message.clone()
+                    }
+                    _ => None,
+                },
+                None,
+            )
+        } else {
+            match &finalization.outcome {
+                TurnTerminalOutcome::Completed { last_agent_message } => {
+                    if managed_final_state == Some(ManagedFinalState::AwaitingCommit) {
+                        (None, Some(TurnAbortReason::Interrupted))
+                    } else {
+                        (last_agent_message.clone(), None)
+                    }
+                }
+                TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted) => {
+                    (None, Some(TurnAbortReason::Interrupted))
+                }
+                TurnTerminalOutcome::ReturnedError(err) => {
+                    warn!(%err, "session task returned an unexpected error");
+                    (None, None)
+                }
+                TurnTerminalOutcome::Aborted(reason) => (None, Some(reason.clone())),
+                TurnTerminalOutcome::WorkerJoinFailed(_) => (None, None),
             }
-            TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted) => {
-                (None, Some(TurnAbortReason::Interrupted))
-            }
-            TurnTerminalOutcome::ReturnedError(err) => {
-                warn!(%err, "session task returned an unexpected error");
-                (None, None)
-            }
-            TurnTerminalOutcome::Aborted(reason) => (None, Some(reason.clone())),
-            TurnTerminalOutcome::WorkerJoinFailed(_) => (None, None),
         };
+        let abort_reason = explicit_abort_reason.or(outcome_abort_reason);
 
         if requires_abort_cleanup {
             // Cancellation is observable before pending approvals are dropped, preventing an
@@ -947,6 +1084,7 @@ impl Session {
         } else {
             None
         };
+        finalization.terminal_lifecycle_started = true;
         if let Some(reason) = abort_reason.as_ref() {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;
@@ -1020,8 +1158,47 @@ impl Session {
                 timing: Some(timing),
             })
         };
-        self.send_event(turn_context.as_ref(), event).await;
-        if let Some(permit) = finalization.permit.as_ref() {
+        let terminal_event_dispatched = match managed_final_state {
+            Some(ManagedFinalState::TerminalPending) => {
+                match emit_managed_final_terminal_checked(
+                    self.as_ref(),
+                    turn_context.as_ref(),
+                    &event,
+                )
+                .await
+                {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!("failed to durably emit managed terminal lifecycle: {err}");
+                        false
+                    }
+                }
+            }
+            Some(ManagedFinalState::ItemsPending) => {
+                self.retry_pending_managed_final_terminal(
+                    turn_context.as_ref(),
+                    &event,
+                    "terminal finalization",
+                )
+                .await
+            }
+            Some(ManagedFinalState::Completed) => true,
+            Some(ManagedFinalState::AwaitingCommit) => {
+                if let Err(err) = self
+                    .send_event_checked(turn_context.as_ref(), event.clone())
+                    .await
+                {
+                    warn!("failed to durably emit managed abort lifecycle: {err}");
+                    self.send_event(turn_context.as_ref(), event).await;
+                }
+                true
+            }
+            Some(ManagedFinalState::NoFinalCandidate) | None => {
+                self.send_event(turn_context.as_ref(), event).await;
+                true
+            }
+        };
+        if terminal_event_dispatched && let Some(permit) = finalization.permit.as_ref() {
             permit.mark_terminal_event_dispatched();
         }
         self.services
@@ -1085,6 +1262,14 @@ impl Session {
     ) {
         let turn_context = Arc::clone(&finalization.task.turn_context);
         finalization.task.cancellation_token.cancel();
+        if let Err(err) = self
+            .services
+            .task_evidence
+            .abort_uncommitted_final_reservations_for_turn(&turn_context.sub_id)
+            .await
+        {
+            warn!("fail-safe could not durably cancel an uncommitted managed final: {err}");
+        }
         finalization.task.worker_abort_handle.abort();
         turn_context
             .turn_metadata_state
@@ -1094,7 +1279,27 @@ impl Session {
             .clear_pending_for_turn_state(finalization.turn_state.as_ref())
             .await;
 
-        let terminal_event_dispatched = finalization.coordinator.terminal_event_dispatched();
+        let mut terminal_event_dispatched = finalization.coordinator.terminal_event_dispatched();
+        let mut managed_final_state = self
+            .services
+            .task_evidence
+            .managed_final_state_for_turn(&turn_context.sub_id)
+            .await;
+        if !terminal_event_dispatched
+            && managed_final_state == Some(ManagedFinalState::ItemsPending)
+        {
+            if let Err(err) = recover_pending_managed_final_outbox(self.as_ref()).await {
+                warn!("fail-safe recovery of committed final items failed: {err}");
+            }
+            managed_final_state = self
+                .services
+                .task_evidence
+                .managed_final_state_for_turn(&turn_context.sub_id)
+                .await;
+        }
+        if managed_final_state == Some(ManagedFinalState::Completed) {
+            terminal_event_dispatched = true;
+        }
         if !terminal_event_dispatched {
             self.send_event(
                 turn_context.as_ref(),
@@ -1123,13 +1328,68 @@ impl Session {
                     profile: timing_snapshot.legacy_profile.clone(),
                     timing: Some(timing.clone()),
                 });
-            let abort_reason = match &finalization.outcome {
-                TurnTerminalOutcome::Aborted(reason) => Some(reason.clone()),
-                TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted) => {
-                    Some(TurnAbortReason::Interrupted)
+            let committed_final_won = matches!(
+                managed_final_state,
+                Some(
+                    ManagedFinalState::ItemsPending
+                        | ManagedFinalState::TerminalPending
+                        | ManagedFinalState::Completed
+                )
+            );
+            let abort_reason = if committed_final_won {
+                None
+            } else {
+                match (&managed_final_state, &finalization.outcome) {
+                    (
+                        Some(ManagedFinalState::AwaitingCommit),
+                        TurnTerminalOutcome::Aborted(reason),
+                    ) => Some(reason.clone()),
+                    (Some(ManagedFinalState::AwaitingCommit), _) => {
+                        Some(TurnAbortReason::Interrupted)
+                    }
+                    (
+                        Some(ManagedFinalState::NoFinalCandidate),
+                        TurnTerminalOutcome::Aborted(reason),
+                    ) => Some(reason.clone()),
+                    (
+                        Some(ManagedFinalState::NoFinalCandidate),
+                        TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted),
+                    ) => Some(TurnAbortReason::Interrupted),
+                    (None, TurnTerminalOutcome::Aborted(reason)) => Some(reason.clone()),
+                    (None, TurnTerminalOutcome::ReturnedError(CodexErr::TurnAborted)) => {
+                        Some(TurnAbortReason::Interrupted)
+                    }
+                    _ => None,
                 }
-                _ => None,
             };
+            let completion = if abort_reason.is_none() {
+                self.services.task_evidence.completion_gate().await
+            } else {
+                None
+            };
+            let last_agent_message = if abort_reason.is_none() {
+                match &finalization.outcome {
+                    TurnTerminalOutcome::Completed { last_agent_message } => {
+                        last_agent_message.clone()
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if !finalization.terminal_lifecycle_started {
+                finalization.terminal_lifecycle_started = true;
+                if let Some(reason) = abort_reason.as_ref() {
+                    self.emit_turn_abort_lifecycle(
+                        reason.clone(),
+                        turn_context.extension_data.as_ref(),
+                    )
+                    .await;
+                } else {
+                    self.emit_turn_stop_lifecycle(turn_context.extension_data.as_ref())
+                        .await;
+                }
+            }
             let event = if let Some(reason) = abort_reason {
                 EventMsg::TurnAborted(TurnAbortedEvent {
                     turn_id: Some(turn_context.sub_id.clone()),
@@ -1141,18 +1401,59 @@ impl Session {
             } else {
                 EventMsg::TurnComplete(TurnCompleteEvent {
                     turn_id: turn_context.sub_id.clone(),
-                    last_agent_message: None,
-                    completion: None,
+                    last_agent_message,
+                    completion,
                     completed_at: timing_snapshot.completed_at_unix_secs,
                     duration_ms: timing_snapshot.duration_ms,
                     time_to_first_token_ms: timing_snapshot.time_to_first_token_ms,
                     timing: Some(timing),
                 })
             };
-            self.send_event(turn_context.as_ref(), event).await;
-            if let Some(permit) = finalization.permit.as_ref() {
-                permit.mark_terminal_event_dispatched();
-            }
+            terminal_event_dispatched = match managed_final_state {
+                Some(ManagedFinalState::TerminalPending) => {
+                    match emit_managed_final_terminal_checked(
+                        self.as_ref(),
+                        turn_context.as_ref(),
+                        &event,
+                    )
+                    .await
+                    {
+                        Ok(()) => true,
+                        Err(err) => {
+                            warn!(
+                                "failed to durably emit fail-safe managed terminal lifecycle: {err}"
+                            );
+                            false
+                        }
+                    }
+                }
+                Some(ManagedFinalState::ItemsPending) => {
+                    self.retry_pending_managed_final_terminal(
+                        turn_context.as_ref(),
+                        &event,
+                        "fail-safe terminal finalization",
+                    )
+                    .await
+                }
+                Some(ManagedFinalState::Completed) => true,
+                Some(ManagedFinalState::AwaitingCommit) => {
+                    if let Err(err) = self
+                        .send_event_checked(turn_context.as_ref(), event.clone())
+                        .await
+                    {
+                        warn!("failed to durably emit fail-safe managed abort lifecycle: {err}");
+                        self.send_event(turn_context.as_ref(), event).await;
+                    }
+                    true
+                }
+                Some(ManagedFinalState::NoFinalCandidate) | None => {
+                    self.send_event(turn_context.as_ref(), event).await;
+                    true
+                }
+            };
+        }
+        if terminal_event_dispatched && let Some(permit) = finalization.permit.as_ref() {
+            permit.mark_terminal_event_dispatched();
         }
 
         self.services
@@ -1178,6 +1479,49 @@ impl Session {
         }
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after fail-safe terminal event: {err}");
+        }
+    }
+
+    async fn retry_pending_managed_final_terminal(
+        self: &Arc<Self>,
+        turn_context: &TurnContext,
+        event: &EventMsg,
+        context: &str,
+    ) -> bool {
+        if let Err(err) = recover_pending_managed_final_outbox(self.as_ref()).await {
+            warn!("failed to retry committed final recovery during {context}: {err}");
+        }
+        match self
+            .services
+            .task_evidence
+            .managed_final_state_for_turn(&turn_context.sub_id)
+            .await
+        {
+            Some(ManagedFinalState::Completed) => true,
+            Some(ManagedFinalState::TerminalPending) => {
+                match emit_managed_final_terminal_checked(self.as_ref(), turn_context, event).await
+                {
+                    Ok(()) => true,
+                    Err(err) => {
+                        warn!(
+                            "failed to retry the durable managed terminal event during {context}: {err}"
+                        );
+                        false
+                    }
+                }
+            }
+            _ => {
+                self.send_event(
+                    turn_context,
+                    EventMsg::Error(ErrorEvent {
+                        message: "The committed final remains pending because its durable lifecycle could not be recovered; it will be retried before the next turn."
+                            .to_string(),
+                        codex_error_info: Some(CodexErrorInfo::InternalServerError),
+                    }),
+                )
+                .await;
+                false
+            }
         }
     }
 }

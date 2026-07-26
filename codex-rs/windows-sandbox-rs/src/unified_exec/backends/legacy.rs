@@ -78,6 +78,7 @@ fn spawn_legacy_process(
             env_map,
             use_private_desktop,
             logs_base_dir,
+            /*containment_job*/ None,
         )?;
         let hpc = conpty.raw_handle();
         let output_join = spawn_output_reader(conpty.take_output_read(), stdout_tx);
@@ -102,6 +103,7 @@ fn spawn_legacy_process(
             ConsoleMode::Inherit,
             use_private_desktop,
             logs_base_dir,
+            /*containment_job*/ None,
         )?;
         let stdout_join = spawn_output_reader(pipe_handles.stdout_read, stdout_tx);
         let Some(stderr_read) = pipe_handles.stderr_read else {

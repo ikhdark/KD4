@@ -148,6 +148,10 @@ impl ToolExecutor<ToolCall> for GoalToolExecutor {
         }
     }
 
+    fn read_only_hint(&self) -> Option<bool> {
+        Some(matches!(self.kind, GoalToolKind::Get))
+    }
+
     fn handle(&self, invocation: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
         Box::pin(async move {
             match self.kind {

@@ -80,11 +80,23 @@ impl ToolRouter {
         params: ToolRouterParams<'_>,
         tool_search_handler_cache: &ToolSearchHandlerCache,
     ) -> Self {
-        let proven_read_only_external_tools = collect_proven_read_only_external_tools(
+        let mut proven_read_only_external_tools = collect_proven_read_only_external_tools(
             params.mcp_tools.as_deref(),
             params.deferred_mcp_tools.as_deref(),
         );
+        let consistent_read_only_extension_tools =
+            collect_consistent_read_only_extension_tools(&params.extension_tool_executors);
         let mut router = build_tool_router(step_context, params, tool_search_handler_cache);
+        let registered_read_only_external_tools = router
+            .registry
+            .registered_read_only_external_tools()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        proven_read_only_external_tools.extend(
+            consistent_read_only_extension_tools
+                .intersection(&registered_read_only_external_tools)
+                .cloned(),
+        );
         router.proven_read_only_external_tools = proven_read_only_external_tools;
         router
     }
@@ -245,10 +257,10 @@ impl ToolRouter {
         source: ToolCallSource,
         terminal_outcome_reached: Option<Arc<AtomicBool>>,
     ) -> Result<AnyToolResult, FunctionCallError> {
-        let external_mutation_intent = if self
+        let proven_read_only_external = self
             .proven_read_only_external_tools
-            .contains(&call.tool_name)
-        {
+            .contains(&call.tool_name);
+        let external_mutation_intent = if proven_read_only_external {
             ExternalMutationIntent::ProvenReadOnly
         } else {
             ExternalMutationIntent::MayMutate
@@ -281,7 +293,11 @@ impl ToolRouter {
         };
 
         self.registry
-            .dispatch_any_with_terminal_outcome(invocation, terminal_outcome_reached)
+            .dispatch_any_with_terminal_outcome(
+                invocation,
+                terminal_outcome_reached,
+                proven_read_only_external,
+            )
             .await
     }
 }
@@ -308,6 +324,23 @@ fn collect_proven_read_only_external_tools(
             == Some(true);
         external_tool_read_only
             .entry(name)
+            .and_modify(|all_read_only| *all_read_only &= read_only)
+            .or_insert(read_only);
+    }
+    external_tool_read_only
+        .into_iter()
+        .filter_map(|(name, read_only)| read_only.then_some(name))
+        .collect()
+}
+
+fn collect_consistent_read_only_extension_tools(
+    extension_tool_executors: &[Arc<dyn ToolExecutor<ExtensionToolCall>>],
+) -> HashSet<ToolName> {
+    let mut external_tool_read_only = HashMap::new();
+    for executor in extension_tool_executors {
+        let read_only = executor.read_only_hint() == Some(true);
+        external_tool_read_only
+            .entry(executor.tool_name())
             .and_modify(|all_read_only| *all_read_only &= read_only)
             .or_insert(read_only);
     }

@@ -132,6 +132,10 @@ impl ToolExecutor<ToolCall> for ImageGenerationTool {
         image_history_requirement(payload)
     }
 
+    fn read_only_hint(&self) -> Option<bool> {
+        Some(false)
+    }
+
     fn handles_runtime_cancellation(&self) -> bool {
         true
     }

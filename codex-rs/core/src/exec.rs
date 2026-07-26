@@ -64,6 +64,7 @@ const TIMEOUT_CODE: i32 = 64;
 const EXIT_CODE_SIGNAL_BASE: i32 = 128; // conventional shell: 128 + signal
 const EXEC_TIMEOUT_EXIT_CODE: i32 = 124; // conventional timeout exit code
 const CANCELLATION_TERMINATION_GRACE_PERIOD: Duration = Duration::from_millis(50);
+const CONTAINED_TERMINATION_ACK_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 // I/O buffer sizing
 const READ_CHUNK_SIZE: usize = 8192; // bytes per read
@@ -461,6 +462,8 @@ pub(crate) async fn execute_exec_request(
         exec_server_sandbox: _,
         exec_server_enforce_managed_network: _,
         exec_server_managed_network: _,
+        descendant_containment_required,
+        descendant_containment_established: _,
     } = exec_request;
 
     // TODO(anp): Keep PathUri through the local process launch boundary.
@@ -498,6 +501,7 @@ pub(crate) async fn execute_exec_request(
         &windows_sandbox_policy_cwd,
         &windows_sandbox_workspace_roots,
         windows_sandbox_filesystem_overrides.as_ref(),
+        descendant_containment_required,
     )
     .await;
     let duration = start.elapsed();
@@ -518,6 +522,7 @@ async fn get_raw_output_result(
     #[cfg_attr(not(windows), allow(unused_variables))] windows_sandbox_filesystem_overrides: Option<
         &WindowsSandboxFilesystemOverrides,
     >,
+    #[cfg_attr(not(windows), allow(unused_variables))] descendant_containment_required: bool,
 ) -> Result<RawExecToolCallOutput> {
     #[cfg(target_os = "windows")]
     if sandbox == SandboxType::WindowsRestrictedToken {
@@ -527,11 +532,19 @@ async fn get_raw_output_result(
             windows_sandbox_policy_cwd,
             windows_sandbox_workspace_roots,
             windows_sandbox_filesystem_overrides,
+            descendant_containment_required,
         )
         .await;
     }
 
-    exec(params, network_sandbox_policy, stdout_stream, after_spawn).await
+    exec(
+        params,
+        network_sandbox_policy,
+        stdout_stream,
+        after_spawn,
+        descendant_containment_required,
+    )
+    .await
 }
 
 #[cfg(target_os = "windows")]
@@ -607,6 +620,7 @@ async fn exec_windows_sandbox(
     windows_sandbox_policy_cwd: &AbsolutePathBuf,
     windows_sandbox_workspace_roots: &[AbsolutePathBuf],
     windows_sandbox_filesystem_overrides: Option<&WindowsSandboxFilesystemOverrides>,
+    descendant_containment_required: bool,
 ) -> Result<RawExecToolCallOutput> {
     use crate::config::find_codex_home;
     use codex_windows_sandbox::run_windows_sandbox_capture_for_permission_profile_elevated;
@@ -691,6 +705,7 @@ async fn exec_windows_sandbox(
                     write_roots_override: elevated_write_roots_override.as_deref(),
                     deny_read_paths_override: &additional_deny_read_paths,
                     deny_write_paths_override: &additional_deny_write_paths,
+                    require_confirmed_descendant_exit: descendant_containment_required,
                 },
             )
         } else {
@@ -722,6 +737,12 @@ async fn exec_windows_sandbox(
             return Err(CodexErr::Io(io::Error::other(format!(
                 "windows sandbox: {err}"
             ))));
+        }
+        Err(join_err) if descendant_containment_required => {
+            tracing::error!(
+                "managed Windows sandbox capture task failed after an unknown spawn boundary: {join_err}"
+            );
+            std::future::pending().await
         }
         Err(join_err) => {
             return Err(CodexErr::Io(io::Error::other(format!(
@@ -902,6 +923,7 @@ async fn exec(
     network_sandbox_policy: NetworkSandboxPolicy,
     stdout_stream: Option<StdoutStream>,
     after_spawn: Option<Box<dyn FnOnce() + Send>>,
+    descendant_containment_required: bool,
 ) -> Result<RawExecToolCallOutput> {
     let ExecParams {
         command,
@@ -953,7 +975,14 @@ async fn exec(
     if let Some(after_spawn) = after_spawn {
         after_spawn();
     }
-    consume_output(child, expiration, capture_policy, stdout_stream).await
+    consume_output(
+        child,
+        expiration,
+        capture_policy,
+        stdout_stream,
+        descendant_containment_required,
+    )
+    .await
 }
 
 /// Consumes the output of a child process according to the configured capture
@@ -963,7 +992,42 @@ async fn consume_output(
     expiration: ExecExpiration,
     capture_policy: ExecCapturePolicy,
     stdout_stream: Option<StdoutStream>,
+    descendant_containment_required: bool,
 ) -> Result<RawExecToolCallOutput> {
+    async fn terminate_contained_child_and_wait(child: &mut Child) -> ExitStatus {
+        let process_group_id = match child.id() {
+            Some(process_group_id) => process_group_id,
+            None => {
+                let _ = child.start_kill();
+                return std::future::pending::<ExitStatus>().await;
+            }
+        };
+        if let Err(err) = codex_utils_pty::process_group::terminate_process_group(process_group_id)
+        {
+            tracing::error!("contained process-group termination failed: {err}");
+            let _ = kill_child_process_group(child);
+            let _ = child.start_kill();
+            return std::future::pending::<ExitStatus>().await;
+        }
+        match tokio::time::timeout(CONTAINED_TERMINATION_ACK_GRACE_PERIOD, child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(err)) => {
+                tracing::error!("contained child wait after termination failed: {err}");
+                let _ = kill_child_process_group(child);
+                let _ = child.start_kill();
+                std::future::pending::<ExitStatus>().await
+            }
+            Err(_) => {
+                // A hard kill can stop further mutation, but the outer helper
+                // can no longer acknowledge that bubblewrap's PID namespace
+                // and cleanup work are complete. Retain mutation authority.
+                let _ = kill_child_process_group(child);
+                let _ = child.start_kill();
+                std::future::pending::<ExitStatus>().await
+            }
+        }
+    }
+
     // Both stdout and stderr were configured with `Stdio::piped()`
     // above, therefore `take()` should normally return `Some`.  If it doesn't
     // we treat it as an exceptional I/O error
@@ -1003,47 +1067,67 @@ async fn consume_output(
     tokio::pin!(expiration_wait);
     let (exit_status, timed_out) = tokio::select! {
         status_result = child.wait() => {
-            let exit_status = status_result?;
-            (exit_status, false)
+            match status_result {
+                Ok(exit_status) => (exit_status, false),
+                Err(err) if descendant_containment_required => {
+                    tracing::error!("contained child wait failed: {err}");
+                    let _ = kill_child_process_group(&mut child);
+                    let _ = child.start_kill();
+                    std::future::pending::<(ExitStatus, bool)>().await
+                }
+                Err(err) => return Err(err.into()),
+            }
         }
         outcome = &mut expiration_wait => {
             match outcome {
                 Some(ExecExpirationOutcome::TimedOut) => {
-                    kill_child_process_group(&mut child)?;
-                    child.start_kill()?;
-                    (
-                        synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE),
-                        true,
-                    )
+                    if descendant_containment_required {
+                        let status = terminate_contained_child_and_wait(&mut child).await;
+                        (status, true)
+                    } else {
+                        kill_child_process_group(&mut child)?;
+                        child.start_kill()?;
+                        (
+                            synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE),
+                            true,
+                        )
+                    }
                 }
                 Some(ExecExpirationOutcome::Cancelled) => {
-                    // Let TERM-aware processes run cleanup briefly, then kill any
-                    // remaining members of the original process group.
-                    let process_group_id = child.id();
-                    let should_escalate = if let Some(process_group_id) = process_group_id {
-                        codex_utils_pty::process_group::terminate_process_group(process_group_id)?
+                    if descendant_containment_required {
+                        let _ = terminate_contained_child_and_wait(&mut child).await;
                     } else {
-                        false
-                    };
-                    match tokio::time::timeout(
-                        CANCELLATION_TERMINATION_GRACE_PERIOD,
-                        child.wait(),
-                    )
-                    .await
-                    {
-                        Ok(status) => {
-                            status?;
-                            if should_escalate
-                                && let Some(process_group_id) = process_group_id
-                            {
-                                codex_utils_pty::process_group::kill_process_group(
-                                    process_group_id,
-                                )?;
+                        // Let TERM-aware processes run cleanup briefly, then
+                        // kill any remaining members of the original process
+                        // group.
+                        let process_group_id = child.id();
+                        let should_escalate = if let Some(process_group_id) = process_group_id {
+                            codex_utils_pty::process_group::terminate_process_group(
+                                process_group_id,
+                            )?
+                        } else {
+                            false
+                        };
+                        match tokio::time::timeout(
+                            CANCELLATION_TERMINATION_GRACE_PERIOD,
+                            child.wait(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_status)) => {
+                                if should_escalate
+                                    && let Some(process_group_id) = process_group_id
+                                {
+                                    codex_utils_pty::process_group::kill_process_group(
+                                        process_group_id,
+                                    )?;
+                                }
                             }
-                        }
-                        Err(_) => {
-                            kill_child_process_group(&mut child)?;
-                            child.start_kill()?;
+                            Ok(Err(err)) => return Err(err.into()),
+                            Err(_) => {
+                                kill_child_process_group(&mut child)?;
+                                child.start_kill()?;
+                            }
                         }
                     }
                     (synthetic_exit_status_for_code(/*code*/ 1), false)
@@ -1052,8 +1136,12 @@ async fn consume_output(
             }
         }
         _ = tokio::signal::ctrl_c() => {
-            kill_child_process_group(&mut child)?;
-            child.start_kill()?;
+            if descendant_containment_required {
+                let _ = terminate_contained_child_and_wait(&mut child).await;
+            } else {
+                kill_child_process_group(&mut child)?;
+                child.start_kill()?;
+            }
             (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
         }
     };

@@ -76,6 +76,16 @@ pub trait ToolExecutor<Invocation>: Send + Sync {
         false
     }
 
+    /// Declares whether this executor is semantically read-only.
+    ///
+    /// Hosts must treat `None` and `Some(false)` as potentially mutating. A
+    /// `Some(true)` hint is only one half of the dispatch trust decision: the
+    /// host must independently retain provenance for the same concrete
+    /// executor before allowing it through a read-only gate.
+    fn read_only_hint(&self) -> Option<bool> {
+        None
+    }
+
     /// Returns the history needed for this payload before the invocation is built.
     fn conversation_history_requirement(
         &self,

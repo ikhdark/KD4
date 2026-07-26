@@ -505,6 +505,103 @@ async fn shell_command_active_path_applies_read_only_repair_and_retains_output()
 }
 
 #[tokio::test]
+async fn intercepted_apply_patch_unsupported_target_preserves_mutation_revision() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let managed_root = tempfile::tempdir().expect("create managed root");
+    let unsupported_root = tempfile::tempdir().expect("create unsupported root");
+    let evidence_home = tempfile::tempdir().expect("create task evidence home");
+    let unsupported_write_root =
+        codex_utils_absolute_path::AbsolutePathBuf::try_from(unsupported_root.path().to_path_buf())
+            .expect("absolute unsupported root");
+    turn.permission_profile = codex_protocol::models::PermissionProfile::workspace_write_with(
+        &[unsupported_write_root],
+        codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+        /*exclude_tmpdir_env_var*/ false,
+        /*exclude_slash_tmp*/ false,
+    );
+    let ledger = crate::task_evidence::TaskEvidenceLedger::load_or_new(
+        evidence_home.path().to_path_buf(),
+        codex_protocol::ThreadId::new(),
+        managed_root.path(),
+    )
+    .await;
+    ledger
+        .begin_turn(&turn.sub_id, "verify intercepted shell patch preflight")
+        .await
+        .expect("begin managed turn");
+    ledger
+        .classify(crate::task_evidence::TaskClassification {
+            exhaustive: false,
+            risk_domains: std::collections::BTreeSet::new(),
+            supported_non_git_roots: std::collections::BTreeSet::from([managed_root
+                .path()
+                .to_string_lossy()
+                .into_owned()]),
+        })
+        .await
+        .expect("classify managed task");
+    let ready = ledger
+        .submit_closure(crate::task_evidence::ClosureSubmission {
+            path_review: std::collections::BTreeSet::from([".".to_string()]),
+            competing_paths_checked: std::collections::BTreeSet::from([".".to_string()]),
+            validation_receipt_ids: std::collections::BTreeSet::new(),
+            runtime_evidence: std::collections::BTreeSet::new(),
+            missing_requirement_ids: std::collections::BTreeSet::new(),
+            actionable_findings: std::collections::BTreeSet::new(),
+            blocked_reasons: std::collections::BTreeSet::new(),
+        })
+        .await
+        .expect("prepare Ready task");
+    assert_eq!(ready.phase, crate::task_evidence::TaskPhase::Ready);
+    session.services.task_evidence = ledger;
+
+    let target = unsupported_root.path().join("unsupported.txt");
+    let patch = "*** Begin Patch\n*** Add File: unsupported.txt\n+unsupported\n*** End Patch";
+    let payload = ToolPayload::Function {
+        arguments: json!({
+            "kind": "argv",
+            "program": "apply_patch",
+            "args": [patch],
+            "workdir": unsupported_root.path(),
+        })
+        .to_string(),
+    };
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let handler = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic);
+    let err = match handler
+        .handle(ToolInvocation {
+            session: Arc::clone(&session),
+            step_context: StepContext::for_test(Arc::clone(&turn)),
+            turn: Arc::clone(&turn),
+            cancellation_token: tokio_util::sync::CancellationToken::new(),
+            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+            call_id: "shell-intercept-unsupported".to_string(),
+            tool_name: codex_tools::ToolName::plain("shell_command"),
+            source: ToolCallSource::Direct,
+            payload,
+        })
+        .await
+    {
+        Ok(_) => panic!("unsupported intercepted patch must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("mutation target is not owned by a registered Git root"),
+        "unexpected error: {err}"
+    );
+    let after = session
+        .services
+        .task_evidence
+        .inspect_status()
+        .await
+        .expect("inspect task status");
+    assert_eq!(after.mutation_revision, ready.mutation_revision);
+    assert!(!target.exists());
+}
+
+#[tokio::test]
 async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
     let payload = ToolPayload::Function {
         arguments: json!({ "command": "printf shell command" }).to_string(),

@@ -2,11 +2,167 @@ use super::*;
 use futures::StreamExt;
 use std::collections::HashSet;
 use std::future::Future;
+use std::path::Path;
 
 const AGENT_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const AGENT_TREE_SHUTDOWN_CONCURRENCY: usize = 8;
 
+pub(crate) struct TaskClosureDescendantSeal {
+    _closing_guard: crate::agent::registry::AgentTreeClosingGuard,
+    descendant_evidence: Vec<crate::task_evidence::DescendantTaskEvidenceCoverage>,
+}
+
+impl TaskClosureDescendantSeal {
+    pub(crate) fn descendant_evidence(
+        &self,
+    ) -> &[crate::task_evidence::DescendantTaskEvidenceCoverage] {
+        &self.descendant_evidence
+    }
+}
+
 impl AgentControl {
+    /// Permanently close and synchronously quiesce every known descendant of `root_thread_id`.
+    ///
+    /// The returned guard keeps the subtree closed to new spawns until the caller has completed
+    /// the task-closure transition. Persisted edges are closed before live runtimes are stopped so
+    /// a concurrent or post-restart V2 cold load cannot reopen a descendant after this method
+    /// returns.
+    pub(crate) async fn seal_descendants_for_task_closure(
+        &self,
+        root_thread_id: ThreadId,
+        codex_home: &Path,
+    ) -> CodexResult<TaskClosureDescendantSeal> {
+        let state = self.upgrade()?;
+        let mut closing_guard = self.state.begin_closing_agent_tree(root_thread_id);
+        let mut descendant_ids = HashSet::new();
+
+        loop {
+            let mut snapshot = self.live_thread_spawn_descendants(root_thread_id).await?;
+            if let Some(agent_graph_store) = state.agent_graph_store() {
+                snapshot.extend(
+                    agent_graph_store
+                        .list_thread_spawn_descendants(root_thread_id, /*status_filter*/ None)
+                        .await
+                        .map_err(|err| {
+                            CodexErr::Fatal(format!(
+                                "failed to enumerate persisted descendant agents: {err}"
+                            ))
+                        })?,
+                );
+            }
+
+            let newly_discovered = snapshot
+                .into_iter()
+                .filter(|thread_id| descendant_ids.insert(*thread_id))
+                .collect::<Vec<_>>();
+            if newly_discovered.is_empty() {
+                break;
+            }
+            closing_guard.mark_threads(newly_discovered);
+        }
+
+        let mut ordered_descendant_ids = descendant_ids.iter().copied().collect::<Vec<_>>();
+        ordered_descendant_ids.sort_by_key(ToString::to_string);
+        if let Some(agent_graph_store) = state.agent_graph_store() {
+            for descendant_id in ordered_descendant_ids.iter().copied() {
+                agent_graph_store
+                    .set_thread_spawn_edge_status(
+                        descendant_id,
+                        codex_agent_graph_store::ThreadSpawnEdgeStatus::Closed,
+                    )
+                    .await
+                    .map_err(|err| {
+                        CodexErr::Fatal(format!(
+                            "failed to persist closed spawn-edge status for descendant agent \
+                             {descendant_id}: {err}"
+                        ))
+                    })?;
+            }
+        }
+
+        let load_completions = {
+            let flights = self
+                .v2_load_flights
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            ordered_descendant_ids
+                .iter()
+                .filter_map(|thread_id| flights.get(thread_id).map(|flight| flight.subscribe()))
+                .collect::<Vec<_>>()
+        };
+        for completion in load_completions {
+            tokio::time::timeout(
+                AGENT_SHUTDOWN_TIMEOUT,
+                wait_for_v2_load_completion(completion),
+            )
+            .await
+            .map_err(|_| {
+                CodexErr::Fatal(
+                    "timed out waiting for a descendant agent cold load to quiesce".to_string(),
+                )
+            })?;
+        }
+
+        let coverage_threads = futures::future::join_all(
+            ordered_descendant_ids
+                .iter()
+                .map(|thread_id| state.get_thread(*thread_id)),
+        )
+        .await;
+        let shutdown_results = run_tree_shutdowns(&ordered_descendant_ids, |thread_id| {
+            self.shutdown_live_agent(thread_id)
+        })
+        .await;
+        let shutdown_failures = shutdown_results
+            .into_iter()
+            .filter_map(|(thread_id, result)| match result {
+                Ok(_) | Err(CodexErr::ThreadNotFound(_)) | Err(CodexErr::InternalAgentDied) => None,
+                Err(err) => Some(format!("{thread_id}: {err}")),
+            })
+            .collect::<Vec<_>>();
+        if !shutdown_failures.is_empty() {
+            return Err(CodexErr::Fatal(format!(
+                "failed to quiesce descendant agents: {}",
+                shutdown_failures.join("; ")
+            )));
+        }
+
+        let mut descendant_evidence = Vec::with_capacity(ordered_descendant_ids.len());
+        for (thread_id, live_thread) in ordered_descendant_ids.iter().copied().zip(coverage_threads)
+        {
+            let live_coverage = match live_thread {
+                Ok(thread) => thread
+                    .codex
+                    .session
+                    .services
+                    .task_evidence
+                    .descendant_coverage()
+                    .await
+                    .ok(),
+                Err(_) => None,
+            };
+            let coverage = match live_coverage {
+                Some(coverage) => coverage,
+                None => crate::task_evidence::TaskEvidenceLedger::load_descendant_coverage(
+                    codex_home,
+                    thread_id,
+                )
+                .await
+                .map_err(|err| {
+                    CodexErr::Fatal(format!(
+                        "could not collect mutation evidence from descendant agent {thread_id}: {err}"
+                    ))
+                })?,
+            };
+            descendant_evidence.push(coverage);
+        }
+
+        Ok(TaskClosureDescendantSeal {
+            _closing_guard: closing_guard,
+            descendant_evidence,
+        })
+    }
+
     /// Submit a shutdown request for a live agent without marking it explicitly closed in
     /// persisted spawn-edge state.
     pub(crate) async fn shutdown_live_agent(&self, agent_id: ThreadId) -> CodexResult<String> {
@@ -216,6 +372,20 @@ impl AgentControl {
             drop(closing_guard);
         });
         result
+    }
+}
+
+async fn wait_for_v2_load_completion(
+    mut completion: tokio::sync::watch::Receiver<V2AgentLoadCompletion>,
+) {
+    loop {
+        let current = completion.borrow_and_update().clone();
+        if !matches!(current, V2AgentLoadCompletion::Loading) {
+            return;
+        }
+        if completion.changed().await.is_err() {
+            return;
+        }
     }
 }
 

@@ -4,13 +4,14 @@ const DEFAULT_SUMMARY_AFTER_BYTES: usize = 48 * 1024;
 const DEFAULT_SUMMARY_AFTER_LINES: usize = 600;
 const EARLY_SUMMARY_AFTER_BYTES: usize = 10 * 1024;
 const EARLY_SUMMARY_AFTER_LINES: usize = 160;
-const SUMMARY_MAX_BYTES: usize = 32 * 1024;
-const SUMMARY_MAX_LINES: usize = 240;
+const SUMMARY_MAX_BYTES: usize = 16 * 1024;
+const SUMMARY_MAX_LINES: usize = 120;
+const SUMMARY_MAX_LINE_BYTES: usize = 512;
 const SUCCESS_HEAD_LINES: usize = 24;
-const SUCCESS_TAIL_LINES: usize = 64;
-const FAILURE_TAIL_LINES: usize = 140;
+const SUCCESS_TAIL_LINES: usize = 48;
+const FAILURE_TAIL_LINES: usize = 64;
 const FOCUS_CONTEXT_LINES: usize = 3;
-const MAX_FOCUS_MATCHES: usize = 48;
+const MAX_FOCUS_MATCHES: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ShellOutputSummaryOptions<'a> {
@@ -33,8 +34,11 @@ pub(crate) fn summarize_shell_output_for_model(
         return None;
     }
 
+    let validation = options
+        .command_text
+        .is_some_and(looks_like_validation_command);
     let line_count = output.lines().count();
-    let (byte_threshold, line_threshold) = if options.turn_cost_guard {
+    let (byte_threshold, line_threshold) = if options.turn_cost_guard || validation {
         (EARLY_SUMMARY_AFTER_BYTES, EARLY_SUMMARY_AFTER_LINES)
     } else {
         (DEFAULT_SUMMARY_AFTER_BYTES, DEFAULT_SUMMARY_AFTER_LINES)
@@ -45,9 +49,6 @@ pub(crate) fn summarize_shell_output_for_model(
 
     let lines = output.lines().collect::<Vec<_>>();
     let failed = timed_out || exit_code != 0;
-    let validation = options
-        .command_text
-        .is_some_and(looks_like_validation_command);
     let selected = selected_line_indexes(&lines, failed, validation);
     let retained_shape = if validation {
         "failure-focused lines, final status lines, tail"
@@ -227,7 +228,8 @@ impl SummaryBuilder {
         let separator_bytes = usize::from(!self.text.is_empty());
         let remaining = SUMMARY_MAX_BYTES
             .saturating_sub(self.text.len())
-            .saturating_sub(separator_bytes);
+            .saturating_sub(separator_bytes)
+            .min(SUMMARY_MAX_LINE_BYTES);
         if remaining == 0 {
             self.capped = true;
             return;
@@ -251,15 +253,41 @@ impl SummaryBuilder {
     }
 
     fn finish(mut self) -> Option<String> {
+        const CAP_MARKER: &str = "[summary capped]";
+
         if self.text.trim().is_empty() {
             return None;
         }
-        if self.capped && !self.text.ends_with("[summary capped]") {
+        if self.capped && !self.text.ends_with(CAP_MARKER) {
+            while self.lines >= SUMMARY_MAX_LINES {
+                let Some(last_separator) = self.text.rfind('\n') else {
+                    self.text.clear();
+                    self.lines = 0;
+                    break;
+                };
+                self.text.truncate(last_separator);
+                self.lines -= 1;
+            }
+            while self.text.ends_with('\n') {
+                self.text.pop();
+            }
+            let separator_bytes = usize::from(!self.text.is_empty());
+            let body_limit = SUMMARY_MAX_BYTES
+                .saturating_sub(CAP_MARKER.len())
+                .saturating_sub(separator_bytes);
+            if self.text.len() > body_limit {
+                self.text = take_prefix_at_char_boundary(&self.text, body_limit).to_string();
+                while self.text.ends_with('\n') {
+                    self.text.pop();
+                }
+            }
             if !self.text.is_empty() {
                 self.text.push('\n');
             }
-            self.text.push_str("[summary capped]");
+            self.text.push_str(CAP_MARKER);
         }
+        debug_assert!(self.text.len() <= SUMMARY_MAX_BYTES);
+        debug_assert!(self.text.lines().count() <= SUMMARY_MAX_LINES);
         Some(self.text)
     }
 }

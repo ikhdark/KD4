@@ -122,7 +122,28 @@ impl RequestPermissionsHandler {
 }
 
 impl CoreToolRuntime for RequestPermissionsHandler {
+    fn task_evidence_read_only(&self) -> bool {
+        true
+    }
+
+    fn task_evidence_review_read_only(&self) -> bool {
+        false
+    }
+
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         ToolExecutionTiming::Interactive
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_requests_preserve_managed_tasks_without_expanding_review_authority() {
+        let handler = RequestPermissionsHandler;
+
+        assert!(CoreToolRuntime::task_evidence_read_only(&handler));
+        assert!(!CoreToolRuntime::task_evidence_review_read_only(&handler));
     }
 }

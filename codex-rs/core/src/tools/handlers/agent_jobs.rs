@@ -125,6 +125,29 @@ fn required_state_db(
     })
 }
 
+fn single_local_environment_cwd(turn: &TurnContext) -> Result<AbsolutePathBuf, FunctionCallError> {
+    let [turn_environment] = turn.environments.turn_environments.as_slice() else {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agents_on_csv requires exactly one local environment".to_string(),
+        ));
+    };
+
+    if turn_environment.environment.is_remote() {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agents_on_csv is not supported for remote environments".to_string(),
+        ));
+    }
+
+    // TODO(anp): Migrate spawn_agents_on_csv filesystem access to PathUri before enabling it for
+    // remote environments.
+    turn_environment.cwd().to_abs_path().map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "spawn_agents_on_csv cwd `{}` is not native to the Codex host: {err}",
+            turn_environment.cwd()
+        ))
+    })
+}
+
 async fn build_runner_options(
     session: &Arc<Session>,
     turn: &Arc<TurnContext>,
@@ -509,7 +532,9 @@ async fn run_agent_job_loop(
     } else {
         None
     };
-    let export_error = export_job_csv_snapshot(db.clone(), &job).await.err();
+    let export_error = export_job_csv_snapshot(&session, &turn, db.clone(), &job)
+        .await
+        .err();
     if let Some(cleanup_error) = cleanup_error {
         if let Some(export_error) = export_error {
             return Err(anyhow::anyhow!(
@@ -539,6 +564,8 @@ async fn run_agent_job_loop(
 }
 
 async fn export_job_csv_snapshot(
+    session: &Arc<Session>,
+    turn: &Arc<TurnContext>,
     db: Arc<codex_state::StateRuntime>,
     job: &codex_state::AgentJob,
 ) -> anyhow::Result<()> {
@@ -547,15 +574,74 @@ async fn export_job_csv_snapshot(
         .await?;
     let csv_content = render_job_csv(job.input_headers.as_slice(), items.as_slice())
         .map_err(|err| anyhow::anyhow!("failed to render job csv for auto-export: {err}"))?;
-    let output_path = PathBuf::from(job.output_csv_path.clone());
-    write_job_csv_atomically(output_path, csv_content).await?;
+    let cwd = single_local_environment_cwd(turn)
+        .map_err(|err| anyhow::anyhow!("failed to resolve csv export cwd: {err}"))?;
+    let authorized_output_path = PathBuf::from(job.output_csv_path.clone());
+    let output_path =
+        resolve_current_job_output_path(cwd.as_path(), authorized_output_path.as_path())?;
+    let file_system_policy = turn.file_system_sandbox_policy();
+    if !file_system_policy.can_write_path_with_cwd(&output_path, cwd.as_path()) {
+        return Err(anyhow::anyhow!(
+            "output csv path is no longer writable under the active sandbox policy: {}",
+            output_path.display()
+        ));
+    }
+    if session
+        .services
+        .task_evidence
+        .manages_turn(&turn.sub_id)
+        .await
+    {
+        session
+            .services
+            .task_evidence
+            .register_mutation_targets(cwd.as_path(), std::slice::from_ref(&output_path))
+            .await
+            .map_err(anyhow::Error::msg)?;
+    }
+    write_job_csv_atomically(
+        authorized_output_path,
+        cwd.as_path().to_path_buf(),
+        csv_content,
+    )
+    .await?;
     Ok(())
 }
 
-async fn write_job_csv_atomically(output_path: PathBuf, csv_content: String) -> anyhow::Result<()> {
+fn resolve_current_job_output_path(
+    cwd: &std::path::Path,
+    authorized_output_path: &std::path::Path,
+) -> anyhow::Result<PathBuf> {
+    if !authorized_output_path.is_absolute() {
+        return Err(anyhow::anyhow!(
+            "persisted output csv path must be absolute: {}",
+            authorized_output_path.display()
+        ));
+    }
+    let symlink_resolved =
+        crate::path_utils::resolve_symlink_write_paths(authorized_output_path)?.write_path;
+    let current_output_path =
+        crate::task_evidence::canonicalize_mutation_target(cwd, &symlink_resolved)
+            .map_err(anyhow::Error::msg)?;
+    if authorized_output_path != current_output_path {
+        return Err(anyhow::anyhow!(
+            "output csv path changed after authorization: {} now resolves to {}",
+            authorized_output_path.display(),
+            current_output_path.display()
+        ));
+    }
+    Ok(current_output_path)
+}
+
+async fn write_job_csv_atomically(
+    authorized_output_path: PathBuf,
+    cwd: PathBuf,
+    csv_content: String,
+) -> anyhow::Result<()> {
     tokio::task::spawn_blocking(move || {
-        let write_paths = crate::path_utils::resolve_symlink_write_paths(&output_path)?;
-        crate::path_utils::write_atomically(&write_paths.write_path, &csv_content)
+        let output_path =
+            resolve_current_job_output_path(cwd.as_path(), authorized_output_path.as_path())?;
+        crate::path_utils::write_atomically(&output_path, &csv_content).map_err(anyhow::Error::from)
     })
     .await
     .map_err(|err| anyhow::anyhow!("atomic csv write task failed: {err}"))??;

@@ -41,6 +41,7 @@ pub struct WindowsSandboxSessionRequest<'a> {
     pub tty: bool,
     pub stdin_open: bool,
     pub use_private_desktop: bool,
+    pub require_confirmed_descendant_exit: bool,
 }
 
 pub async fn spawn_windows_sandbox_session_for_level(
@@ -67,6 +68,7 @@ pub async fn spawn_windows_sandbox_session_for_level(
             request.tty,
             request.stdin_open,
             request.use_private_desktop,
+            request.require_confirmed_descendant_exit,
         )
         .await
     } else {
@@ -138,6 +140,7 @@ pub async fn spawn_windows_sandbox_session_elevated_for_permission_profile(
     tty: bool,
     stdin_open: bool,
     use_private_desktop: bool,
+    require_confirmed_descendant_exit: bool,
 ) -> Result<SpawnedProcess> {
     backends::elevated::spawn_windows_sandbox_session_elevated_for_permission_profile(
         permission_profile,
@@ -157,6 +160,7 @@ pub async fn spawn_windows_sandbox_session_elevated_for_permission_profile(
         tty,
         stdin_open,
         use_private_desktop,
+        require_confirmed_descendant_exit,
     )
     .await
 }

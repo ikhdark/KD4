@@ -8,6 +8,7 @@ use crate::compact::CompactionAnalyticsAttempt;
 use crate::compact::CompactionAnalyticsDetails;
 use crate::compact::InitialContextInjection;
 use crate::compact::compaction_status_from_result;
+use crate::compact::remove_protected_pending_final_items;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::compact_remote::process_compacted_history;
@@ -272,10 +273,11 @@ async fn run_remote_compact_task_inner_impl(
         prompt_input,
         compaction_output,
         token_usage,
+        mut protected_item_ids,
         owned_client_session: _owned_client_session,
     } = attempt;
     if let Some(token_usage) = token_usage {
-        sess.record_rollout_budget_usage(&token_usage)?;
+        sess.record_rollout_budget_usage(compaction_turn_context.as_ref(), &token_usage)?;
         analytics_details.active_context_tokens_before = Some(token_usage.input_tokens);
         analytics_details.compaction_summary_tokens = Some(token_usage.output_tokens);
         analytics_details.cached_input_tokens = Some(token_usage.cached_input_tokens);
@@ -284,13 +286,20 @@ async fn run_remote_compact_task_inner_impl(
         build_v2_compacted_history(prompt_input, compaction_output);
     analytics_details.retained_image_count = Some(retained_images);
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
-    let (new_history, world_state_baseline) = process_compacted_history(
+    let (mut new_history, world_state_baseline) = process_compacted_history(
         sess.as_ref(),
         compaction_turn_context.as_ref(),
         compacted_history,
         &initial_context_injection,
     )
     .await;
+    protected_item_ids.extend(
+        sess.services
+            .task_evidence
+            .protected_pending_final_item_ids()
+            .await,
+    );
+    remove_protected_pending_final_items(&mut new_history, &protected_item_ids);
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
@@ -355,7 +364,7 @@ async fn run_remote_compaction_request_v2(
         .min(MAX_REMOTE_COMPACTION_V2_STREAM_RETRIES);
     let mut retries = 0;
     loop {
-        sess.ensure_rollout_budget_available()?;
+        sess.reserve_rollout_model_call(turn_context)?;
         let trace_attempt = compaction_trace.start_attempt(&RemoteCompactionV2TraceRequest {
             model: turn_context.model_info.slug.as_str(),
             instructions: prompt.base_instructions.text.as_str(),

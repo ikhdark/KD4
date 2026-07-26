@@ -667,13 +667,31 @@ fn ensure_linux_bubblewrap_is_supported(
     allow_network_for_proxy: bool,
     is_wsl1: bool,
 ) -> Result<(), SandboxTransformError> {
-    let requires_bubblewrap = allow_network_for_proxy
-        || (!use_legacy_landlock && !file_system_sandbox_policy.has_full_disk_write_access());
+    let requires_bubblewrap = linux_sandbox_uses_bubblewrap(
+        file_system_sandbox_policy,
+        use_legacy_landlock,
+        allow_network_for_proxy,
+    );
     if is_wsl1 && requires_bubblewrap {
         return Err(SandboxTransformError::Wsl1UnsupportedForBubblewrap);
     }
 
     Ok(())
+}
+
+/// Returns whether the Linux sandbox helper will enter bubblewrap for this
+/// effective policy.
+///
+/// Full-disk-write commands bypass the helper's filesystem sandbox unless
+/// proxy-only networking requires a network namespace. Legacy Landlock is
+/// likewise used only when proxy-only networking does not force bubblewrap.
+pub fn linux_sandbox_uses_bubblewrap(
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    use_legacy_landlock: bool,
+    allow_network_for_proxy: bool,
+) -> bool {
+    allow_network_for_proxy
+        || (!use_legacy_landlock && !file_system_sandbox_policy.has_full_disk_write_access())
 }
 
 fn os_argv_to_strings(argv: Vec<OsString>) -> Vec<String> {

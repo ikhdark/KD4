@@ -1,3 +1,4 @@
+use crate::client_common::Prompt;
 use crate::context::ContextualUserFragment;
 use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSnapshot;
@@ -33,6 +34,43 @@ use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::LazyLock;
+
+const PROMPT_RETIRED_SUCCESS_OUTPUT: &str =
+    "[successful tool output retired from prompt; call/output linkage preserved]";
+const PROMPT_MIN_RECENT_SUCCESS_OUTPUTS: usize = 4;
+const PROMPT_MAX_RECENT_SUCCESS_OUTPUTS: usize = 20;
+const PROMPT_RECENT_SUCCESS_OUTPUT_TOKEN_BUDGET: usize = 40_000;
+
+enum SuccessfulToolOutputMut<'a> {
+    Function(&'a mut FunctionCallOutputPayload),
+    ToolSearch(&'a mut Vec<serde_json::Value>),
+}
+
+impl SuccessfulToolOutputMut<'_> {
+    fn token_count(&self) -> usize {
+        match self {
+            Self::Function(output) => match &output.body {
+                FunctionCallOutputBody::Text(text) => approx_token_count(text),
+                FunctionCallOutputBody::ContentItems(items) => serde_json::to_string(items)
+                    .map(|text| approx_token_count(&text))
+                    .unwrap_or(PROMPT_RECENT_SUCCESS_OUTPUT_TOKEN_BUDGET),
+            },
+            Self::ToolSearch(tools) => serde_json::to_string(tools)
+                .map(|text| approx_token_count(&text))
+                .unwrap_or(PROMPT_RECENT_SUCCESS_OUTPUT_TOKEN_BUDGET),
+        }
+    }
+
+    fn retire(self) {
+        match self {
+            Self::Function(output) => {
+                output.body =
+                    FunctionCallOutputBody::Text(PROMPT_RETIRED_SUCCESS_OUTPUT.to_string());
+            }
+            Self::ToolSearch(tools) => tools.clear(),
+        }
+    }
+}
 
 /// Transcript of thread history
 #[derive(Debug, Clone, Default)]
@@ -143,7 +181,51 @@ impl ContextManager {
     /// outputs.
     pub(crate) fn for_prompt(mut self, input_modalities: &[InputModality]) -> Vec<ResponseItem> {
         self.normalize_history(input_modalities);
+        self.retire_old_successful_tool_outputs();
         Arc::unwrap_or_clone(self.items)
+    }
+
+    /// Shrinks only the disposable prompt projection. Persisted rollout history and
+    /// the live in-memory transcript remain untouched because `for_prompt` consumes
+    /// a cloned snapshot.
+    fn retire_old_successful_tool_outputs(&mut self) {
+        let mut successful_outputs_seen = 0usize;
+        let mut retained_tokens = 0usize;
+        let mut token_budget_exhausted = false;
+
+        for item in Arc::make_mut(&mut self.items).iter_mut().rev() {
+            let output = match item {
+                ResponseItem::FunctionCallOutput { output, .. }
+                | ResponseItem::CustomToolCallOutput { output, .. }
+                    if output.success == Some(true) =>
+                {
+                    SuccessfulToolOutputMut::Function(output)
+                }
+                ResponseItem::ToolSearchOutput { status, tools, .. }
+                    if status.eq_ignore_ascii_case("completed") =>
+                {
+                    SuccessfulToolOutputMut::ToolSearch(tools)
+                }
+                _ => continue,
+            };
+
+            successful_outputs_seen = successful_outputs_seen.saturating_add(1);
+            let output_tokens = output.token_count();
+            let retain_for_recency = successful_outputs_seen <= PROMPT_MIN_RECENT_SUCCESS_OUTPUTS;
+            let retain_within_budget = successful_outputs_seen <= PROMPT_MAX_RECENT_SUCCESS_OUTPUTS
+                && !token_budget_exhausted
+                && retained_tokens.saturating_add(output_tokens)
+                    <= PROMPT_RECENT_SUCCESS_OUTPUT_TOKEN_BUDGET;
+
+            if retain_for_recency || retain_within_budget {
+                retained_tokens = retained_tokens.saturating_add(output_tokens);
+                continue;
+            }
+            if successful_outputs_seen <= PROMPT_MAX_RECENT_SUCCESS_OUTPUTS {
+                token_budget_exhausted = true;
+            }
+            output.retire();
+        }
     }
 
     /// Returns raw items in the history.
@@ -174,6 +256,37 @@ impl ContextManager {
             text: model_info.get_model_instructions(personality),
         };
         self.estimate_token_count_with_base_instructions(&base_instructions)
+    }
+
+    pub(crate) fn estimate_prompt_token_count(prompt: &Prompt) -> Option<i64> {
+        let base_and_input_tokens = Self::estimate_items_token_count_with_base_instructions(
+            &prompt.input,
+            &prompt.base_instructions,
+        )?;
+        let tools_tokens = serde_json::to_vec(&prompt.tools)
+            .map(|tools| {
+                approx_tokens_from_byte_count_i64(i64::try_from(tools.len()).unwrap_or(i64::MAX))
+            })
+            .unwrap_or(i64::MAX);
+        let output_schema_tokens = prompt
+            .output_schema
+            .as_ref()
+            .map(|schema| {
+                serde_json::to_vec(schema)
+                    .map(|schema| {
+                        approx_tokens_from_byte_count_i64(
+                            i64::try_from(schema.len()).unwrap_or(i64::MAX),
+                        )
+                    })
+                    .unwrap_or(i64::MAX)
+            })
+            .unwrap_or_default();
+
+        Some(
+            base_and_input_tokens
+                .saturating_add(tools_tokens)
+                .saturating_add(output_schema_tokens),
+        )
     }
 
     pub(crate) fn estimate_token_count_with_base_instructions(

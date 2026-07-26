@@ -192,6 +192,7 @@ async fn run_windows_sandbox_wrapper_request(request: WindowsSandboxWrapperReque
             tty: false,
             stdin_open: true,
             use_private_desktop: request.windows_sandbox_private_desktop,
+            require_confirmed_descendant_exit: false,
         })
         .await?;
 

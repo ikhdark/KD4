@@ -164,7 +164,11 @@ impl TestSyncHandler {
     }
 }
 
-impl CoreToolRuntime for TestSyncHandler {}
+impl CoreToolRuntime for TestSyncHandler {
+    fn task_evidence_read_only(&self) -> bool {
+        true
+    }
+}
 
 async fn wait_on_barrier(args: BarrierArgs) -> Result<(), FunctionCallError> {
     if args.participants == 0 {

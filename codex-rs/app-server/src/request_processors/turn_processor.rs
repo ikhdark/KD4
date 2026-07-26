@@ -1017,6 +1017,7 @@ impl TurnRequestProcessor {
                             Some(AnalyticsJsonRpcError::TurnSteer(turn_steer_error)),
                         )
                     }
+                    SteerInputError::TaskState(message) => (message, None, None),
                     SteerInputError::EmptyInput => (
                         "input must not be empty".to_string(),
                         None,

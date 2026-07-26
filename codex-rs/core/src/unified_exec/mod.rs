@@ -43,6 +43,7 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
+use crate::task_evidence::TaskMutationGuard;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -72,15 +73,16 @@ pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 2_000;
 pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
 pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
 pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
-pub(crate) const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 10_000;
-pub(crate) const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 10_000;
-pub(crate) const ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS: usize = 10_000;
+pub(crate) const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 2_000;
+pub(crate) const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 4_000;
+pub(crate) const ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS: usize = 6_000;
 #[cfg(all(test, unix))]
 pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = DEFAULT_SUCCESS_OUTPUT_TOKENS;
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
 pub(crate) const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
 
+#[derive(Clone)]
 pub(crate) struct UnifiedExecContext {
     pub session: Arc<Session>,
     pub turn: Arc<TurnContext>,
@@ -114,7 +116,7 @@ impl UnifiedExecContext {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ExecCommandRequest {
     pub command: Vec<String>,
     pub command_for_safety: Vec<String>,
@@ -136,6 +138,7 @@ pub(crate) struct ExecCommandRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
+    pub mutation_guard: Option<TaskMutationGuard>,
 }
 
 #[derive(Debug)]
@@ -145,6 +148,7 @@ pub(crate) struct WriteStdinRequest<'a> {
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
     pub truncation_policy: TruncationPolicy,
+    pub mutation_guard: Option<TaskMutationGuard>,
 }
 
 #[derive(Default)]
@@ -187,11 +191,12 @@ impl ProcessStore {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct UnifiedExecProcessManager {
     process_store: Arc<Mutex<ProcessStore>>,
     max_write_stdin_yield_time_ms: u64,
     deferred_executor_enabled: bool,
-    executor_ready: AtomicBool,
+    executor_ready: Arc<AtomicBool>,
 }
 
 impl UnifiedExecProcessManager {
@@ -211,7 +216,7 @@ impl UnifiedExecProcessManager {
             max_write_stdin_yield_time_ms: max_write_stdin_yield_time_ms
                 .max(MIN_EMPTY_YIELD_TIME_MS),
             deferred_executor_enabled,
-            executor_ready: AtomicBool::new(false),
+            executor_ready: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -233,6 +238,7 @@ struct ProcessEntry {
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
+    mutation_guard: Option<TaskMutationGuard>,
 }
 
 #[cfg(test)]

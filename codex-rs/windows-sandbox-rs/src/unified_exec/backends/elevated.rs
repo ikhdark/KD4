@@ -95,7 +95,8 @@ async fn spawn_runner_transport_task(
     sandbox_creds: SandboxCreds,
     request: RunnerTransportRequest,
 ) -> Result<RunnerTransport> {
-    tokio::task::spawn_blocking(move || -> Result<_> {
+    let require_confirmed_descendant_exit = request.spawn_request.require_confirmed_descendant_exit;
+    let result = tokio::task::spawn_blocking(move || -> Result<_> {
         spawn_runner_transport_with_retry(
             sandbox_creds,
             &request,
@@ -103,8 +104,12 @@ async fn spawn_runner_transport_task(
             refresh_logon_sandbox_creds,
         )
     })
-    .await
-    .map_err(|err| anyhow::anyhow!("runner handshake task failed: {err}"))?
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_err) if require_confirmed_descendant_exit => std::future::pending().await,
+        Err(err) => Err(anyhow::anyhow!("runner handshake task failed: {err}")),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -126,6 +131,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
     tty: bool,
     stdin_open: bool,
     use_private_desktop: bool,
+    require_confirmed_descendant_exit: bool,
 ) -> Result<SpawnedProcess> {
     let deny_read_paths_override = deny_read_paths_override
         .iter()
@@ -175,6 +181,7 @@ pub(crate) async fn spawn_windows_sandbox_session_elevated_for_permission_profil
             tty,
             stdin_open,
             use_private_desktop,
+            require_confirmed_descendant_exit,
         },
         read_roots_override: read_roots_override.map(<[PathBuf]>::to_vec),
         read_roots_include_platform_defaults,

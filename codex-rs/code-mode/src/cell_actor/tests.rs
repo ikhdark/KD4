@@ -252,6 +252,36 @@ async fn yield_timer_preempts_buffered_runtime_output() {
         })
     );
     harness.task.await.unwrap();
+
+    let mut run_to_completion = spawn_cell_actor_harness(ObserveMode::RunToCompletion);
+    run_to_completion
+        .event_tx
+        .send(RuntimeEvent::Started)
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        run_to_completion.initial_event_rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    run_to_completion
+        .event_tx
+        .send(RuntimeEvent::YieldRequested)
+        .unwrap();
+    assert_eq!(
+        run_to_completion.initial_event_rx.await.unwrap(),
+        Ok(CellEvent::Yielded {
+            content_items: Vec::new(),
+        })
+    );
+    let termination = run_to_completion.handle.terminate();
+    drop(run_to_completion.event_tx);
+    assert_eq!(
+        termination.await,
+        Ok(CellEvent::Terminated {
+            content_items: Vec::new(),
+        })
+    );
+    run_to_completion.task.await.unwrap();
 }
 
 #[tokio::test]

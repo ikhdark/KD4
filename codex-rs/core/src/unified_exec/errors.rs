@@ -19,6 +19,10 @@ pub(crate) enum UnifiedExecError {
     StdinClosed,
     #[error("missing command line for unified exec request")]
     MissingCommandLine,
+    #[error(
+        "managed mutation rejected: the existing process was not launched with strong descendant containment"
+    )]
+    DescendantContainmentUnavailable,
     #[error("Command denied by sandbox: {message}")]
     SandboxDenied {
         message: String,

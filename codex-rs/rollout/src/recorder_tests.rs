@@ -5,9 +5,12 @@ use crate::config::RolloutConfig;
 use chrono::TimeZone;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
+use codex_protocol::models::FunctionCallOutputBody;
+use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageEvent;
 use codex_protocol::protocol::AskForApproval;
+use codex_protocol::protocol::CompactedItem;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
@@ -69,6 +72,93 @@ fn write_session_file(root: &Path, ts: &str, uuid: Uuid) -> std::io::Result<Path
     });
     writeln!(file, "{user_event}")?;
     Ok(path)
+}
+
+fn function_output(call_id: &str, success: bool) -> ResponseItem {
+    ResponseItem::FunctionCallOutput {
+        id: Some(format!("fco-{call_id}")),
+        call_id: call_id.to_string(),
+        output: FunctionCallOutputPayload {
+            body: FunctionCallOutputBody::Text(format!("output for {call_id}")),
+            success: Some(success),
+        },
+        internal_chat_message_metadata_passthrough: None,
+    }
+}
+
+#[tokio::test]
+async fn rollout_private_metadata_restores_tool_success_without_changing_wire_output()
+-> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let response_item = RolloutItem::ResponseItem(function_output("live", true));
+    let compacted_item = RolloutItem::Compacted(CompactedItem {
+        message: "summary".to_string(),
+        replacement_history: Some(vec![
+            function_output("duplicate", true),
+            function_output("duplicate", false),
+        ]),
+        window_number: Some(2),
+        first_window_id: None,
+        previous_window_id: None,
+        window_id: None,
+    });
+    let mut lines = String::new();
+    for item in [&response_item, &compacted_item] {
+        let line = RolloutLineRef {
+            timestamp: "2026-07-23T00:00:00.000Z".to_string(),
+            item,
+            local_tool_output_statuses: collect_local_tool_output_statuses(item),
+        };
+        let json = serde_json::to_string(&line)?;
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+        if matches!(item, RolloutItem::ResponseItem(_)) {
+            assert_eq!(value["payload"]["output"], "output for live");
+            assert_eq!(value[LOCAL_TOOL_OUTPUT_STATUS_FIELD][0]["success"], true);
+            assert_eq!(value[LOCAL_TOOL_OUTPUT_STATUS_FIELD][0]["output_index"], 0);
+        } else {
+            assert_eq!(value[LOCAL_TOOL_OUTPUT_STATUS_FIELD][0]["output_index"], 0);
+            assert_eq!(value[LOCAL_TOOL_OUTPUT_STATUS_FIELD][1]["output_index"], 1);
+        }
+        let _: RolloutLine = serde_json::from_str(&json)?;
+        lines.push_str(&json);
+        lines.push('\n');
+    }
+    fs::write(&rollout_path, lines)?;
+
+    let (loaded, _, parse_errors) = RolloutRecorder::load_rollout_items(&rollout_path).await?;
+
+    assert_eq!(parse_errors, 0);
+    let RolloutItem::ResponseItem(ResponseItem::FunctionCallOutput { output, .. }) = &loaded[0]
+    else {
+        panic!("expected restored response item");
+    };
+    assert_eq!(output.success, Some(true));
+    let RolloutItem::Compacted(CompactedItem {
+        replacement_history: Some(history),
+        ..
+    }) = &loaded[1]
+    else {
+        panic!("expected restored compacted item");
+    };
+    let restored_successes = history
+        .iter()
+        .map(|item| match item {
+            ResponseItem::FunctionCallOutput { output, .. } => output.success,
+            other => panic!("expected restored compacted output, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(restored_successes, vec![Some(true), Some(false)]);
+    Ok(())
+}
+
+#[test]
+fn local_tool_output_status_without_index_remains_loadable() {
+    let statuses: Vec<LocalToolOutputStatus> = serde_json::from_value(serde_json::json!([
+        {"call_id": "legacy", "success": false}
+    ]))
+    .expect("legacy private metadata should deserialize");
+    assert_eq!(statuses[0].output_index, None);
 }
 
 #[test]

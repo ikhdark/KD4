@@ -20,6 +20,7 @@ pub struct ElevatedSandboxProfileCaptureRequest<'a> {
     pub write_roots_override: Option<&'a [PathBuf]>,
     pub deny_read_paths_override: &'a [AbsolutePathBuf],
     pub deny_write_paths_override: &'a [AbsolutePathBuf],
+    pub require_confirmed_descendant_exit: bool,
 }
 
 mod windows_impl {
@@ -60,6 +61,12 @@ mod windows_impl {
     use std::time::Duration;
 
     pub use crate::windows_impl::CaptureResult;
+
+    fn wait_forever_without_containment_acknowledgement() -> ! {
+        loop {
+            std::thread::park_timeout(Duration::from_secs(60));
+        }
+    }
 
     /// Polls for cancellation and sends the runner's terminate IPC frame when requested.
     ///
@@ -115,6 +122,7 @@ mod windows_impl {
             write_roots_override,
             deny_read_paths_override,
             deny_write_paths_override,
+            require_confirmed_descendant_exit,
         } = request;
         let permissions =
             ResolvedWindowsSandboxPermissions::try_from_permission_profile_for_workspace_roots(
@@ -194,6 +202,7 @@ mod windows_impl {
                 tty: false,
                 stdin_open: false,
                 use_private_desktop,
+                require_confirmed_descendant_exit,
             };
             let transport = retry_runner_spawn_once(
                 sandbox_creds,
@@ -224,7 +233,20 @@ mod windows_impl {
                 },
             )?;
             let (pipe_write, mut pipe_read) = transport.into_files();
-            let cancel_writer = spawn_cancel_writer(&pipe_write, cancellation)?;
+            let cancel_writer = match spawn_cancel_writer(&pipe_write, cancellation) {
+                Ok(cancel_writer) => cancel_writer,
+                Err(err) => {
+                    drop(pipe_write);
+                    drop(pipe_read);
+                    if require_confirmed_descendant_exit {
+                        // SpawnReady has already been received. Without a
+                        // readable Exit frame, closing the pipes can request
+                        // Job teardown but cannot acknowledge it.
+                        wait_forever_without_containment_acknowledgement();
+                    }
+                    return Err(err);
+                }
+            };
 
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
@@ -262,6 +284,12 @@ mod windows_impl {
                 let _ = cancel_handle.join();
             }
             drop(pipe_write);
+            if require_confirmed_descendant_exit && result.is_err() {
+                // Closing the input pipe asks the runner to tear down its Job,
+                // but only its Exit frame proves that teardown completed. Keep
+                // the managed mutation lease pending when that proof was lost.
+                wait_forever_without_containment_acknowledgement();
+            }
             let (exit_code, timed_out) = result?;
 
             if exit_code == 0 {

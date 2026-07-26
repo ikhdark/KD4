@@ -34,6 +34,8 @@ pub(crate) mod shell_spec;
 mod sleep;
 mod source;
 pub(crate) mod source_spec;
+mod task_state;
+pub(crate) mod task_state_spec;
 mod test_sync;
 pub(crate) mod test_sync_spec;
 mod tool_search;
@@ -45,6 +47,12 @@ mod view_image;
 pub(crate) mod view_image_spec;
 mod wait_for_environment;
 
+use codex_protocol::permissions::FileSystemAccessMode;
+use codex_protocol::permissions::FileSystemPath;
+use codex_protocol::permissions::FileSystemSandboxPolicy;
+use codex_protocol::permissions::FileSystemSpecialPath;
+use codex_protocol::permissions::NetworkSandboxPolicy;
+use codex_sandboxing::policy_transforms::effective_network_sandbox_policy;
 use codex_sandboxing::policy_transforms::intersect_permission_profiles;
 use codex_sandboxing::policy_transforms::merge_permission_profiles;
 use codex_sandboxing::policy_transforms::normalize_additional_permissions;
@@ -84,6 +92,7 @@ pub(crate) use shell::ShellCommandHandlerOptions;
 pub use sleep::SleepHandler;
 pub use source::ReadFileSpanHandler;
 pub use source::SearchSourceHandler;
+pub use task_state::TaskStateHandler;
 pub use test_sync::TestSyncHandler;
 pub(crate) use tool_search::ToolSearchHandlerCache;
 pub use unified_exec::ExecCommandHandler;
@@ -101,6 +110,34 @@ where
     serde_json::from_str(arguments).map_err(|err| {
         FunctionCallError::RespondToModel(format!("failed to parse function arguments: {err}"))
     })
+}
+
+fn task_evidence_writable_roots(
+    policy: &FileSystemSandboxPolicy,
+    cwd: &Path,
+) -> Vec<std::path::PathBuf> {
+    let mut tracked_policy = policy.clone();
+    tracked_policy.entries.retain(|entry| {
+        !(entry.access == FileSystemAccessMode::Write
+            && matches!(
+                entry.path,
+                FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Tmpdir | FileSystemSpecialPath::SlashTmp
+                }
+            ))
+    });
+    tracked_policy
+        .get_writable_roots_with_cwd(cwd)
+        .into_iter()
+        .map(|root| root.root.as_path().to_path_buf())
+        .collect()
+}
+
+fn task_evidence_network_is_unbounded(
+    base_policy: NetworkSandboxPolicy,
+    additional_permissions: Option<&AdditionalPermissionProfile>,
+) -> bool {
+    effective_network_sandbox_policy(base_policy, additional_permissions).is_enabled()
 }
 
 fn updated_hook_command(updated_input: &Value) -> Result<&str, FunctionCallError> {
@@ -345,6 +382,8 @@ mod tests {
     use super::implicit_granted_permissions;
     use super::normalize_and_validate_additional_permissions;
     use super::permissions_are_preapproved;
+    use super::task_evidence_network_is_unbounded;
+    use super::task_evidence_writable_roots;
     use crate::sandboxing::SandboxPermissions;
     use codex_protocol::models::AdditionalPermissionProfile;
     use codex_protocol::models::FileSystemPermissions;
@@ -352,7 +391,9 @@ mod tests {
     use codex_protocol::permissions::FileSystemAccessMode;
     use codex_protocol::permissions::FileSystemPath;
     use codex_protocol::permissions::FileSystemSandboxEntry;
+    use codex_protocol::permissions::FileSystemSandboxPolicy;
     use codex_protocol::permissions::FileSystemSpecialPath;
+    use codex_protocol::permissions::NetworkSandboxPolicy;
     use codex_protocol::protocol::AskForApproval;
     use codex_protocol::protocol::GranularApprovalConfig;
     use codex_sandboxing::policy_transforms::intersect_permission_profiles;
@@ -497,5 +538,65 @@ mod tests {
             stored_grant,
             cwd.path(),
         ));
+    }
+
+    #[test]
+    fn task_evidence_treats_base_network_access_as_unbounded() {
+        assert!(task_evidence_network_is_unbounded(
+            NetworkSandboxPolicy::Enabled,
+            None,
+        ));
+        assert!(!task_evidence_network_is_unbounded(
+            NetworkSandboxPolicy::Restricted,
+            None,
+        ));
+    }
+
+    #[test]
+    fn task_evidence_tracks_explicit_writable_roots_but_not_runtime_scratch() {
+        let cwd = tempdir().expect("cwd");
+        let extra = tempdir().expect("extra");
+        let cwd = AbsolutePathBuf::from_absolute_path(
+            dunce::canonicalize(cwd.path()).expect("canonical cwd"),
+        )
+        .expect("absolute cwd");
+        let extra = AbsolutePathBuf::from_absolute_path(
+            dunce::canonicalize(extra.path()).expect("canonical extra"),
+        )
+        .expect("absolute extra");
+        let policy = FileSystemSandboxPolicy::restricted(vec![
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::Tmpdir,
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Special {
+                    value: FileSystemSpecialPath::SlashTmp,
+                },
+                access: FileSystemAccessMode::Write,
+            },
+            FileSystemSandboxEntry {
+                path: FileSystemPath::Path {
+                    path: extra.clone(),
+                },
+                access: FileSystemAccessMode::Write,
+            },
+        ]);
+        let roots = task_evidence_writable_roots(&policy, cwd.as_path());
+        assert!(roots.iter().any(|root| root == cwd.as_path()));
+        assert!(roots.iter().any(|root| root == extra.as_path()));
+        assert!(
+            roots
+                .iter()
+                .all(|root| root == cwd.as_path() || root == extra.as_path())
+        );
     }
 }

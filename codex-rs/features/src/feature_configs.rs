@@ -9,6 +9,9 @@ use std::collections::BTreeMap;
 pub struct CodeModeConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Controls whether code-mode calls yield automatically or remain attached until completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_policy: Option<CodeModeWaitingPolicy>,
     /// Exact tool namespaces to omit from the code-mode nested tool surface.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub excluded_tool_namespaces: Option<Vec<String>>,
@@ -27,6 +30,14 @@ impl FeatureConfig for CodeModeConfigToml {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = Some(enabled);
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeModeWaitingPolicy {
+    YieldAfter,
+    #[default]
+    RunToCompletion,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, JsonSchema)]
@@ -123,6 +134,23 @@ pub struct RolloutBudgetConfigToml {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0.0))]
     pub prefill_token_weight: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0))]
+    pub cached_input_token_weight: Option<f64>,
+    /// Weighted-token charge applied to every model request, including retries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0))]
+    pub model_call_token_cost: Option<f64>,
+    /// Weighted-token charge per byte of tool output recorded in shared history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0))]
+    pub tool_output_byte_weight: Option<f64>,
+    /// Weighted-token charge applied to each spawned subagent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0))]
+    pub subagent_token_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub action: Option<RolloutBudgetAction>,
 }
 
 impl FeatureConfig for RolloutBudgetConfigToml {
@@ -133,6 +161,15 @@ impl FeatureConfig for RolloutBudgetConfigToml {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = Some(enabled);
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RolloutBudgetAction {
+    Remind,
+    Ask,
+    #[default]
+    Stop,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq, JsonSchema)]

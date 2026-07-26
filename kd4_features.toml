@@ -559,11 +559,11 @@ contains = ".codex/harness/workflow.md"
 
 [[features]]
 id = "task-evidence-completion-gate"
-version = 1
+version = 2
 status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Fresh task evidence and machine-derived passed, partial, or blocked status."
+summary = "Runtime-enforced classification, mutation locks, exact-state closure, review, and final-output authorization."
 upstream_equivalent = "none"
 config_keys = []
 
@@ -580,7 +580,7 @@ contains = "pub(crate) task_evidence: TaskEvidenceLedger"
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tools/handlers/plan.rs"
-contains = ".record_plan_update(&args)"
+contains = ".try_record_plan_update(&requested_args)"
 
 [[features.evidence]]
 kind = "registration"
@@ -598,6 +598,46 @@ path = "codex-rs/core/src/session/turn.rs"
 contains = ".take_automatic_verify_plan_request()"
 
 [[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/tools/handlers/task_state.rs"
+contains = "enum TaskStateArgs"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/spec_plan.rs"
+contains = "TaskStateHandler"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/registry.rs"
+contains = ".reserve_tool_dispatch("
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/shell.rs"
+contains = ".guard_normalized_command("
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tools/handlers/unified_exec/write_stdin.rs"
+contains = "\"normalized_shell_mutation\""
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/tasks/review.rs"
+contains = "run_task_evidence_review"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/session/turn.rs"
+contains = ".authorize_final_item("
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/session/mod.rs"
+contains = "record_conversation_items_for_model_history_and_rollout_only"
+
+[[features.evidence]]
 kind = "protocol"
 path = "codex-rs/protocol/src/protocol.rs"
 contains = "pub enum TaskCompletionStatus"
@@ -610,7 +650,12 @@ contains = "pub struct TaskCompletionGate"
 [[features.evidence]]
 kind = "test"
 path = "codex-rs/core/src/task_evidence.rs"
-contains = "automatic_verify_plan_is_requested_once_per_mutation_epoch"
+contains = "identical_incomplete_closure_without_verified_work_terminates_blocked"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/stream_events_utils_tests.rs"
+contains = "provisional_final_is_persisted_without_item_lifecycle_events"
 
 [[features]]
 id = "desktop-runtime-receipt"

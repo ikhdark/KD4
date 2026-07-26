@@ -1,6 +1,6 @@
 # Repository policy
 
-Shared policy revision: `2026-07-22`.
+Shared policy revision: `2026-07-23`.
 
 ## Synchronization contract
 
@@ -198,6 +198,10 @@ behavior, or the amount of requested work.
 
 For implementation work:
 
+- Do not stop after the first fixes or rush to finish. Confirm test outcomes
+  instead of assuming a test run is green, and do not treat green tests alone
+  as completion. Continue until the complete task-relevant behavior is
+  implemented correctly.
 - Change the complete intended path, including a directly competing or replaced
   path that would otherwise continue winning at runtime.
 - Do not leave task-relevant TODOs, placeholders, stubs, inert registrations, or

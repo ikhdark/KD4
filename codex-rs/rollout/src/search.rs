@@ -29,6 +29,12 @@ use super::compression;
 const MATCH_CONTEXT_BEFORE_CHARS: usize = 48;
 const MATCH_CONTEXT_AFTER_CHARS: usize = 96;
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PendingFinalItem {
+    turn_id: String,
+    item_id: String,
+}
+
 /// Search matches keyed by the canonical `.jsonl` path for each rollout.
 pub type RolloutSearchMatches = HashMap<PathBuf, Option<String>>;
 
@@ -88,6 +94,7 @@ async fn ripgrep_rollout_paths(
         return Ok(Some(HashMap::new()));
     }
 
+    let json_search_term_regex = case_insensitive_literal_regex(json_search_term)?;
     let search_term = case_insensitive_literal_regex(search_term)?;
     let mut command = rollout_ripgrep_command(rg_command, root, json_search_term);
     let mut child = match command.spawn() {
@@ -122,7 +129,25 @@ async fn ripgrep_rollout_paths(
         )));
     }
 
-    Ok(Some(matches))
+    Ok(Some(
+        verify_ripgrep_rollout_matches(matches, &json_search_term_regex, &search_term).await?,
+    ))
+}
+
+async fn verify_ripgrep_rollout_matches(
+    candidates: RolloutSearchMatches,
+    json_search_term: &Regex,
+    search_term: &Regex,
+) -> io::Result<RolloutSearchMatches> {
+    let mut matches = HashMap::new();
+    for path in candidates.into_keys() {
+        let (matched, snippet) =
+            inspect_rollout_match(path.as_path(), json_search_term, search_term).await?;
+        if matched {
+            insert_rollout_match(&mut matches, path, snippet);
+        }
+    }
+    Ok(matches)
 }
 
 fn rollout_ripgrep_command(rg_command: &Path, root: &Path, json_search_term: &str) -> Command {
@@ -256,10 +281,14 @@ async fn inspect_rollout_match(
     json_search_term: &Regex,
     search_term: &Regex,
 ) -> io::Result<(bool, Option<String>)> {
+    let pending_final_items = load_pending_final_items(path).await?;
     let mut lines = compression::open_rollout_line_reader(path).await?;
     let mut matched = false;
     while let Some(line) = lines.next_line().await? {
         if !json_search_term.is_match(line.as_str()) {
+            continue;
+        }
+        if !rollout_line_is_search_visible(line.as_str(), &pending_final_items) {
             continue;
         }
         matched = true;
@@ -268,6 +297,72 @@ async fn inspect_rollout_match(
         }
     }
     Ok((matched, None))
+}
+
+async fn load_pending_final_items(path: &Path) -> io::Result<HashSet<PendingFinalItem>> {
+    let Some(codex_home) = codex_home_from_rollout_path(path) else {
+        return Ok(HashSet::new());
+    };
+    let mut lines = compression::open_rollout_line_reader(path).await?;
+    let mut thread_id = None;
+    while let Some(line) = lines.next_line().await? {
+        let Ok(line) = serde_json::from_str::<RolloutLine>(line.trim()) else {
+            continue;
+        };
+        if let RolloutItem::SessionMeta(meta) = line.item {
+            thread_id = Some(meta.meta.id);
+            break;
+        }
+    }
+    let Some(thread_id) = thread_id else {
+        return Ok(HashSet::new());
+    };
+    let thread_id = thread_id.to_string();
+    let evidence_path = codex_home
+        .join("task-evidence")
+        .join(format!("{thread_id}.json"));
+    let Ok(bytes) = tokio::fs::read(evidence_path).await else {
+        return Ok(HashSet::new());
+    };
+    let Ok(document) = serde_json::from_slice::<Value>(&bytes) else {
+        return Ok(HashSet::new());
+    };
+    if document.get("thread_id").and_then(Value::as_str) != Some(thread_id.as_str()) {
+        return Ok(HashSet::new());
+    }
+    let Some(pending_finals) = document.get("pending_finals").and_then(Value::as_array) else {
+        return Ok(HashSet::new());
+    };
+    Ok(pending_finals
+        .iter()
+        .filter(|pending| {
+            !(pending
+                .get("externally_emitted")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && pending
+                    .get("externally_completed")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false))
+        })
+        .filter_map(|pending| {
+            Some(PendingFinalItem {
+                turn_id: pending.get("turn_id")?.as_str()?.to_string(),
+                item_id: pending.get("item_id")?.as_str()?.to_string(),
+            })
+        })
+        .collect())
+}
+
+fn codex_home_from_rollout_path(path: &Path) -> Option<&Path> {
+    path.ancestors().find_map(|ancestor| {
+        matches!(
+            ancestor.file_name().and_then(|name| name.to_str()),
+            Some(SESSIONS_SUBDIR | ARCHIVED_SESSIONS_SUBDIR)
+        )
+        .then(|| ancestor.parent())
+        .flatten()
+    })
 }
 
 pub async fn first_rollout_content_match_snippet(
@@ -343,6 +438,36 @@ fn content_match_snippet(jsonl_line: &str, search_term: &Regex) -> Option<String
     let rollout_line = serde_json::from_str::<RolloutLine>(jsonl_line.trim()).ok()?;
     let text = conversation_text_from_item(&rollout_line.item)?;
     excerpt_around_match(text.as_str(), search_term)
+}
+
+fn rollout_line_is_search_visible(
+    jsonl_line: &str,
+    pending_final_items: &HashSet<PendingFinalItem>,
+) -> bool {
+    let Ok(rollout_line) = serde_json::from_str::<RolloutLine>(jsonl_line.trim()) else {
+        return true;
+    };
+    let RolloutItem::ResponseItem(item) = &rollout_line.item else {
+        return true;
+    };
+    let ResponseItem::Message {
+        id: Some(item_id),
+        role,
+        ..
+    } = item
+    else {
+        return true;
+    };
+    if role != "assistant" {
+        return true;
+    }
+    let Some(turn_id) = item.turn_id() else {
+        return true;
+    };
+    !pending_final_items.contains(&PendingFinalItem {
+        turn_id: turn_id.to_string(),
+        item_id: item_id.clone(),
+    })
 }
 
 fn conversation_text_from_item(item: &RolloutItem) -> Option<String> {
@@ -451,6 +576,12 @@ fn char_end_after(text: &str, byte_index: usize, chars_after: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_protocol::ThreadId;
+    use codex_protocol::items::AgentMessageItem;
+    use codex_protocol::protocol::AgentMessageEvent;
+    use codex_protocol::protocol::ItemCompletedEvent;
+    use codex_protocol::protocol::SessionMeta;
+    use codex_protocol::protocol::SessionMetaLine;
     use codex_protocol::protocol::UserMessageEvent;
     use pretty_assertions::assert_eq;
     use std::io::Write as _;
@@ -461,6 +592,76 @@ mod tests {
             item: RolloutItem::EventMsg(EventMsg::UserMessage(UserMessageEvent {
                 message: message.to_string(),
                 ..Default::default()
+            })),
+        })
+        .expect("serialize rollout line")
+    }
+
+    fn assistant_response_rollout_line(timestamp: &str, id: &str, message: &str) -> String {
+        let mut item = ResponseItem::Message {
+            id: Some(id.to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: message.to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        item.set_turn_id_if_missing("turn");
+        serde_json::to_string(&RolloutLine {
+            timestamp: timestamp.to_string(),
+            item: RolloutItem::ResponseItem(item),
+        })
+        .expect("serialize rollout line")
+    }
+
+    fn session_meta_rollout_line(timestamp: &str, thread_id: ThreadId) -> String {
+        let mut meta = SessionMeta::default();
+        meta.id = thread_id;
+        meta.session_id = thread_id.into();
+        serde_json::to_string(&RolloutLine {
+            timestamp: timestamp.to_string(),
+            item: RolloutItem::SessionMeta(SessionMetaLine { meta, git: None }),
+        })
+        .expect("serialize session meta")
+    }
+
+    async fn write_pending_final_evidence(
+        codex_home: &Path,
+        thread_id: ThreadId,
+        pending_finals: Value,
+    ) {
+        let evidence_dir = codex_home.join("task-evidence");
+        tokio::fs::create_dir_all(&evidence_dir)
+            .await
+            .expect("create evidence directory");
+        tokio::fs::write(
+            evidence_dir.join(format!("{thread_id}.json")),
+            serde_json::to_vec(&serde_json::json!({
+                "thread_id": thread_id.to_string(),
+                "pending_finals": pending_finals,
+            }))
+            .expect("serialize evidence"),
+        )
+        .await
+        .expect("write evidence");
+    }
+
+    fn completed_agent_rollout_line(timestamp: &str, id: &str, message: &str) -> String {
+        serde_json::to_string(&RolloutLine {
+            timestamp: timestamp.to_string(),
+            item: RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: ThreadId::new(),
+                turn_id: "turn".to_string(),
+                item: TurnItem::AgentMessage(AgentMessageItem {
+                    id: id.to_string(),
+                    content: vec![AgentMessageContent::Text {
+                        text: message.to_string(),
+                    }],
+                    phase: None,
+                    memory_citation: None,
+                }),
+                completed_at_ms: 0,
             })),
         })
         .expect("serialize rollout line")
@@ -638,6 +839,168 @@ mod tests {
                 .await
                 .expect("scan rollout fallback"),
             Some("later needle".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn provisional_raw_assistant_message_is_not_search_visible() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let sessions = tempdir.path().join(SESSIONS_SUBDIR);
+        tokio::fs::create_dir_all(&sessions)
+            .await
+            .expect("create sessions directory");
+        let rollout_path = sessions.join("rollout-test.jsonl");
+        let thread_id = ThreadId::new();
+        let session_meta = session_meta_rollout_line("2026-07-09T00:00:00Z", thread_id);
+        let provisional =
+            assistant_response_rollout_line("2026-07-09T00:00:01Z", "msg_1", "private needle");
+        tokio::fs::write(&rollout_path, format!("{session_meta}\n{provisional}\n"))
+            .await
+            .expect("write rollout");
+        write_pending_final_evidence(
+            tempdir.path(),
+            thread_id,
+            serde_json::json!([{
+                "turn_id": "turn",
+                "item_id": "msg_1",
+                "persisted": true,
+                "externally_emitted": false,
+                "externally_completed": false,
+            }]),
+        )
+        .await;
+        let json_search_term = case_insensitive_literal_regex("needle").expect("json search regex");
+        let search_term = case_insensitive_literal_regex("needle").expect("search regex");
+
+        assert_eq!(
+            inspect_rollout_match(&rollout_path, &json_search_term, &search_term)
+                .await
+                .expect("inspect rollout"),
+            (false, None)
+        );
+
+        let verified = verify_ripgrep_rollout_matches(
+            HashMap::from([(rollout_path.clone(), Some("private needle".to_string()))]),
+            &json_search_term,
+            &search_term,
+        )
+        .await
+        .expect("verify ripgrep candidates");
+        assert!(!verified.contains_key(&rollout_path));
+    }
+
+    #[tokio::test]
+    async fn non_pending_raw_assistant_message_remains_search_visible() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let sessions = tempdir.path().join(SESSIONS_SUBDIR);
+        tokio::fs::create_dir_all(&sessions)
+            .await
+            .expect("create sessions directory");
+        let rollout_path = sessions.join("rollout-test.jsonl");
+        let thread_id = ThreadId::new();
+        let session_meta = session_meta_rollout_line("2026-07-09T00:00:00Z", thread_id);
+        let assistant =
+            assistant_response_rollout_line("2026-07-09T00:00:01Z", "msg_visible", "public needle");
+        tokio::fs::write(&rollout_path, format!("{session_meta}\n{assistant}\n"))
+            .await
+            .expect("write rollout");
+        write_pending_final_evidence(
+            tempdir.path(),
+            thread_id,
+            serde_json::json!([
+                {
+                    "turn_id": "different_turn",
+                    "item_id": "msg_visible",
+                    "persisted": true,
+                    "externally_emitted": false,
+                    "externally_completed": false,
+                },
+                {
+                    "turn_id": "turn",
+                    "item_id": "different_item",
+                    "persisted": true,
+                    "externally_emitted": false,
+                    "externally_completed": false,
+                }
+            ]),
+        )
+        .await;
+
+        assert_eq!(
+            first_rollout_content_match_snippet(&rollout_path, "needle")
+                .await
+                .expect("search rollout"),
+            Some("public needle".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn fully_emitted_final_raw_assistant_message_is_search_visible() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let sessions = tempdir.path().join(SESSIONS_SUBDIR);
+        tokio::fs::create_dir_all(&sessions)
+            .await
+            .expect("create sessions directory");
+        let rollout_path = sessions.join("rollout-test.jsonl");
+        let thread_id = ThreadId::new();
+        let session_meta = session_meta_rollout_line("2026-07-09T00:00:00Z", thread_id);
+        let assistant =
+            assistant_response_rollout_line("2026-07-09T00:00:01Z", "msg_1", "public needle");
+        tokio::fs::write(&rollout_path, format!("{session_meta}\n{assistant}\n"))
+            .await
+            .expect("write rollout");
+        write_pending_final_evidence(
+            tempdir.path(),
+            thread_id,
+            serde_json::json!([{
+                "turn_id": "turn",
+                "item_id": "msg_1",
+                "persisted": true,
+                "externally_emitted": true,
+                "externally_completed": true,
+            }]),
+        )
+        .await;
+
+        assert_eq!(
+            first_rollout_content_match_snippet(&rollout_path, "needle")
+                .await
+                .expect("search rollout"),
+            Some("public needle".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_agent_lifecycle_message_remains_search_visible() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let rollout_path = tempdir.path().join("rollout-test.jsonl");
+        let provisional =
+            assistant_response_rollout_line("2026-07-09T00:00:00Z", "msg_1", "public needle");
+        let completed =
+            completed_agent_rollout_line("2026-07-09T00:00:01Z", "msg_1", "public needle");
+        tokio::fs::write(&rollout_path, format!("{provisional}\n{completed}\n"))
+            .await
+            .expect("write rollout");
+
+        assert_eq!(
+            first_rollout_content_match_snippet(&rollout_path, "needle")
+                .await
+                .expect("search rollout"),
+            Some("public needle".to_string())
+        );
+    }
+
+    #[test]
+    fn legacy_agent_message_remains_search_visible() {
+        let item = RolloutItem::EventMsg(EventMsg::AgentMessage(AgentMessageEvent {
+            message: "legacy answer".to_string(),
+            phase: None,
+            memory_citation: None,
+        }));
+
+        assert_eq!(
+            conversation_text_from_item(&item),
+            Some("legacy answer".to_string())
         );
     }
 }

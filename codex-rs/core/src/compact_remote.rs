@@ -7,6 +7,7 @@ use crate::compact::InitialContextInjection;
 use crate::compact::build_compaction_initial_context;
 use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
+use crate::compact::remove_protected_pending_final_items;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
 use crate::context::world_state::WorldState;
@@ -259,15 +260,23 @@ async fn run_remote_compact_task_inner_impl(
     let RemoteCompactAttempt {
         new_history,
         trace_input_history,
+        mut protected_item_ids,
     } = attempt;
     let (new_window_number, new_window_ids) = sess.advance_auto_compact_window().await;
-    let (new_history, world_state_baseline) = process_compacted_history(
+    let (mut new_history, world_state_baseline) = process_compacted_history(
         sess.as_ref(),
         compaction_turn_context.as_ref(),
         new_history,
         &initial_context_injection,
     )
     .await;
+    protected_item_ids.extend(
+        sess.services
+            .task_evidence
+            .protected_pending_final_item_ids()
+            .await,
+    );
+    remove_protected_pending_final_items(&mut new_history, &protected_item_ids);
 
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,

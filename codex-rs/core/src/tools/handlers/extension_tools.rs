@@ -49,6 +49,10 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
         self.0.supports_parallel_tool_calls()
     }
 
+    fn read_only_hint(&self) -> Option<bool> {
+        self.0.read_only_hint()
+    }
+
     fn search_info(&self) -> Option<ToolSearchInfo> {
         self.0.search_info()
     }
@@ -70,6 +74,18 @@ impl ToolExecutor<ToolInvocation> for ExtensionToolAdapter {
 }
 
 impl CoreToolRuntime for ExtensionToolAdapter {
+    fn task_evidence_read_only(&self) -> bool {
+        self.0.read_only_hint() == Some(true)
+    }
+
+    fn task_evidence_proven_read_only_external(&self) -> bool {
+        self.0.read_only_hint() == Some(true)
+    }
+
+    fn task_evidence_review_read_only(&self) -> bool {
+        false
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -225,7 +241,7 @@ mod tests {
     use crate::tools::registry::PreToolUsePayload;
     use crate::turn_diff_tracker::TurnDiffTracker;
 
-    struct StubExtensionExecutor;
+    struct StubExtensionExecutor(Option<bool>);
 
     impl codex_extension_api::ToolExecutor<codex_tools::ToolCall> for StubExtensionExecutor {
         fn tool_name(&self) -> codex_tools::ToolName {
@@ -249,6 +265,10 @@ mod tests {
                 output_schema: None,
                 defer_loading: None,
             })
+        }
+
+        fn read_only_hint(&self) -> Option<bool> {
+            self.0
         }
 
         fn handle(&self, _call: codex_tools::ToolCall) -> codex_tools::ToolExecutorFuture<'_> {
@@ -399,9 +419,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn extension_read_only_evidence_requires_an_explicit_true_hint_and_denies_reviewers() {
+        let read_only = ExtensionToolAdapter::new(Arc::new(StubExtensionExecutor(Some(true))));
+        let explicitly_mutating =
+            ExtensionToolAdapter::new(Arc::new(StubExtensionExecutor(Some(false))));
+        let missing_hint = ExtensionToolAdapter::new(Arc::new(StubExtensionExecutor(None)));
+
+        assert!(CoreToolRuntime::task_evidence_read_only(&read_only));
+        assert!(CoreToolRuntime::task_evidence_proven_read_only_external(
+            &read_only
+        ));
+        assert!(!CoreToolRuntime::task_evidence_review_read_only(&read_only));
+        assert!(!CoreToolRuntime::task_evidence_read_only(
+            &explicitly_mutating
+        ));
+        assert!(!CoreToolRuntime::task_evidence_proven_read_only_external(
+            &explicitly_mutating
+        ));
+        assert!(!CoreToolRuntime::task_evidence_read_only(&missing_hint));
+        assert!(!CoreToolRuntime::task_evidence_proven_read_only_external(
+            &missing_hint
+        ));
+    }
+
     #[tokio::test]
     async fn exposes_generic_hook_payloads() {
-        let handler = ExtensionToolAdapter::new(Arc::new(StubExtensionExecutor));
+        let handler = ExtensionToolAdapter::new(Arc::new(StubExtensionExecutor(None)));
         let (session, turn) = crate::session::tests::make_session_and_context().await;
         let turn = Arc::new(turn);
         let invocation = ToolInvocation {

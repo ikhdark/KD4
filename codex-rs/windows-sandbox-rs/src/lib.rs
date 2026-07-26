@@ -759,6 +759,7 @@ mod windows_impl {
                 Some((in_r, out_w, err_w)),
                 ConsoleMode::Inherit,
                 use_private_desktop,
+                /*containment_job*/ None,
             )
         };
         let created = match spawn_res {

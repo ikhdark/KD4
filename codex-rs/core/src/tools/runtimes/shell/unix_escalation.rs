@@ -169,6 +169,8 @@ pub(super) async fn try_run_zsh_fork(
         exec_server_sandbox: _,
         exec_server_enforce_managed_network: _,
         exec_server_managed_network: _,
+        descendant_containment_required: _,
+        descendant_containment_established: _,
     } = sandbox_exec_request;
     let ParsedShellCommand { script, login, .. } = extract_shell_script(&command)?;
     let effective_timeout = Duration::from_millis(
@@ -904,6 +906,8 @@ impl CoreShellCommandExecutor {
                 exec_server_sandbox: None,
                 exec_server_enforce_managed_network: false,
                 exec_server_managed_network: None,
+                descendant_containment_required: false,
+                descendant_containment_established: false,
             },
             /*stdout_stream*/ None,
             after_spawn,

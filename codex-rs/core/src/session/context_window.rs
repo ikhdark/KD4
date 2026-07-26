@@ -2,6 +2,8 @@ use super::session::Session;
 use super::turn_context::TurnContext;
 use codex_protocol::config_types::AutoCompactTokenLimitScope;
 
+pub(crate) const LOCAL_CONTEXT_WINDOW_LIMIT: i64 = 272_000;
+
 #[derive(Debug)]
 pub(crate) struct ContextWindowTokenStatus {
     // Full active context usage, independent of the configured auto-compact scope.
@@ -31,18 +33,16 @@ pub(crate) async fn context_window_token_status(
         match turn_context.config.model_auto_compact_token_limit_scope {
             AutoCompactTokenLimitScope::Total => (
                 active_context_tokens,
-                turn_context.model_info.auto_compact_token_limit(),
+                effective_auto_compact_token_limit(turn_context),
                 None,
             ),
             AutoCompactTokenLimitScope::BodyAfterPrefix => {
                 let window = sess.auto_compact_window_snapshot().await;
                 let baseline = window.prefill_input_tokens.unwrap_or(active_context_tokens);
 
-                let scope_limit = turn_context
-                    .config
-                    .model_auto_compact_token_limit
-                    .or_else(|| turn_context.model_info.auto_compact_token_limit());
-                let full_context_window_limit = turn_context.model_context_window();
+                let scope_limit = effective_auto_compact_token_limit(turn_context);
+                let full_context_window_limit =
+                    body_after_prefix_full_context_limit(turn_context.model_context_window());
 
                 (
                     active_context_tokens.saturating_sub(baseline),
@@ -88,5 +88,110 @@ pub(crate) async fn context_window_token_status(
         auto_compact_window_prefill_tokens,
         full_context_window_limit_reached,
         token_limit_reached,
+    }
+}
+
+pub(crate) fn estimated_prompt_reaches_hard_limit(
+    turn_context: &TurnContext,
+    estimated_tokens: Option<i64>,
+) -> bool {
+    let hard_limit = prompt_hard_limit(turn_context.model_context_window());
+    estimated_tokens.is_some_and(|estimated| estimated >= hard_limit)
+}
+
+fn prompt_hard_limit(model_context_window: Option<i64>) -> i64 {
+    model_context_window
+        .filter(|limit| *limit > 0)
+        .map_or(LOCAL_CONTEXT_WINDOW_LIMIT, |limit| {
+            limit.min(LOCAL_CONTEXT_WINDOW_LIMIT)
+        })
+}
+
+fn body_after_prefix_full_context_limit(model_context_window: Option<i64>) -> Option<i64> {
+    Some(prompt_hard_limit(model_context_window))
+}
+
+fn effective_auto_compact_token_limit(turn_context: &TurnContext) -> Option<i64> {
+    Some(effective_auto_compact_token_limit_value(turn_context))
+}
+
+fn effective_auto_compact_token_limit_value(turn_context: &TurnContext) -> i64 {
+    effective_auto_compact_token_limit_from_values(
+        turn_context.config.model_auto_compact_token_limit,
+        turn_context.model_info.auto_compact_token_limit(),
+        turn_context.model_context_window(),
+    )
+}
+
+fn effective_auto_compact_token_limit_from_values(
+    configured_limit: Option<i64>,
+    model_auto_compact_limit: Option<i64>,
+    model_context_window: Option<i64>,
+) -> i64 {
+    [
+        Some(LOCAL_CONTEXT_WINDOW_LIMIT),
+        configured_limit,
+        model_auto_compact_limit,
+        model_context_window,
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|limit| *limit > 0)
+    .min()
+    .unwrap_or(LOCAL_CONTEXT_WINDOW_LIMIT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_limit_uses_smallest_explicit_or_local_limit() {
+        assert_eq!(
+            effective_auto_compact_token_limit_from_values(None, None, None),
+            272_000
+        );
+        assert_eq!(
+            effective_auto_compact_token_limit_from_values(None, None, Some(64_000)),
+            64_000
+        );
+        assert_eq!(
+            effective_auto_compact_token_limit_from_values(None, Some(50_000), Some(64_000)),
+            50_000
+        );
+        assert_eq!(
+            effective_auto_compact_token_limit_from_values(Some(120_000), None, Some(64_000)),
+            64_000
+        );
+        assert_eq!(
+            effective_auto_compact_token_limit_from_values(Some(0), Some(-1), Some(200_000)),
+            200_000
+        );
+        assert_eq!(
+            effective_auto_compact_token_limit_from_values(Some(0), Some(-1), Some(300_000)),
+            272_000
+        );
+    }
+
+    #[test]
+    fn prompt_hard_limit_excludes_soft_auto_compact_limits() {
+        assert_eq!(prompt_hard_limit(None), 272_000);
+        assert_eq!(prompt_hard_limit(Some(64_000)), 64_000);
+        assert_eq!(prompt_hard_limit(Some(200_000)), 200_000);
+        assert_eq!(prompt_hard_limit(Some(300_000)), 272_000);
+        assert_eq!(prompt_hard_limit(Some(0)), 272_000);
+    }
+
+    #[test]
+    fn body_after_prefix_full_limit_matches_prompt_hard_limit() {
+        assert_eq!(
+            body_after_prefix_full_context_limit(Some(300_000)),
+            Some(272_000)
+        );
+        assert_eq!(
+            body_after_prefix_full_context_limit(Some(64_000)),
+            Some(64_000)
+        );
+        assert_eq!(body_after_prefix_full_context_limit(None), Some(272_000));
     }
 }

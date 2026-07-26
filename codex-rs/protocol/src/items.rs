@@ -560,7 +560,7 @@ pub fn build_hook_prompt_message(fragments: &[HookPromptFragment]) -> Option<Res
     }
 
     Some(ResponseItem::Message {
-        id: Some(new_item_id()),
+        id: Some(format!("msg_{}", new_item_id())),
         role: "user".to_string(),
         content,
         phase: None,
@@ -660,11 +660,14 @@ mod tests {
         ];
         let message = build_hook_prompt_message(&original).expect("hook prompt");
 
-        let ResponseItem::Message { content, .. } = message else {
+        let ResponseItem::Message { id, content, .. } = message else {
             panic!("expected hook prompt message");
         };
+        let id = id.expect("hook prompt message id");
+        assert!(id.starts_with("msg_"));
 
-        let parsed = parse_hook_prompt_message(/*id*/ None, &content).expect("parsed hook prompt");
+        let parsed = parse_hook_prompt_message(Some(&id), &content).expect("parsed hook prompt");
+        assert_eq!(parsed.id, id);
         assert_eq!(parsed.fragments, original);
     }
 

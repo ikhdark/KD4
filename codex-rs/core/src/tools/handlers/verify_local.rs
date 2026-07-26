@@ -142,6 +142,10 @@ impl ToolExecutor<ToolInvocation> for VerifyLocalHandler {
 }
 
 impl CoreToolRuntime for VerifyLocalHandler {
+    fn task_evidence_success_implies_mutation(&self) -> bool {
+        false
+    }
+
     fn waits_for_runtime_cancellation(&self) -> bool {
         true
     }
@@ -281,6 +285,7 @@ impl VerifyLocalHandler {
             attempt_key: None,
             repair_notice: None,
             capture_exec_output: true,
+            guard_task_mutation: false,
         })
         .await?;
         let (mut output, run) = finalize_verify_local_output(

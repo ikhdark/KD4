@@ -138,6 +138,7 @@ async fn exec_command_with_tty(
             network_approval: None,
             session: Arc::downgrade(session),
             last_used: started_at,
+            mutation_guard: None,
         };
         manager
             .process_store
@@ -320,6 +321,7 @@ async fn write_stdin(
             yield_time_ms,
             max_output_tokens: None,
             truncation_policy: TruncationPolicy::Tokens(10_000),
+            mutation_guard: None,
         })
         .await
 }
@@ -686,6 +688,7 @@ async fn terminating_initial_exec_command_rechecks_initial_response_state() -> a
             network_approval: None,
             session: Arc::downgrade(&session),
             last_used: Instant::now(),
+            mutation_guard: None,
         },
     );
 
@@ -759,6 +762,7 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
             network_approval: None,
             session: Arc::downgrade(&session),
             last_used,
+            mutation_guard: None,
         },
     );
 
@@ -797,6 +801,68 @@ async fn terminating_during_stdin_poll_returns_exited_response() -> anyhow::Resu
     assert_eq!(output.process_id, None);
     assert!(manager.process_store.lock().await.processes.is_empty());
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn write_stdin_rejects_managed_mutation_for_uncontained_process() -> anyhow::Result<()> {
+    let (session, turn) = test_session_and_turn().await;
+    let manager = &session.services.unified_exec_manager;
+    let process_id = manager.allocate_process_id().await;
+    let (terminate_started_tx, _terminate_started_rx) = watch::channel(false);
+    let allow_terminate = Arc::new(Notify::new());
+    let process = blocking_terminate_unified_process(
+        process_id,
+        terminate_started_tx,
+        Arc::clone(&allow_terminate),
+    )
+    .await?;
+    #[allow(deprecated)]
+    let cwd = turn.cwd.clone();
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ProcessEntry {
+            process,
+            call_id: "call".to_string(),
+            process_id,
+            cwd: cwd.into(),
+            initial_exec_command_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            hook_command: "interactive helper".to_string(),
+            tty: true,
+            network_approval: None,
+            session: Arc::downgrade(&session),
+            last_used: Instant::now(),
+            mutation_guard: None,
+        },
+    );
+
+    let result = manager
+        .write_stdin(WriteStdinRequest {
+            process_id,
+            input: "mutating input",
+            yield_time_ms: 250,
+            max_output_tokens: None,
+            truncation_policy: TruncationPolicy::Tokens(10_000),
+            mutation_guard: Some(crate::task_evidence::TaskMutationGuard::for_test()),
+        })
+        .await;
+    assert!(matches!(
+        result,
+        Err(UnifiedExecError::DescendantContainmentUnavailable)
+    ));
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .get(&process_id)
+            .is_some_and(|entry| entry.mutation_guard.is_none()),
+        "a rejected stdin mutation must not attach its mutation lease"
+    );
+
+    allow_terminate.notify_waiters();
+    manager.release_process_id(process_id).await;
     Ok(())
 }
 

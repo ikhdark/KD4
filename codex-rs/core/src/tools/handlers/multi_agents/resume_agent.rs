@@ -200,6 +200,10 @@ fn stale_shutdown_cleanup_error_is_tolerable(err: &CodexErr) -> bool {
 }
 
 impl CoreToolRuntime for Handler {
+    fn task_evidence_trusted_mutator(&self) -> bool {
+        true
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

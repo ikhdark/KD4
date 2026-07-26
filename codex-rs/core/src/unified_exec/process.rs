@@ -93,6 +93,8 @@ pub(crate) struct UnifiedExecProcess {
     output_task: Option<JoinHandle<()>>,
     raw_output_artifact: Option<Arc<Mutex<RawOutputArtifact>>>,
     sandbox_type: SandboxType,
+    descendant_containment_established: bool,
+    strict_descendant_exit_required: AtomicBool,
     _spawn_lifecycle: Option<SpawnLifecycleHandle>,
 }
 
@@ -102,6 +104,14 @@ impl std::fmt::Debug for UnifiedExecProcess {
             .field("has_exited", &self.has_exited())
             .field("exit_code", &self.exit_code())
             .field("sandbox_type", &self.sandbox_type)
+            .field(
+                "descendant_containment_established",
+                &self.descendant_containment_established,
+            )
+            .field(
+                "strict_descendant_exit_required",
+                &self.strict_descendant_exit_required(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -110,6 +120,8 @@ impl UnifiedExecProcess {
     fn new(
         process_handle: ProcessHandle,
         sandbox_type: SandboxType,
+        descendant_containment_established: bool,
+        descendant_containment_required: bool,
         spawn_lifecycle: Option<SpawnLifecycleHandle>,
         raw_output_artifact: Option<RawOutputArtifact>,
     ) -> Self {
@@ -138,6 +150,10 @@ impl UnifiedExecProcess {
             output_task: None,
             raw_output_artifact: raw_output_artifact.map(|artifact| Arc::new(Mutex::new(artifact))),
             sandbox_type,
+            descendant_containment_established,
+            strict_descendant_exit_required: AtomicBool::new(
+                descendant_containment_required && descendant_containment_established,
+            ),
             _spawn_lifecycle: spawn_lifecycle,
         }
     }
@@ -215,6 +231,12 @@ impl UnifiedExecProcess {
     pub(super) fn has_exited(&self) -> bool {
         let state = self.state_rx.borrow().clone();
         match &self.process_handle {
+            ProcessHandle::Local(process_handle) if self.strict_descendant_exit_required() => {
+                // A synthetic failure state is not enough to release a
+                // mutation guard. The contained driver reports exit only
+                // after its process tree is gone.
+                process_handle.termination_confirmed()
+            }
             ProcessHandle::Local(process_handle) => state.has_exited || process_handle.has_exited(),
             ProcessHandle::ExecServer(_) => state.has_exited,
         }
@@ -241,6 +263,23 @@ impl UnifiedExecProcess {
 
     pub(super) fn terminate(&self) {
         match &self.process_handle {
+            #[cfg(target_os = "linux")]
+            ProcessHandle::Local(process_handle)
+                if self.strict_descendant_exit_required()
+                    && self.descendant_containment_established
+                    && self.sandbox_type == SandboxType::LinuxSeccomp =>
+            {
+                // Keep the helper alive so it can forward TERM to bubblewrap,
+                // reap it, and publish the positive teardown acknowledgement.
+                if process_handle.request_graceful_terminate().is_err() {
+                    process_handle.request_terminate();
+                }
+            }
+            ProcessHandle::Local(process_handle) if self.strict_descendant_exit_required() => {
+                // Preserve the wait task that carries the containment
+                // backend's process-tree cleanup acknowledgement.
+                process_handle.request_terminate();
+            }
             ProcessHandle::Local(process_handle) => process_handle.terminate(),
             ProcessHandle::ExecServer(process_handle) => {
                 let process_handle = Arc::clone(process_handle);
@@ -253,8 +292,51 @@ impl UnifiedExecProcess {
     }
 
     pub(super) async fn terminate_confirmed(&self) -> Result<(), UnifiedExecError> {
+        if !self.strict_descendant_exit_required() {
+            match &self.process_handle {
+                ProcessHandle::Local(process_handle) => process_handle.terminate(),
+                ProcessHandle::ExecServer(process_handle) => {
+                    process_handle
+                        .terminate()
+                        .await
+                        .map_err(|err| UnifiedExecError::process_failed(err.to_string()))?;
+                }
+            }
+            self.signal_exit(self.exit_code());
+            self.finish_termination();
+            return Ok(());
+        }
+
+        #[cfg(target_os = "linux")]
+        if self.descendant_containment_established
+            && self.sandbox_type == SandboxType::LinuxSeccomp
+            && let ProcessHandle::Local(process_handle) = &self.process_handle
+            && !process_handle.termination_confirmed()
+        {
+            // The Linux sandbox helper forwards TERM to its separately grouped
+            // bubblewrap child, waits for bubblewrap plus protected-path
+            // cleanup, and only then exits. That wait result is the positive
+            // process-tree acknowledgement required by a mutation lease.
+            if let Err(err) = process_handle.request_graceful_terminate() {
+                tracing::error!("contained Linux graceful termination failed: {err}");
+                process_handle.request_terminate();
+                std::future::pending::<()>().await;
+            }
+            self.wait_for_confirmed_exit().await;
+            process_handle.terminate();
+            self.finish_termination();
+            return Ok(());
+        }
+
         match &self.process_handle {
-            ProcessHandle::Local(process_handle) => process_handle.terminate(),
+            ProcessHandle::Local(process_handle) => {
+                // Keep the driver's wait task alive until it reports exit. In
+                // particular, the Windows elevated runner only emits that
+                // report after its Job Object is empty.
+                process_handle.request_terminate();
+                self.wait_for_confirmed_exit().await;
+                process_handle.terminate();
+            }
             ProcessHandle::ExecServer(process_handle) => {
                 process_handle
                     .terminate()
@@ -262,7 +344,9 @@ impl UnifiedExecProcess {
                     .map_err(|err| UnifiedExecError::process_failed(err.to_string()))?;
             }
         }
-        self.signal_exit(self.exit_code());
+        if !self.has_exited() {
+            self.signal_exit(self.exit_code());
+        }
         self.finish_termination();
         Ok(())
     }
@@ -301,6 +385,38 @@ impl UnifiedExecProcess {
         self.sandbox_type
     }
 
+    pub(super) fn descendant_containment_established(&self) -> bool {
+        self.descendant_containment_established
+    }
+
+    pub(super) fn strict_descendant_exit_required(&self) -> bool {
+        self.strict_descendant_exit_required.load(Ordering::Acquire)
+    }
+
+    pub(super) fn require_strict_descendant_exit(&self) {
+        debug_assert!(self.descendant_containment_established);
+        self.strict_descendant_exit_required
+            .store(true, Ordering::Release);
+    }
+
+    pub(super) async fn wait_for_confirmed_exit(&self) {
+        let mut state_rx = self.state_rx.clone();
+        loop {
+            let confirmed = match &self.process_handle {
+                ProcessHandle::Local(process_handle) => process_handle.termination_confirmed(),
+                ProcessHandle::ExecServer(_) => state_rx.borrow().has_exited,
+            };
+            if confirmed {
+                return;
+            }
+            if state_rx.changed().await.is_err() {
+                // Losing the only exit-notification channel is not proof that
+                // a contained descendant tree is gone.
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
     pub(super) fn failure_message(&self) -> Option<String> {
         self.state_rx.borrow().failure_message.clone()
     }
@@ -315,6 +431,17 @@ impl UnifiedExecProcess {
             .await?;
 
         Ok(())
+    }
+
+    async fn check_early_sandbox_denial(&self) -> Result<(), UnifiedExecError> {
+        let result = self.check_for_sandbox_denial().await;
+        if result.is_err() && self.strict_descendant_exit_required() && !self.has_exited() {
+            // A denial can be inferred from output even when the driver exit
+            // was synthetic. Do not propagate that post-spawn error to the
+            // launch watchdog until the contained tree is positively gone.
+            self.terminate_confirmed().await?;
+        }
+        result
     }
 
     pub(super) async fn check_for_sandbox_denial_with_text(
@@ -352,6 +479,8 @@ impl UnifiedExecProcess {
     pub(super) async fn from_spawned(
         spawned: SpawnedPty,
         sandbox_type: SandboxType,
+        descendant_containment_established: bool,
+        descendant_containment_required: bool,
         spawn_lifecycle: SpawnLifecycleHandle,
         raw_output_artifact: Option<RawOutputArtifact>,
     ) -> Result<Self, UnifiedExecError> {
@@ -364,6 +493,8 @@ impl UnifiedExecProcess {
         let mut managed = Self::new(
             ProcessHandle::Local(Box::new(process_handle)),
             sandbox_type,
+            descendant_containment_established,
+            descendant_containment_required,
             Some(spawn_lifecycle),
             raw_output_artifact,
         );
@@ -379,12 +510,12 @@ impl UnifiedExecProcess {
         match exit_rx.try_recv() {
             Ok(exit_code) => {
                 managed.signal_exit(Some(exit_code));
-                managed.check_for_sandbox_denial().await?;
+                managed.check_early_sandbox_denial().await?;
                 return Ok(managed);
             }
             Err(TryRecvError::Closed) => {
                 managed.signal_exit(/*exit_code*/ None);
-                managed.check_for_sandbox_denial().await?;
+                managed.check_early_sandbox_denial().await?;
                 return Ok(managed);
             }
             Err(TryRecvError::Empty) => {}
@@ -392,7 +523,7 @@ impl UnifiedExecProcess {
 
         if let Ok(exit_result) = tokio::time::timeout(EARLY_EXIT_GRACE_PERIOD, &mut exit_rx).await {
             managed.signal_exit(exit_result.ok());
-            managed.check_for_sandbox_denial().await?;
+            managed.check_early_sandbox_denial().await?;
             return Ok(managed);
         }
 
@@ -418,6 +549,8 @@ impl UnifiedExecProcess {
         let mut managed = Self::new(
             process_handle,
             SandboxType::None,
+            /*descendant_containment_established*/ false,
+            /*descendant_containment_required*/ false,
             /*spawn_lifecycle*/ None,
             raw_output_artifact,
         );

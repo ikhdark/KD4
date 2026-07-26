@@ -5,6 +5,7 @@ use codex_model_provider_info::WireApi;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use pretty_assertions::assert_eq;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 async fn process_compacted_history_with_test_session(
@@ -41,6 +42,47 @@ fn user_message(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+#[test]
+fn protected_pending_final_items_are_removed_by_exact_identity() {
+    let protected = ResponseItem::Message {
+        id: Some("protected-final".to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "must stay provisional".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let same_text_different_identity = ResponseItem::Message {
+        id: Some("committed-final".to_string()),
+        role: "assistant".to_string(),
+        content: vec![ContentItem::OutputText {
+            text: "must stay provisional".to_string(),
+        }],
+        phase: None,
+        internal_chat_message_metadata_passthrough: None,
+    };
+    let mut items = vec![
+        user_message("keep user context"),
+        protected,
+        same_text_different_identity.clone(),
+    ];
+
+    let removed = remove_protected_pending_final_items(
+        &mut items,
+        &BTreeSet::from(["protected-final".to_string()]),
+    );
+
+    assert_eq!(removed, 1);
+    assert_eq!(
+        items,
+        vec![
+            user_message("keep user context"),
+            same_text_different_identity
+        ]
+    );
 }
 
 fn compacted_user_message(text: &str) -> CompactedUserMessage {

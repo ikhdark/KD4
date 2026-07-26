@@ -10,9 +10,14 @@ use codex_core::Prompt;
 use codex_core::RolloutRecorder;
 use codex_core::config::Config;
 use codex_protocol::error::CodexErr;
+use codex_protocol::items::AgentMessageContent;
+use codex_protocol::items::AgentMessageItem;
+use codex_protocol::items::TurnItem;
 use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::AgentMessageEvent;
+use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::TokenUsage;
 use codex_rollout::INTERACTIVE_SESSION_SOURCES;
@@ -411,6 +416,15 @@ mod job {
                 RolloutItem::InterAgentCommunication(communication) => {
                     Some(communication.to_model_input_item())
                 }
+                RolloutItem::EventMsg(EventMsg::AgentMessage(agent)) => {
+                    Some(legacy_agent_message_for_memories(agent))
+                }
+                RolloutItem::EventMsg(EventMsg::ItemCompleted(event)) => match &event.item {
+                    TurnItem::AgentMessage(agent) => {
+                        Some(completed_agent_message_for_memories(agent))
+                    }
+                    _ => None,
+                },
                 RolloutItem::SessionMeta(_)
                 | RolloutItem::InterAgentCommunicationMetadata { .. }
                 | RolloutItem::Compacted(_)
@@ -437,7 +451,7 @@ mod job {
             return should_persist_response_item_for_memories(item).then(|| item.clone());
         };
 
-        if role == "developer" {
+        if role == "assistant" || role == "developer" {
             return None;
         }
 
@@ -461,6 +475,36 @@ mod job {
             phase: phase.clone(),
             internal_chat_message_metadata_passthrough: metadata.clone(),
         })
+    }
+
+    pub(super) fn legacy_agent_message_for_memories(agent: &AgentMessageEvent) -> ResponseItem {
+        ResponseItem::Message {
+            id: None,
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: agent.message.clone(),
+            }],
+            phase: agent.phase.clone(),
+            internal_chat_message_metadata_passthrough: None,
+        }
+    }
+
+    pub(super) fn completed_agent_message_for_memories(agent: &AgentMessageItem) -> ResponseItem {
+        ResponseItem::Message {
+            id: Some(agent.id.clone()),
+            role: "assistant".to_string(),
+            content: agent
+                .content
+                .iter()
+                .map(|content| match content {
+                    AgentMessageContent::Text { text } => {
+                        ContentItem::OutputText { text: text.clone() }
+                    }
+                })
+                .collect(),
+            phase: agent.phase.clone(),
+            internal_chat_message_metadata_passthrough: None,
+        }
     }
 
     fn is_memory_excluded_contextual_user_fragment(content_item: &ContentItem) -> bool {
@@ -665,7 +709,9 @@ fn emit_metrics(context: &StageOneRequestContext, counts: &Stats) {
 mod tests {
     use super::*;
     use codex_protocol::AgentPath;
+    use codex_protocol::ThreadId;
     use codex_protocol::protocol::InterAgentCommunication;
+    use codex_protocol::protocol::ItemCompletedEvent;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -811,6 +857,75 @@ mod tests {
         let parsed: Vec<ResponseItem> = serde_json::from_str(&serialized).expect("parse");
 
         assert_eq!(parsed, vec![response_item]);
+    }
+
+    #[test]
+    fn provisional_raw_assistant_message_is_not_serialized_for_memory() {
+        let provisional = ResponseItem::Message {
+            id: Some("msg_1".to_string()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "private provisional answer".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+
+        let serialized =
+            job::serialize_filtered_rollout_response_items(&[RolloutItem::ResponseItem(
+                provisional,
+            )])
+            .expect("serialize");
+        let parsed: Vec<ResponseItem> = serde_json::from_str(&serialized).expect("parse");
+
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn completed_and_legacy_agent_messages_are_serialized_for_memory() {
+        let completed = AgentMessageItem {
+            id: "msg_completed".to_string(),
+            content: vec![AgentMessageContent::Text {
+                text: "completed answer".to_string(),
+            }],
+            phase: None,
+            memory_citation: None,
+        };
+        let completed_raw = ResponseItem::Message {
+            id: Some(completed.id.clone()),
+            role: "assistant".to_string(),
+            content: vec![ContentItem::OutputText {
+                text: "completed answer".to_string(),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        };
+        let legacy = AgentMessageEvent {
+            message: "legacy answer".to_string(),
+            phase: None,
+            memory_citation: None,
+        };
+
+        let serialized = job::serialize_filtered_rollout_response_items(&[
+            RolloutItem::ResponseItem(completed_raw),
+            RolloutItem::EventMsg(EventMsg::ItemCompleted(ItemCompletedEvent {
+                thread_id: ThreadId::new(),
+                turn_id: "turn".to_string(),
+                item: TurnItem::AgentMessage(completed.clone()),
+                completed_at_ms: 0,
+            })),
+            RolloutItem::EventMsg(EventMsg::AgentMessage(legacy.clone())),
+        ])
+        .expect("serialize");
+        let parsed: Vec<ResponseItem> = serde_json::from_str(&serialized).expect("parse");
+
+        assert_eq!(
+            parsed,
+            vec![
+                job::completed_agent_message_for_memories(&completed),
+                job::legacy_agent_message_for_memories(&legacy),
+            ]
+        );
     }
 
     #[test]

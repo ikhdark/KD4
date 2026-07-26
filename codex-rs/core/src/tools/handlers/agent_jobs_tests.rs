@@ -73,6 +73,15 @@ async fn create_reporting_session(
     Arc::new(session)
 }
 
+fn workspace_write_profile_for(
+    root: &std::path::Path,
+) -> codex_protocol::models::PermissionProfile {
+    let root =
+        AbsolutePathBuf::from_absolute_path(root).expect("test workspace root should be absolute");
+    codex_protocol::models::PermissionProfile::workspace_write()
+        .materialize_project_roots_with_workspace_roots(std::slice::from_ref(&root))
+}
+
 #[test]
 fn parse_csv_supports_quotes_and_commas() {
     let input = "id,name\n1,\"alpha, beta\"\n2,gamma\n";
@@ -215,6 +224,46 @@ async fn spawn_rejects_invalid_and_non_object_output_schemas_before_reading_csv(
 }
 
 #[tokio::test]
+async fn zero_row_csv_exports_when_task_evidence_is_disabled() {
+    let (mut session, mut turn) = crate::session::tests::make_session_and_context().await;
+    let state_root = tempfile::tempdir().expect("create state tempdir");
+    let db = codex_state::StateRuntime::init(
+        state_root.path().join("state"),
+        "test-provider".to_string(),
+    )
+    .await
+    .expect("initialize state runtime");
+    session.services.state_db = Some(db);
+    let cwd = single_local_environment_cwd(&turn).expect("resolve local test cwd");
+    turn.permission_profile = workspace_write_profile_for(cwd.as_path());
+    let input_path = cwd.join("empty-agent-job.csv");
+    let output_path = cwd.join("empty-agent-job-output.csv");
+    tokio::fs::write(&input_path, "value\n")
+        .await
+        .expect("write header-only csv");
+
+    let output = spawn_agents_on_csv::handle(
+        Arc::new(session),
+        Arc::new(turn),
+        json!({
+            "csv_path": input_path.display().to_string(),
+            "instruction": "Process {value}",
+            "output_csv_path": output_path.display().to_string(),
+        })
+        .to_string(),
+        CancellationToken::new(),
+    )
+    .await
+    .expect("disabled task evidence must not reject an unmanaged agent job");
+
+    assert!(output.into_text().contains("\"total_items\":0"));
+    let csv = tokio::fs::read_to_string(&output_path)
+        .await
+        .expect("empty job output should be exported");
+    assert!(csv.starts_with("value,job_id,item_id,row_index,source_id,status"));
+}
+
+#[tokio::test]
 async fn report_rejects_schema_invalid_result_without_completing_then_accepts_correction() {
     let output_schema = json!({
         "type": "object",
@@ -338,9 +387,13 @@ async fn atomic_csv_write_failure_leaves_no_partial_destination() {
     let tempdir = tempfile::tempdir().expect("create tempdir");
     let output_path = tempdir.path().join("x".repeat(300));
 
-    write_job_csv_atomically(output_path.clone(), "partial csv contents".to_string())
-        .await
-        .expect_err("overlong destination name should fail publication");
+    write_job_csv_atomically(
+        output_path.clone(),
+        tempdir.path().to_path_buf(),
+        "partial csv contents".to_string(),
+    )
+    .await
+    .expect_err("overlong destination name should fail publication");
 
     assert!(!output_path.exists());
     assert_eq!(
@@ -353,9 +406,60 @@ async fn atomic_csv_write_failure_leaves_no_partial_destination() {
 }
 
 #[tokio::test]
+async fn csv_write_rejects_retargeted_output_ancestor() {
+    let authorized_root = tempfile::tempdir().expect("create authorized root");
+    let outside_root = tempfile::tempdir().expect("create outside root");
+    let output_parent = authorized_root.path().join("exports");
+    std::fs::create_dir(&output_parent).expect("create original output parent");
+    let output_path = output_parent.join("results.csv");
+    std::fs::remove_dir(&output_parent).expect("remove original output parent");
+    if create_agent_job_dir_symlink(outside_root.path(), &output_parent).is_err() {
+        return;
+    }
+
+    let error = write_job_csv_atomically(
+        output_path,
+        authorized_root.path().to_path_buf(),
+        "must not escape".to_string(),
+    )
+    .await
+    .expect_err("retargeted output ancestor must fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("output csv path changed after authorization")
+    );
+    assert!(
+        !outside_root.path().join("results.csv").exists(),
+        "csv export must not write through a retargeted ancestor"
+    );
+}
+
+#[cfg(unix)]
+fn create_agent_job_dir_symlink(
+    target: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+#[cfg(windows)]
+fn create_agent_job_dir_symlink(
+    target: &std::path::Path,
+    link: &std::path::Path,
+) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_dir(target, link)
+}
+
+#[tokio::test]
 async fn runner_settles_non_limit_spawn_failure_without_retrying() {
-    let (_tempdir, db, job) = create_running_job(/*item_count*/ 1).await;
-    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let (tempdir, db, job) = create_running_job(/*item_count*/ 1).await;
+    let (session, mut turn, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut turn)
+        .expect("runner turn should be uniquely owned")
+        .permission_profile = workspace_write_profile_for(tempdir.path());
     let options = JobRunnerOptions {
         max_concurrency: 1,
         spawn_config: (*turn.config).clone(),
@@ -398,7 +502,7 @@ async fn runner_settles_non_limit_spawn_failure_without_retrying() {
 
 #[tokio::test]
 async fn parent_cancellation_settles_running_item_and_exports_snapshot() {
-    let (_tempdir, db, job) = create_running_job(/*item_count*/ 1).await;
+    let (tempdir, db, job) = create_running_job(/*item_count*/ 1).await;
     let assigned_thread_id = ThreadId::new();
     assert!(
         db.mark_agent_job_item_running_with_thread(
@@ -409,7 +513,11 @@ async fn parent_cancellation_settles_running_item_and_exports_snapshot() {
         .await
         .expect("bind running job item")
     );
-    let (session, turn, _events) = crate::session::tests::make_session_and_context_with_rx().await;
+    let (session, mut turn, _events) =
+        crate::session::tests::make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut turn)
+        .expect("runner turn should be uniquely owned")
+        .permission_profile = workspace_write_profile_for(tempdir.path());
     let options = JobRunnerOptions {
         max_concurrency: 1,
         spawn_config: (*turn.config).clone(),
@@ -453,10 +561,13 @@ async fn parent_cancellation_settles_running_item_and_exports_snapshot() {
 
 #[tokio::test]
 async fn worker_stop_cancels_job_settles_other_worker_and_requests_shutdown() {
-    let (_tempdir, db, job) = create_running_job(/*item_count*/ 2).await;
+    let (tempdir, db, job) = create_running_job(/*item_count*/ 2).await;
     let reporting_thread_id = ThreadId::new();
-    let (mut runner_session, turn, _events) =
+    let (mut runner_session, mut turn, _events) =
         crate::session::tests::make_session_and_context_with_rx().await;
+    Arc::get_mut(&mut turn)
+        .expect("runner turn should be uniquely owned")
+        .permission_profile = workspace_write_profile_for(tempdir.path());
     let manager = crate::ThreadManager::with_models_provider_for_tests(
         codex_login::CodexAuth::from_api_key("dummy"),
         turn.config.model_provider.clone(),

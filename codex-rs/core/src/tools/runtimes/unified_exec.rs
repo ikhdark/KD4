@@ -84,6 +84,7 @@ pub struct UnifiedExecRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
+    pub require_descendant_containment: bool,
 }
 
 /// Cache key for approval decisions that can be reused across equivalent
@@ -300,6 +301,11 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<UnifiedExecProcess, ToolError> {
+        attempt.require_strong_descendant_containment(
+            req.require_descendant_containment,
+            req.turn_environment.environment.is_remote(),
+            req.additional_permissions.as_ref(),
+        )?;
         let base_command = &req.command;
         let session_shell = ctx.session.user_shell();
         let shell = req
@@ -416,6 +422,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                 )
                 .map_err(ToolError::Codex)?;
             exec_env.exec_server_env_config = req.exec_server_env_config.clone();
+            exec_env.descendant_containment_required = req.require_descendant_containment;
             match zsh_fork_backend::maybe_prepare_unified_exec(
                 req,
                 attempt,
@@ -483,6 +490,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                 managed_network,
                 /*environment_id*/ Some(&req.turn_environment.environment_id),
                 req.exec_server_env_config.clone(),
+                req.require_descendant_containment,
                 req.tty,
                 Box::new(NoopSpawnLifecycle),
                 Some(req.raw_output_artifact.clone()),
@@ -628,6 +636,7 @@ mod tests {
                 bypass_sandbox: false,
                 proposed_execpolicy_amendment: None,
             },
+            require_descendant_containment: false,
         };
 
         assert_eq!(
@@ -733,6 +742,7 @@ mod tests {
             additional_permissions_preapproved: false,
             justification: None,
             exec_approval_requirement,
+            require_descendant_containment: false,
         }
     }
 

@@ -97,7 +97,7 @@ pub fn format_exec_output_for_model(
         exec_output.timed_out,
         ShellOutputSummaryOptions {
             enabled: true,
-            turn_cost_guard: false,
+            turn_cost_guard: true,
             command_text: None,
         },
     )
@@ -132,7 +132,7 @@ pub fn format_exec_output_str(
         exec_output.timed_out,
         ShellOutputSummaryOptions {
             enabled: true,
-            turn_cost_guard: false,
+            turn_cost_guard: true,
             command_text: None,
         },
     )

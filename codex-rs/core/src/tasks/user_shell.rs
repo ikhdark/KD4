@@ -231,6 +231,8 @@ pub(crate) async fn execute_user_shell_command(
         exec_server_sandbox: None,
         exec_server_enforce_managed_network: false,
         exec_server_managed_network: None,
+        descendant_containment_required: false,
+        descendant_containment_established: false,
     };
 
     let stdout_stream = Some(StdoutStream {

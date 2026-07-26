@@ -48,6 +48,10 @@ impl Handler {
 }
 
 impl CoreToolRuntime for Handler {
+    fn task_evidence_read_only(&self) -> bool {
+        true
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

@@ -448,16 +448,62 @@ async fn mutating_preflight_rejection_does_not_reserve_process_id() {
 
 #[tokio::test]
 async fn intercepted_apply_patch_failure_releases_process_id_and_counts_retry_failure() {
+    let managed_root = tempfile::tempdir().expect("create managed root");
+    let evidence_home = tempfile::tempdir().expect("create task evidence home");
     let patch = "*** Begin Patch\n*** Update File: missing.txt\n@@\n-old\n+new\n*** End Patch";
     let payload = ToolPayload::Function {
         arguments: serde_json::json!({
             "kind": "argv",
             "program": "apply_patch",
-            "args": [patch]
+            "args": [patch],
+            "workdir": managed_root.path(),
         })
         .to_string(),
     };
-    let (session, turn) = make_session_and_context().await;
+    let (mut session, mut turn) = make_session_and_context().await;
+    let managed_write_root = AbsolutePathBuf::try_from(managed_root.path().to_path_buf())
+        .expect("absolute managed root");
+    turn.permission_profile = PermissionProfile::workspace_write_with(
+        &[managed_write_root],
+        codex_protocol::permissions::NetworkSandboxPolicy::Restricted,
+        /*exclude_tmpdir_env_var*/ false,
+        /*exclude_slash_tmp*/ false,
+    );
+    let ledger = crate::task_evidence::TaskEvidenceLedger::load_or_new(
+        evidence_home.path().to_path_buf(),
+        codex_protocol::ThreadId::new(),
+        managed_root.path(),
+    )
+    .await;
+    ledger
+        .begin_turn(&turn.sub_id, "verify intercepted unified patch preflight")
+        .await
+        .expect("begin managed turn");
+    ledger
+        .classify(crate::task_evidence::TaskClassification {
+            exhaustive: false,
+            risk_domains: std::collections::BTreeSet::new(),
+            supported_non_git_roots: std::collections::BTreeSet::from([managed_root
+                .path()
+                .to_string_lossy()
+                .into_owned()]),
+        })
+        .await
+        .expect("classify managed task");
+    let ready = ledger
+        .submit_closure(crate::task_evidence::ClosureSubmission {
+            path_review: std::collections::BTreeSet::from([".".to_string()]),
+            competing_paths_checked: std::collections::BTreeSet::from([".".to_string()]),
+            validation_receipt_ids: std::collections::BTreeSet::new(),
+            runtime_evidence: std::collections::BTreeSet::new(),
+            missing_requirement_ids: std::collections::BTreeSet::new(),
+            actionable_findings: std::collections::BTreeSet::new(),
+            blocked_reasons: std::collections::BTreeSet::new(),
+        })
+        .await
+        .expect("prepare Ready task");
+    assert_eq!(ready.phase, crate::task_evidence::TaskPhase::Ready);
+    session.services.task_evidence = ledger;
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     let handler = ExecCommandHandler::default();
@@ -480,7 +526,21 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_counts_retry_fa
             Ok(_) => panic!("invalid intercepted patch must fail"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("apply_patch verification failed"));
+        assert!(
+            err.to_string().contains("apply_patch verification failed"),
+            "unexpected interception error: {err}"
+        );
+        assert_eq!(
+            session
+                .services
+                .task_evidence
+                .inspect_status()
+                .await
+                .expect("inspect task status")
+                .mutation_revision,
+            ready.mutation_revision,
+            "invalid interception must not manufacture mutation progress"
+        );
 
         let process_id = session
             .services
@@ -500,6 +560,7 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_counts_retry_fa
             "kind": "argv",
             "program": "apply_patch",
             "args": [patch],
+            "workdir": managed_root.path(),
             "max_output_tokens": 1
         })
         .to_string(),
@@ -522,6 +583,17 @@ async fn intercepted_apply_patch_failure_releases_process_id_and_counts_retry_fa
         Err(err) => err,
     };
     assert!(blocked.to_string().contains("Command blocked"));
+    assert_eq!(
+        session
+            .services
+            .task_evidence
+            .inspect_status()
+            .await
+            .expect("inspect task status")
+            .mutation_revision,
+        ready.mutation_revision,
+        "blocked retry must preserve the canonical mutation revision"
+    );
 
     let artifact_directory = turn
         .config
@@ -1277,4 +1349,8 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
             }),
         ]
     );
+}
+#[test]
+fn exec_command_waits_for_runtime_cancellation_cleanup() {
+    assert!(ExecCommandHandler::default().waits_for_runtime_cancellation());
 }

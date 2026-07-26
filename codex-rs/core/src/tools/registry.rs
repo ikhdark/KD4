@@ -56,6 +56,48 @@ pub use codex_tools::ToolExposure;
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    fn task_evidence_builtin(&self) -> bool {
+        false
+    }
+
+    fn task_evidence_read_only(&self) -> bool {
+        false
+    }
+
+    fn task_evidence_review_read_only(&self) -> bool {
+        self.task_evidence_read_only()
+    }
+
+    /// Whether this runtime is the core-owned adapter for an external executor
+    /// whose concrete instance explicitly declares read-only behavior.
+    fn task_evidence_proven_read_only_external(&self) -> bool {
+        false
+    }
+
+    /// Whether this core-owned handler is allowed to initiate local mutations
+    /// when it is exposed through a namespace.
+    fn task_evidence_trusted_mutator(&self) -> bool {
+        false
+    }
+
+    /// Whether a successful handler call is itself sufficient evidence that a
+    /// managed mutation occurred. Validation runners can return false here:
+    /// their before/after root snapshots still detect actual drift, but a
+    /// read-only successful validation must not stale the proof it just wrote.
+    fn task_evidence_success_implies_mutation(&self) -> bool {
+        true
+    }
+
+    /// Validates a managed mutation after hook input rewrites but before the
+    /// ledger invalidates the current mutation revision. Mutators with
+    /// payload-dependent ownership must also register their exact targets here.
+    fn preflight_task_evidence_mutation<'a>(
+        &'a self,
+        _invocation: &'a ToolInvocation,
+    ) -> BoxFuture<'a, Result<(), FunctionCallError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         ToolExecutionTiming::Handler
     }
@@ -292,6 +334,37 @@ impl ToolExecutor<ToolInvocation> for ExposureOverride {
 }
 
 impl CoreToolRuntime for ExposureOverride {
+    fn task_evidence_builtin(&self) -> bool {
+        self.handler.task_evidence_builtin()
+    }
+
+    fn task_evidence_read_only(&self) -> bool {
+        self.handler.task_evidence_read_only()
+    }
+
+    fn task_evidence_proven_read_only_external(&self) -> bool {
+        self.handler.task_evidence_proven_read_only_external()
+    }
+
+    fn task_evidence_trusted_mutator(&self) -> bool {
+        self.handler.task_evidence_trusted_mutator()
+    }
+
+    fn task_evidence_success_implies_mutation(&self) -> bool {
+        self.handler.task_evidence_success_implies_mutation()
+    }
+
+    fn preflight_task_evidence_mutation<'a>(
+        &'a self,
+        invocation: &'a ToolInvocation,
+    ) -> BoxFuture<'a, Result<(), FunctionCallError>> {
+        self.handler.preflight_task_evidence_mutation(invocation)
+    }
+
+    fn task_evidence_review_read_only(&self) -> bool {
+        self.handler.task_evidence_review_read_only()
+    }
+
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         self.handler.tool_execution_timing()
     }
@@ -330,6 +403,119 @@ impl CoreToolRuntime for ExposureOverride {
         invocation: &'a ToolInvocation,
     ) -> BoxFuture<'a, ToolTelemetryTags> {
         self.handler.telemetry_tags(invocation)
+    }
+
+    fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
+        self.handler.create_diff_consumer()
+    }
+}
+
+pub(crate) fn mark_task_evidence_builtin(
+    handler: Arc<dyn CoreToolRuntime>,
+) -> Arc<dyn CoreToolRuntime> {
+    if handler.task_evidence_builtin() {
+        handler
+    } else {
+        Arc::new(TaskEvidenceBuiltin { handler })
+    }
+}
+
+struct TaskEvidenceBuiltin {
+    handler: Arc<dyn CoreToolRuntime>,
+}
+
+impl ToolExecutor<ToolInvocation> for TaskEvidenceBuiltin {
+    fn tool_name(&self) -> ToolName {
+        self.handler.tool_name()
+    }
+
+    fn spec(&self) -> ToolSpec {
+        self.handler.spec()
+    }
+
+    fn exposure(&self) -> ToolExposure {
+        self.handler.exposure()
+    }
+
+    fn supports_parallel_tool_calls(&self) -> bool {
+        self.handler.supports_parallel_tool_calls()
+    }
+
+    fn search_info(&self) -> Option<ToolSearchInfo> {
+        self.handler.search_info()
+    }
+
+    fn handle(&self, invocation: ToolInvocation) -> codex_tools::ToolExecutorFuture<'_> {
+        self.handler.handle(invocation)
+    }
+}
+
+impl CoreToolRuntime for TaskEvidenceBuiltin {
+    fn task_evidence_builtin(&self) -> bool {
+        true
+    }
+
+    fn task_evidence_read_only(&self) -> bool {
+        self.handler.task_evidence_read_only()
+    }
+
+    fn task_evidence_review_read_only(&self) -> bool {
+        self.handler.task_evidence_review_read_only()
+    }
+
+    fn task_evidence_trusted_mutator(&self) -> bool {
+        self.handler.task_evidence_trusted_mutator()
+    }
+
+    fn task_evidence_success_implies_mutation(&self) -> bool {
+        self.handler.task_evidence_success_implies_mutation()
+    }
+
+    fn preflight_task_evidence_mutation<'a>(
+        &'a self,
+        invocation: &'a ToolInvocation,
+    ) -> BoxFuture<'a, Result<(), FunctionCallError>> {
+        self.handler.preflight_task_evidence_mutation(invocation)
+    }
+
+    fn tool_execution_timing(&self) -> ToolExecutionTiming {
+        self.handler.tool_execution_timing()
+    }
+
+    fn matches_kind(&self, payload: &ToolPayload) -> bool {
+        self.handler.matches_kind(payload)
+    }
+
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        self.handler.waits_for_runtime_cancellation()
+    }
+
+    fn telemetry_tags<'a>(
+        &'a self,
+        invocation: &'a ToolInvocation,
+    ) -> BoxFuture<'a, ToolTelemetryTags> {
+        self.handler.telemetry_tags(invocation)
+    }
+
+    fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
+        self.handler.pre_tool_use_payload(invocation)
+    }
+
+    fn post_tool_use_payload(
+        &self,
+        invocation: &ToolInvocation,
+        result: &dyn ToolOutput,
+    ) -> Option<PostToolUsePayload> {
+        self.handler.post_tool_use_payload(invocation, result)
+    }
+
+    fn with_updated_hook_input(
+        &self,
+        invocation: ToolInvocation,
+        updated_input: Value,
+    ) -> Result<ToolInvocation, FunctionCallError> {
+        self.handler
+            .with_updated_hook_input(invocation, updated_input)
     }
 
     fn create_diff_consumer(&self) -> Option<Box<dyn ToolArgumentDiffConsumer>> {
@@ -407,13 +593,26 @@ impl ToolRegistry {
         Some(tool.waits_for_runtime_cancellation())
     }
 
+    pub(crate) fn registered_read_only_external_tools(&self) -> Vec<ToolName> {
+        self.tools
+            .iter()
+            .filter_map(|(name, tool)| {
+                (!tool.task_evidence_builtin() && tool.task_evidence_proven_read_only_external())
+                    .then(|| name.clone())
+            })
+            .collect()
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn dispatch_any(
         &self,
         invocation: ToolInvocation,
     ) -> Result<AnyToolResult, FunctionCallError> {
-        self.dispatch_any_with_terminal_outcome(invocation, /*terminal_outcome_reached*/ None)
-            .await
+        self.dispatch_any_with_terminal_outcome(
+            invocation, /*terminal_outcome_reached*/ None,
+            /*proven_read_only_external*/ false,
+        )
+        .await
     }
 
     #[expect(
@@ -424,6 +623,7 @@ impl ToolRegistry {
         &self,
         mut invocation: ToolInvocation,
         terminal_outcome_reached: Option<Arc<AtomicBool>>,
+        proven_read_only_external: bool,
     ) -> Result<AnyToolResult, FunctionCallError> {
         let tool_name = invocation.tool_name.clone();
         let tool_name_flat = flat_tool_name(&tool_name);
@@ -507,9 +707,52 @@ impl ToolRegistry {
             return Err(err);
         }
 
+        let review_delegate = matches!(
+            invocation.turn.session_source,
+            codex_protocol::protocol::SessionSource::SubAgent(
+                codex_protocol::protocol::SubAgentSource::Review
+            )
+        );
+        let declared_read_only = tool.task_evidence_read_only()
+            && (!review_delegate || tool.task_evidence_review_read_only());
+        // The router owns this provenance. Requiring the registered handler to
+        // agree prevents a stale or colliding name from inheriting read-only trust.
+        let trusted_external_read_only =
+            proven_read_only_external && declared_read_only && !review_delegate;
+        let _task_mutation_guard = match invocation
+            .session
+            .services
+            .task_evidence
+            .reserve_tool_dispatch(
+                &tool_name,
+                &invocation.turn.sub_id,
+                declared_read_only,
+                trusted_external_read_only,
+                review_delegate,
+                tool.task_evidence_trusted_mutator(),
+                tool.task_evidence_builtin(),
+            )
+            .await
+        {
+            Ok(guard) => guard,
+            Err(message) => {
+                let err = FunctionCallError::RespondToModel(message);
+                dispatch_trace.record_failed(&err);
+                return Err(err);
+            }
+        };
+        let hooks_allowed = _task_mutation_guard.is_some()
+            || !invocation
+                .session
+                .services
+                .task_evidence
+                .manages_turn(&invocation.turn.sub_id)
+                .await;
+
         notify_tool_start(&invocation).await;
 
-        if let Some(pre_tool_use_payload) = tool.pre_tool_use_payload(&invocation) {
+        if hooks_allowed && let Some(pre_tool_use_payload) = tool.pre_tool_use_payload(&invocation)
+        {
             match run_pre_tool_use_hooks(
                 &invocation.session,
                 &invocation.turn,
@@ -555,6 +798,42 @@ impl ToolRegistry {
             }
         }
 
+        if tool.task_evidence_success_implies_mutation()
+            && let Some(reservation) = _task_mutation_guard.as_ref()
+        {
+            if let Err(err) = tool.preflight_task_evidence_mutation(&invocation).await {
+                dispatch_trace.record_failed(&err);
+                notify_tool_finish_if_unclaimed(
+                    &invocation,
+                    terminal_outcome_reached.as_deref(),
+                    ToolCallOutcome::Failed {
+                        handler_executed: false,
+                    },
+                )
+                .await;
+                return Err(err);
+            }
+            if let Err(message) = invocation
+                .session
+                .services
+                .task_evidence
+                .start_reserved_tool_dispatch(&invocation.turn.sub_id, reservation)
+                .await
+            {
+                let err = FunctionCallError::RespondToModel(message);
+                dispatch_trace.record_failed(&err);
+                notify_tool_finish_if_unclaimed(
+                    &invocation,
+                    terminal_outcome_reached.as_deref(),
+                    ToolCallOutcome::Failed {
+                        handler_executed: false,
+                    },
+                )
+                .await;
+                return Err(err);
+            }
+        }
+
         let response_cell = tokio::sync::Mutex::new(None);
         let invocation_for_tool = invocation.clone();
         let log_payload = invocation.payload.log_payload();
@@ -584,6 +863,18 @@ impl ToolRegistry {
                 },
             )
             .await;
+        if let Some(reservation) = _task_mutation_guard.as_ref()
+            && let Err(message) = invocation
+                .session
+                .services
+                .task_evidence
+                .finish_reserved_tool_dispatch(&invocation.turn.sub_id, reservation)
+                .await
+        {
+            let err = FunctionCallError::RespondToModel(message);
+            dispatch_trace.record_failed(&err);
+            return Err(err);
+        }
         let success = match &result {
             Ok((_, success)) => *success,
             Err(_) => false,
@@ -597,22 +888,23 @@ impl ToolRegistry {
         } else {
             None
         };
-        let post_tool_use_outcome = if let Some(post_tool_use_payload) = post_tool_use_payload {
-            Some(
-                run_post_tool_use_hooks(
-                    &invocation.session,
-                    &invocation.turn,
-                    post_tool_use_payload.tool_use_id,
-                    post_tool_use_payload.tool_name.name().to_string(),
-                    post_tool_use_payload.tool_name.matcher_aliases().to_vec(),
-                    post_tool_use_payload.tool_input,
-                    post_tool_use_payload.tool_response,
+        let post_tool_use_outcome =
+            if hooks_allowed && let Some(post_tool_use_payload) = post_tool_use_payload {
+                Some(
+                    run_post_tool_use_hooks(
+                        &invocation.session,
+                        &invocation.turn,
+                        post_tool_use_payload.tool_use_id,
+                        post_tool_use_payload.tool_name.name().to_string(),
+                        post_tool_use_payload.tool_name.matcher_aliases().to_vec(),
+                        post_tool_use_payload.tool_input,
+                        post_tool_use_payload.tool_response,
+                    )
+                    .await,
                 )
-                .await,
-            )
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         if let Some(outcome) = &post_tool_use_outcome {
             record_additional_contexts(
                 &invocation.session,
