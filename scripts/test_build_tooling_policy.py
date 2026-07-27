@@ -649,11 +649,16 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "_core-test-helpers-windows-sandbox target_dir:",
             'cargo build --target-dir "{{ target_dir }}" -p codex-cli --bin codex',
             'cargo build --target-dir "{{ target_dir }}" -p codex-code-mode-host --bin codex-code-mode-host',
-            'cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args',
+            '$forwarded_args = @($args | Select-Object -Skip 2); $target_dir = "target\\lanes\\{{ package }}"',
+            '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args',
             '$text -match "(?i)rmcp|mcp|plugin|test_stdio_server"',
             '$text -match "(?i)windows_sandbox|windows-sandbox|sandbox|codex_command_runner"',
         ):
             self.assertIn(command, justfile)
+        self.assertNotIn(
+            "test-lane-package package *args:\n    @$forwarded_args",
+            justfile,
+        )
         self.assertGreaterEqual(justfile.count("scripts\\cargo-lane.ps1"), 3)
 
     def test_perf_env_recipes_pass_structured_argv(self) -> None:

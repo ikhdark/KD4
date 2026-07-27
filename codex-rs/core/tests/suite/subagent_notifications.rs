@@ -1067,22 +1067,37 @@ async fn spawn_agent_instruction_only_role_keeps_built_in_model_defaults() -> Re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn spawned_multi_agent_v2_child_inherits_parent_developer_context() -> Result<()> {
+async fn spawned_multi_agent_v2_child_inherits_developer_context_without_parent_history()
+-> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
+    let seed_turn = mount_sse_once_match(
+        &server,
+        |req: &wiremock::Request| {
+            body_contains(req, TURN_0_FORK_PROMPT) && !request_has_input_type(req, "agent_message")
+        },
+        sse(vec![
+            ev_response_created("resp-seed-1"),
+            ev_assistant_message("msg-seed-1", "seeded"),
+            ev_completed("resp-seed-1"),
+        ]),
+    )
+    .await;
     let spawn_args = serde_json::to_string(&json!({
         "message": CHILD_PROMPT,
         "task_name": "worker",
     }))?;
     mount_sse_once_match(
         &server,
-        |req: &wiremock::Request| body_contains(req, TURN_1_PROMPT),
+        |req: &wiremock::Request| {
+            body_contains(req, TURN_1_PROMPT) && !request_has_input_type(req, "agent_message")
+        },
         sse(vec![
             ev_response_created("resp-turn1-1"),
             ev_function_call_with_namespace(
                 SPAWN_CALL_ID,
-                MULTI_AGENT_V1_NAMESPACE,
+                MULTI_AGENT_V2_NAMESPACE,
                 "spawn_agent",
                 &spawn_args,
             ),
@@ -1105,7 +1120,9 @@ async fn spawned_multi_agent_v2_child_inherits_parent_developer_context() -> Res
 
     let _turn1_followup = mount_sse_once_match(
         &server,
-        |req: &wiremock::Request| body_contains(req, SPAWN_CALL_ID),
+        |req: &wiremock::Request| {
+            body_contains(req, SPAWN_CALL_ID) && !request_has_input_type(req, "agent_message")
+        },
         sse(vec![
             ev_response_created("resp-turn1-2"),
             ev_assistant_message("msg-turn1-2", "parent done"),
@@ -1127,14 +1144,27 @@ async fn spawned_multi_agent_v2_child_inherits_parent_developer_context() -> Res
     });
     let test = builder.build(&server).await?;
 
+    test.submit_turn(TURN_0_FORK_PROMPT).await?;
+    let _ = seed_turn.single_request();
     test.submit_turn(TURN_1_PROMPT).await?;
 
-    let child_requests = wait_for_requests(&child_request_log).await?;
-    let child_request = child_requests
-        .last()
-        .expect("child request log should capture at least one request");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let child_request = loop {
+        if let Some(request) = child_request_log
+            .requests()
+            .into_iter()
+            .find(|request| !request.inputs_of_type("agent_message").is_empty())
+        {
+            break request;
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("timed out waiting for child agent message request");
+        }
+        sleep(Duration::from_millis(10)).await;
+    };
     assert!(child_request.body_contains_text("Parent developer instructions."));
     assert!(child_request.body_contains_text(CHILD_PROMPT));
+    assert!(!child_request.body_contains_text(TURN_0_FORK_PROMPT));
 
     Ok(())
 }

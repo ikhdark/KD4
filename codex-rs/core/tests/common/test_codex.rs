@@ -797,7 +797,8 @@ fn ensure_test_model_catalog(config: &mut Config) -> Result<()> {
 }
 
 /// A test thread handle that keeps its owning [`ThreadManager`] alive when it
-/// is moved out of [`TestCodex`].
+/// is moved or cloned out of [`TestCodex`].
+#[derive(Clone)]
 pub struct TestCodexThread {
     codex: Arc<CodexThread>,
     _thread_manager: Arc<ThreadManager>,
@@ -1296,7 +1297,7 @@ mod tests {
     use serde_json::json;
 
     #[tokio::test]
-    async fn moved_thread_handle_keeps_thread_manager_alive() -> Result<()> {
+    async fn moved_or_cloned_thread_handle_keeps_thread_manager_alive() -> Result<()> {
         let server = start_mock_server().await;
         let test = test_codex()
             .with_config(|config| {
@@ -1317,7 +1318,11 @@ mod tests {
         drop(thread_manager);
         assert!(weak_thread_manager.upgrade().is_some());
 
+        let cloned_codex = codex.clone();
         drop(codex);
+        assert!(weak_thread_manager.upgrade().is_some());
+
+        drop(cloned_codex);
         assert!(weak_thread_manager.upgrade().is_none());
         Ok(())
     }

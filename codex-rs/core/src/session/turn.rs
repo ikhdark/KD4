@@ -2499,7 +2499,9 @@ fn assign_missing_streamed_response_item_id(
         return;
     }
 
-    let active_item_id = active_item.map(|item| ResponseItemId::from_server(item.id()));
+    let active_item_id = active_item
+        .map(|item| ResponseItemId::from_server(item.id()))
+        .filter(|item_id| !item_id.is_empty());
     item.set_id(active_item_id);
     Session::assign_missing_response_item_id(item);
 }

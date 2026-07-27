@@ -353,6 +353,11 @@ mod tests {
                 reminder_at_remaining_tokens: Some(vec![50_000, 25_000, 10_000]),
                 sampling_token_weight: Some(1.0),
                 prefill_token_weight: Some(0.25),
+                cached_input_token_weight: None,
+                model_call_token_cost: None,
+                tool_output_byte_weight: None,
+                subagent_token_cost: None,
+                action: None,
             }))
         );
         assert_eq!(

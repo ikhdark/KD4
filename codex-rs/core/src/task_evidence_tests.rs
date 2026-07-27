@@ -127,6 +127,11 @@ fn repository_identity_canonicalizes_drive_letter_case() {
     assert!(repository_roots_match(&canonical, Path::new(&alternate)));
 }
 
+#[test]
+fn persisted_repository_identity_must_be_absolute() {
+    assert!(!recorded_repository_root_matches(".", Path::new(".")));
+}
+
 #[tokio::test]
 async fn verifier_repo_root_must_match_the_task_evidence_root() {
     let (temp, repo, ledger) = ledger_fixture().await;

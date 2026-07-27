@@ -1265,16 +1265,19 @@ async fn load_existing_document(
             reason: "thread id does not match the requested task".to_string(),
         };
     }
-    if !repository_roots_match(
-        Path::new(&document.start.repository_root),
-        expected_repository_root,
-    ) {
+    if !recorded_repository_root_matches(&document.start.repository_root, expected_repository_root)
+    {
         return ExistingDocument::Rejected {
             kind: "incompatible",
             reason: "repository root does not match the requested checkout".to_string(),
         };
     }
     ExistingDocument::Loaded(Box::new(document))
+}
+
+fn recorded_repository_root_matches(recorded: &str, expected: &Path) -> bool {
+    let recorded = Path::new(recorded);
+    recorded.is_absolute() && repository_roots_match(recorded, expected)
 }
 
 fn canonical_repository_root(path: &Path) -> PathBuf {

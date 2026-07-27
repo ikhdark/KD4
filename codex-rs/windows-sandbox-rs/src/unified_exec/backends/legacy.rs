@@ -49,6 +49,7 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 const WAIT_OBJECT_0: u32 = 0x0000_0000;
 const WAIT_TIMEOUT: u32 = 0x0000_0102;
 const WAIT_FAILED: u32 = u32::MAX;
+const TERMINATION_WAIT_MS: u32 = 5_000;
 
 struct LegacyProcessHandles {
     process: PROCESS_INFORMATION,
@@ -244,21 +245,79 @@ fn finalize_exit(
     output_join: std::thread::JoinHandle<()>,
     logs_base_dir: Option<&Path>,
     command: Vec<String>,
+    termination_requested: bool,
 ) {
-    let exit_code = {
-        let mut raw_exit = 1u32;
-        if let Ok(guard) = process_handle.lock()
-            && let Some(handle) = guard.as_ref()
-        {
-            unsafe {
-                WaitForSingleObject(*handle, INFINITE);
-                GetExitCodeProcess(*handle, &mut raw_exit);
+    let wait_timeout = if termination_requested {
+        TERMINATION_WAIT_MS
+    } else {
+        INFINITE
+    };
+    let (exit_code, root_exited) = match process_handle.lock() {
+        Ok(guard) => match guard.as_ref() {
+            Some(handle) => {
+                let wait_result = unsafe { WaitForSingleObject(*handle, wait_timeout) };
+                match wait_result {
+                    WAIT_OBJECT_0 => {
+                        let mut raw_exit = 1u32;
+                        if unsafe { GetExitCodeProcess(*handle, &mut raw_exit) } == 0 {
+                            log_note(
+                                &format!(
+                                    "legacy spawn failed to read root process exit code: {}",
+                                    unsafe { GetLastError() }
+                                ),
+                                logs_base_dir,
+                            );
+                            (1, false)
+                        } else {
+                            (raw_exit as i32, true)
+                        }
+                    }
+                    WAIT_TIMEOUT => {
+                        log_note(
+                            "legacy root process did not exit after termination",
+                            logs_base_dir,
+                        );
+                        (1, false)
+                    }
+                    WAIT_FAILED => {
+                        log_note(
+                            &format!(
+                                "legacy spawn failed final root process wait: Windows error {}",
+                                unsafe { GetLastError() }
+                            ),
+                            logs_base_dir,
+                        );
+                        (1, false)
+                    }
+                    unexpected => {
+                        log_note(
+                            &format!(
+                                "legacy spawn received unexpected final root wait result \
+                                 0x{unexpected:08x}"
+                            ),
+                            logs_base_dir,
+                        );
+                        (1, false)
+                    }
+                }
             }
+            None => {
+                log_note("legacy spawn lost its root process handle", logs_base_dir);
+                (1, false)
+            }
+        },
+        Err(_) => {
+            log_note(
+                "legacy spawn root process handle lock poisoned",
+                logs_base_dir,
+            );
+            (1, false)
         }
-        raw_exit as i32
     };
 
-    let _ = output_join.join();
+    if root_exited {
+        let _ = output_join.join();
+    }
     let _ = exit_tx.send(exit_code);
 
     unsafe {
@@ -426,7 +485,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
         let _desktop = desktop;
         let timeout = timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
         let wait_res = unsafe { WaitForSingleObject(pi.hProcess, timeout) };
-        match wait_res {
+        let termination_requested = match wait_res {
             WAIT_OBJECT_0 => {
                 if let Err(err) = job_for_wait.preserve_descendants() {
                     log_note(
@@ -436,6 +495,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
                         wait_logs_base_dir.as_deref(),
                     );
                 }
+                false
             }
             WAIT_TIMEOUT => {
                 terminate_job_or_process(
@@ -443,6 +503,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
                     &wait_handle,
                     wait_logs_base_dir.as_deref(),
                 );
+                true
             }
             WAIT_FAILED => {
                 let wait_error = unsafe { GetLastError() };
@@ -458,6 +519,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
                     &wait_handle,
                     wait_logs_base_dir.as_deref(),
                 );
+                true
             }
             unexpected => {
                 log_note(
@@ -472,8 +534,9 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
                     &wait_handle,
                     wait_logs_base_dir.as_deref(),
                 );
+                true
             }
-        }
+        };
         if let Some(hpc) = hpc_for_wait
             && let Ok(mut guard) = hpc.lock()
         {
@@ -492,6 +555,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
             output_join,
             wait_logs_base_dir.as_deref(),
             command_for_wait,
+            termination_requested,
         );
     });
 
@@ -519,3 +583,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
 
     Ok(finish_driver_spawn(driver, stdin_open))
 }
+
+#[cfg(test)]
+#[path = "legacy_tests.rs"]
+mod tests;

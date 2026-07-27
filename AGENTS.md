@@ -1,6 +1,6 @@
 # Repository policy
 
-Shared policy revision: `2026-07-26.1`.
+Shared policy revision: `2026-07-27.1`.
 
 ## Synchronization contract
 
@@ -153,9 +153,10 @@ completes the request.
   requests, return findings first and do not edit until the user asks.
 - Ignore unrelated dirty-worktree changes, untracked files, generated outputs,
   and failures outside the accepted scope.
-- Preserve unrelated local edits. If the target overlaps competing local work,
-  compare the versions, keep the compatible task-relevant behavior, and avoid
-  overwriting unrelated changes.
+- Preserve unrelated local edits. Overlapping edits from other agents are
+  expected. Compare competing versions once, keep or combine the best
+  compatible task-relevant behavior, coordinate directly when needed, and
+  continue without restarting or repeatedly revisiting the overlap.
 - Verify drift-prone facts only when the task depends on them. Examples include
   the current branch, remotes, installed paths, active processes, available
   recipes, and generated-artifact freshness.
@@ -170,6 +171,9 @@ completes the request.
   may inspect relevant or adjacent contract surfaces but must not edit them;
   report findings to the busy agent, who retains edit ownership for the owned
   surface.
+- Before finishing, review the task-relevant diff and result once, and fix any
+  problems found. Do not loop on unchanged checks or repeatedly revisit settled
+  work.
 - Do not stop after the first fixes or rush to finish. Confirm test outcomes
   instead of assuming a test run is green, and do not treat green tests alone
   as completion. Continue until the complete task-relevant behavior is

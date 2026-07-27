@@ -471,7 +471,7 @@ test-lane-package package *args:
 
 [windows]
 test-lane-package package *args:
-    @$forwarded_args = @($args | Select-Object -Skip 2); $target_dir = "target\lanes\{{ package }}"; if ("{{ package }}" -eq "codex-core") { just _core-test-helpers-if-needed $target_dir "-p" "{{ package }}" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = "target\lanes\{{ package }}"; if ("{{ package }}" -eq "codex-core") { just _core-test-helpers-if-needed $target_dir "-p" "{{ package }}" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args
 
 [unix]
 check-lane package *args:
