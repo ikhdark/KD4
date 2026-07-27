@@ -942,7 +942,7 @@ async fn tool_search_returns_deferred_dynamic_tool_and_routes_follow_up_call() -
         .start_thread_with_tools(base_test.config.clone(), vec![dynamic_tool])
         .await?;
     let mut test = base_test;
-    test.codex = new_thread.thread;
+    test.codex.replace_thread(new_thread.thread);
     test.session_configured = new_thread.session_configured;
 
     test.codex
@@ -1574,7 +1574,7 @@ async fn tool_search_matches_dynamic_tools_by_name_description_namespace_and_sch
         .start_thread_with_tools(base_test.config.clone(), vec![dynamic_tool])
         .await?;
     let mut test = base_test;
-    test.codex = new_thread.thread;
+    test.codex.replace_thread(new_thread.thread);
     test.session_configured = new_thread.session_configured;
 
     test.codex

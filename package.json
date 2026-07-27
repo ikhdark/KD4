@@ -4,8 +4,8 @@
   "description": "Tools for repo-wide maintenance.",
   "scripts": {
     "audit:scripts": "python scripts/root_maintenance.py audit-scripts",
-    "format": "prettier --check *.json *.md docs/*.md .github/workflows/*.yml **/*.js",
-    "format:fix": "prettier --write *.json *.md docs/*.md .github/workflows/*.yml **/*.js",
+    "format": "prettier --check *.json *.md docs/*.md **/*.js",
+    "format:fix": "prettier --write *.json *.md docs/*.md **/*.js",
     "format:python": "python scripts/root_maintenance.py format-python",
     "format:python:fix": "python scripts/root_maintenance.py format-python --write",
     "lint:python": "python scripts/root_maintenance.py lint-python",

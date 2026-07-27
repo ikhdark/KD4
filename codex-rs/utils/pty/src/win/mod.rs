@@ -19,12 +19,8 @@
 // SOFTWARE.
 
 // Local modifications:
-// - Fix Codex bug #13945 in the Windows PTY kill path. The vendored code treated
-//   `TerminateProcess`'s nonzero success return as failure and `0` as success,
-//   which inverts kill outcomes for both `WinChild::do_kill` and
-//   `WinChildKiller::kill`.
-// - This bug still exists in the original WezTerm source as of 2026-03-08, so
-//   this is an intentional divergence from upstream.
+// - Place spawned processes in a Job Object so kill operations terminate the
+//   full process tree, while normal root exit preserves background descendants.
 
 use anyhow::Context as _;
 use filedescriptor::OwnedHandle;
@@ -35,6 +31,7 @@ use std::io::Error as IoError;
 use std::io::Result as IoResult;
 use std::os::windows::io::AsRawHandle;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Context;
 use std::task::Poll;
@@ -44,20 +41,33 @@ use winapi::um::processthreadsapi::*;
 use winapi::um::synchapi::WaitForSingleObject;
 use winapi::um::winbase::INFINITE;
 
+const WAIT_OBJECT_0_RESULT: DWORD = 0;
+const WAIT_FAILED_RESULT: DWORD = u32::MAX;
+
 pub(crate) mod conpty;
+mod job;
 mod procthreadattr;
 mod psuedocon;
 
 pub use conpty::ConPtySystem;
+pub use job::JobObject;
 pub use psuedocon::PsuedoCon;
 pub use psuedocon::conpty_supported;
 
 #[derive(Debug)]
 pub struct WinChild {
-    proc: Mutex<OwnedHandle>,
+    proc: Arc<Mutex<OwnedHandle>>,
+    job: Arc<JobObject>,
 }
 
 impl WinChild {
+    pub(crate) fn new(proc: OwnedHandle, job: Arc<JobObject>) -> Self {
+        Self {
+            proc: Arc::new(Mutex::new(proc)),
+            job,
+        }
+    }
+
     fn is_complete(&mut self) -> IoResult<Option<ExitStatus>> {
         let mut status: DWORD = 0;
         let proc = self.proc.lock().unwrap().try_clone().unwrap();
@@ -66,56 +76,83 @@ impl WinChild {
             if status == STILL_ACTIVE {
                 Ok(None)
             } else {
+                self.preserve_descendants();
                 Ok(Some(ExitStatus::with_exit_code(status)))
             }
         } else {
-            Ok(None)
+            Err(IoError::last_os_error())
         }
     }
 
     fn do_kill(&mut self) -> IoResult<()> {
-        let proc = self.proc.lock().unwrap().try_clone().unwrap();
-        let res = unsafe { TerminateProcess(proc.as_raw_handle() as _, 1) };
-        // Codex bug #13945: Win32 returns nonzero on success, so only `0` is an error.
-        if res == 0 {
-            Err(IoError::last_os_error())
-        } else {
-            Ok(())
+        terminate_job_or_process(&self.job, self.proc.as_ref())
+    }
+
+    fn preserve_descendants(&self) {
+        if let Err(err) = self.job.preserve_descendants() {
+            log::warn!("ConPTY failed to preserve descendants after root exit: {err}");
         }
     }
 }
 
 impl ChildKiller for WinChild {
     fn kill(&mut self) -> IoResult<()> {
-        self.do_kill().ok();
-        Ok(())
+        self.do_kill()
     }
 
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-        let proc = self.proc.lock().unwrap().try_clone().unwrap();
-        Box::new(WinChildKiller { proc })
+        Box::new(WinChildKiller {
+            job: Arc::clone(&self.job),
+            proc: Arc::clone(&self.proc),
+        })
     }
 }
 
 #[derive(Debug)]
 pub struct WinChildKiller {
-    proc: OwnedHandle,
+    job: Arc<JobObject>,
+    proc: Arc<Mutex<OwnedHandle>>,
 }
 
 impl ChildKiller for WinChildKiller {
     fn kill(&mut self) -> IoResult<()> {
-        let res = unsafe { TerminateProcess(self.proc.as_raw_handle() as _, 1) };
-        // Codex bug #13945: Win32 returns nonzero on success, so only `0` is an error.
-        if res == 0 {
-            Err(IoError::last_os_error())
-        } else {
-            Ok(())
-        }
+        terminate_job_or_process(&self.job, self.proc.as_ref())
     }
 
     fn clone_killer(&self) -> Box<dyn ChildKiller + Send + Sync> {
-        let proc = self.proc.try_clone().unwrap();
-        Box::new(WinChildKiller { proc })
+        Box::new(WinChildKiller {
+            job: Arc::clone(&self.job),
+            proc: Arc::clone(&self.proc),
+        })
+    }
+}
+
+fn terminate_process(process: &Mutex<OwnedHandle>) -> IoResult<()> {
+    let process = process
+        .lock()
+        .map_err(|_| IoError::other("process handle lock poisoned"))?;
+    let terminated = unsafe { TerminateProcess(process.as_raw_handle() as _, 1) };
+    if terminated == 0 {
+        Err(IoError::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn terminate_job_or_process(job: &JobObject, process: &Mutex<OwnedHandle>) -> IoResult<()> {
+    match job.terminate() {
+        Ok(()) => Ok(()),
+        Err(job_err) => {
+            log::warn!(
+                "ConPTY failed to terminate process tree; terminating root process: {job_err}"
+            );
+            terminate_process(process).map_err(|process_err| {
+                IoError::other(format!(
+                    "failed to terminate ConPTY job ({job_err}); root process fallback also \
+                     failed: {process_err}"
+                ))
+            })
+        }
     }
 }
 
@@ -125,16 +162,28 @@ impl Child for WinChild {
     }
 
     fn wait(&mut self) -> IoResult<ExitStatus> {
-        if let Ok(Some(status)) = self.try_wait() {
+        if let Some(status) = self.try_wait()? {
             return Ok(status);
         }
         let proc = self.proc.lock().unwrap().try_clone().unwrap();
-        unsafe {
-            WaitForSingleObject(proc.as_raw_handle() as _, INFINITE);
+        let wait_result = unsafe { WaitForSingleObject(proc.as_raw_handle() as _, INFINITE) };
+        if wait_result == WAIT_FAILED_RESULT {
+            return Err(IoError::last_os_error());
+        }
+        if wait_result != WAIT_OBJECT_0_RESULT {
+            return Err(IoError::other(format!(
+                "unexpected process wait result: 0x{wait_result:08x}"
+            )));
         }
         let mut status: DWORD = 0;
         let res = unsafe { GetExitCodeProcess(proc.as_raw_handle() as _, &mut status) };
         if res != 0 {
+            if status == STILL_ACTIVE {
+                return Err(IoError::other(
+                    "process remained active after its wait handle was signaled",
+                ));
+            }
+            self.preserve_descendants();
             Ok(ExitStatus::with_exit_code(status))
         } else {
             Err(IoError::last_os_error())

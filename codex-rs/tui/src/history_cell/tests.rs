@@ -1633,6 +1633,7 @@ fn coalesces_sequential_reads_within_one_call() {
         ExecCall {
             call_id: call_id.clone(),
             command: vec!["bash".into(), "-lc".into(), "echo".into()],
+            display_label: None,
             parsed: vec![
                 ParsedCommand::Search {
                     query: Some("shimmer_spans".into()),
@@ -1672,6 +1673,7 @@ fn coalesces_reads_across_multiple_calls() {
         ExecCall {
             call_id: "c1".to_string(),
             command: vec!["bash".into(), "-lc".into(), "echo".into()],
+            display_label: None,
             parsed: vec![ParsedCommand::Search {
                 query: Some("shimmer_spans".into()),
                 path: None,
@@ -1692,6 +1694,7 @@ fn coalesces_reads_across_multiple_calls() {
         .with_added_call(
             "c2".into(),
             vec!["bash".into(), "-lc".into(), "echo".into()],
+            /*display_label*/ None,
             vec![ParsedCommand::Read {
                 name: "shimmer.rs".into(),
                 cmd: "cat shimmer.rs".into(),
@@ -1707,6 +1710,7 @@ fn coalesces_reads_across_multiple_calls() {
         .with_added_call(
             "c3".into(),
             vec!["bash".into(), "-lc".into(), "echo".into()],
+            /*display_label*/ None,
             vec![ParsedCommand::Read {
                 name: "status_indicator_widget.rs".into(),
                 cmd: "cat status_indicator_widget.rs".into(),
@@ -1729,6 +1733,7 @@ fn coalesced_reads_dedupe_names() {
         ExecCall {
             call_id: "c1".to_string(),
             command: vec!["bash".into(), "-lc".into(), "echo".into()],
+            display_label: None,
             parsed: vec![
                 ParsedCommand::Read {
                     name: "auth.rs".into(),
@@ -1769,6 +1774,7 @@ fn multiline_command_wraps_with_extra_indent_on_subsequent_lines() {
         ExecCall {
             call_id: call_id.clone(),
             command: vec!["bash".into(), "-lc".into(), cmd],
+            display_label: None,
             parsed: Vec::new(),
             output: None,
             source: ExecCommandSource::Agent,
@@ -1795,6 +1801,7 @@ fn single_line_command_compact_when_fits() {
         ExecCall {
             call_id: call_id.clone(),
             command: vec!["echo".into(), "ok".into()],
+            display_label: None,
             parsed: Vec::new(),
             output: None,
             source: ExecCommandSource::Agent,
@@ -1819,6 +1826,7 @@ fn single_line_command_wraps_with_four_space_continuation() {
         ExecCall {
             call_id: call_id.clone(),
             command: vec!["bash".into(), "-lc".into(), long],
+            display_label: None,
             parsed: Vec::new(),
             output: None,
             source: ExecCommandSource::Agent,
@@ -1842,6 +1850,7 @@ fn multiline_command_without_wrap_uses_branch_then_eight_spaces() {
         ExecCall {
             call_id: call_id.clone(),
             command: vec!["bash".into(), "-lc".into(), cmd],
+            display_label: None,
             parsed: Vec::new(),
             output: None,
             source: ExecCommandSource::Agent,
@@ -1866,6 +1875,7 @@ fn multiline_command_both_lines_wrap_with_correct_prefixes() {
         ExecCall {
             call_id: call_id.clone(),
             command: vec!["bash".into(), "-lc".into(), cmd],
+            display_label: None,
             parsed: Vec::new(),
             output: None,
             source: ExecCommandSource::Agent,
@@ -1890,6 +1900,7 @@ fn stderr_tail_more_than_five_lines_snapshot() {
         ExecCall {
             call_id: call_id.clone(),
             command: vec!["bash".into(), "-lc".into(), "seq 1 10 1>&2 && false".into()],
+            display_label: None,
             parsed: Vec::new(),
             output: None,
             source: ExecCommandSource::Agent,
@@ -1940,6 +1951,7 @@ fn ran_cell_multiline_with_stderr_snapshot() {
         ExecCall {
             call_id: call_id.clone(),
             command: vec!["bash".into(), "-lc".into(), long_cmd.to_string()],
+            display_label: None,
             parsed: Vec::new(),
             output: None,
             source: ExecCommandSource::Agent,

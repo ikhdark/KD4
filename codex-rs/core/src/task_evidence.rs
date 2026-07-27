@@ -21,11 +21,13 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tempfile::NamedTempFile;
+use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
 const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 2;
+const FILE_HASH_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_COMMAND_RECEIPTS: usize = 256;
 const MAX_EDIT_RECEIPTS: usize = 256;
 const MAX_VALIDATION_RECEIPTS: usize = 64;
@@ -41,6 +43,7 @@ pub(crate) struct TaskEvidenceLedger {
 pub(crate) struct TaskEvidenceValidationStart {
     epoch: u64,
     file_snapshots: BTreeMap<String, FileHashSnapshot>,
+    owned_file_paths: BTreeSet<String>,
     artifact_snapshots: BTreeMap<String, FileHashSnapshot>,
 }
 
@@ -220,6 +223,7 @@ impl TaskEvidenceLedger {
         let Some(repo_root) = find_kd4_repo_root(cwd) else {
             return Self::disabled();
         };
+        let repo_root = canonical_repository_root(&repo_root);
         let evidence_path = codex_home
             .join("task-evidence")
             .join(format!("{thread_id}.json"));
@@ -227,8 +231,7 @@ impl TaskEvidenceLedger {
         let thread_id_text = thread_id.to_string();
         let repository_root = repo_root.to_string_lossy().into_owned();
 
-        let existing =
-            load_existing_document(&evidence_path, &thread_id_text, &repository_root).await;
+        let existing = load_existing_document(&evidence_path, &thread_id_text, &repo_root).await;
         let mut storage_failure_reason = None;
         let existing = match existing {
             ExistingDocument::Loaded(document) => Some(*document),
@@ -256,6 +259,7 @@ impl TaskEvidenceLedger {
         };
         let document = if let Some(mut document) = existing {
             migrate_document(&mut document);
+            document.start.repository_root.clone_from(&repository_root);
             document.updated_at = now;
             document.revision = document.revision.saturating_add(1);
             document
@@ -332,37 +336,34 @@ impl TaskEvidenceLedger {
         let Some(repo_root) = self.repo_root.as_ref() else {
             return false;
         };
-        let Ok(repo_root) = std::fs::canonicalize(repo_root) else {
-            return false;
-        };
-        let Ok(candidate) = std::fs::canonicalize(candidate) else {
-            return false;
-        };
-        repo_root == candidate
+        repository_roots_match(repo_root, candidate)
     }
 
     pub(crate) async fn begin_verify_local_validation(
         &self,
+        requested_paths: &[PathBuf],
     ) -> Option<TaskEvidenceValidationStart> {
         let repo_root = self.repo_root.as_ref()?;
-        let (epoch, mut file_paths, artifact_paths) = {
+        let requested_paths = requested_paths
+            .iter()
+            .map(|path| normalize_input_path(repo_root, Some(repo_root), path))
+            .collect::<BTreeSet<_>>();
+        let (epoch, mut owned_file_paths, artifact_paths) = {
             let guard = self.document.lock().await;
             let document = guard.as_ref()?;
-            let mut file_paths = document
-                .latest_file_hashes
-                .keys()
-                .cloned()
-                .collect::<BTreeSet<_>>();
-            for step in &document.plan {
-                file_paths.extend(step.edit_paths.iter().cloned());
-            }
             let artifact_paths = document
                 .generated_artifact_requirements
                 .iter()
                 .filter_map(|requirement| requirement.path.clone())
                 .collect::<BTreeSet<_>>();
-            (document.evidence_epoch, file_paths, artifact_paths)
+            (
+                document.evidence_epoch,
+                task_owned_file_paths(document),
+                artifact_paths,
+            )
         };
+        owned_file_paths.extend(requested_paths);
+        let mut file_paths = owned_file_paths.clone();
         file_paths.extend(git_dirty_paths(repo_root).await);
         let mut file_snapshots = BTreeMap::new();
         for path in file_paths {
@@ -375,6 +376,7 @@ impl TaskEvidenceLedger {
         Some(TaskEvidenceValidationStart {
             epoch,
             file_snapshots,
+            owned_file_paths,
             artifact_snapshots,
         })
     }
@@ -706,15 +708,28 @@ impl TaskEvidenceLedger {
             .iter()
             .map(|path| normalize_input_path(repo_root, Some(repo_root), path))
             .collect::<Vec<_>>();
-        let mut file_snapshots = Vec::with_capacity(normalized_active_files.len());
-        for path in &normalized_active_files {
-            file_snapshots.push(snapshot_file(repo_root, path).await);
+        let mut checked_paths = normalized_active_files
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if let Some(start) = validation_start {
+            checked_paths.extend(start.owned_file_paths.iter().cloned());
         }
         let mut validation_end_files = BTreeMap::new();
+        for path in checked_paths {
+            validation_end_files.insert(path.clone(), snapshot_file(repo_root, &path).await);
+        }
+        let file_snapshots = normalized_active_files
+            .iter()
+            .filter_map(|path| validation_end_files.get(path).cloned())
+            .collect::<Vec<_>>();
+        let mut validation_start_files = BTreeMap::new();
         let mut validation_end_artifacts = BTreeMap::new();
         if let Some(start) = validation_start {
-            for path in start.file_snapshots.keys() {
-                validation_end_files.insert(path.clone(), snapshot_file(repo_root, path).await);
+            for path in validation_end_files.keys() {
+                if let Some(snapshot) = start.file_snapshots.get(path) {
+                    validation_start_files.insert(path.clone(), snapshot.clone());
+                }
             }
             for path in start.artifact_snapshots.keys() {
                 validation_end_artifacts.insert(path.clone(), snapshot_file(repo_root, path).await);
@@ -724,7 +739,7 @@ impl TaskEvidenceLedger {
             normalized_active_files
                 .iter()
                 .all(|path| start.file_snapshots.contains_key(path))
-                && start.file_snapshots == validation_end_files
+                && validation_start_files == validation_end_files
                 && start.artifact_snapshots == validation_end_artifacts
         });
 
@@ -771,14 +786,21 @@ impl TaskEvidenceLedger {
                             .insert(snapshot.path.clone(), snapshot.clone());
                     }
                     for step in &mut document.plan {
-                        if !step.edit_paths.is_empty()
+                        let edit_free_step_is_ready = step.edit_paths.is_empty()
+                            && matches!(
+                                step.status,
+                                StepStatus::Implemented
+                                    | StepStatus::Completed
+                                    | StepStatus::Passed
+                            );
+                        let edited_step_is_covered = !step.edit_paths.is_empty()
                             && step.edit_paths.iter().all(|path| {
                                 file_snapshots.iter().any(|active| {
                                     active.read_error.is_none()
                                         && path_is_covered(path, &active.path)
                                 })
-                            })
-                        {
+                            });
+                        if edit_free_step_is_ready || edited_step_is_covered {
                             step.validation_receipt_ids.push(receipt_id.clone());
                             step.validation_receipt_ids.sort();
                             step.validation_receipt_ids.dedup();
@@ -1188,7 +1210,7 @@ enum ExistingDocument {
 async fn load_existing_document(
     path: &Path,
     expected_thread_id: &str,
-    expected_repository_root: &str,
+    expected_repository_root: &Path,
 ) -> ExistingDocument {
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
@@ -1243,13 +1265,62 @@ async fn load_existing_document(
             reason: "thread id does not match the requested task".to_string(),
         };
     }
-    if document.start.repository_root != expected_repository_root {
+    if !repository_roots_match(
+        Path::new(&document.start.repository_root),
+        expected_repository_root,
+    ) {
         return ExistingDocument::Rejected {
             kind: "incompatible",
             reason: "repository root does not match the requested checkout".to_string(),
         };
     }
     ExistingDocument::Loaded(Box::new(document))
+}
+
+fn canonical_repository_root(path: &Path) -> PathBuf {
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn repository_roots_match(left: &Path, right: &Path) -> bool {
+    match (dunce::canonicalize(left), dunce::canonicalize(right)) {
+        (Ok(left), Ok(right)) => repository_root_paths_equal(&left, &right),
+        _ => repository_root_paths_equal(left, right),
+    }
+}
+
+#[cfg(not(windows))]
+fn repository_root_paths_equal(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+#[cfg(windows)]
+fn repository_root_paths_equal(left: &Path, right: &Path) -> bool {
+    use std::path::Component;
+    use std::path::Prefix;
+
+    let mut left_components = left.components();
+    let mut right_components = right.components();
+    let left_drive = match left_components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => Some(drive),
+            _ => None,
+        },
+        _ => None,
+    };
+    let right_drive = match right_components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => Some(drive),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    match (left_drive, right_drive) {
+        (Some(left_drive), Some(right_drive)) => {
+            left_drive.eq_ignore_ascii_case(&right_drive) && left_components.eq(right_components)
+        }
+        _ => left == right,
+    }
 }
 
 async fn quarantine_evidence_file(path: &Path, kind: &str) -> io::Result<PathBuf> {
@@ -1341,6 +1412,10 @@ fn migrate_document(document: &mut TaskEvidenceDocument) {
     if document.latest_generated_artifact_hashes.is_empty() {
         document.latest_generated_artifact_hashes = document.generated_artifact_hashes.clone();
     }
+    let owned_file_paths = task_owned_file_paths(document);
+    document
+        .latest_file_hashes
+        .retain(|path, _| owned_file_paths.contains(path));
     let mut used_ids = BTreeSet::new();
     let mut duplicate_step_ids = BTreeSet::new();
     for (index, step) in document.plan.iter_mut().enumerate() {
@@ -1415,6 +1490,23 @@ fn find_kd4_repo_root(cwd: &Path) -> Option<PathBuf> {
                 && candidate.join("kd4_features.toml").is_file()
         })
         .map(Path::to_path_buf)
+}
+
+fn task_owned_file_paths(document: &TaskEvidenceDocument) -> BTreeSet<String> {
+    let mut paths = BTreeSet::new();
+    for step in &document.plan {
+        paths.extend(step.edit_paths.iter().cloned());
+    }
+    for intent in &document.edit_intents {
+        paths.extend(intent.files.iter().map(|file| file.path.clone()));
+    }
+    for receipt in &document.edit_receipts {
+        paths.extend(receipt.files.iter().map(|file| file.path.clone()));
+    }
+    for receipt in &document.validation_receipts {
+        paths.extend(receipt.active_files.iter().map(|file| file.path.clone()));
+    }
+    paths
 }
 
 async fn git_dirty_paths(repo_root: &Path) -> BTreeSet<String> {
@@ -1725,7 +1817,7 @@ fn step_has_fresh_evidence(document: &TaskEvidenceDocument, index: usize) -> boo
     }) {
         return false;
     }
-    if step.edit_paths.is_empty() || step.validation_receipt_ids.is_empty() {
+    if step.validation_receipt_ids.is_empty() {
         return false;
     }
     let validation = step
@@ -2094,10 +2186,10 @@ async fn snapshot_file(repo_root: &Path, normalized: &str) -> FileHashSnapshot {
     } else {
         repo_root.join(path)
     };
-    match tokio::fs::read(&absolute).await {
-        Ok(bytes) => FileHashSnapshot {
+    match sha1_file(&absolute).await {
+        Ok(sha1) => FileHashSnapshot {
             path: normalize_slashes(normalized),
-            sha1: Some(sha1_hex(&bytes)),
+            sha1: Some(sha1),
             exists: true,
             read_error: None,
         },
@@ -2114,6 +2206,20 @@ async fn snapshot_file(repo_root: &Path, normalized: &str) -> FileHashSnapshot {
             read_error: Some(format!("{:?}", err.kind())),
         },
     }
+}
+
+async fn sha1_file(path: &Path) -> io::Result<String> {
+    let mut file = tokio::fs::File::open(path).await?;
+    let mut hasher = Sha1::new();
+    let mut buffer = vec![0_u8; FILE_HASH_CHUNK_SIZE];
+    loop {
+        let bytes_read = file.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn path_is_covered(path: &str, active: &str) -> bool {
@@ -2228,7 +2334,7 @@ mod tests {
             .expect("source update");
         ledger.record_edit_result("patch-1", "completed").await;
         let plan_validation_start = ledger
-            .begin_verify_local_validation()
+            .begin_verify_local_validation(&[])
             .await
             .expect("plan validation start");
         ledger
@@ -2244,7 +2350,7 @@ mod tests {
             )
             .await;
         let final_validation_start = ledger
-            .begin_verify_local_validation()
+            .begin_verify_local_validation(&[])
             .await
             .expect("final validation start");
         ledger

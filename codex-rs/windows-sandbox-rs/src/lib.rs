@@ -386,6 +386,7 @@ mod windows_impl {
     use super::WindowsSandboxCancellationToken;
     use super::legacy_restricted_token_enforces_delete_child;
     use super::logging::log_failure;
+    use super::logging::log_note;
     use super::logging::log_success;
     use super::process::ConsoleMode;
     use super::process::create_process_as_user;
@@ -405,6 +406,7 @@ mod windows_impl {
     use std::io;
     use std::path::Path;
     use std::ptr;
+    use std::sync::Arc;
     use std::sync::mpsc;
     use std::time::Duration;
     use std::time::Instant;
@@ -427,11 +429,29 @@ mod windows_impl {
 
     const CAPTURE_PIPE_POLL_INTERVAL: Duration = Duration::from_millis(10);
     const CAPTURE_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
+    const TERMINATION_WAIT_MS: u64 = 5_000;
+    const WAIT_OBJECT_0: u32 = 0x0000_0000;
+    const WAIT_TIMEOUT: u32 = 0x0000_0102;
+    const WAIT_FAILED: u32 = u32::MAX;
 
+    #[derive(Debug)]
     enum WaitOutcome {
         Exited,
         TimedOut,
         Cancelled,
+        Failed(io::Error),
+    }
+
+    fn wait_outcome(process: HANDLE, timeout_ms: u32) -> WaitOutcome {
+        let wait_result = unsafe { WaitForSingleObject(process, timeout_ms) };
+        match wait_result {
+            WAIT_OBJECT_0 => WaitOutcome::Exited,
+            WAIT_TIMEOUT => WaitOutcome::TimedOut,
+            WAIT_FAILED => WaitOutcome::Failed(io::Error::last_os_error()),
+            _ => WaitOutcome::Failed(io::Error::other(format!(
+                "unexpected process wait result: 0x{wait_result:08x}"
+            ))),
+        }
     }
 
     fn wait_for_process(
@@ -441,12 +461,7 @@ mod windows_impl {
     ) -> WaitOutcome {
         let Some(cancellation) = cancellation else {
             let timeout = timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
-            let res = unsafe { WaitForSingleObject(process, timeout) };
-            return if res == 0x0000_0102 {
-                WaitOutcome::TimedOut
-            } else {
-                WaitOutcome::Exited
-            };
+            return wait_outcome(process, timeout);
         };
 
         let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
@@ -464,11 +479,10 @@ mod windows_impl {
                 }
                 None => 50,
             };
-            let res = unsafe { WaitForSingleObject(process, wait_ms) };
-            if res == 0x0000_0102 {
-                continue;
+            match wait_outcome(process, wait_ms) {
+                WaitOutcome::TimedOut => continue,
+                outcome => return outcome,
             }
-            return WaitOutcome::Exited;
         }
     }
 
@@ -777,6 +791,7 @@ mod windows_impl {
             }
         };
         let pi = created.process_info;
+        let job = Arc::clone(&created.job);
         let _desktop = created;
 
         unsafe {
@@ -791,18 +806,63 @@ mod windows_impl {
         let stderr_reader = CapturePipeReader::spawn_capture_pipe_reader(err_r);
 
         let wait_outcome = wait_for_process(pi.hProcess, timeout_ms, cancellation.as_ref());
-        let timed_out = matches!(wait_outcome, WaitOutcome::TimedOut);
-        let cancelled = matches!(wait_outcome, WaitOutcome::Cancelled);
+        let process_exited = matches!(&wait_outcome, WaitOutcome::Exited);
+        let timed_out = matches!(&wait_outcome, WaitOutcome::TimedOut);
+        if let WaitOutcome::Failed(err) = &wait_outcome {
+            log_note(
+                &format!(
+                    "capture failed to wait for root process; terminating process tree: {err}"
+                ),
+                logs_base_dir,
+            );
+        }
         let mut exit_code_u32: u32 = 1;
-        if !timed_out && !cancelled {
+        if process_exited {
             unsafe {
                 GetExitCodeProcess(pi.hProcess, &mut exit_code_u32);
             }
-        } else {
-            unsafe {
-                windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
-                let _ = WaitForSingleObject(pi.hProcess, 5_000);
+        }
+        if !process_exited {
+            if let Err(job_err) = job.terminate() {
+                log_note(
+                    &format!("capture failed to terminate process tree: {job_err}"),
+                    logs_base_dir,
+                );
+                let root_result = unsafe {
+                    windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1)
+                };
+                if root_result == 0 {
+                    log_note(
+                        &format!("capture failed to terminate root process: {}", unsafe {
+                            GetLastError()
+                        }),
+                        logs_base_dir,
+                    );
+                }
             }
+            match wait_for_process(
+                pi.hProcess,
+                Some(TERMINATION_WAIT_MS),
+                /*cancellation*/ None,
+            ) {
+                WaitOutcome::Exited => {}
+                WaitOutcome::TimedOut => log_note(
+                    "capture root process did not exit after termination",
+                    logs_base_dir,
+                ),
+                WaitOutcome::Failed(err) => log_note(
+                    &format!("capture failed to wait for root process after termination: {err}"),
+                    logs_base_dir,
+                ),
+                WaitOutcome::Cancelled => {
+                    unreachable!("termination wait has no cancellation token")
+                }
+            }
+        } else if let Err(err) = job.preserve_descendants() {
+            log_note(
+                &format!("capture failed to preserve descendants after root exit: {err}"),
+                logs_base_dir,
+            );
         }
 
         unsafe {
@@ -1048,6 +1108,20 @@ mod windows_impl {
                 .expect_err("invalid pipe handle should fail");
 
             assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE as i32));
+        }
+
+        #[test]
+        fn process_wait_failure_is_not_treated_as_exit() {
+            match super::wait_for_process(
+                /*invalid process handle*/ 0,
+                Some(0),
+                /*cancellation*/ None,
+            ) {
+                super::WaitOutcome::Failed(err) => {
+                    assert_eq!(err.raw_os_error(), Some(ERROR_INVALID_HANDLE as i32));
+                }
+                outcome => panic!("invalid handle was misclassified as {outcome:?}"),
+            }
         }
 
         #[test]

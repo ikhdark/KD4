@@ -50,6 +50,7 @@ use codex_protocol::openai_models::ModelPreset;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::McpServerRefreshConfig;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::ResumedHistory;
@@ -568,6 +569,54 @@ impl ThreadManager {
 
     pub async fn get_thread(&self, thread_id: ThreadId) -> CodexResult<Arc<CodexThread>> {
         self.state.get_thread(thread_id).await
+    }
+
+    /// Atomically replaces the pending MCP refresh config for a set of threads.
+    ///
+    /// Every thread is validated and every pending-config lock is acquired before the
+    /// first config is written. The locks remain held until every config is written, so
+    /// validation failure or cancellation leaves every thread unchanged.
+    #[doc(hidden)]
+    pub async fn queue_mcp_server_refreshes_atomically(
+        &self,
+        refreshes: Vec<(ThreadId, Arc<CodexThread>, McpServerRefreshConfig)>,
+    ) -> CodexResult<()> {
+        let mut seen = HashSet::with_capacity(refreshes.len());
+        let mut validated = Vec::with_capacity(refreshes.len());
+        for (thread_id, thread, config) in refreshes {
+            if !seen.insert(thread_id) {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "duplicate thread {thread_id} in MCP refresh batch"
+                )));
+            }
+            let actual_thread_id = thread.session_configured().thread_id;
+            if thread.session_source.is_internal() || actual_thread_id != thread_id {
+                return Err(CodexErr::InvalidRequest(format!(
+                    "thread {thread_id} does not match MCP refresh target {actual_thread_id}"
+                )));
+            }
+            validated.push((thread_id, thread, config));
+        }
+        validated.sort_by_cached_key(|(thread_id, _, _)| thread_id.to_string());
+        let (threads, configs): (Vec<_>, Vec<_>) = validated
+            .into_iter()
+            .map(|(_, thread, config)| (thread, config))
+            .unzip();
+
+        let mut pending_configs = Vec::with_capacity(threads.len());
+        for thread in &threads {
+            pending_configs.push(
+                thread
+                    .codex
+                    .session
+                    .lock_pending_mcp_server_refresh_config()
+                    .await,
+            );
+        }
+        for (pending_config, config) in pending_configs.iter_mut().zip(configs) {
+            **pending_config = Some(config);
+        }
+        Ok(())
     }
 
     /// Updates metadata for loaded and cold threads through one entrypoint.
@@ -1987,6 +2036,10 @@ fn append_interrupted_boundary(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "thread_manager_mcp_refresh_tests.rs"]
+mod mcp_refresh_tests;
 
 #[cfg(test)]
 #[path = "thread_manager_tests.rs"]

@@ -372,9 +372,24 @@
             "type": "string"
           },
           "type": "array"
+        },
+        "waiting_policy": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CodeModeWaitingPolicy"
+            }
+          ],
+          "description": "Deprecated compatibility field. Its value is ignored."
         }
       },
       "type": "object"
+    },
+    "CodeModeWaitingPolicy": {
+      "enum": [
+        "yield_after",
+        "run_to_completion"
+      ],
+      "type": "string"
     },
     "ConfigProfile": {
       "additionalProperties": false,
@@ -2721,9 +2736,31 @@
         }
       ]
     },
+    "RolloutBudgetAction": {
+      "enum": [
+        "remind",
+        "ask",
+        "stop"
+      ],
+      "type": "string"
+    },
     "RolloutBudgetConfigToml": {
       "additionalProperties": false,
       "properties": {
+        "action": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RolloutBudgetAction"
+            }
+          ],
+          "description": "Deprecated compatibility field. Its value is ignored."
+        },
+        "cached_input_token_weight": {
+          "description": "Deprecated compatibility field. Its value is ignored.",
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
+        },
         "enabled": {
           "type": "boolean"
         },
@@ -2731,6 +2768,12 @@
           "format": "int64",
           "minimum": 1.0,
           "type": "integer"
+        },
+        "model_call_token_cost": {
+          "description": "Deprecated compatibility field. Its value is ignored.",
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
         },
         "prefill_token_weight": {
           "format": "double",
@@ -2746,6 +2789,18 @@
           "type": "array"
         },
         "sampling_token_weight": {
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "subagent_token_cost": {
+          "description": "Deprecated compatibility field. Its value is ignored.",
+          "format": "double",
+          "minimum": 0.0,
+          "type": "number"
+        },
+        "tool_output_byte_weight": {
+          "description": "Deprecated compatibility field. Its value is ignored.",
           "format": "double",
           "minimum": 0.0,
           "type": "number"

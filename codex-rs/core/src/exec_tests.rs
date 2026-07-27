@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(windows)]
+use base64::Engine;
 use codex_protocol::config_types::WindowsSandboxLevel;
 use codex_protocol::models::PermissionProfile;
 use codex_sandboxing::SandboxType;
@@ -1095,6 +1097,101 @@ async fn kill_child_process_group_kills_grandchildren_on_timeout() -> Result<()>
     }
 
     assert!(killed, "grandchild process with pid {pid} is still alive");
+    Ok(())
+}
+
+#[cfg(windows)]
+fn encode_powershell_script(script: &str) -> String {
+    let utf16_le = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    base64::prelude::BASE64_STANDARD.encode(utf16_le)
+}
+
+#[cfg(windows)]
+fn powershell_literal_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\'', "''")
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn direct_exec_cancellation_terminates_windows_descendants() -> Result<()> {
+    let temp_dir = tempfile::TempDir::new()?;
+    let ready_marker = temp_dir.path().join("descendant.ready");
+    let survival_marker = temp_dir.path().join("descendant.survived");
+    let descendant_script = format!(
+        "Start-Sleep -Seconds 2; Set-Content -LiteralPath '{}' -Value survived",
+        powershell_literal_path(&survival_marker)
+    );
+    let descendant_script = encode_powershell_script(&descendant_script);
+    let root_script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $null = Start-Process -FilePath 'powershell.exe' \
+             -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant_script}') \
+             -WindowStyle Hidden; \
+         Set-Content -LiteralPath '{}' -Value ready; \
+         Start-Sleep -Seconds 60",
+        powershell_literal_path(&ready_marker)
+    );
+    let command = vec![
+        "powershell.exe".to_string(),
+        "-NoLogo".to_string(),
+        "-NoProfile".to_string(),
+        "-NonInteractive".to_string(),
+        "-EncodedCommand".to_string(),
+        encode_powershell_script(&root_script),
+    ];
+    let cwd = codex_utils_absolute_path::AbsolutePathBuf::current_dir()?;
+    let cancellation = CancellationToken::new();
+    let cancel_tx = cancellation.clone();
+    let ready_for_cancel = ready_marker.clone();
+    let cancel_task = tokio::spawn(async move {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !ready_for_cancel.exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let ready = ready_for_cancel.exists();
+        cancel_tx.cancel();
+        ready
+    });
+    let params = ExecParams {
+        command,
+        cwd,
+        expiration: ExecExpiration::Cancellation(cancellation),
+        capture_policy: ExecCapturePolicy::ShellTool,
+        env: std::env::vars().collect(),
+        network: None,
+        network_environment_id: None,
+        sandbox_permissions: SandboxPermissions::UseDefault,
+        windows_sandbox_level: WindowsSandboxLevel::Disabled,
+        windows_sandbox_private_desktop: false,
+        justification: None,
+        arg0: None,
+    };
+
+    let output = timeout(
+        Duration::from_secs(15),
+        exec(
+            params,
+            NetworkSandboxPolicy::Restricted,
+            /*stdout_stream*/ None,
+            /*after_spawn*/ None,
+        ),
+    )
+    .await
+    .expect("Windows direct exec cancellation should complete promptly")?;
+    assert!(
+        cancel_task.await.expect("join cancellation task"),
+        "descendant did not start before cancellation"
+    );
+    assert!(!output.timed_out);
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        !survival_marker.exists(),
+        "Windows direct exec descendant survived cancellation"
+    );
     Ok(())
 }
 

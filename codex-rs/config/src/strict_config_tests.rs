@@ -112,6 +112,32 @@ foo = true"#;
 }
 
 #[test]
+fn strict_config_accepts_deprecated_feature_config_fields() {
+    let path = Path::new("/tmp/config.toml");
+    let contents = r#"
+[features.code_mode]
+enabled = true
+waiting_policy = "yield_after"
+
+[features.rollout_budget]
+enabled = true
+limit_tokens = 100000
+reminder_at_remaining_tokens = [50000, 25000, 10000]
+sampling_token_weight = 1.0
+prefill_token_weight = 0.1
+cached_input_token_weight = 0.05
+model_call_token_cost = 750
+tool_output_byte_weight = 0.025
+subagent_token_cost = 4000
+action = "ask"
+"#;
+
+    let error = config_error_from_ignored_toml_fields::<ConfigToml>(path, contents);
+
+    assert_eq!(error, None);
+}
+
+#[test]
 fn strict_config_accepts_opaque_desktop_keys() {
     let path = Path::new("/tmp/config.toml");
     let contents = r#"

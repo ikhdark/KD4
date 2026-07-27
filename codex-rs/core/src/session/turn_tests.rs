@@ -15,6 +15,7 @@ use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::ToolInfo;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::built_in_model_providers;
+use codex_protocol::ResponseItemId;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ModelsResponse;
@@ -94,7 +95,7 @@ impl TurnItemContributor for RewriteAgentMessageContributor {
 
 fn assistant_output_text(text: &str) -> ResponseItem {
     ResponseItem::Message {
-        id: Some("msg-1".to_string()),
+        id: Some(ResponseItemId::with_suffix("msg", "1")),
         role: "assistant".to_string(),
         content: vec![ContentItem::OutputText {
             text: text.to_string(),

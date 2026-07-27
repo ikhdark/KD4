@@ -633,6 +633,9 @@ impl Session {
                     return TerminalSchedule::NotFound;
                 };
                 let Some(coordinator) = active_turn.terminal.as_ref().cloned() else {
+                    if expected_turn_id.is_none() && active_turn.task.is_none() {
+                        *active = None;
+                    }
                     return TerminalSchedule::NotFound;
                 };
                 if expected_turn_id.is_some_and(|turn_id| coordinator.turn_id() != turn_id) {

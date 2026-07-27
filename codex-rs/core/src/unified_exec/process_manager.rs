@@ -1525,8 +1525,14 @@ impl UnifiedExecProcessManager {
         };
 
         for entry in entries {
+            if let Err(err) = entry.process.terminate_confirmed().await {
+                tracing::warn!(
+                    process_id = entry.process_id,
+                    %err,
+                    "failed to terminate unified exec process during shutdown"
+                );
+            }
             unregister_network_approval_for_entry(&entry).await;
-            entry.process.terminate();
         }
     }
 

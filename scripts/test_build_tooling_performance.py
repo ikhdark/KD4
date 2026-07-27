@@ -584,14 +584,43 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             "scripts/install/AGENTS.md",
         ]
         actual_agent_files = sorted(
-            path.relative_to(REPO_ROOT).as_posix()
-            for path in REPO_ROOT.rglob("AGENTS.md")
-            if ".git" not in path.parts
+            subprocess.run(
+                [
+                    "git",
+                    "ls-files",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "--",
+                    ":(glob)**/AGENTS.md",
+                ],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+                creationflags=CREATE_NO_WINDOW,
+            ).stdout.splitlines()
         )
+        actual_eol_attributes = subprocess.run(
+            ["git", "check-attr", "eol", "--", *expected_agent_files],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+            creationflags=CREATE_NO_WINDOW,
+        ).stdout.splitlines()
+        expected_eol_attributes = [
+            f"{path}: eol: lf" for path in expected_agent_files
+        ]
         root_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         normalized_root = " ".join(root_text.split())
 
         self.assertEqual(actual_agent_files, sorted(expected_agent_files))
+        self.assertEqual(actual_eol_attributes, expected_eol_attributes)
         self.assertIn("further nested files apply only where present", normalized_root)
         self.assertIn(
             "Never rely on an instruction file that is absent", normalized_root

@@ -26,9 +26,27 @@ use crate::process::exit_code_from_status;
 #[cfg(target_os = "linux")]
 use libc;
 
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
+use std::os::windows::io::BorrowedHandle;
+#[cfg(windows)]
+use std::os::windows::io::OwnedHandle;
+#[cfg(windows)]
+use std::os::windows::io::RawHandle;
+
+#[cfg(windows)]
+enum WindowsChildTerminator {
+    Job {
+        job: Arc<crate::win::JobObject>,
+        process: OwnedHandle,
+    },
+    Process(OwnedHandle),
+}
+
 struct PipeChildTerminator {
     #[cfg(windows)]
-    pid: u32,
+    windows: WindowsChildTerminator,
     #[cfg(unix)]
     process_group_id: u32,
 }
@@ -58,7 +76,12 @@ impl ChildTerminator for PipeChildTerminator {
 
         #[cfg(windows)]
         {
-            kill_process(self.pid)
+            match &self.windows {
+                WindowsChildTerminator::Job { job, process } => {
+                    terminate_job_or_process(job, process)
+                }
+                WindowsChildTerminator::Process(process) => terminate_process(process),
+            }
         }
 
         #[cfg(not(any(unix, windows)))]
@@ -69,20 +92,37 @@ impl ChildTerminator for PipeChildTerminator {
 }
 
 #[cfg(windows)]
-fn kill_process(pid: u32) -> io::Result<()> {
-    unsafe {
-        let handle = winapi::um::processthreadsapi::OpenProcess(
-            winapi::um::winnt::PROCESS_TERMINATE,
-            0,
-            pid,
-        );
-        if handle.is_null() {
-            return Err(io::Error::last_os_error());
+fn duplicate_process_handle(process: RawHandle) -> io::Result<OwnedHandle> {
+    unsafe { BorrowedHandle::borrow_raw(process) }.try_clone_to_owned()
+}
+
+#[cfg(windows)]
+fn terminate_process(process: &OwnedHandle) -> io::Result<()> {
+    let success =
+        unsafe { winapi::um::processthreadsapi::TerminateProcess(process.as_raw_handle(), 1) };
+    if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn terminate_job_or_process(job: &crate::win::JobObject, process: &OwnedHandle) -> io::Result<()> {
+    match job.terminate() {
+        Ok(()) => Ok(()),
+        Err(job_err) => {
+            log::warn!(
+                "Windows pipe failed to terminate process tree; terminating root process: \
+                 {job_err}"
+            );
+            terminate_process(process).map_err(|process_err| {
+                io::Error::other(format!(
+                    "failed to terminate Windows job ({job_err}); root process fallback also \
+                     failed: {process_err}"
+                ))
+            })
         }
-        let success = winapi::um::processthreadsapi::TerminateProcess(handle, 1);
-        let err = io::Error::last_os_error();
-        winapi::um::handleapi::CloseHandle(handle);
-        if success == 0 { Err(err) } else { Ok(()) }
     }
 }
 
@@ -109,6 +149,8 @@ enum PipeStdinMode {
     Null,
 }
 
+/// On Windows, process-tree containment is best-effort because Tokio returns
+/// only after the root process starts, so job assignment cannot be atomic.
 async fn spawn_process_with_stdin_mode(
     program: &str,
     args: &[String],
@@ -165,12 +207,53 @@ async fn spawn_process_with_stdin_mode(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
 
+    #[cfg(windows)]
+    let job = crate::win::JobObject::create().map(Arc::new);
     let mut child = command.spawn()?;
-    let pid = child
+    #[cfg(windows)]
+    let windows_terminator = {
+        // Accept the small race: a descendant created between spawn and
+        // assignment is not guaranteed to join the job and can escape termination.
+        let pid = child
+            .id()
+            .ok_or_else(|| io::Error::other("missing child pid"))?;
+        let assigned_job = job.and_then(|job| {
+            let process_handle = child
+                .raw_handle()
+                .ok_or_else(|| io::Error::other("missing child process handle"))?;
+            job.assign_process(process_handle)?;
+            Ok(job)
+        });
+        let process_handle = child
+            .raw_handle()
+            .ok_or_else(|| io::Error::other("missing child process handle"))?;
+        let process = match duplicate_process_handle(process_handle) {
+            Ok(process) => process,
+            Err(err) => {
+                if let Ok(job) = &assigned_job {
+                    if job.terminate().is_err() {
+                        let _ = child.start_kill();
+                    }
+                } else {
+                    let _ = child.start_kill();
+                }
+                return Err(err.into());
+            }
+        };
+        match assigned_job {
+            Ok(job) => WindowsChildTerminator::Job { job, process },
+            Err(err) => {
+                log::warn!(
+                    "Windows pipe process tree containment unavailable for pid {pid}: {err}"
+                );
+                WindowsChildTerminator::Process(process)
+            }
+        }
+    };
+    #[cfg(unix)]
+    let process_group_id = child
         .id()
         .ok_or_else(|| io::Error::other("missing child pid"))?;
-    #[cfg(unix)]
-    let process_group_id = pid;
 
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
@@ -225,9 +308,24 @@ async fn spawn_process_with_stdin_mode(
     let wait_exit_status = Arc::clone(&exit_status);
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
+    #[cfg(windows)]
+    let wait_job = match &windows_terminator {
+        WindowsChildTerminator::Job { job, .. } => Some(Arc::clone(job)),
+        WindowsChildTerminator::Process(_) => None,
+    };
     let wait_handle: JoinHandle<()> = tokio::spawn(async move {
         let code = match child.wait().await {
-            Ok(status) => exit_code_from_status(status),
+            Ok(status) => {
+                #[cfg(windows)]
+                if let Some(job) = wait_job
+                    && let Err(err) = job.preserve_descendants()
+                {
+                    log::warn!(
+                        "Windows pipe failed to preserve descendants after root exit: {err}"
+                    );
+                }
+                exit_code_from_status(status)
+            }
             Err(_) => -1,
         };
         wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -241,7 +339,7 @@ async fn spawn_process_with_stdin_mode(
         writer_tx,
         Box::new(PipeChildTerminator {
             #[cfg(windows)]
-            pid,
+            windows: windows_terminator,
             #[cfg(unix)]
             process_group_id,
         }),
@@ -306,3 +404,7 @@ pub async fn spawn_process_no_stdin_with_inherited_fds(
     )
     .await
 }
+
+#[cfg(all(test, windows))]
+#[path = "pipe_tests.rs"]
+mod tests;

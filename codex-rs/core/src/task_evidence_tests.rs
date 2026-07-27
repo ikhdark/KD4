@@ -23,6 +23,110 @@ async fn ledger_fixture() -> (tempfile::TempDir, PathBuf, TaskEvidenceLedger) {
     (temp, repo, ledger)
 }
 
+#[cfg(unix)]
+fn create_directory_alias(target: &Path, alias: &Path) {
+    std::os::unix::fs::symlink(target, alias).expect("create directory symlink");
+}
+
+#[cfg(windows)]
+fn create_directory_alias(target: &Path, alias: &Path) {
+    let output = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(alias)
+        .arg(target)
+        .output()
+        .expect("create directory junction");
+    assert!(
+        output.status.success(),
+        "mklink /J failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn existing_evidence_reuses_canonical_repository_identity() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    let repo_alias = temp.path().join("repo-alias");
+    let codex_home = temp.path().join("home");
+    tokio::fs::create_dir_all(repo.join("scripts"))
+        .await
+        .expect("scripts");
+    tokio::fs::create_dir_all(repo.join(".git"))
+        .await
+        .expect("git dir");
+    tokio::fs::write(repo.join("scripts/verify_local.py"), "# fixture")
+        .await
+        .expect("verifier");
+    tokio::fs::write(repo.join("kd4_features.toml"), "# fixture")
+        .await
+        .expect("manifest");
+    create_directory_alias(&repo, &repo_alias);
+
+    let thread_id = ThreadId::new();
+    let evidence_path = codex_home
+        .join("task-evidence")
+        .join(format!("{thread_id}.json"));
+    let ledger = TaskEvidenceLedger::load_or_new(codex_home.clone(), thread_id, &repo).await;
+    drop(ledger);
+
+    let mut value = serde_json::from_slice::<Value>(
+        &tokio::fs::read(&evidence_path)
+            .await
+            .expect("persisted evidence"),
+    )
+    .expect("valid evidence");
+    value["start"]["repository_root"] = Value::String(repo_alias.to_string_lossy().into_owned());
+    tokio::fs::write(
+        &evidence_path,
+        serde_json::to_vec_pretty(&value).expect("serialize evidence"),
+    )
+    .await
+    .expect("rewrite legacy repository root");
+
+    let reloaded = TaskEvidenceLedger::load_or_new(codex_home.clone(), thread_id, &repo).await;
+    let guard = reloaded.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    assert_eq!(document.revision, 2);
+    assert_eq!(
+        PathBuf::from(&document.start.repository_root),
+        canonical_repository_root(&repo)
+    );
+    drop(guard);
+
+    let mut entries = tokio::fs::read_dir(codex_home.join("task-evidence"))
+        .await
+        .expect("evidence directory");
+    while let Some(entry) = entries.next_entry().await.expect("evidence entry") {
+        assert!(
+            !entry.file_name().to_string_lossy().ends_with(".preserved"),
+            "matching repository evidence must not be quarantined"
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn repository_identity_canonicalizes_drive_letter_case() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let canonical = canonical_repository_root(temp.path());
+    let mut alternate = canonical.to_string_lossy().into_owned();
+    let drive = alternate.as_bytes().first().copied().expect("drive letter");
+    assert_eq!(alternate.as_bytes().get(1), Some(&b':'));
+    let alternate_drive = if drive.is_ascii_uppercase() {
+        drive.to_ascii_lowercase()
+    } else {
+        drive.to_ascii_uppercase()
+    };
+    alternate.replace_range(0..1, &(alternate_drive as char).to_string());
+
+    assert!(repository_root_paths_equal(
+        &canonical,
+        Path::new(&alternate)
+    ));
+    assert!(repository_roots_match(&canonical, Path::new(&alternate)));
+}
+
 #[tokio::test]
 async fn verifier_repo_root_must_match_the_task_evidence_root() {
     let (temp, repo, ledger) = ledger_fixture().await;
@@ -234,6 +338,113 @@ fn verifier_requirements_require_an_exact_successful_result() {
 }
 
 #[tokio::test]
+async fn edit_free_step_passes_with_fresh_validation_evidence() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let mut audit = plan_item("audit", StepStatus::Implemented);
+    audit.step = "Audit the runtime behavior".to_string();
+    ledger.record_plan_update(&plan_with(vec![audit])).await;
+
+    let plan_validation_start = ledger
+        .begin_verify_local_validation(&[])
+        .await
+        .expect("plan validation start");
+    ledger
+        .record_verify_local(
+            "plan",
+            Some("PLANNED"),
+            true,
+            false,
+            Some(&plan_validation_start),
+            &[],
+            &[],
+            Some(&serde_json::json!({"planned": []})),
+        )
+        .await;
+    let final_validation_start = ledger
+        .begin_verify_local_validation(&[])
+        .await
+        .expect("final validation start");
+    assert!(
+        ledger
+            .record_verify_local(
+                "final",
+                Some("VERIFIED"),
+                true,
+                true,
+                Some(&final_validation_start),
+                &[],
+                &[],
+                Some(&serde_json::json!({"verdict": "VERIFIED"})),
+            )
+            .await
+    );
+
+    {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("document");
+        assert!(document.plan[0].edit_paths.is_empty());
+        assert_eq!(document.plan[0].validation_receipt_ids.len(), 1);
+        assert_eq!(document.plan[0].status, StepStatus::Passed);
+    }
+    assert_eq!(
+        ledger.completion_gate().await.expect("gate").status,
+        TaskCompletionStatus::Passed
+    );
+}
+
+#[tokio::test]
+async fn pending_edit_free_step_does_not_capture_early_validation_evidence() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item(
+            "future-audit",
+            StepStatus::Pending,
+        )]))
+        .await;
+
+    let plan_validation_start = ledger
+        .begin_verify_local_validation(&[])
+        .await
+        .expect("plan validation start");
+    ledger
+        .record_verify_local(
+            "plan",
+            Some("PLANNED"),
+            true,
+            false,
+            Some(&plan_validation_start),
+            &[],
+            &[],
+            Some(&serde_json::json!({"planned": []})),
+        )
+        .await;
+    let final_validation_start = ledger
+        .begin_verify_local_validation(&[])
+        .await
+        .expect("final validation start");
+    assert!(
+        ledger
+            .record_verify_local(
+                "final",
+                Some("VERIFIED"),
+                true,
+                true,
+                Some(&final_validation_start),
+                &[],
+                &[],
+                Some(&serde_json::json!({"verdict": "VERIFIED"})),
+            )
+            .await
+    );
+
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    assert!(document.plan[0].edit_paths.is_empty());
+    assert!(document.plan[0].validation_receipt_ids.is_empty());
+    assert_eq!(document.plan[0].status, StepStatus::Pending);
+}
+
+#[tokio::test]
 async fn generated_artifact_mutation_invalidates_validation_freshness() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     tokio::fs::create_dir_all(repo.join("generated"))
@@ -247,7 +458,7 @@ async fn generated_artifact_mutation_invalidates_validation_freshness() {
     item.generated_artifacts = vec!["generated/schema.json".to_string()];
     ledger.record_plan_update(&plan_with(vec![item])).await;
     let validation_start = ledger
-        .begin_verify_local_validation()
+        .begin_verify_local_validation(&[])
         .await
         .expect("validation start");
     ledger
@@ -292,7 +503,7 @@ async fn generated_artifact_mutation_invalidates_validation_freshness() {
     }
 
     let revalidation_start = ledger
-        .begin_verify_local_validation()
+        .begin_verify_local_validation(&[])
         .await
         .expect("revalidation start");
     ledger
@@ -367,6 +578,62 @@ async fn migration_repairs_duplicate_receipts_and_invalidates_ambiguous_links() 
     );
     assert!(document.plan[0].validation_receipt_ids.is_empty());
     assert_eq!(document.plan[0].status, StepStatus::Implemented);
+}
+
+#[tokio::test]
+async fn migration_drops_unattributed_legacy_file_hashes() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    let mut document = ledger
+        .document
+        .lock()
+        .await
+        .as_ref()
+        .expect("document")
+        .clone();
+    document.plan = vec![EvidencePlanStep {
+        id: "step".to_string(),
+        step: "step".to_string(),
+        status: StepStatus::Implemented,
+        depends_on: Vec::new(),
+        acceptance_criteria: Vec::new(),
+        runtime_paths: Vec::new(),
+        generated_artifacts: Vec::new(),
+        risks: Vec::new(),
+        requires_desktop_activation: false,
+        edit_paths: BTreeSet::from(["src/owned.rs".to_string()]),
+        validation_receipt_ids: Vec::new(),
+    }];
+    document.latest_file_hashes = BTreeMap::from([
+        (
+            "src/owned.rs".to_string(),
+            FileHashSnapshot {
+                path: "src/owned.rs".to_string(),
+                sha1: Some("a".repeat(40)),
+                exists: true,
+                read_error: None,
+            },
+        ),
+        (
+            "src/unrelated.rs".to_string(),
+            FileHashSnapshot {
+                path: "src/unrelated.rs".to_string(),
+                sha1: Some("b".repeat(40)),
+                exists: true,
+                read_error: None,
+            },
+        ),
+    ]);
+
+    migrate_document(&mut document);
+
+    assert_eq!(
+        document
+            .latest_file_hashes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec!["src/owned.rs".to_string()]
+    );
 }
 
 #[tokio::test]
@@ -466,7 +733,7 @@ async fn validation_rejects_files_that_change_after_the_start_snapshot() {
         .expect("edited source");
     ledger.record_edit_result("edit", "completed").await;
     let validation_start = ledger
-        .begin_verify_local_validation()
+        .begin_verify_local_validation(&[])
         .await
         .expect("validation start");
     tokio::fs::write(repo.join("src/step.rs"), "pub fn value() -> u8 { 3 }")
@@ -499,7 +766,102 @@ async fn validation_rejects_files_that_change_after_the_start_snapshot() {
 }
 
 #[tokio::test]
-async fn validation_rejects_a_newly_discovered_active_file_that_changes_mid_run() {
+async fn validation_checks_explicit_requested_paths_when_reported_scope_is_empty() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    tokio::fs::write(repo.join("requested.rs"), "pub fn value() -> u8 { 1 }")
+        .await
+        .expect("requested source");
+    let validation_start = ledger
+        .begin_verify_local_validation(&[PathBuf::from("requested.rs")])
+        .await
+        .expect("validation start");
+    assert!(validation_start.owned_file_paths.contains("requested.rs"));
+    tokio::fs::write(repo.join("requested.rs"), "pub fn value() -> u8 { 2 }")
+        .await
+        .expect("requested source update");
+
+    let proof_accepted = ledger
+        .record_verify_local(
+            "final",
+            Some("VERIFIED"),
+            true,
+            true,
+            Some(&validation_start),
+            &[],
+            &[],
+            Some(&serde_json::json!({"verdict": "VERIFIED"})),
+        )
+        .await;
+
+    assert!(!proof_accepted);
+}
+
+#[tokio::test]
+async fn validation_ignores_unrelated_dirty_file_changes() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    initialize_git_repo(&repo).await;
+    tokio::fs::create_dir_all(repo.join("src"))
+        .await
+        .expect("src");
+    tokio::fs::write(repo.join("src/step.rs"), "pub fn value() -> u8 { 1 }")
+        .await
+        .expect("source");
+    tokio::fs::write(repo.join("src/unrelated.rs"), "pub fn value() -> u8 { 1 }")
+        .await
+        .expect("unrelated source");
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::InProgress)]))
+        .await;
+    ledger
+        .record_edit_intent("edit", &repo, &[PathBuf::from("src/step.rs")])
+        .await;
+    tokio::fs::write(repo.join("src/step.rs"), "pub fn value() -> u8 { 2 }")
+        .await
+        .expect("edited source");
+    ledger.record_edit_result("edit", "completed").await;
+
+    let validation_start = ledger
+        .begin_verify_local_validation(&[])
+        .await
+        .expect("validation start");
+    assert!(validation_start.file_snapshots.contains_key("src/step.rs"));
+    assert!(
+        validation_start
+            .file_snapshots
+            .contains_key("src/unrelated.rs")
+    );
+    assert!(validation_start.owned_file_paths.contains("src/step.rs"));
+    assert!(
+        !validation_start
+            .owned_file_paths
+            .contains("src/unrelated.rs")
+    );
+    tokio::fs::write(repo.join("src/unrelated.rs"), "pub fn value() -> u8 { 2 }")
+        .await
+        .expect("unrelated mid-run source update");
+
+    let proof_accepted = ledger
+        .record_verify_local(
+            "final",
+            Some("VERIFIED"),
+            true,
+            true,
+            Some(&validation_start),
+            &[PathBuf::from("src/step.rs")],
+            &[],
+            Some(&serde_json::json!({"verdict": "VERIFIED"})),
+        )
+        .await;
+
+    assert!(proof_accepted);
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("document");
+    assert_eq!(document.validation_epoch, Some(document.evidence_epoch));
+    assert!(!document.latest_file_hashes.contains_key("src/unrelated.rs"));
+}
+
+#[tokio::test]
+async fn validation_rejects_newly_discovered_active_file_that_changes_mid_run() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     initialize_git_repo(&repo).await;
     tokio::fs::create_dir_all(repo.join("src"))
@@ -510,14 +872,18 @@ async fn validation_rejects_a_newly_discovered_active_file_that_changes_mid_run(
         .expect("new dirty source");
 
     let validation_start = ledger
-        .begin_verify_local_validation()
+        .begin_verify_local_validation(&[])
         .await
         .expect("validation start");
     assert!(
         validation_start
             .file_snapshots
-            .contains_key("src/discovered.rs"),
-        "the pre-run token must include dirty files not already known to task evidence"
+            .contains_key("src/discovered.rs")
+    );
+    assert!(
+        !validation_start
+            .owned_file_paths
+            .contains("src/discovered.rs")
     );
     tokio::fs::write(repo.join("src/discovered.rs"), "pub fn value() -> u8 { 2 }")
         .await
@@ -546,6 +912,23 @@ async fn validation_rejects_a_newly_discovered_active_file_that_changes_mid_run(
             .iter()
             .any(|risk| { risk.id == "verify-local-concurrent-change" && !risk.resolved })
     );
+}
+
+#[tokio::test]
+async fn snapshot_file_hashes_across_multiple_bounded_chunks() {
+    let (_temp, repo, _ledger) = ledger_fixture().await;
+    let bytes = (0..FILE_HASH_CHUNK_SIZE * 2 + 17)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    tokio::fs::write(repo.join("large.bin"), &bytes)
+        .await
+        .expect("large fixture");
+
+    let snapshot = snapshot_file(&repo, "large.bin").await;
+
+    assert_eq!(snapshot.sha1, Some(sha1_hex(&bytes)));
+    assert!(snapshot.exists);
+    assert_eq!(snapshot.read_error, None);
 }
 
 #[tokio::test]

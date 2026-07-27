@@ -3569,7 +3569,7 @@ async fn code_mode_can_call_hidden_dynamic_tools() -> Result<()> {
         )
         .await?;
     let mut test = base_test;
-    test.codex = new_thread.thread;
+    test.codex.replace_thread(new_thread.thread);
     test.session_configured = new_thread.session_configured;
 
     let code = r#"
@@ -3735,7 +3735,7 @@ async fn code_mode_excludes_configured_nested_tool_namespaces() -> Result<()> {
         )
         .await?;
     let mut test = base_test;
-    test.codex = new_thread.thread;
+    test.codex.replace_thread(new_thread.thread);
     test.session_configured = new_thread.session_configured;
 
     let first_mock = responses::mount_sse_once(

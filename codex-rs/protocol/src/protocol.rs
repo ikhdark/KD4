@@ -16,6 +16,7 @@ use std::time::Duration;
 use strum_macros::EnumIter;
 
 use crate::AgentPath;
+use crate::ResponseItemId;
 use crate::SessionId;
 use crate::ThreadId;
 use crate::approvals::ElicitationRequestEvent;
@@ -736,7 +737,7 @@ impl From<Vec<UserInput>> for Op {
 pub struct InterAgentCommunication {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
-    pub id: Option<String>,
+    pub id: Option<ResponseItemId>,
     pub author: AgentPath,
     pub recipient: AgentPath,
     #[serde(default)]
@@ -3595,6 +3596,10 @@ pub struct ExecCommandBeginEvent {
     pub started_at_ms: i64,
     /// The command to be executed.
     pub command: Vec<String>,
+    /// Optional short label for collapsed command activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub display_label: Option<String>,
     /// The command's working directory if not the default cwd for the agent.
     pub cwd: PathUri,
     pub parsed_cmd: Vec<ParsedCommand>,
@@ -3621,6 +3626,10 @@ pub struct ExecCommandEndEvent {
     pub completed_at_ms: i64,
     /// The command that was executed.
     pub command: Vec<String>,
+    /// Optional short label for collapsed command activity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub display_label: Option<String>,
     /// The command's working directory if not the default cwd for the agent.
     pub cwd: PathUri,
     pub parsed_cmd: Vec<ParsedCommand>,
@@ -4662,7 +4671,7 @@ mod tests {
     #[test]
     fn inter_agent_communication_response_input_item_preserves_commentary_phase() {
         let mut communication = InterAgentCommunication {
-            id: Some("amsg_1".to_string()),
+            id: Some(ResponseItemId::with_suffix("amsg", "1")),
             author: AgentPath::root(),
             recipient: AgentPath::root().join("reviewer").expect("recipient path"),
             other_recipients: vec![AgentPath::root().join("worker").expect("recipient path")],
@@ -5519,6 +5528,7 @@ mod tests {
                 id: "exec-1".into(),
                 process_id: Some("pid-1".into()),
                 command: vec!["echo".into(), "done".into()],
+                display_label: Some("Example -".into()),
                 cwd: cwd.clone(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo done".into(),
@@ -5542,6 +5552,7 @@ mod tests {
                 id: "exec-1".into(),
                 process_id: Some("pid-1".into()),
                 command: vec!["echo".into(), "done".into()],
+                display_label: Some("Example -".into()),
                 cwd,
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo done".into(),
@@ -5564,8 +5575,9 @@ mod tests {
                 call_id,
                 turn_id,
                 started_at_ms: 10,
+                display_label: Some(display_label),
                 ..
-            })] if call_id == "exec-1" && turn_id == "turn-1"
+            })] if call_id == "exec-1" && turn_id == "turn-1" && display_label == "Example -"
         ));
         assert!(matches!(
             completed
@@ -5576,8 +5588,12 @@ mod tests {
                 turn_id,
                 completed_at_ms: 20,
                 aggregated_output,
+                display_label: Some(display_label),
                 ..
-            })] if call_id == "exec-1" && turn_id == "turn-1" && aggregated_output == "done\n"
+            })] if call_id == "exec-1"
+                && turn_id == "turn-1"
+                && aggregated_output == "done\n"
+                && display_label == "Example -"
         ));
     }
 

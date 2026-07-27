@@ -61,7 +61,6 @@ owner documentation directly.
 | Path | Owns |
 | --- | --- |
 | `.codex/` | Repo-local Codex policy, environments, harness artifacts, skills, and generated local workflow state |
-| `.github/` | CI, release, repository checks, issue templates, and automation |
 | `codex-cli/` | npm-facing `@openai/codex` wrapper, native binary discovery, and package staging inputs |
 | `codex-rs/` | Primary Rust workspace and nearly all CLI, runtime, app-server, TUI, tool, protocol, state, plugin, and sandbox behavior |
 | `docs/` | User, contributor, configuration, authentication, sandbox, command, and skill documentation |
@@ -108,7 +107,6 @@ and validation.
 | TypeScript SDK package | `sdk/typescript/package.json`, `sdk/typescript/src`, `sdk/typescript/tests` |
 | Python SDK package | `sdk/python/pyproject.toml`, `sdk/python/src`, `sdk/python/tests` |
 | Python runtime package | `sdk/python-runtime/pyproject.toml`, `sdk/python-runtime/src` |
-| CI and release | `.github/workflows/`, especially repository checks and Rust release workflows |
 
 The installed Windows runtime target for this fork is
 `C:\Users\kuh\Desktop\LOCAL-KD\codex.exe`. Source changes do not become visible

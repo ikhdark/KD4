@@ -583,8 +583,10 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
     let (_, append_lock) = compression::lock_rollout_for_append_blocking(&rollout_path)?;
     let mut state = RolloutWriterState::new(
         Some(JsonlWriter {
+            path: rollout_path.clone(),
             file: tokio::fs::File::from_std(read_only_file),
             _append_lock: append_lock,
+            write_fault: None,
         }),
         /*deferred_log_file_info*/ None,
         /*meta*/ None,
@@ -604,6 +606,83 @@ async fn writer_state_retries_write_error_before_reporting_flush_success() -> st
     assert!(
         text_after_retry.contains("queued-after-writer-error"),
         "flush should retry after reopening and write buffered items"
+    );
+    Ok(())
+}
+
+async fn assert_failed_append_is_written_once(
+    fault: JsonlWriteFault,
+    message: &str,
+) -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    File::create(&rollout_path)?;
+    let mut writer = open_log_file(&rollout_path)?.into_jsonl_writer();
+    writer.write_fault = Some(fault);
+    let mut state = RolloutWriterState::new(
+        Some(writer),
+        /*deferred_log_file_info*/ None,
+        /*meta*/ None,
+        home.path().to_path_buf(),
+        rollout_path.clone(),
+    );
+    state.add_items(vec![RolloutItem::EventMsg(EventMsg::AgentMessage(
+        AgentMessageEvent {
+            message: message.to_string(),
+            phase: None,
+            memory_citation: None,
+        },
+    ))]);
+
+    state.flush().await?;
+
+    let text = std::fs::read_to_string(&rollout_path)?;
+    assert_eq!(
+        text.lines().count(),
+        1,
+        "failed append recovery must leave exactly one complete record: {text:?}"
+    );
+    let line: RolloutLine = serde_json::from_str(text.trim_end())?;
+    let RolloutItem::EventMsg(EventMsg::AgentMessage(event)) = line.item else {
+        panic!("expected agent message rollout item");
+    };
+    assert_eq!(event.message, message);
+    Ok(())
+}
+
+#[tokio::test]
+async fn writer_state_does_not_retry_an_ambiguously_flushed_record() -> std::io::Result<()> {
+    assert_failed_append_is_written_once(
+        JsonlWriteFault::AfterCompleteWrite,
+        "ambiguous-flush-record",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn writer_state_rolls_back_a_partial_record_before_retry() -> std::io::Result<()> {
+    assert_failed_append_is_written_once(
+        JsonlWriteFault::AfterPartialWrite(32),
+        "partial-write-record",
+    )
+    .await
+}
+
+#[test]
+fn rollout_write_lock_serializes_append_recovery() -> std::io::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let rollout_path = home.path().join("rollout.jsonl");
+    let first_lock = compression::lock_rollout_for_write_blocking(&rollout_path)?;
+
+    assert!(
+        compression::try_lock_rollout_for_write_blocking(&rollout_path)?.is_none(),
+        "a concurrent append transaction must not enter while recovery can truncate the tail"
+    );
+
+    drop(first_lock);
+    assert!(
+        compression::try_lock_rollout_for_write_blocking(&rollout_path)?.is_some(),
+        "the append transaction lock should be released with its guard"
     );
     Ok(())
 }

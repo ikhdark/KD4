@@ -1,6 +1,6 @@
 # Repository policy
 
-Shared policy revision: `2026-07-26`.
+Shared policy revision: `2026-07-26.1`.
 
 ## Synchronization contract
 
@@ -62,16 +62,25 @@ outside that block or edit a target's shared portion independently.
   local-only fork behavior. Call out changes affecting public CLI flags,
   app-server APIs, configuration loading, sandbox behavior, stored sessions,
   rollout compatibility, or installed-binary behavior.
+- Treat [`openai/codex`](https://github.com/openai/codex) as the official
+  upstream. Merge upstream releases only for concrete improvements,
+  compatibility, or local-fork repairs; do not merge solely because a change
+  landed upstream.
 - Identify the owning contract before editing protocol, app-server, SDK,
   configuration-schema, generated-artifact, or publish-path behavior. Update
   generated outputs only through the owning generator or recipe.
+
+## Desktop app boundary
+
 - The repository contains the Rust CLI and app-server components used by Codex
-  Desktop, but not the native Windows desktop shell source. Source edits do not
-  hot-apply to the installed app.
+  Desktop, but not the native Windows desktop shell source.
+- Source edits here do not hot-apply to the installed app. Desktop-visible
+  completion requires rebuilding and updating or replacing the local binary,
+  then restarting the Desktop app.
 
-### Validation and runtime proof
+## Validation and local-build proof
 
-- Rust changes: work from `codex-rs` and prefer the focused crate `just` recipe
+- Rust crates: work from `codex-rs` and prefer the focused crate `just` recipe
   or focused Cargo check/test.
 - App-server schema or protocol: run focused app-server tests and
   `just app-server-schema-check`. Use the force or raw generator recipes only
@@ -81,12 +90,11 @@ outside that block or edit a target's shared portion independently.
   intentional `codex-rs/core/config.schema.json` regeneration.
 - Python SDK changes: use focused `uv run pytest` and `uv run ruff check .`;
   regenerate locks or artifacts only for touched SDK surfaces.
-- Script changes: run syntax checks and the closest script tests. Do not
-  hand-edit generated locks such as `scripts/uv.lock`.
+- Scripts: run syntax checks and the closest script tests; do not hand-edit
+  generated locks such as `scripts/uv.lock`.
 - Root maintenance: prefer matching root `package.json` scripts.
-- Local publish path changes: use `just publish-local-codex-dry-run` for path
-  proof and `just publish-local-codex-final` before claiming installed
-  replacement.
+- Local publish: use `just publish-local-codex-dry-run` for path proof and
+  `just publish-local-codex-final` before claiming installed replacement.
 - For a local-build claim, prove only the applicable links: relevant crates
   compile, focused tests pass, the local `codex` binary builds, publish or
   dry-run paths succeed when touched, installed replacement is correct when
@@ -98,6 +106,8 @@ outside that block or edit a target's shared portion independently.
   relevant app-server initialize/model metadata, and a user-visible screenshot
   or equivalent evidence. State whether `just publish-local-codex-final` and a
   Desktop restart remain required.
+- Tooling success alone does not prove a runtime bug is fixed; require the
+  focused failing test or approved final gate.
 
 ### Protected paths and state
 
@@ -116,8 +126,8 @@ rg --files --hidden -g AGENTS.md
 ```
 
 Read the closest relevant `AGENTS.md`. A nearer file augments this policy and
-takes precedence inside its subtree. Do not rely on instruction files absent
-from the working tree.
+takes precedence inside its subtree. Never rely on an instruction file that is
+absent from the working tree.
 
 Keep shared rules in the synchronized root portion, durable repository-specific
 rules inside the project-context block, and subtree-specific rules in the
@@ -156,11 +166,6 @@ completes the request.
   installation, and compatibility behavior unless the user requests a change.
 - Do not alter approval, permission, sandbox, patch-guard, stale-read,
   validation-gating, or execution-safety behavior as part of unrelated work.
-- Read-only agents may investigate in parallel to help other busy agents. They
-  may inspect relevant or adjacent contract surfaces but must not edit them;
-  report findings to the busy agent, who retains edit ownership for the owned
-  surface.
-- https://github.com/openai/codex is the official upstream. use this for merging new releases that contain actual improvements, do not merge simply because it is in the official upstream, this is for compatibility and local fork repairs only.
 - Read-only agents may investigate in parallel to help other busy agents. They
   may inspect relevant or adjacent contract surfaces but must not edit them;
   report findings to the busy agent, who retains edit ownership for the owned

@@ -1,4 +1,5 @@
 pub(crate) mod code_mode;
+pub(crate) mod command_display_label;
 pub(crate) mod command_execution;
 pub(crate) mod command_output_artifact;
 pub(crate) mod context;

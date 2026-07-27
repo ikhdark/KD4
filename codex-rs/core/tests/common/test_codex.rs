@@ -631,13 +631,12 @@ impl TestCodexBuilder {
             /*attestation_provider*/ None,
             /*external_time_provider*/ self.external_time_provider.clone(),
         );
-        let code_mode_host_program = self
-            .code_mode_host_program
-            .take()
-            .or_else(|| codex_utils_cargo_bin::cargo_bin("codex-code-mode-host").ok());
-        let thread_manager = if config.features.enabled(Feature::CodeModeHost)
-            && let Some(code_mode_host_program) = code_mode_host_program
-        {
+        let thread_manager = if config.features.enabled(Feature::CodeModeHost) {
+            let code_mode_host_program = match self.code_mode_host_program.take() {
+                Some(code_mode_host_program) => code_mode_host_program,
+                None => codex_utils_cargo_bin::cargo_bin("codex-code-mode-host")
+                    .context("resolve codex-code-mode-host for core test fixture")?,
+            };
             codex_core::test_support::with_code_mode_host_program(
                 thread_manager,
                 code_mode_host_program,
@@ -711,7 +710,7 @@ impl TestCodexBuilder {
             home,
             cwd,
             config,
-            codex: new_conversation.thread,
+            codex: TestCodexThread::new(new_conversation.thread, Arc::clone(&thread_manager)),
             session_configured: new_conversation.session_configured,
             thread_manager,
             _test_env: test_env,
@@ -797,10 +796,42 @@ fn ensure_test_model_catalog(config: &mut Config) -> Result<()> {
     Ok(())
 }
 
+/// A test thread handle that keeps its owning [`ThreadManager`] alive when it
+/// is moved out of [`TestCodex`].
+pub struct TestCodexThread {
+    codex: Arc<CodexThread>,
+    _thread_manager: Arc<ThreadManager>,
+}
+
+impl TestCodexThread {
+    fn new(codex: Arc<CodexThread>, thread_manager: Arc<ThreadManager>) -> Self {
+        Self {
+            codex,
+            _thread_manager: thread_manager,
+        }
+    }
+
+    pub fn replace_thread(&mut self, codex: Arc<CodexThread>) {
+        self.codex = codex;
+    }
+
+    pub fn into_parts(self) -> (Arc<CodexThread>, Arc<ThreadManager>) {
+        (self.codex, self._thread_manager)
+    }
+}
+
+impl std::ops::Deref for TestCodexThread {
+    type Target = Arc<CodexThread>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.codex
+    }
+}
+
 pub struct TestCodex {
     pub home: Arc<TempDir>,
     pub cwd: Arc<TempDir>,
-    pub codex: Arc<CodexThread>,
+    pub codex: TestCodexThread,
     pub session_configured: SessionConfiguredEvent,
     pub config: Config,
     pub thread_manager: Arc<ThreadManager>,
@@ -1263,6 +1294,33 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn moved_thread_handle_keeps_thread_manager_alive() -> Result<()> {
+        let server = start_mock_server().await;
+        let test = test_codex()
+            .with_config(|config| {
+                config
+                    .features
+                    .disable(Feature::CodeModeHost)
+                    .expect("code mode host should be disabled");
+            })
+            .build(&server)
+            .await?;
+        let TestCodex {
+            codex,
+            thread_manager,
+            ..
+        } = test;
+        let weak_thread_manager = Arc::downgrade(&thread_manager);
+
+        drop(thread_manager);
+        assert!(weak_thread_manager.upgrade().is_some());
+
+        drop(codex);
+        assert!(weak_thread_manager.upgrade().is_none());
+        Ok(())
+    }
 
     #[test]
     fn custom_tool_call_output_text_returns_output_text() {

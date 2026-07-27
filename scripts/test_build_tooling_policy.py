@@ -459,9 +459,42 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_package_json_exposes_focused_script_test_alias(self) -> None:
+    def test_formatting_commands_only_target_existing_repository_sources(
+        self,
+    ) -> None:
         package = json.loads((REPO_ROOT / "package.json").read_text(encoding="utf-8"))
+        root_maintenance = load_root_maintenance_module()
 
+        self.assertEqual(
+            package["scripts"]["format"],
+            "prettier --check *.json *.md docs/*.md **/*.js",
+        )
+        self.assertEqual(
+            package["scripts"]["format:fix"],
+            "prettier --write *.json *.md docs/*.md **/*.js",
+        )
+        tracked_paths = set(
+            subprocess.run(
+                ["git", "ls-files"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            ).stdout.splitlines()
+        )
+        for target in root_maintenance.PRETTIER_TARGETS:
+            with self.subTest(target=target):
+                local_matches = {
+                    path.relative_to(REPO_ROOT).as_posix()
+                    for path in REPO_ROOT.glob(target)
+                    if path.is_file()
+                }
+                self.assertTrue(
+                    local_matches & tracked_paths,
+                    f"Prettier target does not match repository files: {target}",
+                )
         self.assertEqual(
             package["scripts"]["test:scripts:target"],
             "python scripts/root_maintenance.py test-python --changed",
@@ -611,8 +644,12 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "cargo nextest run --no-run @forwarded_args",
             'cargo watch -x "check -p {{ package }}" @($args | Select-Object -Skip 2)',
             'cargo llvm-cov -p "{{ package }}" @($args | Select-Object -Skip 2)',
-            "_core-test-helpers-mcp:",
-            "_core-test-helpers-windows-sandbox:",
+            "_core-test-helpers-runtime target_dir:",
+            "_core-test-helpers-mcp target_dir:",
+            "_core-test-helpers-windows-sandbox target_dir:",
+            'cargo build --target-dir "{{ target_dir }}" -p codex-cli --bin codex',
+            'cargo build --target-dir "{{ target_dir }}" -p codex-code-mode-host --bin codex-code-mode-host',
+            'cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args',
             '$text -match "(?i)rmcp|mcp|plugin|test_stdio_server"',
             '$text -match "(?i)windows_sandbox|windows-sandbox|sandbox|codex_command_runner"',
         ):

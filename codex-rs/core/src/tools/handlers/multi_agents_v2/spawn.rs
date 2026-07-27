@@ -387,14 +387,7 @@ impl SpawnAgentArgs {
         }
 
         let Some(fork_turns) = explicit_fork_turns else {
-            if self.assignment.is_some()
-                || self.agent_type.is_some()
-                || self.model.is_some()
-                || self.reasoning_effort.is_some()
-            {
-                return Ok(None);
-            }
-            return Ok(Some(SpawnAgentForkMode::FullHistory));
+            return Ok(None);
         };
 
         if fork_turns.eq_ignore_ascii_case("none") {
@@ -567,12 +560,9 @@ mod tests {
     }
 
     #[test]
-    fn untyped_spawn_without_overrides_defaults_to_full_history() {
+    fn untyped_spawn_without_overrides_defaults_to_no_history() {
         let args = spawn_args();
-        assert!(matches!(
-            args.fork_mode(None),
-            Ok(Some(SpawnAgentForkMode::FullHistory))
-        ));
+        assert!(matches!(args.fork_mode(None), Ok(None)));
     }
 
     #[test]

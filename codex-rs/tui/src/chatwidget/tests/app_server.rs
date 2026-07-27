@@ -780,6 +780,7 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
             item: AppServerThreadItem::CommandExecution {
                 id: "cmd-1".to_string(),
                 command: command.clone(),
+                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
                 source: AppServerCommandExecutionSource::UserShell,
@@ -802,6 +803,7 @@ async fn live_app_server_command_execution_strips_shell_wrapper() {
             item: AppServerThreadItem::CommandExecution {
                 id: "cmd-1".to_string(),
                 command,
+                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
                 source: AppServerCommandExecutionSource::UserShell,

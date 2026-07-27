@@ -147,6 +147,7 @@ pub(crate) async fn emit_exec_command_begin(
     cwd: &PathUri,
     parsed_cmd: &[ParsedCommand],
     source: ExecCommandSource,
+    display_label: Option<String>,
     interaction_input: Option<String>,
     process_id: Option<&str>,
 ) {
@@ -157,6 +158,7 @@ pub(crate) async fn emit_exec_command_begin(
                 id: ctx.call_id.to_string(),
                 process_id: process_id.map(str::to_owned),
                 command: command.to_vec(),
+                display_label,
                 cwd: cwd.clone(),
                 parsed_cmd: parsed_cmd.to_vec(),
                 source,
@@ -179,6 +181,7 @@ pub(crate) enum ToolEmitter {
         cwd: PathUri,
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
+        display_label: Option<String>,
         environment_id: String,
     },
     ApplyPatch {
@@ -191,6 +194,7 @@ pub(crate) enum ToolEmitter {
         cwd: PathUri,
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
+        display_label: Option<String>,
         process_id: Option<String>,
         environment_id: String,
     },
@@ -204,11 +208,13 @@ impl ToolEmitter {
         environment_id: String,
     ) -> Self {
         let parsed_cmd = parse_command(&command);
+        let display_label = crate::tools::command_display_label::for_command(&command);
         Self::Shell {
             command,
             cwd: PathUri::from_abs_path(&cwd),
             source,
             parsed_cmd,
+            display_label,
             environment_id,
         }
     }
@@ -233,11 +239,13 @@ impl ToolEmitter {
         environment_id: String,
     ) -> Self {
         let parsed_cmd = parse_command(command);
+        let display_label = crate::tools::command_display_label::for_command(command);
         Self::UnifiedExec {
             command: command.to_vec(),
             cwd,
             source,
             parsed_cmd,
+            display_label,
             process_id,
             environment_id,
         }
@@ -251,6 +259,7 @@ impl ToolEmitter {
                     cwd,
                     source,
                     parsed_cmd,
+                    display_label,
                     environment_id,
                 },
                 stage,
@@ -263,6 +272,7 @@ impl ToolEmitter {
                         environment_id,
                         parsed_cmd,
                         *source,
+                        display_label.as_deref(),
                         /*interaction_input*/ None,
                         /*process_id*/ None,
                     ),
@@ -393,6 +403,7 @@ impl ToolEmitter {
                     cwd,
                     source,
                     parsed_cmd,
+                    display_label,
                     process_id,
                     environment_id,
                 },
@@ -406,6 +417,7 @@ impl ToolEmitter {
                         environment_id,
                         parsed_cmd,
                         *source,
+                        display_label.as_deref(),
                         /*interaction_input*/ None,
                         process_id.as_deref(),
                     ),
@@ -517,6 +529,7 @@ struct ExecCommandInput<'a> {
     environment_id: &'a str,
     parsed_cmd: &'a [ParsedCommand],
     source: ExecCommandSource,
+    display_label: Option<&'a str>,
     interaction_input: Option<&'a str>,
     process_id: Option<&'a str>,
 }
@@ -528,6 +541,7 @@ impl<'a> ExecCommandInput<'a> {
         environment_id: &'a str,
         parsed_cmd: &'a [ParsedCommand],
         source: ExecCommandSource,
+        display_label: Option<&'a str>,
         interaction_input: Option<&'a str>,
         process_id: Option<&'a str>,
     ) -> Self {
@@ -537,6 +551,7 @@ impl<'a> ExecCommandInput<'a> {
             environment_id,
             parsed_cmd,
             source,
+            display_label,
             interaction_input,
             process_id,
         }
@@ -567,6 +582,7 @@ async fn emit_exec_stage(
                 exec_input.cwd,
                 exec_input.parsed_cmd,
                 exec_input.source,
+                exec_input.display_label.map(str::to_owned),
                 exec_input.interaction_input.map(str::to_owned),
                 exec_input.process_id,
             )
@@ -662,6 +678,7 @@ async fn emit_exec_end(
                 id: ctx.call_id.to_string(),
                 process_id: exec_input.process_id.map(str::to_owned),
                 command: exec_input.command.to_vec(),
+                display_label: exec_input.display_label.map(str::to_owned),
                 cwd: exec_input.cwd.clone(),
                 parsed_cmd: exec_input.parsed_cmd.to_vec(),
                 source: exec_input.source,

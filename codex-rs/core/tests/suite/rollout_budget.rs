@@ -123,6 +123,7 @@ async fn subagent_usage_draws_from_the_shared_budget() -> Result<()> {
 
     let server = start_mock_server().await;
     let spawn_args = json!({
+        "fork_turns": "none",
         "message": CHILD_PROMPT,
         "task_name": "budget_worker",
     })

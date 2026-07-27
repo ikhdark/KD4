@@ -1328,6 +1328,7 @@ async fn start_command_execution_item(
             item: ThreadItem::CommandExecution {
                 id: item_id,
                 command,
+                display_label: None,
                 cwd,
                 process_id: None,
                 source,
@@ -1372,6 +1373,7 @@ async fn complete_command_execution_item(
     let item = ThreadItem::CommandExecution {
         id: item_id,
         command,
+        display_label: None,
         cwd,
         process_id,
         source,
@@ -2499,6 +2501,7 @@ mod tests {
                     ThreadItem::CommandExecution {
                         id: "cmd-1".to_string(),
                         command: completion_item.command.clone(),
+                        display_label: None,
                         cwd: completion_item.cwd.clone(),
                         process_id: None,
                         source: CommandExecutionSource::Agent,

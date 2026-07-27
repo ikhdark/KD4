@@ -144,6 +144,7 @@ pub(crate) async fn execute_user_shell_command(
     // We do not source rc files or otherwise reformat the script.
     let use_login_shell = true;
     let display_command = environment_shell.derive_exec_args(&command, use_login_shell);
+    let display_label = crate::tools::command_display_label::for_command(&display_command);
     // TODO(anp): Migrate user-shell events and execution plumbing to PathUri so this local-only
     // feature does not need to project the selected environment cwd onto the Codex host.
     let Ok(cwd) = turn_environment.cwd().to_abs_path() else {
@@ -186,6 +187,7 @@ pub(crate) async fn execute_user_shell_command(
                 id: call_id.clone(),
                 process_id: None,
                 command: display_command.clone(),
+                display_label: display_label.clone(),
                 cwd: cwd.clone().into(),
                 parsed_cmd: parsed_cmd.clone(),
                 source: ExecCommandSource::UserShell,
@@ -265,6 +267,7 @@ pub(crate) async fn execute_user_shell_command(
                         id: call_id,
                         process_id: None,
                         command: display_command.clone(),
+                        display_label: display_label.clone(),
                         cwd: cwd.clone().into(),
                         parsed_cmd: parsed_cmd.clone(),
                         source: ExecCommandSource::UserShell,
@@ -290,6 +293,7 @@ pub(crate) async fn execute_user_shell_command(
                         id: call_id.clone(),
                         process_id: None,
                         command: display_command.clone(),
+                        display_label: display_label.clone(),
                         cwd: cwd.clone().into(),
                         parsed_cmd: parsed_cmd.clone(),
                         source: ExecCommandSource::UserShell,
@@ -342,6 +346,7 @@ pub(crate) async fn execute_user_shell_command(
                         id: call_id,
                         process_id: None,
                         command: display_command,
+                        display_label,
                         cwd: cwd.into(),
                         parsed_cmd,
                         source: ExecCommandSource::UserShell,

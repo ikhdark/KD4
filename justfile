@@ -283,7 +283,7 @@ test *args:
 
 [windows]
 test *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed "target" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast @forwarded_args
 
 # Fast local test loop: stop at the first failure and skip flaky retries.
 [unix]
@@ -292,25 +292,31 @@ test-fast *args:
 
 [windows]
 test-fast *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed "target" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run @forwarded_args
 
 [windows]
-_core-test-helpers-if-needed *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); $text = ($forwarded_args -join " "); $has_filter = ($forwarded_args -contains "-E") -or ($forwarded_args -contains "--filter-expr") -or ($text -match "--filter-expr="); if (-not $has_filter) { just _core-test-helpers; exit $LASTEXITCODE }; if ($text -match "(?i)rmcp|mcp|plugin|test_stdio_server") { just _core-test-helpers-mcp; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; if ($text -match "(?i)windows_sandbox|windows-sandbox|sandbox|codex_command_runner") { just _core-test-helpers-windows-sandbox; exit $LASTEXITCODE }
+_core-test-helpers-if-needed target_dir *args:
+    $forwarded_args = @($args | Select-Object -Skip 2); $text = ($forwarded_args -join " "); $has_filter = ($forwarded_args -contains "-E") -or ($forwarded_args -contains "--filter-expr") -or ($text -match "--filter-expr="); if (-not $has_filter) { just _core-test-helpers "{{ target_dir }}"; exit $LASTEXITCODE }; just _core-test-helpers-runtime "{{ target_dir }}"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; if ($text -match "(?i)rmcp|mcp|plugin|test_stdio_server") { just _core-test-helpers-mcp "{{ target_dir }}"; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; if ($text -match "(?i)windows_sandbox|windows-sandbox|sandbox|codex_command_runner") { just _core-test-helpers-windows-sandbox "{{ target_dir }}"; exit $LASTEXITCODE }
 
 [windows]
-_core-test-helpers:
-    just _core-test-helpers-mcp
-    just _core-test-helpers-windows-sandbox
+_core-test-helpers target_dir:
+    just _core-test-helpers-runtime "{{ target_dir }}"
+    just _core-test-helpers-mcp "{{ target_dir }}"
+    just _core-test-helpers-windows-sandbox "{{ target_dir }}"
 
 [windows]
-_core-test-helpers-mcp:
-    cargo build -p codex-rmcp-client --bin test_stdio_server
+_core-test-helpers-runtime target_dir:
+    cargo build --target-dir "{{ target_dir }}" -p codex-cli --bin codex
+    cargo build --target-dir "{{ target_dir }}" -p codex-code-mode-host --bin codex-code-mode-host
 
 [windows]
-_core-test-helpers-windows-sandbox:
-    cargo build -p codex-windows-sandbox --bin codex-windows-sandbox-setup
-    cargo build -p codex-windows-sandbox --bin codex-command-runner
+_core-test-helpers-mcp target_dir:
+    cargo build --target-dir "{{ target_dir }}" -p codex-rmcp-client --bin test_stdio_server
+
+[windows]
+_core-test-helpers-windows-sandbox target_dir:
+    cargo build --target-dir "{{ target_dir }}" -p codex-windows-sandbox --bin codex-windows-sandbox-setup
+    cargo build --target-dir "{{ target_dir }}" -p codex-windows-sandbox --bin codex-command-runner
 
 [windows]
 test-fast-nosccache *args:
@@ -322,11 +328,11 @@ test-compile *args:
 
 [unix]
 test-windows-sandbox-processes *args:
-    RUST_MIN_STACK={{ rust_min_stack }} cargo nextest run -p codex-windows-sandbox legacy_capture_cancellation_is_not_reported_as_timeout "$@"
+    RUST_MIN_STACK={{ rust_min_stack }} cargo nextest run -p codex-windows-sandbox -E 'test(legacy_capture_cancellation_terminates_descendants_without_timeout) | test(controlling_ipc_eof_terminates_process_tree) | test(process_wait_failure_is_not_treated_as_exit) | test(invalid_process_wait_is_not_treated_as_exit)' "$@"
 
 [windows]
 test-windows-sandbox-processes *args:
-    $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; cargo nextest run -p codex-windows-sandbox legacy_capture_cancellation_is_not_reported_as_timeout @($args | Select-Object -Skip 1)
+    $forwarded_args = @($args | Select-Object -Skip 1); $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; cargo nextest run -p codex-windows-sandbox -E 'test(legacy_capture_cancellation_terminates_descendants_without_timeout) | test(controlling_ipc_eof_terminates_process_tree) | test(process_wait_failure_is_not_treated_as_exit) | test(invalid_process_wait_is_not_treated_as_exit)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo nextest run -p codex-core direct_exec_cancellation_terminates_windows_descendants @forwarded_args
 
 # Full local gate with benchmark startup smoke coverage.
 test-full *args:
@@ -364,11 +370,11 @@ test-lane lane *args:
 
 [windows]
 test-lane lane *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $target_dir = "target\lanes\{{ lane }}"; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --target-dir $target_dir --no-fail-fast @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = "target\lanes\{{ lane }}"; if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed $target_dir @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --target-dir $target_dir --no-fail-fast @forwarded_args
 
 [windows]
 test-lane-main *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $target_dir = "target\lanes\main"; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --target-dir $target_dir --no-fail-fast @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = "target\lanes\main"; if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed $target_dir @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --target-dir $target_dir --no-fail-fast @forwarded_args
 
 # Fast isolated local test loop for parallel validation lanes.
 [unix]
@@ -377,7 +383,7 @@ test-lane-fast lane *args:
 
 [windows]
 test-lane-fast lane *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $target_dir = "target\lanes\{{ lane }}"; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = "target\lanes\{{ lane }}"; if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed $target_dir @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir @forwarded_args
 
 # Emit nextest timing reports for the selected local test slice.
 [unix]
@@ -465,7 +471,7 @@ test-lane-package package *args:
 
 [windows]
 test-lane-package package *args:
-    @$forwarded_args = @($args | Select-Object -Skip 2); if ("{{ package }}" -eq "codex-core") { just _core-test-helpers-if-needed "-p" "{{ package }}" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:NEXTEST_PROFILE = "fast"; powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\cargo-lane.ps1" -Lane auto cargo nextest run -p "{{ package }}" @forwarded_args
+    @$forwarded_args = @($args | Select-Object -Skip 2); $target_dir = "target\lanes\{{ package }}"; if ("{{ package }}" -eq "codex-core") { just _core-test-helpers-if-needed $target_dir "-p" "{{ package }}" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args
 
 [unix]
 check-lane package *args:
@@ -605,6 +611,7 @@ app-server-runtime-check:
     just app-server-thread-status-check
 
 source-map-check:
+    {{ python }} "{{ justfile_directory() }}/scripts/source_map_check.py" "{{ justfile_directory() }}/SOURCEMAP.md"
     {{ python }} "{{ justfile_directory() }}/scripts/asciicheck.py" "{{ justfile_directory() }}/SOURCEMAP.md"
     {{ python }} "{{ justfile_directory() }}/scripts/readme_toc.py" "{{ justfile_directory() }}/SOURCEMAP.md"
 

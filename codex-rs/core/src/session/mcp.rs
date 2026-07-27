@@ -78,6 +78,12 @@ impl ElicitationReviewer for GuardianMcpElicitationReviewer {
 }
 
 impl Session {
+    pub(crate) async fn lock_pending_mcp_server_refresh_config(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, Option<McpServerRefreshConfig>> {
+        self.pending_mcp_server_refresh_config.lock().await
+    }
+
     pub(crate) async fn runtime_mcp_config(&self, config: &Config) -> McpConfig {
         let originator = self.originator().await;
         let environments = self.services.turn_environments.snapshot().await;

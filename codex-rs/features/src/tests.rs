@@ -115,6 +115,63 @@ path = "/custom/mcp"
 }
 
 #[test]
+fn removed_strict_feature_config_fields_deserialize_for_compatibility() {
+    let features = toml::from_str::<FeaturesToml>(
+        r#"
+[code_mode]
+enabled = true
+waiting_policy = "yield_after"
+
+[rollout_budget]
+enabled = true
+limit_tokens = 100000
+cached_input_token_weight = 0.05
+model_call_token_cost = 750
+tool_output_byte_weight = 0.025
+subagent_token_cost = 4000
+action = "ask"
+"#,
+    )
+    .expect("removed compatibility fields should deserialize");
+
+    let Some(FeatureToml::Config(code_mode)) = features.code_mode else {
+        panic!("code_mode should deserialize as structured config");
+    };
+    assert_eq!(
+        code_mode.waiting_policy,
+        Some(crate::CodeModeWaitingPolicy::YieldAfter)
+    );
+
+    let Some(FeatureToml::Config(rollout_budget)) = features.rollout_budget else {
+        panic!("rollout_budget should deserialize as structured config");
+    };
+    assert_eq!(rollout_budget.cached_input_token_weight, Some(0.05));
+    assert_eq!(rollout_budget.model_call_token_cost, Some(750.0));
+    assert_eq!(rollout_budget.tool_output_byte_weight, Some(0.025));
+    assert_eq!(rollout_budget.subagent_token_cost, Some(4000.0));
+    assert_eq!(rollout_budget.action, Some(crate::RolloutBudgetAction::Ask));
+}
+
+#[test]
+fn strict_feature_configs_still_reject_unknown_fields() {
+    for contents in [
+        r#"
+[code_mode]
+enabled = true
+not_a_real_field = 1
+"#,
+        r#"
+[rollout_budget]
+enabled = true
+not_a_real_field = 1
+"#,
+    ] {
+        toml::from_str::<FeaturesToml>(contents)
+            .expect_err("unknown structured feature fields should still be rejected");
+    }
+}
+
+#[test]
 fn code_mode_only_requires_code_mode() {
     let mut features = Features::with_defaults();
     features.enable(Feature::CodeModeOnly);

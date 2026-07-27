@@ -256,10 +256,11 @@ impl VerifyLocalHandler {
         // Keep the temporary CODEX_HOME/SQLite directories alive until the
         // orchestrated command and cancellation cleanup have fully completed.
         let _isolation = isolation;
+        let validation_paths = args.changed.iter().map(PathBuf::from).collect::<Vec<_>>();
         let validation_start = session
             .services
             .task_evidence
-            .begin_verify_local_validation()
+            .begin_verify_local_validation(&validation_paths)
             .await;
         let result = run_exec_like_with_exit_code(RunExecLikeArgs {
             tool_name: self.tool_name(),

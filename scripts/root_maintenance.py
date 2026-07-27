@@ -46,11 +46,8 @@ POWERSHELL_PARSE_ALL_SCRIPT = (
 
 PRETTIER_TARGETS = [
     "package.json",
-    "knip.json",
     "pnpm-workspace.yaml",
-    "eslint.config.mjs",
     "docs/*.md",
-    ".github/workflows/*.yml",
     "codex-cli/**/*.js",
     "sdk/typescript/**/*.js",
     "sdk/typescript/**/*.ts",

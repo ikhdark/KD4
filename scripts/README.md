@@ -35,7 +35,7 @@ is the current source map for the checked-in script tooling.
   `package.json` `audit:scripts`, `format:python*`, `lint:python*`, and
   `test:scripts*` aliases route script maintenance through this helper.
 - Repository checks: `format.py`, `asciicheck.py`, `readme_toc.py`,
-  `check_blob_size.py`, and their matching tests.
+  `source_map_check.py`, `check_blob_size.py`, and their matching tests.
 - Script invocation compatibility: `just-shell.py`, `run-powershell-script.ps1`,
   and `test_run_powershell_script.py`.
 - Tool-version reporting: `tool_versions.py`.
@@ -83,7 +83,7 @@ is the current source map for the checked-in script tooling.
   aliases synchronized with the checked-in script types.
 - `format.py`: repository formatting entry point. Keep rustfmt/toolchain behavior
   aligned with `codex-rs/rustfmt.toml` and `codex-rs/rust-toolchain.toml`.
-- `asciicheck.py`, `check_blob_size.py`, `readme_toc.py`,
+- `asciicheck.py`, `check_blob_size.py`, `readme_toc.py`, `source_map_check.py`,
   and matching `test_*` files: focused repository checks. Prefer updating the
   check and its focused test together when behavior changes.
 - `mock_responses_websocket_server.py` and

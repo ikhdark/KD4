@@ -1,4 +1,3 @@
-use codex_core::CodexThread;
 use codex_core::REVIEW_PROMPT;
 use codex_core::config::Config;
 use codex_protocol::items::TurnItem;
@@ -24,6 +23,7 @@ use core_test_support::responses::ResponseMock;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
+use core_test_support::test_codex::TestCodexThread;
 use core_test_support::test_codex::local_selections;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
@@ -1074,7 +1074,7 @@ async fn new_conversation_for_server<F>(
     server: &MockServer,
     codex_home: Arc<TempDir>,
     mutator: F,
-) -> Arc<CodexThread>
+) -> TestCodexThread
 where
     F: FnOnce(&mut Config) + Send + 'static,
 {
@@ -1098,7 +1098,7 @@ async fn resume_conversation_for_server<F>(
     codex_home: Arc<TempDir>,
     resume_path: std::path::PathBuf,
     mutator: F,
-) -> Arc<CodexThread>
+) -> TestCodexThread
 where
     F: FnOnce(&mut Config) + Send + 'static,
 {

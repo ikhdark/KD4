@@ -1,5 +1,4 @@
 use core_test_support::test_codex::local_selections;
-use std::sync::Arc;
 
 use codex_core::CodexThread;
 use codex_core::config::CurrentTimeReminderConfig;
@@ -31,6 +30,7 @@ use core_test_support::streaming_sse::StreamingSseChunk;
 use core_test_support::streaming_sse::StreamingSseServer;
 use core_test_support::streaming_sse::start_streaming_sse_server;
 use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::TestCodexThread;
 use core_test_support::test_codex::test_codex;
 use core_test_support::test_codex::turn_permission_fields;
 use core_test_support::wait_for_event;
@@ -119,7 +119,7 @@ fn response_completed_chunks(response_id: &str) -> Vec<StreamingSseChunk> {
     ]
 }
 
-async fn build_codex(server: &StreamingSseServer) -> Arc<CodexThread> {
+async fn build_codex(server: &StreamingSseServer) -> TestCodexThread {
     test_codex()
         .with_model("gpt-5.4")
         .build_with_streaming_server(server)

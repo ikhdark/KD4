@@ -34,17 +34,37 @@ use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+struct TerminationControl {
+    started: Notify,
+    allowed: watch::Sender<bool>,
+    completed: AtomicBool,
+}
+
+impl TerminationControl {
+    fn new() -> Self {
+        let (allowed, _allowed_rx) = watch::channel(false);
+        Self {
+            started: Notify::new(),
+            allowed,
+            completed: AtomicBool::new(false),
+        }
+    }
+}
 
 struct MockExecProcess {
     process_id: ProcessId,
     write_response: WriteResponse,
     read_responses: Mutex<VecDeque<ReadResponse>>,
     terminate_error: Option<String>,
+    termination_control: Option<Arc<TerminationControl>>,
     wake_tx: watch::Sender<u64>,
 }
 
@@ -67,8 +87,16 @@ impl MockExecProcess {
     }
 
     async fn terminate(&self) -> Result<(), ExecServerError> {
+        if let Some(control) = &self.termination_control {
+            let mut allowed = control.allowed.subscribe();
+            control.started.notify_one();
+            let _ = allowed.wait_for(|allowed| *allowed).await;
+        }
         if let Some(message) = &self.terminate_error {
             return Err(ExecServerError::Protocol(message.clone()));
+        }
+        if let Some(control) = &self.termination_control {
+            control.completed.store(true, Ordering::Release);
         }
         Ok(())
     }
@@ -113,6 +141,14 @@ async fn remote_process(
     write_status: WriteStatus,
     terminate_error: Option<String>,
 ) -> UnifiedExecProcess {
+    remote_process_with_termination_control(write_status, terminate_error, None).await
+}
+
+async fn remote_process_with_termination_control(
+    write_status: WriteStatus,
+    terminate_error: Option<String>,
+    termination_control: Option<Arc<TerminationControl>>,
+) -> UnifiedExecProcess {
     let (wake_tx, _wake_rx) = watch::channel(0);
     let started = StartedExecProcess {
         process: Arc::new(MockExecProcess {
@@ -122,6 +158,7 @@ async fn remote_process(
             },
             read_responses: Mutex::new(VecDeque::new()),
             terminate_error,
+            termination_control,
             wake_tx,
         }),
     };
@@ -257,6 +294,56 @@ async fn remote_terminate_confirmed_updates_state_on_success_only() {
         .expect("terminate should succeed");
 
     assert!(process.has_exited());
+}
+
+#[tokio::test]
+async fn terminate_all_processes_confirms_remote_termination_for_failed_process() {
+    let manager = Arc::new(UnifiedExecProcessManager::default());
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let termination_control = Arc::new(TerminationControl::new());
+    let process = Arc::new(
+        remote_process_with_termination_control(
+            WriteStatus::Accepted,
+            /*terminate_error*/ None,
+            Some(Arc::clone(&termination_control)),
+        )
+        .await,
+    );
+    store_process_for_test(&manager, &session, &turn, 1000, Arc::clone(&process)).await;
+
+    process.fail_and_terminate("test failure".to_string());
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        termination_control.started.notified(),
+    )
+    .await
+    .expect("detached remote termination should start");
+    assert!(process.has_exited());
+
+    let manager_for_shutdown = Arc::clone(&manager);
+    let shutdown_task = tokio::spawn(async move {
+        manager_for_shutdown.terminate_all_processes().await;
+    });
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        termination_control.started.notified(),
+    )
+    .await
+    .expect("confirmed remote termination should start");
+    assert!(!shutdown_task.is_finished());
+    assert!(!termination_control.completed.load(Ordering::Acquire));
+
+    termination_control.allowed.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(2), shutdown_task)
+        .await
+        .expect("shutdown should finish after remote termination")
+        .expect("shutdown task should succeed");
+
+    assert!(termination_control.completed.load(Ordering::Acquire));
+    assert!(process.has_exited());
+    assert!(manager.process_store.lock().await.processes.is_empty());
 }
 
 #[tokio::test]

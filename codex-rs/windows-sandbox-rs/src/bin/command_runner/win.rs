@@ -13,6 +13,7 @@ mod cwd_junction;
 
 use anyhow::Context;
 use anyhow::Result;
+use codex_utils_pty::JobObject;
 use codex_windows_sandbox::ConsoleMode;
 use codex_windows_sandbox::ErrorPayload;
 use codex_windows_sandbox::ErrorStage;
@@ -53,6 +54,8 @@ use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::DUPLICATE_SAME_ACCESS;
+use windows_sys::Win32::Foundation::DuplicateHandle;
 use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -63,12 +66,7 @@ use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
 use windows_sys::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows_sys::Win32::System::Console::COORD;
 use windows_sys::Win32::System::Console::ResizePseudoConsole;
-use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
-use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
-use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
-use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::GetProcessId;
 use windows_sys::Win32::System::Threading::INFINITE;
@@ -82,16 +80,31 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 // a dependency cycle.
 const FS_HELPER_ARG: &str = "--codex-run-as-fs-helper";
 const READ_ACL_MUTEX_NAME: &str = "Local\\CodexSandboxReadAcl";
+const TERMINATION_WAIT_MS: u32 = 5_000;
+const WAIT_OBJECT_0: u32 = 0x0000_0000;
 const WAIT_TIMEOUT: u32 = 0x0000_0102;
+const WAIT_FAILED: u32 = u32::MAX;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessWaitOutcome {
+    Exited,
+    TimedOut,
+    Failed {
+        wait_result: u32,
+        windows_error: Option<u32>,
+    },
+}
 
 struct IpcSpawnedProcess {
     log_dir: PathBuf,
     pi: PROCESS_INFORMATION,
+    job: Arc<JobObject>,
     stdout_handle: HANDLE,
     stderr_handle: HANDLE,
     stdin_handle: Option<HANDLE>,
     conpty_owner: Option<codex_windows_sandbox::ConptyInstance>,
     hpc_handle: Option<HANDLE>,
+    control_process_handle: OwnedWinHandle,
     _pipe_handles: Option<PipeSpawnHandles>,
 }
 
@@ -111,6 +124,29 @@ impl OwnedWinHandle {
         self.0
     }
 
+    fn duplicate(handle: HANDLE) -> Result<Self> {
+        if handle == 0 || handle == INVALID_HANDLE_VALUE {
+            anyhow::bail!("cannot duplicate an invalid Windows handle");
+        }
+        let current_process = unsafe { GetCurrentProcess() };
+        let mut duplicate = 0;
+        let duplicated = unsafe {
+            DuplicateHandle(
+                current_process,
+                handle,
+                current_process,
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if duplicated == 0 {
+            anyhow::bail!("DuplicateHandle failed: {}", unsafe { GetLastError() });
+        }
+        Ok(Self::new(duplicate))
+    }
+
     fn into_raw(mut self) -> HANDLE {
         // Transfer ownership to the caller. After this point the caller is responsible for
         // eventually closing the returned HANDLE.
@@ -128,25 +164,6 @@ impl Drop for OwnedWinHandle {
             }
         }
     }
-}
-
-unsafe fn create_job_kill_on_close() -> Result<HANDLE> {
-    let h_job = OwnedWinHandle::new(CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()));
-    if h_job.raw() == 0 {
-        return Err(anyhow::anyhow!("CreateJobObjectW failed"));
-    }
-    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    let ok = SetInformationJobObject(
-        h_job.raw(),
-        JobObjectExtendedLimitInformation,
-        &mut limits as *mut _ as *mut _,
-        std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-    );
-    if ok == 0 {
-        return Err(anyhow::anyhow!("SetInformationJobObject failed"));
-    }
-    Ok(h_job.into_raw())
 }
 
 /// Open a named pipe created by the parent process.
@@ -303,7 +320,7 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
     let mut conpty_owner = None;
     let mut hpc_handle: Option<HANDLE> = None;
     let mut pipe_handles = None;
-    let (pi, stdout_handle, stderr_handle, stdin_handle) = if req.tty {
+    let (pi, job, stdout_handle, stderr_handle, stdin_handle) = if req.tty {
         let (pi, mut conpty) = codex_windows_sandbox::spawn_conpty_process_as_user(
             h_token.raw(),
             &req.command,
@@ -312,6 +329,9 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
             req.use_private_desktop,
             Some(log_dir.as_path()),
         )?;
+        let job = conpty
+            .job()
+            .context("spawned ConPTY is missing its process job")?;
         hpc_handle = conpty.raw_handle();
         let input_write = conpty.take_input_write();
         let output_read = conpty.take_output_read();
@@ -326,6 +346,7 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
         };
         (
             pi,
+            job,
             output_read,
             windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE,
             stdin_handle,
@@ -357,17 +378,27 @@ fn spawn_ipc_process(req: &SpawnRequest) -> Result<IpcSpawnedProcess> {
             .stderr_read
             .unwrap_or(windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
         let stdin_handle = spawned_pipes.stdin_write;
+        let job = spawned_pipes.job();
         pipe_handles = Some(spawned_pipes);
-        (pi, stdout_handle, stderr_handle, stdin_handle)
+        (pi, job, stdout_handle, stderr_handle, stdin_handle)
+    };
+    let control_process_handle = match OwnedWinHandle::duplicate(pi.hProcess) {
+        Ok(handle) => handle,
+        Err(err) => {
+            terminate_job_or_process(&job, pi.hProcess, Some(log_dir.as_path()));
+            return Err(err.context("failed to retain child process handle for runner control"));
+        }
     };
     Ok(IpcSpawnedProcess {
         log_dir,
         pi,
+        job,
         stdout_handle,
         stderr_handle,
         stdin_handle,
         conpty_owner,
         hpc_handle,
+        control_process_handle,
         _pipe_handles: pipe_handles,
     })
 }
@@ -400,21 +431,127 @@ fn spawn_output_reader(
     })
 }
 
+fn terminate_job_or_process(job: &JobObject, process: HANDLE, log_dir: Option<&Path>) {
+    if let Err(job_err) = job.terminate() {
+        log_note(
+            &format!("runner failed to terminate process tree: {job_err}"),
+            log_dir,
+        );
+        if unsafe { TerminateProcess(process, 1) } == 0 {
+            log_note(
+                &format!("runner failed to terminate root process: {}", unsafe {
+                    GetLastError()
+                }),
+                log_dir,
+            );
+        }
+    }
+}
+
+fn wait_for_process(process: HANDLE, timeout_ms: u32) -> ProcessWaitOutcome {
+    let wait_result = unsafe { WaitForSingleObject(process, timeout_ms) };
+    match wait_result {
+        WAIT_OBJECT_0 => ProcessWaitOutcome::Exited,
+        WAIT_TIMEOUT => ProcessWaitOutcome::TimedOut,
+        WAIT_FAILED => ProcessWaitOutcome::Failed {
+            wait_result,
+            windows_error: Some(unsafe { GetLastError() }),
+        },
+        _ => ProcessWaitOutcome::Failed {
+            wait_result,
+            windows_error: None,
+        },
+    }
+}
+
+fn log_failed_wait(
+    context: &str,
+    wait_result: u32,
+    windows_error: Option<u32>,
+    log_dir: Option<&Path>,
+) {
+    let error_suffix = windows_error
+        .map(|error| format!(", Windows error {error}"))
+        .unwrap_or_default();
+    log_note(
+        &format!("{context}: wait result 0x{wait_result:08x}{error_suffix}"),
+        log_dir,
+    );
+}
+
+fn wait_for_terminated_root(process: HANDLE, log_dir: Option<&Path>) -> bool {
+    match wait_for_process(process, TERMINATION_WAIT_MS) {
+        ProcessWaitOutcome::Exited => true,
+        ProcessWaitOutcome::TimedOut => {
+            log_note(
+                "runner root process did not exit after termination",
+                log_dir,
+            );
+            false
+        }
+        ProcessWaitOutcome::Failed {
+            wait_result,
+            windows_error,
+        } => {
+            log_failed_wait(
+                "runner failed to wait for root process after termination",
+                wait_result,
+                windows_error,
+                log_dir,
+            );
+            false
+        }
+    }
+}
+
 /// Read stdin/terminate frames and forward to the child process.
 fn spawn_input_loop(
+    reader: File,
+    stdin_handle: Option<HANDLE>,
+    hpc_handle: Arc<StdMutex<Option<HANDLE>>>,
+    job: Arc<JobObject>,
+    process: OwnedWinHandle,
+    log_dir: Option<PathBuf>,
+) -> std::thread::JoinHandle<()> {
+    let termination_log_dir = log_dir.clone();
+    spawn_input_loop_with_terminator(reader, stdin_handle, hpc_handle, log_dir, move || {
+        terminate_job_or_process(&job, process.raw(), termination_log_dir.as_deref())
+    })
+}
+
+fn spawn_input_loop_with_terminator<F>(
     mut reader: File,
     stdin_handle: Option<HANDLE>,
     hpc_handle: Arc<StdMutex<Option<HANDLE>>>,
-    process_handle: Arc<StdMutex<Option<HANDLE>>>,
     log_dir: Option<PathBuf>,
-) -> std::thread::JoinHandle<()> {
+    terminate_process_tree: F,
+) -> std::thread::JoinHandle<()>
+where
+    F: Fn() + Send + 'static,
+{
     std::thread::spawn(move || {
         let mut stdin_handle = stdin_handle;
         loop {
             let msg = match read_frame(&mut reader) {
                 Ok(Some(v)) => v,
-                Ok(None) => break,
-                Err(_) => break,
+                Ok(None) => {
+                    terminate_process_tree();
+                    log_note(
+                        "runner control pipe reached EOF; terminating process tree",
+                        log_dir.as_deref(),
+                    );
+                    break;
+                }
+                Err(err) => {
+                    terminate_process_tree();
+                    log_note(
+                        &format!(
+                            "runner control pipe read failed; terminating process tree: {err}"
+                        ),
+                        log_dir.as_deref(),
+                    );
+                    break;
+                }
             };
             match msg.message {
                 Message::Stdin { payload } => {
@@ -498,13 +635,7 @@ fn spawn_input_loop(
                     }
                 }
                 Message::Terminate { .. } => {
-                    if let Ok(guard) = process_handle.lock()
-                        && let Some(handle) = guard.as_ref()
-                    {
-                        unsafe {
-                            let _ = TerminateProcess(*handle, 1);
-                        }
-                    }
+                    terminate_process_tree();
                 }
                 Message::SpawnRequest { .. } => {}
                 Message::SpawnReady { .. } => {}
@@ -579,18 +710,11 @@ pub fn main() -> Result<()> {
     let pi = ipc_spawn.pi;
     let stdout_handle = ipc_spawn.stdout_handle;
     let stderr_handle = ipc_spawn.stderr_handle;
+    let job = Arc::clone(&ipc_spawn.job);
     let mut conpty_owner = ipc_spawn.conpty_owner;
     let stdin_handle = ipc_spawn.stdin_handle;
     let hpc_handle = Arc::new(StdMutex::new(ipc_spawn.hpc_handle));
-
-    let h_job = unsafe { create_job_kill_on_close().ok() };
-    if let Some(job) = h_job {
-        unsafe {
-            let _ = AssignProcessToJobObject(job, pi.hProcess);
-        }
-    }
-
-    let process_handle = Arc::new(StdMutex::new(Some(pi.hProcess)));
+    let control_process_handle = ipc_spawn.control_process_handle;
 
     let msg = FramedMessage {
         version: IPC_PROTOCOL_VERSION,
@@ -635,32 +759,60 @@ pub fn main() -> Result<()> {
         pipe_read,
         stdin_handle,
         Arc::clone(&hpc_handle),
-        Arc::clone(&process_handle),
+        Arc::clone(&job),
+        control_process_handle,
         log_dir_owned,
     );
 
     let timeout = req.timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
-    let wait_res = unsafe { WaitForSingleObject(pi.hProcess, timeout) };
-    let timed_out = wait_res == WAIT_TIMEOUT;
+    let wait_outcome = wait_for_process(pi.hProcess, timeout);
+    let timed_out = matches!(wait_outcome, ProcessWaitOutcome::TimedOut);
+    let root_exited = matches!(wait_outcome, ProcessWaitOutcome::Exited);
+    let child_stopped = match wait_outcome {
+        ProcessWaitOutcome::Exited => {
+            if let Err(err) = job.preserve_descendants() {
+                log_note(
+                    &format!("runner failed to preserve descendants after root exit: {err}"),
+                    log_dir,
+                );
+            }
+            true
+        }
+        ProcessWaitOutcome::TimedOut => {
+            terminate_job_or_process(&job, pi.hProcess, log_dir);
+            wait_for_terminated_root(pi.hProcess, log_dir)
+        }
+        ProcessWaitOutcome::Failed {
+            wait_result,
+            windows_error,
+        } => {
+            log_failed_wait(
+                "runner failed to wait for root process; terminating process tree",
+                wait_result,
+                windows_error,
+                log_dir,
+            );
+            terminate_job_or_process(&job, pi.hProcess, log_dir);
+            wait_for_terminated_root(pi.hProcess, log_dir)
+        }
+    };
 
     let exit_code: i32;
     unsafe {
         if timed_out {
-            let _ = TerminateProcess(pi.hProcess, 1);
             exit_code = 128 + 64;
-        } else {
+        } else if root_exited {
             let mut raw_exit: u32 = 1;
             GetExitCodeProcess(pi.hProcess, &mut raw_exit);
             exit_code = raw_exit as i32;
+        } else {
+            exit_code = 1;
         }
         if pi.hThread != 0 {
             CloseHandle(pi.hThread);
         }
         if pi.hProcess != 0 {
             CloseHandle(pi.hProcess);
-        }
-        if let Some(job) = h_job {
-            CloseHandle(job);
         }
     }
 
@@ -669,9 +821,15 @@ pub fn main() -> Result<()> {
     }
     drop(conpty_owner.take());
 
-    let _ = out_thread.join();
-    if let Some(thread) = err_thread {
-        let _ = thread.join();
+    if child_stopped {
+        if out_thread.join().is_err() {
+            log_note("runner stdout reader thread panicked", log_dir);
+        }
+        if let Some(thread) = err_thread
+            && thread.join().is_err()
+        {
+            log_note("runner stderr reader thread panicked", log_dir);
+        }
     }
 
     let exit_msg = FramedMessage {
@@ -690,4 +848,141 @@ pub fn main() -> Result<()> {
     }
 
     std::process::exit(exit_code);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OwnedWinHandle;
+    use super::ProcessWaitOutcome;
+    use super::WAIT_FAILED;
+    use super::encode_bytes;
+    use super::spawn_input_loop;
+    use super::wait_for_process;
+    use codex_utils_pty::JobObject;
+    use std::fs::File;
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::FromRawHandle;
+    use std::process::Stdio;
+    use std::ptr;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use std::time::Instant;
+    use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::Pipes::CreatePipe;
+
+    fn encode_powershell_script(script: &str) -> String {
+        let utf16_le = script
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        encode_bytes(&utf16_le)
+    }
+
+    fn powershell_literal_path(path: &std::path::Path) -> String {
+        path.to_string_lossy().replace('\'', "''")
+    }
+
+    fn wait_for_path(path: &std::path::Path, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        path.exists()
+    }
+
+    #[test]
+    fn invalid_process_wait_is_not_treated_as_exit() {
+        assert_eq!(
+            wait_for_process(/*invalid process handle*/ 0, 0),
+            ProcessWaitOutcome::Failed {
+                wait_result: WAIT_FAILED,
+                windows_error: Some(ERROR_INVALID_HANDLE),
+            }
+        );
+    }
+
+    #[test]
+    fn controlling_ipc_eof_terminates_process_tree() -> anyhow::Result<()> {
+        let temp_dir = tempfile::TempDir::new()?;
+        let start_marker = temp_dir.path().join("start");
+        let ready_marker = temp_dir.path().join("ready");
+        let survival_marker = temp_dir.path().join("survived");
+        let descendant_script = format!(
+            "Start-Sleep -Seconds 2; Set-Content -LiteralPath '{}' -Value survived",
+            powershell_literal_path(&survival_marker)
+        );
+        let descendant_script = encode_powershell_script(&descendant_script);
+        let root_script = format!(
+            "$ErrorActionPreference = 'Stop'; \
+             while (-not (Test-Path -LiteralPath '{}')) {{ Start-Sleep -Milliseconds 25 }}; \
+             $null = Start-Process -FilePath 'powershell.exe' \
+                 -ArgumentList @('-NoLogo','-NoProfile','-NonInteractive','-EncodedCommand','{descendant_script}') \
+                 -WindowStyle Hidden; \
+             Set-Content -LiteralPath '{}' -Value ready; \
+             Start-Sleep -Seconds 60",
+            powershell_literal_path(&start_marker),
+            powershell_literal_path(&ready_marker)
+        );
+        let root_script = encode_powershell_script(&root_script);
+        let mut root = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &root_script,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let job = Arc::new(JobObject::create()?);
+        if let Err(err) = job.assign_process(root.as_raw_handle()) {
+            let _ = root.kill();
+            let _ = root.wait();
+            return Err(err.into());
+        }
+        std::fs::write(&start_marker, b"start")?;
+        assert!(
+            wait_for_path(&ready_marker, Duration::from_secs(10)),
+            "descendant did not start"
+        );
+
+        let mut control_read = 0;
+        let mut control_write = 0;
+        if unsafe { CreatePipe(&mut control_read, &mut control_write, ptr::null_mut(), 0) } == 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let reader = unsafe { File::from_raw_handle(control_read as _) };
+        let control_writer = OwnedWinHandle::new(control_write);
+        let process_observer = OwnedWinHandle::duplicate(root.as_raw_handle() as HANDLE)?;
+        let input_thread = spawn_input_loop(
+            reader,
+            /*stdin_handle*/ None,
+            Arc::new(Mutex::new(None)),
+            Arc::clone(&job),
+            OwnedWinHandle::duplicate(root.as_raw_handle() as HANDLE)?,
+            /*log_dir*/ None,
+        );
+
+        // Close the original `Child` handle before delivering EOF. The input
+        // thread must terminate through the duplicate it owns, never a stale
+        // raw HANDLE that could be reused for another kernel object.
+        drop(root);
+        drop(control_writer);
+        input_thread.join().expect("join runner input loop");
+        assert_eq!(
+            wait_for_process(process_observer.raw(), 10_000),
+            ProcessWaitOutcome::Exited,
+            "root survived control-pipe EOF"
+        );
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            !survival_marker.exists(),
+            "descendant survived control-pipe EOF"
+        );
+        Ok(())
+    }
 }

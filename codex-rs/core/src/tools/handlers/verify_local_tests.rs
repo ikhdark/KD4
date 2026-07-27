@@ -290,7 +290,7 @@ async fn stale_post_verifier_evidence_fails_output_and_preserves_diff_state() {
     tracker.lock().await.track_delta("primary", &tracked_delta);
     assert!(tracker.lock().await.has_unvalidated_mutation());
     let validation_start = ledger
-        .begin_verify_local_validation()
+        .begin_verify_local_validation(&[PathBuf::from("changed.rs")])
         .await
         .expect("validation start snapshot");
     let payload = json!({

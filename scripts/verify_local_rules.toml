@@ -172,7 +172,8 @@ paths = [
   "AGENTS.md",
   "codex-rs/AGENTS.md",
   "scripts/AGENTS.md",
-  ".github/workflows/repo-checks.yml",
+  "scripts/source_map_check.py",
+  "scripts/test_source_map_check.py",
   "codex-cli/scripts/build_npm_package.py",
 ]
 validation_command = ["just", "source-map-check"]

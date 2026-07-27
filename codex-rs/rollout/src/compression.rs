@@ -71,6 +71,11 @@ pub(crate) struct RolloutAppendLock {
     _file: File,
 }
 
+/// Exclusive per-rollout lock held only while an append transaction can mutate the plain file.
+pub(crate) struct RolloutWriteLock {
+    _file: File,
+}
+
 /// Acquires the append lock and materializes the canonical plain rollout while
 /// compression is excluded. The returned guard must live as long as the append
 /// handle that is opened for the returned path.
@@ -84,6 +89,24 @@ pub(crate) fn lock_rollout_for_append_blocking(
     Ok((plain_path, RolloutAppendLock { _file: lock_file }))
 }
 
+pub(crate) fn lock_rollout_for_write_blocking(path: &Path) -> io::Result<RolloutWriteLock> {
+    let lock_file = open_rollout_write_lock_file(plain_rollout_path(path).as_path())?;
+    lock_file.lock()?;
+    Ok(RolloutWriteLock { _file: lock_file })
+}
+
+#[cfg(test)]
+pub(crate) fn try_lock_rollout_for_write_blocking(
+    path: &Path,
+) -> io::Result<Option<RolloutWriteLock>> {
+    let lock_file = open_rollout_write_lock_file(plain_rollout_path(path).as_path())?;
+    match lock_file.try_lock() {
+        Ok(()) => Ok(Some(RolloutWriteLock { _file: lock_file })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
 fn try_lock_rollout_for_compression(path: &Path) -> io::Result<Option<File>> {
     let lock_file = open_rollout_lock_file(plain_rollout_path(path).as_path())?;
     match lock_file.try_lock() {
@@ -94,7 +117,14 @@ fn try_lock_rollout_for_compression(path: &Path) -> io::Result<Option<File>> {
 }
 
 fn open_rollout_lock_file(path: &Path) -> io::Result<File> {
-    let lock_path = rollout_lock_path(path);
+    open_lock_file(rollout_lock_path(path).as_path())
+}
+
+fn open_rollout_write_lock_file(path: &Path) -> io::Result<File> {
+    open_lock_file(rollout_write_lock_path(path).as_path())
+}
+
+fn open_lock_file(lock_path: &Path) -> io::Result<File> {
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -112,6 +142,15 @@ fn rollout_lock_path(path: &Path) -> PathBuf {
         .map(OsStr::to_os_string)
         .unwrap_or_else(|| OsStr::new("rollout").to_os_string());
     plain_path.with_file_name(format!(".{}.lock", file_name.to_string_lossy()))
+}
+
+fn rollout_write_lock_path(path: &Path) -> PathBuf {
+    let plain_path = plain_rollout_path(path);
+    let file_name = plain_path
+        .file_name()
+        .map(OsStr::to_os_string)
+        .unwrap_or_else(|| OsStr::new("rollout").to_os_string());
+    plain_path.with_file_name(format!(".{}.write.lock", file_name.to_string_lossy()))
 }
 
 fn materialize_rollout_for_append_locked(path: &Path) -> io::Result<PathBuf> {

@@ -53,6 +53,8 @@ use codex_sandboxing::windows_sandbox_uses_elevated_backend;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use codex_utils_pty::DEFAULT_OUTPUT_BYTES_CAP;
+#[cfg(target_os = "windows")]
+use codex_utils_pty::JobObject;
 use codex_utils_pty::process_group::kill_child_process_group;
 
 pub const DEFAULT_EXEC_COMMAND_TIMEOUT_MS: u64 = 10_000;
@@ -63,6 +65,7 @@ const SIGKILL_CODE: i32 = 9;
 const TIMEOUT_CODE: i32 = 64;
 const EXIT_CODE_SIGNAL_BASE: i32 = 128; // conventional shell: 128 + signal
 const EXEC_TIMEOUT_EXIT_CODE: i32 = 124; // conventional timeout exit code
+#[cfg(not(target_os = "windows"))]
 const CANCELLATION_TERMINATION_GRACE_PERIOD: Duration = Duration::from_millis(50);
 
 // I/O buffer sizing
@@ -936,6 +939,8 @@ async fn exec(
         ))
     })?;
     let arg0_ref = arg0.as_deref();
+    #[cfg(target_os = "windows")]
+    let windows_job = JobObject::create();
     let child = spawn_child_async(SpawnChildRequest {
         program: PathBuf::from(program),
         args: args.into(),
@@ -950,10 +955,56 @@ async fn exec(
         env,
     })
     .await?;
+    #[cfg(target_os = "windows")]
+    let windows_job = match windows_job.and_then(|job| {
+        let process_handle = child
+            .raw_handle()
+            .ok_or_else(|| io::Error::other("missing child process handle"))?;
+        job.assign_process(process_handle)?;
+        Ok(job)
+    }) {
+        Ok(job) => Some(job),
+        Err(err) => {
+            tracing::warn!(
+                "Windows direct exec process tree containment unavailable; \
+                 cancellation will terminate only the root process: {err}"
+            );
+            None
+        }
+    };
     if let Some(after_spawn) = after_spawn {
         after_spawn();
     }
-    consume_output(child, expiration, capture_policy, stdout_stream).await
+    consume_output(
+        child,
+        expiration,
+        capture_policy,
+        stdout_stream,
+        #[cfg(target_os = "windows")]
+        windows_job,
+    )
+    .await
+}
+
+fn kill_child_process_tree(
+    child: &mut Child,
+    #[cfg(target_os = "windows")] windows_job: Option<&JobObject>,
+) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    if let Some(job) = windows_job {
+        match job.terminate() {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                tracing::warn!(
+                    "Windows direct exec failed to terminate process tree; \
+                     falling back to the root process: {err}"
+                );
+            }
+        }
+    }
+
+    kill_child_process_group(child)?;
+    child.start_kill()
 }
 
 /// Consumes the output of a child process according to the configured capture
@@ -963,6 +1014,7 @@ async fn consume_output(
     expiration: ExecExpiration,
     capture_policy: ExecCapturePolicy,
     stdout_stream: Option<StdoutStream>,
+    #[cfg(target_os = "windows")] windows_job: Option<JobObject>,
 ) -> Result<RawExecToolCallOutput> {
     // Both stdout and stderr were configured with `Stdio::piped()`
     // above, therefore `take()` should normally return `Some`.  If it doesn't
@@ -1004,46 +1056,67 @@ async fn consume_output(
     let (exit_status, timed_out) = tokio::select! {
         status_result = child.wait() => {
             let exit_status = status_result?;
+            #[cfg(target_os = "windows")]
+            if let Some(job) = windows_job.as_ref()
+                && let Err(err) = job.preserve_descendants()
+            {
+                tracing::warn!(
+                    "Windows direct exec failed to preserve descendants after root exit: {err}"
+                );
+            }
             (exit_status, false)
         }
         outcome = &mut expiration_wait => {
             match outcome {
                 Some(ExecExpirationOutcome::TimedOut) => {
-                    kill_child_process_group(&mut child)?;
-                    child.start_kill()?;
+                    kill_child_process_tree(
+                        &mut child,
+                        #[cfg(target_os = "windows")]
+                        windows_job.as_ref(),
+                    )?;
                     (
                         synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + TIMEOUT_CODE),
                         true,
                     )
                 }
                 Some(ExecExpirationOutcome::Cancelled) => {
-                    // Let TERM-aware processes run cleanup briefly, then kill any
-                    // remaining members of the original process group.
-                    let process_group_id = child.id();
-                    let should_escalate = if let Some(process_group_id) = process_group_id {
-                        codex_utils_pty::process_group::terminate_process_group(process_group_id)?
-                    } else {
-                        false
-                    };
-                    match tokio::time::timeout(
-                        CANCELLATION_TERMINATION_GRACE_PERIOD,
-                        child.wait(),
-                    )
-                    .await
+                    #[cfg(target_os = "windows")]
                     {
-                        Ok(status) => {
-                            status?;
-                            if should_escalate
-                                && let Some(process_group_id) = process_group_id
-                            {
-                                codex_utils_pty::process_group::kill_process_group(
-                                    process_group_id,
-                                )?;
+                        kill_child_process_tree(&mut child, windows_job.as_ref())?;
+                        child.wait().await?;
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        // Let TERM-aware processes run cleanup briefly, then kill any
+                        // remaining members of the original process group.
+                        let process_group_id = child.id();
+                        let should_escalate = if let Some(process_group_id) = process_group_id {
+                            codex_utils_pty::process_group::terminate_process_group(
+                                process_group_id,
+                            )?
+                        } else {
+                            false
+                        };
+                        match tokio::time::timeout(
+                            CANCELLATION_TERMINATION_GRACE_PERIOD,
+                            child.wait(),
+                        )
+                        .await
+                        {
+                            Ok(status) => {
+                                status?;
+                                if should_escalate
+                                    && let Some(process_group_id) = process_group_id
+                                {
+                                    codex_utils_pty::process_group::kill_process_group(
+                                        process_group_id,
+                                    )?;
+                                }
                             }
-                        }
-                        Err(_) => {
-                            kill_child_process_group(&mut child)?;
-                            child.start_kill()?;
+                            Err(_) => {
+                                kill_child_process_group(&mut child)?;
+                                child.start_kill()?;
+                            }
                         }
                     }
                     (synthetic_exit_status_for_code(/*code*/ 1), false)
@@ -1052,8 +1125,11 @@ async fn consume_output(
             }
         }
         _ = tokio::signal::ctrl_c() => {
-            kill_child_process_group(&mut child)?;
-            child.start_kill()?;
+            kill_child_process_tree(
+                &mut child,
+                #[cfg(target_os = "windows")]
+                windows_job.as_ref(),
+            )?;
             (synthetic_exit_status(EXIT_CODE_SIGNAL_BASE + SIGKILL_CODE), false)
         }
     };

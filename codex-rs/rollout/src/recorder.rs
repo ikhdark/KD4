@@ -24,6 +24,8 @@ use time::OffsetDateTime;
 use time::format_description::FormatItem;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncSeekExt;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
@@ -1507,6 +1509,7 @@ fn precompute_log_file_info(
 }
 
 struct LockedRolloutFile {
+    path: PathBuf,
     file: File,
     append_lock: compression::RolloutAppendLock,
 }
@@ -1514,8 +1517,11 @@ struct LockedRolloutFile {
 impl LockedRolloutFile {
     fn into_jsonl_writer(self) -> JsonlWriter {
         JsonlWriter {
+            path: self.path,
             file: tokio::fs::File::from_std(self.file),
             _append_lock: self.append_lock,
+            #[cfg(test)]
+            write_fault: None,
         }
     }
 }
@@ -1536,13 +1542,19 @@ fn open_log_file_with_options(
         )));
     };
     fs::create_dir_all(parent)?;
+    let _write_lock = compression::lock_rollout_for_write_blocking(&path)?;
     let mut file = std::fs::OpenOptions::new()
         .read(true)
         .append(true)
         .create(create)
         .open(&path)?;
     ensure_rollout_is_newline_terminated(&mut file)?;
-    Ok((path, LockedRolloutFile { file, append_lock }))
+    let locked_file = LockedRolloutFile {
+        path: path.clone(),
+        file,
+        append_lock,
+    };
+    Ok((path, locked_file))
 }
 
 /// Mutable state owned by the background rollout writer.
@@ -1558,6 +1570,7 @@ struct RolloutWriterState {
     cwd: PathBuf,
     rollout_path: PathBuf,
     last_logged_error: Option<String>,
+    retry_blocked_error: Option<String>,
 }
 
 impl RolloutWriterState {
@@ -1576,6 +1589,7 @@ impl RolloutWriterState {
             cwd,
             rollout_path,
             last_logged_error: None,
+            retry_blocked_error: None,
         }
     }
 
@@ -1611,12 +1625,20 @@ impl RolloutWriterState {
     }
 
     async fn write_pending_with_recovery(&mut self, operation: &str) -> std::io::Result<()> {
+        if let Some(err) = self.retry_blocked_error.as_ref() {
+            return Err(IoError::other(err.clone()));
+        }
+
         match self.write_pending_once().await {
             Ok(()) => {
                 self.last_logged_error = None;
                 Ok(())
             }
             Err(first_err) => {
+                if is_unrecoverable_rollout_append_error(&first_err) {
+                    self.block_unsafe_retry(&first_err);
+                    return Err(first_err);
+                }
                 self.enter_recovery_mode(&first_err);
                 warn!("failed to {operation} rollout writer; reopening and retrying: {first_err}");
                 match self.write_pending_once().await {
@@ -1625,7 +1647,11 @@ impl RolloutWriterState {
                         Ok(())
                     }
                     Err(second_err) => {
-                        self.enter_recovery_mode(&second_err);
+                        if is_unrecoverable_rollout_append_error(&second_err) {
+                            self.block_unsafe_retry(&second_err);
+                        } else {
+                            self.enter_recovery_mode(&second_err);
+                        }
                         warn!(
                             "retrying rollout writer {operation} failed; first error: \
                              {first_err}; final error: {second_err}"
@@ -1642,6 +1668,9 @@ impl RolloutWriterState {
     }
 
     fn enter_recovery_mode(&mut self, err: &IoError) {
+        if self.retry_blocked_error.is_some() {
+            return;
+        }
         let message = err.to_string();
         if self.last_logged_error.as_ref() != Some(&message) {
             error!(
@@ -1653,6 +1682,18 @@ impl RolloutWriterState {
             );
         }
         self.last_logged_error = Some(message);
+        self.writer = None;
+    }
+
+    fn block_unsafe_retry(&mut self, err: &IoError) {
+        let message = err.to_string();
+        error!(
+            "rollout writer failed for {}; retry is blocked because the last record could not be \
+             proven committed or rolled back: {err}",
+            self.rollout_path.display()
+        );
+        self.last_logged_error = Some(message.clone());
+        self.retry_blocked_error = Some(message);
         self.writer = None;
     }
 
@@ -1823,8 +1864,24 @@ fn ensure_rollout_is_newline_terminated(file: &mut File) -> std::io::Result<()> 
 }
 
 struct JsonlWriter {
+    path: PathBuf,
     file: tokio::fs::File,
     _append_lock: compression::RolloutAppendLock,
+    #[cfg(test)]
+    write_fault: Option<JsonlWriteFault>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum FailedAppendRecovery {
+    Committed,
+    RolledBack,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum JsonlWriteFault {
+    AfterPartialWrite(usize),
+    AfterCompleteWrite,
 }
 
 #[derive(serde::Serialize)]
@@ -1852,10 +1909,119 @@ impl JsonlWriter {
     async fn write_line(&mut self, item: &impl serde::Serialize) -> std::io::Result<()> {
         let mut json = serde_json::to_string(item)?;
         json.push('\n');
-        self.file.write_all(json.as_bytes()).await?;
-        self.file.flush().await?;
-        Ok(())
+        let line = json.as_bytes();
+        let path = self.path.clone();
+        let _write_lock = tokio::task::spawn_blocking(move || {
+            compression::lock_rollout_for_write_blocking(path.as_path())
+        })
+        .await
+        .map_err(IoError::other)??;
+        let append_start = self.file.metadata().await?.len();
+        let write_result = self.write_line_bytes(line).await;
+        let Err(append_error) = write_result else {
+            return Ok(());
+        };
+
+        match self.recover_failed_append(append_start, line).await {
+            Ok(FailedAppendRecovery::Committed) => Ok(()),
+            Ok(FailedAppendRecovery::RolledBack) => Err(append_error),
+            Err(recovery_error) => Err(IoError::other(RolloutAppendRecoveryError {
+                path: self.path.clone(),
+                append_error,
+                recovery_error,
+            })),
+        }
     }
+
+    async fn write_line_bytes(&mut self, line: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(fault) = self.write_fault.take() {
+            match fault {
+                JsonlWriteFault::AfterPartialWrite(max_bytes) => {
+                    let partial_len = max_bytes.min(line.len().saturating_sub(1));
+                    self.file.write_all(&line[..partial_len]).await?;
+                }
+                JsonlWriteFault::AfterCompleteWrite => {
+                    self.file.write_all(line).await?;
+                }
+            }
+            self.file.flush().await?;
+            return Err(IoError::other("injected rollout append failure"));
+        }
+
+        self.file.write_all(line).await?;
+        self.file.flush().await
+    }
+
+    async fn recover_failed_append(
+        &self,
+        append_start: u64,
+        expected_line: &[u8],
+    ) -> std::io::Result<FailedAppendRecovery> {
+        let mut file = tokio::fs::File::open(&self.path).await?;
+        let file_len = file.metadata().await?.len();
+        if file_len == append_start {
+            return Ok(FailedAppendRecovery::RolledBack);
+        }
+        if file_len < append_start {
+            return Err(IoError::other(format!(
+                "rollout shrank from byte {append_start} to {file_len} during append"
+            )));
+        }
+
+        let expected_len = u64::try_from(expected_line.len())
+            .map_err(|_| IoError::other("rollout line length exceeds u64"))?;
+        let observed_len = usize::try_from((file_len - append_start).min(expected_len))
+            .map_err(|_| IoError::other("rollout append length exceeds usize"))?;
+        file.seek(SeekFrom::Start(append_start)).await?;
+        let mut observed = vec![0; observed_len];
+        file.read_exact(&mut observed).await?;
+
+        if observed == expected_line[..observed_len] {
+            if observed_len == expected_line.len() {
+                return Ok(FailedAppendRecovery::Committed);
+            }
+
+            let rollback_file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&self.path)
+                .await?;
+            rollback_file.set_len(append_start).await?;
+            return Ok(FailedAppendRecovery::RolledBack);
+        }
+
+        Err(IoError::other(format!(
+            "rollout contains unexpected bytes after failed append at byte {append_start}"
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct RolloutAppendRecoveryError {
+    path: PathBuf,
+    append_error: IoError,
+    recovery_error: IoError,
+}
+
+impl std::fmt::Display for RolloutAppendRecoveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "append to {} failed ({}) and its on-disk state could not be recovered ({}); retry is \
+             unsafe",
+            self.path.display(),
+            self.append_error,
+            self.recovery_error
+        )
+    }
+}
+
+impl std::error::Error for RolloutAppendRecoveryError {}
+
+fn is_unrecoverable_rollout_append_error(err: &IoError) -> bool {
+    err.get_ref()
+        .and_then(|source| source.downcast_ref::<RolloutAppendRecoveryError>())
+        .is_some()
 }
 
 impl From<codex_state::ThreadsPage> for ThreadsPage {

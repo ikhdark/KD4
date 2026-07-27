@@ -350,6 +350,11 @@ async fn spawn_process_preserving_fds(
             });
     }
 
+    // Finish all fallible parent-side PTY setup before spawning so an error
+    // cannot leave a live child without a ProcessHandle.
+    let mut reader = master.try_clone()?;
+    let writer = Arc::new(tokio::sync::Mutex::new(master.try_clone()?));
+
     let mut child = command.spawn()?;
     drop(slave);
     let process_group_id = child.id();
@@ -357,7 +362,6 @@ async fn spawn_process_preserving_fds(
     let (writer_tx, mut writer_rx) = mpsc::channel::<Vec<u8>>(128);
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(128);
     let (_stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>(1);
-    let mut reader = master.try_clone()?;
     let reader_handle: JoinHandle<()> = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 8_192];
         loop {
@@ -376,7 +380,6 @@ async fn spawn_process_preserving_fds(
         }
     });
 
-    let writer = Arc::new(tokio::sync::Mutex::new(master.try_clone()?));
     let writer_handle: JoinHandle<()> = tokio::spawn({
         let writer = Arc::clone(&writer);
         async move {
@@ -460,10 +463,25 @@ fn open_unix_pty(size: TerminalSize) -> Result<(File, File)> {
         anyhow::bail!("failed to openpty: {:?}", std::io::Error::last_os_error());
     }
 
-    set_cloexec(master)?;
-    set_cloexec(slave)?;
+    // Take ownership immediately so either descriptor is closed if any
+    // subsequent setup step fails.
+    let master = unsafe { File::from_raw_fd(master) };
+    let slave = unsafe { File::from_raw_fd(slave) };
 
-    Ok(unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) })
+    Ok(configure_owned_pty_files(master, slave, |file| {
+        set_cloexec(file.as_raw_fd())
+    })?)
+}
+
+#[cfg(any(unix, test))]
+fn configure_owned_pty_files<T>(
+    master: T,
+    slave: T,
+    mut configure: impl FnMut(&T) -> std::io::Result<()>,
+) -> std::io::Result<(T, T)> {
+    configure(&master)?;
+    configure(&slave)?;
+    Ok((master, slave))
 }
 
 #[cfg(unix)]
@@ -477,6 +495,53 @@ fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod pty_fd_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use super::configure_owned_pty_files;
+
+    struct TrackedDescriptor {
+        drop_count: Arc<AtomicUsize>,
+    }
+
+    impl Drop for TrackedDescriptor {
+        fn drop(&mut self) {
+            self.drop_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn cloexec_failure_drops_both_owned_pty_descriptors() {
+        for failing_call in [1, 2] {
+            let drop_count = Arc::new(AtomicUsize::new(0));
+            let mut call_count = 0;
+            let result = configure_owned_pty_files(
+                TrackedDescriptor {
+                    drop_count: Arc::clone(&drop_count),
+                },
+                TrackedDescriptor {
+                    drop_count: Arc::clone(&drop_count),
+                },
+                |_| {
+                    call_count += 1;
+                    if call_count == failing_call {
+                        Err(std::io::Error::other("injected CLOEXEC failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+
+            assert!(result.is_err());
+            assert_eq!(call_count, failing_call);
+            assert_eq!(drop_count.load(Ordering::SeqCst), 2);
+        }
+    }
 }
 
 #[cfg(unix)]

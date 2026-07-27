@@ -1256,7 +1256,7 @@ async fn remote_compact_filters_deferred_dynamic_tools() -> Result<()> {
         .thread_manager
         .start_thread_with_tools(test.config.clone(), dynamic_tools)
         .await?;
-    test.codex = new_thread.thread;
+    test.codex.replace_thread(new_thread.thread);
     test.session_configured = new_thread.session_configured;
     let codex = test.codex.clone();
 
@@ -1897,7 +1897,7 @@ async fn remote_compact_trims_tool_search_output_to_empty_tools_array() -> Resul
         .thread_manager
         .start_thread_with_tools(test.config.clone(), vec![dynamic_tool])
         .await?;
-    test.codex = new_thread.thread;
+    test.codex.replace_thread(new_thread.thread);
     test.session_configured = new_thread.session_configured;
     let codex = test.codex.clone();
 

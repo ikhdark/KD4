@@ -447,7 +447,7 @@ impl ThreadHistoryBuilder {
             return;
         }
 
-        let Some(hook_prompt) = parse_hook_prompt_message(id.as_ref(), content) else {
+        let Some(hook_prompt) = parse_hook_prompt_message(id.as_deref(), content) else {
             return;
         };
 
@@ -2066,6 +2066,7 @@ mod tests {
             id: "exec-1".to_string(),
             process_id: Some("pid-1".to_string()),
             command: vec!["echo".to_string(), "hello world".to_string()],
+            display_label: Some("Example -".to_string()),
             cwd: test_path_buf("/tmp").abs().into(),
             parsed_cmd: vec![ParsedCommand::Unknown {
                 cmd: "echo hello world".to_string(),
@@ -2117,6 +2118,7 @@ mod tests {
             vec![ThreadItem::CommandExecution {
                 id: "exec-1".to_string(),
                 command: "echo 'hello world'".to_string(),
+                display_label: Some("Example -".to_string()),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-1".to_string()),
                 source: CommandExecutionSource::Agent,
@@ -2671,6 +2673,7 @@ mod tests {
                 turn_id: "turn-1".into(),
                 completed_at_ms: 0,
                 command: vec!["echo".into(), "hello world".into()],
+                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo hello world".into(),
@@ -2727,6 +2730,7 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "exec-1".into(),
                 command: "echo 'hello world'".into(),
+                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-1".into()),
                 source: CommandExecutionSource::Agent,
@@ -2930,6 +2934,7 @@ mod tests {
                 turn_id: "turn-1".into(),
                 completed_at_ms: 0,
                 command: vec!["ls".into()],
+                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 parsed_cmd: vec![ParsedCommand::Unknown { cmd: "ls".into() }],
                 source: ExecCommandSource::Agent,
@@ -2972,6 +2977,7 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "exec-declined".into(),
                 command: "ls".into(),
+                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-2".into()),
                 source: CommandExecutionSource::Agent,
@@ -3070,6 +3076,7 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "guardian-exec".into(),
                 command: "rm -rf /tmp/guardian".into(),
+                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
                 source: CommandExecutionSource::Agent,
@@ -3136,6 +3143,7 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "guardian-execve".into(),
                 command: "/bin/rm -f /tmp/file.sqlite".into(),
+                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
                 source: CommandExecutionSource::Agent,
@@ -3198,6 +3206,7 @@ mod tests {
                 turn_id: "turn-a".into(),
                 completed_at_ms: 0,
                 command: vec!["echo".into(), "done".into()],
+                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo done".into(),
@@ -3238,6 +3247,7 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "exec-late".into(),
                 command: "echo done".into(),
+                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-42".into()),
                 source: CommandExecutionSource::Agent,
@@ -3300,6 +3310,7 @@ mod tests {
                 turn_id: "turn-missing".into(),
                 completed_at_ms: 0,
                 command: vec!["echo".into(), "done".into()],
+                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo done".into(),
@@ -4113,7 +4124,7 @@ mod tests {
                 collaboration_mode_kind: Default::default(),
             })),
             RolloutItem::ResponseItem(codex_protocol::models::ResponseItem::Message {
-                id: Some("msg-1".into()),
+                id: Some(codex_protocol::ResponseItemId::with_suffix("msg", "1")),
                 role: "user".into(),
                 content: vec![codex_protocol::models::ContentItem::InputText {
                     text: "plain text".into(),

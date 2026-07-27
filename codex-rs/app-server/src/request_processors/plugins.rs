@@ -472,7 +472,7 @@ impl PluginRequestProcessor {
         let thread_manager = Arc::clone(&self.thread_manager);
         let config_manager = self.config_manager.clone();
         Arc::new(move || {
-            Self::spawn_effective_plugins_changed_task(
+            Self::invalidate_effective_plugins_and_spawn_refresh(
                 Arc::clone(&thread_manager),
                 config_manager.clone(),
             );
@@ -480,19 +480,20 @@ impl PluginRequestProcessor {
     }
 
     fn on_effective_plugins_changed(&self) {
-        Self::spawn_effective_plugins_changed_task(
+        Self::invalidate_effective_plugins_and_spawn_refresh(
             Arc::clone(&self.thread_manager),
             self.config_manager.clone(),
         );
     }
 
-    fn spawn_effective_plugins_changed_task(
+    fn invalidate_effective_plugins_and_spawn_refresh(
         thread_manager: Arc<ThreadManager>,
         config_manager: ConfigManager,
     ) {
+        // Cache invalidation is part of mutation completion; only MCP refresh is best-effort.
+        thread_manager.plugins_manager().clear_cache();
+        thread_manager.skills_service().clear_cache();
         tokio::spawn(async move {
-            thread_manager.plugins_manager().clear_cache();
-            thread_manager.skills_service().clear_cache();
             if thread_manager.list_thread_ids().await.is_empty() {
                 return;
             }
@@ -2398,3 +2399,7 @@ fn remote_plugin_bundle_install_error_to_jsonrpc(
 ) -> JSONRPCErrorError {
     internal_error(format!("install remote plugin bundle: {err}"))
 }
+
+#[cfg(test)]
+#[path = "plugins_tests.rs"]
+mod tests;

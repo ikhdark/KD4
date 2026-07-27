@@ -1,9 +1,7 @@
 use crate::config_manager::ConfigManager;
 use codex_core::CodexThread;
 use codex_core::ThreadManager;
-use codex_protocol::ThreadId;
 use codex_protocol::protocol::McpServerRefreshConfig;
-use codex_protocol::protocol::Op;
 use std::io;
 use std::sync::Arc;
 use tracing::warn;
@@ -24,9 +22,10 @@ pub(crate) async fn queue_strict_refresh(
         let config = build_refresh_config(thread.as_ref(), config_manager).await?;
         refreshes.push((thread_id, thread, config));
     }
-    for (thread_id, thread, config) in refreshes {
-        queue_refresh(thread_id, thread, config).await?;
-    }
+    thread_manager
+        .queue_mcp_server_refreshes_atomically(refreshes)
+        .await
+        .map_err(|err| io::Error::other(format!("failed to queue MCP refresh batch: {err}")))?;
     Ok(())
 }
 
@@ -34,6 +33,7 @@ pub(crate) async fn queue_best_effort_refresh(
     thread_manager: &Arc<ThreadManager>,
     config_manager: &ConfigManager,
 ) {
+    let mut refreshes = Vec::new();
     for thread_id in thread_manager.list_thread_ids().await {
         let thread = match thread_manager.get_thread(thread_id).await {
             Ok(thread) => thread,
@@ -49,9 +49,13 @@ pub(crate) async fn queue_best_effort_refresh(
                 continue;
             }
         };
-        if let Err(err) = queue_refresh(thread_id, thread, config).await {
-            warn!("{err}");
-        }
+        refreshes.push((thread_id, thread, config));
+    }
+    if let Err(err) = thread_manager
+        .queue_mcp_server_refreshes_atomically(refreshes)
+        .await
+    {
+        warn!("failed to queue MCP refresh batch: {err}");
     }
 }
 
@@ -74,22 +78,6 @@ async fn build_refresh_config(
         auth_keyring_backend_kind: serde_json::to_value(config.auth_keyring_backend_kind())
             .map_err(io::Error::other)?,
     })
-}
-
-async fn queue_refresh(
-    thread_id: ThreadId,
-    thread: Arc<CodexThread>,
-    config: McpServerRefreshConfig,
-) -> io::Result<()> {
-    thread
-        .submit(Op::RefreshMcpServers { config })
-        .await
-        .map(|_| ())
-        .map_err(|err| {
-            io::Error::other(format!(
-                "failed to queue MCP refresh for thread {thread_id}: {err}"
-            ))
-        })
 }
 
 #[cfg(test)]
@@ -142,6 +130,21 @@ mod tests {
 
         assert_eq!(loader.good_loads.load(Ordering::Relaxed), 1);
         assert_eq!(loader.bad_loads.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strict_refresh_commits_after_a_thread_terminates() -> anyhow::Result<()> {
+        let (temp_dir, thread_manager, _config_manager, _loader) = refresh_test_state().await?;
+        let config_manager =
+            ConfigManager::without_managed_config_for_tests(temp_dir.path().to_path_buf());
+        let thread_ids = thread_manager.list_thread_ids().await;
+        assert_eq!(thread_ids.len(), 2);
+        let terminated_thread = thread_manager.get_thread(thread_ids[1]).await?;
+        terminated_thread.shutdown_and_wait().await?;
+
+        queue_strict_refresh(&thread_manager, &config_manager).await?;
+
         Ok(())
     }
 

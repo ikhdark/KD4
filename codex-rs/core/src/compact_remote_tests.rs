@@ -1,12 +1,13 @@
 use super::*;
 
 use crate::session::tests::make_session_and_context;
+use codex_protocol::ResponseItemId;
 use codex_protocol::models::ContentItem;
 use pretty_assertions::assert_eq;
 
 fn message(id: &str, role: &str, content: ContentItem) -> ResponseItem {
     ResponseItem::Message {
-        id: Some(id.to_string()),
+        id: Some(ResponseItemId::from_server(id.to_string())),
         role: role.to_string(),
         content: vec![content],
         phase: None,
@@ -16,7 +17,7 @@ fn message(id: &str, role: &str, content: ContentItem) -> ResponseItem {
 
 fn function_call_output(id: &str, call_id: &str, output: &str) -> ResponseItem {
     ResponseItem::FunctionCallOutput {
-        id: Some(id.to_string()),
+        id: Some(ResponseItemId::from_server(id.to_string())),
         call_id: call_id.to_string(),
         output: FunctionCallOutputPayload {
             body: FunctionCallOutputBody::Text(output.to_string()),
@@ -28,7 +29,7 @@ fn function_call_output(id: &str, call_id: &str, output: &str) -> ResponseItem {
 
 fn custom_tool_call_output(id: &str, call_id: &str, output: &str) -> ResponseItem {
     ResponseItem::CustomToolCallOutput {
-        id: Some(id.to_string()),
+        id: Some(ResponseItemId::from_server(id.to_string())),
         call_id: call_id.to_string(),
         name: Some("custom-tool".to_string()),
         output: FunctionCallOutputPayload {

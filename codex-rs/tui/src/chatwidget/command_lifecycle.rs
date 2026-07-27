@@ -244,6 +244,7 @@ impl ChatWidget {
         let ThreadItem::CommandExecution {
             id,
             command,
+            display_label,
             source,
             command_actions,
             ..
@@ -260,6 +261,7 @@ impl ChatWidget {
             id.clone(),
             RunningCommand {
                 command: command.clone(),
+                display_label: display_label.clone(),
                 parsed_cmd: parsed_cmd.clone(),
                 source,
             },
@@ -288,6 +290,7 @@ impl ChatWidget {
             && let Some(new_exec) = cell.with_added_call(
                 id.clone(),
                 command.clone(),
+                display_label.clone(),
                 parsed_cmd.clone(),
                 source,
                 /*interaction_input*/ None,
@@ -301,6 +304,7 @@ impl ChatWidget {
             self.transcript.active_cell = Some(Box::new(new_active_exec_command(
                 id,
                 command,
+                display_label,
                 parsed_cmd,
                 source,
                 /*interaction_input*/ None,
@@ -334,6 +338,7 @@ impl ChatWidget {
         let ThreadItem::CommandExecution {
             id,
             command,
+            display_label,
             process_id: _,
             source,
             command_actions,
@@ -358,9 +363,14 @@ impl ChatWidget {
         if self.suppressed_exec_calls.remove(&id) {
             return;
         }
-        let (command, parsed, source) = match running {
-            Some(rc) => (rc.command, rc.parsed_cmd, rc.source),
-            None => (event_command, event_parsed, source),
+        let (command, display_label, parsed, source) = match running {
+            Some(rc) => (
+                rc.command,
+                rc.display_label.or(display_label),
+                rc.parsed_cmd,
+                rc.source,
+            ),
+            None => (event_command, display_label, event_parsed, source),
         };
         let parsed = self.annotate_skill_reads_in_parsed_cmd(parsed);
         let is_unified_exec_interaction =
@@ -417,6 +427,7 @@ impl ChatWidget {
                 let mut orphan = new_active_exec_command(
                     id.clone(),
                     command,
+                    display_label,
                     parsed,
                     source,
                     /*interaction_input*/ None,
@@ -434,6 +445,7 @@ impl ChatWidget {
                 let mut cell = new_active_exec_command(
                     id.clone(),
                     command,
+                    display_label,
                     parsed,
                     source,
                     /*interaction_input*/ None,

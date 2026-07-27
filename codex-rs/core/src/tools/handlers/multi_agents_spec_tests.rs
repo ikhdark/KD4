@@ -93,7 +93,8 @@ fn spawn_agent_tool_v2_exposes_typed_assignments_and_lists_visible_models() {
             .get("fork_turns")
             .and_then(|schema| schema.description.as_deref())
             .is_some_and(|description| {
-                description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE)
+                description.contains("Defaults to `none`.")
+                    && description.contains(SPAWN_AGENT_V2_FULL_HISTORY_OVERRIDE_GUIDANCE)
             })
     );
     assert!(!properties.contains_key("items"));
