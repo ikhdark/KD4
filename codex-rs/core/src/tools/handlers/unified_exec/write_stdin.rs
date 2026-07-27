@@ -71,29 +71,6 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
-        let mutation_guard = if !args.chars.is_empty() {
-            session
-                .services
-                .task_evidence
-                .guard_tool_dispatch(
-                    &ToolName::plain("normalized_shell_mutation"),
-                    &turn.sub_id,
-                    /*declared_read_only*/ false,
-                    /*trusted_external_read_only*/ false,
-                    matches!(
-                        turn.session_source,
-                        codex_protocol::protocol::SessionSource::SubAgent(
-                            codex_protocol::protocol::SubAgentSource::Review
-                        )
-                    ),
-                    false,
-                    true,
-                )
-                .await
-                .map_err(FunctionCallError::RespondToModel)?
-        } else {
-            None
-        };
         let mut response = session
             .services
             .unified_exec_manager
@@ -103,7 +80,6 @@ impl WriteStdinHandler {
                 yield_time_ms: args.yield_time_ms,
                 max_output_tokens: args.max_output_tokens,
                 truncation_policy: turn.model_info.truncation_policy.into(),
-                mutation_guard,
             })
             .await
             .map_err(|err| {

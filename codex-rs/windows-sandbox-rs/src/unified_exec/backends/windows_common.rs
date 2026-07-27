@@ -93,7 +93,7 @@ pub(crate) fn start_runner_stdout_reader(
                         &stdout_tx,
                         stderr_tx.as_ref(),
                     );
-                    finish_runner_transport_failure(exit_tx);
+                    let _ = exit_tx.send(-1);
                     break;
                 }
                 Err(err) => {
@@ -102,7 +102,7 @@ pub(crate) fn start_runner_stdout_reader(
                         &stdout_tx,
                         stderr_tx.as_ref(),
                     );
-                    finish_runner_transport_failure(exit_tx);
+                    let _ = exit_tx.send(-1);
                     break;
                 }
             };
@@ -130,7 +130,7 @@ pub(crate) fn start_runner_stdout_reader(
                 }
                 Message::Error { payload } => {
                     send_runner_error(&payload.message, &stdout_tx, stderr_tx.as_ref());
-                    finish_runner_transport_failure(exit_tx);
+                    let _ = exit_tx.send(-1);
                     break;
                 }
                 Message::SpawnReady { .. }
@@ -142,14 +142,6 @@ pub(crate) fn start_runner_stdout_reader(
             }
         }
     });
-}
-
-fn finish_runner_transport_failure(exit_tx: oneshot::Sender<i32>) {
-    // Closing the driver channel preserves the legacy synthetic `-1` process
-    // state while remaining distinguishable from a runner Exit frame. A
-    // session promoted to strict containment later must never mistake a
-    // transport failure for Job-empty acknowledgement.
-    drop(exit_tx);
 }
 
 pub(crate) fn make_runner_resizer(
@@ -180,30 +172,5 @@ fn send_runner_error(
         let _ = stderr_tx.send(formatted);
     } else {
         let _ = stdout_tx.send(formatted);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::finish_runner_transport_failure;
-    use tokio::sync::oneshot;
-
-    #[tokio::test]
-    async fn contained_transport_failure_does_not_acknowledge_exit() {
-        let (exit_tx, exit_rx) = oneshot::channel();
-        finish_runner_transport_failure(exit_tx);
-
-        assert!(
-            exit_rx.await.is_err(),
-            "transport closure must not send an Exit acknowledgement"
-        );
-    }
-
-    #[tokio::test]
-    async fn uncontained_transport_failure_closes_the_driver_exit_channel() {
-        let (exit_tx, exit_rx) = oneshot::channel();
-        finish_runner_transport_failure(exit_tx);
-
-        assert!(exit_rx.await.is_err());
     }
 }

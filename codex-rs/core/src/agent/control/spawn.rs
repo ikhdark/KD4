@@ -467,8 +467,6 @@ impl AgentControl {
         let parent_thread_id = initial_history
             .get_resumed_parent_thread_id()
             .or(stored_parent_thread_id);
-        self.ensure_persisted_spawn_edge_open(state, parent_thread_id, thread_id)
-            .await?;
         let inherited_environments = self
             .inherited_environments_for_source(state, Some(&session_source))
             .await;
@@ -489,22 +487,6 @@ impl AgentControl {
             .await
         {
             Ok(reloaded_thread) => {
-                if let Err(err) = self
-                    .ensure_persisted_spawn_edge_open(state, parent_thread_id, thread_id)
-                    .await
-                {
-                    drop(residency_slot);
-                    let shutdown_result = self.shutdown_live_agent(thread_id).await;
-                    return match shutdown_result {
-                        Ok(_)
-                        | Err(CodexErr::ThreadNotFound(_))
-                        | Err(CodexErr::InternalAgentDied) => Err(err),
-                        Err(shutdown_err) => Err(CodexErr::Fatal(format!(
-                            "descendant agent {thread_id} was closed during cold load ({err}); \
-                             cleanup failed ({shutdown_err})"
-                        ))),
-                    };
-                }
                 residency_slot.commit(reloaded_thread.thread_id);
                 state.notify_thread_created(reloaded_thread.thread_id);
                 Ok(())
@@ -519,37 +501,6 @@ impl AgentControl {
                 }
                 Err(err)
             }
-        }
-    }
-
-    async fn ensure_persisted_spawn_edge_open(
-        &self,
-        state: &Arc<ThreadManagerState>,
-        parent_thread_id: Option<ThreadId>,
-        thread_id: ThreadId,
-    ) -> CodexResult<()> {
-        let (Some(parent_thread_id), Some(agent_graph_store)) =
-            (parent_thread_id, state.agent_graph_store())
-        else {
-            return Ok(());
-        };
-        let open_children = agent_graph_store
-            .list_thread_spawn_children(
-                parent_thread_id,
-                Some(codex_agent_graph_store::ThreadSpawnEdgeStatus::Open),
-            )
-            .await
-            .map_err(|err| {
-                CodexErr::Fatal(format!(
-                    "failed to verify persisted spawn-edge status for agent {thread_id}: {err}"
-                ))
-            })?;
-        if open_children.contains(&thread_id) {
-            Ok(())
-        } else {
-            Err(CodexErr::UnsupportedOperation(format!(
-                "cannot load descendant agent {thread_id}: its persisted spawn edge is closed"
-            )))
         }
     }
 
@@ -650,10 +601,6 @@ impl AgentControl {
                 .inherited_exec_policy_for_source(&state, session_source.as_ref(), &config)
                 .await,
         };
-        let subagent_budget_reservation = self
-            .rollout_budget()
-            .try_reserve_subagent_spawn()
-            .map_err(|()| CodexErr::SessionBudgetExceeded)?;
 
         // The same `AgentControl` is sent to spawn the thread.
         let new_thread = match (session_source, options.fork_mode.as_ref(), inheritance) {
@@ -759,10 +706,6 @@ impl AgentControl {
                 last_task_message_from_communication(communication)
             }
         };
-        agent_metadata.last_task_message = initial_last_task_message;
-        if let Err(err) = reservation.commit(agent_metadata.clone()) {
-            return Err(pending_cleanup.rollback(err).await);
-        }
         #[cfg(test)]
         self.pause_before_initial_submission_for_test().await;
         let initial_submission_result = match initial_input {
@@ -789,13 +732,15 @@ impl AgentControl {
         if let Err(err) = initial_submission_result {
             return Err(pending_cleanup.rollback(err).await);
         }
+        agent_metadata.last_task_message = initial_last_task_message;
+        if let Err(err) = reservation.commit(agent_metadata.clone()) {
+            return Err(pending_cleanup.rollback(err).await);
+        }
         if let Some(residency_slot) = residency_slot {
             residency_slot.commit(new_thread.thread_id);
         }
-        subagent_budget_reservation.commit();
 
-        // Registration makes the child path-addressable before initial submission so task
-        // closure can seal it. Notify observers only after the initial work is queued.
+        // Notify only after the initial work is queued and the child becomes path-addressable.
         state.notify_thread_created(new_thread.thread_id);
         pending_cleanup.disarm();
 

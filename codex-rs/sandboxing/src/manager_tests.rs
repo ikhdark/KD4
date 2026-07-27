@@ -373,38 +373,6 @@ fn wsl1_rejects_linux_bubblewrap_path() {
     ));
 }
 
-#[test]
-fn linux_bubblewrap_selection_matches_effective_policy_and_proxy_mode() {
-    let unrestricted = FileSystemSandboxPolicy::unrestricted();
-    let restricted = FileSystemSandboxPolicy::restricted(vec![FileSystemSandboxEntry {
-        path: FileSystemPath::Special {
-            value: FileSystemSpecialPath::Root,
-        },
-        access: FileSystemAccessMode::Read,
-    }]);
-
-    assert!(!super::linux_sandbox_uses_bubblewrap(
-        &unrestricted,
-        /*use_legacy_landlock*/ false,
-        /*allow_network_for_proxy*/ false,
-    ));
-    assert!(super::linux_sandbox_uses_bubblewrap(
-        &unrestricted,
-        /*use_legacy_landlock*/ true,
-        /*allow_network_for_proxy*/ true,
-    ));
-    assert!(super::linux_sandbox_uses_bubblewrap(
-        &restricted,
-        /*use_legacy_landlock*/ false,
-        /*allow_network_for_proxy*/ false,
-    ));
-    assert!(!super::linux_sandbox_uses_bubblewrap(
-        &restricted,
-        /*use_legacy_landlock*/ true,
-        /*allow_network_for_proxy*/ false,
-    ));
-}
-
 #[cfg(target_os = "linux")]
 #[test]
 fn wsl1_allows_non_bubblewrap_linux_paths() {

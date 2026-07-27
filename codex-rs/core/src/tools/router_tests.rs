@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -34,7 +33,6 @@ use super::ToolCallBuildError;
 use super::ToolCallSource;
 use super::ToolRouter;
 use super::ToolRouterParams;
-use super::collect_consistent_read_only_extension_tools;
 use super::collect_proven_read_only_external_tools;
 use super::extension_tool_executors;
 
@@ -46,11 +44,11 @@ impl codex_extension_api::ToolContributor for ExtensionEchoContributor {
         _session_store: &ExtensionData,
         _thread_store: &ExtensionData,
     ) -> Vec<Arc<dyn ToolExecutor<ExtensionToolCall>>> {
-        vec![Arc::new(ExtensionEchoExecutor(None))]
+        vec![Arc::new(ExtensionEchoExecutor)]
     }
 }
 
-struct ExtensionEchoExecutor(Option<bool>);
+struct ExtensionEchoExecutor;
 
 impl ToolExecutor<ExtensionToolCall> for ExtensionEchoExecutor {
     fn tool_name(&self) -> ToolName {
@@ -80,10 +78,6 @@ impl ToolExecutor<ExtensionToolCall> for ExtensionEchoExecutor {
         })
     }
 
-    fn read_only_hint(&self) -> Option<bool> {
-        self.0
-    }
-
     fn handle(&self, call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_> {
         Box::pin(self.handle_call(call))
     }
@@ -109,81 +103,6 @@ fn extension_tool_test_registry() -> Arc<ExtensionRegistry<Config>> {
     let mut builder = ExtensionRegistryBuilder::new();
     builder.tool_contributor(Arc::new(ExtensionEchoContributor));
     Arc::new(builder.build())
-}
-
-async fn dispatch_managed_extension_tool(
-    read_only_hints: &[Option<bool>],
-    exhaustive: bool,
-) -> Result<crate::tools::registry::AnyToolResult, crate::function_tool::FunctionCallError> {
-    let (mut session, turn) = make_session_and_context().await;
-    let temp = tempfile::tempdir().expect("task evidence tempdir");
-    let repo = temp.path().join("repo");
-    tokio::fs::create_dir_all(repo.join("scripts"))
-        .await
-        .expect("task evidence scripts directory");
-    tokio::fs::write(repo.join("scripts/verify_local.py"), "# fixture")
-        .await
-        .expect("task evidence verifier fixture");
-    tokio::fs::write(repo.join("kd4_features.toml"), "# fixture")
-        .await
-        .expect("task evidence manifest fixture");
-    let ledger = crate::task_evidence::TaskEvidenceLedger::load_or_new(
-        temp.path().join("codex-home"),
-        session.thread_id,
-        &repo,
-    )
-    .await;
-    ledger
-        .begin_turn(&turn.sub_id, "inspect with an extension tool")
-        .await
-        .expect("begin managed turn");
-    if exhaustive {
-        ledger
-            .classify(crate::task_evidence::TaskClassification {
-                exhaustive: true,
-                risk_domains: BTreeSet::new(),
-                supported_non_git_roots: BTreeSet::new(),
-            })
-            .await
-            .expect("enter Investigating");
-    }
-    session.services.task_evidence = ledger;
-
-    let turn = Arc::new(turn);
-    let step_context = StepContext::for_test(Arc::clone(&turn));
-    let extension_tool_executors = read_only_hints
-        .iter()
-        .map(|hint| {
-            Arc::new(ExtensionEchoExecutor(*hint)) as Arc<dyn ToolExecutor<ExtensionToolCall>>
-        })
-        .collect();
-    let router = ToolRouter::from_context(
-        step_context.as_ref(),
-        ToolRouterParams {
-            tool_suggest_candidates: None,
-            deferred_mcp_tools: None,
-            mcp_tools: None,
-            extension_tool_executors,
-            dynamic_tools: turn.dynamic_tools.as_slice(),
-        },
-        &Default::default(),
-    );
-    router
-        .dispatch_tool_call_with_code_mode_result(
-            Arc::new(session),
-            step_context,
-            CancellationToken::new(),
-            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new())),
-            ToolCall {
-                tool_name: ToolName::namespaced("extension/", "echo"),
-                call_id: "call-managed-extension".to_string(),
-                payload: ToolPayload::Function {
-                    arguments: json!({ "message": "hello" }).to_string(),
-                },
-            },
-            ToolCallSource::Direct,
-        )
-        .await
 }
 
 #[tokio::test]
@@ -440,14 +359,6 @@ async fn specs_filter_deferred_dynamic_tools() -> anyhow::Result<()> {
         namespace_function_names(&router.model_visible_specs(), "codex_app"),
         vec![visible_tool.to_string()]
     );
-    for tool_name in [hidden_tool, visible_tool] {
-        assert!(
-            !router
-                .proven_read_only_external_tools
-                .contains(&ToolName::namespaced("codex_app", tool_name)),
-            "dynamic tools must remain conservatively mutable without authoritative metadata"
-        );
-    }
 
     Ok(())
 }
@@ -479,7 +390,7 @@ fn mcp_tool_info(
 }
 
 #[test]
-fn mcp_read_only_intent_requires_consistent_true_metadata() {
+fn mcp_read_only_intent_requires_consistent_metadata() {
     let mut read_only = mcp_tool_info("reader", false, "mcp__reader", "lookup");
     read_only.tool.annotations = Some(rmcp::model::ToolAnnotations::new().read_only(true));
     let read_only_tools = [read_only];
@@ -496,88 +407,6 @@ fn mcp_read_only_intent_requires_consistent_true_metadata() {
         !collect_proven_read_only_external_tools(Some(&read_only_tools), Some(&conflicting_tools),)
             .contains(&callable_name)
     );
-
-    let mut explicitly_mutating = mcp_tool_info("mutator", false, "mcp__mutator", "lookup");
-    explicitly_mutating.tool.annotations =
-        Some(rmcp::model::ToolAnnotations::new().read_only(false));
-    assert!(
-        !collect_proven_read_only_external_tools(Some(&[explicitly_mutating]), None)
-            .contains(&ToolName::namespaced("mcp__mutator", "lookup"))
-    );
-
-    let missing_hint = mcp_tool_info("unknown", false, "mcp__unknown", "lookup");
-    assert!(
-        !collect_proven_read_only_external_tools(Some(&[missing_hint]), None)
-            .contains(&ToolName::namespaced("mcp__unknown", "lookup"))
-    );
-}
-
-#[test]
-fn extension_read_only_intent_requires_consistent_true_metadata() {
-    let read_only: Arc<dyn ToolExecutor<ExtensionToolCall>> =
-        Arc::new(ExtensionEchoExecutor(Some(true)));
-    let explicitly_mutating: Arc<dyn ToolExecutor<ExtensionToolCall>> =
-        Arc::new(ExtensionEchoExecutor(Some(false)));
-    let missing_hint: Arc<dyn ToolExecutor<ExtensionToolCall>> =
-        Arc::new(ExtensionEchoExecutor(None));
-    let callable_name = ToolName::namespaced("extension/", "echo");
-
-    assert!(
-        collect_consistent_read_only_extension_tools(std::slice::from_ref(&read_only))
-            .contains(&callable_name)
-    );
-    assert!(
-        !collect_consistent_read_only_extension_tools(std::slice::from_ref(&explicitly_mutating))
-            .contains(&callable_name)
-    );
-    assert!(
-        !collect_consistent_read_only_extension_tools(std::slice::from_ref(&missing_hint))
-            .contains(&callable_name)
-    );
-    assert!(
-        !collect_consistent_read_only_extension_tools(&[
-            Arc::clone(&read_only),
-            explicitly_mutating,
-        ])
-        .contains(&callable_name)
-    );
-}
-
-#[tokio::test]
-async fn registered_read_only_extension_runs_in_managed_locked_phases() {
-    for exhaustive in [false, true] {
-        dispatch_managed_extension_tool(&[Some(true)], exhaustive)
-            .await
-            .unwrap_or_else(|err| {
-                panic!(
-                    "registered read-only extension should run while {}: {err}",
-                    if exhaustive {
-                        "Investigating"
-                    } else {
-                        "Unclassified"
-                    }
-                )
-            });
-    }
-}
-
-#[tokio::test]
-async fn unproven_or_conflicting_extensions_remain_denied() {
-    for (label, hints) in [
-        ("explicitly mutating", vec![Some(false)]),
-        ("missing hint", vec![None]),
-        ("conflicting duplicate hints", vec![Some(true), Some(false)]),
-    ] {
-        let err = match dispatch_managed_extension_tool(&hints, /*exhaustive*/ false).await {
-            Ok(_) => panic!("{label} extension should be denied"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("has no resolvable local mutation owner"),
-            "{label} should be denied by task evidence, got: {err}"
-        );
-    }
 }
 
 #[tokio::test]

@@ -35,6 +35,7 @@ use codex_protocol::protocol::HookSource;
 use codex_protocol::protocol::HookStartedEvent;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use codex_thread_store::ReadThreadParams;
 use serde_json::Value;
 use tracing::instrument;
 
@@ -126,14 +127,11 @@ pub(crate) async fn run_pending_session_start_hooks(
                 source: session_start_source,
             },
         };
-        let transcript_path =
-            protected_final_safe_hook_transcript_path(sess, sess.hook_transcript_path().await)
-                .await;
         let request = codex_hooks::SessionStartRequest {
             session_id: sess.session_id().into(),
             #[allow(deprecated)]
             cwd: turn_context.cwd.clone(),
-            transcript_path,
+            transcript_path: sess.hook_transcript_path().await,
             model: turn_context.model_info.slug.clone(),
             permission_mode: hook_permission_mode(turn_context),
             target,
@@ -169,15 +167,13 @@ pub(crate) async fn run_pre_tool_use_hooks(
     tool_name: &HookToolName,
     tool_input: &Value,
 ) -> PreToolUseHookResult {
-    let transcript_path =
-        protected_final_safe_hook_transcript_path(sess, sess.hook_transcript_path().await).await;
     let request = PreToolUseRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
         subagent: thread_spawn_subagent_hook_context(sess, turn_context),
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
-        transcript_path,
+        transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
         tool_name: tool_name.name().to_string(),
@@ -232,15 +228,13 @@ pub(crate) async fn run_permission_request_hooks(
     run_id_suffix: &str,
     payload: PermissionRequestPayload,
 ) -> Option<PermissionRequestDecision> {
-    let transcript_path =
-        protected_final_safe_hook_transcript_path(sess, sess.hook_transcript_path().await).await;
     let request = PermissionRequestRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
         subagent: thread_spawn_subagent_hook_context(sess, turn_context),
         #[allow(deprecated)]
         cwd: turn_context.cwd.to_path_buf(),
-        transcript_path,
+        transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
         tool_name: payload.tool_name.name().to_string(),
@@ -276,15 +270,13 @@ pub(crate) async fn run_post_tool_use_hooks(
     tool_input: Value,
     tool_response: Value,
 ) -> PostToolUseOutcome {
-    let transcript_path =
-        protected_final_safe_hook_transcript_path(sess, sess.hook_transcript_path().await).await;
     let request = PostToolUseRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
         subagent: thread_spawn_subagent_hook_context(sess, turn_context),
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
-        transcript_path,
+        transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         permission_mode: hook_permission_mode(turn_context),
         tool_name,
@@ -308,37 +300,52 @@ pub(crate) async fn run_turn_stop_hooks(
     turn_context: &Arc<TurnContext>,
     stop_hook_active: bool,
     last_assistant_message: Option<String>,
-    provisional_final_pending: bool,
 ) -> StopOutcome {
     // Resolve the stop hook kind from the session source before building the
     // request. Root turns run Stop; thread-spawned child turns run SubagentStop.
     let (target, transcript_path) = match &turn_context.session_source {
-        SessionSource::SubAgent(SubAgentSource::ThreadSpawn { agent_role, .. }) => {
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            agent_role,
+            parent_thread_id,
+            ..
+        }) => {
             let context = subagent_hook_context(sess, agent_role);
-            let agent_transcript_path =
-                protected_final_safe_hook_transcript_path(sess, sess.hook_transcript_path().await)
-                    .await;
-            // This child session cannot certify that its parent's rollout has no
-            // protected provisional final, so fail closed instead of exposing it.
+            let agent_transcript_path = sess.hook_transcript_path().await;
+            let parent_transcript_path = match sess
+                .services
+                .thread_store
+                .read_thread(ReadThreadParams {
+                    thread_id: *parent_thread_id,
+                    include_archived: true,
+                    include_history: false,
+                })
+                .await
+            {
+                Ok(thread) => thread.rollout_path,
+                Err(error) => {
+                    tracing::warn!(
+                        parent_thread_id = %parent_thread_id,
+                        error = %error,
+                        "failed to resolve parent transcript path for subagent hook"
+                    );
+                    None
+                }
+            };
             (
                 StopHookTarget::SubagentStop {
                     agent_id: context.agent_id,
                     agent_type: context.agent_type,
                     agent_transcript_path,
                 },
-                None,
+                parent_transcript_path,
             )
         }
         // Internal/synthetic subagents do not expose user-configured lifecycle
         // hooks, so there is no Stop or SubagentStop request to dispatch.
         SessionSource::SubAgent(_) => return StopOutcome::default(),
-        _ => (
-            StopHookTarget::Stop,
-            protected_final_safe_hook_transcript_path(sess, sess.hook_transcript_path().await)
-                .await,
-        ),
+        _ => (StopHookTarget::Stop, sess.hook_transcript_path().await),
     };
-    let mut request = codex_hooks::StopRequest {
+    let request = codex_hooks::StopRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
         #[allow(deprecated)]
@@ -350,17 +357,6 @@ pub(crate) async fn run_turn_stop_hooks(
         last_assistant_message,
         target,
     };
-    if provisional_final_pending {
-        redact_provisional_final_from_stop_request(&mut request);
-    } else if !sess
-        .services
-        .task_evidence
-        .protected_pending_final_item_ids()
-        .await
-        .is_empty()
-    {
-        redact_protected_final_transcripts_from_stop_request(&mut request);
-    }
     let hooks = sess.hooks();
     emit_hook_started_events(sess, turn_context, hooks.preview_stop(&request)).await;
 
@@ -369,60 +365,18 @@ pub(crate) async fn run_turn_stop_hooks(
     outcome
 }
 
-fn redact_provisional_final_from_stop_request(request: &mut codex_hooks::StopRequest) {
-    request.last_assistant_message = None;
-    redact_protected_final_transcripts_from_stop_request(request);
-}
-
-fn redact_protected_final_transcripts_from_stop_request(request: &mut codex_hooks::StopRequest) {
-    request.transcript_path = None;
-    if let StopHookTarget::SubagentStop {
-        agent_transcript_path,
-        ..
-    } = &mut request.target
-    {
-        *agent_transcript_path = None;
-    }
-}
-
-fn hook_transcript_without_protected_finals<T>(
-    transcript_path: Option<T>,
-    has_protected_finals: bool,
-) -> Option<T> {
-    if has_protected_finals {
-        None
-    } else {
-        transcript_path
-    }
-}
-
-async fn protected_final_safe_hook_transcript_path(
-    sess: &Session,
-    transcript_path: Option<std::path::PathBuf>,
-) -> Option<std::path::PathBuf> {
-    let has_protected_finals = !sess
-        .services
-        .task_evidence
-        .protected_pending_final_item_ids()
-        .await
-        .is_empty();
-    hook_transcript_without_protected_finals(transcript_path, has_protected_finals)
-}
-
 pub(crate) async fn run_pre_compact_hooks(
     sess: &Arc<Session>,
     turn_context: &Arc<TurnContext>,
     trigger: CompactionTrigger,
 ) -> PreCompactHookOutcome {
-    let transcript_path =
-        protected_final_safe_hook_transcript_path(sess, sess.hook_transcript_path().await).await;
     let request = codex_hooks::PreCompactRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
         subagent: thread_spawn_subagent_hook_context(sess, turn_context),
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
-        transcript_path,
+        transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         trigger: compaction_trigger_label(trigger).to_string(),
     };
@@ -453,15 +407,13 @@ pub(crate) async fn run_post_compact_hooks(
     turn_context: &Arc<TurnContext>,
     trigger: CompactionTrigger,
 ) -> PostCompactHookOutcome {
-    let transcript_path =
-        protected_final_safe_hook_transcript_path(sess, sess.hook_transcript_path().await).await;
     let request = codex_hooks::PostCompactRequest {
         session_id: sess.session_id().into(),
         turn_id: turn_context.sub_id.clone(),
         subagent: thread_spawn_subagent_hook_context(sess, turn_context),
         #[allow(deprecated)]
         cwd: turn_context.cwd.clone(),
-        transcript_path,
+        transcript_path: sess.hook_transcript_path().await,
         model: turn_context.model_info.slug.clone(),
         trigger: compaction_trigger_label(trigger).to_string(),
     };
@@ -552,16 +504,13 @@ pub(crate) async fn inspect_pending_input(
 ) -> HookRuntimeOutcome {
     match pending_input_item {
         TurnInput::UserInput { content, .. } => {
-            let transcript_path =
-                protected_final_safe_hook_transcript_path(sess, sess.hook_transcript_path().await)
-                    .await;
             let request = UserPromptSubmitRequest {
                 session_id: sess.session_id().into(),
                 turn_id: turn_context.sub_id.clone(),
                 subagent: thread_spawn_subagent_hook_context(sess, turn_context),
                 #[allow(deprecated)]
                 cwd: turn_context.cwd.clone(),
-                transcript_path,
+                transcript_path: sess.hook_transcript_path().await,
                 model: turn_context.model_info.slug.clone(),
                 permission_mode: hook_permission_mode(turn_context),
                 prompt: UserMessageItem::new(content).message(),
@@ -839,97 +788,11 @@ mod tests {
     use super::additional_context_messages;
     use super::hook_run_analytics_payload;
     use super::hook_run_metric_tags;
-    use super::hook_transcript_without_protected_finals;
-    use super::protected_final_safe_hook_transcript_path;
-    use super::redact_provisional_final_from_stop_request;
     use crate::session::tests::make_session_and_context;
-    use codex_hooks::StopHookTarget;
-    use codex_hooks::StopRequest;
     use codex_protocol::protocol::HookCompletedEvent;
     use codex_protocol::protocol::HookRunSummary;
     use codex_utils_absolute_path::test_support::PathBufExt;
     use codex_utils_absolute_path::test_support::test_path_buf;
-
-    #[tokio::test]
-    async fn provisional_final_is_redacted_from_precommit_stop_hook_request() {
-        let (session, turn_context) = make_session_and_context().await;
-        let mut request = StopRequest {
-            session_id: session.thread_id,
-            turn_id: turn_context.sub_id.clone(),
-            #[allow(deprecated)]
-            cwd: turn_context.cwd.clone(),
-            transcript_path: Some(std::path::PathBuf::from("parent-rollout.jsonl")),
-            model: turn_context.model_info.slug.clone(),
-            permission_mode: "default".to_string(),
-            stop_hook_active: false,
-            last_assistant_message: Some("provisional final".to_string()),
-            target: StopHookTarget::SubagentStop {
-                agent_id: "agent".to_string(),
-                agent_type: "worker".to_string(),
-                agent_transcript_path: Some(std::path::PathBuf::from("agent-rollout.jsonl")),
-            },
-        };
-
-        redact_provisional_final_from_stop_request(&mut request);
-
-        assert_eq!(request.last_assistant_message, None);
-        assert_eq!(request.transcript_path, None);
-        let StopHookTarget::SubagentStop {
-            agent_transcript_path,
-            ..
-        } = request.target
-        else {
-            panic!("expected subagent stop target");
-        };
-        assert_eq!(agent_transcript_path, None);
-    }
-
-    #[test]
-    fn compaction_hook_transcript_is_omitted_while_provisional_final_is_protected() {
-        let transcript_path = Some(std::path::PathBuf::from("rollout.jsonl"));
-
-        assert_eq!(
-            hook_transcript_without_protected_finals(transcript_path.clone(), true),
-            None
-        );
-        assert_eq!(
-            hook_transcript_without_protected_finals(transcript_path.clone(), false),
-            transcript_path
-        );
-    }
-
-    #[tokio::test]
-    async fn shared_hook_transcript_helper_uses_persisted_pending_final_state() {
-        let (mut session, turn_context) = make_session_and_context().await;
-        let task_home = tempfile::tempdir().expect("create task evidence home");
-        let repository = tempfile::tempdir().expect("create task repository");
-        session.services.task_evidence = crate::task_evidence::TaskEvidenceLedger::load_or_new(
-            task_home.path().to_path_buf(),
-            session.thread_id,
-            repository.path(),
-        )
-        .await;
-        session
-            .services
-            .task_evidence
-            .begin_turn(&turn_context.sub_id, "hook transcript redaction")
-            .await
-            .expect("begin managed task turn");
-        session
-            .services
-            .task_evidence
-            .authorize_final_item(&turn_context.sub_id, "protected-final")
-            .await
-            .expect("reserve protected final");
-
-        let transcript_path = protected_final_safe_hook_transcript_path(
-            &session,
-            Some(std::path::PathBuf::from("rollout.jsonl")),
-        )
-        .await;
-
-        assert_eq!(transcript_path, None);
-    }
 
     #[test]
     fn additional_context_messages_stay_separate_and_ordered() {

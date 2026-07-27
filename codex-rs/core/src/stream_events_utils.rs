@@ -111,11 +111,8 @@ pub(crate) async fn record_completed_response_item(
         turn_context,
         item,
         /*finalized_facts*/ None,
-        /*suppress_external_effects*/ false,
-        /*require_durable_persistence*/ false,
     )
-    .await
-    .expect("ordinary response-item recording is infallible");
+    .await;
 }
 
 pub(crate) async fn record_completed_response_item_with_finalized_facts(
@@ -123,24 +120,9 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
     turn_context: &TurnContext,
     item: &ResponseItem,
     finalized_facts: Option<&FinalizedTurnItemFacts>,
-    suppress_external_effects: bool,
-    require_durable_persistence: bool,
-) -> std::result::Result<bool, String> {
-    let persisted = if suppress_external_effects {
-        sess.record_conversation_items_for_model_history_and_rollout_only(
-            turn_context,
-            std::slice::from_ref(item),
-        )
-        .await
-    } else if require_durable_persistence {
-        sess.record_conversation_items_checked(turn_context, std::slice::from_ref(item))
-            .await?;
-        true
-    } else {
-        sess.record_conversation_items(turn_context, std::slice::from_ref(item))
-            .await;
-        true
-    };
+) {
+    sess.record_conversation_items(turn_context, std::slice::from_ref(item))
+        .await;
     let defers_mailbox_delivery = finalized_facts.map_or_else(
         || {
             completed_item_defers_mailbox_delivery_to_next_turn(
@@ -150,7 +132,7 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
         },
         |facts| facts.defers_mailbox_delivery_to_next_turn,
     );
-    if defers_mailbox_delivery && !suppress_external_effects {
+    if defers_mailbox_delivery {
         sess.input_queue
             .defer_mailbox_delivery_to_next_turn(&sess.active_turn, &turn_context.sub_id)
             .await;
@@ -172,7 +154,6 @@ pub(crate) async fn record_completed_response_item_with_finalized_facts(
         sess.record_memory_citation_for_turn(&turn_context.sub_id)
             .await;
     }
-    Ok(persisted)
 }
 
 fn response_item_may_include_external_context(item: &ResponseItem) -> bool {
@@ -241,11 +222,8 @@ pub(crate) type InFlightFuture<'f> =
 #[derive(Default)]
 pub(crate) struct OutputItemResult {
     pub last_agent_message: Option<String>,
-    pub last_agent_message_item_id: Option<String>,
     pub needs_follow_up: bool,
     pub tool_future: Option<InFlightFuture<'static>>,
-    pub provisional_history_persisted: bool,
-    pub turn_item_completed: bool,
 }
 
 pub(crate) struct HandleOutputCtx {
@@ -263,12 +241,10 @@ pub(crate) async fn apply_turn_item_contributors(
 ) {
     let contributors = sess.services.extensions.turn_item_contributors().to_vec();
     for contributor in contributors {
-        let item_before_contribution = item.clone();
         if let Err(err) = contributor
             .contribute(&sess.services.thread_extension_data, turn_store, item)
             .await
         {
-            *item = item_before_contribution;
             warn!("turn item contributor failed: {err}");
         }
     }
@@ -284,7 +260,7 @@ pub(crate) struct FinalizedTurnItem {
     pub(crate) facts: FinalizedTurnItemFacts,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct FinalizedTurnItemFacts {
     pub(crate) memory_citation: Option<MemoryCitation>,
     pub(crate) last_agent_message: Option<String>,
@@ -340,9 +316,6 @@ pub(crate) async fn handle_output_item_done(
     ctx: &mut HandleOutputCtx,
     item: ResponseItem,
     previously_active_item: Option<TurnItem>,
-    suppress_external_effects: bool,
-    require_durable_lifecycle: bool,
-    prefinalized_non_tool_item: Option<FinalizedTurnItem>,
 ) -> Result<OutputItemResult> {
     let mut output = OutputItemResult::default();
     let plan_mode = ctx.turn_context.collaboration_mode.mode == ModeKind::Plan;
@@ -381,107 +354,36 @@ pub(crate) async fn handle_output_item_done(
         }
         // No tool call: convert messages/reasoning into turn items and mark them as complete.
         Ok(None) => {
-            let finalized_turn_item = match prefinalized_non_tool_item {
-                Some(finalized_turn_item) => Some(finalized_turn_item),
-                None => {
-                    finalize_non_tool_response_item(
-                        ctx.sess.as_ref(),
-                        TurnItemContributorPolicy::Run(ctx.turn_store.as_ref()),
-                        &item,
-                        plan_mode,
-                    )
-                    .await
-                }
-            };
+            let finalized_turn_item = finalize_non_tool_response_item(
+                ctx.sess.as_ref(),
+                TurnItemContributorPolicy::Run(ctx.turn_store.as_ref()),
+                &item,
+                plan_mode,
+            )
+            .await;
             let finalized_facts = finalized_turn_item
                 .as_ref()
                 .map(|finalized| finalized.facts.clone());
             if let Some(finalized_turn_item) = finalized_turn_item {
-                if require_durable_lifecycle
-                    && !matches!(
-                        &finalized_turn_item.turn_item,
-                        TurnItem::AgentMessage(agent_message)
-                            if Some(agent_message.id.as_str()) == item.id()
-                                && !matches!(
-                                    agent_message.phase,
-                                    Some(MessagePhase::Commentary)
-                                )
-                    )
-                {
-                    return Err(codex_protocol::error::CodexErr::InvalidRequest(
-                        "final turn-item contributors changed the committed item identity or finality"
-                            .to_string(),
-                    ));
-                }
-                let finalized_item_id = finalized_turn_item.turn_item.id();
-                if previously_active_item.is_none() && !suppress_external_effects {
+                if previously_active_item.is_none() {
                     ctx.sess
                         .emit_turn_item_started(&ctx.turn_context, &finalized_turn_item.turn_item)
                         .await;
                 }
 
-                output.provisional_history_persisted =
-                    record_completed_response_item_with_finalized_facts(
-                        ctx.sess.as_ref(),
-                        ctx.turn_context.as_ref(),
-                        &item,
-                        finalized_facts.as_ref(),
-                        suppress_external_effects,
-                        require_durable_lifecycle,
-                    )
-                    .await
-                    .map_err(codex_protocol::error::CodexErr::InvalidRequest)?;
-                if require_durable_lifecycle {
-                    let item_id = item.id().ok_or_else(|| {
-                        codex_protocol::error::CodexErr::InvalidRequest(
-                            "committed final response is missing its item identity".to_string(),
-                        )
-                    })?;
-                    ctx.sess
-                        .services
-                        .task_evidence
-                        .mark_final_item_persisted(&ctx.turn_context.sub_id, item_id, &item)
-                        .await
-                        .map_err(codex_protocol::error::CodexErr::InvalidRequest)?;
-                }
-                if !suppress_external_effects {
-                    if require_durable_lifecycle {
-                        ctx.sess
-                            .emit_turn_item_completed_checked(
-                                &ctx.turn_context,
-                                finalized_turn_item.turn_item,
-                            )
-                            .await
-                            .map_err(codex_protocol::error::CodexErr::InvalidRequest)?;
-                    } else {
-                        ctx.sess
-                            .emit_turn_item_completed(
-                                &ctx.turn_context,
-                                finalized_turn_item.turn_item,
-                            )
-                            .await;
-                    }
-                    output.turn_item_completed = true;
-                    output.last_agent_message_item_id = Some(finalized_item_id);
-                }
-            } else {
-                output.provisional_history_persisted =
-                    record_completed_response_item_with_finalized_facts(
-                        ctx.sess.as_ref(),
-                        ctx.turn_context.as_ref(),
-                        &item,
-                        finalized_facts.as_ref(),
-                        suppress_external_effects,
-                        require_durable_lifecycle,
-                    )
-                    .await
-                    .map_err(codex_protocol::error::CodexErr::InvalidRequest)?;
+                ctx.sess
+                    .emit_turn_item_completed(&ctx.turn_context, finalized_turn_item.turn_item)
+                    .await;
             }
+            record_completed_response_item_with_finalized_facts(
+                ctx.sess.as_ref(),
+                ctx.turn_context.as_ref(),
+                &item,
+                finalized_facts.as_ref(),
+            )
+            .await;
 
-            if !suppress_external_effects {
-                output.last_agent_message =
-                    finalized_facts.and_then(|facts| facts.last_agent_message);
-            }
+            output.last_agent_message = finalized_facts.and_then(|facts| facts.last_agent_message);
         }
         // Preserve the tool-search response shape and call ID when argument parsing fails.
         Err(ToolCallBuildError::ToolSearchArguments { call_id, .. }) => {

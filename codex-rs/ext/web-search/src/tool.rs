@@ -79,10 +79,6 @@ impl ToolExecutor<ToolCall> for WebSearchTool {
         true
     }
 
-    fn read_only_hint(&self) -> Option<bool> {
-        Some(true)
-    }
-
     fn handles_runtime_cancellation(&self) -> bool {
         true
     }

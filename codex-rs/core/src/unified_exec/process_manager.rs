@@ -1,9 +1,7 @@
-use futures::FutureExt;
 use rand::Rng;
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -257,40 +255,6 @@ async fn unregister_network_approval_for_entry(entry: &ProcessEntry) {
     }
 }
 
-fn spawn_process_entry_cleanup(entry: ProcessEntry) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        // The task owns the complete entry, including its mutation guard, so
-        // cancellation of whichever caller removed the entry cannot release
-        // mutation authority before containment teardown is acknowledged.
-        if entry.mutation_guard.is_some() || entry.process.strict_descendant_exit_required() {
-            let _ = entry.process.terminate_confirmed().await;
-        } else {
-            entry.process.terminate();
-        }
-        unregister_network_approval_for_entry(&entry).await;
-    })
-}
-
-fn spawn_mutation_guard_exit_watcher(
-    process_store: Arc<tokio::sync::Mutex<ProcessStore>>,
-    process: Arc<UnifiedExecProcess>,
-    process_id: i32,
-) {
-    tokio::spawn(async move {
-        process.cancellation_token().cancelled().await;
-        process.wait_for_confirmed_exit().await;
-        let mutation_guard = {
-            let mut store = process_store.lock().await;
-            store
-                .processes
-                .get_mut(&process_id)
-                .filter(|entry| Arc::ptr_eq(&entry.process, &process))
-                .and_then(|entry| entry.mutation_guard.take())
-        };
-        drop(mutation_guard);
-    });
-}
-
 async fn finish_network_approval_after_process_exit_for_entry(
     entry: &ProcessEntry,
 ) -> Result<(), String> {
@@ -369,27 +333,6 @@ fn fail_process_with_message(process: &UnifiedExecProcess, message: String) -> U
 
     process.fail_and_terminate(message.clone());
     UnifiedExecError::process_failed(process.failure_message().unwrap_or(message))
-}
-
-fn require_contained_stdin_mutation(
-    mutation_guard_present: bool,
-    descendant_containment_established: bool,
-) -> Result<(), UnifiedExecError> {
-    if mutation_guard_present && !descendant_containment_established {
-        return Err(UnifiedExecError::DescendantContainmentUnavailable);
-    }
-    Ok(())
-}
-
-fn process_requires_store_adoption(process: &UnifiedExecProcess) -> bool {
-    if process.strict_descendant_exit_required() {
-        // Synthetic exit metadata from a failed driver transport is not a
-        // containment acknowledgement. Keep the process and mutation guard
-        // adopted until the backend positively confirms teardown.
-        !process.has_exited()
-    } else {
-        !process.has_exited() && process.exit_code().is_none()
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -509,7 +452,7 @@ impl UnifiedExecProcessManager {
             store.remove(process_id)
         };
         if let Some(entry) = removed {
-            let _ = spawn_process_entry_cleanup(entry).await;
+            unregister_network_approval_for_entry(&entry).await;
         }
     }
 
@@ -525,98 +468,15 @@ impl UnifiedExecProcessManager {
             .turn
             .turn_timing_state
             .begin_local_phase(TurnLocalPhase::ExecutorReadinessWait);
-        let launch = if let Some(launch_guard) = request.mutation_guard.clone() {
-            let manager = self.clone();
-            let launch_request = request.clone();
-            let launch_context = context.clone();
-            let launch_cwd = cwd.clone();
-            let (result_tx, result_rx) = tokio::sync::oneshot::channel::<
-                Result<
-                    (
-                        Arc<UnifiedExecProcess>,
-                        Option<DeferredNetworkApproval>,
-                        tokio::sync::oneshot::Sender<()>,
-                    ),
-                    UnifiedExecError,
-                >,
-            >();
-            tokio::spawn(async move {
-                let launched = AssertUnwindSafe(manager.open_session_with_sandbox(
-                    &launch_request,
-                    launch_cwd,
-                    &launch_context,
-                ))
-                .catch_unwind()
-                .await;
-                let launched = match launched {
-                    Ok(launched) => launched,
-                    Err(_) => {
-                        // The launch crossed an unknown panic boundary. Its
-                        // child state cannot be proven, so retain the detached
-                        // mutation lease permanently.
-                        std::future::pending::<
-                            Result<
-                                (UnifiedExecProcess, Option<DeferredNetworkApproval>),
-                                UnifiedExecError,
-                            >,
-                        >()
-                        .await
-                    }
-                };
-                match launched {
-                    Ok((process, deferred_network_approval)) => {
-                        let process = Arc::new(process);
-                        let (adopt_tx, adopt_rx) = tokio::sync::oneshot::channel();
-                        if result_tx
-                            .send(Ok((
-                                Arc::clone(&process),
-                                deferred_network_approval,
-                                adopt_tx,
-                            )))
-                            .is_err()
-                        {
-                            let _ = process.terminate_confirmed().await;
-                            drop(launch_guard);
-                            return;
-                        }
-                        if adopt_rx.await.is_err() {
-                            let _ = process.terminate_confirmed().await;
-                        }
-                        drop(launch_guard);
-                    }
-                    Err(err) => {
-                        let _ = result_tx.send(Err(err));
-                        drop(launch_guard);
-                    }
-                }
-            });
-            match result_rx.await {
-                Ok(result) => {
-                    result.map(|(process, deferred, adopt)| (process, deferred, Some(adopt)))
-                }
-                Err(_) => {
-                    std::future::pending::<
-                        Result<
-                            (
-                                Arc<UnifiedExecProcess>,
-                                Option<DeferredNetworkApproval>,
-                                Option<tokio::sync::oneshot::Sender<()>>,
-                            ),
-                            UnifiedExecError,
-                        >,
-                    >()
-                    .await
-                }
-            }
-        } else {
-            self.open_session_with_sandbox(&request, cwd.clone(), context)
-                .await
-                .map(|(process, deferred)| (Arc::new(process), deferred, None))
-        };
+        let process = self
+            .open_session_with_sandbox(&request, cwd.clone(), context)
+            .await;
         drop(executor_readiness_timing_guard);
 
-        let (process, mut deferred_network_approval, adoption_sender) = match launch {
-            Ok(launch) => launch,
+        let (process, mut deferred_network_approval) = match process {
+            Ok((process, deferred_network_approval)) => {
+                (Arc::new(process), deferred_network_approval)
+            }
             Err(err) => {
                 self.release_process_id(request.process_id).await;
                 return Err(err);
@@ -649,18 +509,11 @@ impl UnifiedExecProcessManager {
         );
         emitter.emit(event_ctx, ToolEventStage::Begin).await;
 
-        if let Err(err) = start_streaming_output(&process, context, Arc::clone(&transcript)) {
-            if request.mutation_guard.is_some() {
-                let _ = process.terminate_confirmed().await;
-            } else {
-                process.terminate();
-            }
-            return Err(err);
-        }
+        start_streaming_output(&process, context, Arc::clone(&transcript))?;
         let start = Instant::now();
         // Persist live sessions before the initial yield wait so interrupting the
         // turn cannot drop the last Arc and terminate the background process.
-        let process_started_alive = process_requires_store_adoption(&process);
+        let process_started_alive = !process.has_exited() && process.exit_code().is_none();
         let _initial_exec_command_guard = if process_started_alive {
             let initial_exec_command_active = Arc::new(AtomicBool::new(true));
             self.store_process(
@@ -679,7 +532,6 @@ impl UnifiedExecProcessManager {
                 deferred_network_approval.clone(),
                 Arc::clone(&transcript),
                 Arc::clone(&initial_exec_command_active),
-                request.mutation_guard.clone(),
             )
             .await;
             Some(InitialExecCommandGuard {
@@ -688,9 +540,6 @@ impl UnifiedExecProcessManager {
         } else {
             None
         };
-        if let Some(adoption_sender) = adoption_sender {
-            let _ = adoption_sender.send(());
-        }
 
         let yield_time_ms =
             clamp_yield_time_for_readiness(request.yield_time_ms, executor_was_ready);
@@ -865,33 +714,14 @@ impl UnifiedExecProcessManager {
         // Different terminal sessions can be polled concurrently, but reads and
         // writes against one terminal must not overlap because they share a
         // draining output buffer and process lifecycle.
-        let (locked_process, mutation_guard_installed) = {
-            let mut store = self.process_store.lock().await;
+        let locked_process = {
+            let store = self.process_store.lock().await;
             let entry = store
                 .processes
-                .get_mut(&process_id)
+                .get(&process_id)
                 .ok_or(UnifiedExecError::UnknownProcessId { process_id })?;
-            require_contained_stdin_mutation(
-                request.mutation_guard.is_some(),
-                entry.process.descendant_containment_established(),
-            )?;
-            let mutation_guard_installed =
-                request.mutation_guard.is_some() && entry.mutation_guard.is_none();
-            if request.mutation_guard.is_some() {
-                entry.process.require_strict_descendant_exit();
-            }
-            if mutation_guard_installed {
-                entry.mutation_guard = request.mutation_guard.clone();
-            }
-            (Arc::clone(&entry.process), mutation_guard_installed)
+            Arc::clone(&entry.process)
         };
-        if mutation_guard_installed {
-            spawn_mutation_guard_exit_watcher(
-                Arc::clone(&self.process_store),
-                Arc::clone(&locked_process),
-                process_id,
-            );
-        }
         let _interaction_guard = locked_process.interaction_lock().lock_owned().await;
 
         let PreparedProcessHandles {
@@ -1060,7 +890,6 @@ impl UnifiedExecProcessManager {
             let Some(entry) = store.remove(process_id) else {
                 return ProcessStatus::Unknown;
             };
-            entry.process.terminate();
             ProcessStatus::Exited {
                 exit_code,
                 entry: Box::new(entry),
@@ -1136,9 +965,7 @@ impl UnifiedExecProcessManager {
         network_approval: Option<DeferredNetworkApproval>,
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
         initial_exec_command_active: Arc<AtomicBool>,
-        mutation_guard: Option<crate::task_evidence::TaskMutationGuard>,
     ) {
-        let mutation_guard_present = mutation_guard.is_some();
         let entry = ProcessEntry {
             process: Arc::clone(&process),
             call_id: context.call_id.clone(),
@@ -1150,7 +977,6 @@ impl UnifiedExecProcessManager {
             network_approval,
             session: Arc::downgrade(&context.session),
             last_used: started_at,
-            mutation_guard,
         };
         let pruned_entry = {
             let mut store = self.process_store.lock().await;
@@ -1159,30 +985,18 @@ impl UnifiedExecProcessManager {
             process_id_reservation.transfer_to_store();
             pruned_entry
         };
-        if mutation_guard_present {
-            // The store owns the guard once the insertion is complete. This
-            // detached watcher releases it after a positively acknowledged
-            // natural exit even if no later write_stdin/poll call prunes the
-            // process entry.
-            spawn_mutation_guard_exit_watcher(
-                Arc::clone(&self.process_store),
-                Arc::clone(&process),
-                process_id,
-            );
-        }
         // prune_processes_if_needed runs while holding process_store; do async
         // network-approval cleanup only after dropping that lock.
         if let Some(pruned_entry) = pruned_entry {
+            unregister_network_approval_for_entry(&pruned_entry).await;
             let exit_code = pruned_entry.process.exit_code().unwrap_or(-1);
-            let process_id = pruned_entry.process_id;
-            let cleanup = spawn_process_entry_cleanup(pruned_entry);
             context
                 .session
                 .services
                 .command_execution
-                .finish_running_process(process_id, Some(exit_code))
+                .finish_running_process(pruned_entry.process_id, Some(exit_code))
                 .await;
-            let _ = cleanup.await;
+            pruned_entry.process.terminate();
         }
 
         context
@@ -1217,7 +1031,6 @@ impl UnifiedExecProcessManager {
         network: Option<&NetworkProxy>,
         environment_id: Option<&str>,
         exec_server_env_config: Option<ExecServerEnvConfig>,
-        require_descendant_containment: bool,
         tty: bool,
         spawn_lifecycle: SpawnLifecycleHandle,
         raw_output_artifact: Option<crate::tools::command_output_artifact::RawOutputArtifact>,
@@ -1230,7 +1043,6 @@ impl UnifiedExecProcessManager {
         }
         .map_err(ToolError::Codex)?;
         request.exec_server_env_config = exec_server_env_config;
-        request.descendant_containment_required = require_descendant_containment;
         self.open_session_with_prepared_exec_env(
             process_id,
             &request,
@@ -1318,7 +1130,6 @@ impl UnifiedExecProcessManager {
                         tty,
                         tty,
                         request.windows_sandbox_private_desktop,
-                        request.descendant_containment_required,
                     )
                     .await
                 }
@@ -1345,8 +1156,6 @@ impl UnifiedExecProcessManager {
             return UnifiedExecProcess::from_spawned(
                 spawned.map_err(|err| UnifiedExecError::create_process(err.to_string()))?,
                 request.sandbox,
-                request.descendant_containment_established,
-                request.descendant_containment_required,
                 spawn_lifecycle,
                 raw_output_artifact,
             )
@@ -1409,8 +1218,6 @@ impl UnifiedExecProcessManager {
         UnifiedExecProcess::from_spawned(
             spawned,
             request.sandbox,
-            request.descendant_containment_established,
-            request.descendant_containment_required,
             spawn_lifecycle,
             raw_output_artifact,
         )
@@ -1477,7 +1284,6 @@ impl UnifiedExecProcessManager {
             additional_permissions_preapproved: request.additional_permissions_preapproved,
             justification: request.justification.clone(),
             exec_approval_requirement,
-            require_descendant_containment: request.mutation_guard.is_some(),
         };
         let tool_ctx = ToolCtx {
             session: context.session.clone(),
@@ -1718,12 +1524,9 @@ impl UnifiedExecProcessManager {
             entries
         };
 
-        let cleanup_tasks = entries
-            .into_iter()
-            .map(spawn_process_entry_cleanup)
-            .collect::<Vec<_>>();
-        for cleanup in cleanup_tasks {
-            let _ = cleanup.await;
+        for entry in entries {
+            unregister_network_approval_for_entry(&entry).await;
+            entry.process.terminate();
         }
     }
 

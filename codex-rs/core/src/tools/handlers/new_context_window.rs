@@ -42,8 +42,4 @@ impl ToolExecutor<ToolInvocation> for NewContextWindowHandler {
     }
 }
 
-impl CoreToolRuntime for NewContextWindowHandler {
-    fn task_evidence_read_only(&self) -> bool {
-        true
-    }
-}
+impl CoreToolRuntime for NewContextWindowHandler {}

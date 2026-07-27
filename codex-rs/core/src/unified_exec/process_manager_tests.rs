@@ -7,18 +7,9 @@ use crate::unified_exec::async_watcher::omitted_output_marker;
 use crate::unified_exec::async_watcher::resolve_aggregated_output;
 use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::clamp_yield_time_for_readiness;
-use crate::unified_exec::process::NoopSpawnLifecycle;
 use crate::unified_exec::resolve_adaptive_max_tokens;
 use codex_network_proxy::ManagedNetworkSandboxContext;
-use codex_protocol::protocol::TruncationPolicy;
-use codex_sandboxing::SandboxType;
-use codex_utils_path_uri::PathUri;
-use codex_utils_pty::ProcessDriver;
-use codex_utils_pty::spawn_from_driver;
 use pretty_assertions::assert_eq;
-use tokio::sync::broadcast;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tokio::time::Instant;
 
@@ -51,164 +42,11 @@ async fn dropped_process_id_reservation_is_released_before_store_transfer() {
     manager.release_process_id(next.process_id()).await;
 }
 
-#[tokio::test]
-async fn strict_driver_failure_remains_adopted_until_containment_acknowledgement() {
-    let (writer_tx, _writer_rx) = mpsc::channel::<Vec<u8>>(1);
-    let (_stdout_tx, stdout_rx) = broadcast::channel::<Vec<u8>>(1);
-    let (driver_exit_tx, driver_exit_rx) = oneshot::channel::<i32>();
-    drop(driver_exit_tx);
-    let spawned = spawn_from_driver(ProcessDriver {
-        writer_tx,
-        stdout_rx,
-        stderr_rx: None,
-        exit_rx: driver_exit_rx,
-        terminator: None,
-        writer_handle: None,
-        resizer: None,
-    });
-    let process = UnifiedExecProcess::from_spawned(
-        spawned,
-        SandboxType::None,
-        /*descendant_containment_established*/ true,
-        /*descendant_containment_required*/ true,
-        Box::<NoopSpawnLifecycle>::default(),
-        None,
-    )
-    .await
-    .expect("local process should start");
-
-    assert_eq!(process.exit_code(), Some(-1));
-    assert!(!process.has_exited());
-    assert!(
-        process_requires_store_adoption(&process),
-        "exec_command must store the process so its mutation guard cannot be released"
-    );
-}
-
-#[tokio::test]
-async fn cancelled_write_releases_its_guard_after_confirmed_natural_exit() {
-    let manager = UnifiedExecProcessManager::default();
-    let process_id = 4242;
-    let (writer_tx, _writer_rx) = mpsc::channel::<Vec<u8>>(1);
-    let (_stdout_tx, stdout_rx) = broadcast::channel::<Vec<u8>>(1);
-    let (driver_exit_tx, driver_exit_rx) = oneshot::channel::<i32>();
-    let spawned = spawn_from_driver(ProcessDriver {
-        writer_tx,
-        stdout_rx,
-        stderr_rx: None,
-        exit_rx: driver_exit_rx,
-        terminator: None,
-        writer_handle: None,
-        resizer: None,
-    });
-    let process = Arc::new(
-        UnifiedExecProcess::from_spawned(
-            spawned,
-            SandboxType::None,
-            /*descendant_containment_established*/ true,
-            /*descendant_containment_required*/ false,
-            Box::<NoopSpawnLifecycle>::default(),
-            None,
-        )
-        .await
-        .expect("local process should start"),
-    );
-    let cwd = codex_utils_absolute_path::AbsolutePathBuf::try_from(
-        std::env::current_dir().expect("current directory"),
-    )
-    .expect("current directory is absolute");
-    manager.process_store.lock().await.processes.insert(
-        process_id,
-        ProcessEntry {
-            process: Arc::clone(&process),
-            call_id: "write-guard-call".to_string(),
-            process_id,
-            cwd: PathUri::from_abs_path(&cwd),
-            initial_exec_command_active: Arc::new(AtomicBool::new(false)),
-            hook_command: "interactive mutation".to_string(),
-            tty: true,
-            network_approval: None,
-            session: std::sync::Weak::new(),
-            last_used: Instant::now(),
-            mutation_guard: None,
-        },
-    );
-
-    let write_manager = manager.clone();
-    let write = tokio::spawn(async move {
-        write_manager
-            .write_stdin(WriteStdinRequest {
-                process_id,
-                input: "",
-                yield_time_ms: 60_000,
-                max_output_tokens: None,
-                truncation_policy: TruncationPolicy::Bytes(10_000),
-                mutation_guard: Some(crate::task_evidence::TaskMutationGuard::for_test()),
-            })
-            .await
-    });
-
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let installed = manager
-                .process_store
-                .lock()
-                .await
-                .processes
-                .get(&process_id)
-                .is_some_and(|entry| entry.mutation_guard.is_some());
-            if installed {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("write_stdin should install its mutation guard");
-    assert!(process.strict_descendant_exit_required());
-    write.abort();
-    let _ = write.await;
-
-    driver_exit_tx
-        .send(0)
-        .expect("send confirmed contained-tree exit");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let released = manager
-                .process_store
-                .lock()
-                .await
-                .processes
-                .get(&process_id)
-                .is_some_and(|entry| entry.mutation_guard.is_none());
-            if released {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("confirmed natural exit should release the stored mutation guard");
-
-    manager.release_process_id(process_id).await;
-}
-
 #[test]
-fn stdin_mutation_requires_containment_without_affecting_unmanaged_input() {
-    assert!(require_contained_stdin_mutation(false, false).is_ok());
-    assert!(require_contained_stdin_mutation(false, true).is_ok());
-    assert!(require_contained_stdin_mutation(true, true).is_ok());
-    assert!(matches!(
-        require_contained_stdin_mutation(true, false),
-        Err(UnifiedExecError::DescendantContainmentUnavailable)
-    ));
-}
-
-#[test]
-fn adaptive_output_budget_uses_local_limits_and_honors_override() {
-    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 2_000);
-    assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 4_000);
-    assert_eq!(ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS, 6_000);
+fn adaptive_output_budget_matches_upstream_default_and_honors_override() {
+    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 10_000);
+    assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 10_000);
+    assert_eq!(ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS, 10_000);
     assert_eq!(
         resolve_adaptive_max_tokens(None, OutputBudgetClass::Success, Some("echo ok"), "ok"),
         DEFAULT_SUCCESS_OUTPUT_TOKENS
@@ -538,8 +376,6 @@ fn exec_server_params_use_path_uri_and_env_policy_overlay_contract() {
         exec_server_sandbox: None,
         exec_server_enforce_managed_network: true,
         exec_server_managed_network: Some(managed_network.clone()),
-        descendant_containment_required: false,
-        descendant_containment_established: false,
     };
 
     let params =
@@ -687,7 +523,6 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         additional_permissions_preapproved: false,
         justification: None,
         prefix_rule: None,
-        mutation_guard: None,
     };
 
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));

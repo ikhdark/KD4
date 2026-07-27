@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::RemoteCompactionV2Output;
@@ -6,7 +5,6 @@ use super::run_remote_compaction_request_v2;
 use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::compact::CompactionAnalyticsDetails;
-use crate::compact::remove_protected_pending_final_items_from_history;
 use crate::compact_remote::trim_function_call_history_to_fit_context_window;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
@@ -25,7 +23,6 @@ pub(super) struct RemoteCompactV2Attempt {
     pub(super) prompt_input: Vec<ResponseItem>,
     pub(super) compaction_output: ResponseItem,
     pub(super) token_usage: Option<TokenUsage>,
-    pub(super) protected_item_ids: BTreeSet<String>,
     /// Keeps a session created for standalone compaction alive through lifecycle completion.
     pub(super) owned_client_session: Option<ModelClientSession>,
 }
@@ -40,14 +37,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
 ) -> CodexResult<RemoteCompactV2Attempt> {
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
-    // Managed finals enter the ledger before history, so this ordering closes
-    // the snapshot race: anything protected in `history` is visible here.
-    let protected_item_ids = sess
-        .services
-        .task_evidence
-        .protected_pending_final_item_ids()
-        .await;
-    remove_protected_pending_final_items_from_history(&mut history, &protected_item_ids);
     let base_instructions = sess.get_base_instructions().await;
     let (rewritten_outputs, estimated_deleted_tokens) =
         trim_function_call_history_to_fit_context_window(
@@ -105,12 +94,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
         Some(client_session) => client_session,
         None => owned_client_session.insert(sess.services.model_client.new_session()),
     };
-    // The websocket's opaque prior-response state may still contain a
-    // protected item even when the current local history no longer does.
-    if !protected_item_ids.is_empty() {
-        client_session
-            .invalidate_incremental_history("protected pending final filtered from compaction");
-    }
     let compaction_output_result = run_remote_compaction_request_v2(
         sess,
         turn_context.as_ref(),
@@ -133,7 +116,6 @@ pub(super) async fn run_remote_compact_v2_attempt(
         prompt_input,
         compaction_output,
         token_usage,
-        protected_item_ids,
         owned_client_session,
     })
 }

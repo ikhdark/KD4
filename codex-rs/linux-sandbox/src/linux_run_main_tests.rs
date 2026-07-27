@@ -425,68 +425,6 @@ fn bwrap_signal_forwarder_terminates_child_and_keeps_parent_alive() {
     assert_eq!(libc::WEXITSTATUS(status), 0);
 }
 
-#[test]
-fn bwrap_subreaper_waits_for_adopted_detached_descendants() {
-    let supervisor_pid = unsafe { libc::fork() };
-    assert!(supervisor_pid >= 0, "failed to fork supervisor");
-
-    if supervisor_pid == 0 {
-        run_bwrap_subreaper_test_supervisor();
-    }
-
-    let status = wait_for_bwrap_child(supervisor_pid);
-    assert!(libc::WIFEXITED(status), "supervisor status: {status}");
-    assert_eq!(libc::WEXITSTATUS(status), 0);
-}
-
-#[cfg(test)]
-fn run_bwrap_subreaper_test_supervisor() -> ! {
-    enable_child_subreaper();
-    let monitor_pid = unsafe { libc::fork() };
-    if monitor_pid < 0 {
-        unsafe {
-            libc::_exit(2);
-        }
-    }
-    if monitor_pid == 0 {
-        let descendant_pid = unsafe { libc::fork() };
-        if descendant_pid < 0 {
-            unsafe {
-                libc::_exit(3);
-            }
-        }
-        if descendant_pid == 0 {
-            unsafe {
-                if libc::setsid() < 0 {
-                    libc::_exit(6);
-                }
-                libc::usleep(500_000);
-                libc::_exit(0);
-            }
-        }
-        unsafe {
-            libc::_exit(0);
-        }
-    }
-
-    let wait_started = std::time::Instant::now();
-    let monitor_status = wait_for_bwrap_child(monitor_pid);
-    if !libc::WIFEXITED(monitor_status) || libc::WEXITSTATUS(monitor_status) != 0 {
-        unsafe {
-            libc::_exit(4);
-        }
-    }
-    wait_for_all_adopted_bwrap_descendants();
-    if wait_started.elapsed() < std::time::Duration::from_millis(350) {
-        unsafe {
-            libc::_exit(5);
-        }
-    }
-    unsafe {
-        libc::_exit(0);
-    }
-}
-
 #[cfg(test)]
 fn run_bwrap_signal_forwarder_test_supervisor() -> ! {
     let child_pid = unsafe { libc::fork() };

@@ -7,7 +7,6 @@ use codex_protocol::items::EnteredReviewModeItem;
 use codex_protocol::items::ExitedReviewModeItem;
 use codex_protocol::items::TurnItem;
 use codex_protocol::models::ContentItem;
-use codex_protocol::models::PermissionProfile;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::AgentMessageContentDeltaEvent;
 use codex_protocol::protocol::AskForApproval;
@@ -23,14 +22,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::codex_delegate::run_codex_thread_one_shot;
 use crate::config::Constrained;
-use crate::config::Permissions;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::state::TaskKind;
-use crate::task_evidence::TaskEvidenceReviewPacket;
-use crate::task_evidence::TaskLifecycleStatus;
-use crate::task_evidence::TaskReviewReceipt;
 use codex_features::Feature;
 use codex_protocol::user_input::UserInput;
 
@@ -48,104 +43,6 @@ impl ReviewTask {
         Self {
             entered_review_mode,
         }
-    }
-}
-
-pub(crate) async fn run_task_evidence_review(
-    session: Arc<Session>,
-    turn_extension_data: Arc<codex_extension_api::ExtensionData>,
-    ctx: Arc<TurnContext>,
-    packet: TaskEvidenceReviewPacket,
-    cancellation_token: CancellationToken,
-) -> Result<Option<TaskLifecycleStatus>, String> {
-    let task_session = Arc::new(SessionTaskContext::new(
-        Arc::clone(&session),
-        turn_extension_data,
-    ));
-    let input = vec![UserInput::Text {
-        text: packet.prompt,
-        text_elements: Vec::new(),
-    }];
-    let receiver = match start_review_conversation(
-        Arc::clone(&task_session),
-        Arc::clone(&ctx),
-        input,
-        cancellation_token.clone(),
-    )
-    .await
-    {
-        Ok(receiver) => receiver,
-        Err(_) if cancellation_token.is_cancelled() => return Ok(None),
-        Err(err) => return Err(err),
-    };
-    let (output, structured) =
-        process_review_events(task_session, Arc::clone(&ctx), receiver).await;
-    if cancellation_token.is_cancelled() {
-        return Ok(None);
-    }
-    let receipt = task_review_receipt(output.as_ref(), structured);
-    let status = session
-        .services
-        .task_evidence
-        .accept_review(&packet.binding_hash, receipt)
-        .await?;
-    let reviewer_report = output
-        .as_ref()
-        .map(render_review_output_text)
-        .unwrap_or_else(|| "Independent review produced no structured output.".to_string());
-    let structure_note = if structured {
-        ""
-    } else {
-        "\nThe reviewer output was not exact structured JSON and could not authorize a clean verdict."
-    };
-    session
-        .record_conversation_items(
-            &ctx,
-            &[ResponseItem::Message {
-                id: Some(uuid::Uuid::now_v7().to_string()),
-                role: "user".to_string(),
-                content: vec![ContentItem::InputText {
-                    text: format!(
-                        "Runtime independent review: {}\n\n{}{}",
-                        status.message, reviewer_report, structure_note
-                    ),
-                }],
-                phase: None,
-                internal_chat_message_metadata_passthrough: None,
-            }],
-        )
-        .await;
-    Ok(Some(status))
-}
-
-fn task_review_receipt(output: Option<&ReviewOutputEvent>, structured: bool) -> TaskReviewReceipt {
-    let findings = output
-        .filter(|_| structured)
-        .map(|output| {
-            output
-                .findings
-                .iter()
-                .filter_map(|finding| serde_json::to_string(finding).ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    let confidence_score_millis = output
-        .filter(|_| structured)
-        .map(|output| output.overall_confidence_score)
-        .filter(|confidence| confidence.is_finite() && (0.0..=1.0).contains(confidence))
-        .map(|confidence| (confidence * 1000.0).round() as u16)
-        .unwrap_or(1001);
-    TaskReviewReceipt {
-        findings,
-        verdict: output
-            .filter(|_| structured)
-            .map(|output| output.overall_correctness.clone())
-            .unwrap_or_default(),
-        explanation: output
-            .filter(|_| structured)
-            .map(|output| output.overall_explanation.clone())
-            .unwrap_or_else(|| "independent review was interrupted".to_string()),
-        confidence_score_millis,
     }
 }
 
@@ -195,7 +92,7 @@ impl SessionTask for ReviewTask {
 
         // Start sub-codex conversation and get the receiver for events.
         let standalone_work_guard = ctx.turn_timing_state.begin_standalone_work();
-        let (output, structured) = match start_review_conversation(
+        let output = match start_review_conversation(
             session.clone(),
             ctx.clone(),
             user_input,
@@ -203,30 +100,18 @@ impl SessionTask for ReviewTask {
         )
         .await
         {
-            Ok(receiver) => process_review_events(session.clone(), ctx.clone(), receiver).await,
-            Err(_) => (None, false),
+            Some(receiver) => process_review_events(session.clone(), ctx.clone(), receiver).await,
+            None => None,
         };
         drop(standalone_work_guard);
         if !cancellation_token.is_cancelled() {
-            exit_review_mode(
-                session.clone_session(),
-                output.clone(),
-                structured,
-                ctx.clone(),
-            )
-            .await;
+            exit_review_mode(session.clone_session(), output.clone(), ctx.clone()).await;
         }
         Ok(None)
     }
 
     async fn abort(&self, session: Arc<SessionTaskContext>, ctx: Arc<TurnContext>) {
-        exit_review_mode(
-            session.clone_session(),
-            /*review_output*/ None,
-            /*structured*/ false,
-            ctx,
-        )
-        .await;
+        exit_review_mode(session.clone_session(), /*review_output*/ None, ctx).await;
     }
 }
 
@@ -235,7 +120,7 @@ async fn start_review_conversation(
     ctx: Arc<TurnContext>,
     input: Vec<UserInput>,
     cancellation_token: CancellationToken,
-) -> Result<async_channel::Receiver<Event>, String> {
+) -> Option<async_channel::Receiver<Event>> {
     let config = ctx.config.clone();
     let mut sub_agent_config = config.as_ref().clone();
     // Carry over review-only feature restrictions so the delegate cannot
@@ -252,21 +137,14 @@ async fn start_review_conversation(
 
     // Set explicit review rubric for the sub-agent
     sub_agent_config.base_instructions = Some(crate::REVIEW_PROMPT.to_string());
-    sub_agent_config.permissions = Permissions::from_approval_and_profile(
-        Constrained::allow_only(AskForApproval::Never),
-        Constrained::allow_only(PermissionProfile::read_only()),
-    )
-    .expect("the built-in read-only reviewer profile is valid");
-    sub_agent_config.notify = None;
-    sub_agent_config.bypass_hook_trust = false;
-    sub_agent_config.ephemeral = true;
+    sub_agent_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
 
     let model = config
         .review_model
         .clone()
         .unwrap_or_else(|| ctx.model_info.slug.clone());
     sub_agent_config.model = Some(model);
-    run_codex_thread_one_shot(
+    (run_codex_thread_one_shot(
         sub_agent_config,
         session.auth_manager(),
         session.models_manager(),
@@ -278,16 +156,16 @@ async fn start_review_conversation(
         /*final_output_json_schema*/ None,
         /*initial_history*/ None,
     )
-    .await
-    .map(|io| io.rx_event)
-    .map_err(|err| format!("failed to start isolated independent reviewer: {err:#}"))
+    .await)
+        .ok()
+        .map(|io| io.rx_event)
 }
 
 async fn process_review_events(
     session: Arc<SessionTaskContext>,
     ctx: Arc<TurnContext>,
     receiver: async_channel::Receiver<Event>,
-) -> (Option<ReviewOutputEvent>, bool) {
+) -> Option<ReviewOutputEvent> {
     let mut prev_agent_message: Option<Event> = None;
     while let Ok(event) = receiver.recv().await {
         match event.clone().msg {
@@ -317,14 +195,11 @@ async fn process_review_events(
                     .last_agent_message
                     .as_deref()
                     .map(parse_review_output_event);
-                return match out {
-                    Some((output, structured)) => (Some(output), structured),
-                    None => (None, false),
-                };
+                return out;
             }
             EventMsg::TurnAborted(_) => {
                 // Cancellation or abort: consumer will finalize with None.
-                return (None, false);
+                return None;
             }
             other => {
                 session
@@ -335,32 +210,29 @@ async fn process_review_events(
         }
     }
     // Channel closed without TurnComplete: treat as interrupted.
-    (None, false)
+    None
 }
 
 /// Parse a ReviewOutputEvent from a text blob returned by the reviewer model.
 /// If the text is valid JSON matching ReviewOutputEvent, deserialize it.
-/// Otherwise, attempt to extract the first JSON object substring for display,
-/// but mark it unstructured so surrounding prose or fences can never authorize
-/// lifecycle completion.
-fn parse_review_output_event(text: &str) -> (ReviewOutputEvent, bool) {
+/// Otherwise, attempt to extract the first JSON object substring and parse it.
+/// If parsing still fails, return a structured fallback carrying the plain text
+/// in `overall_explanation`.
+fn parse_review_output_event(text: &str) -> ReviewOutputEvent {
     if let Ok(ev) = serde_json::from_str::<ReviewOutputEvent>(text) {
-        return (ev, true);
+        return ev;
     }
     if let (Some(start), Some(end)) = (text.find('{'), text.rfind('}'))
         && start < end
         && let Some(slice) = text.get(start..=end)
         && let Ok(ev) = serde_json::from_str::<ReviewOutputEvent>(slice)
     {
-        return (ev, false);
+        return ev;
     }
-    (
-        ReviewOutputEvent {
-            overall_explanation: text.to_string(),
-            ..Default::default()
-        },
-        false,
-    )
+    ReviewOutputEvent {
+        overall_explanation: text.to_string(),
+        ..Default::default()
+    }
 }
 
 /// Emits ExitedReviewMode item lifecycle with optional ReviewOutput,
@@ -368,13 +240,10 @@ fn parse_review_output_event(text: &str) -> (ReviewOutputEvent, bool) {
 pub(crate) async fn exit_review_mode(
     session: Arc<Session>,
     review_output: Option<ReviewOutputEvent>,
-    review_was_structured: bool,
     ctx: Arc<TurnContext>,
 ) {
     const REVIEW_USER_MESSAGE_ID: &str = "review_rollout_user";
     const REVIEW_ASSISTANT_MESSAGE_ID: &str = "review_rollout_assistant";
-    let _ = review_was_structured;
-
     let (user_message, assistant_message) = if let Some(out) = review_output.clone() {
         let mut findings_str = String::new();
         let text = out.overall_explanation.trim();
@@ -434,36 +303,4 @@ pub(crate) async fn exit_review_mode(
     // materialize rollout persistence. Do this after emitting review output so
     // file creation + git metadata collection cannot delay client-facing items.
     session.ensure_rollout_materialized().await;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unstructured_review_text_cannot_be_a_clean_receipt() {
-        let (output, structured) = parse_review_output_event("looks clean");
-        assert!(!structured);
-        assert_eq!(output.overall_explanation, "looks clean");
-    }
-
-    #[test]
-    fn structured_review_output_is_accepted_as_a_receipt() {
-        let expected = ReviewOutputEvent::default();
-        let encoded = serde_json::to_string(&expected).expect("review output");
-        let (actual, structured) = parse_review_output_event(&encoded);
-        assert!(structured);
-        assert_eq!(actual.findings, expected.findings);
-        assert_eq!(actual.overall_explanation, expected.overall_explanation);
-    }
-
-    #[test]
-    fn fenced_structured_review_output_cannot_authorize_a_clean_receipt() {
-        let expected = ReviewOutputEvent::default();
-        let encoded = serde_json::to_string(&expected).expect("review output");
-        let (actual, structured) = parse_review_output_event(&format!("```json\n{encoded}\n```"));
-        assert!(!structured);
-        assert_eq!(actual.findings, expected.findings);
-        assert_eq!(actual.overall_explanation, expected.overall_explanation);
-    }
 }

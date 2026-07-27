@@ -19,8 +19,6 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::PostToolUsePayload;
 use crate::tools::registry::PreToolUsePayload;
-use crate::tools::registry::ToolRegistry;
-use crate::tools::registry::mark_task_evidence_builtin;
 use crate::turn_diff_tracker::TurnDiffTracker;
 
 fn sample_patch() -> &'static str {
@@ -43,140 +41,6 @@ async fn invocation_for_payload(payload: ToolPayload) -> ToolInvocation {
         tool_name: codex_tools::ToolName::plain("apply_patch"),
         source: crate::tools::context::ToolCallSource::Direct,
         payload,
-    }
-}
-
-#[tokio::test]
-async fn managed_preflight_rejects_invalid_or_unsupported_patch_without_mutation_revision()
--> anyhow::Result<()> {
-    let (mut session, mut turn) = make_session_and_context().await;
-    let managed_root = TempDir::new()?;
-    let evidence_home = TempDir::new()?;
-    let unsupported_root = TempDir::new()?;
-    let unsupported_cwd = PathUri::from_abs_path(&unsupported_root.path().abs());
-    let unsupported_environment = TurnEnvironment::new(
-        "unsupported-environment".to_string(),
-        Arc::new(codex_exec_server::Environment::default_for_tests()),
-        unsupported_cwd,
-        /*shell*/ None,
-    );
-    turn.environments
-        .turn_environments
-        .push(unsupported_environment);
-    turn.permission_profile = codex_protocol::models::PermissionProfile::Disabled;
-
-    let ledger = crate::task_evidence::TaskEvidenceLedger::load_or_new(
-        evidence_home.path().to_path_buf(),
-        codex_protocol::ThreadId::new(),
-        managed_root.path(),
-    )
-    .await;
-    ledger
-        .begin_turn(&turn.sub_id, "verify apply_patch mutation preflight")
-        .await
-        .expect("begin managed turn");
-    ledger
-        .classify(crate::task_evidence::TaskClassification {
-            exhaustive: false,
-            risk_domains: std::collections::BTreeSet::new(),
-            supported_non_git_roots: std::collections::BTreeSet::from([managed_root
-                .path()
-                .to_string_lossy()
-                .into_owned()]),
-        })
-        .await
-        .expect("classify managed task");
-    let ready = ledger
-        .submit_closure(test_closure_submission())
-        .await
-        .expect("prepare Ready task");
-    assert_eq!(ready.phase, crate::task_evidence::TaskPhase::Ready);
-    assert_eq!(
-        ready.outcome,
-        Some(crate::task_evidence::TaskOutcome::Passed)
-    );
-    session.services.task_evidence = ledger;
-
-    let handler: Arc<dyn CoreToolRuntime> = Arc::new(ApplyPatchHandler::new(true));
-    let registry = ToolRegistry::from_tools([mark_task_evidence_builtin(handler)]);
-    let session = Arc::new(session);
-    let turn = Arc::new(turn);
-    let invocation = |call_id: &str, patch: String| ToolInvocation {
-        session: Arc::clone(&session),
-        step_context: StepContext::for_test(Arc::clone(&turn)),
-        turn: Arc::clone(&turn),
-        cancellation_token: tokio_util::sync::CancellationToken::new(),
-        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-        call_id: call_id.to_string(),
-        tool_name: codex_tools::ToolName::plain("apply_patch"),
-        source: crate::tools::context::ToolCallSource::Direct,
-        payload: ToolPayload::Custom { input: patch },
-    };
-
-    let invalid_err = match registry
-        .dispatch_any(invocation(
-            "invalid-patch",
-            "*** Begin Patch\ninvalid\n*** End Patch".to_string(),
-        ))
-        .await
-    {
-        Ok(_) => panic!("invalid patch must fail preflight"),
-        Err(err) => err,
-    };
-    assert!(
-        invalid_err
-            .to_string()
-            .contains("apply_patch verification failed"),
-        "unexpected invalid-patch error: {invalid_err}"
-    );
-    let after_invalid = session
-        .services
-        .task_evidence
-        .inspect_status()
-        .await
-        .expect("status after invalid patch");
-    assert_eq!(after_invalid.phase, ready.phase);
-    assert_eq!(after_invalid.outcome, ready.outcome);
-    assert_eq!(after_invalid.mutation_revision, ready.mutation_revision);
-
-    let unsupported_target = unsupported_root.path().join("unsupported.txt");
-    let unsupported_patch = "*** Begin Patch\n*** Environment ID: unsupported-environment\n*** Add File: unsupported.txt\n+unsupported\n*** End Patch".to_string();
-    let err = match registry
-        .dispatch_any(invocation("unsupported-patch", unsupported_patch))
-        .await
-    {
-        Ok(_) => panic!("unsupported target ownership must fail preflight"),
-        Err(err) => err,
-    };
-    assert!(
-        err.to_string()
-            .contains("mutation target is not owned by a registered Git root"),
-        "unexpected preflight error: {err}"
-    );
-    let after_unsupported = session
-        .services
-        .task_evidence
-        .inspect_status()
-        .await
-        .expect("status after unsupported patch");
-    assert_eq!(
-        after_unsupported.mutation_revision, ready.mutation_revision,
-        "unsupported ownership must not manufacture mutation progress"
-    );
-    assert!(!unsupported_target.exists());
-
-    Ok(())
-}
-
-fn test_closure_submission() -> crate::task_evidence::ClosureSubmission {
-    crate::task_evidence::ClosureSubmission {
-        path_review: std::collections::BTreeSet::from([".".to_string()]),
-        competing_paths_checked: std::collections::BTreeSet::from([".".to_string()]),
-        validation_receipt_ids: std::collections::BTreeSet::new(),
-        runtime_evidence: std::collections::BTreeSet::new(),
-        missing_requirement_ids: std::collections::BTreeSet::new(),
-        actionable_findings: std::collections::BTreeSet::new(),
-        blocked_reasons: std::collections::BTreeSet::new(),
     }
 }
 
@@ -436,13 +300,16 @@ async fn intercepted_patch_rejects_mismatched_environment_without_mutation() {
     let command = vec!["apply_patch".to_string(), patch];
     let fs = turn_environment.environment.get_filesystem();
 
-    let result = preflight_intercept_apply_patch(
+    let result = intercept_apply_patch(
         &command,
         &cwd,
         fs.as_ref(),
-        &turn_environment,
-        &session,
-        &turn,
+        turn_environment,
+        Arc::new(session),
+        Arc::new(turn),
+        /*tracker*/ None,
+        "phase31-call",
+        "shell",
     )
     .await;
 

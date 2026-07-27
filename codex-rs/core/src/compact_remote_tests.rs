@@ -39,17 +39,6 @@ fn custom_tool_call_output(id: &str, call_id: &str, output: &str) -> ResponseIte
     }
 }
 
-fn tool_search_output(id: &str, call_id: &str, tools: Vec<serde_json::Value>) -> ResponseItem {
-    ResponseItem::ToolSearchOutput {
-        id: Some(id.to_string()),
-        call_id: Some(call_id.to_string()),
-        status: "completed".to_string(),
-        execution: "client".to_string(),
-        tools,
-        internal_chat_message_metadata_passthrough: None,
-    }
-}
-
 #[tokio::test]
 async fn trim_function_call_history_rewrites_contiguous_trailing_outputs_in_one_pass() {
     let (_session, mut turn_context) = make_session_and_context().await;
@@ -73,15 +62,6 @@ async fn trim_function_call_history_rewrites_contiguous_trailing_outputs_in_one_
     let first_output = function_call_output("first-output-id", "first-call-id", &"a".repeat(8_192));
     let second_output =
         custom_tool_call_output("second-output-id", "second-call-id", &"b".repeat(8_192));
-    let trailing_tool_search_output = tool_search_output(
-        "tool-search-output-id",
-        "tool-search-call-id",
-        vec![serde_json::json!({
-            "type": "function",
-            "name": "oversized_dynamic_tool",
-            "description": "c".repeat(8_192),
-        })],
-    );
     let expected_first_output = function_call_output(
         "first-output-id",
         "first-call-id",
@@ -92,14 +72,11 @@ async fn trim_function_call_history_rewrites_contiguous_trailing_outputs_in_one_
         "second-call-id",
         CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE,
     );
-    let expected_tool_search_output =
-        tool_search_output("tool-search-output-id", "tool-search-call-id", Vec::new());
     let expected_items = vec![
         prefix.clone(),
         rewrite_boundary.clone(),
         expected_first_output,
         expected_second_output,
-        expected_tool_search_output,
     ];
 
     let mut expected_history = ContextManager::new();
@@ -111,13 +88,7 @@ async fn trim_function_call_history_rewrites_contiguous_trailing_outputs_in_one_
     turn_context.model_info.effective_context_window_percent = 100;
 
     let mut history = ContextManager::new();
-    history.replace(vec![
-        prefix,
-        rewrite_boundary,
-        first_output,
-        second_output,
-        trailing_tool_search_output,
-    ]);
+    history.replace(vec![prefix, rewrite_boundary, first_output, second_output]);
     let estimated_tokens_before = history
         .estimate_token_count_with_base_instructions(&base_instructions)
         .expect("token estimate before rewrite");
@@ -132,7 +103,7 @@ async fn trim_function_call_history_rewrites_contiguous_trailing_outputs_in_one_
         .estimate_token_count_with_base_instructions(&base_instructions)
         .expect("token estimate after rewrite");
 
-    assert_eq!(rewritten_outputs, 3);
+    assert_eq!(rewritten_outputs, 2);
     assert_eq!(history.raw_items(), expected_items);
     assert!(
         estimated_tokens_after

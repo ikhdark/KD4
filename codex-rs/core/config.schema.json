@@ -372,24 +372,9 @@
             "type": "string"
           },
           "type": "array"
-        },
-        "waiting_policy": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/CodeModeWaitingPolicy"
-            }
-          ],
-          "description": "Controls whether code-mode calls yield automatically or remain attached until completion."
         }
       },
       "type": "object"
-    },
-    "CodeModeWaitingPolicy": {
-      "enum": [
-        "yield_after",
-        "run_to_completion"
-      ],
-      "type": "string"
     },
     "ConfigProfile": {
       "additionalProperties": false,
@@ -2736,25 +2721,9 @@
         }
       ]
     },
-    "RolloutBudgetAction": {
-      "enum": [
-        "remind",
-        "ask",
-        "stop"
-      ],
-      "type": "string"
-    },
     "RolloutBudgetConfigToml": {
       "additionalProperties": false,
       "properties": {
-        "action": {
-          "$ref": "#/definitions/RolloutBudgetAction"
-        },
-        "cached_input_token_weight": {
-          "format": "double",
-          "minimum": 0.0,
-          "type": "number"
-        },
         "enabled": {
           "type": "boolean"
         },
@@ -2762,12 +2731,6 @@
           "format": "int64",
           "minimum": 1.0,
           "type": "integer"
-        },
-        "model_call_token_cost": {
-          "description": "Weighted-token charge applied to every model request, including retries.",
-          "format": "double",
-          "minimum": 0.0,
-          "type": "number"
         },
         "prefill_token_weight": {
           "format": "double",
@@ -2783,18 +2746,6 @@
           "type": "array"
         },
         "sampling_token_weight": {
-          "format": "double",
-          "minimum": 0.0,
-          "type": "number"
-        },
-        "subagent_token_cost": {
-          "description": "Weighted-token charge applied to each spawned subagent.",
-          "format": "double",
-          "minimum": 0.0,
-          "type": "number"
-        },
-        "tool_output_byte_weight": {
-          "description": "Weighted-token charge per byte of tool output recorded in shared history.",
           "format": "double",
           "minimum": 0.0,
           "type": "number"

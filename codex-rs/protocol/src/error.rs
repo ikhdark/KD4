@@ -69,9 +69,7 @@ pub enum CodexErr {
     #[error("turn aborted. Something went wrong? Hit `/feedback` to report the issue.")]
     TurnAborted,
 
-    #[error(
-        "shared rollout token budget exhausted; when ask mode is enabled, send exactly `approve additional budget` to grant one additional tranche"
-    )]
+    #[error("shared rollout token budget exhausted")]
     SessionBudgetExceeded,
 
     /// Returned by ResponsesClient when the SSE stream disconnects or errors out **after** the HTTP

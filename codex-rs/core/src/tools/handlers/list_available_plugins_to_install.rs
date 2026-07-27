@@ -101,11 +101,7 @@ impl ListAvailablePluginsToInstallHandler {
     }
 }
 
-impl CoreToolRuntime for ListAvailablePluginsToInstallHandler {
-    fn task_evidence_read_only(&self) -> bool {
-        true
-    }
-}
+impl CoreToolRuntime for ListAvailablePluginsToInstallHandler {}
 
 fn truncate_to_char_boundary(value: &str, max_chars: usize) -> &str {
     match value.char_indices().nth(max_chars) {

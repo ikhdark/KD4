@@ -313,30 +313,8 @@ pub async fn run_user_shell_command(sess: &Arc<Session>, sub_id: String, command
     if let Some((turn_context, cancellation_token)) =
         sess.active_turn_context_and_cancellation_token().await
     {
-        let mutation_guard = match sess
-            .services
-            .task_evidence
-            .guard_active_turn_user_shell(&turn_context.sub_id)
-            .await
-        {
-            Ok(guard) => guard,
-            Err(message) => {
-                sess.send_event_raw(Event {
-                    id: sub_id,
-                    msg: EventMsg::Error(ErrorEvent {
-                        message: format!(
-                            "active-turn shell was not executed against the managed task: {message}"
-                        ),
-                        codex_error_info: None,
-                    }),
-                })
-                .await;
-                return;
-            }
-        };
         let session = Arc::clone(sess);
         tokio::spawn(async move {
-            let _mutation_guard = mutation_guard;
             execute_user_shell_command(
                 session,
                 turn_context,

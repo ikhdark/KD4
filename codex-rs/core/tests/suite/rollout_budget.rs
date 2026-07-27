@@ -1,18 +1,15 @@
 use anyhow::Result;
 use codex_core::config::RolloutBudgetConfig;
 use codex_features::Feature;
-use codex_features::RolloutBudgetAction;
 use codex_model_provider_info::built_in_model_providers;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::user_input::UserInput;
-use codex_utils_absolute_path::AbsolutePathBuf;
 use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_completed_with_tokens;
-use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_once_match;
@@ -36,11 +33,6 @@ fn rollout_budget() -> RolloutBudgetConfig {
         reminder_at_remaining_tokens: vec![75, 50, 25],
         sampling_token_weight: 1.0,
         prefill_token_weight: 1.0,
-        cached_input_token_weight: 0.0,
-        model_call_token_cost: 0.0,
-        tool_output_byte_weight: 0.0,
-        subagent_token_cost: 0.0,
-        action: RolloutBudgetAction::Stop,
     }
 }
 
@@ -59,71 +51,7 @@ fn rollout_budget_message(remaining_tokens: i64) -> String {
 }
 
 fn wire_request_contains(request: &wiremock::Request, text: &str) -> bool {
-    decoded_body(request)
-        .and_then(|body| String::from_utf8(body).ok())
-        .is_some_and(|body| body.contains(text))
-}
-
-fn request_has_input_type(request: &wiremock::Request, input_type: &str) -> bool {
-    decoded_body(request)
-        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
-        .and_then(|body| {
-            body.get("input")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-        })
-        .is_some_and(|items| {
-            items.iter().any(|item| {
-                item.get("type").and_then(serde_json::Value::as_str) == Some(input_type)
-            })
-        })
-}
-
-fn responses_request_has_input_type(request: &ResponsesRequest, input_type: &str) -> bool {
-    request
-        .body_json()
-        .get("input")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|items| {
-            items.iter().any(|item| {
-                item.get("type").and_then(serde_json::Value::as_str) == Some(input_type)
-            })
-        })
-}
-
-fn decoded_body(request: &wiremock::Request) -> Option<Vec<u8>> {
-    let is_zstd = request
-        .headers
-        .get("content-encoding")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| {
-            value
-                .split(',')
-                .any(|entry| entry.trim().eq_ignore_ascii_case("zstd"))
-        });
-    if is_zstd {
-        zstd::stream::decode_all(std::io::Cursor::new(&request.body)).ok()
-    } else {
-        Some(request.body.clone())
-    }
-}
-
-fn request_input_types(request: &wiremock::Request) -> Vec<String> {
-    decoded_body(request)
-        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
-        .and_then(|body| {
-            body.get("input")
-                .and_then(serde_json::Value::as_array)
-                .cloned()
-        })
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|item| {
-            item.get("type")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string)
-        })
-        .collect()
+    std::str::from_utf8(&request.body).is_ok_and(|body| body.contains(text))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -192,45 +120,14 @@ async fn subagent_usage_draws_from_the_shared_budget() -> Result<()> {
     const CHILD_PROMPT: &str = "consume child budget";
     const FOLLOW_UP_PROMPT: &str = "report the shared budget";
     const SPAWN_CALL_ID: &str = "spawn-budget-worker";
-    const CLASSIFY_PROMPT: &str = "classify this budget integration task";
-    const CLASSIFY_CALL_ID: &str = "classify-budget-task";
 
     let server = start_mock_server().await;
-    let isolated_cwd = tempfile::tempdir()?;
-    let isolated_cwd_path = AbsolutePathBuf::try_from(isolated_cwd.path())?;
-    let classify_args = json!({
-        "operation": "classify",
-        "exhaustive": false,
-        "risk_domains": [],
-        "supported_non_git_roots": [],
-    })
-    .to_string();
-    let classify_start = mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| wire_request_contains(request, CLASSIFY_PROMPT),
-        sse(vec![
-            ev_response_created("classify-1"),
-            ev_function_call(CLASSIFY_CALL_ID, "task_state", &classify_args),
-            ev_completed("classify-1"),
-        ]),
-    )
-    .await;
-    let classify_continue = mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| wire_request_contains(request, CLASSIFY_CALL_ID),
-        sse(vec![
-            ev_response_created("classify-2"),
-            ev_completed("classify-2"),
-        ]),
-    )
-    .await;
     let spawn_args = json!({
-        "fork_turns": "none",
         "message": CHILD_PROMPT,
         "task_name": "budget_worker",
     })
     .to_string();
-    let root_spawn = mount_sse_once_match(
+    mount_sse_once_match(
         &server,
         |request: &wiremock::Request| wire_request_contains(request, ROOT_PROMPT),
         sse(vec![
@@ -245,21 +142,20 @@ async fn subagent_usage_draws_from_the_shared_budget() -> Result<()> {
         ]),
     )
     .await;
-    let child_run = mount_sse_once_match(
+    mount_sse_once_match(
         &server,
-        |request: &wiremock::Request| request_has_input_type(request, "agent_message"),
+        |request: &wiremock::Request| wire_request_contains(request, "\"type\":\"agent_message\""),
         sse(vec![
             ev_response_created("child-1"),
-            ev_assistant_message("child-message", "child budget consumed"),
             ev_completed_with_tokens("child-1", /*total_tokens*/ 30),
         ]),
     )
     .await;
-    let root_continue = mount_sse_once_match(
+    mount_sse_once_match(
         &server,
         |request: &wiremock::Request| {
             wire_request_contains(request, SPAWN_CALL_ID)
-                && !request_has_input_type(request, "agent_message")
+                && !wire_request_contains(request, "\"type\":\"agent_message\"")
         },
         sse(vec![
             ev_response_created("root-2"),
@@ -275,8 +171,7 @@ async fn subagent_usage_draws_from_the_shared_budget() -> Result<()> {
     .await;
 
     let test = test_codex()
-        .with_config(move |config| {
-            config.cwd = isolated_cwd_path;
+        .with_config(|config| {
             config
                 .features
                 .enable(Feature::Collab)
@@ -290,79 +185,15 @@ async fn subagent_usage_draws_from_the_shared_budget() -> Result<()> {
         .build(&server)
         .await?;
 
-    test.submit_turn(CLASSIFY_PROMPT).await?;
     let mut created_threads = test.thread_manager.subscribe_thread_created();
-    let root_result = timeout(Duration::from_secs(10), test.submit_turn(ROOT_PROMPT)).await;
-    let Ok(root_result) = root_result else {
-        anyhow::bail!(
-            "root turn timed out: spawn={}, child={}, continuation={}",
-            root_spawn.requests().len(),
-            child_run.requests().len(),
-            root_continue.requests().len()
-        );
-    };
-    root_result?;
-    let child_thread_id = match timeout(Duration::from_secs(10), created_threads.recv()).await {
-        Ok(Ok(child_thread_id)) => child_thread_id,
-        Ok(Err(error)) => return Err(error.into()),
-        Err(_) => {
-            let spawn_output = root_continue
-                .requests()
-                .into_iter()
-                .find_map(|request| request.function_call_output_text(SPAWN_CALL_ID));
-            anyhow::bail!(
-                "child thread was not created: spawn={}, child={}, continuation={}, spawn_output={spawn_output:?}",
-                root_spawn.requests().len(),
-                child_run.requests().len(),
-                root_continue.requests().len()
-            );
-        }
-    };
+    test.submit_turn(ROOT_PROMPT).await?;
+    let child_thread_id = timeout(Duration::from_secs(10), created_threads.recv()).await??;
     let child_thread = test.thread_manager.get_thread(child_thread_id).await?;
-    let child_events = std::sync::Mutex::new(Vec::<String>::new());
-    let child_complete = timeout(Duration::from_secs(10), async {
-        loop {
-            let event = child_thread
-                .next_event()
-                .await
-                .expect("child event stream ended before turn completion");
-            let is_complete = matches!(event.msg, EventMsg::TurnComplete(_));
-            let mut events = child_events.lock().expect("child events lock poisoned");
-            events.push(format!("{:?}", event.msg));
-            if events.len() > 8 {
-                events.remove(0);
-            }
-            drop(events);
-            if is_complete {
-                break;
-            }
-        }
+    wait_for_event(child_thread.as_ref(), |event| {
+        matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
-    if child_complete.is_err() {
-        let request_shapes = server
-            .received_requests()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|request| {
-                (
-                    request.url.path().to_string(),
-                    request_input_types(&request),
-                )
-            })
-            .collect::<Vec<_>>();
-        anyhow::bail!(
-            "child turn did not complete: spawn={}, child={}, continuation={}, events={:?}, requests={request_shapes:?}",
-            root_spawn.requests().len(),
-            child_run.requests().len(),
-            root_continue.requests().len(),
-            child_events
-                .into_inner()
-                .expect("child events lock poisoned")
-        );
-    }
-    timeout(Duration::from_secs(10), test.submit_turn(FOLLOW_UP_PROMPT)).await??;
+    test.submit_turn(FOLLOW_UP_PROMPT).await?;
 
     let requests = follow_up
         .requests()
@@ -381,14 +212,6 @@ async fn subagent_usage_draws_from_the_shared_budget() -> Result<()> {
         rollout_budget_texts(request).last(),
         Some(&rollout_budget_message(/*remaining_tokens*/ 50))
     );
-    let child_sample_request_count = child_run
-        .requests()
-        .iter()
-        .filter(|request| responses_request_has_input_type(request, "agent_message"))
-        .count();
-    assert_eq!(child_sample_request_count, 1);
-    assert_eq!(classify_start.requests().len(), 1);
-    assert_eq!(classify_continue.requests().len(), 1);
 
     Ok(())
 }
@@ -448,83 +271,6 @@ async fn exhausted_budget_fails_current_and_later_turns_without_another_request(
         responses.requests().len(),
         1,
         "known budget exhaustion should fail before another model request"
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ask_budget_requires_exact_approval_before_another_request() -> Result<()> {
-    skip_if_no_network!(Ok(()));
-
-    const APPROVAL: &str = "approve additional budget";
-    let server = start_mock_server().await;
-    let responses = mount_sse_sequence(
-        &server,
-        vec![
-            sse(vec![
-                ev_response_created("exhaust-ask-budget"),
-                ev_completed_with_tokens("exhaust-ask-budget", /*total_tokens*/ 30),
-            ]),
-            sse(vec![
-                ev_response_created("approved-budget"),
-                ev_completed("approved-budget"),
-            ]),
-        ],
-    )
-    .await;
-    let test = test_codex()
-        .with_config(|config| {
-            config.rollout_budget = Some(RolloutBudgetConfig {
-                limit_tokens: 30,
-                reminder_at_remaining_tokens: vec![20, 10],
-                action: RolloutBudgetAction::Ask,
-                ..rollout_budget()
-            });
-        })
-        .build(&server)
-        .await?;
-
-    for prompt in ["exhaust the ask budget", "this is not approval"] {
-        test.codex
-            .submit(Op::UserInput {
-                items: vec![UserInput::Text {
-                    text: prompt.to_string(),
-                    text_elements: Vec::new(),
-                }],
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
-            .await?;
-        wait_for_event(&test.codex, |event| {
-            matches!(
-                event,
-                EventMsg::Error(error)
-                    if error.codex_error_info == Some(CodexErrorInfo::SessionBudgetExceeded)
-            )
-        })
-        .await;
-        wait_for_event(&test.codex, |event| {
-            matches!(event, EventMsg::TurnComplete(_))
-        })
-        .await;
-    }
-
-    assert_eq!(
-        responses.requests().len(),
-        1,
-        "a different user turn must not implicitly approve more budget"
-    );
-    test.submit_turn(APPROVAL).await?;
-    let requests = responses.requests();
-    assert_eq!(requests.len(), 2);
-    assert!(
-        requests[1]
-            .message_input_texts("user")
-            .iter()
-            .any(|text| text == APPROVAL)
     );
 
     Ok(())

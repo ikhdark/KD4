@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -6,7 +5,6 @@ use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
 use crate::context::world_state::WorldState;
-use crate::context_manager::ContextManager;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
@@ -68,33 +66,6 @@ const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
 pub(crate) enum InitialContextInjection {
     BeforeLastUserMessage(Arc<WorldState>),
     DoNotInject,
-}
-
-pub(crate) fn remove_protected_pending_final_items(
-    items: &mut Vec<ResponseItem>,
-    protected_item_ids: &BTreeSet<String>,
-) -> usize {
-    if protected_item_ids.is_empty() {
-        return 0;
-    }
-    let original_len = items.len();
-    items.retain(|item| {
-        item.id()
-            .is_none_or(|item_id| !protected_item_ids.contains(item_id))
-    });
-    original_len.saturating_sub(items.len())
-}
-
-pub(crate) fn remove_protected_pending_final_items_from_history(
-    history: &mut ContextManager,
-    protected_item_ids: &BTreeSet<String>,
-) -> usize {
-    let mut items = history.raw_items().to_vec();
-    let removed = remove_protected_pending_final_items(&mut items, protected_item_ids);
-    if removed > 0 {
-        history.replace(items);
-    }
-    removed
 }
 
 pub(crate) async fn build_compaction_initial_context(
@@ -260,15 +231,6 @@ async fn run_compact_task_inner_impl(
     let initial_input_for_turn: ResponseInputItem = ResponseInputItem::from(input);
 
     let mut history = sess.clone_history().await;
-    // A managed final is reserved in the ledger before it is recorded in
-    // history. Snapshot history first, then read the ledger so every protected
-    // item that could be present in this snapshot is visible to the filter.
-    let mut protected_item_ids = sess
-        .services
-        .task_evidence
-        .protected_pending_final_item_ids()
-        .await;
-    remove_protected_pending_final_items_from_history(&mut history, &protected_item_ids);
     history.record_items(
         &[initial_input_for_turn.into()],
         turn_context.model_info.truncation_policy.into(),
@@ -386,16 +348,7 @@ async fn run_compact_task_inner_impl(
         }
     }
 
-    // As above, snapshot history before sampling the ledger. A final that is
-    // present in this snapshot was reserved first and is therefore included.
-    let mut history_snapshot = sess.clone_history().await;
-    protected_item_ids.extend(
-        sess.services
-            .task_evidence
-            .protected_pending_final_item_ids()
-            .await,
-    );
-    remove_protected_pending_final_items_from_history(&mut history_snapshot, &protected_item_ids);
+    let history_snapshot = sess.clone_history().await;
     let history_items = history_snapshot.raw_items();
     let summary_suffix = get_last_assistant_message_from_turn(history_items).unwrap_or_default();
     let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
@@ -419,7 +372,6 @@ async fn run_compact_task_inner_impl(
         new_history =
             insert_initial_context_before_last_real_user_or_summary(new_history, initial_context);
     }
-    remove_protected_pending_final_items(&mut new_history, &protected_item_ids);
     let reference_context_item = match initial_context_injection {
         InitialContextInjection::DoNotInject => None,
         InitialContextInjection::BeforeLastUserMessage(_) => {
@@ -742,7 +694,7 @@ async fn drain_to_completed(
     responses_metadata: &CodexResponsesMetadata,
     prompt: &Prompt,
 ) -> CodexResult<()> {
-    sess.reserve_rollout_model_call(turn_context)?;
+    sess.ensure_rollout_budget_available()?;
     let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
     let stream_result = client_session
         .stream(
@@ -776,11 +728,8 @@ async fn drain_to_completed(
             .begin_model_stream_processing();
         match event {
             Ok(ResponseEvent::OutputItemDone(item)) => {
-                sess.record_conversation_items_for_model_history_and_rollout_only(
-                    turn_context,
-                    std::slice::from_ref(&item),
-                )
-                .await;
+                sess.record_conversation_items(turn_context, std::slice::from_ref(&item))
+                    .await;
             }
             Ok(ResponseEvent::ServerReasoningIncluded(included)) => {
                 sess.set_server_reasoning_included(included).await;

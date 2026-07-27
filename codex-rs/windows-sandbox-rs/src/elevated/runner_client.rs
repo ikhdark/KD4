@@ -93,15 +93,6 @@ impl std::fmt::Display for RunnerStartupError {
 
 impl std::error::Error for RunnerStartupError {}
 
-fn startup_error_proves_no_resumed_child(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<RunnerStartupError>().is_some_and(|err| {
-        matches!(
-            err.payload.stage,
-            ErrorStage::ReadSpawnRequest | ErrorStage::SpawnChild
-        )
-    })
-}
-
 pub(crate) struct RunnerTransport {
     pipe_write: File,
     pipe_read: File,
@@ -324,7 +315,6 @@ pub(crate) fn spawn_runner_transport(
     log_dir: Option<&Path>,
     spawn_request: SpawnRequest,
 ) -> Result<RunnerTransport> {
-    let require_confirmed_descendant_exit = spawn_request.require_confirmed_descendant_exit;
     let (pipe_in_name, pipe_out_name) = pipe_pair();
     let h_pipe_in =
         create_named_pipe(&pipe_in_name, PIPE_ACCESS_OUTBOUND, &sandbox_creds.username)?;
@@ -428,22 +418,6 @@ pub(crate) fn spawn_runner_transport(
         Ok(())
     })();
     if let Err(err) = startup_result {
-        if require_confirmed_descendant_exit && !startup_error_proves_no_resumed_child(&err) {
-            // Once any part of SpawnRequest may have reached the runner, a
-            // timeout, malformed response, or WriteSpawnReady failure cannot
-            // prove that no resumed child exists. Explicit ReadSpawnRequest
-            // and SpawnChild errors are pre-resume and remain safe to return
-            // (including to credential-refresh retry logic).
-            drop(transport);
-            unsafe {
-                if pi.hProcess != 0 {
-                    CloseHandle(pi.hProcess);
-                }
-            }
-            loop {
-                std::thread::park_timeout(Duration::from_secs(60));
-            }
-        }
         unsafe {
             if pi.hProcess != 0 {
                 let _ = TerminateProcess(pi.hProcess, 1);
@@ -517,32 +491,12 @@ mod tests {
     use super::RunnerLogonError;
     use super::RunnerStartupError;
     use super::is_refreshable_sandbox_creds_error;
-    use super::startup_error_proves_no_resumed_child;
     use crate::ipc_framed::ErrorPayload;
     use crate::ipc_framed::ErrorStage;
     use pretty_assertions::assert_eq;
     use windows_sys::Win32::Foundation::ERROR_LOGON_FAILURE;
     use windows_sys::Win32::Foundation::ERROR_NO_SUCH_LOGON_SESSION;
     use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
-
-    #[test]
-    fn only_explicit_pre_resume_startup_errors_release_confirmed_mode() {
-        let proves_no_child = |stage| {
-            let err = anyhow::Error::new(RunnerStartupError::new(ErrorPayload {
-                message: "runner startup failed".to_string(),
-                stage,
-                windows_error_code: None,
-            }));
-            startup_error_proves_no_resumed_child(&err)
-        };
-
-        assert!(proves_no_child(ErrorStage::ReadSpawnRequest));
-        assert!(proves_no_child(ErrorStage::SpawnChild));
-        assert!(!proves_no_child(ErrorStage::WriteSpawnReady));
-        assert!(!startup_error_proves_no_resumed_child(&anyhow::anyhow!(
-            "runner pipe closed"
-        )));
-    }
 
     #[test]
     fn refreshable_sandbox_creds_error_recognizes_credential_and_child_start_failures() {

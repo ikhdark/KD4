@@ -65,8 +65,6 @@ pub struct ExecRequest {
     pub(crate) exec_server_sandbox: Option<FileSystemSandboxContext>,
     pub(crate) exec_server_enforce_managed_network: bool,
     pub(crate) exec_server_managed_network: Option<ManagedNetworkSandboxContext>,
-    pub(crate) descendant_containment_required: bool,
-    pub(crate) descendant_containment_established: bool,
 }
 
 impl ExecRequest {
@@ -112,8 +110,6 @@ impl ExecRequest {
             exec_server_sandbox: None,
             exec_server_enforce_managed_network: false,
             exec_server_managed_network: None,
-            descendant_containment_required: false,
-            descendant_containment_established: false,
         }
     }
 
@@ -173,8 +169,6 @@ impl ExecRequest {
             exec_server_sandbox: None,
             exec_server_enforce_managed_network: false,
             exec_server_managed_network: None,
-            descendant_containment_required: false,
-            descendant_containment_established: false,
         }
     }
 }

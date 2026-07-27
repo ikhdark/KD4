@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -6,7 +5,6 @@ use super::trim_function_call_history_to_fit_context_window;
 use crate::Prompt;
 use crate::client::CompactConversationRequestSettings;
 use crate::compact::CompactionAnalyticsDetails;
-use crate::compact::remove_protected_pending_final_items_from_history;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_metadata::CompactionTurnMetadata;
 use crate::session::session::Session;
@@ -22,7 +20,6 @@ use tracing::info;
 pub(super) struct RemoteCompactAttempt {
     pub(super) new_history: Vec<ResponseItem>,
     pub(super) trace_input_history: Option<Vec<ResponseItem>>,
-    pub(super) protected_item_ids: BTreeSet<String>,
 }
 
 pub(super) async fn run_remote_compact_attempt(
@@ -35,19 +32,6 @@ pub(super) async fn run_remote_compact_attempt(
 ) -> CodexResult<RemoteCompactAttempt> {
     let turn_context = &step_context.turn;
     let mut history = sess.clone_history().await;
-    // Managed finals enter the ledger before history, so this ordering closes
-    // the snapshot race: anything protected in `history` is visible here.
-    let protected_item_ids = sess
-        .services
-        .task_evidence
-        .protected_pending_final_item_ids()
-        .await;
-    remove_protected_pending_final_items_from_history(&mut history, &protected_item_ids);
-    // A protected item can be absent from the current local snapshot while it
-    // still exists in opaque server-side incremental state. Any protected ID
-    // therefore requires a full-history compaction request, not only IDs that
-    // were removed from this particular snapshot.
-    let protected_history_requires_full_replay = !protected_item_ids.is_empty();
     let base_instructions = sess.get_base_instructions().await;
     let (rewritten_outputs, estimated_deleted_tokens) =
         trim_function_call_history_to_fit_context_window(
@@ -97,7 +81,7 @@ pub(super) async fn run_remote_compact_attempt(
         window_id,
         CodexResponsesRequestKind::Compaction(compaction_metadata),
     );
-    sess.reserve_rollout_model_call(turn_context.as_ref())?;
+    sess.ensure_rollout_budget_available()?;
     let model_request_timing_guard = turn_context.turn_timing_state.begin_model_request_wait();
     let new_history_result = sess
         .services
@@ -105,11 +89,7 @@ pub(super) async fn run_remote_compact_attempt(
         .compact_conversation_history(
             &prompt,
             &turn_context.model_info,
-            if protected_history_requires_full_replay {
-                None
-            } else {
-                turn_state
-            },
+            turn_state,
             CompactConversationRequestSettings {
                 effort: turn_context.reasoning_effort.clone(),
                 summary: turn_context.reasoning_summary,
@@ -129,6 +109,5 @@ pub(super) async fn run_remote_compact_attempt(
     Ok(RemoteCompactAttempt {
         new_history,
         trace_input_history,
-        protected_item_ids,
     })
 }

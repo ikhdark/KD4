@@ -18,13 +18,10 @@ use codex_protocol::config_types::SERVICE_TIER_DEFAULT_REQUEST_VALUE;
 use codex_protocol::config_types::ServiceTier;
 use codex_protocol::permissions::FileSystemPath;
 use codex_protocol::permissions::FileSystemSpecialPath;
-use codex_protocol::protocol::InternalSessionSource;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
-use std::path::Path;
-use std::path::PathBuf;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
 
@@ -468,31 +465,6 @@ async fn warm_plugins_and_skills_for_session_init(
         .outcome()
         .errors
         .clone()
-}
-
-pub(super) async fn task_evidence_for_session(
-    ephemeral: bool,
-    session_source: &SessionSource,
-    codex_home: PathBuf,
-    thread_id: ThreadId,
-    cwd: &Path,
-) -> crate::task_evidence::TaskEvidenceLedger {
-    if !ephemeral {
-        return crate::task_evidence::TaskEvidenceLedger::load_or_new(codex_home, thread_id, cwd)
-            .await;
-    }
-
-    let specialized_session = matches!(
-        session_source,
-        SessionSource::SubAgent(
-            SubAgentSource::Review | SubAgentSource::Compact | SubAgentSource::MemoryConsolidation
-        ) | SessionSource::Internal(InternalSessionSource::MemoryConsolidation)
-    ) || crate::guardian::is_guardian_reviewer_source(session_source);
-    if specialized_session {
-        crate::task_evidence::TaskEvidenceLedger::disabled()
-    } else {
-        crate::task_evidence::TaskEvidenceLedger::in_memory(thread_id, cwd).await
-    }
 }
 
 impl Session {
@@ -1054,19 +1026,12 @@ impl Session {
                     (None, None)
                 };
 
-            let hooks = if matches!(
-                session_configuration.session_source,
-                SessionSource::SubAgent(SubAgentSource::Review)
-            ) {
-                Hooks::default()
-            } else {
-                build_hooks_for_config(
-                    &config,
-                    plugins_manager.as_ref(),
-                    resolved_environments.single_local_environment(),
-                )
-                .await
-            };
+            let hooks = build_hooks_for_config(
+                &config,
+                plugins_manager.as_ref(),
+                resolved_environments.single_local_environment(),
+            )
+            .await;
             for warning in hooks.startup_warnings() {
                 post_session_configured_events.push(Event {
                     id: INITIAL_SUBMIT_ID.to_owned(),
@@ -1097,24 +1062,17 @@ impl Session {
             session_extension_data.insert(McpResourceClient::new(Arc::clone(
                 &mcp_connection_manager,
             )));
-            if !matches!(
-                session_configuration.session_source,
-                SessionSource::SubAgent(SubAgentSource::Review)
-            ) {
-                for contributor in extensions.thread_lifecycle_contributors() {
-                    contributor.on_thread_start(codex_extension_api::ThreadStartInput {
-                        config: config.as_ref(),
-                        session_source: &session_configuration.session_source,
-                        persistent_thread_state_available: state_db_ctx.is_some(),
-                        environments: session_configuration.environment_selections(),
-                        session_store: &session_extension_data,
-                        thread_store: &thread_extension_data,
-                    }).await;
-                }
+            for contributor in extensions.thread_lifecycle_contributors() {
+                contributor.on_thread_start(codex_extension_api::ThreadStartInput {
+                    config: config.as_ref(),
+                    session_source: &session_configuration.session_source,
+                    persistent_thread_state_available: state_db_ctx.is_some(),
+                    environments: session_configuration.environment_selections(),
+                    session_store: &session_extension_data,
+                    thread_store: &thread_extension_data,
+                }).await;
             }
-            let task_evidence = task_evidence_for_session(
-                config.ephemeral,
-                &session_configuration.session_source,
+            let task_evidence = crate::task_evidence::TaskEvidenceLedger::load_or_new(
                 config.codex_home.to_path_buf(),
                 thread_id,
                 session_configuration.cwd().as_path(),

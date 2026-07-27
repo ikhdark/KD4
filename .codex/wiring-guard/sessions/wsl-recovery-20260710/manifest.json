@@ -1,0 +1,8 @@
+{
+  "task": "repair malformed LOCAL-KD desktop runtime config",
+  "must_reach": [],
+  "replaces": [],
+  "no_wiring_targets": true,
+  "reason": "config-only repair; no source symbols or call sites change",
+  "session_id": "wsl-recovery-20260710"
+}

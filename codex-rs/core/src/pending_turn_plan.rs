@@ -33,26 +33,22 @@ pub(crate) struct CompletedEffect {
 
 #[derive(Debug, Default)]
 pub(crate) struct FixedPointPlanningState {
-    attempts: usize,
+    iterations: usize,
     digest_visits: HashMap<String, usize>,
     completed_effects: HashMap<String, CompletedEffect>,
 }
 
 impl FixedPointPlanningState {
-    pub(crate) fn begin_attempt(&mut self) -> Result<(), String> {
-        self.attempts = self.attempts.saturating_add(1);
-        if self.attempts > MAX_FIXED_POINT_ITERATIONS {
+    pub(crate) fn begin_iteration(
+        &mut self,
+        snapshot: &PlanningSnapshotIdentity,
+    ) -> Result<(), String> {
+        self.iterations = self.iterations.saturating_add(1);
+        if self.iterations > MAX_FIXED_POINT_ITERATIONS {
             return Err(format!(
                 "pending-turn planning did not reach a fixed point after {MAX_FIXED_POINT_ITERATIONS} iterations"
             ));
         }
-        Ok(())
-    }
-
-    pub(crate) fn observe_snapshot(
-        &mut self,
-        snapshot: &PlanningSnapshotIdentity,
-    ) -> Result<(), String> {
         let visits = self
             .digest_visits
             .entry(snapshot.state_digest.clone())
@@ -171,11 +167,10 @@ mod tests {
     fn fixed_point_loop_is_bounded() {
         let mut state = FixedPointPlanningState::default();
         for generation in 0..MAX_FIXED_POINT_ITERATIONS {
-            state.begin_attempt().expect("within bound");
             state
-                .observe_snapshot(&snapshot(generation as u64, &format!("state-{generation}")))
-                .expect("snapshot within bound");
+                .begin_iteration(&snapshot(generation as u64, &format!("state-{generation}")))
+                .expect("within bound");
         }
-        assert!(state.begin_attempt().is_err());
+        assert!(state.begin_iteration(&snapshot(9, "state-9")).is_err());
     }
 }

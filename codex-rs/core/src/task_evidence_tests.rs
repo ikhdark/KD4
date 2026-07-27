@@ -98,7 +98,6 @@ fn validation_receipt(id: &str) -> ValidationReceipt {
         verdict: Some("VERIFIED".to_string()),
         tool_success: true,
         proof_bearing: true,
-        accepted_proof: true,
         active_files: Vec::new(),
         stale_reasons: Vec::new(),
         payload: None,
@@ -276,10 +275,7 @@ async fn generated_artifact_mutation_invalidates_validation_freshness() {
     tokio::fs::write(repo.join("generated/schema.json"), br#"{"version":2}"#)
         .await
         .expect("mutated generated artifact");
-    ledger
-        .refresh_external_file_freshness()
-        .await
-        .expect("refresh freshness");
+    ledger.refresh_external_file_freshness().await;
 
     {
         let guard = ledger.document.lock().await;

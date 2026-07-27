@@ -28,6 +28,7 @@ use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
 use codex_protocol::user_input::UserInput;
 use core_test_support::PathBufExt;
+use core_test_support::apps_test_server::configure_search_capable_model;
 use core_test_support::context_snapshot;
 use core_test_support::context_snapshot::ContextSnapshotOptions;
 use core_test_support::context_snapshot::ContextSnapshotRenderMode;
@@ -1444,6 +1445,251 @@ async fn remote_compact_runs_automatically() -> Result<()> {
 
 #[cfg_attr(target_os = "windows", ignore)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_compact_trims_function_call_history_to_fit_context_window() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let first_user_message = "turn with retained shell call";
+    let second_user_message = "turn with trimmed shell call";
+    let retained_call_id = "retained-call";
+    let trimmed_call_id = "trimmed-call";
+    let retained_command = "echo retained-shell-output";
+    let trimmed_command = "yes x | head -n 3000";
+
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.model_context_window = Some(2_000);
+                config.model_auto_compact_token_limit = Some(200_000);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+
+    responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            sse(vec![
+                responses::ev_shell_command_call(retained_call_id, retained_command),
+                responses::ev_completed("retained-call-response"),
+            ]),
+            sse(vec![
+                responses::ev_assistant_message("retained-assistant", "retained complete"),
+                responses::ev_completed("retained-final-response"),
+            ]),
+            sse(vec![
+                responses::ev_shell_command_call(trimmed_call_id, trimmed_command),
+                responses::ev_completed("trimmed-call-response"),
+            ]),
+        ],
+    )
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: first_user_message.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: second_user_message.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let compact_mock = responses::mount_compact_user_history_with_summary_once(
+        harness.server(),
+        "REMOTE_COMPACT_SUMMARY",
+    )
+    .await;
+
+    codex.submit(Op::Compact).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let compact_request = compact_mock.single_request();
+    let user_messages = compact_request.message_input_texts("user");
+    assert!(
+        user_messages
+            .iter()
+            .any(|message| message == first_user_message),
+        "expected compact request to retain earlier user history"
+    );
+    assert!(
+        user_messages
+            .iter()
+            .any(|message| message == second_user_message),
+        "expected compact request to retain the user boundary message"
+    );
+
+    assert!(
+        compact_request.has_function_call(retained_call_id)
+            && compact_request
+                .function_call_output_text(retained_call_id)
+                .is_some(),
+        "expected compact request to keep the older function call/result pair"
+    );
+    assert!(
+        compact_request.has_function_call(trimmed_call_id),
+        "expected compact request to retain the trailing function call"
+    );
+    assert_eq!(
+        compact_request.function_call_output_text(trimmed_call_id),
+        Some(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE.to_string()),
+        "expected compact request to rewrite the trailing function call output past the boundary"
+    );
+
+    assert_eq!(
+        compact_request.inputs_of_type("function_call").len(),
+        2,
+        "expected both function calls after rewriting the trailing output"
+    );
+    assert_eq!(
+        compact_request.inputs_of_type("function_call_output").len(),
+        2,
+        "expected both function call outputs after rewriting the trailing output"
+    );
+
+    Ok(())
+}
+
+#[cfg_attr(target_os = "windows", ignore)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_compact_rewrites_multiple_trailing_function_call_outputs() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let first_user_message = "turn with retained shell call";
+    let second_user_message = "turn with parallel shell calls";
+    let retained_call_id = "retained-call";
+    let first_trimmed_call_id = "first-trimmed-call";
+    let second_trimmed_call_id = "second-trimmed-call";
+    let retained_command = "echo retained-shell-output";
+    let first_trimmed_command = "yes x | head -n 3000";
+    let second_trimmed_command = "yes y | head -n 3000";
+
+    let harness = TestCodexHarness::with_builder(
+        test_codex()
+            .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+            .with_config(|config| {
+                config.model_context_window = Some(2_000);
+                config.model_auto_compact_token_limit = Some(200_000);
+            }),
+    )
+    .await?;
+    let codex = harness.test().codex.clone();
+
+    responses::mount_sse_sequence(
+        harness.server(),
+        vec![
+            sse(vec![
+                responses::ev_shell_command_call(retained_call_id, retained_command),
+                responses::ev_completed("retained-call-response"),
+            ]),
+            sse(vec![
+                responses::ev_assistant_message("retained-assistant", "retained complete"),
+                responses::ev_completed("retained-final-response"),
+            ]),
+            sse(vec![
+                responses::ev_shell_command_call(first_trimmed_call_id, first_trimmed_command),
+                responses::ev_shell_command_call(second_trimmed_call_id, second_trimmed_command),
+                responses::ev_completed("parallel-call-response"),
+            ]),
+        ],
+    )
+    .await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: first_user_message.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: second_user_message.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let compact_mock = responses::mount_compact_user_history_with_summary_once(
+        harness.server(),
+        "REMOTE_COMPACT_SUMMARY",
+    )
+    .await;
+
+    codex.submit(Op::Compact).await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let compact_request = compact_mock.single_request();
+    assert!(
+        compact_request.has_function_call(retained_call_id)
+            && compact_request
+                .function_call_output_text(retained_call_id)
+                .is_some(),
+        "expected compact request to keep the older function call/result pair"
+    );
+    assert!(
+        compact_request.has_function_call(first_trimmed_call_id)
+            && compact_request.has_function_call(second_trimmed_call_id),
+        "expected compact request to retain both trailing parallel function calls"
+    );
+    assert_eq!(
+        compact_request.function_call_output_text(first_trimmed_call_id),
+        Some(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE.to_string()),
+        "expected compact request to rewrite the first trailing function call output"
+    );
+    assert_eq!(
+        compact_request.function_call_output_text(second_trimmed_call_id),
+        Some(CONTEXT_WINDOW_TRUNCATED_OUTPUT_MESSAGE.to_string()),
+        "expected compact request to rewrite the second trailing function call output"
+    );
+
+    assert_eq!(
+        compact_request.inputs_of_type("function_call").len(),
+        3,
+        "expected all function calls after rewriting trailing outputs"
+    );
+    assert_eq!(
+        compact_request.inputs_of_type("function_call_output").len(),
+        3,
+        "expected all function call outputs after rewriting trailing outputs"
+    );
+
+    Ok(())
+}
+
+#[cfg_attr(target_os = "windows", ignore)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_remote_compact_trims_function_call_history_to_fit_context_window() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
@@ -1452,13 +1698,12 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
     let retained_call_id = "retained-call";
     let trimmed_call_id = "trimmed-call";
     let retained_command = "echo retained-shell-output";
-    let trimmed_command = "yes x | head -n 50000";
+    let trimmed_command = "yes x | head -n 3000";
     let harness = TestCodexHarness::with_builder(
         test_codex()
             .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
             .with_config(|config| {
-                config.base_instructions = Some("test instructions".to_string());
-                config.model_context_window = Some(8_000);
+                config.model_context_window = Some(2_000);
                 config.model_auto_compact_token_limit = Some(200_000);
             }),
     )
@@ -1508,6 +1753,20 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
         .await?;
     wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
 
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: second_user_message.into(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&codex, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
     let compact_mock = responses::mount_compact_user_history_with_summary_once(
         harness.server(),
         "REMOTE_AUTO_COMPACT_SUMMARY",
@@ -1517,7 +1776,7 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
     codex
         .submit(Op::UserInput {
             items: vec![UserInput::Text {
-                text: second_user_message.into(),
+                text: "turn that triggers auto compact".into(),
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
@@ -1574,6 +1833,112 @@ async fn auto_remote_compact_trims_function_call_history_to_fit_context_window()
         compact_request.inputs_of_type("function_call_output").len(),
         2,
         "expected both function call outputs after rewriting the trailing output"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_compact_trims_tool_search_output_to_empty_tools_array() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = responses::start_mock_server().await;
+    let search_call_id = "tool-search-1";
+    let tool_name = "oversized_dynamic_tool";
+    let tool_description = format!(
+        "Oversized deferred tool for remote compaction. {}",
+        "x".repeat(20_000)
+    );
+    let _responses_mock = mount_sse_once(
+        &server,
+        sse(vec![
+            responses::ev_response_created("resp-1"),
+            responses::ev_tool_search_call(
+                search_call_id,
+                &json!({
+                    "query": "oversized deferred tool",
+                    "limit": 8,
+                }),
+            ),
+            responses::ev_completed("resp-1"),
+        ]),
+    )
+    .await;
+
+    let input_schema = json!({
+        "type": "object",
+        "properties": {
+            "mode": { "type": "string" },
+        },
+        "required": ["mode"],
+        "additionalProperties": false,
+    });
+    let dynamic_tool = DynamicToolSpec::Namespace(DynamicToolNamespaceSpec {
+        name: "codex_app".to_string(),
+        description: "Codex app tools.".to_string(),
+        tools: vec![DynamicToolNamespaceTool::Function(
+            DynamicToolFunctionSpec {
+                name: tool_name.to_string(),
+                description: tool_description,
+                input_schema,
+                defer_loading: true,
+            },
+        )],
+    });
+
+    let mut builder = test_codex()
+        .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
+        .with_config(|config| {
+            configure_search_capable_model(config);
+            config.model_context_window = Some(2_000);
+        });
+    let mut test = builder.build(&server).await?;
+    let new_thread = test
+        .thread_manager
+        .start_thread_with_tools(test.config.clone(), vec![dynamic_tool])
+        .await?;
+    test.codex = new_thread.thread;
+    test.session_configured = new_thread.session_configured;
+    let codex = test.codex.clone();
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "Find the oversized deferred tool".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_turn_complete(&codex).await;
+
+    let compact_mock =
+        responses::mount_compact_user_history_with_summary_once(&server, "REMOTE_COMPACT_SUMMARY")
+            .await;
+
+    codex.submit(Op::Compact).await?;
+    wait_for_turn_complete(&codex).await;
+
+    let compact_request = compact_mock.single_request();
+    let compact_tools = compact_request
+        .tool_search_output(search_call_id)
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        compact_request
+            .inputs_of_type("tool_search_output")
+            .iter()
+            .any(|item| item.get("call_id").and_then(Value::as_str) == Some(search_call_id)),
+        "expected compact request to retain the tool_search_output item"
+    );
+    assert!(
+        compact_tools.is_empty(),
+        "expected compact request to rewrite trailing tool_search output to an empty tools array"
     );
 
     Ok(())

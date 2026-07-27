@@ -259,11 +259,6 @@ mod tests {
             reminder_at_remaining_tokens: vec![50_000, 25_000, 10_000],
             sampling_token_weight: 1.0,
             prefill_token_weight: 0.25,
-            cached_input_token_weight: 0.1,
-            model_call_token_cost: 1_000.0,
-            tool_output_byte_weight: 0.05,
-            subagent_token_cost: 5_000.0,
-            action: codex_features::RolloutBudgetAction::Ask,
         });
         config
             .features
@@ -358,11 +353,6 @@ mod tests {
                 reminder_at_remaining_tokens: Some(vec![50_000, 25_000, 10_000]),
                 sampling_token_weight: Some(1.0),
                 prefill_token_weight: Some(0.25),
-                cached_input_token_weight: Some(0.1),
-                model_call_token_cost: Some(1_000.0),
-                tool_output_byte_weight: Some(0.05),
-                subagent_token_cost: Some(5_000.0),
-                action: Some(codex_features::RolloutBudgetAction::Ask),
             }))
         );
         assert_eq!(

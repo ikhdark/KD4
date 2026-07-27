@@ -55,10 +55,6 @@ impl ToolExecutor<ToolCall> for ReadTool {
         )
     }
 
-    fn read_only_hint(&self) -> Option<bool> {
-        Some(true)
-    }
-
     fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {
         Box::pin(async move {
             let args: ReadArgs = parse_args(&call)?;

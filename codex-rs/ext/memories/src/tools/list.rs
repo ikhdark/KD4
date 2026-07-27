@@ -54,10 +54,6 @@ where
         )
     }
 
-    fn read_only_hint(&self) -> Option<bool> {
-        Some(true)
-    }
-
     fn handle(&self, call: ToolCall) -> codex_extension_api::ToolExecutorFuture<'_> {
         Box::pin(self.handle_call(call))
     }

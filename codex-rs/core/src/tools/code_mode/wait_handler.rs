@@ -23,12 +23,16 @@ pub struct CodeModeWaitHandler;
 #[derive(Debug, Deserialize)]
 struct ExecWaitArgs {
     cell_id: String,
-    #[serde(default)]
-    yield_time_ms: Option<u64>,
+    #[serde(default = "default_wait_yield_time_ms")]
+    yield_time_ms: u64,
     #[serde(default)]
     max_tokens: Option<usize>,
     #[serde(default)]
     terminate: bool,
+}
+
+fn default_wait_yield_time_ms() -> u64 {
+    DEFAULT_WAIT_YIELD_TIME_MS
 }
 
 fn parse_arguments<T>(arguments: &str) -> Result<T, FunctionCallError>
@@ -73,16 +77,6 @@ impl CodeModeWaitHandler {
             {
                 let args: ExecWaitArgs = parse_arguments(&arguments)?;
                 let exec = ExecContext { session, turn };
-                let yield_time_ms = args.yield_time_ms.unwrap_or_else(|| {
-                    if matches!(
-                        exec.turn.config.code_mode.waiting_policy,
-                        codex_features::CodeModeWaitingPolicy::RunToCompletion
-                    ) {
-                        codex_code_mode::RUN_TO_COMPLETION_YIELD_TIME_MS
-                    } else {
-                        DEFAULT_WAIT_YIELD_TIME_MS
-                    }
-                });
                 let started_at = std::time::Instant::now();
                 let cell_id = codex_code_mode::CellId::new(args.cell_id);
                 let wait_response = if args.terminate {
@@ -97,7 +91,7 @@ impl CodeModeWaitHandler {
                         .code_mode_service
                         .wait(codex_code_mode::WaitRequest {
                             cell_id,
-                            yield_time_ms,
+                            yield_time_ms: args.yield_time_ms,
                         })
                         .await
                 }

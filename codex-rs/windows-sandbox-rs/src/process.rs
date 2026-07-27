@@ -22,58 +22,15 @@ use windows_sys::Win32::System::Console::GetStdHandle;
 use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
 use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
 use windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE;
-use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
-use windows_sys::Win32::System::JobObjects::TerminateJobObject;
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
 use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
 use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::EXTENDED_STARTUPINFO_PRESENT;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
-use windows_sys::Win32::System::Threading::ResumeThread;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 use windows_sys::Win32::System::Threading::STARTUPINFOEXW;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
-use windows_sys::Win32::System::Threading::TerminateProcess;
-use windows_sys::Win32::System::Threading::WaitForSingleObject;
-
-pub(crate) unsafe fn attach_to_job_and_resume(
-    process_info: &PROCESS_INFORMATION,
-    containment_job: Option<HANDLE>,
-) -> Result<()> {
-    let Some(job) = containment_job else {
-        return Ok(());
-    };
-    if AssignProcessToJobObject(job, process_info.hProcess) == 0 {
-        let err = GetLastError();
-        let _ = TerminateProcess(process_info.hProcess, 1);
-        let _ = WaitForSingleObject(process_info.hProcess, 5_000);
-        if process_info.hThread != 0 {
-            CloseHandle(process_info.hThread);
-        }
-        if process_info.hProcess != 0 {
-            CloseHandle(process_info.hProcess);
-        }
-        return Err(anyhow!(
-            "AssignProcessToJobObject failed before child resume: {err}"
-        ));
-    }
-    if ResumeThread(process_info.hThread) == u32::MAX {
-        let err = GetLastError();
-        let _ = TerminateJobObject(job, 1);
-        let _ = TerminateProcess(process_info.hProcess, 1);
-        let _ = WaitForSingleObject(process_info.hProcess, 5_000);
-        if process_info.hThread != 0 {
-            CloseHandle(process_info.hThread);
-        }
-        if process_info.hProcess != 0 {
-            CloseHandle(process_info.hProcess);
-        }
-        return Err(anyhow!("ResumeThread failed for contained child: {err}"));
-    }
-    Ok(())
-}
 
 pub struct CreatedProcess {
     pub process_info: PROCESS_INFORMATION,
@@ -137,7 +94,6 @@ pub unsafe fn create_process_as_user(
     stdio: Option<(HANDLE, HANDLE, HANDLE)>,
     console_mode: ConsoleMode,
     use_private_desktop: bool,
-    containment_job: Option<HANDLE>,
 ) -> Result<CreatedProcess> {
     let cmdline_str = argv_to_command_line(argv);
     let mut cmdline: Vec<u16> = to_wide(&cmdline_str);
@@ -176,11 +132,6 @@ pub unsafe fn create_process_as_user(
 
             let creation_flags = CREATE_UNICODE_ENVIRONMENT
                 | EXTENDED_STARTUPINFO_PRESENT
-                | if containment_job.is_some() {
-                    CREATE_SUSPENDED
-                } else {
-                    0
-                }
                 | match console_mode {
                     ConsoleMode::Inherit => 0,
                     ConsoleMode::NoWindow => CREATE_NO_WINDOW,
@@ -213,7 +164,6 @@ pub unsafe fn create_process_as_user(
                 logging::debug_log(&msg, logs_base_dir);
                 return Err(std::io::Error::from_raw_os_error(err)).context(msg);
             }
-            attach_to_job_and_resume(&pi, containment_job)?;
             Ok(CreatedProcess {
                 process_info: pi,
                 startup_info: si.StartupInfo,
@@ -226,12 +176,7 @@ pub unsafe fn create_process_as_user(
             si.lpDesktop = desktop.startup_info_desktop();
             ensure_inheritable_stdio(&mut si)?;
 
-            let creation_flags = CREATE_UNICODE_ENVIRONMENT
-                | if containment_job.is_some() {
-                    CREATE_SUSPENDED
-                } else {
-                    0
-                };
+            let creation_flags = CREATE_UNICODE_ENVIRONMENT;
             let ok = CreateProcessAsUserW(
                 h_token,
                 std::ptr::null(),
@@ -260,7 +205,6 @@ pub unsafe fn create_process_as_user(
                 logging::debug_log(&msg, logs_base_dir);
                 return Err(std::io::Error::from_raw_os_error(err)).context(msg);
             }
-            attach_to_job_and_resume(&pi, containment_job)?;
             Ok(CreatedProcess {
                 process_info: pi,
                 startup_info: si,
@@ -306,7 +250,6 @@ pub fn spawn_process_with_pipes(
     console_mode: ConsoleMode,
     use_private_desktop: bool,
     logs_base_dir: Option<&Path>,
-    containment_job: Option<HANDLE>,
 ) -> Result<PipeSpawnHandles> {
     let mut in_r: HANDLE = 0;
     let mut in_w: HANDLE = 0;
@@ -350,7 +293,6 @@ pub fn spawn_process_with_pipes(
             stdio,
             console_mode,
             use_private_desktop,
-            containment_job,
         )
     };
     let created = match spawn_result {
@@ -428,157 +370,4 @@ where
             CloseHandle(handle);
         }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::winutil::argv_to_command_line;
-    use windows_sys::Win32::System::JobObjects::CreateJobObjectW;
-    use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    use windows_sys::Win32::System::JobObjects::JOBOBJECT_BASIC_ACCOUNTING_INFORMATION;
-    use windows_sys::Win32::System::JobObjects::JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
-    use windows_sys::Win32::System::JobObjects::JobObjectBasicAccountingInformation;
-    use windows_sys::Win32::System::JobObjects::JobObjectExtendedLimitInformation;
-    use windows_sys::Win32::System::JobObjects::QueryInformationJobObject;
-    use windows_sys::Win32::System::JobObjects::SetInformationJobObject;
-    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-    use windows_sys::Win32::System::Threading::CreateProcessW;
-
-    unsafe fn create_kill_on_close_job() -> HANDLE {
-        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
-        assert_ne!(job, 0, "CreateJobObjectW failed: {}", GetLastError());
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
-        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        assert_ne!(
-            SetInformationJobObject(
-                job,
-                JobObjectExtendedLimitInformation,
-                &limits as *const _ as *const _,
-                std::mem::size_of_val(&limits) as u32,
-            ),
-            0,
-            "SetInformationJobObject failed: {}",
-            GetLastError()
-        );
-        job
-    }
-
-    unsafe fn job_accounting(job: HANDLE) -> JOBOBJECT_BASIC_ACCOUNTING_INFORMATION {
-        let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = std::mem::zeroed();
-        assert_ne!(
-            QueryInformationJobObject(
-                job,
-                JobObjectBasicAccountingInformation,
-                &mut accounting as *mut _ as *mut _,
-                std::mem::size_of_val(&accounting) as u32,
-                std::ptr::null_mut(),
-            ),
-            0,
-            "QueryInformationJobObject failed: {}",
-            GetLastError()
-        );
-        accounting
-    }
-
-    #[test]
-    fn suspended_job_assignment_contains_detached_descendants() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let child_script = temp.path().join("detached-child.ps1");
-        let parent_script = temp.path().join("parent.ps1");
-        let escaped_marker = temp
-            .path()
-            .join("escaped.txt")
-            .to_string_lossy()
-            .replace('\'', "''");
-        std::fs::write(
-            &child_script,
-            format!(
-                "Start-Sleep -Milliseconds 750\n[IO.File]::WriteAllText('{escaped_marker}', 'escaped')\n"
-            ),
-        )
-        .expect("write child script");
-        let escaped_child = child_script.to_string_lossy().replace('\'', "''");
-        std::fs::write(
-            &parent_script,
-            format!(
-                "Start-Process -FilePath powershell.exe -WindowStyle Hidden -ArgumentList @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File','{escaped_child}')\n"
-            ),
-        )
-        .expect("write parent script");
-
-        let argv = vec![
-            "powershell.exe".to_string(),
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-ExecutionPolicy".to_string(),
-            "Bypass".to_string(),
-            "-File".to_string(),
-            parent_script.to_string_lossy().into_owned(),
-        ];
-        let mut command_line = to_wide(argv_to_command_line(&argv));
-        let cwd = to_wide(temp.path());
-        let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
-        startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
-        let mut process_info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
-        let job = unsafe { create_kill_on_close_job() };
-        let created = unsafe {
-            CreateProcessW(
-                std::ptr::null(),
-                command_line.as_mut_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                0,
-                CREATE_NO_WINDOW | CREATE_SUSPENDED,
-                std::ptr::null(),
-                cwd.as_ptr(),
-                &startup,
-                &mut process_info,
-            )
-        };
-        assert_ne!(created, 0, "CreateProcessW failed: {}", unsafe {
-            GetLastError()
-        });
-        unsafe {
-            attach_to_job_and_resume(&process_info, Some(job))
-                .expect("assign suspended child to job and resume");
-        }
-        assert_eq!(
-            unsafe { WaitForSingleObject(process_info.hProcess, 10_000) },
-            0,
-            "parent process did not exit"
-        );
-        let accounting = unsafe { job_accounting(job) };
-        assert!(
-            accounting.TotalProcesses >= 2 && accounting.ActiveProcesses >= 1,
-            "expected a live detached descendant in the job (total={}, active={})",
-            accounting.TotalProcesses,
-            accounting.ActiveProcesses,
-        );
-
-        assert_ne!(
-            unsafe { TerminateJobObject(job, 1) },
-            0,
-            "TerminateJobObject failed: {}",
-            unsafe { GetLastError() }
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while unsafe { job_accounting(job).ActiveProcesses } != 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "contained descendants did not terminate"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        unsafe {
-            CloseHandle(process_info.hThread);
-            CloseHandle(process_info.hProcess);
-            CloseHandle(job);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(900));
-        assert!(
-            !temp.path().join("escaped.txt").exists(),
-            "detached descendant outlived the Job Object"
-        );
-    }
 }

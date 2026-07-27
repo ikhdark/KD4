@@ -57,10 +57,6 @@ impl SpawnAgentsOnCsvHandler {
 }
 
 impl CoreToolRuntime for SpawnAgentsOnCsvHandler {
-    fn task_evidence_trusted_mutator(&self) -> bool {
-        true
-    }
-
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }
@@ -93,28 +89,7 @@ pub async fn handle(
 
     let cwd = single_local_environment_cwd(&turn)?;
     let db = required_state_db(&session)?;
-    let file_system_policy = turn.file_system_sandbox_policy();
-    let logical_input_path = cwd.join(args.csv_path);
-    let input_path = AbsolutePathBuf::from_absolute_path(
-        dunce::canonicalize(&logical_input_path).map_err(|err| {
-            FunctionCallError::RespondToModel(format!(
-                "failed to resolve csv input {}: {err}",
-                logical_input_path.display()
-            ))
-        })?,
-    )
-    .map_err(|err| {
-        FunctionCallError::RespondToModel(format!(
-            "failed to normalize csv input {}: {err}",
-            logical_input_path.display()
-        ))
-    })?;
-    if !file_system_policy.can_read_path_with_cwd(&input_path, cwd.as_path()) {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "csv input path is not readable under the active sandbox policy: {}",
-            input_path.display()
-        )));
-    }
+    let input_path = cwd.join(args.csv_path);
     let input_path_display = input_path.display().to_string();
     let csv_content = tokio::fs::read_to_string(&input_path)
         .await
@@ -185,41 +160,10 @@ pub async fn handle(
     }
 
     let job_id = Uuid::new_v4().to_string();
-    let logical_output_csv_path = args.output_csv_path.map_or_else(
+    let output_csv_path = args.output_csv_path.map_or_else(
         || default_output_csv_path(&input_path, job_id.as_str()),
         |path| cwd.join(path),
     );
-    let symlink_resolved_output =
-        crate::path_utils::resolve_symlink_write_paths(&logical_output_csv_path)
-            .map_err(|err| {
-                FunctionCallError::RespondToModel(format!(
-                    "failed to resolve output csv path {}: {err}",
-                    logical_output_csv_path.display()
-                ))
-            })?
-            .write_path;
-    let output_csv_path =
-        crate::task_evidence::canonicalize_mutation_target(cwd.as_path(), &symlink_resolved_output)
-            .map_err(FunctionCallError::RespondToModel)?;
-    if !file_system_policy.can_write_path_with_cwd(&output_csv_path, cwd.as_path()) {
-        return Err(FunctionCallError::RespondToModel(format!(
-            "output csv path is not writable under the active sandbox policy: {}",
-            output_csv_path.display()
-        )));
-    }
-    if session
-        .services
-        .task_evidence
-        .manages_turn(&turn.sub_id)
-        .await
-    {
-        session
-            .services
-            .task_evidence
-            .register_mutation_targets(cwd.as_path(), std::slice::from_ref(&output_csv_path))
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
-    }
     let job_suffix = &job_id[..8];
     let job_name = format!("agent-job-{job_suffix}");
     let max_runtime_seconds = normalize_max_runtime_seconds(
@@ -257,7 +201,7 @@ pub async fn handle(
                         "failed to cancel agent job {job_id}: {error}"
                     ))
                 })?;
-            export_job_csv_snapshot(&session, &turn, db.clone(), &_job)
+            export_job_csv_snapshot(db.clone(), &_job)
                 .await
                 .map_err(|error| {
                     FunctionCallError::RespondToModel(format!(
@@ -319,9 +263,7 @@ pub async fn handle(
             )
             .await
             .err();
-            let export_error = export_job_csv_snapshot(&session, &turn, db.clone(), &_job)
-                .await
-                .err();
+            let export_error = export_job_csv_snapshot(db.clone(), &_job).await.err();
             let cleanup_details = match (cleanup_error, export_error) {
                 (Some(cleanup_error), Some(export_error)) => format!(
                     "; worker cleanup failed: {cleanup_error}; final export failed: {export_error}"
@@ -349,7 +291,7 @@ pub async fn handle(
         })?;
     let output_path = PathBuf::from(job.output_csv_path.clone());
     if !tokio::fs::try_exists(&output_path).await.unwrap_or(false) {
-        export_job_csv_snapshot(&session, &turn, db.clone(), &job)
+        export_job_csv_snapshot(db.clone(), &job)
             .await
             .map_err(|err| {
                 FunctionCallError::RespondToModel(format!(
@@ -418,4 +360,27 @@ pub async fn handle(
         ))
     })?;
     Ok(FunctionToolOutput::from_text(content, Some(true)))
+}
+
+fn single_local_environment_cwd(turn: &TurnContext) -> Result<AbsolutePathBuf, FunctionCallError> {
+    let [turn_environment] = turn.environments.turn_environments.as_slice() else {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agents_on_csv requires exactly one local environment".to_string(),
+        ));
+    };
+
+    if turn_environment.environment.is_remote() {
+        return Err(FunctionCallError::RespondToModel(
+            "spawn_agents_on_csv is not supported for remote environments".to_string(),
+        ));
+    }
+
+    // TODO(anp): Migrate spawn_agents_on_csv filesystem access to PathUri before enabling it for
+    // remote environments.
+    turn_environment.cwd().to_abs_path().map_err(|err| {
+        FunctionCallError::RespondToModel(format!(
+            "spawn_agents_on_csv cwd `{}` is not native to the Codex host: {err}",
+            turn_environment.cwd()
+        ))
+    })
 }

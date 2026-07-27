@@ -57,7 +57,6 @@ use codex_core_plugins::PluginsConfigInput;
 use codex_exec_server::ExecutorFileSystem;
 use codex_exec_server::LOCAL_FS;
 use codex_features::CodeModeConfigToml;
-use codex_features::CodeModeWaitingPolicy;
 use codex_features::CurrentTimeReminderConfigToml;
 use codex_features::CurrentTimeReminderDeliveryMode;
 use codex_features::CurrentTimeSource;
@@ -69,7 +68,6 @@ use codex_features::Features;
 use codex_features::FeaturesToml;
 use codex_features::MultiAgentV2ConfigToml;
 use codex_features::NetworkProxyConfigToml;
-use codex_features::RolloutBudgetAction;
 use codex_features::TokenBudgetConfigToml;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_http_client::HttpClientFactory;
@@ -1168,7 +1166,6 @@ pub struct Config {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct CodeModeConfig {
-    pub waiting_policy: CodeModeWaitingPolicy,
     pub excluded_tool_namespaces: Vec<String>,
     pub direct_only_tool_namespaces: Vec<String>,
 }
@@ -1203,11 +1200,6 @@ pub struct RolloutBudgetConfig {
     pub reminder_at_remaining_tokens: Vec<i64>,
     pub sampling_token_weight: f64,
     pub prefill_token_weight: f64,
-    pub cached_input_token_weight: f64,
-    pub model_call_token_cost: f64,
-    pub tool_output_byte_weight: f64,
-    pub subagent_token_cost: f64,
-    pub action: RolloutBudgetAction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -2575,9 +2567,6 @@ fn resolve_code_mode_config(config_toml: &ConfigToml) -> CodeModeConfig {
     let base = code_mode_toml_config(config_toml.features.as_ref());
 
     CodeModeConfig {
-        waiting_policy: base
-            .and_then(|config| config.waiting_policy)
-            .unwrap_or_default(),
         excluded_tool_namespaces: base
             .and_then(|config| config.excluded_tool_namespaces.as_ref())
             .cloned()
@@ -2761,17 +2750,9 @@ fn resolve_rollout_budget_config(
     }
     let sampling_token_weight = config.sampling_token_weight.unwrap_or(1.0);
     let prefill_token_weight = config.prefill_token_weight.unwrap_or(1.0);
-    let cached_input_token_weight = config.cached_input_token_weight.unwrap_or(0.1);
-    let model_call_token_cost = config.model_call_token_cost.unwrap_or(1_000.0);
-    let tool_output_byte_weight = config.tool_output_byte_weight.unwrap_or(0.05);
-    let subagent_token_cost = config.subagent_token_cost.unwrap_or(5_000.0);
     for (field, weight) in [
         ("sampling_token_weight", sampling_token_weight),
         ("prefill_token_weight", prefill_token_weight),
-        ("cached_input_token_weight", cached_input_token_weight),
-        ("model_call_token_cost", model_call_token_cost),
-        ("tool_output_byte_weight", tool_output_byte_weight),
-        ("subagent_token_cost", subagent_token_cost),
     ] {
         if !weight.is_finite() || weight < 0.0 {
             return Err(std::io::Error::new(
@@ -2785,11 +2766,6 @@ fn resolve_rollout_budget_config(
         reminder_at_remaining_tokens,
         sampling_token_weight,
         prefill_token_weight,
-        cached_input_token_weight,
-        model_call_token_cost,
-        tool_output_byte_weight,
-        subagent_token_cost,
-        action: config.action.unwrap_or_default(),
     }))
 }
 

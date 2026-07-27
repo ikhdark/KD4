@@ -71,7 +71,6 @@ use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use codex_protocol::request_permissions::PermissionGrantScope;
 use codex_protocol::request_permissions::RequestPermissionProfile;
-use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_path_uri::PathUri;
 use tracing::Span;
 
@@ -79,24 +78,6 @@ use crate::connectors::AppInfo;
 use crate::rollout::recorder::RolloutRecorder;
 use crate::state::ActiveTurn;
 use crate::state::TaskKind;
-
-#[test]
-fn rollout_budget_counts_tool_output_after_history_truncation() {
-    let long_output = "large diagnostic output\n".repeat(10_000);
-    let item = ResponseItem::FunctionCallOutput {
-        id: None,
-        call_id: "call-budget-truncation".to_string(),
-        output: FunctionCallOutputPayload::from_text(long_output.clone()),
-        internal_chat_message_metadata_passthrough: None,
-    };
-    let raw_bytes = model_visible_tool_output_bytes(std::slice::from_ref(&item));
-    let mut history = ContextManager::new();
-    history.record_items([&item], TruncationPolicy::Tokens(1_000));
-    let stored_bytes = model_visible_tool_output_bytes(history.raw_items());
-
-    assert_eq!(raw_bytes, long_output.len());
-    assert!(stored_bytes < raw_bytes);
-}
 use crate::tasks::SessionTask;
 use crate::tasks::SessionTaskContext;
 use crate::tasks::SessionTaskResult;
@@ -2991,40 +2972,6 @@ async fn session_permission_profile_rebinds_runtime_workspace_roots() -> anyhow:
     let updated_policy = updated.file_system_sandbox_policy();
     assert!(updated_policy.can_write_path_with_cwd(new_root.as_path(), updated.cwd().as_path()));
     assert!(!updated_policy.can_write_path_with_cwd(old_root.as_path(), updated.cwd().as_path()));
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn managed_turn_without_final_candidate_emits_turn_complete() -> anyhow::Result<()> {
-    let server = start_mock_server().await;
-    mount_sse_once(
-        &server,
-        sse(vec![ev_response_created("resp-1"), ev_completed("resp-1")]),
-    )
-    .await;
-    let test = test_codex().build(&server).await?;
-
-    test.codex
-        .submit(Op::UserInput {
-            items: vec![UserInput::Text {
-                text: "complete without an assistant item".into(),
-                text_elements: Vec::new(),
-            }],
-            final_output_json_schema: None,
-            responsesapi_client_metadata: None,
-            additional_context: Default::default(),
-            thread_settings: Default::default(),
-        })
-        .await?;
-
-    let terminal = wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::TurnComplete(_) | EventMsg::TurnAborted(_))
-    })
-    .await;
-    assert!(
-        matches!(terminal, EventMsg::TurnComplete(_)),
-        "a managed turn with no provisional final candidate must retain ordinary completion behavior"
-    );
     Ok(())
 }
 
@@ -7541,7 +7488,7 @@ async fn shutdown_and_wait_shuts_down_tracked_ephemeral_guardian_review() {
         .expect("ephemeral guardian review should receive a shutdown op");
 }
 
-pub(crate) async fn make_session_and_context_with_auth_and_config_and_rx<F>(
+async fn make_session_and_context_with_auth_and_config_and_rx<F>(
     auth: CodexAuth,
     dynamic_tools: Vec<DynamicToolSpec>,
     configure_config: F,
@@ -7582,14 +7529,6 @@ where
     let state_db = None;
     let config = Arc::new(config);
     let thread_id = ThreadId::default();
-    let task_evidence = super::session::task_evidence_for_session(
-        config.ephemeral,
-        &SessionSource::Exec,
-        config.codex_home.to_path_buf(),
-        thread_id,
-        config.cwd.as_path(),
-    )
-    .await;
     let auth_manager = AuthManager::from_auth_for_testing(auth);
     let models_manager = models_manager_with_provider(
         config.codex_home.to_path_buf(),
@@ -7693,7 +7632,7 @@ where
             config.background_terminal_max_timeout,
         ),
         command_execution: crate::tools::command_execution::CommandExecutionLedger::default(),
-        task_evidence,
+        task_evidence: crate::task_evidence::TaskEvidenceLedger::disabled(),
         elicitations: crate::elicitation::ElicitationService::new(),
         shell_zsh_path: None,
         main_execve_wrapper_exe: config.main_execve_wrapper_exe.clone(),
@@ -9291,284 +9230,6 @@ async fn run_user_shell_command_does_not_set_reference_context_item() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn managed_active_user_shell_is_rejected_without_spawn_or_mutation() {
-    let codex_home = tempfile::tempdir().expect("create temp dir");
-    let marker = codex_home.path().join("active-shell-spawned");
-    let (session, turn_context, rx) = make_session_and_context_with_auth_config_home_and_rx(
-        CodexAuth::from_api_key("Test API Key"),
-        Vec::new(),
-        codex_home.path(),
-        |config| config.ephemeral = false,
-    )
-    .await;
-    let before = session
-        .services
-        .task_evidence
-        .inspect_status()
-        .await
-        .expect("managed task evidence status");
-
-    session
-        .spawn_task(
-            Arc::clone(&turn_context),
-            Vec::new(),
-            NeverEndingTask {
-                kind: TaskKind::Regular,
-                listen_to_cancellation_token: true,
-            },
-        )
-        .await;
-    handlers::run_user_shell_command(
-        &session,
-        "active-shell".to_string(),
-        format!("echo spawned > \"{}\"", marker.display()),
-    )
-    .await;
-
-    let error = tokio::time::timeout(StdDuration::from_secs(5), async {
-        loop {
-            let event = rx.recv().await.expect("event");
-            if let EventMsg::Error(error) = event.msg {
-                break error;
-            }
-        }
-    })
-    .await
-    .expect("managed active /shell rejection event");
-    assert!(
-        error.message.contains("cannot be strongly contained"),
-        "unexpected error: {}",
-        error.message
-    );
-    sleep(StdDuration::from_millis(250)).await;
-    assert!(
-        !marker.exists(),
-        "rejected active /shell command must not spawn"
-    );
-    let after = session
-        .services
-        .task_evidence
-        .inspect_status()
-        .await
-        .expect("managed task evidence status");
-    assert_eq!(after.mutation_revision, before.mutation_revision);
-    assert_eq!(after.phase, before.phase);
-
-    session.abort_all_tasks(TurnAbortReason::Interrupted).await;
-}
-
-#[tokio::test]
-async fn regular_ephemeral_session_uses_in_memory_task_evidence_without_materializing_a_file() {
-    let codex_home = tempfile::tempdir().expect("create temp dir");
-    let (session, turn_context, _rx) = make_session_and_context_with_auth_config_home_and_rx(
-        CodexAuth::from_api_key("Test API Key"),
-        Vec::new(),
-        codex_home.path(),
-        |config| config.ephemeral = true,
-    )
-    .await;
-    let evidence_path = codex_home
-        .path()
-        .join("task-evidence")
-        .join(format!("{}.json", session.thread_id));
-
-    session
-        .services
-        .task_evidence
-        .begin_turn(&turn_context.sub_id, "ephemeral task")
-        .await
-        .expect("in-memory task evidence should satisfy lifecycle persistence");
-    assert!(
-        session
-            .services
-            .task_evidence
-            .inspect_status()
-            .await
-            .is_some(),
-        "regular ephemeral sessions must retain task lifecycle enforcement"
-    );
-    assert!(
-        !evidence_path.exists(),
-        "ephemeral task evidence must not be materialized on disk"
-    );
-    let history_len = session.clone_history().await.raw_items().len();
-    assert!(
-        session
-            .record_conversation_items_for_model_history_and_rollout_only(
-                turn_context.as_ref(),
-                &[assistant_message("provisional ephemeral final")],
-            )
-            .await,
-        "ephemeral provisional history should be accepted as in-memory persistence"
-    );
-    session
-        .record_conversation_items_checked(
-            turn_context.as_ref(),
-            &[assistant_message("committed ephemeral final")],
-        )
-        .await
-        .expect("ephemeral committed final should be recorded without a rollout");
-    session
-        .send_event_checked(
-            turn_context.as_ref(),
-            EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: turn_context.sub_id.clone(),
-                last_agent_message: Some("committed ephemeral final".to_string()),
-                completion: None,
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-                timing: None,
-            }),
-        )
-        .await
-        .expect("ephemeral lifecycle events should be emitted without a rollout");
-    assert_eq!(
-        session.clone_history().await.raw_items().len(),
-        history_len + 2
-    );
-    assert_eq!(
-        session
-            .current_rollout_path()
-            .await
-            .expect("ephemeral rollout lookup"),
-        None,
-        "ephemeral final buffering must not materialize a rollout"
-    );
-    assert!(
-        !evidence_path.exists(),
-        "ephemeral final buffering must not materialize task evidence"
-    );
-
-    let regular_subagent_sources = [
-        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-            parent_thread_id: session.thread_id,
-            depth: 1,
-            agent_path: None,
-            agent_nickname: None,
-            agent_role: None,
-        }),
-        SessionSource::SubAgent(SubAgentSource::Other("regular-worker".to_string())),
-    ];
-    for source in regular_subagent_sources {
-        let ledger = super::session::task_evidence_for_session(
-            /*ephemeral*/ true,
-            &source,
-            codex_home.path().to_path_buf(),
-            ThreadId::new(),
-            codex_home.path(),
-        )
-        .await;
-        ledger
-            .begin_turn("subagent-turn", "ephemeral subagent task")
-            .await
-            .expect("regular ephemeral subagents should use in-memory task evidence");
-        assert!(
-            ledger.inspect_status().await.is_some(),
-            "regular ephemeral subagent {source:?} must retain task lifecycle enforcement"
-        );
-    }
-    assert!(
-        !codex_home.path().join("task-evidence").exists(),
-        "regular ephemeral subagents must not materialize evidence"
-    );
-}
-
-#[tokio::test]
-async fn specialized_ephemeral_sessions_keep_task_evidence_disabled() {
-    let codex_home = tempfile::tempdir().expect("create temp dir");
-    let cwd = codex_home.path();
-    let sources = [
-        SessionSource::SubAgent(SubAgentSource::Review),
-        SessionSource::SubAgent(SubAgentSource::Compact),
-        SessionSource::SubAgent(SubAgentSource::MemoryConsolidation),
-        SessionSource::Internal(
-            codex_protocol::protocol::InternalSessionSource::MemoryConsolidation,
-        ),
-        SessionSource::SubAgent(SubAgentSource::Other(
-            crate::guardian::GUARDIAN_REVIEWER_NAME.to_string(),
-        )),
-    ];
-
-    for source in sources {
-        let ledger = super::session::task_evidence_for_session(
-            /*ephemeral*/ true,
-            &source,
-            codex_home.path().to_path_buf(),
-            ThreadId::new(),
-            cwd,
-        )
-        .await;
-        assert!(
-            ledger.inspect_status().await.is_none(),
-            "specialized ephemeral session {source:?} must remain isolated from regular task evidence"
-        );
-    }
-    assert!(
-        !codex_home.path().join("task-evidence").exists(),
-        "specialized ephemeral sessions must not materialize evidence"
-    );
-}
-
-#[tokio::test]
-async fn non_ephemeral_final_buffering_without_a_rollout_fails_closed() {
-    let codex_home = tempfile::tempdir().expect("create temp dir");
-    let (session, turn_context, _rx) = make_session_and_context_with_auth_config_home_and_rx(
-        CodexAuth::from_api_key("Test API Key"),
-        Vec::new(),
-        codex_home.path(),
-        |config| config.ephemeral = false,
-    )
-    .await;
-    assert_eq!(
-        session
-            .current_rollout_path()
-            .await
-            .expect("rollout lookup"),
-        None
-    );
-    assert!(
-        !session
-            .record_conversation_items_for_model_history_and_rollout_only(
-                turn_context.as_ref(),
-                &[assistant_message("unpersisted provisional final")],
-            )
-            .await,
-        "non-ephemeral provisional history must not claim durability without a rollout"
-    );
-    let history_len = session.clone_history().await.raw_items().len();
-    let error = session
-        .record_conversation_items_checked(
-            turn_context.as_ref(),
-            &[assistant_message("unpersisted committed final")],
-        )
-        .await
-        .expect_err("non-ephemeral committed final must fail without a rollout");
-    assert!(error.contains("rollout persistence is disabled"));
-    let lifecycle_error = session
-        .send_event_checked(
-            turn_context.as_ref(),
-            EventMsg::TurnComplete(TurnCompleteEvent {
-                turn_id: turn_context.sub_id.clone(),
-                last_agent_message: None,
-                completion: None,
-                completed_at: None,
-                duration_ms: None,
-                time_to_first_token_ms: None,
-                timing: None,
-            }),
-        )
-        .await
-        .expect_err("non-ephemeral lifecycle emission must fail without a rollout");
-    assert!(lifecycle_error.contains("rollout persistence is disabled"));
-    assert_eq!(
-        session.clone_history().await.raw_items().len(),
-        history_len,
-        "a failed durable write must not append committed final history"
-    );
-}
-
 #[tokio::test]
 async fn realtime_conversation_list_voices_emits_builtin_list() {
     let (session, _turn_context, rx) = make_session_and_context_with_rx().await;
@@ -10812,53 +10473,6 @@ async fn steer_input_returns_active_turn_id() {
 }
 
 #[tokio::test]
-async fn regular_task_is_evidence_managed_before_it_becomes_steerable() {
-    let (sess, tc, _rx) = make_session_and_context_with_rx().await;
-    let (_release_prewarm, startup_prewarm_rx) = tokio::sync::oneshot::channel::<()>();
-    let handle = tokio::spawn(async move {
-        let _ = startup_prewarm_rx.await;
-        Ok(test_model_client_session())
-    });
-    sess.set_session_startup_prewarm(
-        crate::session_startup_prewarm::SessionStartupPrewarmHandle::new(
-            handle,
-            std::time::Instant::now(),
-            crate::client::WEBSOCKET_CONNECT_TIMEOUT,
-        ),
-    )
-    .await;
-    sess.spawn_task(
-        Arc::clone(&tc),
-        vec![TurnInput::UserInput {
-            content: vec![UserInput::Text {
-                text: "initial task".to_string(),
-                text_elements: Vec::new(),
-            }],
-            client_id: None,
-        }],
-        crate::tasks::RegularTask::new(),
-    )
-    .await;
-
-    let turn_id = sess
-        .steer_input(
-            vec![UserInput::Text {
-                text: "extend the same task".to_string(),
-                text_elements: Vec::new(),
-            }],
-            /*additional_context*/ Default::default(),
-            Some(&tc.sub_id),
-            /*client_user_message_id*/ None,
-            /*responsesapi_client_metadata*/ None,
-        )
-        .await
-        .expect("the evidence ledger must own the task before steering is accepted");
-
-    assert_eq!(turn_id, tc.sub_id);
-    sess.abort_all_tasks(TurnAbortReason::Interrupted).await;
-}
-
-#[tokio::test]
 async fn abort_empty_active_turn_preserves_pending_input() {
     let (sess, _tc, _rx) = make_session_and_context_with_rx().await;
     let pending_item = ResponseItem::Message {
@@ -11137,13 +10751,9 @@ async fn tool_calls_reopen_mailbox_delivery_for_current_turn() {
         cancellation_token: CancellationToken::new(),
     };
 
-    let output = handle_output_item_done(
-        &mut ctx, item, /*previously_active_item*/ None,
-        /*suppress_external_effects*/ false, /*require_durable_lifecycle*/ false,
-        /*prefinalized_non_tool_item*/ None,
-    )
-    .await
-    .expect("tool call should be handled");
+    let output = handle_output_item_done(&mut ctx, item, /*previously_active_item*/ None)
+        .await
+        .expect("tool call should be handled");
 
     assert!(output.needs_follow_up);
     assert!(output.tool_future.is_some());

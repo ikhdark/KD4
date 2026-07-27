@@ -4309,15 +4309,11 @@ async fn auto_compact_body_after_prefix_ignores_starting_window_prefix() {
 
     let first_turn = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_usage(
-            "r1", /*input_tokens*/ 30_000, /*output_tokens*/ 5_000,
-        ),
+        ev_completed_with_usage("r1", /*input_tokens*/ 600, /*output_tokens*/ 50),
     ]);
     let second_turn = sse(vec![
         ev_assistant_message("m2", SECOND_LARGE_REPLY),
-        ev_completed_with_usage(
-            "r2", /*input_tokens*/ 40_000, /*output_tokens*/ 5_000,
-        ),
+        ev_completed_with_usage("r2", /*input_tokens*/ 700, /*output_tokens*/ 50),
     ]);
     let auto_compact_turn = sse(vec![
         ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
@@ -4338,8 +4334,8 @@ async fn auto_compact_body_after_prefix_ignores_starting_window_prefix() {
         .with_config(move |config| {
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
-            config.model_context_window = Some(50_000);
-            config.model_auto_compact_token_limit = Some(10_000);
+            config.model_context_window = Some(1_000);
+            config.model_auto_compact_token_limit = Some(100);
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
         })
@@ -4485,13 +4481,11 @@ async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
 
     let first_turn = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_usage(
-            "r1", /*input_tokens*/ 30_000, /*output_tokens*/ 1_000,
-        ),
+        ev_completed_with_usage("r1", /*input_tokens*/ 80, /*output_tokens*/ 5),
     ]);
     let second_turn = sse(vec![
         ev_assistant_message("m2", SECOND_LARGE_REPLY),
-        ev_completed_with_usage("r2", /*input_tokens*/ 49_990, /*output_tokens*/ 1),
+        ev_completed_with_usage("r2", /*input_tokens*/ 98, /*output_tokens*/ 1),
     ]);
     let auto_compact_turn = sse(vec![
         ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
@@ -4512,8 +4506,8 @@ async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
         .with_config(move |config| {
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
-            config.model_context_window = Some(50_000);
-            config.model_auto_compact_token_limit = Some(100_000);
+            config.model_context_window = Some(100);
+            config.model_auto_compact_token_limit = Some(200);
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
         })
@@ -5232,7 +5226,7 @@ async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Re
         vec![
             responses::sse(vec![
                 responses::ev_function_call("call-1", "unsupported_tool", "{}"),
-                responses::ev_completed_with_tokens("first-response", /*total_tokens*/ 45_000),
+                responses::ev_completed_with_tokens("first-response", /*total_tokens*/ 96),
             ]),
             responses::sse(vec![
                 responses::ev_assistant_message("compact-message", "summary"),
@@ -5258,8 +5252,8 @@ async fn mid_turn_compaction_keeps_the_creation_time_global_instructions() -> Re
         .with_home(Arc::clone(&home))
         .with_config(move |config| {
             config.model_provider = provider;
-            config.model_context_window = Some(50_000);
-            config.model_auto_compact_token_limit = Some(40_000);
+            config.model_context_window = Some(100);
+            config.model_auto_compact_token_limit = Some(90);
         });
     let test = builder.build(&server).await?;
 

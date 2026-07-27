@@ -946,8 +946,7 @@ const result = await tools.get_context_remaining({});
 text(JSON.stringify(result));
 "#,
         |config| {
-            config.model_context_window = Some(128_000);
-            config.model_auto_compact_token_limit = Some(9_000);
+            config.model_context_window = Some(10_000);
             config
                 .features
                 .enable(Feature::TokenBudget)

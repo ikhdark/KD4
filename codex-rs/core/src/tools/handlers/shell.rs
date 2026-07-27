@@ -3,7 +3,6 @@ use codex_features::Feature;
 use codex_protocol::error::CodexErr;
 use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
-use codex_sandboxing::policy_transforms::effective_file_system_sandbox_policy;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
@@ -21,15 +20,12 @@ use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::events::ToolEventCtx;
 use crate::tools::handlers::apply_granted_turn_permissions;
-use crate::tools::handlers::apply_patch::execute_intercepted_apply_patch;
-use crate::tools::handlers::apply_patch::preflight_intercept_apply_patch;
+use crate::tools::handlers::apply_patch::intercept_apply_patch;
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::command_shape::powershell_script_failure_advisory;
 use crate::tools::handlers::implicit_granted_permissions;
 use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
-use crate::tools::handlers::task_evidence_network_is_unbounded;
-use crate::tools::handlers::task_evidence_writable_roots;
 use crate::tools::orchestrator::ToolOrchestrator;
 use crate::tools::runtimes::shell::ShellRequest;
 use crate::tools::runtimes::shell::ShellRuntime;
@@ -106,7 +102,6 @@ pub(super) struct RunExecLikeArgs {
     pub(super) attempt_key: Option<CommandAttemptKey>,
     pub(super) repair_notice: Option<String>,
     pub(super) capture_exec_output: bool,
-    pub(super) guard_task_mutation: bool,
 }
 
 pub(super) struct RunExecLikeResult {
@@ -206,7 +201,6 @@ async fn run_exec_like_with_exit_code_inner(
         attempt_key,
         repair_notice,
         capture_exec_output,
-        guard_task_mutation,
     } = args;
 
     let fs = turn_environment.environment.get_filesystem();
@@ -252,6 +246,7 @@ async fn run_exec_like_with_exit_code_inner(
         |permissions| Ok(Some(permissions)),
     )
     .map_err(FunctionCallError::RespondToModel)?;
+
     let effective_permission_context = format!(
         "sandbox={:?};additional={:?};preapproved={};normalized={:?}",
         effective_additional_permissions.sandbox_permissions,
@@ -279,90 +274,6 @@ async fn run_exec_like_with_exit_code_inner(
             "approval policy is {approval_policy:?}; reject command — you should not ask for escalated permissions if the approval policy is {approval_policy:?}"
         )));
     }
-    let base_file_system_policy = turn.file_system_sandbox_policy();
-    let effective_file_system_policy = effective_file_system_sandbox_policy(
-        &base_file_system_policy,
-        normalized_additional_permissions.as_ref(),
-    );
-    let network_is_unbounded = task_evidence_network_is_unbounded(
-        turn.network_sandbox_policy(),
-        normalized_additional_permissions.as_ref(),
-    );
-    let has_unbounded_mutation_authority = effective_additional_permissions
-        .sandbox_permissions
-        .requires_escalated_permissions()
-        || effective_file_system_policy.has_full_disk_write_access()
-        || network_is_unbounded;
-    let review_delegate = matches!(
-        turn.session_source,
-        codex_protocol::protocol::SessionSource::SubAgent(
-            codex_protocol::protocol::SubAgentSource::Review
-        )
-    );
-    let mut reserved_mutation_guard =
-        if guard_task_mutation && !is_known_safe_command(&safety_command) {
-            session
-                .services
-                .task_evidence
-                .reserve_tool_dispatch(
-                    &ToolName::plain("normalized_shell_mutation"),
-                    &turn.sub_id,
-                    /*declared_read_only*/ false,
-                    /*trusted_external_read_only*/ false,
-                    review_delegate,
-                    /*trusted_mutator*/ false,
-                    /*trusted_builtin*/ true,
-                )
-                .await
-                .map_err(FunctionCallError::RespondToModel)?
-        } else {
-            None
-        };
-    if reserved_mutation_guard.is_some() && has_unbounded_mutation_authority {
-        return Err(FunctionCallError::RespondToModel(
-            "command rejected: its effective permissions allow mutations outside bounded registered roots"
-                .to_string(),
-        ));
-    }
-
-    let apply_patch_cwd = PathUri::from_abs_path(&exec_params.cwd);
-    let intercepted_preflight = preflight_intercept_apply_patch(
-        &exec_params.command,
-        &apply_patch_cwd,
-        fs.as_ref(),
-        &turn_environment,
-        session.as_ref(),
-        turn.as_ref(),
-    )
-    .await;
-    let _mutation_guard = if matches!(&intercepted_preflight, Ok(None)) && guard_task_mutation {
-        let guard = session
-            .services
-            .task_evidence
-            .guard_normalized_command(
-                &safety_command,
-                Some(exec_params.cwd.as_path()),
-                &turn.sub_id,
-                review_delegate,
-                has_unbounded_mutation_authority,
-            )
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
-        reserved_mutation_guard = None;
-        guard
-    } else {
-        None
-    };
-    if _mutation_guard.is_some() {
-        let writable_roots =
-            task_evidence_writable_roots(&effective_file_system_policy, exec_params.cwd.as_path());
-        session
-            .services
-            .task_evidence
-            .register_mutation_targets(exec_params.cwd.as_path(), &writable_roots)
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
-    }
 
     if let Some(attempt_key) = attempt_key.as_ref() {
         session
@@ -373,58 +284,20 @@ async fn run_exec_like_with_exit_code_inner(
             .map_err(|blocked| FunctionCallError::RespondToModel(blocked.render_for_model()))?;
     }
 
-    let intercepted = match intercepted_preflight {
-        Ok(Some(changes)) => {
-            if let Some(reservation) = reserved_mutation_guard.as_ref() {
-                if let Err(message) = session
-                    .services
-                    .task_evidence
-                    .start_reserved_tool_dispatch(&turn.sub_id, reservation)
-                    .await
-                {
-                    if let Some(attempt_key) = attempt_key.as_ref() {
-                        session
-                            .services
-                            .command_execution
-                            .record_exit(attempt_key, -1)
-                            .await;
-                    }
-                    return Err(FunctionCallError::RespondToModel(message));
-                }
-            }
-            let result = execute_intercepted_apply_patch(
-                changes,
-                &apply_patch_cwd,
-                turn_environment.clone(),
-                session.clone(),
-                turn.clone(),
-                Some(&tracker),
-                &call_id,
-                tool_name.name.as_str(),
-            )
-            .await
-            .map(Some);
-            if let Some(reservation) = reserved_mutation_guard.as_ref()
-                && let Err(message) = session
-                    .services
-                    .task_evidence
-                    .finish_reserved_tool_dispatch(&turn.sub_id, reservation)
-                    .await
-            {
-                if let Some(attempt_key) = attempt_key.as_ref() {
-                    session
-                        .services
-                        .command_execution
-                        .record_exit(attempt_key, -1)
-                        .await;
-                }
-                return Err(FunctionCallError::RespondToModel(message));
-            }
-            result
-        }
-        Ok(None) => Ok(None),
-        Err(err) => Err(err),
-    };
+    // Intercept apply_patch if present.
+    let apply_patch_cwd = PathUri::from_abs_path(&exec_params.cwd);
+    let intercepted = intercept_apply_patch(
+        &exec_params.command,
+        &apply_patch_cwd,
+        fs.as_ref(),
+        turn_environment.clone(),
+        session.clone(),
+        turn.clone(),
+        Some(&tracker),
+        &call_id,
+        tool_name.name.as_str(),
+    )
+    .await;
     let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
     session
         .services
@@ -507,8 +380,6 @@ async fn run_exec_like_with_exit_code_inner(
             .permissions_preapproved,
         justification: exec_params.justification.clone(),
         exec_approval_requirement,
-        require_descendant_containment: _mutation_guard.is_some(),
-        mutation_guard: _mutation_guard.clone(),
     };
     let mut orchestrator = ToolOrchestrator::new();
     let mut runtime = ShellRuntime::for_shell_command(shell_runtime_backend);

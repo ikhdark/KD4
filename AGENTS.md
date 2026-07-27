@@ -1,6 +1,6 @@
 # Repository policy
 
-Shared policy revision: `2026-07-23`.
+Shared policy revision: `2026-07-26`.
 
 ## Synchronization contract
 
@@ -10,7 +10,6 @@ The canonical shared-policy source is:
 
 Its synchronized targets are:
 
-- `C:\Users\kuh\Desktop\KDWG\AGENTS.md`
 - `C:\Users\kuh\Desktop\kds-main\AGENTS.md`
 - `C:\Users\kuh\Desktop\mdpwa-main\AGENTS.md`
 - `C:\Users\kuh\Desktop\kdsb-main\AGENTS.md`
@@ -18,12 +17,12 @@ Its synchronized targets are:
 - `C:\Users\kuh\Desktop\kdgma-main\AGENTS.md`
 
 Every byte outside the project-context block below must remain identical across
-all seven files. Only that block may contain repository-specific identity,
+all six files. Only that block may contain repository-specific identity,
 ownership, commands, validation, runtime, installation, safety, or protected
 path details.
 
 Change shared rules only in the canonical KD4 source. When a shared rule
-changes, update its revision, copy the shared portion to all six targets in the
+changes, update its revision, copy the shared portion to all five targets in the
 same task, and compare normalized copies after replacing each project-context
 block with the same sentinel. Do not place repository-specific exceptions
 outside that block or edit a target's shared portion independently.
@@ -161,90 +160,14 @@ completes the request.
   may inspect relevant or adjacent contract surfaces but must not edit them;
   report findings to the busy agent, who retains edit ownership for the owned
   surface.
-
-## Fast implementation path
-
-Use this path for a bounded change with a clear owner:
-
-1. Read the nearest applicable instructions.
-2. Inspect the owning file and the smallest relevant surrounding code.
-3. Trace at most one relevant caller, callee, registry, configuration owner, or
-   installation hop when the connection is not already clear.
-4. Inspect the nearest relevant test or existing reproduction.
-5. Patch as soon as the defect or missing behavior is understood.
-6. Review the focused diff.
-7. Run the smallest check that proves the changed behavior.
-8. Stop when the requested behavior is implemented and proven.
-
-Do not scan the entire repository “just in case.” Do not enumerate every
-entrypoint before editing a bounded owner. Do not repeatedly reread large files
-after patching; inspect the focused diff and targeted context instead.
-
-A focused implementation should normally use one inspection pass, one edit
-pass, and one validation pass. When validation fails, diagnose that failure and
-rerun only the invalidated check. Do not restart the investigation or broaden
-the suite unless the failure reveals a wider owner or contract.
-
-Expand beyond the fast path only when evidence shows that the change affects a
-shared protocol, schema, generated artifact, lockfile, dependency, public API,
-persistence format, security boundary, installation path, multiple runtime
-registries, or unclear ownership.
-
-If a new required owner appears after editing, inspect and update that owner.
-Do not announce routine scope growth unless it materially changes risk, public
-behavior, or the amount of requested work.
-
-## Correctness and completion
-
-For implementation work:
-
+- https://github.com/openai/codex is the official upstream. use this for merging new releases that contain actual improvements, do not merge simply because it is in the official upstream, this is for compatibility and local fork repairs only.
+- Read-only agents may investigate in parallel to help other busy agents. They
+  may inspect relevant or adjacent contract surfaces but must not edit them;
+  report findings to the busy agent, who retains edit ownership for the owned
+  surface.
 - Do not stop after the first fixes or rush to finish. Confirm test outcomes
   instead of assuming a test run is green, and do not treat green tests alone
   as completion. Continue until the complete task-relevant behavior is
   implemented correctly.
-- Change the complete intended path, including a directly competing or replaced
-  path that would otherwise continue winning at runtime.
-- Do not leave task-relevant TODOs, placeholders, stubs, inert registrations, or
-  known mismatches in the intended path.
-- For bug fixes, prefer the original failing test, reproduction, or nearest
-  owner test as proof.
-- For broad claims such as “all,” “every,” “complete,” or “repo-wide,” perform a
-  closure search appropriate to that claim. Do not perform a repo-wide closure
-  sweep for a bounded request.
 - When checking for bugs, do not stop at the first bug found, continue to collect all bugs then report/fix.
-
-## Validation
-
-Use the nearest sufficient proof and stop when it passes.
-
-For lifecycle changes, run focused validation during implementation, then one appropriate broad validation and a normal disposable-host installation check after the final edit.
-
-- Documentation or instruction wording: review the focused diff and use
-  `git diff --check` only when whitespace or patch integrity is relevant.
-- Behavior changes: run the closest owner test, focused test selection, or
-  direct runtime reproduction.
-- Tests do not automatically mean working code, do not assume tests equals success.
-- Schema, protocol, package, lockfile, generated artifact, or installation
-  changes: use the owning generator or official recipe.
-- Do not stack build, test, lint, format, audit, install, smoke, and runtime
-  checks unless each proves a distinct claim required by the task.
-- Do not rerun an already-green source check unless a covered source or input
-  changed.
-- When possible, perform smoke-tests to make sure the new code actually works.
-- Documentation, installation, generated inventory updates, and unrelated dirty
-  paths do not invalidate a green source check unless they are declared inputs
-  to that check.
-- If unrelated dirty work blocks a focused proof, try supported scope or
-  baseline isolation once. If that fails, report the limitation without
-  broadening opt-outs or rerunning equivalent command variants.
-- Tool success alone does not prove a runtime defect is fixed. Require the
-  focused failing test or applicable user-visible/runtime evidence.
-
-Final responses should state only:
-
-- what materially changed;
-- the validation that ran; and
-- any known task-scope risk that remains.
-
-Do not add a formal lane, completion-gate classification, or risk section when
-there is no unresolved risk.
+- Do NOT turn a directed fix into a broad fix. Stay focused on the task at hand.

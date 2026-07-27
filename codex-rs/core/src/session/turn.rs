@@ -48,14 +48,11 @@ use crate::responses_metadata::CodexResponsesMetadata;
 use crate::responses_metadata::CodexResponsesRequestKind;
 use crate::responses_retry::ResponsesStreamRequest;
 use crate::responses_retry::handle_retryable_response_stream_error;
-use crate::session::FinalCommitBoundary;
 use crate::session::PreviousTurnSettings;
 use crate::session::TurnInput;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
 use crate::session::turn_context::TurnContext;
-use crate::stream_events_utils::FinalizedTurnItem;
-use crate::stream_events_utils::FinalizedTurnItemFacts;
 use crate::stream_events_utils::HandleOutputCtx;
 use crate::stream_events_utils::TurnItemContributorPolicy;
 use crate::stream_events_utils::finalize_non_tool_response_item;
@@ -65,10 +62,6 @@ use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item_with_finalized_facts;
-use crate::task_evidence::ManagedFinalState;
-use crate::task_evidence::TaskContractUpdate;
-use crate::task_evidence::TaskLifecycleStatus;
-use crate::task_evidence::TaskPhase;
 use crate::tasks::emit_compact_metric;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -117,15 +110,10 @@ use codex_protocol::protocol::AgentReasoningSectionBreakEvent;
 use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
-use codex_protocol::protocol::HasLegacyEvent;
-use codex_protocol::protocol::ItemCompletedEvent;
-use codex_protocol::protocol::ItemStartedEvent;
 use codex_protocol::protocol::PlanDeltaEvent;
 use codex_protocol::protocol::ReasoningContentDeltaEvent;
 use codex_protocol::protocol::ReasoningRawContentDeltaEvent;
-use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SafetyBufferingEvent;
-use codex_protocol::protocol::ThreadHistoryMode;
 use codex_protocol::protocol::TurnDiffEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
@@ -141,7 +129,6 @@ use futures::prelude::*;
 use futures::stream::FuturesOrdered;
 use sha2::Digest;
 use sha2::Sha256;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing::error;
@@ -176,7 +163,6 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
-    super::rollout_budget::maybe_approve_additional_tranche(sess.as_ref(), &input);
     let mut preparation_timing_guard = Some(
         turn_context
             .turn_timing_state
@@ -215,7 +201,6 @@ pub(crate) async fn run_turn(
         first_router,
         injection_items,
         explicitly_enabled_connectors,
-        pre_sampling_context_limit_compaction_completed,
         ..
     } = pending_turn_plan;
 
@@ -273,13 +258,7 @@ pub(crate) async fn run_turn(
 
     let mut next_step_context = Some(first_step_context);
     let mut first_router = Some(first_router);
-    let mut context_limit_compaction_attempted = pre_sampling_context_limit_compaction_completed;
-    let mut has_sampled = false;
-    let mut model_continuation_pending = false;
     loop {
-        if cancellation_token.is_cancelled() {
-            return Err(CodexErr::TurnAborted);
-        }
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
@@ -288,20 +267,6 @@ pub(crate) async fn run_turn(
         } else {
             Vec::new()
         };
-        let pending_task_contract = task_contract_from_inter_agent_input(&pending_input);
-        if !pending_task_contract.is_empty() {
-            let task_contract_update = sess
-                .services
-                .task_evidence
-                .extend_task_contract(&turn_context.sub_id, &pending_task_contract)
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
-            if task_contract_update == TaskContractUpdate::FinalCommitted {
-                return Err(CodexErr::InvalidRequest(
-                    "pending task input arrived after final output committed".to_string(),
-                ));
-            }
-        }
 
         if run_hooks_and_record_inputs(&sess, &turn_context, &pending_input).await {
             break;
@@ -368,20 +333,11 @@ pub(crate) async fn run_turn(
         }
         .await;
         match sampling_request_result {
-            Ok(RunSamplingRequestOutcome::Sampled(
-                sampling_request_output,
-                sampling_request_input,
-            )) => {
-                has_sampled = true;
-                context_limit_compaction_attempted = false;
+            Ok((sampling_request_output, sampling_request_input)) => {
                 let SamplingRequestResult {
                     needs_follow_up: model_needs_follow_up,
                     last_agent_message: sampling_request_last_agent_message,
-                    mut pending_managed_final,
-                    mut models_refresh_task,
                 } = sampling_request_output;
-                let mut managed_final_committed = false;
-                model_continuation_pending = model_needs_follow_up;
                 can_drain_pending_input = true;
                 let (has_pending_input, token_status) = async {
                     let has_pending_input =
@@ -396,23 +352,6 @@ pub(crate) async fn run_turn(
                 .instrument(trace_span!("run_turn.collect_post_sampling_state"))
                 .await;
                 let needs_follow_up = model_needs_follow_up || has_pending_input;
-                if needs_follow_up {
-                    abort_pending_managed_final_reservation(
-                        sess.as_ref(),
-                        turn_context.as_ref(),
-                        &mut pending_managed_final,
-                    )
-                    .await?;
-                }
-                if cancellation_token.is_cancelled() {
-                    abort_pending_managed_final_reservation(
-                        sess.as_ref(),
-                        turn_context.as_ref(),
-                        &mut pending_managed_final,
-                    )
-                    .await?;
-                    return Err(CodexErr::TurnAborted);
-                }
                 let token_limit_reached = token_status.token_limit_reached;
 
                 trace!(
@@ -477,9 +416,7 @@ pub(crate) async fn run_turn(
                             .await;
                         return Ok(None);
                     }
-                    client_session.invalidate_incremental_history("mid-turn compaction");
                     can_drain_pending_input = !model_needs_follow_up;
-                    context_limit_compaction_attempted = true;
                     continue;
                 }
 
@@ -507,168 +444,23 @@ pub(crate) async fn run_turn(
                         )
                         .await;
                     }
-                    if let Some(status) = sess.services.task_evidence.inspect_status().await {
-                        if status.phase == TaskPhase::Reviewing {
-                            let review_packet =
-                                match sess.services.task_evidence.prepare_review().await {
-                                    Ok(review_packet) => review_packet,
-                                    Err(err) => {
-                                        if task_review_was_superseded_by_steering(sess.as_ref())
-                                            .await
-                                        {
-                                            abort_pending_managed_final_reservation(
-                                                sess.as_ref(),
-                                                turn_context.as_ref(),
-                                                &mut pending_managed_final,
-                                            )
-                                            .await?;
-                                            last_agent_message = None;
-                                            continue;
-                                        }
-                                        abort_pending_managed_final_reservation(
-                                            sess.as_ref(),
-                                            turn_context.as_ref(),
-                                            &mut pending_managed_final,
-                                        )
-                                        .await?;
-                                        return Err(CodexErr::InvalidRequest(format!(
-                                            "independent review preparation failed closed: {err}"
-                                        )));
-                                    }
-                                };
-                            if let Some(review_packet) = review_packet {
-                                let review_status = match crate::tasks::run_task_evidence_review(
-                                    Arc::clone(&sess),
-                                    Arc::clone(&turn_extension_data),
-                                    Arc::clone(&turn_context),
-                                    review_packet,
-                                    cancellation_token.child_token(),
-                                )
-                                .await
-                                {
-                                    Ok(review_status) => review_status,
-                                    Err(err) => {
-                                        if task_review_was_superseded_by_steering(sess.as_ref())
-                                            .await
-                                        {
-                                            abort_pending_managed_final_reservation(
-                                                sess.as_ref(),
-                                                turn_context.as_ref(),
-                                                &mut pending_managed_final,
-                                            )
-                                            .await?;
-                                            last_agent_message = None;
-                                            continue;
-                                        }
-                                        abort_pending_managed_final_reservation(
-                                            sess.as_ref(),
-                                            turn_context.as_ref(),
-                                            &mut pending_managed_final,
-                                        )
-                                        .await?;
-                                        return Err(CodexErr::InvalidRequest(format!(
-                                            "independent review acceptance failed closed: {err}"
-                                        )));
-                                    }
-                                };
-                                if review_status.is_none() {
-                                    abort_pending_managed_final_reservation(
-                                        sess.as_ref(),
-                                        turn_context.as_ref(),
-                                        &mut pending_managed_final,
-                                    )
-                                    .await?;
-                                    return Err(CodexErr::TurnAborted);
-                                }
-                            } else {
-                                sess.record_conversation_items(
-                                    &turn_context,
-                                    &[ResponseItem::Message {
-                                        id: Some(uuid::Uuid::now_v7().to_string()),
-                                        role: "user".to_string(),
-                                        content: vec![ContentItem::InputText {
-                                            text: "Runtime lifecycle gate: repository drift invalidated closure before independent review. Re-evaluate the current state and submit fresh closure evidence.".to_string(),
-                                        }],
-                                        phase: None,
-                                        internal_chat_message_metadata_passthrough: None,
-                                    }],
-                                )
-                                .await;
-                            }
-                            abort_pending_managed_final_reservation(
-                                sess.as_ref(),
-                                turn_context.as_ref(),
-                                &mut pending_managed_final,
-                            )
-                            .await?;
-                            last_agent_message = None;
-                            continue;
-                        }
-                        let classification_required =
-                            status.phase == TaskPhase::Unclassified && status.mutation_revision > 0;
-                        let closure_required = task_lifecycle_requires_closure(&status);
-                        let investigation_required = status.phase == TaskPhase::Investigating;
-                        if closure_required || investigation_required {
-                            let instruction = if classification_required {
-                                "Runtime lifecycle gate: this task has mutation evidence but is not classified. Call `task_state.classify` before any further mutation, then continue toward fresh closure."
-                            } else if investigation_required {
-                                "Runtime lifecycle gate: submit one batched investigation checkpoint with `task_state.submit_investigation_checkpoint`, then continue implementation. Do not finalize yet."
-                            } else {
-                                "Runtime lifecycle gate: the current mutation revision is not ready. Repair actionable findings or submit fresh post-mutation closure evidence with `task_state.submit_closure`. Do not repeat unchanged evidence after the recovery allowance."
-                            };
-                            sess.record_conversation_items(
-                                &turn_context,
-                                &[ResponseItem::Message {
-                                    id: Some(uuid::Uuid::now_v7().to_string()),
-                                    role: "user".to_string(),
-                                    content: vec![ContentItem::InputText {
-                                        text: instruction.to_string(),
-                                    }],
-                                    phase: None,
-                                    internal_chat_message_metadata_passthrough: None,
-                                }],
-                            )
-                            .await;
-                            abort_pending_managed_final_reservation(
-                                sess.as_ref(),
-                                turn_context.as_ref(),
-                                &mut pending_managed_final,
-                            )
-                            .await?;
-                            last_agent_message = None;
-                            continue;
-                        }
-                    }
-                    let provisional_final_pending = pending_managed_final.is_some();
-                    let precommit_hook_message = precommit_hook_message(
-                        last_agent_message.clone(),
-                        provisional_final_pending,
-                    );
                     let stop_outcome = run_turn_stop_hooks(
                         &sess,
                         &turn_context,
                         stop_hook_active,
-                        precommit_hook_message.clone(),
-                        provisional_final_pending,
+                        last_agent_message.clone(),
                     )
                     .await;
                     if stop_outcome.should_block {
                         if let Some(hook_prompt_message) =
                             build_hook_prompt_message(&stop_outcome.continuation_fragments)
                         {
-                            abort_pending_managed_final_reservation(
-                                sess.as_ref(),
-                                turn_context.as_ref(),
-                                &mut pending_managed_final,
-                            )
-                            .await?;
                             sess.record_response_item_and_emit_turn_item(
                                 &turn_context,
                                 hook_prompt_message,
                             )
                             .await;
                             stop_hook_active = true;
-                            last_agent_message = None;
                             continue;
                         } else {
                             sess.send_event(
@@ -678,67 +470,6 @@ pub(crate) async fn run_turn(
                                 }),
                             )
                             .await;
-                        }
-                    }
-                    if !stop_outcome.should_stop
-                        && run_legacy_after_agent_hook(
-                            &sess,
-                            &turn_context,
-                            &sampling_request_input,
-                            precommit_hook_message,
-                        )
-                        .await
-                    {
-                        abort_pending_managed_final_reservation(
-                            sess.as_ref(),
-                            turn_context.as_ref(),
-                            &mut pending_managed_final,
-                        )
-                        .await?;
-                        return Ok(None);
-                    }
-                    if cancellation_token.is_cancelled() {
-                        abort_pending_managed_final_reservation(
-                            sess.as_ref(),
-                            turn_context.as_ref(),
-                            &mut pending_managed_final,
-                        )
-                        .await?;
-                        return Err(CodexErr::TurnAborted);
-                    }
-                    if let Some(pending_final) = pending_managed_final.take() {
-                        match commit_and_emit_pending_managed_final(
-                            sess.as_ref(),
-                            turn_context.as_ref(),
-                            pending_final,
-                        )
-                        .await?
-                        {
-                            PendingManagedFinalOutcome::Emitted(message) => {
-                                last_agent_message = message;
-                                managed_final_committed = true;
-                            }
-                            PendingManagedFinalOutcome::PendingInput => {
-                                last_agent_message = None;
-                                continue;
-                            }
-                            PendingManagedFinalOutcome::Rejected => {
-                                sess.record_conversation_items(
-                                    &turn_context,
-                                    &[ResponseItem::Message {
-                                        id: Some(uuid::Uuid::now_v7().to_string()),
-                                        role: "user".to_string(),
-                                        content: vec![ContentItem::InputText {
-                                            text: "Runtime lifecycle gate: repository or evidence state changed after the final candidate was buffered. Re-evaluate the current state and produce a fresh final only after closure is ready.".to_string(),
-                                        }],
-                                        phase: None,
-                                        internal_chat_message_metadata_passthrough: None,
-                                    }],
-                                )
-                                .await;
-                                last_agent_message = None;
-                                continue;
-                            }
                         }
                     }
                     if let Some(warning) = sess
@@ -753,87 +484,35 @@ pub(crate) async fn run_turn(
                         )
                         .await;
                     }
-                    await_models_refresh_task(&mut models_refresh_task).await;
-                    if cancellation_token.is_cancelled() {
-                        return Err(CodexErr::TurnAborted);
-                    }
-                    if !managed_final_committed
-                        && sess.input_queue.has_pending_input(&sess.active_turn).await
-                    {
-                        last_agent_message = None;
-                        continue;
-                    }
                     if stop_outcome.should_stop {
                         break;
                     }
-                    break;
-                }
-                await_models_refresh_task(&mut models_refresh_task).await;
-                if cancellation_token.is_cancelled() {
-                    return Err(CodexErr::TurnAborted);
-                }
-                continue;
-            }
-            Ok(RunSamplingRequestOutcome::NeedsCompaction) => {
-                if cancellation_token.is_cancelled() {
-                    return Err(CodexErr::TurnAborted);
-                }
-                if context_limit_compaction_attempted {
-                    let err = CodexErr::ContextWindowExceeded;
-                    let error = err.to_codex_protocol_error();
-                    sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
-                        .await;
-                    sess.track_turn_codex_error(turn_context.as_ref(), &err);
-                    sess.send_event(
+                    if run_legacy_after_agent_hook(
+                        &sess,
                         &turn_context,
-                        EventMsg::Error(err.to_error_event(/*message_prefix*/ None)),
+                        &sampling_request_input,
+                        last_agent_message.clone(),
                     )
-                    .await;
+                    .await
+                    {
+                        return Ok(None);
+                    }
                     break;
                 }
-                let compaction_phase = if has_sampled {
-                    CompactionPhase::MidTurn
-                } else {
-                    CompactionPhase::PreTurn
-                };
-                if let Err(err) = run_auto_compact(
-                    &sess,
-                    Arc::clone(&step_context),
-                    /*fallback_step_context*/ None,
-                    &mut client_session,
-                    InitialContextInjection::BeforeLastUserMessage(Arc::clone(&world_state)),
-                    CompactionReason::ContextLimit,
-                    compaction_phase,
-                )
-                .await
-                {
-                    if matches!(err, CodexErr::TurnAborted) {
-                        return Err(err);
-                    }
-                    let error = err.to_codex_protocol_error();
-                    sess.emit_turn_error_lifecycle(turn_context.as_ref(), error.clone())
-                        .await;
-                    return Ok(None);
-                }
-                client_session.invalidate_incremental_history("prompt-limit compaction");
-                can_drain_pending_input = !model_continuation_pending;
-                context_limit_compaction_attempted = true;
                 continue;
             }
             Err(err @ CodexErr::TurnAborted) => {
                 return Err(err);
             }
             Err(codex_error @ CodexErr::InvalidImageRequest()) => {
-                let replaced_invalid_image = {
+                {
                     let mut state = sess.state.lock().await;
                     error_or_panic(
                         "Invalid image detected; sanitizing tool output to prevent poisoning",
                     );
-                    state.history.replace_last_turn_images("Invalid image")
-                };
-                if replaced_invalid_image {
-                    client_session.invalidate_incremental_history("invalid image sanitization");
-                    continue;
+                    if state.history.replace_last_turn_images("Invalid image") {
+                        continue;
+                    }
                 }
 
                 sess.track_turn_codex_error(turn_context.as_ref(), &codex_error);
@@ -863,23 +542,6 @@ pub(crate) async fn run_turn(
     }
 
     Ok(last_agent_message)
-}
-
-fn task_lifecycle_requires_closure(status: &TaskLifecycleStatus) -> bool {
-    status.phase == TaskPhase::Fixing
-        || ((status.mutation_revision > 0 || !status.unsupported_mutation_targets.is_empty())
-            && status.phase != TaskPhase::Ready)
-}
-
-async fn task_review_was_superseded_by_steering(sess: &Session) -> bool {
-    if !sess.input_queue.has_pending_input(&sess.active_turn).await {
-        return false;
-    }
-    sess.services
-        .task_evidence
-        .inspect_status()
-        .await
-        .is_some_and(|status| status.phase != TaskPhase::Reviewing)
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -936,7 +598,6 @@ struct PendingTurnPlan {
     tracking: TrackEventsContext,
     mentioned_apps: Vec<(String, Option<String>)>,
     mentioned_plugins: Vec<PluginCapabilitySummary>,
-    pre_sampling_context_limit_compaction_completed: bool,
 }
 
 enum PendingTurnPlanBuild {
@@ -1005,7 +666,6 @@ async fn build_pure_pending_turn_plan(
             tracking,
             mentioned_apps: Vec::new(),
             mentioned_plugins: Vec::new(),
-            pre_sampling_context_limit_compaction_completed: false,
         })));
     }
 
@@ -1160,7 +820,6 @@ async fn build_pure_pending_turn_plan(
         tracking,
         mentioned_apps,
         mentioned_plugins,
-        pre_sampling_context_limit_compaction_completed: false,
     })))
 }
 
@@ -1190,12 +849,10 @@ async fn stabilize_pending_turn_plan(
     let mut fixed_point = FixedPointPlanningState::default();
     let mut check_previous_model_compaction = true;
     let mut incoming_precompaction_completed = false;
-    let mut pre_sampling_context_limit_compaction_completed = false;
     loop {
         if cancellation_token.is_cancelled() {
             return Err(CodexErr::TurnAborted);
         }
-        fixed_point.begin_attempt().map_err(planning_failure)?;
 
         let completed_inventory_effects = fixed_point
             .completed_inventory_effects()
@@ -1217,7 +874,7 @@ async fn stabilize_pending_turn_plan(
             PendingTurnPlanBuild::Ready(plan) => *plan,
         };
         fixed_point
-            .observe_snapshot(&plan.identity)
+            .begin_iteration(&plan.identity)
             .map_err(planning_failure)?;
 
         // Compaction is maintenance of the pre-existing history, not persistence
@@ -1233,20 +890,15 @@ async fn stabilize_pending_turn_plan(
             check_previous_model_compaction,
             plan.pending_token_estimate,
             !incoming_precompaction_completed,
-            !pre_sampling_context_limit_compaction_completed,
         )
         .await?;
         drop(compaction_timing_guard);
         check_previous_model_compaction = false;
-        match compaction_reason {
-            Some(PreSamplingCompactionReason::PendingInputLimit) => {
-                incoming_precompaction_completed = true;
-                pre_sampling_context_limit_compaction_completed = true;
-            }
-            Some(PreSamplingCompactionReason::CommittedHistoryLimit) => {
-                pre_sampling_context_limit_compaction_completed = true;
-            }
-            Some(PreSamplingCompactionReason::PreviousModel) | None => {}
+        if matches!(
+            compaction_reason,
+            Some(PreSamplingCompactionReason::PendingInputLimit)
+        ) {
+            incoming_precompaction_completed = true;
         }
         if compaction_reason.is_some() {
             client_session.invalidate_incremental_history("compaction");
@@ -1434,9 +1086,6 @@ async fn stabilize_pending_turn_plan(
         if sess.services.planning_generation() != plan.identity.generation {
             continue;
         }
-        let mut plan = plan;
-        plan.pre_sampling_context_limit_compaction_completed =
-            pre_sampling_context_limit_compaction_completed;
         return Ok(plan);
     }
 }
@@ -1538,39 +1187,6 @@ fn estimate_pending_tokens(input: &[TurnInput], injection_items: &[ResponseItem]
             .unwrap_or_default(),
     );
     i64::try_from(bytes.div_ceil(4)).unwrap_or(i64::MAX)
-}
-
-pub(crate) fn task_contract_from_input(input: &[TurnInput]) -> String {
-    input
-        .iter()
-        .filter_map(|item| match item {
-            TurnInput::UserInput { content, .. } => {
-                Some(task_contract_from_user_input(content.as_slice()))
-            }
-            TurnInput::InterAgentCommunication(communication) => {
-                serde_json::to_string(&communication.to_model_input_item()).ok()
-            }
-            TurnInput::ResponseItem(_) => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn task_contract_from_inter_agent_input(input: &[TurnInput]) -> String {
-    input
-        .iter()
-        .filter_map(|item| match item {
-            TurnInput::InterAgentCommunication(communication) => {
-                serde_json::to_string(&communication.to_model_input_item()).ok()
-            }
-            TurnInput::UserInput { .. } | TurnInput::ResponseItem(_) => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-pub(super) fn task_contract_from_user_input(input: &[UserInput]) -> String {
-    serde_json::to_string(input).unwrap_or_default()
 }
 
 #[tracing::instrument(
@@ -1718,18 +1334,11 @@ async fn run_pre_sampling_compact(
     check_previous_model: bool,
     pending_token_estimate: i64,
     allow_pending_input_compaction: bool,
-    allow_context_limit_compaction: bool,
 ) -> CodexResult<Option<PreSamplingCompactionReason>> {
     if check_previous_model
         && maybe_run_previous_model_inline_compact(sess, turn_context, client_session).await?
     {
         return Ok(Some(PreSamplingCompactionReason::PreviousModel));
-    }
-    // A completed context-limit compaction already addressed the current history
-    // snapshot. Re-evaluating cumulative token usage here can report the same
-    // soft limit again even though there is no second useful pass to perform.
-    if !allow_context_limit_compaction {
-        return Ok(None);
     }
     let token_status =
         super::context_window::context_window_token_status(sess.as_ref(), turn_context.as_ref())
@@ -2046,11 +1655,6 @@ pub(crate) fn build_prompt(
     }
 }
 
-enum RunSamplingRequestOutcome {
-    Sampled(SamplingRequestResult, Vec<ResponseItem>),
-    NeedsCompaction,
-}
-
 #[allow(clippy::too_many_arguments)]
 #[allow(deprecated)]
 #[instrument(level = "trace",
@@ -2072,7 +1676,7 @@ async fn run_sampling_request(
     prebuilt_router: &mut Option<Arc<ToolRouter>>,
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
     cancellation_token: CancellationToken,
-) -> CodexResult<RunSamplingRequestOutcome> {
+) -> CodexResult<(SamplingRequestResult, Vec<ResponseItem>)> {
     let turn_context = Arc::clone(&step_context.turn);
     let router = match prebuilt_router
         .take()
@@ -2114,14 +1718,6 @@ async fn run_sampling_request(
             turn_context.as_ref(),
             base_instructions.clone(),
         );
-        let estimated_prompt_tokens =
-            crate::context_manager::ContextManager::estimate_prompt_token_count(&prompt);
-        if super::context_window::estimated_prompt_reaches_hard_limit(
-            turn_context.as_ref(),
-            estimated_prompt_tokens,
-        ) {
-            return Ok(RunSamplingRequestOutcome::NeedsCompaction);
-        }
         let err = match try_run_sampling_request(
             tool_runtime.clone(),
             Arc::clone(&sess),
@@ -2137,10 +1733,7 @@ async fn run_sampling_request(
         .await
         {
             Ok(output) => {
-                return Ok(RunSamplingRequestOutcome::Sampled(
-                    output,
-                    original_input.unwrap_or(prompt.input),
-                ));
+                return Ok((output, original_input.unwrap_or(prompt.input)));
             }
             Err(CodexErr::ContextWindowExceeded) => {
                 sess.set_total_tokens_full(&turn_context).await;
@@ -2327,419 +1920,10 @@ pub(crate) async fn built_tools(
     )))
 }
 
+#[derive(Debug)]
 struct SamplingRequestResult {
     needs_follow_up: bool,
     last_agent_message: Option<String>,
-    pending_managed_final: Option<PendingManagedFinal>,
-    models_refresh_task: Option<JoinHandle<()>>,
-}
-
-#[derive(Debug)]
-struct PendingManagedFinal {
-    item_id: String,
-    agent_item: TurnItem,
-    plan_item: Option<TurnItem>,
-    facts: FinalizedTurnItemFacts,
-}
-
-fn precommit_hook_message(
-    last_agent_message: Option<String>,
-    provisional_final_pending: bool,
-) -> Option<String> {
-    if provisional_final_pending {
-        None
-    } else {
-        last_agent_message
-    }
-}
-
-enum PendingManagedFinalOutcome {
-    Emitted(Option<String>),
-    PendingInput,
-    Rejected,
-}
-
-async fn await_models_refresh_task(task: &mut Option<JoinHandle<()>>) {
-    if let Some(task) = task.take() {
-        let _ = task.await;
-    }
-}
-
-async fn abort_pending_managed_final_reservation(
-    sess: &Session,
-    turn_context: &TurnContext,
-    pending: &mut Option<PendingManagedFinal>,
-) -> CodexResult<()> {
-    let Some(pending) = pending.take() else {
-        return Ok(());
-    };
-    sess.services
-        .task_evidence
-        .abort_final_reservation(&turn_context.sub_id, &pending.item_id)
-        .await
-        .map_err(CodexErr::InvalidRequest)
-}
-
-async fn abort_sampling_result_managed_final(
-    sess: &Session,
-    turn_context: &TurnContext,
-    outcome: &mut CodexResult<SamplingRequestResult>,
-) -> CodexResult<()> {
-    let Ok(result) = outcome else {
-        return Ok(());
-    };
-    abort_pending_managed_final_reservation(sess, turn_context, &mut result.pending_managed_final)
-        .await
-}
-
-async fn commit_and_emit_pending_managed_final(
-    sess: &Session,
-    turn_context: &TurnContext,
-    pending: PendingManagedFinal,
-) -> CodexResult<PendingManagedFinalOutcome> {
-    let mut completed_items = Vec::new();
-    if let Some(plan_item) = pending.plan_item {
-        completed_items.push(plan_item);
-    }
-    match pending.agent_item {
-        TurnItem::AgentMessage(agent_message)
-            if !agent_message_text(&agent_message).trim().is_empty() =>
-        {
-            completed_items.push(TurnItem::AgentMessage(agent_message));
-        }
-        TurnItem::AgentMessage(_) => {}
-        _ => {
-            sess.services
-                .task_evidence
-                .abort_final_reservation(&turn_context.sub_id, &pending.item_id)
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
-            return Err(CodexErr::InvalidRequest(
-                "managed final candidate is not an agent message".to_string(),
-            ));
-        }
-    }
-    if completed_items.is_empty() {
-        sess.services
-            .task_evidence
-            .abort_final_reservation(&turn_context.sub_id, &pending.item_id)
-            .await
-            .map_err(CodexErr::InvalidRequest)?;
-        return Err(CodexErr::InvalidRequest(
-            "managed final has no lifecycle item to complete".to_string(),
-        ));
-    }
-
-    let emission_key = match sess
-        .services
-        .task_evidence
-        .stage_final_emission_items(&turn_context.sub_id, &pending.item_id, &completed_items)
-        .await
-    {
-        Ok(emission_key) => emission_key,
-        Err(err) => {
-            sess.services
-                .task_evidence
-                .abort_final_reservation(&turn_context.sub_id, &pending.item_id)
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
-            return Err(CodexErr::InvalidRequest(err));
-        }
-    };
-    let commit_boundary = sess
-        .input_queue
-        .commit_final_if_no_pending_input(&sess.active_turn, &turn_context.sub_id, || {
-            sess.services
-                .task_evidence
-                .commit_final_item(&turn_context.sub_id, &pending.item_id)
-        })
-        .await;
-    match commit_boundary {
-        Ok(FinalCommitBoundary::Committed) => {}
-        Ok(FinalCommitBoundary::PendingInput) => {
-            sess.services
-                .task_evidence
-                .abort_final_reservation(&turn_context.sub_id, &pending.item_id)
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
-            return Ok(PendingManagedFinalOutcome::PendingInput);
-        }
-        Ok(FinalCommitBoundary::Rejected) => {
-            sess.services
-                .task_evidence
-                .abort_final_reservation(&turn_context.sub_id, &pending.item_id)
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
-            return Ok(PendingManagedFinalOutcome::Rejected);
-        }
-        Err(err) => {
-            sess.services
-                .task_evidence
-                .abort_final_reservation(&turn_context.sub_id, &pending.item_id)
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
-            return Err(CodexErr::InvalidRequest(err));
-        }
-    }
-
-    if let Err(emit_error) = sess
-        .emit_managed_final_items_checked(turn_context, completed_items)
-        .await
-    {
-        return Err(CodexErr::InvalidRequest(emit_error));
-    }
-    sess.services
-        .task_evidence
-        .mark_final_emission_items_emitted(&turn_context.sub_id, &pending.item_id, &emission_key)
-        .await
-        .map_err(CodexErr::InvalidRequest)?;
-    Ok(PendingManagedFinalOutcome::Emitted(
-        pending.facts.last_agent_message,
-    ))
-}
-
-pub(crate) async fn recover_pending_managed_final_outbox(sess: &Session) -> CodexResult<()> {
-    let Some(emission) = sess
-        .services
-        .task_evidence
-        .recoverable_final_emission()
-        .await
-        .map_err(CodexErr::InvalidRequest)?
-    else {
-        return Ok(());
-    };
-    let recovery_context = sess
-        .new_default_turn_with_sub_id(emission.turn_id.clone())
-        .await;
-    if recovery_context.config.ephemeral {
-        if sess
-            .services
-            .task_evidence
-            .managed_final_state_for_turn(&emission.turn_id)
-            .await
-            == Some(ManagedFinalState::ItemsPending)
-        {
-            sess.emit_managed_final_items_checked(&recovery_context, emission.items.clone())
-                .await
-                .map_err(|err| {
-                    CodexErr::InvalidRequest(format!(
-                        "failed to emit committed in-memory final during recovery: {err}"
-                    ))
-                })?;
-            sess.services
-                .task_evidence
-                .mark_final_emission_items_emitted(
-                    &emission.turn_id,
-                    &emission.item_id,
-                    &emission.emission_key,
-                )
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
-        }
-        return emit_managed_final_terminal_checked(
-            sess,
-            &recovery_context,
-            &emission.terminal_event,
-        )
-        .await
-        .map_err(CodexErr::InvalidRequest);
-    }
-    let live_thread = sess
-        .live_thread_for_persistence("recovering committed final outbox")
-        .map_err(|err| CodexErr::InvalidRequest(err.to_string()))?;
-    let history = live_thread
-        .load_history(/*include_archived*/ true)
-        .await
-        .map_err(|err| {
-            CodexErr::InvalidRequest(format!(
-                "failed to inspect rollout history for committed final recovery: {err:#}"
-            ))
-        })?;
-    let items_present = durable_managed_final_batch_present(
-        &history.items,
-        sess.thread_id,
-        &emission.turn_id,
-        &emission.item_id,
-        &emission.items,
-        recovery_context.history_mode,
-        sess.show_raw_agent_reasoning(),
-    );
-    let existing_terminal = history.items.iter().find_map(|item| {
-        let RolloutItem::EventMsg(actual @ EventMsg::TurnComplete(actual_complete)) = item else {
-            return None;
-        };
-        let expected = match &emission.terminal_event {
-            EventMsg::TurnComplete(expected) => expected,
-            _ => return None,
-        };
-        if actual_complete.turn_id != expected.turn_id {
-            return None;
-        }
-        if emission.terminal_event_staged {
-            if !durable_final_event_matches(&emission.terminal_event, item) {
-                return None;
-            }
-        } else if actual_complete.last_agent_message != expected.last_agent_message {
-            return None;
-        }
-        Some(actual.clone())
-    });
-    if existing_terminal.is_some() && !items_present {
-        return Err(CodexErr::InvalidRequest(
-            "committed final rollout contains its terminal event without the exact item batch"
-                .to_string(),
-        ));
-    }
-    if !items_present {
-        sess.emit_managed_final_items_checked(&recovery_context, emission.items.clone())
-            .await
-            .map_err(|err| {
-                CodexErr::InvalidRequest(format!(
-                    "failed to append committed final during recovery: {err}"
-                ))
-            })?;
-    }
-    sess.services
-        .task_evidence
-        .mark_final_emission_items_emitted(
-            &emission.turn_id,
-            &emission.item_id,
-            &emission.emission_key,
-        )
-        .await
-        .map_err(CodexErr::InvalidRequest)?;
-    let proposed_terminal = existing_terminal.unwrap_or(emission.terminal_event);
-    emit_managed_final_terminal_checked(sess, &recovery_context, &proposed_terminal)
-        .await
-        .map_err(CodexErr::InvalidRequest)
-}
-
-pub(crate) async fn emit_managed_final_terminal_checked(
-    sess: &Session,
-    turn_context: &TurnContext,
-    proposed_event: &EventMsg,
-) -> Result<(), String> {
-    let staged_terminal = sess
-        .services
-        .task_evidence
-        .stage_final_terminal_event(&turn_context.sub_id, proposed_event)
-        .await?;
-    if turn_context.config.ephemeral {
-        sess.send_event_checked(turn_context, staged_terminal.clone())
-            .await
-            .map_err(|err| format!("failed to emit committed in-memory terminal event: {err}"))?;
-        return sess
-            .services
-            .task_evidence
-            .mark_final_terminal_completed(&turn_context.sub_id, &staged_terminal)
-            .await;
-    }
-    let live_thread = sess
-        .live_thread_for_persistence("reconciling managed final terminal outbox")
-        .map_err(|err| err.to_string())?;
-    let history = live_thread
-        .load_history(/*include_archived*/ true)
-        .await
-        .map_err(|err| {
-            format!("failed to inspect rollout history for managed terminal recovery: {err:#}")
-        })?;
-    if !history
-        .items
-        .iter()
-        .any(|item| durable_final_event_matches(&staged_terminal, item))
-    {
-        sess.send_event_checked(turn_context, staged_terminal.clone())
-            .await
-            .map_err(|err| format!("failed to append committed terminal event: {err}"))?;
-    }
-    sess.services
-        .task_evidence
-        .mark_final_terminal_completed(&turn_context.sub_id, &staged_terminal)
-        .await
-}
-
-fn durable_managed_final_batch_present(
-    history: &[RolloutItem],
-    thread_id: codex_protocol::ThreadId,
-    turn_id: &str,
-    provisional_item_id: &str,
-    items: &[TurnItem],
-    history_mode: ThreadHistoryMode,
-    show_raw_agent_reasoning: bool,
-) -> bool {
-    let history = if history_mode == ThreadHistoryMode::Legacy {
-        let Some(provisional_index) = history.iter().rposition(|item| {
-            matches!(
-                item,
-                RolloutItem::ResponseItem(response)
-                    if response.id() == Some(provisional_item_id)
-            )
-        }) else {
-            return false;
-        };
-        &history[provisional_index.saturating_add(1)..]
-    } else {
-        history
-    };
-    let mut lifecycle_events = items
-        .iter()
-        .cloned()
-        .map(|item| {
-            EventMsg::ItemStarted(ItemStartedEvent {
-                thread_id,
-                turn_id: turn_id.to_string(),
-                item,
-                started_at_ms: 0,
-            })
-        })
-        .collect::<Vec<_>>();
-    lifecycle_events.extend(items.iter().cloned().map(|item| {
-        EventMsg::ItemCompleted(ItemCompletedEvent {
-            thread_id,
-            turn_id: turn_id.to_string(),
-            item,
-            completed_at_ms: 0,
-        })
-    }));
-
-    let mut expected = Vec::new();
-    for event in lifecycle_events {
-        let legacy_events = event.as_legacy_events(show_raw_agent_reasoning);
-        for candidate in std::iter::once(event).chain(legacy_events) {
-            let rollout_item = RolloutItem::EventMsg(candidate.clone());
-            if codex_rollout::is_persisted_rollout_item(&rollout_item, history_mode) {
-                expected.push(candidate);
-            }
-        }
-    }
-    !expected.is_empty()
-        && history.windows(expected.len()).any(|window| {
-            expected
-                .iter()
-                .zip(window)
-                .all(|(expected, actual)| durable_final_event_matches(expected, actual))
-        })
-}
-
-fn durable_final_event_matches(expected: &EventMsg, actual: &RolloutItem) -> bool {
-    let RolloutItem::EventMsg(actual) = actual else {
-        return false;
-    };
-    match (expected, actual) {
-        (EventMsg::ItemStarted(expected), EventMsg::ItemStarted(actual)) => {
-            expected.thread_id == actual.thread_id
-                && expected.turn_id == actual.turn_id
-                && serde_json::to_value(&expected.item).ok()
-                    == serde_json::to_value(&actual.item).ok()
-        }
-        (EventMsg::ItemCompleted(expected), EventMsg::ItemCompleted(actual)) => {
-            expected.thread_id == actual.thread_id
-                && expected.turn_id == actual.turn_id
-                && serde_json::to_value(&expected.item).ok()
-                    == serde_json::to_value(&actual.item).ok()
-        }
-        _ => serde_json::to_value(expected).ok() == serde_json::to_value(actual).ok(),
-    }
 }
 
 /// Ephemeral per-response state for streaming a single proposed plan.
@@ -2751,7 +1935,6 @@ struct ProposedPlanItemState {
     item_id: String,
     started: bool,
     completed: bool,
-    completion_durable: bool,
 }
 
 /// Aggregated state used only while streaming a plan-mode response.
@@ -2834,7 +2017,6 @@ impl ProposedPlanItemState {
             item_id: format!("{turn_id}-plan"),
             started: false,
             completed: false,
-            completion_durable: false,
         }
     }
 
@@ -2872,25 +2054,16 @@ impl ProposedPlanItemState {
         sess: &Session,
         turn_context: &TurnContext,
         text: String,
-        require_durable_lifecycle: bool,
-    ) -> CodexResult<bool> {
+    ) {
         if self.completed || !self.started {
-            return Ok(self.completed && self.completion_durable);
+            return;
         }
+        self.completed = true;
         let item = TurnItem::Plan(PlanItem {
             id: self.item_id.clone(),
             text,
         });
-        if require_durable_lifecycle {
-            sess.emit_turn_item_completed_checked(turn_context, item)
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
-        } else {
-            sess.emit_turn_item_completed(turn_context, item).await;
-        }
-        self.completed = true;
-        self.completion_durable = require_durable_lifecycle;
-        Ok(self.completion_durable)
+        sess.emit_turn_item_completed(turn_context, item).await;
     }
 }
 
@@ -3146,8 +2319,7 @@ async fn maybe_complete_plan_item_from_message(
     turn_context: &TurnContext,
     state: &mut PlanModeStreamState,
     item: &ResponseItem,
-    require_durable_lifecycle: bool,
-) -> CodexResult<Option<String>> {
+) {
     if let ResponseItem::Message { role, content, .. } = item
         && role == "assistant"
     {
@@ -3164,16 +2336,10 @@ async fn maybe_complete_plan_item_from_message(
             }
             state
                 .plan_item_state
-                .complete_with_text(sess, turn_context, plan_text, require_durable_lifecycle)
-                .await?;
-            if state.plan_item_state.completed
-                && (!require_durable_lifecycle || state.plan_item_state.completion_durable)
-            {
-                return Ok(Some(state.plan_item_state.item_id.clone()));
-            }
+                .complete_with_text(sess, turn_context, plan_text)
+                .await;
         }
     }
-    Ok(None)
 }
 
 /// Emit a completed agent message in plan mode, respecting deferred starts.
@@ -3182,14 +2348,13 @@ async fn emit_agent_message_in_plan_mode(
     turn_context: &TurnContext,
     agent_message: codex_protocol::items::AgentMessageItem,
     state: &mut PlanModeStreamState,
-    require_durable_lifecycle: bool,
-) -> CodexResult<Option<String>> {
+) {
     let agent_message_id = agent_message.id.clone();
     let text = agent_message_text(&agent_message);
     if text.trim().is_empty() {
         state.pending_agent_message_items.remove(&agent_message_id);
         state.started_agent_message_items.remove(&agent_message_id);
-        return Ok(None);
+        return;
     }
 
     maybe_emit_pending_agent_message_start(sess, turn_context, state, &agent_message_id).await;
@@ -3215,16 +2380,9 @@ async fn emit_agent_message_in_plan_mode(
             .insert(agent_message_id.clone());
     }
 
-    if require_durable_lifecycle {
-        sess.emit_turn_item_completed_checked(turn_context, TurnItem::AgentMessage(agent_message))
-            .await
-            .map_err(CodexErr::InvalidRequest)?;
-    } else {
-        sess.emit_turn_item_completed(turn_context, TurnItem::AgentMessage(agent_message))
-            .await;
-    }
+    sess.emit_turn_item_completed(turn_context, TurnItem::AgentMessage(agent_message))
+        .await;
     state.started_agent_message_items.remove(&agent_message_id);
-    Ok(Some(agent_message_id))
 }
 
 /// Emit completion for a plan-mode turn item, handling agent messages specially.
@@ -3234,39 +2392,18 @@ async fn emit_turn_item_in_plan_mode(
     turn_item: TurnItem,
     previously_active_item: Option<&TurnItem>,
     state: &mut PlanModeStreamState,
-    require_durable_lifecycle: bool,
-) -> CodexResult<Option<String>> {
+) {
     match turn_item {
         TurnItem::AgentMessage(agent_message) => {
-            emit_agent_message_in_plan_mode(
-                sess,
-                turn_context,
-                agent_message,
-                state,
-                require_durable_lifecycle,
-            )
-            .await
+            emit_agent_message_in_plan_mode(sess, turn_context, agent_message, state).await;
         }
         _ => {
-            let item_id = turn_item.id();
             if previously_active_item.is_none() {
                 sess.emit_turn_item_started(turn_context, &turn_item).await;
             }
-            if require_durable_lifecycle {
-                sess.emit_turn_item_completed_checked(turn_context, turn_item)
-                    .await
-                    .map_err(CodexErr::InvalidRequest)?;
-            } else {
-                sess.emit_turn_item_completed(turn_context, turn_item).await;
-            }
-            Ok(Some(item_id))
+            sess.emit_turn_item_completed(turn_context, turn_item).await;
         }
     }
-}
-
-struct PlanModeAssistantDone {
-    completed_item_id: Option<String>,
-    last_agent_message: Option<String>,
 }
 
 /// Handle a completed assistant response item in plan mode, returning true if handled.
@@ -3277,97 +2414,49 @@ async fn handle_assistant_item_done_in_plan_mode(
     item: &ResponseItem,
     state: &mut PlanModeStreamState,
     previously_active_item: Option<&TurnItem>,
-    require_durable_lifecycle: bool,
-    prefinalized_turn_item: Option<FinalizedTurnItem>,
-) -> CodexResult<Option<PlanModeAssistantDone>> {
+    last_agent_message: &mut Option<String>,
+) -> bool {
     if let ResponseItem::Message { role, .. } = item
         && role == "assistant"
     {
+        maybe_complete_plan_item_from_message(sess, turn_context, state, item).await;
+
         let mut finalized_facts = None;
-        let finalized_turn_item = match prefinalized_turn_item {
-            Some(finalized_turn_item) => Some(finalized_turn_item),
-            None => {
-                finalize_non_tool_response_item(
-                    sess,
-                    TurnItemContributorPolicy::Run(turn_store),
-                    item,
-                    /*plan_mode*/ true,
-                )
-                .await
-            }
-        };
-        if let Some(finalized_turn_item) = finalized_turn_item.as_ref() {
-            if require_durable_lifecycle
-                && !matches!(
-                    &finalized_turn_item.turn_item,
-                    TurnItem::AgentMessage(agent_message)
-                        if Some(agent_message.id.as_str()) == item.id()
-                            && !matches!(
-                                agent_message.phase,
-                                Some(MessagePhase::Commentary)
-                            )
-                )
-            {
-                return Err(CodexErr::InvalidRequest(
-                    "final turn-item contributors changed the committed item identity or finality"
-                        .to_string(),
-                ));
-            }
-            finalized_facts = Some(finalized_turn_item.facts.clone());
-        }
-        record_completed_response_item_with_finalized_facts(
+        if let Some(finalized_turn_item) = finalize_non_tool_response_item(
             sess,
-            turn_context,
+            TurnItemContributorPolicy::Run(turn_store),
             item,
-            finalized_facts.as_ref(),
-            /*suppress_external_effects*/ false,
-            require_durable_lifecycle,
+            /*plan_mode*/ true,
         )
         .await
-        .map_err(CodexErr::InvalidRequest)?;
-        if require_durable_lifecycle {
-            let item_id = item.id().ok_or_else(|| {
-                CodexErr::InvalidRequest(
-                    "committed final response is missing its item identity".to_string(),
-                )
-            })?;
-            sess.services
-                .task_evidence
-                .mark_final_item_persisted(&turn_context.sub_id, item_id, item)
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
-        }
-
-        let _completed_plan_item_id = maybe_complete_plan_item_from_message(
-            sess,
-            turn_context,
-            state,
-            item,
-            require_durable_lifecycle,
-        )
-        .await?;
-
-        let mut completed_item_id = None;
-        if let Some(finalized_turn_item) = finalized_turn_item {
-            completed_item_id = emit_turn_item_in_plan_mode(
+        {
+            finalized_facts = Some(finalized_turn_item.facts.clone());
+            emit_turn_item_in_plan_mode(
                 sess,
                 turn_context,
                 finalized_turn_item.turn_item,
                 previously_active_item,
                 state,
-                require_durable_lifecycle,
             )
-            .await?;
+            .await;
         }
         let final_last_agent_message = finalized_facts
             .as_ref()
             .and_then(|facts| facts.last_agent_message.clone());
-        return Ok(Some(PlanModeAssistantDone {
-            completed_item_id,
-            last_agent_message: final_last_agent_message,
-        }));
+
+        record_completed_response_item_with_finalized_facts(
+            sess,
+            turn_context,
+            item,
+            finalized_facts.as_ref(),
+        )
+        .await;
+        if let Some(agent_message) = final_last_agent_message {
+            *last_agent_message = Some(agent_message);
+        }
+        return true;
     }
-    Ok(None)
+    false
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -3416,28 +2505,6 @@ fn assign_missing_streamed_response_item_id(
     Session::assign_missing_response_item_id(item);
 }
 
-fn is_final_assistant_response_item(item: &ResponseItem) -> bool {
-    matches!(
-        item,
-        ResponseItem::Message { role, phase, .. }
-            if role == "assistant" && !matches!(phase, Some(MessagePhase::Commentary))
-    )
-}
-
-fn response_item_matches_active_final(item: &ResponseItem, active_item: Option<&TurnItem>) -> bool {
-    let Some(TurnItem::AgentMessage(active_message)) = active_item else {
-        return false;
-    };
-    matches!(
-        item,
-        ResponseItem::Message {
-            id: Some(item_id),
-            role,
-            ..
-        } if role == "assistant" && item_id == &active_message.id
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 #[instrument(level = "trace",
     skip_all,
@@ -3458,7 +2525,7 @@ async fn try_run_sampling_request(
     preparation_timing_guard: &mut Option<TurnTimingGuard>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<SamplingRequestResult> {
-    sess.reserve_rollout_model_call(turn_context.as_ref())?;
+    sess.ensure_rollout_budget_available()?;
     feedback_tags!(
         model = turn_context.model_info.slug.clone(),
         approval_policy = turn_context.approval_policy.value(),
@@ -3527,20 +2594,11 @@ async fn try_run_sampling_request(
     let plan_mode = turn_context.collaboration_mode.mode == ModeKind::Plan;
     let mut assistant_message_stream_parsers = AssistantMessageStreamParsers::new(plan_mode);
     let mut plan_mode_state = plan_mode.then(|| PlanModeStreamState::new(&turn_context.sub_id));
-    let managed_task_turn = sess
-        .services
-        .task_evidence
-        .manages_turn(&turn_context.sub_id)
-        .await;
     let defer_streamed_turn_items_for_contributors =
-        managed_task_turn || !sess.services.extensions.turn_item_contributors().is_empty();
+        !sess.services.extensions.turn_item_contributors().is_empty();
     let mut active_item_is_streaming_to_client = false;
-    let mut active_item_is_provisional_final = false;
-    let mut active_item_final_committed = false;
-    let mut active_final_reservation: Option<String> = None;
-    let mut pending_managed_final: Option<PendingManagedFinal> = None;
     let receiving_span = trace_span!("receiving_stream");
-    let mut outcome: CodexResult<SamplingRequestResult> = loop {
+    let outcome: CodexResult<SamplingRequestResult> = loop {
         let handle_responses = trace_span!(
             parent: &receiving_span,
             "handle_responses",
@@ -3586,29 +2644,11 @@ async fn try_run_sampling_request(
             .session_telemetry
             .record_responses(&handle_responses, &event);
         record_turn_ttft_metric(&turn_context, &event).await;
-        if pending_managed_final.is_some()
-            && !matches!(
-                &event,
-                ResponseEvent::Completed { .. }
-                    | ResponseEvent::ModelsEtag(_)
-                    | ResponseEvent::ModelVerifications(_)
-                    | ResponseEvent::RateLimits(_)
-                    | ResponseEvent::SafetyBuffering(_)
-                    | ResponseEvent::ServerModel(_)
-                    | ResponseEvent::ServerReasoningIncluded(_)
-                    | ResponseEvent::TurnModerationMetadata(_)
-            )
-        {
-            break Err(CodexErr::InvalidRequest(
-                "model emitted output after its managed final response completed".to_string(),
-            ));
-        }
 
         match event {
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(mut item) => {
-                let raw_item_is_final = is_final_assistant_response_item(&item);
-                if turn_context.item_ids_enabled() || managed_task_turn || raw_item_is_final {
+                if turn_context.item_ids_enabled() {
                     assign_missing_streamed_response_item_id(&mut item, active_item.as_ref());
                 }
                 if let Some((_, mut consumer)) = active_tool_argument_diff_consumer.take()
@@ -3617,231 +2657,6 @@ async fn try_run_sampling_request(
                     sess.send_event(&turn_context, event).await;
                 }
                 let previously_active_item = active_item.take();
-                let mut suppress_external_effects =
-                    std::mem::take(&mut active_item_is_provisional_final);
-                let mut final_committed = std::mem::take(&mut active_item_final_committed);
-                let deferred_final_reservation = active_final_reservation.take();
-                let mut prefinalized_managed_item = if managed_task_turn
-                    && matches!(ToolRouter::build_tool_call(item.clone()), Ok(None))
-                {
-                    finalize_non_tool_response_item(
-                        sess.as_ref(),
-                        TurnItemContributorPolicy::Run(turn_store.as_ref()),
-                        &item,
-                        plan_mode,
-                    )
-                    .await
-                } else {
-                    None
-                };
-                let contributed_item_is_final =
-                    prefinalized_managed_item.as_ref().is_some_and(|finalized| {
-                        matches!(
-                            &finalized.turn_item,
-                            TurnItem::AgentMessage(agent_message)
-                                if !matches!(
-                                    agent_message.phase,
-                                    Some(MessagePhase::Commentary)
-                                )
-                        )
-                    });
-                let item_is_final = raw_item_is_final || contributed_item_is_final;
-                let item_matches_active_final =
-                    response_item_matches_active_final(&item, previously_active_item.as_ref());
-                let active_was_final_candidate = suppress_external_effects
-                    || final_committed
-                    || deferred_final_reservation.is_some();
-                let active_was_streamed = active_item_is_streaming_to_client;
-                let mut completed_item_id = item.id().map(str::to_owned);
-
-                if managed_task_turn && item_is_final {
-                    if final_committed || deferred_final_reservation.is_some() {
-                        break Err(CodexErr::InvalidRequest(
-                            "managed final response was committed before post-response acceptance"
-                                .to_string(),
-                        ));
-                    }
-                    if active_was_streamed {
-                        break Err(CodexErr::InvalidRequest(
-                            "managed final response was exposed before post-response acceptance"
-                                .to_string(),
-                        ));
-                    }
-                    if pending_managed_final.is_some() {
-                        break Err(CodexErr::InvalidRequest(
-                            "model emitted more than one managed final response".to_string(),
-                        ));
-                    }
-                    if let Err(err) = drain_in_flight(
-                        &mut in_flight,
-                        Arc::clone(&sess),
-                        Arc::clone(&turn_context),
-                    )
-                    .await
-                    {
-                        break Err(err);
-                    }
-                    let Some(finalized_turn_item) = prefinalized_managed_item.take() else {
-                        break Err(CodexErr::InvalidRequest(
-                            "managed final response could not be converted into a final turn item"
-                                .to_string(),
-                        ));
-                    };
-                    let item_id = item.id().expect("managed final item id").to_string();
-                    match &finalized_turn_item.turn_item {
-                        TurnItem::AgentMessage(agent_message)
-                            if agent_message.id == item_id
-                                && !matches!(
-                                    agent_message.phase,
-                                    Some(MessagePhase::Commentary)
-                                ) => {}
-                        _ => {
-                            break Err(CodexErr::InvalidRequest(
-                                "final turn-item contributors changed the managed final identity or finality"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                    let reserved = sess
-                        .services
-                        .task_evidence
-                        .authorize_final_item(&turn_context.sub_id, &item_id)
-                        .await
-                        .map_err(CodexErr::InvalidRequest)?;
-                    let persisted = record_completed_response_item_with_finalized_facts(
-                        sess.as_ref(),
-                        turn_context.as_ref(),
-                        &item,
-                        Some(&finalized_turn_item.facts),
-                        /*suppress_external_effects*/ true,
-                        /*require_durable_persistence*/ false,
-                    )
-                    .await
-                    .map_err(CodexErr::InvalidRequest)?;
-                    if !persisted {
-                        sess.services
-                            .task_evidence
-                            .abort_final_reservation(&turn_context.sub_id, &item_id)
-                            .await
-                            .map_err(CodexErr::InvalidRequest)?;
-                        break Err(CodexErr::InvalidRequest(
-                            "managed final response could not be durably buffered".to_string(),
-                        ));
-                    }
-                    sess.services
-                        .task_evidence
-                        .mark_final_item_persisted(&turn_context.sub_id, &item_id, &item)
-                        .await
-                        .map_err(CodexErr::InvalidRequest)?;
-                    if reserved {
-                        let plan_item = if plan_mode {
-                            raw_assistant_output_text_from_item(&item)
-                                .and_then(|text| extract_proposed_plan_text(&text))
-                                .map(|text| {
-                                    let (text, _) = strip_citations(&text);
-                                    TurnItem::Plan(PlanItem {
-                                        id: format!("{}-plan", turn_context.sub_id),
-                                        text,
-                                    })
-                                })
-                        } else {
-                            None
-                        };
-                        last_agent_message = finalized_turn_item.facts.last_agent_message.clone();
-                        pending_managed_final = Some(PendingManagedFinal {
-                            item_id,
-                            agent_item: finalized_turn_item.turn_item,
-                            plan_item,
-                            facts: finalized_turn_item.facts,
-                        });
-                    } else {
-                        last_agent_message = None;
-                    }
-                    continue;
-                }
-
-                if final_committed && (!item_is_final || !item_matches_active_final) {
-                    break Err(CodexErr::InvalidRequest(
-                        "committed final output did not match its completed stream item"
-                            .to_string(),
-                    ));
-                }
-
-                let needs_late_final_authorization = item_is_final
-                    && !final_committed
-                    && (!active_was_final_candidate || !item_matches_active_final);
-                if needs_late_final_authorization {
-                    if active_was_streamed {
-                        break Err(CodexErr::InvalidRequest(
-                            "assistant item changed identity or finality after public streaming"
-                                .to_string(),
-                        ));
-                    }
-                    if let Some(reserved_item_id) = deferred_final_reservation.as_deref() {
-                        sess.services
-                            .task_evidence
-                            .abort_final_reservation(&turn_context.sub_id, reserved_item_id)
-                            .await
-                            .map_err(CodexErr::InvalidRequest)?;
-                    }
-                    if let Err(err) = drain_in_flight(
-                        &mut in_flight,
-                        Arc::clone(&sess),
-                        Arc::clone(&turn_context),
-                    )
-                    .await
-                    {
-                        break Err(err);
-                    }
-                    let item_id = item
-                        .id()
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
-                    item.set_id(Some(item_id.clone()));
-                    let reserved = sess
-                        .services
-                        .task_evidence
-                        .authorize_final_item(&turn_context.sub_id, &item_id)
-                        .await
-                        .unwrap_or(false);
-                    final_committed = reserved
-                        && sess
-                            .services
-                            .task_evidence
-                            .commit_final_item(&turn_context.sub_id, &item_id)
-                            .await
-                            .unwrap_or(false);
-                    suppress_external_effects = !final_committed;
-                    completed_item_id = Some(item_id);
-                } else if let Some(item_id) = deferred_final_reservation {
-                    if !item_is_final || !item_matches_active_final {
-                        sess.services
-                            .task_evidence
-                            .abort_final_reservation(&turn_context.sub_id, &item_id)
-                            .await
-                            .map_err(CodexErr::InvalidRequest)?;
-                        suppress_external_effects = false;
-                        final_committed = false;
-                    } else {
-                        final_committed = sess
-                            .services
-                            .task_evidence
-                            .commit_final_item(&turn_context.sub_id, &item_id)
-                            .await
-                            .unwrap_or(false);
-                        if !final_committed {
-                            suppress_external_effects = true;
-                        }
-                    }
-                } else if active_was_final_candidate && !item_is_final {
-                    suppress_external_effects = false;
-                }
-                let completed_final_matches = final_committed
-                    && item_is_final
-                    && completed_item_id.as_deref() == item.id()
-                    && (needs_late_final_authorization || item_matches_active_final);
-                let require_durable_lifecycle = completed_final_matches && managed_task_turn;
-                let provisional_response_item = suppress_external_effects.then(|| item.clone());
                 let previously_streamed_item = if active_item_is_streaming_to_client {
                     previously_active_item
                 } else {
@@ -3861,46 +2676,19 @@ async fn try_run_sampling_request(
                     )
                     .await;
                 }
-                if !suppress_external_effects && let Some(state) = plan_mode_state.as_mut() {
-                    let prefinalized_plan_item =
-                        matches!(&item, ResponseItem::Message { role, .. } if role == "assistant")
-                            .then(|| prefinalized_managed_item.take())
-                            .flatten();
-                    let plan_mode_done = match handle_assistant_item_done_in_plan_mode(
+                if let Some(state) = plan_mode_state.as_mut()
+                    && handle_assistant_item_done_in_plan_mode(
                         &sess,
                         &turn_context,
                         turn_store.as_ref(),
                         &item,
                         state,
                         previously_streamed_item.as_ref(),
-                        require_durable_lifecycle,
-                        prefinalized_plan_item,
+                        &mut last_agent_message,
                     )
                     .await
-                    {
-                        Ok(done) => done,
-                        Err(err) => break Err(err),
-                    };
-                    if let Some(plan_mode_done) = plan_mode_done {
-                        let completed_item_matches = completed_final_matches
-                            && plan_mode_done.completed_item_id.as_deref()
-                                == completed_item_id.as_deref();
-                        if require_durable_lifecycle
-                            && completed_item_matches
-                            && let Some(item_id) = completed_item_id.as_deref()
-                            && let Err(err) = sess
-                                .services
-                                .task_evidence
-                                .mark_final_item_completed(&turn_context.sub_id, item_id)
-                                .await
-                        {
-                            break Err(CodexErr::InvalidRequest(err));
-                        }
-                        if completed_item_matches {
-                            last_agent_message = plan_mode_done.last_agent_message;
-                        }
-                        continue;
-                    }
+                {
+                    continue;
                 }
 
                 let mut ctx = HandleOutputCtx {
@@ -3933,59 +2721,18 @@ async fn try_run_sampling_request(
                     | ResponseItem::Other => false,
                 };
 
-                let output_result = match handle_output_item_done(
-                    &mut ctx,
-                    item,
-                    previously_streamed_item,
-                    suppress_external_effects,
-                    require_durable_lifecycle,
-                    prefinalized_managed_item,
-                )
-                .instrument(handle_responses)
-                .await
-                {
-                    Ok(output_result) => output_result,
-                    Err(err) => break Err(err),
-                };
+                let output_result =
+                    match handle_output_item_done(&mut ctx, item, previously_streamed_item)
+                        .instrument(handle_responses)
+                        .await
+                    {
+                        Ok(output_result) => output_result,
+                        Err(err) => break Err(err),
+                    };
                 if let Some(tool_future) = output_result.tool_future {
                     in_flight.push_back(tool_future);
                 }
-                if suppress_external_effects
-                    && output_result.provisional_history_persisted
-                    && let Some(item_id) = completed_item_id.as_deref()
-                    && let Some(provisional_response_item) = provisional_response_item.as_ref()
-                {
-                    if let Err(err) = sess
-                        .services
-                        .task_evidence
-                        .mark_final_item_persisted(
-                            &turn_context.sub_id,
-                            item_id,
-                            provisional_response_item,
-                        )
-                        .await
-                    {
-                        break Err(CodexErr::InvalidRequest(err));
-                    }
-                }
-                if require_durable_lifecycle
-                    && output_result.turn_item_completed
-                    && output_result.last_agent_message_item_id.as_deref()
-                        == completed_item_id.as_deref()
-                    && let Some(item_id) = completed_item_id.as_deref()
-                    && let Err(err) = sess
-                        .services
-                        .task_evidence
-                        .mark_final_item_completed(&turn_context.sub_id, item_id)
-                        .await
-                {
-                    break Err(CodexErr::InvalidRequest(err));
-                }
-                if completed_final_matches
-                    && output_result.last_agent_message_item_id.as_deref()
-                        == completed_item_id.as_deref()
-                    && let Some(agent_message) = output_result.last_agent_message
-                {
+                if let Some(agent_message) = output_result.last_agent_message {
                     last_agent_message = Some(agent_message);
                 }
                 needs_follow_up |= output_result.needs_follow_up;
@@ -3994,28 +2741,12 @@ async fn try_run_sampling_request(
                     break Ok(SamplingRequestResult {
                         needs_follow_up: true,
                         last_agent_message,
-                        pending_managed_final: pending_managed_final.take(),
-                        models_refresh_task: None,
                     });
                 }
             }
             ResponseEvent::OutputItemAdded(mut item) => {
-                if turn_context.item_ids_enabled()
-                    || managed_task_turn
-                    || is_final_assistant_response_item(&item)
-                {
+                if turn_context.item_ids_enabled() {
                     assign_missing_streamed_response_item_id(&mut item, /*active_item*/ None);
-                }
-                let is_final_assistant_item = is_final_assistant_response_item(&item);
-                if is_final_assistant_item
-                    && let Err(err) = drain_in_flight(
-                        &mut in_flight,
-                        Arc::clone(&sess),
-                        Arc::clone(&turn_context),
-                    )
-                    .await
-                {
-                    break Err(err);
                 }
                 if let ResponseItem::CustomToolCall {
                     call_id,
@@ -4040,35 +2771,7 @@ async fn try_run_sampling_request(
                 .await
                 {
                     let mut turn_item = turn_item;
-                    let (provisional_final, final_committed, final_reserved) =
-                        if is_final_assistant_item && managed_task_turn {
-                            (true, false, false)
-                        } else if is_final_assistant_item {
-                            let reserved = sess
-                                .services
-                                .task_evidence
-                                .authorize_final_item(&turn_context.sub_id, &turn_item.id())
-                                .await
-                                .unwrap_or(false);
-                            let commit_now =
-                                reserved && !defer_streamed_turn_items_for_contributors;
-                            let committed = commit_now
-                                && sess
-                                    .services
-                                    .task_evidence
-                                    .commit_final_item(&turn_context.sub_id, &turn_item.id())
-                                    .await
-                                    .unwrap_or(false);
-                            (
-                                !reserved || (commit_now && !committed),
-                                committed,
-                                reserved && !commit_now,
-                            )
-                        } else {
-                            (false, false, false)
-                        };
-                    let stream_item_to_client =
-                        !defer_streamed_turn_items_for_contributors && !provisional_final;
+                    let stream_item_to_client = !defer_streamed_turn_items_for_contributors;
                     let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
                     let mut seeded_item_id: Option<String> = None;
                     if stream_item_to_client
@@ -4119,10 +2822,6 @@ async fn try_run_sampling_request(
                     }
                     active_item = Some(turn_item);
                     active_item_is_streaming_to_client = stream_item_to_client;
-                    active_item_is_provisional_final = provisional_final;
-                    active_item_final_committed = final_committed;
-                    active_final_reservation =
-                        final_reserved.then(|| active_item.as_ref().expect("active item").id());
                 }
             }
             ResponseEvent::ServerModel(server_model) => {
@@ -4202,8 +2901,6 @@ async fn try_run_sampling_request(
                 break Ok(SamplingRequestResult {
                     needs_follow_up,
                     last_agent_message,
-                    pending_managed_final: pending_managed_final.take(),
-                    models_refresh_task: None,
                 });
             }
             ResponseEvent::OutputTextDelta(delta) => {
@@ -4357,23 +3054,6 @@ async fn try_run_sampling_request(
     };
     drop(sampling_timing_guard);
 
-    if outcome.is_err() {
-        abort_pending_managed_final_reservation(
-            sess.as_ref(),
-            turn_context.as_ref(),
-            &mut pending_managed_final,
-        )
-        .await?;
-    }
-
-    if let Some(item_id) = active_final_reservation.take() {
-        sess.services
-            .task_evidence
-            .abort_final_reservation(&turn_context.sub_id, &item_id)
-            .await
-            .map_err(CodexErr::InvalidRequest)?;
-    }
-
     flush_assistant_text_segments_all(
         &sess,
         &turn_context,
@@ -4387,11 +3067,7 @@ async fn try_run_sampling_request(
     } else {
         Some(turn_context.turn_timing_state.begin_tool_blocking())
     };
-    if let Err(err) = drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await {
-        abort_sampling_result_managed_final(sess.as_ref(), turn_context.as_ref(), &mut outcome)
-            .await?;
-        return Err(err);
-    }
+    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
     drop(tool_blocking_timing_guard);
 
     if should_emit_token_count {
@@ -4403,8 +3079,6 @@ async fn try_run_sampling_request(
     }
 
     if cancellation_token.is_cancelled() {
-        abort_sampling_result_managed_final(sess.as_ref(), turn_context.as_ref(), &mut outcome)
-            .await?;
         return Err(CodexErr::TurnAborted);
     }
 
@@ -4440,18 +3114,13 @@ async fn try_run_sampling_request(
         }
     }
 
-    if let Some(etag) = latest_models_etag
-        && let Ok(result) = &mut outcome
-    {
-        let models_manager = Arc::clone(&sess.services.models_manager);
-        let http_client_factory = turn_context.config.http_client_factory();
-        let refresh_cancellation = cancellation_token.child_token();
-        result.models_refresh_task = Some(tokio::spawn(async move {
-            let _ = models_manager
-                .refresh_if_new_etag(etag, http_client_factory)
-                .or_cancel(&refresh_cancellation)
-                .await;
-        }));
+    if let Some(etag) = latest_models_etag {
+        let _ = sess
+            .services
+            .models_manager
+            .refresh_if_new_etag(etag, turn_context.config.http_client_factory())
+            .or_cancel(&cancellation_token)
+            .await;
     }
 
     outcome

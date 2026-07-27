@@ -28,7 +28,6 @@ use crate::tools::handlers::SearchSourceHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
-use crate::tools::handlers::TaskStateHandler;
 use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
@@ -65,7 +64,6 @@ use crate::tools::hosted_spec::create_web_search_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExposure;
 use crate::tools::registry::ToolRegistry;
-use crate::tools::registry::mark_task_evidence_builtin;
 use crate::tools::registry::override_tool_exposure;
 use crate::tools::router::ToolRouter;
 use crate::tools::router::ToolRouterParams;
@@ -122,29 +120,19 @@ impl PlannedTools {
     where
         T: CoreToolRuntime + 'static,
     {
-        self.runtimes
-            .push(mark_task_evidence_builtin(Arc::new(handler)));
+        self.runtimes.push(Arc::new(handler));
     }
 
     fn add_arc(&mut self, handler: PlannedRuntime) {
-        self.runtimes.push(mark_task_evidence_builtin(handler));
-    }
-
-    fn add_external<T>(&mut self, handler: T)
-    where
-        T: CoreToolRuntime + 'static,
-    {
-        self.runtimes.push(Arc::new(handler));
+        self.runtimes.push(handler);
     }
 
     fn add_with_exposure<T>(&mut self, handler: T, exposure: ToolExposure)
     where
         T: CoreToolRuntime + 'static,
     {
-        self.runtimes.push(override_tool_exposure(
-            mark_task_evidence_builtin(Arc::new(handler)),
-            exposure,
-        ));
+        self.runtimes
+            .push(override_tool_exposure(Arc::new(handler), exposure));
     }
 
     fn add_dispatch_only<T>(&mut self, handler: T)
@@ -519,7 +507,7 @@ fn build_code_mode_executors(
         collect_code_mode_exec_prompt_tool_definitions(deferred_exec_prompt_tool_specs.iter());
 
     vec![
-        mark_task_evidence_builtin(Arc::new(CodeModeExecuteHandler::new(
+        Arc::new(CodeModeExecuteHandler::new(
             create_code_mode_tool(
                 &enabled_tools,
                 &deferred_tools,
@@ -527,8 +515,8 @@ fn build_code_mode_executors(
                 tool_mode == ToolMode::CodeModeOnly,
             ),
             code_mode_nested_tool_specs,
-        ))),
-        mark_task_evidence_builtin(Arc::new(CodeModeWaitHandler)),
+        )),
+        Arc::new(CodeModeWaitHandler),
     ]
 }
 
@@ -735,7 +723,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
         planned_tools.add(PlanHandler);
-        planned_tools.add(TaskStateHandler);
     }
 
     if crate::tools::handlers::VerifyLocalHandler::is_available_for_step(context.step_context) {
@@ -973,7 +960,7 @@ fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut 
     if let Some(mcp_tools) = context.mcp_tools {
         for tool in mcp_tools {
             match McpHandler::new(tool.clone()) {
-                Ok(handler) => planned_tools.add_external(handler),
+                Ok(handler) => planned_tools.add(handler),
                 Err(err) => warn!(
                     "Skipping MCP tool `{}`: failed to build tool spec: {err}",
                     tool.canonical_tool_name()
@@ -985,10 +972,7 @@ fn add_mcp_runtime_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut 
     if let Some(deferred_mcp_tools) = context.deferred_mcp_tools {
         for tool in deferred_mcp_tools {
             match McpHandler::new(tool.clone()) {
-                Ok(handler) => planned_tools.runtimes.push(override_tool_exposure(
-                    Arc::new(handler),
-                    ToolExposure::Deferred,
-                )),
+                Ok(handler) => planned_tools.add_with_exposure(handler, ToolExposure::Deferred),
                 Err(err) => warn!(
                     "Skipping deferred MCP tool `{}`: failed to build tool spec: {err}",
                     tool.canonical_tool_name()
@@ -1017,7 +1001,7 @@ fn add_dynamic_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plan
                         continue;
                     }
                 };
-                planned_tools.add_external(handler);
+                planned_tools.add(handler);
             }
             DynamicToolSpec::Namespace(namespace) => {
                 for tool in &namespace.tools {
@@ -1033,7 +1017,7 @@ fn add_dynamic_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut Plan
                             continue;
                         }
                     };
-                    planned_tools.add_external(handler);
+                    planned_tools.add(handler);
                 }
             }
         }
@@ -1135,7 +1119,7 @@ fn append_extension_tool_executors(
             warn!("Skipping extension tool `{tool_name}`: tool already registered");
             continue;
         }
-        planned_tools.add_external(ExtensionToolAdapter::new(executor));
+        planned_tools.add(ExtensionToolAdapter::new(executor));
     }
 }
 
@@ -1191,26 +1175,6 @@ impl ToolExecutor<ToolInvocation> for MultiAgentV2NamespaceOverride {
 }
 
 impl CoreToolRuntime for MultiAgentV2NamespaceOverride {
-    fn task_evidence_builtin(&self) -> bool {
-        self.handler.task_evidence_builtin()
-    }
-
-    fn task_evidence_read_only(&self) -> bool {
-        self.handler.task_evidence_read_only()
-    }
-
-    fn task_evidence_trusted_mutator(&self) -> bool {
-        self.handler.task_evidence_trusted_mutator()
-    }
-
-    fn task_evidence_success_implies_mutation(&self) -> bool {
-        self.handler.task_evidence_success_implies_mutation()
-    }
-
-    fn task_evidence_review_read_only(&self) -> bool {
-        self.handler.task_evidence_review_read_only()
-    }
-
     fn matches_kind(&self, payload: &crate::tools::context::ToolPayload) -> bool {
         self.handler.matches_kind(payload)
     }

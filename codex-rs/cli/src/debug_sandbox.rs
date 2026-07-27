@@ -497,7 +497,6 @@ async fn run_command_under_windows_session(
         tty: false,
         stdin_open: true,
         use_private_desktop: config.permissions.windows_sandbox_private_desktop,
-        require_confirmed_descendant_exit: false,
     })
     .await;
 

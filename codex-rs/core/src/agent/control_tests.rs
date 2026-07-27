@@ -8,7 +8,6 @@ use crate::agent_communication::AgentCommunicationKind;
 use crate::config::AgentRoleConfig;
 use crate::config::Config;
 use crate::config::ConfigBuilder;
-use crate::config::RolloutBudgetConfig;
 use crate::context::ContextualUserFragment;
 use crate::context::SubagentNotification;
 use crate::init_state_db;
@@ -23,7 +22,6 @@ use codex_agent_task_store::CapabilityProfile;
 use codex_extension_api::ExtensionDataInit;
 use codex_extension_api::empty_extension_registry;
 use codex_features::Feature;
-use codex_features::RolloutBudgetAction;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
 use codex_protocol::AgentPath;
@@ -1099,131 +1097,6 @@ async fn concurrent_v2_cold_load_is_singleflight_before_residency() {
 }
 
 #[tokio::test]
-async fn task_closure_seal_rejects_an_in_flight_v2_cold_load() {
-    let (home, mut config) = test_config().await;
-    let _ = config.features.enable(Feature::MultiAgentV2);
-    let _ = config.features.enable(Feature::Sqlite);
-    let harness = AgentControlHarness::new_with_config(home, config).await;
-    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
-    let target = harness
-        .control
-        .spawn_agent_with_metadata(
-            harness.config.clone(),
-            text_input("target task"),
-            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth: 1,
-                agent_path: Some(AgentPath::try_from("/root/target").expect("target agent path")),
-                agent_nickname: None,
-                agent_role: None,
-            })),
-            SpawnAgentOptions {
-                parent_thread_id: Some(parent_thread_id),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("target spawn should succeed");
-    let target_thread = harness
-        .manager
-        .get_thread(target.thread_id)
-        .await
-        .expect("target thread should exist");
-    target_thread
-        .inject_response_items(vec![assistant_message(
-            "target persisted",
-            Some(MessagePhase::FinalAnswer),
-        )])
-        .await
-        .expect("target rollout should persist");
-    target_thread
-        .shutdown_and_wait()
-        .await
-        .expect("target should shut down");
-    assert!(
-        harness
-            .manager
-            .remove_thread(&target.thread_id)
-            .await
-            .is_some()
-    );
-    harness.control.forget_v2_residency(target.thread_id);
-
-    let barrier = Arc::new(AgentControlTestBarrier::default());
-    *harness
-        .control
-        .test_hooks
-        .before_v2_cold_load
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&barrier));
-    let load_control = harness.control.clone();
-    let load_config = harness.config.clone();
-    let target_thread_id = target.thread_id;
-    let cold_load = tokio::spawn(async move {
-        load_control
-            .ensure_v2_agent_loaded(load_config, target_thread_id)
-            .await
-    });
-    timeout(Duration::from_secs(5), barrier.wait_until_reached())
-        .await
-        .expect("cold load should reach the test barrier");
-
-    let seal_control = harness.control.clone();
-    let seal_codex_home = harness.config.codex_home.clone();
-    let seal = tokio::spawn(async move {
-        seal_control
-            .seal_descendants_for_task_closure(parent_thread_id, seal_codex_home.as_path())
-            .await
-    });
-    let state_db = harness
-        .state_db
-        .as_ref()
-        .expect("sqlite state db should be available");
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let closed = state_db
-                .list_thread_spawn_children_with_status(
-                    parent_thread_id,
-                    DirectionalThreadSpawnEdgeStatus::Closed,
-                )
-                .await
-                .expect("closed children should load");
-            if closed == vec![target_thread_id] {
-                break;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("closure seal should persist the closed edge");
-    barrier.release_one();
-
-    let load_error = timeout(Duration::from_secs(10), cold_load)
-        .await
-        .expect("cold load should finish")
-        .expect("cold load task should join")
-        .expect_err("closed descendant must not reload");
-    assert!(load_error.to_string().contains("spawn edge is closed"));
-    let closure_seal = timeout(Duration::from_secs(10), seal)
-        .await
-        .expect("closure sealing should finish")
-        .expect("closure sealing task should join")
-        .expect("closure sealing should succeed");
-    assert_thread_not_loaded(&harness.manager, target_thread_id).await;
-    assert_ne!(
-        harness.control.get_status(parent_thread_id).await,
-        AgentStatus::NotFound
-    );
-
-    drop(closure_seal);
-    let _ = harness
-        .control
-        .shutdown_live_agent(parent_thread_id)
-        .await
-        .expect("parent shutdown should succeed");
-}
-
-#[tokio::test]
 async fn resume_agent_from_rollout_does_not_reopen_v2_descendants() {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
@@ -1374,7 +1247,7 @@ async fn encrypted_inter_agent_communication_clears_existing_last_task_message()
 }
 
 #[tokio::test]
-async fn spawn_agent_registers_child_before_initial_submission_without_notifying() {
+async fn spawn_agent_hides_child_until_initial_submission() {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
     let harness = AgentControlHarness::new_with_config(home, config).await;
@@ -1415,11 +1288,7 @@ async fn spawn_agent_registers_child_before_initial_submission_without_notifying
         .await
         .expect("spawn should pause before initial submission");
 
-    let pending_thread_id = harness
-        .control
-        .state
-        .agent_id_for_path(&agent_path)
-        .expect("spawned child should be registered before initial submission");
+    assert_eq!(harness.control.state.agent_id_for_path(&agent_path), None);
     assert_matches!(
         thread_created.try_recv(),
         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -1431,7 +1300,6 @@ async fn spawn_agent_registers_child_before_initial_submission_without_notifying
         .expect("spawn should finish")
         .expect("spawn task should join")
         .expect("spawn should succeed");
-    assert_eq!(spawned_agent.thread_id, pending_thread_id);
     assert_eq!(
         harness.control.state.agent_id_for_path(&agent_path),
         Some(spawned_agent.thread_id)
@@ -1464,113 +1332,9 @@ async fn spawn_agent_registers_child_before_initial_submission_without_notifying
 }
 
 #[tokio::test]
-async fn task_closure_seal_rejects_spawn_paused_before_initial_submission() {
-    let (home, mut config) = test_config().await;
-    let _ = config.features.enable(Feature::MultiAgentV2);
-    let harness = AgentControlHarness::new_with_config(home, config).await;
-    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
-    let agent_path = AgentPath::try_from("/root/worker").expect("agent path");
-    let barrier = Arc::new(AgentControlTestBarrier::default());
-    *harness
-        .control
-        .test_hooks
-        .before_initial_submission
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&barrier));
-    let mut thread_created = harness.manager.subscribe_thread_created();
-
-    let spawn_control = harness.control.clone();
-    let spawn_config = harness.config.clone();
-    let spawn_path = agent_path.clone();
-    let spawn = tokio::spawn(async move {
-        spawn_control
-            .spawn_agent_with_metadata(
-                spawn_config,
-                text_input("initial assignment"),
-                Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                    parent_thread_id,
-                    depth: 1,
-                    agent_path: Some(spawn_path),
-                    agent_nickname: None,
-                    agent_role: None,
-                })),
-                SpawnAgentOptions {
-                    parent_thread_id: Some(parent_thread_id),
-                    ..Default::default()
-                },
-            )
-            .await
-    });
-    timeout(Duration::from_secs(5), barrier.wait_until_reached())
-        .await
-        .expect("spawn should pause before initial submission");
-    let child_thread_id = harness
-        .control
-        .state
-        .agent_id_for_path(&agent_path)
-        .expect("spawned child should be visible to task closure");
-
-    let closure_seal = timeout(
-        Duration::from_secs(10),
-        harness.control.seal_descendants_for_task_closure(
-            parent_thread_id,
-            harness.config.codex_home.as_path(),
-        ),
-    )
-    .await
-    .expect("closure sealing should finish")
-    .expect("closure sealing should succeed");
-    barrier.release_one();
-
-    timeout(Duration::from_secs(10), spawn)
-        .await
-        .expect("spawn should finish")
-        .expect("spawn task should join")
-        .expect_err("sealed child must reject its initial submission");
-    assert!(
-        !harness
-            .manager
-            .captured_ops()
-            .into_iter()
-            .any(|(thread_id, op)| {
-                thread_id == child_thread_id && matches!(op, Op::UserInput { .. })
-            }),
-        "sealed child must not receive initial work"
-    );
-    assert_eq!(harness.control.state.agent_id_for_path(&agent_path), None);
-    assert_matches!(
-        thread_created.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    );
-    assert_thread_not_loaded(&harness.manager, child_thread_id).await;
-    assert_ne!(
-        harness.control.get_status(parent_thread_id).await,
-        AgentStatus::NotFound
-    );
-
-    drop(closure_seal);
-    let _ = harness
-        .control
-        .shutdown_live_agent(parent_thread_id)
-        .await
-        .expect("parent shutdown should succeed");
-}
-
-#[tokio::test]
 async fn cancelled_spawn_cleans_hidden_thread_and_releases_path() {
     let (home, mut config) = test_config().await;
     let _ = config.features.enable(Feature::MultiAgentV2);
-    config.rollout_budget = Some(RolloutBudgetConfig {
-        limit_tokens: 40,
-        reminder_at_remaining_tokens: Vec::new(),
-        sampling_token_weight: 1.0,
-        prefill_token_weight: 1.0,
-        cached_input_token_weight: 0.0,
-        model_call_token_cost: 0.0,
-        tool_output_byte_weight: 0.0,
-        subagent_token_cost: 20.0,
-        action: RolloutBudgetAction::Stop,
-    });
     let harness = AgentControlHarness::new_with_config(home, config).await;
     let (parent_thread_id, _parent_thread) = harness.start_thread().await;
     let initial_thread_ids = harness.manager.list_thread_ids().await;
@@ -1665,7 +1429,7 @@ async fn cancelled_spawn_cleans_hidden_thread_and_releases_path() {
             },
         )
         .await
-        .expect("cancelled spawn should release its path and budget reservations");
+        .expect("cancelled spawn should release its path reservation");
     assert_eq!(
         harness.control.state.agent_id_for_path(&agent_path),
         Some(retry.thread_id)
@@ -3911,145 +3675,6 @@ async fn shutdown_agent_tree_closes_descendants_when_started_at_child() {
     let mut shutdown_ids = shutdown_ids;
     shutdown_ids.sort_by_key(std::string::ToString::to_string);
     assert_eq!(shutdown_ids, expected_shutdown_ids);
-}
-
-#[test]
-fn task_closure_seal_closes_descendants_and_preserves_parent() {
-    const TEST_STACK_SIZE_BYTES: usize = 64 * 1024 * 1024;
-
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .thread_stack_size(TEST_STACK_SIZE_BYTES)
-        .enable_all()
-        .build()
-        .expect("test runtime should build")
-        .block_on(task_closure_seal_closes_descendants_and_preserves_parent_impl());
-}
-
-async fn task_closure_seal_closes_descendants_and_preserves_parent_impl() {
-    let (home, mut config) = test_config().await;
-    let _ = config.features.enable(Feature::Sqlite);
-    config.sqlite_home = home.path().join("sqlite");
-    let harness = AgentControlHarness::new_with_config(home, config).await;
-    let (parent_thread_id, _parent_thread) = harness.start_thread().await;
-
-    let child_thread_id = harness
-        .control
-        .spawn_agent(
-            harness.config.clone(),
-            text_input("hello child"),
-            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth: 1,
-                agent_path: None,
-                agent_nickname: None,
-                agent_role: Some("explorer".to_string()),
-            })),
-        )
-        .await
-        .expect("child spawn should succeed");
-    let grandchild_thread_id = harness
-        .control
-        .spawn_agent(
-            harness.config.clone(),
-            text_input("hello grandchild"),
-            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id: child_thread_id,
-                depth: 2,
-                agent_path: None,
-                agent_nickname: None,
-                agent_role: Some("worker".to_string()),
-            })),
-        )
-        .await
-        .expect("grandchild spawn should succeed");
-    wait_for_live_thread_spawn_children(&harness.control, parent_thread_id, &[child_thread_id])
-        .await;
-    wait_for_live_thread_spawn_children(&harness.control, child_thread_id, &[grandchild_thread_id])
-        .await;
-
-    let closure_seal = harness
-        .control
-        .seal_descendants_for_task_closure(parent_thread_id, harness.config.codex_home.as_path())
-        .await
-        .expect("descendant sealing should succeed");
-    assert_eq!(
-        closure_seal.descendant_evidence().len(),
-        2,
-        "closure seal should retain durable evidence from every descendant"
-    );
-
-    assert_ne!(
-        harness.control.get_status(parent_thread_id).await,
-        AgentStatus::NotFound
-    );
-    assert_eq!(
-        harness.control.get_status(child_thread_id).await,
-        AgentStatus::NotFound
-    );
-    assert_eq!(
-        harness.control.get_status(grandchild_thread_id).await,
-        AgentStatus::NotFound
-    );
-
-    let state_db = harness
-        .state_db
-        .as_ref()
-        .expect("sqlite state db should be available");
-    assert_eq!(
-        state_db
-            .list_thread_spawn_children_with_status(
-                parent_thread_id,
-                DirectionalThreadSpawnEdgeStatus::Open,
-            )
-            .await
-            .expect("open children should load"),
-        Vec::<ThreadId>::new()
-    );
-    assert_eq!(
-        state_db
-            .list_thread_spawn_children_with_status(
-                parent_thread_id,
-                DirectionalThreadSpawnEdgeStatus::Closed,
-            )
-            .await
-            .expect("closed children should load"),
-        vec![child_thread_id]
-    );
-    assert_eq!(
-        state_db
-            .list_thread_spawn_children_with_status(
-                child_thread_id,
-                DirectionalThreadSpawnEdgeStatus::Closed,
-            )
-            .await
-            .expect("closed grandchildren should load"),
-        vec![grandchild_thread_id]
-    );
-
-    let spawn_error = harness
-        .control
-        .spawn_agent(
-            harness.config.clone(),
-            text_input("too late"),
-            Some(SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
-                parent_thread_id,
-                depth: 1,
-                agent_path: None,
-                agent_nickname: None,
-                agent_role: Some("worker".to_string()),
-            })),
-        )
-        .await
-        .expect_err("closure seal must reject a new descendant");
-    assert!(spawn_error.to_string().contains("is closing"));
-
-    drop(closure_seal);
-    let _ = harness
-        .control
-        .shutdown_live_agent(parent_thread_id)
-        .await
-        .expect("parent shutdown should succeed");
 }
 
 #[tokio::test]

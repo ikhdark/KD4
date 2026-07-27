@@ -51,13 +51,6 @@ pub(crate) fn exit_code_from_status(status: ExitStatus) -> i32 {
 pub(crate) trait ChildTerminator: Send + Sync {
     fn signal(&mut self, signal: ProcessSignal) -> io::Result<()>;
 
-    fn terminate_gracefully(&mut self) -> io::Result<()> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "graceful process-tree termination is not supported by this backend",
-        ))
-    }
-
     fn kill(&mut self) -> io::Result<()>;
 }
 
@@ -123,8 +116,6 @@ pub struct ProcessHandle {
     writer_handle: StdMutex<Option<JoinHandle<()>>>,
     wait_handle: StdMutex<Option<JoinHandle<()>>>,
     exit_status: Arc<AtomicBool>,
-    termination_confirmed: Arc<AtomicBool>,
-    graceful_termination_requested: AtomicBool,
     exit_code: Arc<StdMutex<Option<i32>>>,
     // PtyHandles must be preserved because the process will receive Control+C if the
     // slave is closed
@@ -150,7 +141,6 @@ impl ProcessHandle {
         writer_handle: JoinHandle<()>,
         wait_handle: JoinHandle<()>,
         exit_status: Arc<AtomicBool>,
-        termination_confirmed: Arc<AtomicBool>,
         exit_code: Arc<StdMutex<Option<i32>>>,
         pty_handles: Option<PtyHandles>,
         resizer: Option<ResizeFn>,
@@ -163,8 +153,6 @@ impl ProcessHandle {
             writer_handle: StdMutex::new(Some(writer_handle)),
             wait_handle: StdMutex::new(Some(wait_handle)),
             exit_status,
-            termination_confirmed,
-            graceful_termination_requested: AtomicBool::new(false),
             exit_code,
             _pty_handles: StdMutex::new(pty_handles),
             resizer: StdMutex::new(resizer),
@@ -187,15 +175,6 @@ impl ProcessHandle {
     /// True if the child process has exited.
     pub fn has_exited(&self) -> bool {
         self.exit_status.load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// True only after the backend positively acknowledged process teardown.
-    ///
-    /// This intentionally differs from [`Self::has_exited`], which may also be
-    /// set when a wait/transport failure is surfaced as a synthetic exit.
-    pub fn termination_confirmed(&self) -> bool {
-        self.termination_confirmed
-            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Returns the exit code if known.
@@ -242,48 +221,9 @@ impl ProcessHandle {
     pub fn request_terminate(&self) {
         if let Ok(mut killer_opt) = self.killer.lock()
             && let Some(mut killer) = killer_opt.take()
-            && !self.termination_confirmed()
         {
             let _ = killer.kill();
         }
-    }
-
-    /// Requests a backend-defined graceful process-tree termination while
-    /// preserving the wait task needed to acknowledge completion.
-    pub fn request_graceful_terminate(&self) -> io::Result<()> {
-        if self.termination_confirmed() {
-            return Ok(());
-        }
-        let mut killer_opt = self
-            .killer
-            .lock()
-            .map_err(|_| io::Error::other("process terminator lock poisoned"))?;
-        if self
-            .graceful_termination_requested
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            return Ok(());
-        }
-        let killer = killer_opt.as_mut().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "process terminator is no longer available",
-            )
-        });
-        let killer = match killer {
-            Ok(killer) => killer,
-            Err(err) => {
-                self.graceful_termination_requested
-                    .store(false, std::sync::atomic::Ordering::Release);
-                return Err(err);
-            }
-        };
-        if let Err(err) = killer.terminate_gracefully() {
-            self.graceful_termination_requested
-                .store(false, std::sync::atomic::Ordering::Release);
-            return Err(err);
-        }
-        Ok(())
     }
 
     pub fn signal(&self, signal: ProcessSignal) -> io::Result<()> {
@@ -479,18 +419,10 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
     let (exit_tx, exit_rx_out) = oneshot::channel::<i32>();
     let exit_status = Arc::new(AtomicBool::new(false));
     let wait_exit_status = Arc::clone(&exit_status);
-    let termination_confirmed = Arc::new(AtomicBool::new(false));
-    let wait_termination_confirmed = Arc::clone(&termination_confirmed);
     let exit_code = Arc::new(StdMutex::new(None));
     let wait_exit_code = Arc::clone(&exit_code);
     let wait_handle = tokio::spawn(async move {
-        let code = match exit_rx.await {
-            Ok(code) => {
-                wait_termination_confirmed.store(true, std::sync::atomic::Ordering::SeqCst);
-                code
-            }
-            Err(_) => -1,
-        };
+        let code = exit_rx.await.unwrap_or(-1);
         wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut guard) = wait_exit_code.lock() {
             *guard = Some(code);
@@ -510,7 +442,6 @@ pub fn spawn_from_driver(driver: ProcessDriver) -> SpawnedProcess {
         writer_handle,
         wait_handle,
         exit_status,
-        termination_confirmed,
         exit_code,
         /*pty_handles*/ None,
         resizer,

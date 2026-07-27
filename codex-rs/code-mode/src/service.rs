@@ -15,7 +15,6 @@ use codex_code_mode_protocol::ExecuteToPendingOutcome;
 use codex_code_mode_protocol::FunctionCallOutputContentItem;
 use codex_code_mode_protocol::ImageDetail;
 use codex_code_mode_protocol::NotificationFuture;
-use codex_code_mode_protocol::RUN_TO_COMPLETION_YIELD_TIME_MS;
 use codex_code_mode_protocol::RuntimeResponse;
 use codex_code_mode_protocol::StartedCell;
 use codex_code_mode_protocol::ToolInvocationFuture;
@@ -101,11 +100,13 @@ impl InProcessCodeModeSession {
     }
 
     pub async fn execute(&self, request: ExecuteRequest) -> Result<StartedCell, String> {
-        let observe_mode =
-            observe_mode(request.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_TIME_MS));
+        let yield_time_ms = request.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_TIME_MS);
         let started = self
             .runtime
-            .execute(runtime_request(request), observe_mode)
+            .execute(
+                runtime_request(request),
+                runtime::ObserveMode::YieldAfter(Duration::from_millis(yield_time_ms)),
+            )
             .await
             .map_err(|error| error.to_string())?;
         let cell_id = protocol_cell_id(&started.cell_id);
@@ -157,7 +158,10 @@ impl InProcessCodeModeSession {
         let runtime_cell_id = runtime_cell_id(&cell_id);
         match self
             .runtime
-            .begin_observe(&runtime_cell_id, observe_mode(yield_time_ms))
+            .begin_observe(
+                &runtime_cell_id,
+                runtime::ObserveMode::YieldAfter(Duration::from_millis(yield_time_ms)),
+            )
             .await
         {
             Ok(pending_event) => Box::pin(async move {
@@ -214,14 +218,6 @@ impl InProcessCodeModeSession {
             .shutdown()
             .await
             .map_err(|error| error.to_string())
-    }
-}
-
-fn observe_mode(yield_time_ms: u64) -> runtime::ObserveMode {
-    if yield_time_ms == RUN_TO_COMPLETION_YIELD_TIME_MS {
-        runtime::ObserveMode::RunToCompletion
-    } else {
-        runtime::ObserveMode::YieldAfter(Duration::from_millis(yield_time_ms))
     }
 }
 

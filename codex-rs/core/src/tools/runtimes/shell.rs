@@ -16,7 +16,6 @@ use crate::sandboxing::SandboxPermissions;
 use crate::sandboxing::execute_env;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
-use crate::task_evidence::TaskMutationGuard;
 use crate::tools::flat_tool_name;
 use crate::tools::network_approval::NetworkApprovalMode;
 use crate::tools::network_approval::NetworkApprovalSpec;
@@ -72,8 +71,6 @@ pub struct ShellRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub exec_approval_requirement: ExecApprovalRequirement,
-    pub require_descendant_containment: bool,
-    pub mutation_guard: Option<TaskMutationGuard>,
 }
 
 /// Selects `ShellRuntime` behavior for different callers.
@@ -116,10 +113,6 @@ impl ShellRuntime {
             call_id: ctx.call_id.clone(),
             tx_event: ctx.session.get_tx_event(),
         })
-    }
-
-    fn should_try_zsh_fork(&self, mutation_guard_present: bool) -> bool {
-        self.backend == ShellRuntimeBackend::ShellCommandZshFork && !mutation_guard_present
     }
 }
 
@@ -254,11 +247,6 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ExecToolCallOutput, ToolError> {
-        attempt.require_strong_descendant_containment(
-            req.require_descendant_containment,
-            req.turn_environment.environment.is_remote(),
-            req.additional_permissions.as_ref(),
-        )?;
         let session_shell = ctx.session.user_shell();
         let shell = req
             .turn_environment
@@ -312,7 +300,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             command
         };
 
-        if self.should_try_zsh_fork(req.mutation_guard.is_some()) {
+        if self.backend == ShellRuntimeBackend::ShellCommandZshFork {
             match zsh_fork_backend::maybe_run_shell_command(req, attempt, ctx, &command).await? {
                 Some(out) => return Ok(out),
                 None => {
@@ -321,13 +309,6 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                     );
                 }
             }
-        } else if self.backend == ShellRuntimeBackend::ShellCommandZshFork {
-            // The zsh-fork fast path borrows the turn worker directly. A hard
-            // abort could therefore drop a managed mutation lease before the
-            // process tree is confirmed gone. Managed requests use the
-            // detached classic path below, while unmanaged behavior remains
-            // unchanged.
-            tracing::debug!("using detached classic shell path for managed mutation");
         }
 
         let command =
@@ -341,7 +322,7 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
             expiration,
             capture_policy: ExecCapturePolicy::ShellTool,
         };
-        let mut env = attempt
+        let env = attempt
             .env_for(
                 command,
                 options,
@@ -349,34 +330,9 @@ impl ToolRuntime<ShellRequest, ExecToolCallOutput> for ShellRuntime {
                 Some(&req.turn_environment.environment_id),
             )
             .map_err(ToolError::Codex)?;
-        env.descendant_containment_required = req.require_descendant_containment;
-        let stdout_stream = Self::stdout_stream(ctx);
-        let out = if let Some(mutation_guard) = req.mutation_guard.clone() {
-            let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(async move {
-                if completion_rx.await.is_err() {
-                    // A panic in the detached execution loses the only
-                    // trustworthy teardown result. Keep the lease fail-closed.
-                    std::future::pending::<()>().await;
-                }
-                drop(mutation_guard);
-            });
-            let execution = tokio::spawn(async move {
-                let result = execute_env(env, stdout_stream).await;
-                let _ = completion_tx.send(());
-                result
-            });
-            execution
-                .await
-                .map_err(|err| {
-                    ToolError::Rejected(format!("managed shell execution task failed: {err}"))
-                })?
-                .map_err(ToolError::Codex)?
-        } else {
-            execute_env(env, stdout_stream)
-                .await
-                .map_err(ToolError::Codex)?
-        };
+        let out = execute_env(env, Self::stdout_stream(ctx))
+            .await
+            .map_err(ToolError::Codex)?;
         Ok(out)
     }
 }

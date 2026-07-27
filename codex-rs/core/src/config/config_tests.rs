@@ -68,7 +68,6 @@ use codex_config::types::WindowsSandboxModeToml;
 use codex_config::types::WindowsToml;
 use codex_core_plugins::PluginsManager;
 use codex_exec_server::LOCAL_FS;
-use codex_features::CodeModeWaitingPolicy;
 use codex_features::Feature;
 use codex_features::FeaturesToml;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
@@ -449,7 +448,6 @@ async fn load_config_resolves_code_mode_config() -> std::io::Result<()> {
         r#"
 [features.code_mode]
 enabled = true
-waiting_policy = "yield_after"
 excluded_tool_namespaces = ["mcp__codex_apps", "multi_agent_v1"]
 direct_only_tool_namespaces = ["mcp__history", "mcp__notes"]
 "#,
@@ -462,10 +460,6 @@ direct_only_tool_namespaces = ["mcp__history", "mcp__notes"]
     )
     .await?;
 
-    assert_eq!(
-        config.code_mode.waiting_policy,
-        CodeModeWaitingPolicy::YieldAfter
-    );
     assert_eq!(
         config.code_mode.excluded_tool_namespaces,
         vec!["mcp__codex_apps".to_string(), "multi_agent_v1".to_string()]
@@ -575,11 +569,6 @@ limit_tokens = 100000
 reminder_at_remaining_tokens = [50000, 25000, 10000]
 sampling_token_weight = 1.0
 prefill_token_weight = 0.1
-cached_input_token_weight = 0.05
-model_call_token_cost = 750
-tool_output_byte_weight = 0.025
-subagent_token_cost = 4000
-action = "ask"
 "#,
     )
     .expect("TOML deserialization should succeed");
@@ -599,11 +588,6 @@ action = "ask"
             reminder_at_remaining_tokens: vec![50_000, 25_000, 10_000],
             sampling_token_weight: 1.0,
             prefill_token_weight: 0.1,
-            cached_input_token_weight: 0.05,
-            model_call_token_cost: 750.0,
-            tool_output_byte_weight: 0.025,
-            subagent_token_cost: 4_000.0,
-            action: codex_features::RolloutBudgetAction::Ask,
         })
     );
     Ok(())

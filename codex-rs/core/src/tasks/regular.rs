@@ -36,10 +36,6 @@ impl SessionTask for RegularTask {
         "session_task.turn"
     }
 
-    fn task_evidence_contract(&self, input: &[TurnInput]) -> Option<String> {
-        Some(crate::session::turn::task_contract_from_input(input))
-    }
-
     async fn run(
         self: Arc<Self>,
         session: Arc<SessionTaskContext>,

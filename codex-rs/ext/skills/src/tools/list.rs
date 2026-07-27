@@ -64,10 +64,6 @@ impl ToolExecutor<ToolCall> for ListTool {
         )
     }
 
-    fn read_only_hint(&self) -> Option<bool> {
-        Some(true)
-    }
-
     fn handle(&self, call: ToolCall) -> ToolExecutorFuture<'_> {
         Box::pin(async move {
             let args: ListArgs = parse_args(&call)?;

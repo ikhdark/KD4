@@ -5,7 +5,6 @@ use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::user_input::UserInput;
 use std::collections::VecDeque;
-use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
@@ -24,13 +23,6 @@ pub(crate) enum TurnInput {
 pub(crate) enum InputQueueActivity {
     Mailbox,
     Steer,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FinalCommitBoundary {
-    PendingInput,
-    Rejected,
-    Committed,
 }
 
 /// Turn-local pending input storage owned by the input queue flow.
@@ -90,49 +82,6 @@ impl InputQueue {
 
     pub(crate) async fn has_pending_mailbox_items(&self) -> bool {
         !self.mailbox_pending_mails.lock().await.is_empty()
-    }
-
-    #[expect(
-        clippy::await_holding_invalid_type,
-        reason = "pending input and the durable final commit must share one answer boundary"
-    )]
-    pub(crate) async fn commit_final_if_no_pending_input<F, Fut>(
-        &self,
-        active_turn: &Mutex<Option<ActiveTurn>>,
-        sub_id: &str,
-        commit: F,
-    ) -> Result<FinalCommitBoundary, String>
-    where
-        F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<bool, String>>,
-    {
-        let active = active_turn.lock().await;
-        let Some(active_turn) = active.as_ref() else {
-            return Ok(FinalCommitBoundary::Rejected);
-        };
-        if !active_turn
-            .task
-            .as_ref()
-            .is_some_and(|task| task.turn_context.sub_id == sub_id && task.task_evidence_managed)
-        {
-            return Ok(FinalCommitBoundary::Rejected);
-        }
-
-        let mut turn_state = active_turn.turn_state.lock().await;
-        let mailbox = self.mailbox_pending_mails.lock().await;
-        if !turn_state.pending_input.items.is_empty()
-            || (turn_state.accepts_mailbox_delivery_for_current_turn() && !mailbox.is_empty())
-        {
-            return Ok(FinalCommitBoundary::PendingInput);
-        }
-
-        let committed = commit().await?;
-        if committed {
-            turn_state.set_mailbox_delivery_phase(MailboxDeliveryPhase::NextTurn);
-            Ok(FinalCommitBoundary::Committed)
-        } else {
-            Ok(FinalCommitBoundary::Rejected)
-        }
     }
 
     pub(crate) async fn has_trigger_turn_mailbox_items(&self) -> bool {

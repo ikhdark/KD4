@@ -853,7 +853,7 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
                     })
                     .to_string(),
                 ),
-                ev_completed_with_tokens("resp-1", /*total_tokens*/ 45_000),
+                ev_completed_with_tokens("resp-1", /*total_tokens*/ 96),
             ]),
             sse(vec![
                 ev_assistant_message("msg-compact", "AUTO_COMPACT_SUMMARY"),
@@ -880,8 +880,8 @@ async fn deferred_executor_compaction_preserves_then_updates_environment_once() 
             );
             config.model_provider.name = "OpenAI (test)".to_string();
             config.compact_prompt = Some(SUMMARIZATION_PROMPT.to_string());
-            config.model_context_window = Some(50_000);
-            config.model_auto_compact_token_limit = Some(40_000);
+            config.model_context_window = Some(100);
+            config.model_auto_compact_token_limit = Some(90);
         });
     let test = timeout(Duration::from_secs(5), builder.build(&server))
         .await

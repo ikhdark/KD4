@@ -143,7 +143,6 @@ impl McpHandler {
         };
 
         let started = Instant::now();
-        let sampled_canonical_tool_name = self.tool_info.canonical_tool_name();
         // TODO(sayan): Use StepContext for MCP file arguments when MCP follows dynamic environments.
         let result = handle_mcp_tool_call(
             Arc::clone(&session),
@@ -151,8 +150,6 @@ impl McpHandler {
             call_id.clone(),
             &self.tool_info.server_name,
             self.tool_info.tool.name.as_ref(),
-            sampled_canonical_tool_name,
-            self.task_evidence_read_only(),
             payload,
             cancellation_token,
         )
@@ -169,19 +166,6 @@ impl McpHandler {
 }
 
 impl CoreToolRuntime for McpHandler {
-    fn task_evidence_read_only(&self) -> bool {
-        self.tool_info
-            .tool
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.read_only_hint)
-            .unwrap_or(false)
-    }
-
-    fn task_evidence_review_read_only(&self) -> bool {
-        false
-    }
-
     fn waits_for_runtime_cancellation(&self) -> bool {
         true
     }

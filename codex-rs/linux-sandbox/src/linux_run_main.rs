@@ -1,5 +1,4 @@
 use clap::Parser;
-use std::cell::Cell;
 use std::ffi::CString;
 use std::fmt;
 use std::fs;
@@ -9,8 +8,6 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::panic::AssertUnwindSafe;
-use std::panic::catch_unwind;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -483,15 +480,15 @@ fn resolve_true_command() -> String {
 }
 
 fn run_or_exec_bwrap(bwrap_args: crate::bwrap::BwrapArgs) -> ! {
-    // Always retain the outer helper as a bwrap supervisor. Its normal exit is
-    // the explicit acknowledgement that the bwrap child was reaped and all
-    // PID-namespace descendants are gone. Direct exec cannot distinguish that
-    // state from the helper itself being killed.
+    if bwrap_args.synthetic_mount_targets.is_empty()
+        && bwrap_args.protected_create_targets.is_empty()
+    {
+        exec_bwrap(bwrap_args.args, bwrap_args.preserved_files);
+    }
     run_bwrap_in_child_with_synthetic_mount_cleanup(bwrap_args);
 }
 
 fn run_bwrap_in_child_with_synthetic_mount_cleanup(bwrap_args: crate::bwrap::BwrapArgs) -> ! {
-    enable_child_subreaper();
     let crate::bwrap::BwrapArgs {
         args,
         preserved_files,
@@ -523,43 +520,22 @@ fn run_bwrap_in_child_with_synthetic_mount_cleanup(bwrap_args: crate::bwrap::Bwr
         exec_bwrap(args, preserved_files);
     }
 
-    let child_reaped = Cell::new(false);
-    let parent_result = catch_unwind(AssertUnwindSafe(|| {
-        close_child_exec_start_read(exec_start_pipe[0]);
-        let protected_create_monitor = ProtectedCreateMonitor::start(&protected_create_targets);
-        let signal_forwarders = install_bwrap_signal_forwarders(pid);
-        release_child_exec_start(exec_start_pipe[1]);
-        setup_signal_mask.restore();
-        wait_for_bwrap_child_exit_without_reaping(pid);
-        // Keep the exited bwrap PID reserved until forwarded signals are
-        // blocked and the handler no longer references it. This closes the
-        // stale-PID reuse window before the potentially long descendant drain.
-        let cleanup_signal_mask = ForwardedSignalMask::block();
-        BWRAP_CHILD_PID.store(0, Ordering::SeqCst);
-        let status = wait_for_bwrap_child(pid);
-        wait_for_all_adopted_bwrap_descendants();
-        child_reaped.set(true);
-        let protected_create_monitor_violation = protected_create_monitor
-            .map(ProtectedCreateMonitor::stop)
-            .unwrap_or(false);
-        cleanup_synthetic_mount_targets(&synthetic_mount_registrations);
-        let protected_create_violation = protected_create_monitor_violation
-            || cleanup_protected_create_targets(&protected_create_registrations);
-        signal_forwarders.restore();
-        cleanup_signal_mask.restore();
-        (status, protected_create_violation)
-    }));
-    let Ok((status, protected_create_violation)) = parent_result else {
-        if !child_reaped.get() {
-            terminate_and_reap_bwrap_child_after_parent_panic(pid);
-        }
-        // A caught parent-side panic is not a normal cleanup acknowledgement.
-        // Keep the helper alive so its caller cannot confuse panic exit with a
-        // positively completed bwrap teardown.
-        loop {
-            thread::park_timeout(Duration::from_secs(60));
-        }
-    };
+    close_child_exec_start_read(exec_start_pipe[0]);
+    let protected_create_monitor = ProtectedCreateMonitor::start(&protected_create_targets);
+    let signal_forwarders = install_bwrap_signal_forwarders(pid);
+    release_child_exec_start(exec_start_pipe[1]);
+    setup_signal_mask.restore();
+    let status = wait_for_bwrap_child(pid);
+    let cleanup_signal_mask = ForwardedSignalMask::block();
+    BWRAP_CHILD_PID.store(0, Ordering::SeqCst);
+    let protected_create_monitor_violation = protected_create_monitor
+        .map(ProtectedCreateMonitor::stop)
+        .unwrap_or(false);
+    cleanup_synthetic_mount_targets(&synthetic_mount_registrations);
+    let protected_create_violation = protected_create_monitor_violation
+        || cleanup_protected_create_targets(&protected_create_registrations);
+    signal_forwarders.restore();
+    cleanup_signal_mask.restore();
     exit_with_wait_status_or_policy_violation(status, protected_create_violation);
 }
 
@@ -886,82 +862,6 @@ fn wait_for_bwrap_child(pid: libc::pid_t) -> libc::c_int {
             continue;
         }
         panic!("waitpid failed for bubblewrap child: {err}");
-    }
-}
-
-fn wait_for_bwrap_child_exit_without_reaping(pid: libc::pid_t) {
-    loop {
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        let wait_res = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        if wait_res == 0 {
-            return;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        panic!("waitid failed for bubblewrap child: {err}");
-    }
-}
-
-fn enable_child_subreaper() {
-    let result = unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) };
-    if result < 0 {
-        let err = std::io::Error::last_os_error();
-        panic!("failed to establish bubblewrap descendant subreaper: {err}");
-    }
-}
-
-fn wait_for_all_adopted_bwrap_descendants() {
-    loop {
-        let mut status: libc::c_int = 0;
-        let wait_res = unsafe { libc::waitpid(-1, &mut status, 0) };
-        if wait_res > 0 {
-            continue;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        if err.raw_os_error() == Some(libc::ECHILD) {
-            return;
-        }
-        panic!("waitpid failed while draining bubblewrap descendants: {err}");
-    }
-}
-
-fn terminate_and_reap_bwrap_child_after_parent_panic(pid: libc::pid_t) {
-    unsafe {
-        // The bwrap child establishes PGID == PID before exec. Signal both the
-        // group and the direct child to cover the short pre-setpgid window.
-        libc::kill(-pid, libc::SIGKILL);
-        libc::kill(pid, libc::SIGKILL);
-    }
-    loop {
-        let mut status: libc::c_int = 0;
-        let wait_res = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if wait_res == pid {
-            return;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        if err.raw_os_error() == Some(libc::ECHILD) {
-            return;
-        }
-        // An unknown wait failure cannot establish teardown. Never let the
-        // helper exit and turn that ambiguity into a false acknowledgement.
-        loop {
-            thread::park_timeout(Duration::from_secs(60));
-        }
     }
 }
 
@@ -1373,13 +1273,6 @@ fn exit_with_wait_status_or_policy_violation(
 ) -> ! {
     if protected_create_violation && libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
         std::process::exit(1);
-    }
-
-    if libc::WIFSIGNALED(status) {
-        // The supervisor has already reaped bwrap and completed cleanup.
-        // Preserve the conventional shell code without re-signalling this
-        // outer helper, because a normal helper exit is the containment ack.
-        std::process::exit(128 + libc::WTERMSIG(status));
     }
 
     exit_with_wait_status(status);

@@ -3,16 +3,6 @@ use codex_exec_server::Environment;
 use codex_utils_path_uri::PathUri;
 use std::sync::Arc;
 
-#[test]
-fn managed_mutations_bypass_the_borrowed_zsh_fork_path() {
-    let zsh_fork = ShellRuntime::for_shell_command(ShellRuntimeBackend::ShellCommandZshFork);
-    let classic = ShellRuntime::for_shell_command(ShellRuntimeBackend::ShellCommandClassic);
-
-    assert!(zsh_fork.should_try_zsh_fork(/*mutation_guard_present*/ false));
-    assert!(!zsh_fork.should_try_zsh_fork(/*mutation_guard_present*/ true));
-    assert!(!classic.should_try_zsh_fork(/*mutation_guard_present*/ false));
-}
-
 #[tokio::test]
 async fn approval_key_includes_environment_id() {
     let cwd = AbsolutePathBuf::try_from(std::env::current_dir().expect("read current dir"))
@@ -43,8 +33,6 @@ async fn approval_key_includes_environment_id() {
             bypass_sandbox: false,
             proposed_execpolicy_amendment: None,
         },
-        require_descendant_containment: false,
-        mutation_guard: None,
     };
     let runtime = ShellRuntime::for_shell_command(ShellRuntimeBackend::ShellCommandClassic);
     let original_key = runtime.approval_keys(&request);
@@ -92,8 +80,6 @@ async fn approval_key_uses_inspectable_command_instead_of_encoded_payload() {
             bypass_sandbox: false,
             proposed_execpolicy_amendment: None,
         },
-        require_descendant_containment: false,
-        mutation_guard: None,
     };
     let runtime = ShellRuntime::for_shell_command(ShellRuntimeBackend::ShellCommandClassic);
 

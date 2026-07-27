@@ -96,14 +96,6 @@ fn test_model_client_with_thread_id(
     thread_id: ThreadId,
     session_source: SessionSource,
 ) -> ModelClient {
-    test_model_client_with_thread_id_and_item_ids(thread_id, session_source, /*enabled*/ false)
-}
-
-fn test_model_client_with_thread_id_and_item_ids(
-    thread_id: ThreadId,
-    session_source: SessionSource,
-    item_ids_enabled: bool,
-) -> ModelClient {
     let provider = create_oss_provider_with_base_url("https://example.com/v1", WireApi::Responses);
     ModelClient::new(
         /*auth_manager*/ None,
@@ -116,7 +108,7 @@ fn test_model_client_with_thread_id_and_item_ids(
         /*enable_request_compression*/ false,
         /*include_timing_metrics*/ false,
         /*beta_features_header*/ None,
-        item_ids_enabled,
+        /*item_ids_enabled*/ false,
         /*concurrent_reasoning_summaries_enabled*/ false,
         /*attestation_provider*/ None,
         HttpClientFactory::new(OutboundProxyPolicy::ReqwestDefault),
@@ -157,40 +149,6 @@ fn history_test_request(input: Vec<ResponseItem>) -> ResponsesApiRequest {
         text: None,
         client_metadata: None,
     }
-}
-
-#[test]
-fn request_preparation_drops_malformed_message_ids_when_item_ids_are_enabled() {
-    let client = test_model_client_with_thread_id_and_item_ids(
-        ThreadId::new(),
-        SessionSource::Cli,
-        /*item_ids_enabled*/ true,
-    );
-    let mut input = vec![
-        ResponseItem::Message {
-            id: Some("019f908e-632a-79b2-a445-90a8a2e9fc44".to_string()),
-            role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: "legacy hook prompt".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-        ResponseItem::Message {
-            id: Some("msg_valid".to_string()),
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText {
-                text: "preserved".to_string(),
-            }],
-            phase: None,
-            internal_chat_message_metadata_passthrough: None,
-        },
-    ];
-
-    client.prepare_response_items_for_request(&mut input, /*store*/ false);
-
-    assert_eq!(input[0].id(), None);
-    assert_eq!(input[1].id(), Some("msg_valid"));
 }
 
 #[test]

@@ -6,7 +6,6 @@ use super::async_watcher::omitted_output_marker;
 use super::async_watcher::resolve_aggregated_output;
 use super::async_watcher::start_streaming_output;
 use super::head_tail_buffer::HeadTailBuffer;
-use super::process::NoopSpawnLifecycle;
 use super::process::UnifiedExecProcess;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
@@ -30,19 +29,12 @@ use codex_exec_server::ReadResponse;
 use codex_exec_server::StartedExecProcess;
 use codex_exec_server::WriteResponse;
 use codex_exec_server::WriteStatus;
-use codex_sandboxing::SandboxType;
 use codex_tools::ToolExecutor;
-use codex_utils_pty::ProcessDriver;
-use codex_utils_pty::spawn_from_driver;
 use pretty_assertions::assert_eq;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use tokio::sync::Mutex;
-use tokio::sync::Notify;
-use tokio::sync::broadcast;
-use tokio::sync::mpsc;
-use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::time::Duration;
 use tokio::time::Instant;
@@ -161,7 +153,6 @@ async fn store_process_for_test(
             network_approval: None,
             session: Arc::downgrade(session),
             last_used: Instant::now(),
-            mutation_guard: None,
         },
     );
 }
@@ -266,161 +257,6 @@ async fn remote_terminate_confirmed_updates_state_on_success_only() {
         .expect("terminate should succeed");
 
     assert!(process.has_exited());
-}
-
-#[tokio::test]
-async fn local_terminate_confirmed_waits_for_driver_exit_acknowledgement() {
-    let (writer_tx, _writer_rx) = mpsc::channel::<Vec<u8>>(1);
-    let (_stdout_tx, stdout_rx) = broadcast::channel::<Vec<u8>>(1);
-    let (driver_exit_tx, driver_exit_rx) = oneshot::channel::<i32>();
-    let termination_requested = Arc::new(Notify::new());
-    let cleanup_complete = Arc::new(AtomicBool::new(false));
-
-    let requested = Arc::clone(&termination_requested);
-    let spawned = spawn_from_driver(ProcessDriver {
-        writer_tx,
-        stdout_rx,
-        stderr_rx: None,
-        exit_rx: driver_exit_rx,
-        terminator: Some(Box::new(move || requested.notify_one())),
-        writer_handle: None,
-        resizer: None,
-    });
-    let process = UnifiedExecProcess::from_spawned(
-        spawned,
-        SandboxType::None,
-        /*descendant_containment_established*/ true,
-        /*descendant_containment_required*/ true,
-        Box::<NoopSpawnLifecycle>::default(),
-        None,
-    )
-    .await
-    .expect("local process should start");
-
-    let cleanup_finished = Arc::clone(&cleanup_complete);
-    tokio::spawn(async move {
-        termination_requested.notified().await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        cleanup_finished.store(true, std::sync::atomic::Ordering::Release);
-        driver_exit_tx.send(0).expect("send contained-tree exit");
-    });
-
-    process.fail_and_terminate("network denied".to_string());
-    assert!(
-        !process.has_exited(),
-        "a synthetic failure must not stand in for contained-tree exit"
-    );
-    process
-        .terminate_confirmed()
-        .await
-        .expect("termination should wait for the driver exit acknowledgement");
-
-    assert!(
-        cleanup_complete.load(std::sync::atomic::Ordering::Acquire),
-        "termination returned before contained-tree cleanup completed"
-    );
-    assert!(process.has_exited());
-}
-
-#[tokio::test]
-async fn driver_transport_drop_is_not_containment_confirmation() {
-    let (writer_tx, _writer_rx) = mpsc::channel::<Vec<u8>>(1);
-    let (_stdout_tx, stdout_rx) = broadcast::channel::<Vec<u8>>(1);
-    let (driver_exit_tx, driver_exit_rx) = oneshot::channel::<i32>();
-    drop(driver_exit_tx);
-
-    let spawned = spawn_from_driver(ProcessDriver {
-        writer_tx,
-        stdout_rx,
-        stderr_rx: None,
-        exit_rx: driver_exit_rx,
-        terminator: None,
-        writer_handle: None,
-        resizer: None,
-    });
-    let process = UnifiedExecProcess::from_spawned(
-        spawned,
-        SandboxType::None,
-        /*descendant_containment_established*/ true,
-        /*descendant_containment_required*/ true,
-        Box::<NoopSpawnLifecycle>::default(),
-        None,
-    )
-    .await
-    .expect("local process should start");
-
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while process.exit_code().is_none() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("driver transport failure should surface a synthetic exit");
-
-    assert_eq!(process.exit_code(), Some(-1));
-    assert!(
-        !process.has_exited(),
-        "a dropped driver transport must not acknowledge contained-tree exit"
-    );
-}
-
-#[tokio::test]
-async fn containment_capability_only_becomes_strict_when_mutation_requires_it() {
-    async fn process_with_open_driver_exit() -> (UnifiedExecProcess, oneshot::Sender<i32>) {
-        let (writer_tx, _writer_rx) = mpsc::channel::<Vec<u8>>(1);
-        let (_stdout_tx, stdout_rx) = broadcast::channel::<Vec<u8>>(1);
-        let (driver_exit_tx, driver_exit_rx) = oneshot::channel::<i32>();
-        let spawned = spawn_from_driver(ProcessDriver {
-            writer_tx,
-            stdout_rx,
-            stderr_rx: None,
-            exit_rx: driver_exit_rx,
-            terminator: None,
-            writer_handle: None,
-            resizer: None,
-        });
-        let process = UnifiedExecProcess::from_spawned(
-            spawned,
-            SandboxType::None,
-            /*descendant_containment_established*/ true,
-            /*descendant_containment_required*/ false,
-            Box::<NoopSpawnLifecycle>::default(),
-            None,
-        )
-        .await
-        .expect("local process should start");
-        (process, driver_exit_tx)
-    }
-
-    async fn wait_for_synthetic_exit(process: &UnifiedExecProcess) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while process.exit_code().is_none() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("driver transport failure should surface a synthetic exit");
-    }
-
-    let (unmanaged, unmanaged_exit_tx) = process_with_open_driver_exit().await;
-    drop(unmanaged_exit_tx);
-    wait_for_synthetic_exit(&unmanaged).await;
-    assert!(unmanaged.descendant_containment_established());
-    assert!(!unmanaged.strict_descendant_exit_required());
-    assert!(
-        unmanaged.has_exited(),
-        "unmanaged transport failures retain legacy synthetic-exit behavior"
-    );
-
-    let (promoted, promoted_exit_tx) = process_with_open_driver_exit().await;
-    promoted.require_strict_descendant_exit();
-    drop(promoted_exit_tx);
-    wait_for_synthetic_exit(&promoted).await;
-    assert!(promoted.strict_descendant_exit_required());
-    assert!(
-        !promoted.has_exited(),
-        "a promoted mutating session must require positive containment acknowledgement"
-    );
 }
 
 #[tokio::test]

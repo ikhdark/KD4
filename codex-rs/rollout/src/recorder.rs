@@ -19,7 +19,6 @@ use codex_protocol::ThreadId;
 use codex_protocol::capabilities::SelectedCapabilityRoot;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::BaseInstructions;
-use codex_protocol::models::ResponseItem;
 use serde_json::Value;
 use time::OffsetDateTime;
 use time::format_description::FormatItem;
@@ -950,13 +949,10 @@ impl RolloutRecorder {
                 continue;
             }
 
-            let local_tool_output_statuses = take_local_tool_output_statuses(&mut v);
-
             // Parse the rollout line structure
             match serde_json::from_value::<RolloutLine>(v.clone()) {
                 Ok(rollout_line) => {
-                    let mut item = rollout_line.item;
-                    restore_local_tool_output_statuses(&mut item, &local_tool_output_statuses);
+                    let item = rollout_line.item;
                     // Use the FIRST SessionMeta encountered in the file as the canonical
                     // thread id and main session information. Keep all items intact.
                     if thread_id.is_none()
@@ -1836,123 +1832,6 @@ struct RolloutLineRef<'a> {
     timestamp: String,
     #[serde(flatten)]
     item: &'a RolloutItem,
-    #[serde(
-        rename = "_local_tool_output_status",
-        skip_serializing_if = "Vec::is_empty"
-    )]
-    local_tool_output_statuses: Vec<LocalToolOutputStatus>,
-}
-
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-struct LocalToolOutputStatus {
-    call_id: String,
-    success: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    output_index: Option<usize>,
-}
-
-const LOCAL_TOOL_OUTPUT_STATUS_FIELD: &str = "_local_tool_output_status";
-
-fn collect_local_tool_output_statuses(item: &RolloutItem) -> Vec<LocalToolOutputStatus> {
-    fn collect_response_item(
-        item: &ResponseItem,
-        statuses: &mut Vec<LocalToolOutputStatus>,
-        output_index: &mut usize,
-    ) {
-        match item {
-            ResponseItem::FunctionCallOutput {
-                call_id, output, ..
-            }
-            | ResponseItem::CustomToolCallOutput {
-                call_id, output, ..
-            } => {
-                let current_output_index = *output_index;
-                *output_index = output_index.saturating_add(1);
-                if let Some(success) = output.success {
-                    statuses.push(LocalToolOutputStatus {
-                        call_id: call_id.clone(),
-                        success,
-                        output_index: Some(current_output_index),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut statuses = Vec::new();
-    let mut output_index = 0;
-    match item {
-        RolloutItem::ResponseItem(item) => {
-            collect_response_item(item, &mut statuses, &mut output_index);
-        }
-        RolloutItem::Compacted(compacted) => {
-            if let Some(history) = compacted.replacement_history.as_ref() {
-                for item in history {
-                    collect_response_item(item, &mut statuses, &mut output_index);
-                }
-            }
-        }
-        _ => {}
-    }
-    statuses
-}
-
-fn take_local_tool_output_statuses(value: &mut Value) -> Vec<LocalToolOutputStatus> {
-    value
-        .as_object_mut()
-        .and_then(|fields| fields.remove(LOCAL_TOOL_OUTPUT_STATUS_FIELD))
-        .and_then(|statuses| serde_json::from_value(statuses).ok())
-        .unwrap_or_default()
-}
-
-fn restore_local_tool_output_statuses(item: &mut RolloutItem, statuses: &[LocalToolOutputStatus]) {
-    fn restore_response_item(
-        item: &mut ResponseItem,
-        statuses: &[LocalToolOutputStatus],
-        output_index: &mut usize,
-    ) {
-        let (call_id, output) = match item {
-            ResponseItem::FunctionCallOutput {
-                call_id, output, ..
-            }
-            | ResponseItem::CustomToolCallOutput {
-                call_id, output, ..
-            } => (call_id, output),
-            _ => return,
-        };
-        let current_output_index = *output_index;
-        *output_index = output_index.saturating_add(1);
-        if output.success.is_none()
-            && let Some(status) = statuses
-                .iter()
-                .find(|status| {
-                    status.output_index == Some(current_output_index) && status.call_id == *call_id
-                })
-                .or_else(|| {
-                    statuses
-                        .iter()
-                        .find(|status| status.output_index.is_none() && status.call_id == *call_id)
-                })
-        {
-            output.success = Some(status.success);
-        }
-    }
-
-    let mut output_index = 0;
-    match item {
-        RolloutItem::ResponseItem(item) => {
-            restore_response_item(item, statuses, &mut output_index);
-        }
-        RolloutItem::Compacted(compacted) => {
-            if let Some(history) = compacted.replacement_history.as_mut() {
-                for item in history {
-                    restore_response_item(item, statuses, &mut output_index);
-                }
-            }
-        }
-        _ => {}
-    }
 }
 
 impl JsonlWriter {
@@ -1967,7 +1846,6 @@ impl JsonlWriter {
         let line = RolloutLineRef {
             timestamp,
             item: rollout_item,
-            local_tool_output_statuses: collect_local_tool_output_statuses(rollout_item),
         };
         self.write_line(&line).await
     }

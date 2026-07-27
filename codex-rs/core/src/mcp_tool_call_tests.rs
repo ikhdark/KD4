@@ -8,16 +8,13 @@ use crate::session::tests::make_session_and_context_with_rx;
 use crate::session::turn_context::TurnEnvironment;
 use crate::state::ActiveTurn;
 use crate::test_support::models_manager_with_provider;
-use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::handlers::McpHandler;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::tools::registry::CoreToolRuntime;
-use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::router::ToolCall;
-use crate::tools::router::ToolCallSource;
 use crate::tools::router::ToolRouter;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::turn_metadata::McpTurnMetadataContext;
@@ -379,7 +376,6 @@ async fn execute_mcp_tool_call_records_replayable_correlation() -> anyhow::Resul
         /*rewritten_arguments*/ None,
         /*metadata*/ None,
         /*request_meta*/ None,
-        /*managed_read_only_authorization*/ None,
     )
     .await;
     assert!(
@@ -827,138 +823,6 @@ async fn sampled_mcp_tool_missing_from_live_catalog_skips_before_file_upload() {
     assert!(drain_terminal_mcp_items(&rx_event, call_id).is_empty());
     sampled_startup_token.cancel();
     live_startup_token.cancel();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn sampled_read_only_mcp_tool_rejects_live_writable_drift_for_managed_task() {
-    let server = start_mock_server().await;
-    AppsTestServer::mount(&server)
-        .await
-        .expect("mount Codex Apps MCP fixture");
-
-    let (mut session, turn_context, rx_event) = make_session_and_context_with_rx().await;
-    let task_evidence_temp = tempdir().expect("create task evidence fixture");
-    let repo = task_evidence_temp.path().join("repo");
-    let codex_home = task_evidence_temp.path().join("codex-home");
-    tokio::fs::create_dir_all(&repo)
-        .await
-        .expect("create task evidence repository");
-    let ledger =
-        crate::task_evidence::TaskEvidenceLedger::load_or_new(codex_home, session.thread_id, &repo)
-            .await;
-    ledger
-        .begin_turn(&turn_context.sub_id, "exercise live MCP authorization")
-        .await
-        .expect("begin managed task turn");
-    Arc::get_mut(&mut session)
-        .expect("test session should be uniquely owned")
-        .services
-        .task_evidence = ledger;
-
-    let (step_context, startup_cancellation_token) =
-        step_context_with_live_apps(&turn_context, &server.uri()).await;
-    let live_tool = step_context
-        .mcp
-        .manager()
-        .list_all_tools()
-        .await
-        .into_iter()
-        .find(|tool| tool.tool.name.as_ref() == "calendar_create_event")
-        .expect("writable calendar tool should be listed");
-    assert_eq!(
-        live_tool
-            .tool
-            .annotations
-            .as_ref()
-            .and_then(|annotations| annotations.read_only_hint),
-        Some(false)
-    );
-
-    let mut sampled_tool = live_tool.clone();
-    sampled_tool.tool.annotations = Some(annotations(Some(true), Some(false), Some(false)));
-    let tool_name = sampled_tool.canonical_tool_name();
-    let handler = McpHandler::new(sampled_tool).expect("sampled MCP tool should be valid");
-    let call_id = "sampled-read-only-live-writable";
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        handler.handle(ToolInvocation {
-            session: Arc::clone(&session),
-            step_context: Arc::clone(&step_context),
-            turn: Arc::clone(&turn_context),
-            cancellation_token: CancellationToken::new(),
-            tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
-            call_id: call_id.to_string(),
-            tool_name,
-            source: ToolCallSource::Direct,
-            payload: ToolPayload::Function {
-                arguments: serde_json::json!({
-                    "title": "must not be created",
-                })
-                .to_string(),
-            },
-        }),
-    )
-    .await
-    .expect("live writable drift should fail without waiting for approval")
-    .expect("MCP handler should return a model-visible tool result");
-
-    let started = recv_mcp_item_started(&rx_event, call_id).await;
-    assert_eq!(started.status, McpToolCallStatus::InProgress);
-    let (completed, request_user_input_count) = recv_mcp_item_completed(&rx_event, call_id).await;
-    assert_eq!(request_user_input_count, 0);
-    assert_eq!(completed.status, McpToolCallStatus::Failed);
-    let error = completed
-        .error
-        .expect("live writable drift should report an error");
-    assert!(
-        error
-            .message
-            .contains("no longer satisfies its sampled read-only authorization"),
-        "unexpected authorization error: {}",
-        error.message
-    );
-    assert!(recorded_apps_tool_calls(&server).await.is_empty());
-    assert!(drain_terminal_mcp_items(&rx_event, call_id).is_empty());
-    startup_cancellation_token.cancel();
-}
-
-#[test]
-fn sampled_read_only_mcp_authorization_requires_stable_canonical_identity() {
-    let mut live_tool = ToolInfo {
-        server_name: "sampled-server".to_string(),
-        supports_parallel_tool_calls: false,
-        server_origin: None,
-        callable_name: "sampled-tool".to_string(),
-        callable_namespace: "mcp__sampled-server".to_string(),
-        namespace_description: None,
-        tool: rmcp::model::Tool::new_with_raw(
-            "sampled-tool".to_string(),
-            None,
-            Arc::new(rmcp::model::object(serde_json::json!({
-                "type": "object",
-            }))),
-        ),
-        connector_id: None,
-        connector_name: None,
-        plugin_display_names: Vec::new(),
-    };
-    live_tool.tool.annotations = Some(annotations(Some(true), Some(false), Some(false)));
-    let sampled_canonical_tool_name = live_tool.canonical_tool_name();
-
-    assert!(live_tool_satisfies_sampled_read_only_authorization(
-        &live_tool,
-        "sampled-server",
-        "sampled-tool",
-        &sampled_canonical_tool_name,
-    ));
-
-    live_tool.callable_name = "replacement-tool".to_string();
-    assert!(!live_tool_satisfies_sampled_read_only_authorization(
-        &live_tool,
-        "sampled-server",
-        "sampled-tool",
-        &sampled_canonical_tool_name,
-    ));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -12,7 +12,7 @@ pub(crate) fn create_wait_tool() -> ToolSpec {
         (
             "yield_time_ms".to_string(),
             JsonSchema::number(Some(
-                "Wait before yielding more output. If omitted, Codex uses the configured waiting policy (run-to-completion by default).".to_string(),
+                "Wait before yielding more output. Defaults to 10000 ms.".to_string(),
             )),
         ),
         (
@@ -90,7 +90,7 @@ mod tests {
                         (
                             "yield_time_ms".to_string(),
                             JsonSchema::number(Some(
-                                "Wait before yielding more output. If omitted, Codex uses the configured waiting policy (run-to-completion by default)."
+                                "Wait before yielding more output. Defaults to 10000 ms."
                                     .to_string(),
                             )),
                         ),
