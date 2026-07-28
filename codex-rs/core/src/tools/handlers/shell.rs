@@ -436,12 +436,7 @@ async fn run_exec_like_with_exit_code_inner(
     }
     let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
     let model_projection = out.as_ref().ok().map(|output| {
-        crate::tools::project_exec_output_text_with_budget(
-            output,
-            turn.model_info.truncation_policy.into(),
-            /*requested_limit*/ None,
-            Some(req.hook_command.as_str()),
-        )
+        crate::tools::project_exec_output_text(output, turn.model_info.truncation_policy.into())
     });
     let post_tool_use_response = model_projection
         .as_ref()

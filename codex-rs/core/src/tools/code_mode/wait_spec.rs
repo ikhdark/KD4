@@ -1,7 +1,6 @@
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
-use codex_utils_output_truncation::adaptive_output_budget_description;
 use std::collections::BTreeMap;
 
 pub(crate) fn create_wait_tool() -> ToolSpec {
@@ -18,10 +17,9 @@ pub(crate) fn create_wait_tool() -> ToolSpec {
         ),
         (
             "max_tokens".to_string(),
-            JsonSchema::number(Some(format!(
-                "Output token budget for this wait call. {}.",
-                adaptive_output_budget_description()
-            ))),
+            JsonSchema::number(Some(
+                "Output token budget for this wait call. Defaults adaptively to 4000 tokens for success, 8000 for failure/timeout, and up to 10000 for high-signal diagnostics.".to_string(),
+            )),
         ),
         (
             "terminate".to_string(),

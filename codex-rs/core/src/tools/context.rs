@@ -12,6 +12,8 @@ use crate::tools::command_output_artifact::ToolOutputArtifactId;
 use crate::tools::shell_output_summary::ShellOutputSummaryOptions;
 use crate::tools::shell_output_summary::summarize_shell_output_for_model;
 use crate::turn_diff_tracker::TurnDiffTracker;
+use crate::unified_exec::OutputBudgetClass;
+use crate::unified_exec::resolve_adaptive_max_tokens;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::FunctionCallOutputContentItem;
@@ -20,13 +22,8 @@ use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::function_call_output_content_items_to_text;
 use codex_tools::LoadableToolSpec;
 use codex_tools::ToolName;
-use codex_utils_output_truncation::OutputLimitResolution;
-use codex_utils_output_truncation::OutputOutcome;
-use codex_utils_output_truncation::TruncationMetadata;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text;
-use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
-use codex_utils_output_truncation::resolve_output_limits;
 use codex_utils_string::take_bytes_at_char_boundary;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -430,19 +427,20 @@ impl ToolOutput for ExecCommandToolOutput {
 }
 
 impl ExecCommandToolOutput {
-    fn model_output_limits(&self, raw_output: &str) -> OutputLimitResolution {
-        resolve_output_limits(
-            self.max_output_tokens,
-            OutputOutcome::from_exit_status(self.exit_code, self.process_id.is_some()),
-            self.hook_command.as_deref(),
-            raw_output,
-            self.truncation_policy.token_budget(),
-        )
-    }
-
     fn model_output_max_tokens(&self) -> usize {
         let raw = String::from_utf8_lossy(&self.raw_output);
-        self.model_output_limits(raw.as_ref()).applied_limit
+        let class = if self.process_id.is_some() || self.exit_code != Some(0) {
+            OutputBudgetClass::FailureOrTimeout
+        } else {
+            OutputBudgetClass::Success
+        };
+        resolve_adaptive_max_tokens(
+            self.max_output_tokens,
+            class,
+            self.hook_command.as_deref(),
+            raw.as_ref(),
+        )
+        .min(self.truncation_policy.token_budget())
     }
 
     pub(crate) fn truncated_output(&self, max_tokens: usize) -> String {
@@ -466,9 +464,9 @@ impl ExecCommandToolOutput {
             _ => None,
         };
         let content = summarized.as_deref().unwrap_or(raw.as_ref());
-        let truncated = formatted_truncate_text_with_output_limit(
+        let text = formatted_truncate_text(
             content,
-            self.model_output_limits(raw.as_ref()),
+            TruncationPolicy::Tokens(self.model_output_max_tokens()),
         );
         let artifact_has_more_bytes = self
             .raw_output_artifact
@@ -476,17 +474,14 @@ impl ExecCommandToolOutput {
             .and_then(RawOutputArtifact::retained_bytes)
             .is_some_and(|bytes| bytes > self.raw_output.len() as u64);
         ProjectedModelOutput {
-            reduced: summarized.is_some()
-                || truncated.metadata.is_truncated()
-                || artifact_has_more_bytes,
-            text: truncated.text,
-            truncation_metadata: truncated.metadata,
+            reduced: summarized.is_some() || text != content || artifact_has_more_bytes,
+            text,
         }
     }
 
     fn output_with_reduction_notice(&self, projected: ProjectedModelOutput) -> String {
         let mut output = projected.text;
-        if (projected.reduced || projected.truncation_metadata.is_truncated())
+        if projected.reduced
             && let Some(notice) = self
                 .raw_output_artifact
                 .as_ref()
@@ -540,7 +535,6 @@ impl ExecCommandToolOutput {
 struct ProjectedModelOutput {
     text: String,
     reduced: bool,
-    truncation_metadata: TruncationMetadata,
 }
 
 fn function_tool_response(

@@ -73,9 +73,11 @@ pub(crate) const WINDOWS_INITIAL_EXEC_YIELD_TIME_FLOOR_MS: u64 = 2_000;
 pub(crate) const MIN_EMPTY_YIELD_TIME_MS: u64 = 5_000;
 pub(crate) const MAX_YIELD_TIME_MS: u64 = 30_000;
 pub(crate) const DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS: u64 = 300_000;
+pub(crate) const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 10_000;
+pub(crate) const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 10_000;
+pub(crate) const ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS: usize = 10_000;
 #[cfg(all(test, unix))]
-pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize =
-    codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS;
+pub(crate) const DEFAULT_MAX_OUTPUT_TOKENS: usize = DEFAULT_SUCCESS_OUTPUT_TOKENS;
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024; // 1 MiB
 pub(crate) const UNIFIED_EXEC_OUTPUT_MAX_TOKENS: usize = UNIFIED_EXEC_OUTPUT_MAX_BYTES / 4;
 pub(crate) const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
@@ -250,6 +252,73 @@ pub(crate) fn clamp_yield_time_for_readiness(yield_time_ms: u64, executor_ready:
         yield_time_ms
     };
     yield_time_ms.clamp(MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputBudgetClass {
+    Success,
+    FailureOrTimeout,
+}
+
+pub(crate) fn resolve_adaptive_max_tokens(
+    max_tokens: Option<usize>,
+    class: OutputBudgetClass,
+    command_text: Option<&str>,
+    output_text: &str,
+) -> usize {
+    if let Some(max_tokens) = max_tokens {
+        return max_tokens;
+    }
+    if !crate::latency_switches::stage4_output_budget_enabled() {
+        return ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS;
+    }
+    if is_high_signal_diagnostic(command_text, output_text) {
+        return ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS;
+    }
+    match class {
+        OutputBudgetClass::Success => DEFAULT_SUCCESS_OUTPUT_TOKENS,
+        OutputBudgetClass::FailureOrTimeout => DEFAULT_FAILURE_OUTPUT_TOKENS,
+    }
+}
+
+fn is_high_signal_diagnostic(command_text: Option<&str>, output_text: &str) -> bool {
+    let command = command_text.unwrap_or_default().to_ascii_lowercase();
+    let diagnostic_command = [
+        "cargo check",
+        "cargo test",
+        "cargo nextest",
+        "cargo clippy",
+        "rustc ",
+        "pytest",
+        "python -m unittest",
+        "npm test",
+        "npm run test",
+        "pnpm test",
+        "yarn test",
+        "dotnet test",
+        "go test",
+        "just test",
+        "just check",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle));
+    if diagnostic_command {
+        return true;
+    }
+
+    let output = output_text.to_ascii_lowercase();
+    [
+        "stack backtrace:",
+        "traceback (most recent call last):",
+        "thread 'main' panicked at",
+        "error[e",
+        "test result: failed",
+        "failures:",
+        "compiler error",
+        "caused by:",
+    ]
+    .iter()
+    .any(|needle| output.contains(needle))
 }
 
 pub(crate) fn generate_chunk_id() -> String {

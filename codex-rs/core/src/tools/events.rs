@@ -435,23 +435,7 @@ impl ToolEmitter {
         output: &ExecToolCallOutput,
         ctx: ToolEventCtx<'_>,
     ) -> String {
-        let truncation_policy = ctx.turn.model_info.truncation_policy.into();
-        match self {
-            Self::Shell { command, .. } | Self::UnifiedExec { command, .. } => {
-                let command_text = command.join(" ");
-                let projected = super::project_exec_output_for_model_with_budget(
-                    output,
-                    truncation_policy,
-                    /*requested_limit*/ None,
-                    Some(&command_text),
-                );
-                debug_assert!(!projected.truncation_metadata.is_truncated() || projected.reduced);
-                projected.text
-            }
-            Self::ApplyPatch { .. } => {
-                super::format_exec_output_for_model(output, truncation_policy)
-            }
-        }
+        super::format_exec_output_for_model(output, ctx.turn.model_info.truncation_policy.into())
     }
 
     pub async fn finish(
