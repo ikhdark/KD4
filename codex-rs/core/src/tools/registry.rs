@@ -56,6 +56,32 @@ pub use codex_tools::ToolExposure;
 /// Implementers provide the shared `ToolExecutor` behavior plus optional
 /// core-owned metadata for hooks, telemetry, tool search, and argument diffs.
 pub(crate) trait CoreToolRuntime: ToolExecutor<ToolInvocation> {
+    fn task_evidence_read_only(&self) -> bool {
+        matches!(
+            self.tool_name().name.as_str(),
+            "current_time"
+                | "get_context_remaining"
+                | "list_agents"
+                | "get_agent_task"
+                | "list_available_plugins_to_install"
+                | "list_mcp_resources"
+                | "list_mcp_resource_templates"
+                | "read_file_span"
+                | "read_mcp_resource"
+                | "read_tool_output"
+                | "request_user_input"
+                | "search_source"
+                | "sleep"
+                | "test_sync"
+                | "tool_search"
+                | "update_plan"
+                | "view_image"
+                | "wait"
+                | "wait_agent"
+                | "wait_for_environment"
+        )
+    }
+
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         ToolExecutionTiming::Handler
     }
@@ -507,9 +533,35 @@ impl ToolRegistry {
             return Err(err);
         }
 
+        let review_delegate = matches!(
+            &invocation.turn.session_source,
+            codex_protocol::protocol::SessionSource::SubAgent(
+                codex_protocol::protocol::SubAgentSource::Review
+            )
+        );
+        let _task_mutation_guard = invocation
+            .session
+            .services
+            .task_evidence
+            .reserve_tool_dispatch(
+                &tool_name,
+                &invocation.turn.sub_id,
+                tool.task_evidence_read_only(),
+                review_delegate,
+            )
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
+        let hooks_allowed = _task_mutation_guard.is_some()
+            || !invocation
+                .session
+                .services
+                .task_evidence
+                .allows_kd4_completion();
+
         notify_tool_start(&invocation).await;
 
-        if let Some(pre_tool_use_payload) = tool.pre_tool_use_payload(&invocation) {
+        if hooks_allowed && let Some(pre_tool_use_payload) = tool.pre_tool_use_payload(&invocation)
+        {
             match run_pre_tool_use_hooks(
                 &invocation.session,
                 &invocation.turn,
@@ -597,22 +649,23 @@ impl ToolRegistry {
         } else {
             None
         };
-        let post_tool_use_outcome = if let Some(post_tool_use_payload) = post_tool_use_payload {
-            Some(
-                run_post_tool_use_hooks(
-                    &invocation.session,
-                    &invocation.turn,
-                    post_tool_use_payload.tool_use_id,
-                    post_tool_use_payload.tool_name.name().to_string(),
-                    post_tool_use_payload.tool_name.matcher_aliases().to_vec(),
-                    post_tool_use_payload.tool_input,
-                    post_tool_use_payload.tool_response,
+        let post_tool_use_outcome =
+            if hooks_allowed && let Some(post_tool_use_payload) = post_tool_use_payload {
+                Some(
+                    run_post_tool_use_hooks(
+                        &invocation.session,
+                        &invocation.turn,
+                        post_tool_use_payload.tool_use_id,
+                        post_tool_use_payload.tool_name.name().to_string(),
+                        post_tool_use_payload.tool_name.matcher_aliases().to_vec(),
+                        post_tool_use_payload.tool_input,
+                        post_tool_use_payload.tool_response,
+                    )
+                    .await,
                 )
-                .await,
-            )
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         if let Some(outcome) = &post_tool_use_outcome {
             record_additional_contexts(
                 &invocation.session,

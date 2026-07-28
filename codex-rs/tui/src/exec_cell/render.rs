@@ -998,12 +998,12 @@ mod tests {
         let command = vec![
             "powershell.exe".into(),
             "-Command".into(),
-            r"& 'C:\Users\Alice\private\kds.exe' --agent -- cargo test".into(),
+            r"& 'C:\Users\Alice\private\diagnostic.exe' --agent -- cargo test".into(),
         ];
         let call = ExecCall {
             call_id: "call-id".to_string(),
             command: command.clone(),
-            display_label: Some("KDWireGuard -".to_string()),
+            display_label: Some("Diagnostic -".to_string()),
             parsed: vec![ParsedCommand::Search {
                 cmd: "rg display_label".to_string(),
                 query: Some("display_label".to_string()),
@@ -1033,10 +1033,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert_eq!(rendered[0], "• Ran KDWireGuard -");
+        assert_eq!(rendered[0], "• Ran Diagnostic -");
         assert_eq!(cell.calls[0].command, command);
         assert!(!rendered[0].contains("Alice"));
-        assert!(expanded.contains(r"C:\Users\Alice\private\kds.exe"));
+        assert!(expanded.contains("diagnostic.exe"));
         assert!(expanded.contains("--agent -- cargo test"));
     }
 

@@ -2,7 +2,6 @@ use crate::function_tool::FunctionCallError;
 use crate::task_evidence::ClosureSubmission;
 use crate::task_evidence::InvestigationCheckpoint;
 use crate::task_evidence::TaskClassification;
-use crate::task_evidence::TaskPhase;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
@@ -84,7 +83,7 @@ impl ToolExecutor<ToolInvocation> for TaskStateHandler {
             };
             let args: TaskStateArgs = parse_arguments(arguments)?;
             let review_delegate = matches!(
-                invocation.turn.session_source,
+                &invocation.turn.session_source,
                 codex_protocol::protocol::SessionSource::SubAgent(
                     codex_protocol::protocol::SubAgentSource::Review
                 )
@@ -101,40 +100,7 @@ impl ToolExecutor<ToolInvocation> for TaskStateHandler {
                 TaskStateArgs::SubmitInvestigationCheckpoint { checkpoint } => {
                     ledger.submit_investigation_checkpoint(checkpoint).await
                 }
-                TaskStateArgs::SubmitClosure { closure } => {
-                    let descendant_seal = if ledger
-                        .inspect_status()
-                        .await
-                        .is_some_and(|status| status.phase == TaskPhase::Fixing)
-                    {
-                        Some(
-                            invocation
-                                .session
-                                .services
-                                .agent_control
-                                .seal_descendants_for_task_closure(
-                                    invocation.session.thread_id(),
-                                    invocation.turn.config.codex_home.as_path(),
-                                )
-                                .await
-                                .map_err(|err| {
-                                    FunctionCallError::RespondToModel(format!(
-                                        "could not quiesce descendant agents for closure: {err}"
-                                    ))
-                                })?,
-                        )
-                    } else {
-                        None
-                    };
-                    if let Some(descendant_seal) = descendant_seal.as_ref() {
-                        ledger
-                            .merge_descendant_coverage(descendant_seal.descendant_evidence())
-                            .await
-                            .map_err(FunctionCallError::RespondToModel)?;
-                    }
-                    let _descendant_seal = descendant_seal;
-                    ledger.submit_closure(closure).await
-                }
+                TaskStateArgs::SubmitClosure { closure } => ledger.submit_closure(closure).await,
                 TaskStateArgs::InspectStatus => ledger
                     .inspect_status()
                     .await

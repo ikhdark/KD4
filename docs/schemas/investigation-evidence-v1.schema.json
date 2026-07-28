@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://openai.local/kd4/investigation-evidence-v1.schema.json",
   "title": "Investigation evidence result version 1",
-  "description": "Common evidence envelope for KDS, KDWG, and Repo Atlas provider results.",
+  "description": "Common evidence envelope for external provider results.",
   "type": "object",
   "required": [
     "evidenceMeta"
@@ -32,11 +32,9 @@
           "const": 1
         },
         "producer": {
-          "enum": [
-            "kds",
-            "kdwg",
-            "repo-atlas"
-          ]
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
         },
         "operation": {
           "type": "string",

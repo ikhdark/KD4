@@ -196,6 +196,15 @@ impl McpHandler {
 }
 
 impl CoreToolRuntime for McpHandler {
+    fn task_evidence_read_only(&self) -> bool {
+        self.tool_info
+            .tool
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint)
+            .unwrap_or(false)
+    }
+
     fn waits_for_runtime_cancellation(&self) -> bool {
         true
     }

@@ -29,6 +29,7 @@ use crate::tools::handlers::SearchSourceHandler;
 use crate::tools::handlers::ShellCommandHandler;
 use crate::tools::handlers::ShellCommandHandlerOptions;
 use crate::tools::handlers::SleepHandler;
+use crate::tools::handlers::TaskStateHandler;
 use crate::tools::handlers::TestSyncHandler;
 use crate::tools::handlers::ToolSearchHandlerCache;
 use crate::tools::handlers::ViewImageHandler;
@@ -725,6 +726,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
 
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
         planned_tools.add(PlanHandler);
+        planned_tools.add(TaskStateHandler);
     }
 
     if crate::tools::handlers::VerifyLocalHandler::is_available_for_step(context.step_context) {

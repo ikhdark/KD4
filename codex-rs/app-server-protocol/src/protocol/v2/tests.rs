@@ -2646,7 +2646,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         id: "exec-1".to_string(),
         process_id: Some("pid-1".to_string()),
         command: vec!["echo".to_string(), "done".to_string()],
-        display_label: Some("KDWireGuard -".to_string()),
+        display_label: Some("Diagnostic -".to_string()),
         cwd: PathUri::from_abs_path(&test_path_buf("/tmp").abs()),
         parsed_cmd: vec![codex_protocol::parse_command::ParsedCommand::Unknown {
             cmd: "echo done".to_string(),
@@ -2667,7 +2667,7 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         ThreadItem::CommandExecution {
             id: "exec-1".to_string(),
             command: "echo done".to_string(),
-            display_label: Some("KDWireGuard -".to_string()),
+            display_label: Some("Diagnostic -".to_string()),
             cwd: LegacyAppPathString::from_abs_path(&test_path_buf("/tmp").abs()),
             process_id: Some("pid-1".to_string()),
             source: CommandExecutionSource::Agent,

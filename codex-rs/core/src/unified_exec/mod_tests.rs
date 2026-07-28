@@ -320,6 +320,7 @@ async fn write_stdin(
             yield_time_ms,
             max_output_tokens: None,
             truncation_policy: TruncationPolicy::Tokens(10_000),
+            mutation_guard: None,
         })
         .await
 }

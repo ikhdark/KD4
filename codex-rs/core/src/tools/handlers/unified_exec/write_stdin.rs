@@ -71,6 +71,25 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        let task_mutation_guard = if args.chars.is_empty() {
+            None
+        } else {
+            session
+                .services
+                .task_evidence
+                .guard_named_mutation(
+                    "normalized_shell_mutation",
+                    &turn.sub_id,
+                    matches!(
+                        &turn.session_source,
+                        codex_protocol::protocol::SessionSource::SubAgent(
+                            codex_protocol::protocol::SubAgentSource::Review
+                        )
+                    ),
+                )
+                .await
+                .map_err(FunctionCallError::RespondToModel)?
+        };
         let mut response = session
             .services
             .unified_exec_manager
@@ -80,6 +99,7 @@ impl WriteStdinHandler {
                 yield_time_ms: args.yield_time_ms,
                 max_output_tokens: args.max_output_tokens,
                 truncation_policy: turn.model_info.truncation_policy.into(),
+                mutation_guard: task_mutation_guard,
             })
             .await
             .map_err(|err| {
@@ -133,6 +153,12 @@ impl WriteStdinHandler {
 }
 
 impl CoreToolRuntime for WriteStdinHandler {
+    fn waits_for_runtime_cancellation(&self) -> bool {
+        // Let a non-empty write finish transferring mutation authority to the
+        // existing process before cancellation returns control to the runtime.
+        true
+    }
+
     fn matches_kind(&self, payload: &ToolPayload) -> bool {
         matches!(payload, ToolPayload::Function { .. })
     }

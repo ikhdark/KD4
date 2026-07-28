@@ -144,7 +144,7 @@ pub(crate) async fn execute_user_shell_command(
     // We do not source rc files or otherwise reformat the script.
     let use_login_shell = true;
     let display_command = environment_shell.derive_exec_args(&command, use_login_shell);
-    let display_label = crate::tools::command_display_label::for_command(&display_command);
+    let display_label: Option<String> = None;
     // TODO(anp): Migrate user-shell events and execution plumbing to PathUri so this local-only
     // feature does not need to project the selected environment cwd onto the Codex host.
     let Ok(cwd) = turn_environment.cwd().to_abs_path() else {

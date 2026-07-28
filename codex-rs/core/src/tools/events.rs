@@ -208,13 +208,12 @@ impl ToolEmitter {
         environment_id: String,
     ) -> Self {
         let parsed_cmd = parse_command(&command);
-        let display_label = crate::tools::command_display_label::for_command(&command);
         Self::Shell {
             command,
             cwd: PathUri::from_abs_path(&cwd),
             source,
             parsed_cmd,
-            display_label,
+            display_label: None,
             environment_id,
         }
     }
@@ -239,13 +238,12 @@ impl ToolEmitter {
         environment_id: String,
     ) -> Self {
         let parsed_cmd = parse_command(command);
-        let display_label = crate::tools::command_display_label::for_command(command);
         Self::UnifiedExec {
             command: command.to_vec(),
             cwd,
             source,
             parsed_cmd,
-            display_label,
+            display_label: None,
             process_id,
             environment_id,
         }

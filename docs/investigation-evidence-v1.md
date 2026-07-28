@@ -1,17 +1,14 @@
 # Investigation evidence metadata version 1
 
 This document is the semantic source of truth for the common evidence envelope
-emitted by KDS, KDWG, and Repo Atlas. The machine-readable shape is
+emitted by external evidence providers. The machine-readable shape is
 [`schemas/investigation-evidence-v1.schema.json`](schemas/investigation-evidence-v1.schema.json).
 
 The providers remain independent:
 
-- KDS produces compact command-diagnostic evidence. It does not inspect
-  repository source or retain run history.
-- KDWG produces static implementation-wiring evidence. It does not govern task
-  completion or prove runtime behavior.
-- Repo Atlas produces deterministic repository-structure evidence. It does not
-  execute repository code or decide whether something is a bug.
+- Each provider owns its operation-specific evidence and limitations.
+- Implementing this envelope does not grant a provider task-completion,
+  orchestration, or runtime-proof authority.
 - KD4 may retain valid provider evidence, but it does not move task state,
   hypothesis state, completion authority, or cross-provider orchestration into
   a provider.
@@ -25,7 +22,7 @@ version 1. Provider-specific fields remain alongside it.
 {
   "evidenceMeta": {
     "schemaVersion": 1,
-    "producer": "kds | kdwg | repo-atlas",
+    "producer": "provider-id",
     "operation": "provider operation name",
     "evidenceBearing": true,
     "payloadCompleteness": "complete | partial | unknown",
@@ -46,7 +43,8 @@ version as version 1 evidence.
 
 ### `producer`
 
-The evidence producer is exactly `kds`, `kdwg`, or `repo-atlas`.
+The evidence producer is a non-blank, provider-owned stable identifier. KD4
+treats it as opaque and does not maintain a provider-name allowlist.
 
 ### `operation`
 
@@ -100,10 +98,6 @@ boilerplate when no material limitation applies.
 
 A provider-owned stable identity for the evidence source, or `null` when no
 snapshot applies.
-
-- KDS uses `null`.
-- KDWG uses its diff fingerprint when available.
-- Repo Atlas uses its index snapshot identity.
 
 ## Structured error results
 
