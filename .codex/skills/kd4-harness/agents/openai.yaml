@@ -1,4 +1,0 @@
-interface:
-  display_name: "KD4 Harness"
-  short_description: "Manage durable KD4 plans, evals, audits, and handoffs"
-  default_prompt: "Use $kd4-harness to create or update the smallest durable KD4 plan, eval, audit, checklist, or handoff needed for this task, while leaving implementation policy to the repository instructions."

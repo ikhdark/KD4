@@ -604,6 +604,7 @@ mod tests {
             command: vec!["pwd".to_string()],
             command_for_approval: vec!["pwd".to_string()],
             raw_output_artifact: RawOutputArtifact::Failed {
+                id: None,
                 message: "test fixture".to_string(),
                 owned_path: None,
                 bytes: 0,
@@ -712,6 +713,7 @@ mod tests {
             command: vec!["zsh".to_string(), "-c".to_string(), "echo hi".to_string()],
             command_for_approval: vec!["zsh".to_string(), "-c".to_string(), "echo hi".to_string()],
             raw_output_artifact: RawOutputArtifact::Failed {
+                id: None,
                 message: "test fixture".to_string(),
                 owned_path: None,
                 bytes: 0,

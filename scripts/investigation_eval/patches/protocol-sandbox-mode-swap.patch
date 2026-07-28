@@ -1,0 +1,18 @@
+diff --git a/investigation_cases/protocol_sandbox_mode_swap.rs b/investigation_cases/protocol_sandbox_mode_swap.rs
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/protocol_sandbox_mode_swap.rs
+@@ -0,0 +1,13 @@
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum SandboxMode {
++    ReadOnly,
++    WorkspaceWrite,
++}
++
++fn decode_sandbox_mode(value: &str) -> Result<SandboxMode, String> {
++    match value {
++        "read-only" => Ok(SandboxMode::WorkspaceWrite),
++        "workspace-write" => Ok(SandboxMode::ReadOnly),
++        _ => Err(format!("unknown sandbox mode: {value}")),
++    }
++}

@@ -1,0 +1,19 @@
+diff --git a/investigation_cases/persistence_receipt_sequence_collision.rs b/investigation_cases/persistence_receipt_sequence_collision.rs
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/persistence_receipt_sequence_collision.rs
+@@ -0,0 +1,14 @@
++#[derive(Clone, Debug)]
++struct Document {
++    version: u32,
++    next_receipt_id: u64,
++    receipt_ids: Vec<u64>,
++}
++
++fn migrate_v1_to_v2(mut document: Document) -> Document {
++    if document.version < 2 {
++        document.next_receipt_id = document.receipt_ids.len() as u64 + 1;
++        document.version = 2;
++    }
++    document
++}

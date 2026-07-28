@@ -7,6 +7,8 @@ use crate::tools::TELEMETRY_PREVIEW_MAX_BYTES;
 use crate::tools::TELEMETRY_PREVIEW_MAX_LINES;
 use crate::tools::TELEMETRY_PREVIEW_TRUNCATION_NOTICE;
 use crate::tools::command_output_artifact::RawOutputArtifact;
+#[cfg(test)]
+use crate::tools::command_output_artifact::ToolOutputArtifactId;
 use crate::tools::shell_output_summary::ShellOutputSummaryOptions;
 use crate::tools::shell_output_summary::summarize_shell_output_for_model;
 use crate::turn_diff_tracker::TurnDiffTracker;
@@ -385,7 +387,7 @@ impl ToolOutput for ExecCommandToolOutput {
             #[serde(skip_serializing_if = "Option::is_none")]
             original_token_count: Option<usize>,
             #[serde(skip_serializing_if = "Option::is_none")]
-            raw_output_artifact: Option<String>,
+            raw_output_artifact_id: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             raw_output_artifact_bytes: Option<u64>,
             #[serde(skip_serializing_if = "Option::is_none")]
@@ -395,26 +397,15 @@ impl ToolOutput for ExecCommandToolOutput {
             output: String,
         }
 
-        let (raw_output_artifact, raw_output_artifact_bytes, raw_output_artifact_error) =
+        let (raw_output_artifact_id, raw_output_artifact_bytes, raw_output_artifact_error) =
             match self.raw_output_artifact.as_ref() {
-                Some(RawOutputArtifact::Stored { path, bytes }) => (
-                    Some(path.to_string_lossy().into_owned()),
-                    Some(*bytes),
-                    None,
-                ),
-                Some(RawOutputArtifact::Failed {
-                    message,
-                    owned_path,
-                    bytes,
-                }) => (
-                    owned_path
-                        .as_ref()
-                        .map(|path| path.to_string_lossy().into_owned()),
-                    owned_path.as_ref().map(|_| *bytes),
-                    Some(message.clone()),
-                ),
+                Some(artifact) => {
+                    let (id, bytes, error) = artifact.model_projection();
+                    (id.map(|id| id.to_string()), bytes, error)
+                }
                 None => (None, None, None),
             };
+        let model_output = self.projected_model_output();
 
         let result = UnifiedExecCodeModeResult {
             chunk_id: (!self.chunk_id.is_empty()).then(|| self.chunk_id.clone()),
@@ -422,11 +413,11 @@ impl ToolOutput for ExecCommandToolOutput {
             exit_code: self.exit_code,
             session_id: self.process_id,
             original_token_count: self.original_token_count,
-            raw_output_artifact,
+            raw_output_artifact_id,
             raw_output_artifact_bytes,
             raw_output_artifact_error,
             repair: self.repair_notice.clone(),
-            output: self.model_output(self.model_output_max_tokens()),
+            output: self.output_with_reduction_notice(model_output),
         };
 
         serde_json::to_value(result).unwrap_or_else(|err| {
@@ -457,7 +448,7 @@ impl ExecCommandToolOutput {
         formatted_truncate_text(&text, TruncationPolicy::Tokens(max_tokens))
     }
 
-    fn model_output(&self, max_tokens: usize) -> String {
+    fn projected_model_output(&self) -> ProjectedModelOutput {
         let raw = String::from_utf8_lossy(&self.raw_output);
         let summarized = match (self.process_id, self.exit_code) {
             (None, Some(exit_code)) => summarize_shell_output_for_model(
@@ -473,7 +464,35 @@ impl ExecCommandToolOutput {
             _ => None,
         };
         let content = summarized.as_deref().unwrap_or(raw.as_ref());
-        formatted_truncate_text(content, TruncationPolicy::Tokens(max_tokens))
+        let text = formatted_truncate_text(
+            content,
+            TruncationPolicy::Tokens(self.model_output_max_tokens()),
+        );
+        let artifact_has_more_bytes = self
+            .raw_output_artifact
+            .as_ref()
+            .and_then(RawOutputArtifact::retained_bytes)
+            .is_some_and(|bytes| bytes > self.raw_output.len() as u64);
+        ProjectedModelOutput {
+            reduced: summarized.is_some() || text != content || artifact_has_more_bytes,
+            text,
+        }
+    }
+
+    fn output_with_reduction_notice(&self, projected: ProjectedModelOutput) -> String {
+        let mut output = projected.text;
+        if projected.reduced
+            && let Some(notice) = self
+                .raw_output_artifact
+                .as_ref()
+                .and_then(RawOutputArtifact::reduction_notice)
+        {
+            if !output.is_empty() {
+                output.push('\n');
+            }
+            output.push_str(&notice);
+        }
+        output
     }
 
     fn response_text(&self) -> String {
@@ -507,10 +526,15 @@ impl ExecCommandToolOutput {
         }
 
         sections.push("Output:".to_string());
-        sections.push(self.model_output(self.model_output_max_tokens()));
+        sections.push(self.output_with_reduction_notice(self.projected_model_output()));
 
         sections.join("\n")
     }
+}
+
+struct ProjectedModelOutput {
+    text: String,
+    reduced: bool,
 }
 
 fn function_tool_response(

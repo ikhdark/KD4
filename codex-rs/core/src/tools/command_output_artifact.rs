@@ -1,5 +1,10 @@
+use std::fmt;
+use std::fs::File;
+use std::io::Read;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -8,7 +13,12 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
 
-fn max_retained_artifacts_per_thread() -> usize {
+const ARTIFACT_EXPIRED_MESSAGE: &str = "artifact expired or does not belong to this thread; rerun the command if the output is still needed";
+const ARTIFACT_WRITING_MESSAGE: &str =
+    "artifact is still being written; retry after the command yields or exits";
+const EVIDENCE_PROTECTION_EXTENSION: &str = "evidence-protected";
+
+pub(crate) fn max_retained_artifacts_per_thread() -> usize {
     128
 }
 
@@ -16,13 +26,38 @@ fn max_retained_artifacts_total() -> usize {
     1_024
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolOutputArtifactId(uuid::Uuid);
+
+impl ToolOutputArtifactId {
+    fn new() -> Self {
+        Self(uuid::Uuid::now_v7())
+    }
+}
+
+impl fmt::Display for ToolOutputArtifactId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl FromStr for ToolOutputArtifactId {
+    type Err = uuid::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        uuid::Uuid::parse_str(value).map(Self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RawOutputArtifact {
     Stored {
+        id: ToolOutputArtifactId,
         path: PathBuf,
         bytes: u64,
     },
     Failed {
+        id: Option<ToolOutputArtifactId>,
         message: String,
         owned_path: Option<PathBuf>,
         bytes: u64,
@@ -39,7 +74,7 @@ impl RawOutputArtifactWriter {
     pub(crate) async fn open(state: Option<&Arc<Mutex<RawOutputArtifact>>>) -> Option<Self> {
         let state = state?;
         let artifact = state.lock().await.clone();
-        let RawOutputArtifact::Stored { path, bytes } = artifact else {
+        let RawOutputArtifact::Stored { path, bytes, .. } = artifact else {
             return Some(Self {
                 path: None,
                 file: None,
@@ -61,6 +96,7 @@ impl RawOutputArtifactWriter {
                 Err(err) => {
                     enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path).await;
                     *state.lock().await = RawOutputArtifact::Failed {
+                        id: artifact_id_from_path(&path),
                         message: format!(
                             "failed to lock `{}` for streaming: {err}",
                             path.display()
@@ -78,6 +114,7 @@ impl RawOutputArtifactWriter {
             Err(err) => {
                 enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path).await;
                 *state.lock().await = RawOutputArtifact::Failed {
+                    id: artifact_id_from_path(&path),
                     message: format!("failed to open `{}` for streaming: {err}", path.display()),
                     owned_path: Some(path.clone()),
                     bytes,
@@ -114,6 +151,7 @@ impl RawOutputArtifactWriter {
         }
         self.bytes = self.bytes.saturating_add(output.len() as u64);
         *state.lock().await = RawOutputArtifact::Stored {
+            id: artifact_id_from_path(&path).expect("artifact path is UUID-backed"),
             path,
             bytes: self.bytes,
         };
@@ -146,6 +184,7 @@ async fn lock_output_file(file: tokio::fs::File) -> std::io::Result<tokio::fs::F
 impl RawOutputArtifact {
     pub(crate) fn unavailable(message: impl Into<String>) -> Self {
         Self::Failed {
+            id: None,
             message: message.into(),
             owned_path: None,
             bytes: 0,
@@ -154,19 +193,47 @@ impl RawOutputArtifact {
 
     pub(crate) fn render_for_model(&self) -> String {
         match self {
-            Self::Stored { path, bytes } => format!(
-                "Raw output artifact: {} ({bytes} bytes retained before model summarization)",
-                path.display()
-            ),
+            Self::Stored { id, bytes, .. } => {
+                format!("Raw output artifact: {id} ({bytes} bytes retained)")
+            }
             Self::Failed {
-                message,
-                owned_path: Some(path),
+                id: Some(id),
                 bytes,
-            } => format!(
-                "Raw output artifact incomplete: {} ({bytes} bytes retained; {message})",
-                path.display()
+                ..
+            } => format!("Raw output artifact {id} unavailable ({bytes} bytes retained)"),
+            Self::Failed { .. } => "Raw output artifact unavailable".to_string(),
+        }
+    }
+
+    pub(crate) fn model_projection(
+        &self,
+    ) -> (Option<ToolOutputArtifactId>, Option<u64>, Option<String>) {
+        match self {
+            Self::Stored { id, bytes, .. } => (Some(*id), Some(*bytes), None),
+            Self::Failed { .. } => (
+                None,
+                None,
+                Some("raw output artifact storage failed".to_string()),
             ),
-            Self::Failed { message, .. } => format!("Raw output artifact unavailable: {message}"),
+        }
+    }
+
+    pub(crate) fn reduction_notice(&self) -> Option<String> {
+        let Self::Stored { id, path, .. } = self else {
+            return None;
+        };
+        if open_regular_artifact(path).is_err() {
+            return None;
+        }
+        Some(format!(
+            "[command output reduced; full retained output is available as artifact {id}.\nUse read_tool_output with that id and a narrow line range.]"
+        ))
+    }
+
+    pub(crate) fn retained_bytes(&self) -> Option<u64> {
+        match self {
+            Self::Stored { bytes, .. } => Some(*bytes),
+            Self::Failed { .. } => None,
         }
     }
 }
@@ -184,7 +251,8 @@ pub(crate) async fn create_raw_output_artifact(
         ));
     }
 
-    let path = directory.join(format!("{}.log", uuid::Uuid::now_v7()));
+    let id = ToolOutputArtifactId::new();
+    let path = directory.join(format!("{id}.log"));
     match tokio::fs::OpenOptions::new()
         .create_new(true)
         .read(true)
@@ -225,6 +293,7 @@ pub(crate) async fn create_raw_output_artifact(
             drop(file);
             enforce_retention(&directory, &path).await;
             RawOutputArtifact::Stored {
+                id,
                 path,
                 bytes: output.len() as u64,
             }
@@ -236,11 +305,248 @@ pub(crate) async fn create_raw_output_artifact(
     }
 }
 
+pub(crate) async fn create_evidence_output_artifact(
+    codex_home: &Path,
+    thread_id: &str,
+    output: &[u8],
+) -> Result<PendingEvidenceArtifact, String> {
+    create_evidence_output_artifact_inner(codex_home, thread_id, output, None).await
+}
+
+async fn create_evidence_output_artifact_inner(
+    codex_home: &Path,
+    thread_id: &str,
+    output: &[u8],
+    pre_marker_barrier: Option<&tokio::sync::Barrier>,
+) -> Result<PendingEvidenceArtifact, String> {
+    let directory = codex_home.join("tool-output").join(thread_id);
+    let retention_permit = retention_sweep_permit().await;
+    std::fs::create_dir_all(&directory)
+        .map_err(|err| format!("failed to create `{}`: {err}", directory.display()))?;
+
+    let id = ToolOutputArtifactId::new();
+    let path = directory.join(format!("{id}.log"));
+    let file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|err| format!("failed to create `{}`: {err}", path.display()))?;
+    let cleanup = PendingEvidenceArtifactCleanup::new(path.clone());
+    file.try_lock()
+        .map_err(|err| format!("failed to lock `{}` for creation: {err}", path.display()))?;
+    let mut file = tokio::fs::File::from_std(file);
+    file.write_all(output)
+        .await
+        .map_err(|err| format!("failed to write `{}`: {err}", path.display()))?;
+    file.flush()
+        .await
+        .map_err(|err| format!("failed to flush `{}`: {err}", path.display()))?;
+    file.sync_all()
+        .await
+        .map_err(|err| format!("failed to sync `{}`: {err}", path.display()))?;
+
+    #[cfg(test)]
+    if let Some(barrier) = pre_marker_barrier {
+        barrier.wait().await;
+        barrier.wait().await;
+    }
+    #[cfg(not(test))]
+    let _ = pre_marker_barrier;
+
+    let marker = evidence_protection_path(&path);
+    create_new_evidence_protection_marker(&marker)
+        .map_err(|err| format!("failed to protect `{}` as evidence: {err}", path.display()))?;
+
+    drop(file);
+    Ok(PendingEvidenceArtifact {
+        id,
+        path,
+        bytes: output.len() as u64,
+        cleanup,
+        retention_permit: Some(retention_permit),
+    })
+}
+
+pub(crate) struct PendingEvidenceArtifact {
+    id: ToolOutputArtifactId,
+    path: PathBuf,
+    bytes: u64,
+    cleanup: PendingEvidenceArtifactCleanup,
+    retention_permit: Option<SemaphorePermit<'static>>,
+}
+
+impl PendingEvidenceArtifact {
+    pub(crate) fn id(&self) -> ToolOutputArtifactId {
+        self.id
+    }
+
+    pub(crate) fn mark_durable(mut self) -> RawOutputArtifact {
+        self.cleanup.disarm();
+        drop(self.retention_permit.take());
+        RawOutputArtifact::Stored {
+            id: self.id,
+            path: self.path.clone(),
+            bytes: self.bytes,
+        }
+    }
+}
+
+struct PendingEvidenceArtifactCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl PendingEvidenceArtifactCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PendingEvidenceArtifactCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(evidence_protection_path(&self.path));
+    }
+}
+
+fn create_new_evidence_protection_marker(marker: &Path) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(marker)?;
+    if let Err(err) = file
+        .write_all(b"KD4_EXTERNAL_EVIDENCE_ARTIFACT_V1\n")
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = std::fs::remove_file(marker);
+        return Err(err);
+    }
+    Ok(())
+}
+
+pub(crate) async fn delete_evidence_artifact(
+    codex_home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+) -> std::io::Result<()> {
+    let id = artifact_id.parse::<ToolOutputArtifactId>().map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid artifact id")
+    })?;
+    if id.to_string() != artifact_id {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "non-canonical artifact id",
+        ));
+    }
+    let path = codex_home
+        .join("tool-output")
+        .join(thread_id)
+        .join(format!("{id}.log"));
+    let marker = evidence_protection_path(&path);
+    let _retention_permit = retention_sweep_permit().await;
+    match tokio::fs::remove_file(&marker).await {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    if !remove_inactive_output_path(path).await {
+        return Err(std::io::Error::other(
+            "evidence artifact was unprotected but is still active and could not be deleted",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn reconcile_evidence_artifact_protection(
+    codex_home: &Path,
+    thread_id: &str,
+    referenced_artifact_ids: &std::collections::BTreeSet<String>,
+) -> std::collections::BTreeSet<String> {
+    let directory = codex_home.join("tool-output").join(thread_id);
+    let _retention_permit = retention_sweep_permit().await;
+    let mut live_artifact_ids = std::collections::BTreeSet::new();
+    for artifact_id in referenced_artifact_ids {
+        let Ok(id) = artifact_id.parse::<ToolOutputArtifactId>() else {
+            continue;
+        };
+        if id.to_string() != *artifact_id {
+            continue;
+        }
+        let path = directory.join(format!("{id}.log"));
+        let marker = evidence_protection_path(&path);
+        let marker_is_valid = tokio::task::spawn_blocking(move || {
+            let Ok((_log_file, _)) = open_regular_artifact(&path) else {
+                return false;
+            };
+            match std::fs::symlink_metadata(&marker) {
+                Ok(_) => evidence_protection_marker_is_valid(&marker),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    create_new_evidence_protection_marker(&marker).is_ok()
+                }
+                Err(_) => false,
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if marker_is_valid {
+            live_artifact_ids.insert(artifact_id.clone());
+        }
+    }
+
+    let Ok(mut entries) = tokio::fs::read_dir(&directory).await else {
+        return live_artifact_ids;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let marker = entry.path();
+        if marker.extension().and_then(|extension| extension.to_str())
+            != Some(EVIDENCE_PROTECTION_EXTENSION)
+        {
+            continue;
+        }
+        let Some(artifact_id) = marker.file_stem().and_then(|stem| stem.to_str()) else {
+            continue;
+        };
+        if live_artifact_ids.contains(artifact_id) {
+            continue;
+        }
+        let path = directory.join(format!("{artifact_id}.log"));
+        let _ = tokio::fs::remove_file(marker).await;
+        let _ = remove_inactive_output_path(path).await;
+    }
+    live_artifact_ids
+}
+
+fn evidence_protection_marker_is_valid(marker: &Path) -> bool {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    configure_no_follow_open(&mut options);
+    let Ok(mut file) = options.open(marker) else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata_is_reparse_point(&metadata) {
+        return false;
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).is_ok() && bytes == b"KD4_EXTERNAL_EVIDENCE_ARTIFACT_V1\n"
+}
+
 pub(crate) async fn append_raw_output_artifact(
     artifact: &RawOutputArtifact,
     output: &[u8],
 ) -> RawOutputArtifact {
-    let RawOutputArtifact::Stored { path, bytes } = artifact else {
+    let RawOutputArtifact::Stored { id, path, bytes } = artifact else {
         return artifact.clone();
     };
 
@@ -284,6 +590,7 @@ pub(crate) async fn append_raw_output_artifact(
                 Ok(metadata) => {
                     enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), path).await;
                     RawOutputArtifact::Stored {
+                        id: *id,
                         path: path.clone(),
                         bytes: metadata.len(),
                     }
@@ -314,7 +621,7 @@ pub(crate) async fn replace_raw_output_artifact(
     artifact: &RawOutputArtifact,
     output: &[u8],
 ) -> RawOutputArtifact {
-    let RawOutputArtifact::Stored { path, bytes } = artifact else {
+    let RawOutputArtifact::Stored { id, path, bytes } = artifact else {
         return artifact.clone();
     };
 
@@ -368,6 +675,7 @@ pub(crate) async fn replace_raw_output_artifact(
             }
             enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), path).await;
             RawOutputArtifact::Stored {
+                id: *id,
                 path: path.clone(),
                 bytes: output.len() as u64,
             }
@@ -393,10 +701,263 @@ async fn failed_with_owned_path(
         .map_or(fallback_bytes, |metadata| metadata.len());
     enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path).await;
     RawOutputArtifact::Failed {
+        id: artifact_id_from_path(&path),
         message,
         owned_path: Some(path),
         bytes,
     }
+}
+
+fn artifact_id_from_path(path: &Path) -> Option<ToolOutputArtifactId> {
+    path.file_stem()?.to_str()?.parse().ok()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReadToolOutputError {
+    InvalidArtifactId,
+    InvalidRange(String),
+    Expired,
+    StillWriting,
+    Io(String),
+}
+
+impl ReadToolOutputError {
+    pub(crate) fn for_model(&self) -> String {
+        match self {
+            Self::InvalidArtifactId => "artifact_id must be a UUID".to_string(),
+            Self::InvalidRange(message) | Self::Io(message) => message.clone(),
+            Self::Expired => ARTIFACT_EXPIRED_MESSAGE.to_string(),
+            Self::StillWriting => ARTIFACT_WRITING_MESSAGE.to_string(),
+        }
+    }
+}
+
+pub(crate) async fn read_tool_output_artifact(
+    codex_home: &Path,
+    thread_id: &str,
+    artifact_id: &str,
+    start_line: usize,
+    end_line: usize,
+    max_bytes: usize,
+) -> Result<String, ReadToolOutputError> {
+    let id = artifact_id
+        .parse::<ToolOutputArtifactId>()
+        .map_err(|_| ReadToolOutputError::InvalidArtifactId)?;
+    if id.to_string() != artifact_id {
+        return Err(ReadToolOutputError::InvalidArtifactId);
+    }
+    validate_read_range(start_line, end_line, max_bytes)?;
+    let path = codex_home
+        .join("tool-output")
+        .join(thread_id)
+        .join(format!("{id}.log"));
+    tokio::task::spawn_blocking(move || {
+        read_tool_output_artifact_blocking(&path, id, start_line, end_line, max_bytes)
+    })
+    .await
+    .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?
+}
+
+fn validate_read_range(
+    start_line: usize,
+    end_line: usize,
+    max_bytes: usize,
+) -> Result<(), ReadToolOutputError> {
+    if start_line == 0 {
+        return Err(ReadToolOutputError::InvalidRange(
+            "start_line must be at least 1".to_string(),
+        ));
+    }
+    if end_line < start_line {
+        return Err(ReadToolOutputError::InvalidRange(
+            "end_line must be greater than or equal to start_line".to_string(),
+        ));
+    }
+    if end_line - start_line >= 2_000 {
+        return Err(ReadToolOutputError::InvalidRange(
+            "requested line span must not exceed 2000 lines".to_string(),
+        ));
+    }
+    if max_bytes == 0 || max_bytes > 65_536 {
+        return Err(ReadToolOutputError::InvalidRange(
+            "max_bytes must be between 1 and 65536".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_tool_output_artifact_blocking(
+    path: &Path,
+    id: ToolOutputArtifactId,
+    start_line: usize,
+    end_line: usize,
+    max_bytes: usize,
+) -> Result<String, ReadToolOutputError> {
+    let (mut file, total_bytes) = open_regular_artifact(path)?;
+    file.try_lock_shared()
+        .map_err(|_| ReadToolOutputError::StillWriting)?;
+
+    let mut retained = Vec::with_capacity(max_bytes.min(16 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    let mut current_line = 1_usize;
+    let mut last_line = None;
+    let mut clamped = false;
+    let mut pending_cr = false;
+    let mut done = false;
+
+    while !done {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|err| ReadToolOutputError::Io(format!("failed to read artifact: {err}")))?;
+        if count == 0 {
+            if pending_cr && current_line >= start_line && current_line <= end_line {
+                push_bounded(&mut retained, b'\r', max_bytes, &mut clamped);
+                last_line = Some(current_line);
+            }
+            break;
+        }
+
+        for &byte in &buffer[..count] {
+            if pending_cr {
+                if byte == b'\n' {
+                    if current_line >= start_line && current_line <= end_line {
+                        push_bounded(&mut retained, b'\n', max_bytes, &mut clamped);
+                        last_line = Some(current_line);
+                    }
+                    pending_cr = false;
+                    if current_line == end_line {
+                        done = true;
+                        break;
+                    }
+                    current_line += 1;
+                    continue;
+                }
+                if current_line >= start_line && current_line <= end_line {
+                    push_bounded(&mut retained, b'\r', max_bytes, &mut clamped);
+                    last_line = Some(current_line);
+                }
+                pending_cr = false;
+            }
+
+            if byte == b'\r' {
+                pending_cr = true;
+            } else if byte == b'\n' {
+                if current_line >= start_line && current_line <= end_line {
+                    push_bounded(&mut retained, b'\n', max_bytes, &mut clamped);
+                    last_line = Some(current_line);
+                }
+                if current_line == end_line {
+                    done = true;
+                    break;
+                }
+                current_line += 1;
+            } else if current_line >= start_line && current_line <= end_line {
+                push_bounded(&mut retained, byte, max_bytes, &mut clamped);
+                last_line = Some(current_line);
+            }
+        }
+    }
+
+    let (text, invalid_utf8) = match String::from_utf8(retained) {
+        Ok(text) => (text, false),
+        Err(err) => (String::from_utf8_lossy(err.as_bytes()).into_owned(), true),
+    };
+    let lines = match last_line {
+        Some(last) => format!("{start_line}–{last}"),
+        None => "none".to_string(),
+    };
+    let mut rendered =
+        format!("artifact {id}, lines {lines}, {total_bytes} retained bytes\n{text}");
+    if invalid_utf8 {
+        rendered.push_str("\n[invalid UTF-8 replaced]");
+    }
+    if clamped {
+        rendered.push_str("\n[range clamped at byte limit]");
+    }
+    Ok(rendered)
+}
+
+fn open_regular_artifact(path: &Path) -> Result<(File, u64), ReadToolOutputError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    configure_no_follow_open(&mut options);
+    let file = options.open(path).map_err(map_artifact_open_error)?;
+    let metadata = file
+        .metadata()
+        .map_err(|err| ReadToolOutputError::Io(format!("failed to inspect artifact: {err}")))?;
+    if !metadata.is_file() || metadata_is_reparse_point(&metadata) {
+        return Err(ReadToolOutputError::Expired);
+    }
+    Ok((file, metadata.len()))
+}
+
+fn map_artifact_open_error(error: std::io::Error) -> ReadToolOutputError {
+    if error.kind() == std::io::ErrorKind::NotFound
+        || error.raw_os_error().is_some_and(is_no_follow_error)
+    {
+        ReadToolOutputError::Expired
+    } else {
+        ReadToolOutputError::Io(format!("failed to open artifact: {error}"))
+    }
+}
+
+#[cfg(unix)]
+fn configure_no_follow_open(options: &mut std::fs::OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+}
+
+#[cfg(windows)]
+fn configure_no_follow_open(options: &mut std::fs::OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn configure_no_follow_open(_options: &mut std::fs::OpenOptions) {}
+
+#[cfg(unix)]
+fn is_no_follow_error(raw_os_error: i32) -> bool {
+    raw_os_error == libc::ELOOP
+}
+
+#[cfg(not(unix))]
+fn is_no_follow_error(_raw_os_error: i32) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+fn push_bounded(output: &mut Vec<u8>, byte: u8, max_bytes: usize, clamped: &mut bool) {
+    if output.len() < max_bytes {
+        output.push(byte);
+    } else {
+        *clamped = true;
+    }
+}
+
+fn evidence_protection_path(artifact_path: &Path) -> PathBuf {
+    artifact_path.with_extension(EVIDENCE_PROTECTION_EXTENSION)
+}
+
+async fn evidence_artifact_is_protected(artifact_path: &Path) -> bool {
+    tokio::fs::symlink_metadata(evidence_protection_path(artifact_path))
+        .await
+        .is_ok_and(|metadata| metadata.is_file() && !metadata_is_reparse_point(&metadata))
 }
 
 async fn enforce_retention(directory: &Path, keep_path: &Path) {
@@ -415,7 +976,9 @@ async fn enforce_retention_locked(directory: &Path, keep_path: &Path) {
             Ok(None) | Err(_) => break,
         };
         let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("log") {
+        if path.extension().and_then(|extension| extension.to_str()) == Some("log")
+            && !evidence_artifact_is_protected(&path).await
+        {
             paths.push(path);
         }
     }
@@ -466,7 +1029,9 @@ async fn enforce_global_retention_locked(tool_output_root: &Path, keep_path: &Pa
                 Ok(None) | Err(_) => break,
             };
             let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) == Some("log") {
+            if path.extension().and_then(|extension| extension.to_str()) == Some("log")
+                && !evidence_artifact_is_protected(&path).await
+            {
                 let modified = entry
                     .metadata()
                     .await
@@ -543,7 +1108,7 @@ mod tests {
         let first = create_raw_output_artifact(temp.path(), "thread", b"alpha\0beta\n").await;
         let second = append_raw_output_artifact(&first, b"unicode: \xce\xbb\n").await;
 
-        let RawOutputArtifact::Stored { path, bytes } = second else {
+        let RawOutputArtifact::Stored { path, bytes, .. } = second else {
             panic!("expected stored artifact");
         };
         assert_eq!(bytes, 23);
@@ -561,7 +1126,7 @@ mod tests {
         let final_output = b"partial\ntail\ncomplete\n";
         let replaced = replace_raw_output_artifact(&appended, final_output).await;
 
-        let RawOutputArtifact::Stored { path, bytes } = replaced else {
+        let RawOutputArtifact::Stored { path, bytes, .. } = replaced else {
             panic!("expected stored artifact");
         };
         assert_eq!(bytes, final_output.len() as u64);
@@ -574,13 +1139,190 @@ mod tests {
     #[test]
     fn failed_artifact_preserves_owned_partial_metadata() {
         let artifact = RawOutputArtifact::Failed {
+            id: None,
             message: "flush failed".to_string(),
             owned_path: Some(PathBuf::from("C:/codex/tool-output/partial.log")),
             bytes: 17,
         };
 
-        assert!(artifact.render_for_model().contains("partial.log"));
-        assert!(artifact.render_for_model().contains("17 bytes"));
+        assert!(!artifact.render_for_model().contains("partial.log"));
+        assert!(matches!(
+            artifact,
+            RawOutputArtifact::Failed { bytes: 17, .. }
+        ));
+    }
+
+    fn stored_id(artifact: &RawOutputArtifact) -> ToolOutputArtifactId {
+        let RawOutputArtifact::Stored { id, .. } = artifact else {
+            panic!("expected stored artifact");
+        };
+        *id
+    }
+
+    #[tokio::test]
+    async fn read_returns_exact_range_and_treats_crlf_as_one_break() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bytes = b"one\r\ntwo\r\nthree\r\nfour\r\n";
+        let artifact = create_raw_output_artifact(temp.path(), "thread", bytes).await;
+        let id = stored_id(&artifact);
+
+        let output =
+            read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 2, 3, 16_384)
+                .await
+                .expect("read artifact");
+
+        assert_eq!(
+            output,
+            format!(
+                "artifact {id}, lines 2–3, {} retained bytes\ntwo\nthree\n",
+                bytes.len()
+            )
+        );
+
+        let through_eof =
+            read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 200, 16_384)
+                .await
+                .expect("read through eof");
+        assert!(through_eof.starts_with(&format!(
+            "artifact {id}, lines 1–4, {} retained bytes\n",
+            bytes.len()
+        )));
+    }
+
+    #[tokio::test]
+    async fn read_clamps_at_byte_limit_with_trailer() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact = create_raw_output_artifact(temp.path(), "thread", b"abcdef\n").await;
+        let id = stored_id(&artifact);
+
+        let output = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 3)
+            .await
+            .expect("read artifact");
+
+        assert!(output.contains("\nabc\n[range clamped at byte limit]"));
+    }
+
+    #[tokio::test]
+    async fn read_rejects_invalid_uuid_and_traversal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        for invalid in ["not-a-uuid", "../019fa782-f8e1-7533-a3f7-60d3f9a42997"] {
+            let error = read_tool_output_artifact(temp.path(), "thread", invalid, 1, 1, 16_384)
+                .await
+                .expect_err("invalid id should fail");
+            assert_eq!(error, ReadToolOutputError::InvalidArtifactId);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_rejects_uuid_named_symlink_outside_thread_directory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let thread_directory = temp.path().join("tool-output").join("thread");
+        std::fs::create_dir_all(&thread_directory).expect("create thread directory");
+        let outside = temp.path().join("outside.log");
+        std::fs::write(&outside, b"outside secret\n").expect("write outside artifact");
+        let id = ToolOutputArtifactId::new();
+        symlink(&outside, thread_directory.join(format!("{id}.log"))).expect("create symlink");
+
+        let error = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
+            .await
+            .expect_err("symlink artifact should fail");
+
+        assert_eq!(error, ReadToolOutputError::Expired);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn read_rejects_uuid_named_reparse_point_outside_thread_directory() {
+        use std::os::windows::fs::symlink_file;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let thread_directory = temp.path().join("tool-output").join("thread");
+        std::fs::create_dir_all(&thread_directory).expect("create thread directory");
+        let outside = temp.path().join("outside.log");
+        std::fs::write(&outside, b"outside secret\n").expect("write outside artifact");
+        let id = ToolOutputArtifactId::new();
+        if let Err(error) = symlink_file(&outside, thread_directory.join(format!("{id}.log"))) {
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(1314)
+            {
+                return;
+            }
+            panic!("create file reparse point: {error}");
+        }
+
+        let error = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
+            .await
+            .expect_err("reparse artifact should fail");
+
+        assert_eq!(error, ReadToolOutputError::Expired);
+    }
+
+    #[tokio::test]
+    async fn read_rejects_artifact_from_other_thread() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact = create_raw_output_artifact(temp.path(), "thread-a", b"secret\n").await;
+        let id = stored_id(&artifact);
+
+        let error =
+            read_tool_output_artifact(temp.path(), "thread-b", &id.to_string(), 1, 1, 16_384)
+                .await
+                .expect_err("cross-thread read should fail");
+
+        assert_eq!(error, ReadToolOutputError::Expired);
+        assert_eq!(error.for_model(), ARTIFACT_EXPIRED_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn read_reports_evicted_artifact() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact = create_raw_output_artifact(temp.path(), "thread", b"old\n").await;
+        let id = stored_id(&artifact);
+        let RawOutputArtifact::Stored { path, .. } = artifact else {
+            unreachable!();
+        };
+        tokio::fs::remove_file(path).await.expect("evict artifact");
+
+        let error = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
+            .await
+            .expect_err("evicted artifact should fail");
+
+        assert_eq!(error, ReadToolOutputError::Expired);
+    }
+
+    #[tokio::test]
+    async fn read_replaces_invalid_utf8_and_adds_notice() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact = create_raw_output_artifact(temp.path(), "thread", b"bad:\xff\n").await;
+        let id = stored_id(&artifact);
+
+        let output =
+            read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
+                .await
+                .expect("read artifact");
+
+        assert!(output.contains("bad:\u{fffd}"));
+        assert!(output.ends_with("[invalid UTF-8 replaced]"));
+    }
+
+    #[tokio::test]
+    async fn read_reports_active_writer_lock_without_blocking() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact = create_raw_output_artifact(temp.path(), "thread", b"partial\n").await;
+        let id = stored_id(&artifact);
+        let state = Arc::new(Mutex::new(artifact));
+        let _writer = RawOutputArtifactWriter::open(Some(&state))
+            .await
+            .expect("writer state");
+
+        let error = read_tool_output_artifact(temp.path(), "thread", &id.to_string(), 1, 1, 16_384)
+            .await
+            .expect_err("locked artifact should not be read");
+
+        assert_eq!(error, ReadToolOutputError::StillWriting);
+        assert_eq!(error.for_model(), ARTIFACT_WRITING_MESSAGE);
     }
 
     #[tokio::test]

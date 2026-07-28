@@ -1,0 +1,21 @@
+diff --git a/investigation_cases/static_wiring_missing_handler.rs b/investigation_cases/static_wiring_missing_handler.rs
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/static_wiring_missing_handler.rs
+@@ -0,0 +1,16 @@
++const ADVERTISED_OPERATIONS: [&str; 2] = ["inspect", "repair"];
++
++fn inspect(payload: &str) -> String {
++    format!("inspected: {payload}")
++}
++
++fn repair(payload: &str) -> String {
++    format!("repaired: {payload}")
++}
++
++fn dispatch_request(name: &str, payload: &str) -> Result<String, String> {
++    match name {
++        "inspect" => Ok(inspect(payload)),
++        _ => Err(format!("unknown operation: {name}")),
++    }
++}

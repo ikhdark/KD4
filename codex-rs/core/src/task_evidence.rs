@@ -1,6 +1,8 @@
 use chrono::Utc;
 use codex_git_utils::collect_git_info;
+use codex_git_utils::get_git_repo_root;
 use codex_protocol::ThreadId;
+use codex_protocol::mcp::CallToolResult;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
@@ -12,12 +14,14 @@ use serde::Serialize;
 use serde_json::Value;
 use sha1::Digest;
 use sha1::Sha1;
+use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use tempfile::NamedTempFile;
@@ -26,17 +30,43 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
-const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 2;
+const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 3;
 const FILE_HASH_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_COMMAND_RECEIPTS: usize = 256;
 const MAX_EDIT_RECEIPTS: usize = 256;
 const MAX_VALIDATION_RECEIPTS: usize = 64;
+const MAX_EXTERNAL_EVIDENCE_RECEIPTS: usize = 256;
+const EXTERNAL_EVIDENCE_INLINE_PAYLOAD_BYTES: usize = 16 * 1024;
+const EXTERNAL_EVIDENCE_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
+const EXTERNAL_EVIDENCE_ARTIFACT_HEADER: &str =
+    "KD4_EXTERNAL_EVIDENCE_CANONICAL_JSON_STRING_CHUNKS_V1\n";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaskEvidenceMode {
+    Disabled,
+    EvidenceOnly,
+    Kd4Completion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExternalEvidenceCapture {
+    Ignored,
+    Stored,
+    Warning(&'static str),
+}
+
 pub(crate) struct TaskEvidenceLedger {
+    mode: TaskEvidenceMode,
+    codex_home: Option<PathBuf>,
+    thread_id: Option<String>,
     evidence_path: Option<PathBuf>,
     repo_root: Option<PathBuf>,
-    document: Mutex<Option<TaskEvidenceDocument>>,
-    persistence_gate: Semaphore,
-    last_persisted_revision: AtomicU64,
+    document: Arc<Mutex<Option<TaskEvidenceDocument>>>,
+    persistence_gate: Arc<Semaphore>,
+    external_evidence_gate: Arc<Semaphore>,
+    last_persisted_revision: Arc<AtomicU64>,
+    #[cfg(test)]
+    persistence_test_control: Arc<std::sync::Mutex<Option<PersistenceTestControl>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,6 +82,14 @@ enum PersistOutcome {
     Persisted,
     Superseded,
     Failed,
+}
+
+#[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct PersistenceTestControl {
+    before_next_write:
+        Arc<std::sync::Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>>,
+    fail_writes: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +109,8 @@ struct TaskEvidenceDocument {
     edit_receipts: Vec<EditReceipt>,
     command_receipts: Vec<CommandReceipt>,
     validation_receipts: Vec<ValidationReceipt>,
+    #[serde(default)]
+    external_evidence: Vec<ExternalEvidenceReceipt>,
     generated_artifact_requirements: Vec<GeneratedArtifactRequirement>,
     generated_artifact_hashes: BTreeMap<String, FileHashSnapshot>,
     #[serde(default)]
@@ -89,6 +129,10 @@ struct TaskEvidenceDocument {
     next_command_receipt_sequence: u64,
     #[serde(default = "initial_receipt_sequence")]
     next_validation_receipt_sequence: u64,
+    #[serde(default = "initial_receipt_sequence")]
+    next_external_evidence_receipt_sequence: u64,
+    #[serde(default)]
+    host_mutation_revision: u64,
     completion: Option<TaskCompletionGate>,
 }
 
@@ -188,6 +232,38 @@ struct ValidationReceipt {
     payload: Option<Value>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum EvidenceCompleteness {
+    Complete,
+    Partial,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExternalEvidenceReceipt {
+    id: String,
+    producer: String,
+    producer_schema_version: u32,
+    server_name: String,
+    tool_name: String,
+    call_id: String,
+    recorded_at: String,
+    task_epoch: u64,
+    step_id: Option<String>,
+    workspace_root_fingerprint: String,
+    host_mutation_revision: Option<u64>,
+    provider_snapshot: Option<String>,
+    tool_success: bool,
+    payload_completeness: EvidenceCompleteness,
+    truncated: bool,
+    approximate: bool,
+    limitations: Vec<String>,
+    result_sha256: String,
+    payload: Option<Value>,
+    payload_artifact_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GeneratedArtifactRequirement {
     id: String,
@@ -220,7 +296,11 @@ struct DesktopActivationReceipt {
 
 impl TaskEvidenceLedger {
     pub(crate) async fn load_or_new(codex_home: PathBuf, thread_id: ThreadId, cwd: &Path) -> Self {
-        let Some(repo_root) = find_kd4_repo_root(cwd) else {
+        let (mode, repo_root) = if let Some(repo_root) = find_kd4_repo_root(cwd) {
+            (TaskEvidenceMode::Kd4Completion, repo_root)
+        } else if let Some(repo_root) = get_git_repo_root(cwd) {
+            (TaskEvidenceMode::EvidenceOnly, repo_root)
+        } else {
             return Self::disabled();
         };
         let repo_root = canonical_repository_root(&repo_root);
@@ -289,6 +369,7 @@ impl TaskEvidenceLedger {
                 edit_receipts: Vec::new(),
                 command_receipts: Vec::new(),
                 validation_receipts: Vec::new(),
+                external_evidence: Vec::new(),
                 generated_artifact_requirements: Vec::new(),
                 generated_artifact_hashes: BTreeMap::new(),
                 latest_generated_artifact_hashes: BTreeMap::new(),
@@ -305,31 +386,114 @@ impl TaskEvidenceLedger {
                 next_edit_receipt_sequence: initial_receipt_sequence(),
                 next_command_receipt_sequence: initial_receipt_sequence(),
                 next_validation_receipt_sequence: initial_receipt_sequence(),
+                next_external_evidence_receipt_sequence: initial_receipt_sequence(),
+                host_mutation_revision: 0,
                 completion: None,
             }
         };
+        if mode == TaskEvidenceMode::EvidenceOnly && storage_failure_reason.is_some() {
+            warn!(
+                "disabling evidence-only task ledger because rejected evidence could not be safely replaced"
+            );
+            return Self::disabled();
+        }
         let writable_evidence_path = storage_failure_reason.is_none().then_some(evidence_path);
         let ledger = Self {
+            mode,
+            codex_home: Some(codex_home),
+            thread_id: Some(thread_id.to_string()),
             evidence_path: writable_evidence_path,
             repo_root: Some(repo_root),
-            document: Mutex::new(Some(document.clone())),
-            persistence_gate: Semaphore::new(1),
-            last_persisted_revision: AtomicU64::new(0),
+            document: Arc::new(Mutex::new(Some(document.clone()))),
+            persistence_gate: Arc::new(Semaphore::new(1)),
+            external_evidence_gate: Arc::new(Semaphore::new(1)),
+            last_persisted_revision: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            persistence_test_control: Arc::new(std::sync::Mutex::new(None)),
         };
         if storage_failure_reason.is_none() {
-            let _ = ledger.persist_document(&document).await;
+            let persisted = ledger.persist_document(&document).await;
+            if mode == TaskEvidenceMode::EvidenceOnly && persisted != PersistOutcome::Persisted {
+                warn!(
+                    "disabling evidence-only task ledger because initial persistence could not be established"
+                );
+                return Self::disabled();
+            }
+        }
+        let referenced_artifact_ids = document
+            .external_evidence
+            .iter()
+            .filter_map(|receipt| receipt.payload_artifact_id.clone())
+            .collect();
+        let live_artifact_ids =
+            crate::tools::command_output_artifact::reconcile_evidence_artifact_protection(
+                ledger
+                    .codex_home
+                    .as_deref()
+                    .expect("enabled ledger has a Codex home"),
+                ledger
+                    .thread_id
+                    .as_deref()
+                    .expect("enabled ledger has a thread id"),
+                &referenced_artifact_ids,
+            )
+            .await;
+        let repaired_snapshot = {
+            let mut guard = ledger.document.lock().await;
+            if let Some(document) = guard.as_mut() {
+                let before = document.external_evidence.len();
+                document.external_evidence.retain(|receipt| {
+                    receipt
+                        .payload_artifact_id
+                        .as_ref()
+                        .is_none_or(|artifact_id| live_artifact_ids.contains(artifact_id))
+                });
+                let removed = before.saturating_sub(document.external_evidence.len());
+                if removed == 0 {
+                    None
+                } else {
+                    warn!(
+                        "removed {removed} external evidence receipt(s) whose payload artifacts were missing or invalid"
+                    );
+                    document.updated_at = timestamp();
+                    document.revision = document.revision.saturating_add(1);
+                    Some(document.clone())
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(repaired_snapshot) = repaired_snapshot
+            && ledger.persist_document(&repaired_snapshot).await != PersistOutcome::Persisted
+        {
+            warn!("failed to persist repaired external evidence receipts");
         }
         ledger
     }
 
     pub(crate) fn disabled() -> Self {
         Self {
+            mode: TaskEvidenceMode::Disabled,
+            codex_home: None,
+            thread_id: None,
             evidence_path: None,
             repo_root: None,
-            document: Mutex::new(None),
-            persistence_gate: Semaphore::new(1),
-            last_persisted_revision: AtomicU64::new(0),
+            document: Arc::new(Mutex::new(None)),
+            persistence_gate: Arc::new(Semaphore::new(1)),
+            external_evidence_gate: Arc::new(Semaphore::new(1)),
+            last_persisted_revision: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            persistence_test_control: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mode(&self) -> TaskEvidenceMode {
+        self.mode
+    }
+
+    pub(crate) fn allows_kd4_completion(&self) -> bool {
+        self.mode == TaskEvidenceMode::Kd4Completion
     }
 
     pub(crate) fn matches_repo_root(&self, candidate: &Path) -> bool {
@@ -343,6 +507,9 @@ impl TaskEvidenceLedger {
         &self,
         requested_paths: &[PathBuf],
     ) -> Option<TaskEvidenceValidationStart> {
+        if !self.allows_kd4_completion() {
+            return None;
+        }
         let repo_root = self.repo_root.as_ref()?;
         let requested_paths = requested_paths
             .iter()
@@ -382,9 +549,9 @@ impl TaskEvidenceLedger {
     }
 
     pub(crate) async fn record_plan_update(&self, update: &UpdatePlanArgs) -> UpdatePlanArgs {
-        let Some(_) = self.repo_root else {
+        if !self.allows_kd4_completion() {
             return update.clone();
-        };
+        }
         let Some((response, snapshot)) = self
             .update_document(|document| {
                 let previous = document
@@ -459,6 +626,9 @@ impl TaskEvidenceLedger {
     }
 
     pub(crate) async fn record_edit_intent(&self, call_id: &str, cwd: &Path, paths: &[PathBuf]) {
+        if self.mode != TaskEvidenceMode::Kd4Completion {
+            return;
+        }
         let Some(repo_root) = self.repo_root.as_ref() else {
             return;
         };
@@ -494,6 +664,15 @@ impl TaskEvidenceLedger {
     }
 
     pub(crate) async fn record_edit_result(&self, call_id: &str, outcome: &str) {
+        if self.mode == TaskEvidenceMode::EvidenceOnly {
+            if outcome == "completed" {
+                self.record_host_mutation().await;
+            }
+            return;
+        }
+        if self.mode != TaskEvidenceMode::Kd4Completion {
+            return;
+        }
         let Some(repo_root) = self.repo_root.as_ref() else {
             return;
         };
@@ -629,7 +808,13 @@ impl TaskEvidenceLedger {
         duration_ms: u64,
         possible_mutation: bool,
     ) {
-        if self.repo_root.is_none() {
+        if self.mode == TaskEvidenceMode::EvidenceOnly {
+            if possible_mutation {
+                self.record_host_mutation().await;
+            }
+            return;
+        }
+        if self.mode != TaskEvidenceMode::Kd4Completion {
             return;
         }
         let command_succeeded = exit_code == 0 && !timed_out;
@@ -701,6 +886,9 @@ impl TaskEvidenceLedger {
         stale_reasons: &[String],
         payload: Option<&Value>,
     ) -> bool {
+        if !self.allows_kd4_completion() {
+            return false;
+        }
         let Some(repo_root) = self.repo_root.as_ref() else {
             return false;
         };
@@ -874,6 +1062,9 @@ impl TaskEvidenceLedger {
     }
 
     pub(crate) async fn take_finalization_warning(&self) -> Option<String> {
+        if !self.allows_kd4_completion() {
+            return None;
+        }
         let gate = self.completion_gate().await?;
         if gate.status == TaskCompletionStatus::Passed {
             return None;
@@ -910,6 +1101,9 @@ impl TaskEvidenceLedger {
     }
 
     pub(crate) async fn take_automatic_verify_plan_request(&self) -> Option<Vec<String>> {
+        if !self.allows_kd4_completion() {
+            return None;
+        }
         let (changed_paths, snapshot) = self
             .update_document(|document| {
                 let has_mutation = !document.edit_receipts.is_empty()
@@ -934,6 +1128,9 @@ impl TaskEvidenceLedger {
     }
 
     pub(crate) async fn completion_gate(&self) -> Option<TaskCompletionGate> {
+        if !self.allows_kd4_completion() {
+            return None;
+        }
         let mut latest_gate = None;
         for _ in 0..8 {
             self.refresh_external_file_freshness().await;
@@ -1005,6 +1202,9 @@ impl TaskEvidenceLedger {
         binary_sha1: String,
         runtime_evidence: String,
     ) {
+        if !self.allows_kd4_completion() {
+            return;
+        }
         let Some((_, snapshot)) = self
             .update_document(|document| {
                 document.desktop_activation_receipt = Some(DesktopActivationReceipt {
@@ -1026,6 +1226,9 @@ impl TaskEvidenceLedger {
     }
 
     async fn refresh_external_file_freshness(&self) {
+        if !self.allows_kd4_completion() {
+            return;
+        }
         let Some(repo_root) = self.repo_root.as_ref() else {
             return;
         };
@@ -1143,6 +1346,321 @@ impl TaskEvidenceLedger {
         self.persist_document(&snapshot).await;
     }
 
+    async fn record_host_mutation(&self) {
+        if self.mode == TaskEvidenceMode::Disabled {
+            return;
+        }
+        let Some((_, snapshot)) = self
+            .update_document(|document| {
+                invalidate_for_mutation(document);
+                document.updated_at = timestamp();
+            })
+            .await
+        else {
+            return;
+        };
+        if self.persist_document(&snapshot).await == PersistOutcome::Failed {
+            warn!("failed to persist task-evidence host mutation revision");
+        }
+    }
+
+    pub(crate) async fn record_external_mcp_evidence(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        call_id: &str,
+        result: &CallToolResult,
+    ) -> ExternalEvidenceCapture {
+        self.record_external_mcp_evidence_with_limit(
+            server_name,
+            tool_name,
+            call_id,
+            result,
+            MAX_EXTERNAL_EVIDENCE_RECEIPTS,
+        )
+        .await
+    }
+
+    async fn record_external_mcp_evidence_with_limit(
+        &self,
+        server_name: &str,
+        tool_name: &str,
+        call_id: &str,
+        result: &CallToolResult,
+        max_receipts: usize,
+    ) -> ExternalEvidenceCapture {
+        if self.mode == TaskEvidenceMode::Disabled {
+            return ExternalEvidenceCapture::Ignored;
+        }
+        let metadata = match extract_external_evidence_metadata(result) {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => return ExternalEvidenceCapture::Ignored,
+            Err(message) => return ExternalEvidenceCapture::Warning(message),
+        };
+        if self.evidence_path.is_none() {
+            return ExternalEvidenceCapture::Warning(
+                "external evidence persistence is unavailable for this task",
+            );
+        }
+        let external_evidence_permit = match Arc::clone(&self.external_evidence_gate)
+            .acquire_owned()
+            .await
+        {
+            Ok(permit) => permit,
+            Err(err) => {
+                warn!("external evidence serialization gate unexpectedly closed: {err}");
+                return ExternalEvidenceCapture::Warning(
+                    "external evidence persistence is unavailable for this task",
+                );
+            }
+        };
+        let canonical_payload = canonical_mcp_result_payload(result);
+        let canonical_bytes = match serde_json::to_vec(&canonical_payload) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                return ExternalEvidenceCapture::Warning(
+                    "external evidence result could not be canonicalized",
+                );
+            }
+        };
+        let result_sha256 = format!("{:x}", Sha256::digest(&canonical_bytes));
+        let (task_epoch, step_id, workspace_root_fingerprint, host_mutation_revision) = {
+            let guard = self.document.lock().await;
+            let Some(document) = guard.as_ref() else {
+                return ExternalEvidenceCapture::Ignored;
+            };
+            (
+                document.evidence_epoch,
+                (self.mode == TaskEvidenceMode::Kd4Completion)
+                    .then(|| document.active_step_id.clone())
+                    .flatten(),
+                workspace_root_fingerprint(&document.start),
+                Some(document.host_mutation_revision),
+            )
+        };
+
+        let (payload, payload_artifact_id, mut pending_artifact) = if canonical_bytes.len()
+            <= EXTERNAL_EVIDENCE_INLINE_PAYLOAD_BYTES
+        {
+            (Some(canonical_payload), None, None)
+        } else {
+            let Some(codex_home) = self.codex_home.as_deref() else {
+                return ExternalEvidenceCapture::Warning(
+                    "external evidence payload storage is unavailable",
+                );
+            };
+            let Some(thread_id) = self.thread_id.as_deref() else {
+                return ExternalEvidenceCapture::Warning(
+                    "external evidence thread identity is unavailable",
+                );
+            };
+            let artifact_bytes = encode_external_evidence_artifact(&canonical_bytes);
+            let pending = crate::tools::command_output_artifact::create_evidence_output_artifact(
+                codex_home,
+                thread_id,
+                &artifact_bytes,
+            )
+            .await;
+            let pending = match pending {
+                Ok(pending) => pending,
+                Err(err) => {
+                    warn!("external evidence payload artifact could not be stored: {err}");
+                    return ExternalEvidenceCapture::Warning(
+                        "external evidence payload artifact could not be stored",
+                    );
+                }
+            };
+            let artifact_id = pending.id().to_string();
+            let summary = serde_json::json!({
+                "evidenceMetaSummary": {
+                    "producer": metadata.producer.clone(),
+                    "schemaVersion": metadata.producer_schema_version,
+                    "payloadCompleteness": evidence_completeness_name(
+                        metadata.payload_completeness
+                    ),
+                },
+                "structuredFieldCount": result
+                    .structured_content
+                    .as_ref()
+                    .and_then(Value::as_object)
+                    .map_or(0, serde_json::Map::len),
+                "contentItems": result.content.len(),
+                "isError": result.is_error,
+                "artifact": {
+                    "id": artifact_id,
+                    "encoding": "KD4_EXTERNAL_EVIDENCE_CANONICAL_JSON_STRING_CHUNKS_V1"
+                }
+            });
+            debug_assert!(
+                serde_json::to_vec(&summary)
+                    .is_ok_and(|bytes| { bytes.len() <= EXTERNAL_EVIDENCE_INLINE_PAYLOAD_BYTES }),
+                "external evidence summary must remain within the inline payload cap"
+            );
+            (Some(summary), Some(artifact_id), Some(pending))
+        };
+
+        let document = Arc::clone(&self.document);
+        let persistence_gate = Arc::clone(&self.persistence_gate);
+        let last_persisted_revision = Arc::clone(&self.last_persisted_revision);
+        let persistence_test_control = self.persistence_test_control();
+        let evidence_path = self
+            .evidence_path
+            .clone()
+            .expect("external evidence requires a persistence path");
+        let codex_home = self.codex_home.clone();
+        let thread_id = self.thread_id.clone();
+        let mode = self.mode;
+        let server_name = server_name.to_string();
+        let tool_name = tool_name.to_string();
+        let call_id = call_id.to_string();
+        let tool_success = result.is_error != Some(true);
+        let coordinator = tokio::spawn(async move {
+            let _external_evidence_permit = external_evidence_permit;
+            let mut persistence_permit = match Arc::clone(&persistence_gate).acquire_owned().await {
+                Ok(permit) => permit,
+                Err(err) => {
+                    warn!("KD4 task-evidence persistence gate unexpectedly closed: {err}");
+                    return ExternalEvidenceCapture::Warning(
+                        "external evidence receipt could not be durably persisted",
+                    );
+                }
+            };
+            let mut receipt_id = String::new();
+            let mut trimmed_receipts = Vec::new();
+            let snapshot = {
+                let mut guard = document.lock().await;
+                let Some(document) = guard.as_mut() else {
+                    return ExternalEvidenceCapture::Ignored;
+                };
+                let id = next_receipt_id(
+                    "external-evidence",
+                    &mut document.next_external_evidence_receipt_sequence,
+                );
+                receipt_id.clone_from(&id);
+                document.external_evidence.push(ExternalEvidenceReceipt {
+                    id,
+                    producer: metadata.producer,
+                    producer_schema_version: metadata.producer_schema_version,
+                    server_name,
+                    tool_name,
+                    call_id,
+                    recorded_at: timestamp(),
+                    task_epoch,
+                    step_id,
+                    workspace_root_fingerprint,
+                    host_mutation_revision,
+                    provider_snapshot: metadata.provider_snapshot,
+                    tool_success,
+                    payload_completeness: metadata.payload_completeness,
+                    truncated: metadata.truncated,
+                    approximate: metadata.approximate,
+                    limitations: metadata.limitations,
+                    result_sha256,
+                    payload,
+                    payload_artifact_id,
+                });
+                let trim_count = document
+                    .external_evidence
+                    .len()
+                    .saturating_sub(max_receipts);
+                trimmed_receipts.extend(document.external_evidence.drain(..trim_count));
+                document.updated_at = timestamp();
+                document.revision = document.revision.saturating_add(1);
+                document.clone()
+            };
+            let (outcome, returned_permit) = persist_document_with_permit(
+                evidence_path.clone(),
+                snapshot,
+                persistence_permit,
+                Arc::clone(&last_persisted_revision),
+                persistence_test_control.clone(),
+            )
+            .await;
+            persistence_permit = match returned_permit {
+                Some(permit) => permit,
+                None => match Arc::clone(&persistence_gate).acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        return ExternalEvidenceCapture::Warning(
+                            "external evidence receipt could not be durably persisted",
+                        );
+                    }
+                },
+            };
+            match outcome {
+                PersistOutcome::Persisted | PersistOutcome::Superseded => {
+                    if let Some(pending) = pending_artifact.take() {
+                        let _ = pending.mark_durable();
+                    }
+                    drop(persistence_permit);
+                    for receipt in trimmed_receipts {
+                        delete_external_artifact_owned(
+                            codex_home.as_deref(),
+                            thread_id.as_deref(),
+                            receipt.payload_artifact_id.as_deref(),
+                        )
+                        .await;
+                    }
+                    ExternalEvidenceCapture::Stored
+                }
+                PersistOutcome::Failed => {
+                    let restored_receipts = trimmed_receipts;
+                    let failure_snapshot = {
+                        let mut guard = document.lock().await;
+                        let Some(document) = guard.as_mut() else {
+                            drop(pending_artifact.take());
+                            return ExternalEvidenceCapture::Warning(
+                                "external evidence receipt could not be durably persisted",
+                            );
+                        };
+                        let mut retained = std::mem::take(&mut document.external_evidence);
+                        retained.retain(|receipt| receipt.id != receipt_id);
+                        let mut restored = restored_receipts;
+                        restored.append(&mut retained);
+                        document.external_evidence = restored;
+                        if mode == TaskEvidenceMode::Kd4Completion {
+                            upsert_risk(
+                                document,
+                                task_evidence_storage_risk(
+                                    "external evidence receipt could not be durably persisted",
+                                    document.evidence_epoch,
+                                ),
+                            );
+                        }
+                        document.updated_at = timestamp();
+                        document.revision = document.revision.saturating_add(1);
+                        document.clone()
+                    };
+                    drop(pending_artifact.take());
+                    let rollback_revision = failure_snapshot.revision;
+                    let (rollback_outcome, _) = persist_document_with_permit(
+                        evidence_path,
+                        failure_snapshot,
+                        persistence_permit,
+                        Arc::clone(&last_persisted_revision),
+                        persistence_test_control,
+                    )
+                    .await;
+                    if rollback_outcome == PersistOutcome::Failed {
+                        last_persisted_revision.fetch_max(rollback_revision, Ordering::AcqRel);
+                    }
+                    ExternalEvidenceCapture::Warning(
+                        "external evidence receipt could not be durably persisted",
+                    )
+                }
+            }
+        });
+        match coordinator.await {
+            Ok(capture) => capture,
+            Err(err) => {
+                warn!("external evidence persistence coordinator failed: {err}");
+                ExternalEvidenceCapture::Warning(
+                    "external evidence receipt could not be durably persisted",
+                )
+            }
+        }
+    }
+
     async fn update_document<T>(
         &self,
         update: impl FnOnce(&mut TaskEvidenceDocument) -> T,
@@ -1158,47 +1676,271 @@ impl TaskEvidenceLedger {
         let Some(path) = self.evidence_path.as_ref() else {
             return PersistOutcome::Persisted;
         };
-        let bytes = match serde_json::to_vec_pretty(document) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                warn!("failed to serialize KD4 task evidence: {err}");
-                return PersistOutcome::Failed;
-            }
-        };
-        let _persistence_permit = match self.persistence_gate.acquire().await {
+        let permit = match Arc::clone(&self.persistence_gate).acquire_owned().await {
             Ok(permit) => permit,
             Err(err) => {
                 warn!("KD4 task-evidence persistence gate unexpectedly closed: {err}");
                 return PersistOutcome::Failed;
             }
         };
-        let last_persisted_revision = self.last_persisted_revision.load(Ordering::Acquire);
-        if last_persisted_revision != 0 {
-            if last_persisted_revision > document.revision {
-                return PersistOutcome::Superseded;
-            }
-            if last_persisted_revision == document.revision {
-                return PersistOutcome::Persisted;
+        persist_document_with_permit(
+            path.clone(),
+            document.clone(),
+            permit,
+            Arc::clone(&self.last_persisted_revision),
+            self.persistence_test_control(),
+        )
+        .await
+        .0
+    }
+
+    fn persistence_test_control(&self) -> Option<PersistenceTestControl> {
+        #[cfg(test)]
+        {
+            return self
+                .persistence_test_control
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+        }
+        #[cfg(not(test))]
+        None
+    }
+}
+
+async fn persist_document_with_permit(
+    path: PathBuf,
+    document: TaskEvidenceDocument,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    last_persisted_revision: Arc<AtomicU64>,
+    test_control: Option<PersistenceTestControl>,
+) -> (PersistOutcome, Option<tokio::sync::OwnedSemaphorePermit>) {
+    let bytes = match serde_json::to_vec_pretty(&document) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            warn!("failed to serialize KD4 task evidence: {err}");
+            return (PersistOutcome::Failed, Some(permit));
+        }
+    };
+    match tokio::task::spawn_blocking(move || {
+        if let Some(control) = test_control.as_ref() {
+            if let Some((started, release)) = control
+                .before_next_write
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+            {
+                started.wait();
+                release.wait();
             }
         }
-        let write_path = path.clone();
-        match tokio::task::spawn_blocking(move || atomic_write_evidence(&write_path, &bytes)).await
-        {
-            Ok(Ok(())) => {
-                self.last_persisted_revision
-                    .store(document.revision, Ordering::Release);
-                PersistOutcome::Persisted
+        let last_revision = last_persisted_revision.load(Ordering::Acquire);
+        let outcome = if last_revision > document.revision {
+            PersistOutcome::Superseded
+        } else if last_revision == document.revision && last_revision != 0 {
+            PersistOutcome::Persisted
+        } else {
+            let write_result = if test_control
+                .as_ref()
+                .is_some_and(|control| control.fail_writes.load(Ordering::Acquire))
+            {
+                Err(io::Error::other(
+                    "injected task-evidence persistence failure",
+                ))
+            } else {
+                atomic_write_evidence(&path, &bytes)
+            };
+            match write_result {
+                Ok(()) => {
+                    last_persisted_revision.store(document.revision, Ordering::Release);
+                    PersistOutcome::Persisted
+                }
+                Err(err) => {
+                    warn!("failed to persist KD4 task evidence: {err}");
+                    PersistOutcome::Failed
+                }
             }
-            Ok(Err(err)) => {
-                warn!("failed to persist KD4 task evidence: {err}");
-                PersistOutcome::Failed
-            }
-            Err(err) => {
-                warn!("KD4 task-evidence persistence task failed: {err}");
-                PersistOutcome::Failed
-            }
+        };
+        (outcome, permit)
+    })
+    .await
+    {
+        Ok((outcome, permit)) => (outcome, Some(permit)),
+        Err(err) => {
+            warn!("KD4 task-evidence persistence task failed: {err}");
+            (PersistOutcome::Failed, None)
         }
     }
+}
+
+async fn delete_external_artifact_owned(
+    codex_home: Option<&Path>,
+    thread_id: Option<&str>,
+    artifact_id: Option<&str>,
+) {
+    let (Some(artifact_id), Some(codex_home), Some(thread_id)) =
+        (artifact_id, codex_home, thread_id)
+    else {
+        return;
+    };
+    if let Err(err) = crate::tools::command_output_artifact::delete_evidence_artifact(
+        codex_home,
+        thread_id,
+        artifact_id,
+    )
+    .await
+    {
+        warn!("failed to delete external evidence artifact {artifact_id}: {err}");
+    }
+}
+
+struct ExternalEvidenceMetadata {
+    producer: String,
+    producer_schema_version: u32,
+    provider_snapshot: Option<String>,
+    payload_completeness: EvidenceCompleteness,
+    truncated: bool,
+    approximate: bool,
+    limitations: Vec<String>,
+}
+
+fn extract_external_evidence_metadata(
+    result: &CallToolResult,
+) -> Result<Option<ExternalEvidenceMetadata>, &'static str> {
+    let Some(structured) = result.structured_content.as_ref() else {
+        return Ok(None);
+    };
+    let Some(evidence_meta) = structured.get("evidenceMeta") else {
+        return Ok(None);
+    };
+    let Some(meta) = evidence_meta.as_object() else {
+        return Err("MCP evidenceMeta is malformed and was ignored");
+    };
+    let Some(schema_version) = meta.get("schemaVersion").and_then(Value::as_u64) else {
+        return Err("MCP evidenceMeta schemaVersion is malformed and was ignored");
+    };
+    if schema_version != 1 {
+        return Err("MCP evidenceMeta schemaVersion is unsupported and was ignored");
+    }
+    let Some(producer) = meta.get("producer").and_then(Value::as_str) else {
+        return Err("MCP evidenceMeta producer is malformed and was ignored");
+    };
+    if !matches!(producer, "kds" | "kdwg" | "repo-atlas") {
+        return Err("MCP evidenceMeta producer is unknown and was ignored");
+    }
+    let Some(evidence_bearing) = meta.get("evidenceBearing").and_then(Value::as_bool) else {
+        return Err("MCP evidenceMeta evidenceBearing is malformed and was ignored");
+    };
+    if !evidence_bearing {
+        return Ok(None);
+    }
+    if meta
+        .get("operation")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err("MCP evidenceMeta operation is malformed and was ignored");
+    }
+    let payload_completeness = match meta.get("payloadCompleteness").and_then(Value::as_str) {
+        Some("complete") => EvidenceCompleteness::Complete,
+        Some("partial") => EvidenceCompleteness::Partial,
+        Some("unknown") => EvidenceCompleteness::Unknown,
+        _ => {
+            return Err("MCP evidenceMeta payloadCompleteness is malformed and was ignored");
+        }
+    };
+    let Some(truncated) = meta.get("truncated").and_then(Value::as_bool) else {
+        return Err("MCP evidenceMeta truncated flag is malformed and was ignored");
+    };
+    let Some(approximate) = meta.get("approximate").and_then(Value::as_bool) else {
+        return Err("MCP evidenceMeta approximate flag is malformed and was ignored");
+    };
+    let Some(limitations) = meta.get("limitations").and_then(Value::as_array) else {
+        return Err("MCP evidenceMeta limitations are malformed and were ignored");
+    };
+    let Some(limitations) = limitations
+        .iter()
+        .map(|value| value.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Err("MCP evidenceMeta limitations are malformed and were ignored");
+    };
+    let provider_snapshot = match meta.get("snapshot") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(snapshot)) => Some(snapshot.clone()),
+        Some(_) => return Err("MCP evidenceMeta snapshot is malformed and was ignored"),
+    };
+    Ok(Some(ExternalEvidenceMetadata {
+        producer: producer.to_string(),
+        producer_schema_version: schema_version as u32,
+        provider_snapshot,
+        payload_completeness,
+        truncated,
+        approximate,
+        limitations,
+    }))
+}
+
+fn canonical_mcp_result_payload(result: &CallToolResult) -> Value {
+    canonicalize_json_value(serde_json::json!({
+        "content": result.content,
+        "structuredContent": result.structured_content,
+        "isError": result.is_error,
+    }))
+}
+
+fn canonicalize_json_value(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let sorted = map
+                .into_iter()
+                .map(|(key, value)| (key, canonicalize_json_value(value)))
+                .collect::<BTreeMap<_, _>>();
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(canonicalize_json_value).collect())
+        }
+        other => other,
+    }
+}
+
+const fn evidence_completeness_name(completeness: EvidenceCompleteness) -> &'static str {
+    match completeness {
+        EvidenceCompleteness::Complete => "complete",
+        EvidenceCompleteness::Partial => "partial",
+        EvidenceCompleteness::Unknown => "unknown",
+    }
+}
+
+fn encode_external_evidence_artifact(canonical_bytes: &[u8]) -> Vec<u8> {
+    let canonical = std::str::from_utf8(canonical_bytes)
+        .expect("canonical JSON serialization always produces valid UTF-8");
+    let mut encoded = Vec::with_capacity(canonical_bytes.len() + 256);
+    encoded.extend_from_slice(EXTERNAL_EVIDENCE_ARTIFACT_HEADER.as_bytes());
+    let mut start = 0;
+    while start < canonical.len() {
+        let mut end = (start + EXTERNAL_EVIDENCE_ARTIFACT_CHUNK_BYTES).min(canonical.len());
+        while !canonical.is_char_boundary(end) {
+            end -= 1;
+        }
+        let line = serde_json::to_string(&canonical[start..end])
+            .expect("string serialization cannot fail");
+        encoded.extend_from_slice(line.as_bytes());
+        encoded.push(b'\n');
+        start = end;
+    }
+    encoded
+}
+
+fn workspace_root_fingerprint(start: &TaskStartState) -> String {
+    let identity = canonicalize_json_value(serde_json::json!({
+        "repositoryRoot": start.repository_root,
+        "repositoryUrl": start.repository_url,
+    }));
+    let bytes =
+        serde_json::to_vec(&identity).expect("workspace identity serialization cannot fail");
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 enum ExistingDocument {
@@ -1368,6 +2110,14 @@ fn migrate_document(document: &mut TaskEvidenceDocument) {
                     .iter()
                     .map(|receipt| receipt.id.as_str()),
             ));
+    document.next_external_evidence_receipt_sequence = document
+        .next_external_evidence_receipt_sequence
+        .max(next_sequence_after_ids(
+            document
+                .external_evidence
+                .iter()
+                .map(|receipt| receipt.id.as_str()),
+        ));
     let (duplicate_edit_indices, _) = duplicate_receipt_indices(
         document
             .edit_receipts
@@ -1400,6 +2150,20 @@ fn migrate_document(document: &mut TaskEvidenceDocument) {
     for index in duplicate_validation_indices {
         let id = next_receipt_id("validation", &mut document.next_validation_receipt_sequence);
         document.validation_receipts[index].id = id;
+    }
+    let (duplicate_external_indices, _) = duplicate_receipt_indices(
+        document
+            .external_evidence
+            .iter()
+            .enumerate()
+            .map(|(index, receipt)| (index, receipt.id.as_str())),
+    );
+    for index in duplicate_external_indices {
+        let id = next_receipt_id(
+            "external-evidence",
+            &mut document.next_external_evidence_receipt_sequence,
+        );
+        document.external_evidence[index].id = id;
     }
     if !duplicate_validation_ids.is_empty() {
         for step in &mut document.plan {
@@ -2055,6 +2819,7 @@ fn derive_completion_gate(
 }
 
 fn invalidate_for_mutation(document: &mut TaskEvidenceDocument) {
+    document.host_mutation_revision = document.host_mutation_revision.saturating_add(1);
     invalidate_evidence(document, true, true);
 }
 

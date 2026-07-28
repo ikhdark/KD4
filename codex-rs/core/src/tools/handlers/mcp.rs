@@ -4,6 +4,7 @@ use std::time::Instant;
 use crate::function_tool::FunctionCallError;
 use crate::mcp_tool_call::handle_mcp_tool_call;
 use crate::original_image_detail::can_request_original_image_detail;
+use crate::task_evidence::ExternalEvidenceCapture;
 use crate::tools::context::McpToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -17,6 +18,8 @@ use crate::tools::registry::ToolExecutionTiming;
 use crate::tools::registry::ToolExecutor;
 use crate::tools::registry::ToolTelemetryTags;
 use codex_mcp::ToolInfo;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::WarningEvent;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolName;
@@ -26,6 +29,7 @@ use codex_tools::ToolSpec;
 use codex_tools::mcp_tool_to_responses_api_tool;
 use serde_json::Map;
 use serde_json::Value;
+use tracing::warn;
 
 const LEGACY_MCP_TOOL_NAME_PREFIX: &str = "mcp__";
 const MCP_TOOL_NAME_DELIMITER: &str = "__";
@@ -154,6 +158,32 @@ impl McpHandler {
             cancellation_token,
         )
         .await;
+        if let Some(raw_server_result) = result.raw_server_result.as_ref() {
+            match session
+                .services
+                .task_evidence
+                .record_external_mcp_evidence(
+                    &self.tool_info.server_name,
+                    self.tool_info.tool.name.as_ref(),
+                    &call_id,
+                    raw_server_result,
+                )
+                .await
+            {
+                ExternalEvidenceCapture::Warning(message) => {
+                    warn!("{message}");
+                    session
+                        .send_event(
+                            turn.as_ref(),
+                            EventMsg::Warning(WarningEvent {
+                                message: message.to_string(),
+                            }),
+                        )
+                        .await;
+                }
+                ExternalEvidenceCapture::Ignored | ExternalEvidenceCapture::Stored => {}
+            }
+        }
 
         Ok(boxed_tool_output(McpToolOutput {
             result: result.result,

@@ -529,7 +529,9 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let artifact_path = std::path::PathBuf::from(r"C:\codex\tool-output\raw.log");
+    let artifact_id: ToolOutputArtifactId = "019fa782-f8e1-7533-a3f7-60d3f9a42997".parse().unwrap();
+    let artifact_path =
+        std::path::PathBuf::from(format!(r"C:\codex\tool-output\{artifact_id}.log"));
     let output = ExecCommandToolOutput {
         event_call_id: "call-summary".to_string(),
         chunk_id: "chunk-summary".to_string(),
@@ -542,6 +544,7 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
         original_token_count: Some(20_000),
         hook_command: Some("cargo test".to_string()),
         raw_output_artifact: Some(RawOutputArtifact::Stored {
+            id: artifact_id,
             path: artifact_path.clone(),
             bytes: raw_output.len() as u64,
         }),
@@ -552,20 +555,148 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
     assert!(response.contains("Shell output summary:"));
     assert!(response.contains("error: exact retained failure marker 450"));
     assert!(!response.contains("ordinary-0300"));
-    assert!(response.contains(&artifact_path.display().to_string()));
+    assert!(response.contains(&artifact_id.to_string()));
+    assert!(!response.contains(&artifact_path.display().to_string()));
     assert!(response.contains("Command preflight applied one repair"));
 
     let code_mode = output.code_mode_result(&ToolPayload::Function {
         arguments: "{}".to_string(),
     });
-    assert_eq!(
-        code_mode["raw_output_artifact"],
-        artifact_path.to_string_lossy().as_ref()
-    );
+    assert_eq!(code_mode["raw_output_artifact_id"], artifact_id.to_string());
     assert_eq!(code_mode["raw_output_artifact_bytes"], raw_output.len());
     assert!(
         code_mode["output"]
             .as_str()
             .is_some_and(|value| value.contains("Shell output summary:"))
     );
+}
+
+fn artifact_backed_exec_output(
+    raw_output: &[u8],
+    max_output_tokens: Option<usize>,
+) -> (
+    ExecCommandToolOutput,
+    ToolOutputArtifactId,
+    std::path::PathBuf,
+    tempfile::TempDir,
+) {
+    let artifact_id: ToolOutputArtifactId = "019fa78a-0e8e-78d1-8a9d-b67d330eb5b6".parse().unwrap();
+    let retained_root = tempfile::tempdir().expect("retained artifact root");
+    let artifact_directory = retained_root.path().join("tool-output").join("thread");
+    std::fs::create_dir_all(&artifact_directory).expect("create artifact directory");
+    let artifact_path = artifact_directory.join(format!("{artifact_id}.log"));
+    std::fs::write(&artifact_path, raw_output).expect("write retained artifact");
+    (
+        ExecCommandToolOutput {
+            event_call_id: "call-artifact".to_string(),
+            chunk_id: "chunk-artifact".to_string(),
+            wall_time: std::time::Duration::from_millis(1),
+            raw_output: raw_output.to_vec(),
+            truncation_policy: TruncationPolicy::Tokens(10_000),
+            max_output_tokens,
+            process_id: None,
+            exit_code: Some(0),
+            original_token_count: None,
+            hook_command: None,
+            raw_output_artifact: Some(RawOutputArtifact::Stored {
+                id: artifact_id,
+                path: artifact_path.clone(),
+                bytes: raw_output.len() as u64,
+            }),
+            repair_notice: None,
+        },
+        artifact_id,
+        artifact_path,
+        retained_root,
+    )
+}
+
+#[test]
+fn exec_model_output_exposes_artifact_id_not_path() {
+    let (output, artifact_id, artifact_path, _retained_root) =
+        artifact_backed_exec_output(b"complete output\n", Some(1_000));
+
+    let response = output.response_text();
+
+    assert!(response.contains(&artifact_id.to_string()));
+    assert!(!response.contains(&artifact_path.to_string_lossy().to_string()));
+}
+
+#[test]
+fn exec_code_mode_exposes_artifact_id_not_path() {
+    let (mut output, artifact_id, artifact_path, _retained_root) =
+        artifact_backed_exec_output(b"complete output\n", Some(1_000));
+
+    let result = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".to_string(),
+    });
+
+    assert_eq!(result["raw_output_artifact_id"], artifact_id.to_string());
+    assert!(result.get("raw_output_artifact").is_none());
+    assert!(
+        !result
+            .to_string()
+            .contains(&artifact_path.to_string_lossy().to_string())
+    );
+
+    output.raw_output_artifact = Some(RawOutputArtifact::Failed {
+        id: Some(artifact_id),
+        message: format!("failed to flush `{}`", artifact_path.display()),
+        owned_path: Some(artifact_path.clone()),
+        bytes: 7,
+    });
+    let failed_result = output.code_mode_result(&ToolPayload::Function {
+        arguments: "{}".to_string(),
+    });
+    assert_eq!(
+        failed_result["raw_output_artifact_error"],
+        "raw output artifact storage failed"
+    );
+    assert!(
+        !failed_result
+            .to_string()
+            .contains(&artifact_path.to_string_lossy().to_string())
+    );
+}
+
+#[test]
+fn exec_reduction_notice_appears_when_model_output_is_reduced() {
+    let raw_output = "word ".repeat(200);
+    let (output, artifact_id, _, _retained_root) =
+        artifact_backed_exec_output(raw_output.as_bytes(), Some(4));
+
+    let response = output.response_text();
+
+    assert!(response.contains(&format!(
+        "[command output reduced; full retained output is available as artifact {artifact_id}."
+    )));
+    assert!(response.contains("Use read_tool_output with that id and a narrow line range.]"));
+}
+
+#[test]
+fn exec_reduction_notice_is_absent_for_complete_output() {
+    let (output, _, _, _retained_root) =
+        artifact_backed_exec_output(b"complete output\n", Some(1_000));
+
+    let response = output.response_text();
+
+    assert!(!response.contains("[command output reduced;"));
+}
+
+#[test]
+fn exec_reduction_notice_is_absent_after_artifact_is_evicted() {
+    let raw_output = "word ".repeat(200);
+    let (output, _, artifact_path, _retained_root) =
+        artifact_backed_exec_output(raw_output.as_bytes(), Some(4));
+    std::fs::remove_file(&artifact_path).expect("evict retained artifact");
+
+    let response = output.response_text();
+
+    assert!(!response.contains("[command output reduced;"));
+    assert!(!response.contains("full retained output is available"));
+
+    std::fs::create_dir(&artifact_path).expect("replace artifact with nonregular entry");
+    let nonregular_response = output.response_text();
+    assert!(!nonregular_response.contains("[command output reduced;"));
+    assert!(!nonregular_response.contains("full retained output is available"));
 }

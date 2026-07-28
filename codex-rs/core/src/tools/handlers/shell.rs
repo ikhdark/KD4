@@ -416,13 +416,12 @@ async fn run_exec_like_with_exit_code_inner(
             .await;
     }
     let event_ctx = ToolEventCtx::new(session.as_ref(), turn.as_ref(), &call_id, event_tracker);
-    let post_tool_use_response = out
+    let model_projection = out.as_ref().ok().map(|output| {
+        crate::tools::project_exec_output_text(output, turn.model_info.truncation_policy.into())
+    });
+    let post_tool_use_response = model_projection
         .as_ref()
-        .ok()
-        .map(|output| {
-            crate::tools::format_exec_output_str(output, turn.model_info.truncation_policy.into())
-        })
-        .map(JsonValue::String);
+        .map(|projection| JsonValue::String(projection.text.clone()));
     let advisory = out.as_ref().ok().and_then(|output| {
         powershell_script_failure_advisory(
             shell_type,
@@ -467,6 +466,12 @@ async fn run_exec_like_with_exit_code_inner(
     }
     if let Some(raw_output_artifact) = raw_output_artifact {
         insert_metadata_before_output(&mut content, &raw_output_artifact.render_for_model());
+        if model_projection.is_some_and(|projection| projection.reduced)
+            && let Some(notice) = raw_output_artifact.reduction_notice()
+        {
+            content.push('\n');
+            content.push_str(&notice);
+        }
     }
     Ok(RunExecLikeResult {
         output: FunctionToolOutput {

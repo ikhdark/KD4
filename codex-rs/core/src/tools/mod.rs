@@ -126,8 +126,20 @@ pub fn format_exec_output_str(
     exec_output: &ExecToolCallOutput,
     truncation_policy: TruncationPolicy,
 ) -> String {
+    project_exec_output_text(exec_output, truncation_policy).text
+}
+
+pub(crate) struct FormattedExecOutput {
+    pub(crate) text: String,
+    pub(crate) reduced: bool,
+}
+
+pub(crate) fn project_exec_output_text(
+    exec_output: &ExecToolCallOutput,
+    truncation_policy: TruncationPolicy,
+) -> FormattedExecOutput {
     let raw_content = build_content_with_timeout(exec_output);
-    let content = summarize_shell_output_for_model(
+    let summarized = summarize_shell_output_for_model(
         &raw_content,
         exec_output.exit_code,
         exec_output.timed_out,
@@ -136,11 +148,15 @@ pub fn format_exec_output_str(
             turn_cost_guard: false,
             command_text: None,
         },
-    )
-    .unwrap_or(raw_content);
+    );
+    let content = summarized.as_deref().unwrap_or(&raw_content);
 
     // Truncate for model consumption before serialization.
-    formatted_truncate_text(&content, truncation_policy)
+    let text = formatted_truncate_text(content, truncation_policy);
+    FormattedExecOutput {
+        reduced: summarized.is_some() || text != content,
+        text,
+    }
 }
 
 /// Extracts exec output content and prepends a timeout message if the command timed out.

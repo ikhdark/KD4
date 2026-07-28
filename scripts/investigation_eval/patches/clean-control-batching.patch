@@ -1,0 +1,20 @@
+diff --git a/investigation_cases/clean_control_batching.rs b/investigation_cases/clean_control_batching.rs
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/clean_control_batching.rs
+@@ -0,0 +1,15 @@
++/// Returns no batches when `width` is zero.
++fn batches<T>(items: &[T], width: usize) -> Vec<&[T]> {
++    if width == 0 {
++        return Vec::new();
++    }
++
++    let mut result = Vec::new();
++    let mut start = 0;
++    while start < items.len() {
++        let end = start.saturating_add(width).min(items.len());
++        result.push(&items[start..end]);
++        start = end;
++    }
++    result
++}

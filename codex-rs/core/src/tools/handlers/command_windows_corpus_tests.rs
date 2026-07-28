@@ -208,7 +208,7 @@ async fn windows_command_corpus_measures_phase2_exit_gate() {
 
     let artifact =
         create_raw_output_artifact(temp.path(), "corpus-thread", raw_output.as_bytes()).await;
-    let RawOutputArtifact::Stored { path, bytes } = artifact else {
+    let RawOutputArtifact::Stored { path, bytes, .. } = artifact else {
         panic!("raw output artifact should be stored");
     };
     assert_eq!(bytes, raw_output.len() as u64);

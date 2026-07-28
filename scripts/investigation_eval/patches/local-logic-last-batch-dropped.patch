@@ -1,0 +1,19 @@
+diff --git a/investigation_cases/local_logic_last_batch_dropped.rs b/investigation_cases/local_logic_last_batch_dropped.rs
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/local_logic_last_batch_dropped.rs
+@@ -0,0 +1,14 @@
++fn batches<T>(items: &[T], width: usize) -> Vec<&[T]> {
++    if width == 0 {
++        return Vec::new();
++    }
++
++    let mut result = Vec::new();
++    let mut start = 0;
++    while start.saturating_add(width) < items.len() {
++        let end = start.saturating_add(width).min(items.len());
++        result.push(&items[start..end]);
++        start = end;
++    }
++    result
++}

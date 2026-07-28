@@ -64,6 +64,7 @@ mod hooks;
 #[cfg(not(target_os = "windows"))]
 mod hooks_mcp;
 mod image_rollout;
+mod investigation_evidence_schema;
 mod items;
 mod json_result;
 mod live_cli;

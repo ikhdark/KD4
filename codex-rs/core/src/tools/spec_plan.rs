@@ -21,6 +21,7 @@ use crate::tools::handlers::NewContextWindowHandler;
 use crate::tools::handlers::PlanHandler;
 use crate::tools::handlers::ReadFileSpanHandler;
 use crate::tools::handlers::ReadMcpResourceHandler;
+use crate::tools::handlers::ReadToolOutputHandler;
 use crate::tools::handlers::RequestPermissionsHandler;
 use crate::tools::handlers::RequestPluginInstallHandler;
 use crate::tools::handlers::RequestUserInputHandler;
@@ -720,6 +721,7 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
     let turn_context = context.step_context.turn.as_ref();
     let features = turn_context.config.features.get();
     let environment_mode = tool_environment_mode(context.step_context);
+    planned_tools.add(ReadToolOutputHandler);
 
     if turn_context.collaboration_mode.mode != ModeKind::Plan {
         planned_tools.add(PlanHandler);

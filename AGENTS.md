@@ -1,35 +1,10 @@
 # Repository policy
 
-Shared policy revision: `2026-07-27.1`.
-
-## Synchronization contract
-
-The canonical shared-policy source is:
-
-- `C:\Users\kuh\Desktop\kd4\AGENTS.md`
-
-Its synchronized targets are:
-
-- `C:\Users\kuh\Desktop\kds-main\AGENTS.md`
-- `C:\Users\kuh\Desktop\mdpwa-main\AGENTS.md`
-- `C:\Users\kuh\Desktop\kdsb-main\AGENTS.md`
-- `C:\Users\kuh\Desktop\kdpc-main\AGENTS.md`
-- `C:\Users\kuh\Desktop\kdgma-main\AGENTS.md`
-
-Every byte outside the project-context block below must remain identical across
-all six files. Only that block may contain repository-specific identity,
-ownership, commands, validation, runtime, installation, safety, or protected
-path details.
-
-Change shared rules only in the canonical KD4 source. When a shared rule
-changes, update its revision, copy the shared portion to all five targets in the
-same task, and compare normalized copies after replacing each project-context
-block with the same sentinel. Do not place repository-specific exceptions
-outside that block or edit a target's shared portion independently.
+Policy revision: `2026-07-28.1`.
 
 ## Project context
 
-<!-- PROJECT-CONTEXT: START (only this block may differ) -->
+<!-- PROJECT-CONTEXT: START -->
 ### Identity and objective
 
 - This checkout is the user's local fork of
@@ -52,9 +27,13 @@ outside that block or edit a target's shared portion independently.
   `.codex/config.toml` owns optional repo-local runtime configuration,
   `.codex/environments` owns worktree setup/state, and `.codex/skills` owns
   fork-local skills and validation workflows.
-- [`SOURCEMAP.md`](SOURCEMAP.md) owns the high-level directory map, runtime
-  entrypoints, Rust-domain routing, build/package/publish paths, generated
-  contracts, and cross-cutting change routes.
+- [`SOURCEMAP.md`](SOURCEMAP.md) owns the checked repository inventory, runtime
+  entrypoints, package and Rust-domain routing, build/package/publish paths,
+  generated contracts, validation routes, and cross-cutting change routes.
+- Treat the maintenance contract in [`SOURCEMAP.md`](SOURCEMAP.md) as required:
+  update the map in the same change whenever repository structure, ownership,
+  entrypoints, contracts, generated outputs, or build/install routes materially
+  change, then run `just source-map-check`.
 
 ### Project constraints
 
@@ -129,8 +108,7 @@ Read the closest relevant `AGENTS.md`. A nearer file augments this policy and
 takes precedence inside its subtree. Never rely on an instruction file that is
 absent from the working tree.
 
-Keep shared rules in the synchronized root portion, durable repository-specific
-rules inside the project-context block, and subtree-specific rules in the
+Keep repository-wide rules in this root file and subtree-specific rules in the
 nearest nested `AGENTS.md`. README and background documentation are not loaded
 automatically as instructions.
 
@@ -178,5 +156,15 @@ completes the request.
   instead of assuming a test run is green, and do not treat green tests alone
   as completion. Continue until the complete task-relevant behavior is
   implemented correctly.
-- When checking for bugs, do not stop at the first bug found, continue to collect all bugs then report/fix.
+- When checking for bugs, do not stop merely because the first bug was found. Continue
+  across the accepted scope until relevant surfaces have at least been surveyed and the
+  remaining candidates are confirmed, rejected, duplicated, deferred with a concrete
+  missing fact, blocked, out of scope, or disproportionately expensive to resolve
+  relative to their likely value. Never invent or pad findings to satisfy an expected
+  count.
+- A confirmed finding must identify the violated contract or invariant, the reachable
+  causal path or missing required transition, the practical consequence, and fresh
+  supporting evidence with precise locators or receipt IDs. Report plausible
+  evidence-backed issues that could not be confirmed separately as unconfirmed risks,
+  each with the exact missing fact and why investigation stopped.
 - Do NOT turn a directed fix into a broad fix. Stay focused on the task at hand.

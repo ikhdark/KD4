@@ -497,6 +497,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
             &["echo before".to_string()],
         ),
         raw_output_artifact: crate::tools::command_output_artifact::RawOutputArtifact::Failed {
+            id: None,
             message: "test fixture".to_string(),
             owned_path: None,
             bytes: 0,

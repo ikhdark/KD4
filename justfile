@@ -610,6 +610,7 @@ app-server-runtime-check:
     just app-server-process-exec-check
     just app-server-thread-status-check
 
+# Validate the source map and its material repository inventories.
 source-map-check:
     {{ python }} "{{ justfile_directory() }}/scripts/source_map_check.py" "{{ justfile_directory() }}/SOURCEMAP.md"
     {{ python }} "{{ justfile_directory() }}/scripts/asciicheck.py" "{{ justfile_directory() }}/SOURCEMAP.md"

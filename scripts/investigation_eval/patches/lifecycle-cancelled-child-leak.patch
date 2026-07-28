@@ -1,0 +1,21 @@
+diff --git a/investigation_cases/lifecycle_cancelled_child_leak.rs b/investigation_cases/lifecycle_cancelled_child_leak.rs
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/lifecycle_cancelled_child_leak.rs
+@@ -0,0 +1,16 @@
++use std::io;
++use std::process::ExitStatus;
++use tokio::process::Child;
++use tokio_util::sync::CancellationToken;
++
++pub async fn run_until_cancelled(
++    mut child: Child,
++    cancellation: CancellationToken,
++) -> io::Result<ExitStatus> {
++    tokio::select! {
++        status = child.wait() => status,
++        _ = cancellation.cancelled() => {
++            Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"))
++        }
++    }
++}

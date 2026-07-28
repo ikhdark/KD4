@@ -195,6 +195,11 @@ impl VerifyLocalHandler {
                 "verify_local is available only in the selected local environment".to_string(),
             ));
         }
+        if !session.services.task_evidence.allows_kd4_completion() {
+            return Err(FunctionCallError::RespondToModel(
+                "verify_local is unavailable outside KD4 completion mode".to_string(),
+            ));
+        }
         let repo_root = find_verify_local_repo_root(environment.cwd()).ok_or_else(|| {
             FunctionCallError::RespondToModel(
                 "verify_local is unavailable: expected scripts/verify_local.py and justfile in this repo"

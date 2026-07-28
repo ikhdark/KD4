@@ -405,6 +405,7 @@ mod tests {
                 42,
                 key.clone(),
                 RawOutputArtifact::Failed {
+                    id: None,
                     message: "fixture".to_string(),
                     owned_path: None,
                     bytes: 0,

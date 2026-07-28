@@ -1682,6 +1682,41 @@ fn sanitize_mcp_tool_result_for_model_preserves_image_when_supported() {
 }
 
 #[test]
+fn raw_mcp_tool_result_remains_exact_when_model_copy_is_sanitized() {
+    let original = CallToolResult {
+        content: vec![serde_json::json!({
+            "type": "image",
+            "data": "Zm9v",
+            "mimeType": "image/png",
+        })],
+        structured_content: Some(serde_json::json!({"evidenceMeta": {"schemaVersion": 1}})),
+        is_error: Some(false),
+        meta: Some(serde_json::json!({"server": "raw"})),
+    };
+
+    let (raw, model) = preserve_raw_mcp_tool_result_for_evidence(
+        /*supports_image_input*/ false,
+        original.clone(),
+    )
+    .expect("preserved result");
+
+    assert_eq!(raw, original);
+    assert_ne!(model.content, raw.content);
+    assert_eq!(model.structured_content, raw.structured_content);
+}
+
+#[test]
+fn synthetic_mcp_outcomes_never_expose_raw_server_evidence() {
+    let skipped =
+        McpToolCallOutcome::skipped("skipped".to_string(), serde_json::json!({"input": true}));
+    let cancelled =
+        McpToolCallOutcome::cancelled(serde_json::json!({"input": true}), Duration::from_millis(1));
+
+    assert_eq!(skipped.raw_server_result, None);
+    assert_eq!(cancelled.raw_server_result, None);
+}
+
+#[test]
 fn truncate_mcp_tool_result_for_event_preserves_small_result() {
     let original = CallToolResult {
         content: vec![serde_json::json!({
