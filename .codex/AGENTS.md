@@ -34,7 +34,6 @@ Generated or local runtime state includes:
 - `.codex/app-asar-backups/**`
 - `.codex/app-asar-work/**`, except durable instructions explicitly kept there
 - `.codex/codex-desktop-patched/**`
-- `.codex/wiring-guard/**`
 
 Do not hand-edit generated or runtime-state files unless the task is explicitly
 to inspect, repair, or reset that local state. Do not treat state or cache files

@@ -1,6 +1,7 @@
 use codex_tools::JsonSchema;
 use codex_tools::ResponsesApiTool;
 use codex_tools::ToolSpec;
+use codex_utils_output_truncation::adaptive_output_budget_description;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -89,7 +90,10 @@ pub(crate) fn create_exec_command_tool_with_environment_id(
         (
             "max_output_tokens".to_string(),
             JsonSchema::number(Some(
-                "Output token budget. Defaults adaptively to 4000 tokens for success, 8000 for failure/timeout, and up to 10000 for high-signal diagnostics; larger requests may be capped by policy.".to_string(),
+                format!(
+                    "Output token budget. {}; larger requests may be capped by policy.",
+                    adaptive_output_budget_description()
+                ),
             )),
         ),
     ]);
@@ -164,7 +168,10 @@ pub fn create_write_stdin_tool() -> ToolSpec {
         (
             "max_output_tokens".to_string(),
             JsonSchema::number(Some(
-                "Output token budget. Defaults adaptively to 4000 tokens for success, 8000 for failure/timeout, and up to 10000 for high-signal diagnostics; larger requests may be capped by policy.".to_string(),
+                format!(
+                    "Output token budget. {}; larger requests may be capped by policy.",
+                    adaptive_output_budget_description()
+                ),
             )),
         ),
     ]);

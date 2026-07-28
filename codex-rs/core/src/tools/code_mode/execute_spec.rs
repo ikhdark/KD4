@@ -40,6 +40,8 @@ SOURCE: /[\s\S]+/
 mod tests {
     use super::*;
     use codex_tools::ToolName;
+    use codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS;
+    use codex_utils_output_truncation::adaptive_output_budget_description;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -83,6 +85,20 @@ SOURCE: /[\s\S]+/
                     .to_string(),
                 },
             })
+        );
+    }
+
+    #[test]
+    fn code_mode_descriptions_match_shared_adaptive_output_limits() {
+        let expected = adaptive_output_budget_description();
+        let exec_description =
+            codex_code_mode::build_exec_tool_description(&[], &[], &BTreeMap::new(), true);
+
+        assert!(exec_description.contains(&expected));
+        assert!(codex_code_mode::build_wait_tool_description().contains(&expected));
+        assert_eq!(
+            codex_code_mode::DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL,
+            DEFAULT_SUCCESS_OUTPUT_TOKENS
         );
     }
 }

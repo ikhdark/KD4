@@ -324,7 +324,7 @@ remain required.
 | Python SDK | focused `uv run pytest` and `uv run ruff check .` |
 | Package/archive flow | package-local tests followed by the relevant staging or dry-run proof |
 | Local publish wiring | `just publish-local-codex-dry-run`; installed replacement requires `just publish-local-codex-final` |
-| Installed provider external-evidence path | `python scripts/investigation_evidence_smoke.py --run`; uses staged local KDS/KDWG/Repo Atlas plugins, disposable Git repositories and Codex homes, and a loopback model endpoint |
+| Installed provider external-evidence path | `python scripts/investigation_evidence_smoke.py --run`; uses staged local KDS and Repo Atlas plugins, disposable Git repositories and Codex homes, and a loopback model endpoint |
 | Repository-scoped final validation | `just verify-local <args>` or `scripts/verify_local.py` through its documented bounded flow |
 
 Green tooling alone does not prove runtime behavior. Use the focused failing

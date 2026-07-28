@@ -51,7 +51,6 @@ FORBIDDEN_INVESTIGATION_FIELDS = {
 }
 PLUGIN_MENTIONS = {
     "kds": "[@kds](plugin://kds@local-kds)",
-    "kdwg": "[@wiring-guard](plugin://wiring-guard@local-wiring-guards)",
     "repo-atlas": "[@repo-atlas](plugin://repo-atlas@repo-atlas-local)",
 }
 
@@ -316,7 +315,6 @@ def tool_search_is_advertised(tools: object) -> bool:
 def tool_search_query(invocation: ToolInvocation) -> str:
     queries = {
         ("kds", "KDS"): "KDS compact noisy diagnostic command output",
-        ("kdwg", "KDWG"): "KDWG static implementation wiring check",
         ("repo_atlas", "select_root"): "Repo Atlas select repository root",
         ("repo_atlas", "find_def"): "Repo Atlas find exact symbol definition",
         ("repo_atlas", "trace"): "Repo Atlas approximate symbol trace",
@@ -348,7 +346,6 @@ def plugin_request_summary(provider: str, body: dict[str, Any]) -> str:
     plugin_uri = PLUGIN_MENTIONS[provider].split("(", 1)[1][:-1]
     plugin_skill = {
         "kds": "kds:kds",
-        "kdwg": "wiring-guard:wire-implementations",
         "repo-atlas": "repo-atlas:repo-atlas",
     }[provider]
     return (
@@ -714,10 +711,7 @@ def install_provider(
         )
         return
 
-    if provider == "kdwg":
-        marketplace = "local-wiring-guards"
-        selector = "wiring-guard@local-wiring-guards"
-    elif provider == "repo-atlas":
+    if provider == "repo-atlas":
         marketplace = "repo-atlas-local"
         selector = "repo-atlas@repo-atlas-local"
     else:
@@ -826,19 +820,6 @@ def kds_fixture(noisy: bool) -> dict[str, str]:
     }
 
 
-def kdwg_fixture() -> dict[str, str]:
-    return {
-        "app.py": (
-            "def reset():\n"
-            "    return 'reset'\n\n"
-            "def unused():\n"
-            "    return 'unused'\n\n"
-            "def dispatch():\n"
-            "    return reset()\n"
-        )
-    }
-
-
 def repo_atlas_fixture() -> dict[str, str]:
     return {
         "package.json": '{"name":"repo-atlas-smoke","private":true,"type":"module"}\n',
@@ -927,42 +908,6 @@ def make_case(
                 },
             ),
             kds_fixture(noisy=True),
-        )
-    if provider == "kdwg" and ordinal in {0, 1}:
-        expected_target = "reset" if ordinal == 0 else "unused"
-        target = ToolInvocation(
-            "kdwg",
-            "KDWG",
-            "kdwg-wired-call" if ordinal == 0 else "kdwg-gaps-call",
-            {
-                "command": [
-                    "check",
-                    "--expect",
-                    "app.py::dispatch",
-                    f"app.py::{expected_target}",
-                ],
-                "cwd": str(repo),
-            },
-        )
-        verdict = "WIRED" if ordinal == 0 else "GAPS_FOUND"
-        return (
-            CaseSpec(
-                name="kdwg-wired" if ordinal == 0 else "kdwg-gaps",
-                provider=provider,
-                producer="kdwg",
-                expected_server_name="kdwg",
-                expected_operation="check",
-                target=target,
-                calls=(target,),
-                expected_completeness="complete",
-                expected_truncated=False,
-                expected_approximate=False,
-                expected_tool_success=ordinal == 0,
-                expected_snapshot="present",
-                expected_model_fields={"verdict": verdict},
-                expected_content_markers=(verdict,),
-            ),
-            kdwg_fixture(),
         )
     if provider == "repo-atlas" and ordinal in {0, 1}:
         select = ToolInvocation(
@@ -1524,7 +1469,6 @@ def assert_no_temp_processes(temp_root: Path, env: dict[str, str]) -> None:
 def provider_paths(args: argparse.Namespace) -> dict[str, Path]:
     return {
         "kds": args.kds.resolve(),
-        "kdwg": args.kdwg.resolve(),
         "repo-atlas": args.repo_atlas.resolve(),
     }
 
@@ -1565,7 +1509,7 @@ def parse_args() -> argparse.Namespace:
     desktop = repository.parent
     parser = argparse.ArgumentParser(
         description=(
-            "Exercise installed KDS, KDWG, and Repo Atlas MCP results through "
+            "Exercise installed KDS and Repo Atlas MCP results through "
             "KD4 evidence-only persistence. Requires the explicit --run guard."
         )
     )
@@ -1585,12 +1529,6 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=desktop / "kds-main",
         help="local KDS checkout",
-    )
-    parser.add_argument(
-        "--kdwg",
-        type=Path,
-        default=desktop / "KDWG",
-        help="local KDWG checkout",
     )
     parser.add_argument(
         "--repo-atlas",
@@ -1699,7 +1637,7 @@ def main() -> int:
                 )
                 passed += 1
 
-        print(f"PASS integrated provider evidence smoke: {passed}/6 cases")
+        print(f"PASS integrated provider evidence smoke: {passed}/4 cases")
         return 0
     except Exception as exc:  # noqa: BLE001 - one redacted, nonzero smoke report
         print(f"FAIL integrated provider evidence smoke: {redactor.text(exc)}", file=sys.stderr)
