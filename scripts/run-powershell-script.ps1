@@ -25,9 +25,11 @@ param(
 $ErrorActionPreference = 'Stop'
 
 if ([string]::IsNullOrWhiteSpace($PowerShellPath)) {
-    $command = Get-Command pwsh -ErrorAction SilentlyContinue
+    $command = Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
     if ($null -eq $command) {
-        $command = Get-Command powershell.exe -ErrorAction SilentlyContinue
+        $command = Get-Command powershell.exe -CommandType Application -ErrorAction SilentlyContinue |
+            Select-Object -First 1
     }
     if ($null -eq $command) {
         throw 'PowerShell executable not found. Install pwsh or pass -PowerShellPath.'
@@ -50,7 +52,7 @@ $encodedArgumentList = [Convert]::ToBase64String(
 )
 $runner = @"
 `$argumentJson = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$encodedArgumentList'))
-`$argumentList = @(`$argumentJson | ConvertFrom-Json)
+`[string[]]`$argumentList = ConvertFrom-Json -InputObject `$argumentJson
 if ('$encodedScriptPath') {
     `$scriptPath = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('$encodedScriptPath'))
     & `$scriptPath @argumentList
@@ -70,10 +72,16 @@ if (-not $UseProfile) {
 }
 $powerShellArgs += @('-EncodedCommand', $encoded)
 
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    $commandLineLength = $PowerShellPath.Length
+    foreach ($argument in $powerShellArgs) {
+        # Include a separating space and worst-case surrounding quotes.
+        $commandLineLength += $argument.Length + 3
+    }
+    if ($commandLineLength -ge 32767) {
+        throw "Encoded command is too large for the Windows command-line limit ($commandLineLength characters). Use -ScriptFile for large script bodies."
+    }
+}
+
 & $PowerShellPath @powerShellArgs
-if ($LASTEXITCODE -is [int]) {
-    exit $LASTEXITCODE
-}
-if (-not $?) {
-    exit 1
-}
+exit $LASTEXITCODE

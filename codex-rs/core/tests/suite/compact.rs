@@ -382,6 +382,7 @@ fn model_info_with_context_window(slug: &str, context_window: i64) -> ModelInfo 
         .find(|model| model.slug == slug)
         .expect("model missing from models.json");
     model_info.context_window = Some(context_window);
+    model_info.auto_compact_token_limit = Some(context_window * 90 / 100);
     model_info
 }
 
@@ -1175,7 +1176,10 @@ async fn multiple_auto_compact_per_task_runs_after_token_limit_hit() {
             final_output_json_schema: None,
             responsesapi_client_metadata: None,
             additional_context: Default::default(),
-            thread_settings: Default::default(),
+            thread_settings: codex_protocol::protocol::ThreadSettingsOverrides {
+                approval_policy: Some(AskForApproval::Never),
+                ..Default::default()
+            },
         })
         .await
         .expect("submit user input");
@@ -4028,29 +4032,29 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_tokens("r1", /*total_tokens*/ 500),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 80_000),
     ]);
     let first_summary_payload = auto_summary(FIRST_AUTO_SUMMARY);
     let sse2 = sse(vec![
         ev_assistant_message("m2", &first_summary_payload),
-        ev_completed_with_tokens("r2", /*total_tokens*/ 50),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 10_000),
     ]);
     let sse3 = sse(vec![
         ev_function_call(DUMMY_CALL_ID, DUMMY_FUNCTION_NAME, "{}"),
-        ev_completed_with_tokens("r3", /*total_tokens*/ 150),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 20_000),
     ]);
     let sse4 = sse(vec![
         ev_assistant_message("m4", SECOND_LARGE_REPLY),
-        ev_completed_with_tokens("r4", /*total_tokens*/ 450),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 80_000),
     ]);
     let second_summary_payload = auto_summary(SECOND_AUTO_SUMMARY);
     let sse5 = sse(vec![
         ev_assistant_message("m5", &second_summary_payload),
-        ev_completed_with_tokens("r5", /*total_tokens*/ 60),
+        ev_completed_with_tokens("r5", /*total_tokens*/ 10_000),
     ]);
     let sse6 = sse(vec![
         ev_assistant_message("m6", FINAL_REPLY),
-        ev_completed_with_tokens("r6", /*total_tokens*/ 120),
+        ev_completed_with_tokens("r6", /*total_tokens*/ 20_000),
     ]);
     let follow_up_user = "FOLLOW_UP_AUTO_COMPACT";
     let final_user = "FINAL_AUTO_COMPACT";
@@ -4062,7 +4066,7 @@ async fn auto_compact_allows_multiple_attempts_when_interleaved_with_other_turn_
     let mut builder = test_codex().with_config(move |config| {
         config.model_provider = model_provider;
         set_test_compact_prompt(config);
-        config.model_auto_compact_token_limit = Some(200);
+        config.model_auto_compact_token_limit = Some(50_000);
     });
     let codex = builder.build(&server).await.unwrap().codex;
 
@@ -4140,7 +4144,7 @@ async fn snapshot_request_shape_mid_turn_continuation_compaction() {
 
     let server = start_mock_server().await;
 
-    let context_window = 100;
+    let context_window = 100_000;
     let limit = context_window * 90 / 100;
     let over_limit_tokens = context_window * 95 / 100 + 1;
 
@@ -4481,11 +4485,15 @@ async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
 
     let first_turn = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_usage("r1", /*input_tokens*/ 80, /*output_tokens*/ 5),
+        ev_completed_with_usage(
+            "r1", /*input_tokens*/ 80_000, /*output_tokens*/ 5_000,
+        ),
     ]);
     let second_turn = sse(vec![
         ev_assistant_message("m2", SECOND_LARGE_REPLY),
-        ev_completed_with_usage("r2", /*input_tokens*/ 98, /*output_tokens*/ 1),
+        ev_completed_with_usage(
+            "r2", /*input_tokens*/ 98_000, /*output_tokens*/ 1_000,
+        ),
     ]);
     let auto_compact_turn = sse(vec![
         ev_assistant_message("m3", AUTO_SUMMARY_TEXT),
@@ -4493,7 +4501,9 @@ async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
     ]);
     let third_turn = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_usage("r4", /*input_tokens*/ 80, /*output_tokens*/ 5),
+        ev_completed_with_usage(
+            "r4", /*input_tokens*/ 80_000, /*output_tokens*/ 5_000,
+        ),
     ]);
     let request_log = mount_sse_sequence(
         &server,
@@ -4506,8 +4516,8 @@ async fn auto_compact_body_after_prefix_still_caps_at_context_window() {
         .with_config(move |config| {
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
-            config.model_context_window = Some(100);
-            config.model_auto_compact_token_limit = Some(200);
+            config.model_context_window = Some(100_000);
+            config.model_auto_compact_token_limit = Some(200_000);
             config.model_auto_compact_token_limit_scope =
                 AutoCompactTokenLimitScope::BodyAfterPrefix;
         })
@@ -4542,8 +4552,8 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
     let second_user = "TRIGGER_COMPACT_AT_LIMIT";
     let third_user = "AFTER_REMOTE_COMPACT";
 
-    let pre_last_reasoning_content = "a".repeat(2_400);
-    let post_last_reasoning_content = "b".repeat(4_000);
+    let pre_last_reasoning_content = "a".repeat(240_000);
+    let post_last_reasoning_content = "b".repeat(400_000);
 
     let first_turn = sse(vec![
         ev_reasoning_item("pre-reasoning", &["pre"], &[&pre_last_reasoning_content]),
@@ -4596,7 +4606,7 @@ async fn auto_compact_counts_encrypted_reasoning_before_last_user() {
         .with_config(move |config| {
             config.chatgpt_base_url = chatgpt_base_url;
             set_test_compact_prompt(config);
-            config.model_auto_compact_token_limit = Some(300);
+            config.model_auto_compact_token_limit = Some(50_000);
             let _ = config.features.disable(Feature::RemoteCompactionV2);
         })
         .build(&server)
@@ -4676,8 +4686,8 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
     let second_user = "SERVER_INCLUDED_SECOND";
     let third_user = "SERVER_INCLUDED_THIRD";
 
-    let pre_last_reasoning_content = "a".repeat(2_400);
-    let post_last_reasoning_content = "b".repeat(4_000);
+    let pre_last_reasoning_content = "a".repeat(240_000);
+    let post_last_reasoning_content = "b".repeat(400_000);
 
     let first_turn = sse(vec![
         ev_reasoning_item("pre-reasoning", &["pre"], &[&pre_last_reasoning_content]),
@@ -4722,7 +4732,7 @@ async fn auto_compact_runs_when_reasoning_header_clears_between_turns() {
         .with_auth(CodexAuth::create_dummy_chatgpt_auth_for_testing())
         .with_config(|config| {
             set_test_compact_prompt(config);
-            config.model_auto_compact_token_limit = Some(300);
+            config.model_auto_compact_token_limit = Some(50_000);
             let _ = config.features.disable(Feature::RemoteCompactionV2);
         })
         .build(&server)
@@ -4764,19 +4774,19 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
 
     let sse1 = sse(vec![
         ev_assistant_message("m1", FIRST_REPLY),
-        ev_completed_with_tokens("r1", /*total_tokens*/ 60),
+        ev_completed_with_tokens("r1", /*total_tokens*/ 10_000),
     ]);
     let sse2 = sse(vec![
         ev_assistant_message("m2", "SECOND_REPLY"),
-        ev_completed_with_tokens("r2", /*total_tokens*/ 500),
+        ev_completed_with_tokens("r2", /*total_tokens*/ 80_000),
     ]);
     let sse3 = sse(vec![
         ev_assistant_message("m3", "PRE_TURN_SUMMARY"),
-        ev_completed_with_tokens("r3", /*total_tokens*/ 100),
+        ev_completed_with_tokens("r3", /*total_tokens*/ 10_000),
     ]);
     let sse4 = sse(vec![
         ev_assistant_message("m4", FINAL_REPLY),
-        ev_completed_with_tokens("r4", /*total_tokens*/ 80),
+        ev_completed_with_tokens("r4", /*total_tokens*/ 10_000),
     ]);
     let request_log = mount_sse_sequence(&server, vec![sse1, sse2, sse3, sse4]).await;
 
@@ -4785,7 +4795,7 @@ async fn snapshot_request_shape_pre_turn_compaction_including_incoming_user_mess
         .with_config(move |config| {
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
-            config.model_auto_compact_token_limit = Some(200);
+            config.model_auto_compact_token_limit = Some(50_000);
         })
         .build(&server)
         .await
@@ -4891,15 +4901,15 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
         vec![
             sse(vec![
                 ev_assistant_message("m1", "BEFORE_SWITCH_REPLY"),
-                ev_completed_with_tokens("r1", /*total_tokens*/ 500),
+                ev_completed_with_tokens("r1", /*total_tokens*/ 80_000),
             ]),
             sse(vec![
                 ev_assistant_message("m2", "PRETURN_SWITCH_SUMMARY"),
-                ev_completed_with_tokens("r2", /*total_tokens*/ 100),
+                ev_completed_with_tokens("r2", /*total_tokens*/ 10_000),
             ]),
             sse(vec![
                 ev_assistant_message("m3", "AFTER_SWITCH_REPLY"),
-                ev_completed_with_tokens("r3", /*total_tokens*/ 100),
+                ev_completed_with_tokens("r3", /*total_tokens*/ 10_000),
             ]),
         ],
     )
@@ -4913,7 +4923,7 @@ async fn snapshot_request_shape_pre_turn_compaction_strips_incoming_model_switch
             config.model_provider = model_provider;
             set_test_compact_prompt(config);
             let _ = config.features.enable(Feature::RemoteModels);
-            config.model_auto_compact_token_limit = Some(200);
+            config.model_auto_compact_token_limit = Some(50_000);
         })
         .build(&server)
         .await

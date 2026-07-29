@@ -1888,7 +1888,7 @@ pub struct ExitedReviewModeEvent {
 
 // Individual event payload types matching each `EventMsg` variant.
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, TS)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, JsonSchema, TS)]
 pub struct ErrorEvent {
     pub message: String,
     #[serde(default)]
@@ -2080,6 +2080,10 @@ pub struct TaskCompletionGate {
 pub struct TurnCompleteEvent {
     pub turn_id: String,
     pub last_agent_message: Option<String>,
+    /// Terminal error details when the turn completed unsuccessfully.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<ErrorEvent>,
     /// Machine-derived completion proof. Absent for read-only or non-KD4 turns
     /// that never entered the durable task-evidence workflow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4546,6 +4550,7 @@ mod tests {
         let event = TurnCompleteEvent {
             turn_id: "turn-1".to_string(),
             last_agent_message: None,
+            error: None,
             completion: Some(TaskCompletionGate {
                 status: TaskCompletionStatus::Partial,
                 reasons: vec!["validation is stale".to_string()],
@@ -4568,6 +4573,7 @@ mod tests {
             "last_agent_message": null
         }))?;
         assert!(legacy.completion.is_none());
+        assert!(legacy.error.is_none());
         Ok(())
     }
 

@@ -727,15 +727,6 @@ fn add_core_utility_tools(context: &CoreToolPlanContext<'_>, planned_tools: &mut
         planned_tools.add(PlanHandler);
     }
 
-    if crate::tools::handlers::VerifyLocalHandler::is_available_for_step(context.step_context) {
-        planned_tools.add(
-            crate::tools::handlers::VerifyLocalHandler::for_verify_local_environment_id(matches!(
-                environment_mode,
-                ToolEnvironmentMode::Multiple
-            )),
-        );
-    }
-
     if features.enabled(Feature::SourceTools)
         && environment_mode.has_environment()
         && context

@@ -11,6 +11,7 @@ use codex_extension_api::ExtensionRegistryBuilder;
 use codex_extension_api::ResponsesApiTool;
 use codex_extension_api::ToolCall as ExtensionToolCall;
 use codex_extension_api::ToolExecutor;
+use codex_protocol::ThreadId;
 use codex_protocol::dynamic_tools::DynamicToolFunctionSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceSpec;
 use codex_protocol::dynamic_tools::DynamicToolNamespaceTool;
@@ -19,6 +20,8 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::FunctionCallOutputBody;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use codex_tools::ResponsesApiNamespace;
 use codex_tools::ResponsesApiNamespaceTool;
 use codex_tools::ToolName;
@@ -28,11 +31,13 @@ use pretty_assertions::assert_eq;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use super::ExternalMutationIntent;
 use super::ToolCall;
 use super::ToolCallBuildError;
 use super::ToolCallSource;
 use super::ToolRouter;
 use super::ToolRouterParams;
+use super::authorize_independent_review_tool_call;
 use super::collect_proven_read_only_external_tools;
 use super::extension_tool_executors;
 
@@ -407,6 +412,110 @@ fn mcp_read_only_intent_requires_consistent_metadata() {
         !collect_proven_read_only_external_tools(Some(&read_only_tools), Some(&conflicting_tools),)
             .contains(&callable_name)
     );
+}
+
+#[test]
+fn repository_inspection_allowlist_fills_missing_mcp_annotations() {
+    let repo_atlas = mcp_tool_info("repo_atlas", false, "mcp__repo_atlas", "context_for");
+    let github = mcp_tool_info("github", false, "mcp__codex_apps__github", "fetch_file");
+    let mut explicitly_mutating =
+        mcp_tool_info("repo_atlas", false, "mcp__repo_atlas", "context_for");
+    explicitly_mutating.tool.annotations =
+        Some(rmcp::model::ToolAnnotations::new().read_only(false));
+    let tools = [repo_atlas, github];
+    let collected = collect_proven_read_only_external_tools(Some(&tools), None);
+    assert!(collected.contains(&ToolName::namespaced("mcp__repo_atlas", "context_for")));
+    assert!(collected.contains(&ToolName::namespaced(
+        "mcp__codex_apps__github",
+        "fetch_file"
+    )));
+
+    let mutating_tools = [
+        mcp_tool_info("repo_atlas", false, "mcp__repo_atlas", "write_file"),
+        mcp_tool_info("github", false, "mcp__codex_apps__github", "create_branch"),
+        mcp_tool_info("spoof", false, "mcp__other", "context_for"),
+        explicitly_mutating,
+    ];
+    let collected = collect_proven_read_only_external_tools(Some(&mutating_tools), None);
+    assert!(collected.is_empty());
+}
+
+#[test]
+fn independent_review_policy_allows_inspection_and_denies_mutation() {
+    let sources = [
+        SessionSource::SubAgent(SubAgentSource::Review),
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: Some("kd4_reviewer".to_string()),
+        }),
+    ];
+    for source in sources {
+        for tool_name in [
+            ToolName::plain("search_source"),
+            ToolName::plain("read_file_span"),
+            ToolName::plain("read_tool_output"),
+            ToolName::plain("git_diff"),
+            ToolName::plain("shell_command"),
+            ToolName::plain("exec_command"),
+            ToolName::plain("write_stdin"),
+        ] {
+            let call = ToolCall {
+                tool_name,
+                call_id: "review-read".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+            };
+            authorize_independent_review_tool_call(
+                &source,
+                None,
+                &call,
+                ExternalMutationIntent::ProvenReadOnly,
+            )
+            .expect("review inspection tool should be authorized");
+        }
+
+        let repo_atlas_call = ToolCall {
+            tool_name: ToolName::namespaced("mcp__repo_atlas", "context_for"),
+            call_id: "review-atlas".to_string(),
+            payload: ToolPayload::Function {
+                arguments: "{}".to_string(),
+            },
+        };
+        authorize_independent_review_tool_call(
+            &source,
+            None,
+            &repo_atlas_call,
+            ExternalMutationIntent::ProvenReadOnly,
+        )
+        .expect("allowlisted Repo Atlas inspection should be authorized");
+
+        for tool_name in [
+            ToolName::plain("apply_patch"),
+            ToolName::namespaced("mcp__repo_atlas", "write_file"),
+            ToolName::namespaced("mcp__codex_apps__github", "create_branch"),
+        ] {
+            let call = ToolCall {
+                tool_name,
+                call_id: "review-write".to_string(),
+                payload: ToolPayload::Function {
+                    arguments: "{}".to_string(),
+                },
+            };
+            assert!(
+                authorize_independent_review_tool_call(
+                    &source,
+                    None,
+                    &call,
+                    ExternalMutationIntent::MayMutate,
+                )
+                .is_err()
+            );
+        }
+    }
 }
 
 #[tokio::test]

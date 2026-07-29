@@ -207,14 +207,18 @@ pub async fn load_default_config_for_test_with_cloud_config_bundle(
     codex_home: &TempDir,
     cloud_config_bundle: CloudConfigBundleLoader,
 ) -> Config {
-    ConfigBuilder::default()
+    let mut config = ConfigBuilder::default()
         .loader_overrides(LoaderOverrides::without_managed_config_for_tests())
         .codex_home(codex_home.path().to_path_buf())
-        .harness_overrides(default_test_overrides())
+        .harness_overrides(default_test_overrides(codex_home.path()))
         .cloud_config_bundle(cloud_config_bundle)
         .build()
         .await
-        .expect("defaults for test should always succeed")
+        .expect("defaults for test should always succeed");
+    // Do not let a developer-level CODEX_SQLITE_HOME override make otherwise
+    // hermetic integration tests share one state database.
+    config.sqlite_home = codex_home.path().join("sqlite");
+    config
 }
 
 pub fn managed_network_requirements_loader() -> CloudConfigBundleLoader {
@@ -228,8 +232,9 @@ allow_local_binding = true
 }
 
 #[cfg(target_os = "linux")]
-fn default_test_overrides() -> ConfigOverrides {
+fn default_test_overrides(codex_home: &Path) -> ConfigOverrides {
     ConfigOverrides {
+        cwd: Some(codex_home.to_path_buf()),
         codex_linux_sandbox_exe: Some(
             find_codex_linux_sandbox_exe().expect("should find binary for codex-linux-sandbox"),
         ),
@@ -238,8 +243,11 @@ fn default_test_overrides() -> ConfigOverrides {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn default_test_overrides() -> ConfigOverrides {
-    ConfigOverrides::default()
+fn default_test_overrides(codex_home: &Path) -> ConfigOverrides {
+    ConfigOverrides {
+        cwd: Some(codex_home.to_path_buf()),
+        ..ConfigOverrides::default()
+    }
 }
 
 #[cfg(target_os = "linux")]

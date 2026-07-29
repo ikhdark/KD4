@@ -5779,6 +5779,53 @@ async fn shutdown_first_exit_uses_app_server_shutdown_without_submitting_op() {
 }
 
 #[tokio::test]
+async fn turn_start_rejection_becomes_transcript_error_and_event_loop_continues() -> Result<()> {
+    Box::pin(async {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+        let thread_id = ThreadId::new();
+        app.active_thread_id = Some(thread_id);
+        app.chat_widget.handle_thread_session(test_thread_session(
+            thread_id,
+            test_path_buf("/tmp/project"),
+        ));
+        while app_event_rx.try_recv().is_ok() {}
+
+        let op = app
+            .chat_widget
+            .submit_user_message_as_plain_user_turn(crate::chatwidget::UserMessage::from(
+                "start a turn",
+            ))
+            .expect("configured thread should submit a user turn");
+        while app_event_rx.try_recv().is_ok() {}
+
+        let mut app_server = Box::pin(crate::start_embedded_app_server_for_picker(
+            app.chat_widget.config_ref(),
+        ))
+        .await?;
+        let mut tui = crate::tui::test_support::make_test_tui()?;
+        let result =
+            Box::pin(app.handle_event(&mut tui, &mut app_server, AppEvent::CodexOp(op))).await;
+        app_server.shutdown().await?;
+
+        assert!(matches!(result?, AppRunControl::Continue));
+        let mut rendered_history = Vec::new();
+        while let Ok(event) = app_event_rx.try_recv() {
+            if let AppEvent::InsertHistoryCell(cell) = event {
+                rendered_history.push(lines_to_single_string(&cell.display_lines(/*width*/ 120)));
+            }
+        }
+        assert!(
+            rendered_history
+                .iter()
+                .any(|cell| cell.contains("turn/start failed in TUI")),
+            "expected turn/start rejection in transcript, got {rendered_history:?}"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
 async fn interrupt_without_active_turn_is_treated_as_handled() {
     Box::pin(async {
         let mut app = make_test_app().await;

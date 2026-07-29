@@ -142,6 +142,7 @@ def _validate_evidence(
     evidence_items: object,
     repo_root: Path,
     findings: list[Finding],
+    text_cache: dict[Path, str],
 ) -> Counter[str]:
     kinds: Counter[str] = Counter()
     if not isinstance(evidence_items, list):
@@ -152,7 +153,6 @@ def _validate_evidence(
         )
         return kinds
 
-    text_cache: dict[Path, str] = {}
     for index, evidence in enumerate(evidence_items):
         if not isinstance(evidence, dict):
             findings.append(
@@ -198,7 +198,9 @@ def _validate_evidence(
 
         contains = evidence.get("contains")
         regex = evidence.get("regex")
-        if bool(contains) == bool(regex):
+        contains_present = "contains" in evidence
+        regex_present = "regex" in evidence
+        if contains_present == regex_present:
             findings.append(
                 Finding(
                     "error",
@@ -208,9 +210,23 @@ def _validate_evidence(
                 )
             )
             continue
+        match_value = contains if contains_present else regex
+        if not isinstance(match_value, str) or not match_value:
+            match_name = "contains" if contains_present else "regex"
+            findings.append(
+                Finding(
+                    "error",
+                    "invalid-evidence-match",
+                    f"evidence[{index}] {match_name} must be a non-empty string",
+                    feature_id,
+                )
+            )
+            continue
 
         try:
-            text = text_cache.setdefault(path, path.read_text(encoding="utf-8"))
+            if path not in text_cache:
+                text_cache[path] = path.read_text(encoding="utf-8")
+            text = text_cache[path]
         except (OSError, UnicodeError) as exc:
             findings.append(
                 Finding(
@@ -302,6 +318,7 @@ def validate_manifest(
 
     seen_ids: set[str] = set()
     status_counts: Counter[str] = Counter()
+    text_cache: dict[Path, str] = {}
     for index, feature in enumerate(features):
         if not isinstance(feature, dict):
             findings.append(
@@ -315,7 +332,7 @@ def validate_manifest(
         feature_id = (
             raw_id if isinstance(raw_id, str) and raw_id else f"features[{index}]"
         )
-        if raw_id in seen_ids:
+        if isinstance(raw_id, str) and raw_id and raw_id in seen_ids:
             findings.append(
                 Finding(
                     "error",
@@ -376,18 +393,22 @@ def validate_manifest(
                 )
             )
 
-        owner_path, owner_error = _safe_repo_path(repo_root, feature.get("owner"))
-        if owner_error is not None:
-            findings.append(Finding("error", "invalid-owner", owner_error, feature_id))
-        elif owner_path is not None and not owner_path.exists():
-            findings.append(
-                Finding(
-                    "error",
-                    "missing-owner",
-                    f"owner path does not exist: {feature.get('owner')}",
-                    feature_id,
+        owner = feature.get("owner")
+        if isinstance(owner, str) and owner.strip():
+            owner_path, owner_error = _safe_repo_path(repo_root, owner)
+            if owner_error is not None:
+                findings.append(
+                    Finding("error", "invalid-owner", owner_error, feature_id)
                 )
-            )
+            elif owner_path is not None and not owner_path.exists():
+                findings.append(
+                    Finding(
+                        "error",
+                        "missing-owner",
+                        f"owner path does not exist: {owner}",
+                        feature_id,
+                    )
+                )
 
         config_keys = feature.get("config_keys")
         if not isinstance(config_keys, list) or not all(
@@ -424,6 +445,7 @@ def validate_manifest(
             evidence_items=feature.get("evidence", []),
             repo_root=repo_root,
             findings=findings,
+            text_cache=text_cache,
         )
         if status == "enabled":
             if evidence_kinds["entrypoint"] == 0:

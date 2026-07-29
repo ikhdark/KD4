@@ -33,19 +33,33 @@ function Invoke-SccachePerfCommand {
     # -IgnoreFailure before the exit-code check below runs.
     $oldErrorActionPreference = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
+    $commandSucceeded = $false
+    $commandExitCode = $null
+    $global:LASTEXITCODE = $null
     try {
         if ($SuppressStderr) {
             & $SccachePath @Arguments 2>$null
+            $commandSucceeded = $?
+            $commandExitCode = $global:LASTEXITCODE
         }
         else {
             & $SccachePath @Arguments
+            $commandSucceeded = $?
+            $commandExitCode = $global:LASTEXITCODE
         }
+    }
+    catch {
+        $commandSucceeded = $false
+        $commandExitCode = $null
     }
     finally {
         $ErrorActionPreference = $oldErrorActionPreference
     }
-    $exitCode = if ($null -eq $LASTEXITCODE) { 0 } else { $LASTEXITCODE }
-    if ($exitCode -ne 0 -and -not $IgnoreFailure) {
+    $exitCode = if ($null -eq $commandExitCode) { 0 } else { $commandExitCode }
+    if ((-not $commandSucceeded -or $exitCode -ne 0) -and -not $IgnoreFailure) {
+        if (-not $commandSucceeded -and $null -eq $commandExitCode) {
+            throw "sccache $($Arguments -join ' ') failed to launch."
+        }
         throw "sccache $($Arguments -join ' ') failed with exit code $exitCode."
     }
 }

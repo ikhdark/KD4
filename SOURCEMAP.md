@@ -170,7 +170,6 @@ below.
 | Linux sandbox helper | `codex-rs/linux-sandbox/src/main.rs` | sandboxing policy and Bubblewrap helper |
 | Windows sandbox setup | `codex-rs/windows-sandbox-rs/src/bin/setup_main/main.rs` | Windows sandbox installation and policy |
 | Windows command runner | `codex-rs/windows-sandbox-rs/src/bin/command_runner/main.rs` | sandboxed Windows process execution |
-| Rust local validation binary | `codex-rs/verify-local/src/main.rs` | standalone Rust verifier; the preferred scripted router is `scripts/verify_local.py` with `scripts/verify_local_rules.toml` |
 | State log client | `codex-rs/state/src/bin/logs_client.rs` | state DB log queries and `just log` |
 | Config schema writer | `codex-rs/core/src/bin/config_schema.rs` | config/core/features inputs and `codex-rs/core/config.schema.json` |
 | App-server schema writers | `codex-rs/app-server-protocol/src/bin/export.rs`, `codex-rs/app-server-protocol/src/bin/write_schema_fixtures.rs` | app-server protocol schema tree and fixtures |
@@ -182,7 +181,7 @@ below.
 
 | Domain | Package roots |
 | --- | --- |
-| Workspace and repository tooling | `codex-rs`, `codex-rs/verify-local`, `tools/argument-comment-lint` |
+| Workspace and repository tooling | `codex-rs`, `tools/argument-comment-lint` |
 | CLI, authentication, home, and install context | `codex-rs/arg0`, `codex-rs/aws-auth`, `codex-rs/cli`, `codex-rs/codex-home`, `codex-rs/install-context`, `codex-rs/keyring-store`, `codex-rs/login`, `codex-rs/secrets` |
 | Interactive and headless clients | `codex-rs/tui`, `codex-rs/exec` |
 | Core runtime, configuration, context, and prompts | `codex-rs/collaboration-mode-templates`, `codex-rs/config`, `codex-rs/context-fragments`, `codex-rs/core`, `codex-rs/core/tests/common`, `codex-rs/core-api`, `codex-rs/features`, `codex-rs/prompts` |
@@ -223,7 +222,7 @@ below.
 | Model requests and retries | `codex-rs/core/src/client.rs` | model-provider, backend/client crates, auth, telemetry, response debug context |
 | Tool planning and dispatch | `codex-rs/core/src/tools`, `codex-rs/tools` | built-in handlers, extension tools, MCP calls, approvals, shell and sandbox owners |
 | Retained command output | `codex-rs/core/src/tools/command_output_artifact.rs` | unified exec and shell producers, `ExecCommandToolOutput` model/code-mode projection, opaque current-thread `read_tool_output` handler/spec, generic retention and receipt-scoped protected evidence-artifact lifecycle |
-| Task and external evidence ledger | `codex-rs/core/src/task_evidence.rs` | session initialization, KD4 completion-only plan/validation callers, direct MCP handler receipt capture, thread-scoped output artifacts for oversized canonical payloads |
+| Task and external evidence ledger | `codex-rs/core/src/task_evidence.rs` | session initialization, KD4 completion-only plan acknowledgement and mutation reopening, repository-contained current generated-artifact checks, direct MCP handler receipt capture, thread-scoped output artifacts for oversized canonical payloads |
 | Shell execution and approvals | `codex-rs/core/src/exec.rs`, `codex-rs/core/src/exec_policy.rs` | shell-command, shell-escalation, execpolicy, sandboxing, platform sandboxes |
 | Configuration resolution | `codex-rs/config`, `codex-rs/core/src/config`, `codex-rs/features` | profiles, permissions, requirements, hooks, MCP, schema generator, consuming runtime |
 | Interactive presentation | `codex-rs/tui/src/app.rs`, `codex-rs/tui/src/chatwidget.rs` | app-server session bridge, bottom pane, history cells, protocol conversion, snapshots |
@@ -292,7 +291,7 @@ owner must trace every reader and writer before completion.
 
 | Flow | Owner and entrypoint | Required downstream proof |
 | --- | --- | --- |
-| Rust workspace build/test | `codex-rs/Cargo.toml`, root `justfile`, crate manifests | focused crate check/test; use isolated lanes when parallel Rust work exists |
+| Rust workspace build/test | `codex-rs/Cargo.toml`, `codex-rs/.cargo/config.toml`, `codex-rs/.config/nextest.toml`, root `justfile`, crate manifests | bounded local compiler/test fanout by default; focused crate check/test; use isolated lanes when parallel Rust work exists |
 | npm CLI wrapper staging | `codex-cli/bin/codex.js`, `codex-cli/package.json`, `scripts/stage_npm_packages.py` | wrapper lint, staging/package tests, platform layout inspection |
 | Canonical package archives | `scripts/codex_package` | package-local tests and archive/content checks |
 | Standalone installers | `scripts/install/install.sh`, `scripts/install/install.ps1` | installer tests, digest/layout/locking/PATH/migration behavior |
@@ -300,7 +299,7 @@ owner must trace every reader and writer before completion.
 | Python SDK | `sdk/python` | focused `uv run pytest` and `uv run ruff check .` |
 | Python runtime package | `sdk/python-runtime` | focused runtime-package tests and lint |
 | Nix environment | `flake.nix`, `flake.lock` | Nix evaluation/build appropriate to the changed input |
-| Windows local publish | `scripts/publish-local-codex.ps1`, `just publish-local-codex-*` | dry-run, release build, doctor, backup/rollback guards, installed hash/version |
+| Windows local publish | `scripts/publish-local-codex.ps1`, `just publish-local-codex-final` | dry-run argument proof, release build, doctor, backup/rollback guards, installed hash/version |
 | Desktop-visible completion | local publish output plus app-server/CLI runtime | publish final, restart Desktop, prove process path and binary hash/version, inspect initialize/model metadata, capture visible evidence |
 
 The expected installed target is
@@ -323,9 +322,8 @@ remain required.
 | TypeScript SDK | `just sdk-ts-check` |
 | Python SDK | focused `uv run pytest` and `uv run ruff check .` |
 | Package/archive flow | package-local tests followed by the relevant staging or dry-run proof |
-| Local publish wiring | `just publish-local-codex-dry-run`; installed replacement requires `just publish-local-codex-final` |
-| Installed provider external-evidence path | `python scripts/investigation_evidence_smoke.py --run`; uses staged local KDS/KDWG/Repo Atlas plugins, disposable Git repositories and Codex homes, and a loopback model endpoint |
-| Repository-scoped final validation | `just verify-local <args>` or `scripts/verify_local.py` through its documented bounded flow |
+| Local publish wiring | `just publish-local-codex-final -DryRun`; installed replacement requires `just publish-local-codex-final` |
+| Installed provider external-evidence path | `python scripts/investigation_evidence_smoke.py --run`; uses staged local KDS and Repo Atlas plugins, disposable Git repositories and Codex homes, and a loopback model endpoint |
 
 Green tooling alone does not prove runtime behavior. Use the focused failing
 test or approved runtime gate for the behavior being changed.

@@ -15,14 +15,19 @@ import mock_responses_websocket_server as server
 
 
 class FakeWebSocket:
-    def __init__(self, messages: list[str | bytes], *, path: str = server.PATH) -> None:
+    def __init__(
+        self, messages: list[str | bytes | BaseException], *, path: str = server.PATH
+    ) -> None:
         self._messages = list(messages)
         self.request = SimpleNamespace(path=path)
         self.sent: list[str] = []
         self.close_calls: list[tuple[int, str]] = []
 
     async def recv(self) -> str | bytes:
-        return self._messages.pop(0)
+        message = self._messages.pop(0)
+        if isinstance(message, BaseException):
+            raise message
+        return message
 
     async def send(self, message: str) -> None:
         self.sent.append(message)
@@ -46,6 +51,16 @@ class FakeServer:
 
     async def wait_closed(self) -> None:
         return None
+
+
+class FlushTrackingStringIO(io.StringIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self.flush_count = 0
+
+    def flush(self) -> None:
+        self.flush_count += 1
+        super().flush()
 
 
 class MockResponsesWebSocketServerTest(unittest.TestCase):
@@ -107,20 +122,26 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
         self.assertIn('{"b":2,"a":1}', logged)
         self.assertNotIn('\n  "a"', logged)
 
-    def test_oversized_request_closes_before_sending_events(self) -> None:
-        websocket = FakeWebSocket(['{"payload":"too large"}', '{"second":true}'])
+    def test_connection_and_request_logs_are_flushed(self) -> None:
+        out = FlushTrackingStringIO()
 
-        asyncio.run(
-            server._handle_connection(
-                websocket,
-                quiet=True,
-                log_json="off",
-                max_message_bytes=5,
-            )
+        with contextlib.redirect_stdout(out):
+            server._log_conn("connected", quiet=False)
+            server._print_request("[req] recv", {"ok": True})
+
+        self.assertEqual(out.flush_count, 2)
+
+    def test_legacy_websocket_path_is_validated(self) -> None:
+        websocket = FakeWebSocket(["{}", "{}"], path="/unexpected")
+        websocket.path = websocket.request.path
+        del websocket.request
+
+        completed = asyncio.run(
+            server._handle_connection(websocket, quiet=True, log_json="off")
         )
 
-        self.assertEqual(websocket.sent, [])
-        self.assertEqual(websocket.close_calls, [(1009, "message too large")])
+        self.assertFalse(completed)
+        self.assertEqual(websocket.close_calls, [(1008, "unexpected websocket path")])
 
     def test_invalid_json_closes_with_invalid_payload_code(self) -> None:
         websocket = FakeWebSocket([b"\xff"])
@@ -176,6 +197,50 @@ class MockResponsesWebSocketServerTest(unittest.TestCase):
         self.assertIsInstance(kwargs, dict)
         self.assertIsNone(kwargs["compression"])
         self.assertEqual(kwargs["max_size"], 123)
+
+    def test_serve_ignores_aborted_connections_for_session_limit(self) -> None:
+        captured: dict[str, object] = {}
+        fake_server = FakeServer()
+
+        async def fake_serve(handler: object, host: str, port: int, **kwargs: object):
+            captured["handler"] = handler
+            return fake_server
+
+        with (
+            mock.patch.object(server.websockets, "serve", side_effect=fake_serve),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+
+            async def run_connections() -> int:
+                task = asyncio.create_task(server._serve(0, quiet=True, max_sessions=1))
+                await asyncio.sleep(0)
+                handler = captured["handler"]
+                await handler(FakeWebSocket([server.ConnectionClosed(None, None)]))
+                await handler(FakeWebSocket(["{}", "{}"], path="/health"))
+                self.assertFalse(task.done())
+                await handler(FakeWebSocket(["{}", "{}"]))
+                return await task
+
+            rc = asyncio.run(run_connections())
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(fake_server.closed)
+
+    def test_missing_websockets_dependency_is_reported_cleanly(self) -> None:
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(
+                server.websockets,
+                "serve",
+                side_effect=server.MissingWebsocketsError("dependency missing"),
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            rc = asyncio.run(server._serve(0, quiet=True, max_sessions=1))
+
+        self.assertEqual(rc, 2)
+        self.assertIn("dependency missing", stderr.getvalue())
 
     def test_serve_rejects_non_positive_max_sessions(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_sessions must be >= 1"):

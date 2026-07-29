@@ -19,6 +19,7 @@ use codex_protocol::protocol::SubAgentSource;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::WarningEvent;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio::time::sleep_until;
@@ -65,6 +66,15 @@ const GUARDIAN_TIMEOUT_INSTRUCTIONS: &str = concat!(
 
 const GUARDIAN_REVIEW_MAX_ATTEMPTS: i64 = 3;
 const GUARDIAN_REVIEW_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+static GUARDIAN_REVIEW_RUNTIME: LazyLock<std::io::Result<tokio::runtime::Runtime>> =
+    LazyLock::new(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("codex-guardian-review")
+            .thread_stack_size(GUARDIAN_REVIEW_THREAD_STACK_SIZE)
+            .enable_all()
+            .build()
+    });
 
 pub(crate) fn new_guardian_review_id() -> String {
     uuid::Uuid::new_v4().to_string()
@@ -647,30 +657,25 @@ pub(crate) fn spawn_approval_request_review(
     cancel_token: CancellationToken,
 ) -> oneshot::Receiver<ReviewDecision> {
     let (tx, rx) = oneshot::channel();
-    if let Err(err) = std::thread::Builder::new()
-        .name("codex-guardian-review".to_string())
-        .stack_size(GUARDIAN_REVIEW_THREAD_STACK_SIZE)
-        .spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                let _ = tx.send(ReviewDecision::Denied);
-                return;
-            };
-            let decision = runtime.block_on(review_approval_request_with_cancel(
-                &session,
-                &turn,
-                review_id,
-                request,
-                retry_reason,
-                approval_request_source,
-                cancel_token,
-            ));
-            let _ = tx.send(decision);
-        })
-    {
-        warn!(%err, "failed to spawn guardian review thread");
+    match &*GUARDIAN_REVIEW_RUNTIME {
+        Ok(runtime) => {
+            std::mem::drop(runtime.spawn(async move {
+                let decision = review_approval_request_with_cancel(
+                    &session,
+                    &turn,
+                    review_id,
+                    request,
+                    retry_reason,
+                    approval_request_source,
+                    cancel_token,
+                )
+                .await;
+                let _ = tx.send(decision);
+            }));
+        }
+        Err(err) => {
+            warn!(%err, "failed to initialize guardian review runtime");
+        }
     }
     rx
 }

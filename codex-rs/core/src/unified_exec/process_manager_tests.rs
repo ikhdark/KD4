@@ -1,14 +1,14 @@
 use super::*;
-use crate::unified_exec::ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS;
-use crate::unified_exec::DEFAULT_FAILURE_OUTPUT_TOKENS;
-use crate::unified_exec::DEFAULT_SUCCESS_OUTPUT_TOKENS;
-use crate::unified_exec::OutputBudgetClass;
 use crate::unified_exec::async_watcher::omitted_output_marker;
 use crate::unified_exec::async_watcher::resolve_aggregated_output;
 use crate::unified_exec::clamp_yield_time;
 use crate::unified_exec::clamp_yield_time_for_readiness;
-use crate::unified_exec::resolve_adaptive_max_tokens;
 use codex_network_proxy::ManagedNetworkSandboxContext;
+use codex_utils_output_truncation::DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS;
+use codex_utils_output_truncation::DEFAULT_FAILURE_OUTPUT_TOKENS;
+use codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS;
+use codex_utils_output_truncation::OutputOutcome;
+use codex_utils_output_truncation::resolve_output_limits;
 use pretty_assertions::assert_eq;
 use tokio::time::Duration;
 use tokio::time::Instant;
@@ -43,48 +43,65 @@ async fn dropped_process_id_reservation_is_released_before_store_transfer() {
 }
 
 #[test]
-fn adaptive_output_budget_matches_upstream_default_and_honors_override() {
-    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 10_000);
-    assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 10_000);
-    assert_eq!(ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS, 10_000);
+fn adaptive_output_budget_uses_4k_8k_10k_and_honors_override() {
+    const HARD_LIMIT: usize = 20_000;
+
+    assert_eq!(DEFAULT_SUCCESS_OUTPUT_TOKENS, 4_000);
+    assert_eq!(DEFAULT_FAILURE_OUTPUT_TOKENS, 8_000);
+    assert_eq!(DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS, 10_000);
     assert_eq!(
-        resolve_adaptive_max_tokens(None, OutputBudgetClass::Success, Some("echo ok"), "ok"),
+        resolve_output_limits(
+            None,
+            OutputOutcome::Success,
+            Some("echo ok"),
+            "ok",
+            HARD_LIMIT,
+        )
+        .applied_limit,
         DEFAULT_SUCCESS_OUTPUT_TOKENS
     );
     assert_eq!(
-        resolve_adaptive_max_tokens(
+        resolve_output_limits(
             None,
-            OutputBudgetClass::FailureOrTimeout,
+            OutputOutcome::Failure,
             Some("custom-command"),
-            "failed"
-        ),
+            "failed",
+            HARD_LIMIT,
+        )
+        .applied_limit,
         DEFAULT_FAILURE_OUTPUT_TOKENS
     );
     assert_eq!(
-        resolve_adaptive_max_tokens(
+        resolve_output_limits(
             None,
-            OutputBudgetClass::Success,
+            OutputOutcome::Success,
             Some("cargo nextest run -p codex-core"),
-            "tests passed"
-        ),
-        ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS
+            "tests passed",
+            HARD_LIMIT,
+        )
+        .applied_limit,
+        DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS
     );
     assert_eq!(
-        resolve_adaptive_max_tokens(
+        resolve_output_limits(
             None,
-            OutputBudgetClass::FailureOrTimeout,
+            OutputOutcome::Failure,
             None,
-            "Traceback (most recent call last):"
-        ),
-        ADAPTIVE_DIAGNOSTIC_OUTPUT_TOKENS
+            "Traceback (most recent call last):",
+            HARD_LIMIT,
+        )
+        .applied_limit,
+        DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS
     );
     assert_eq!(
-        resolve_adaptive_max_tokens(
+        resolve_output_limits(
             Some(1_234),
-            OutputBudgetClass::FailureOrTimeout,
+            OutputOutcome::Failure,
             Some("cargo test"),
-            "test result: FAILED"
-        ),
+            "test result: FAILED",
+            HARD_LIMIT,
+        )
+        .applied_limit,
         1_234
     );
 }

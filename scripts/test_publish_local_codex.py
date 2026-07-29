@@ -9,13 +9,6 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parent / "publish-local-codex.ps1"
-HASHING_HELPER = Path(__file__).resolve().parent / "publish-local-codex.hashing.ps1"
-PUBLISH_HELPERS = (
-    Path(__file__).resolve().parent / "publish-local-codex.proof.ps1",
-    Path(__file__).resolve().parent / "publish-local-codex.desktop.ps1",
-    Path(__file__).resolve().parent / "publish-local-codex.build.ps1",
-    Path(__file__).resolve().parent / "publish-local-codex.apply.ps1",
-)
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 RUN_TIMEOUT_SECONDS = 120
 FIXTURE_TIME = 946684900
@@ -32,6 +25,8 @@ def powershell() -> str | None:
 
 PUBLISH_ENV_VARS = (
     "CODEX_LOCAL_PUBLISH_DIR",
+    "CODEX_LOCAL_CODEX_HOME",
+    "CODEX_LOCAL_CODEX_SQLITE_HOME",
     "CODEX_HOME",
     "CODEX_SQLITE_HOME",
     "CODEX_CLI_PATH",
@@ -49,52 +44,55 @@ def clean_env() -> dict[str, str]:
     return env
 
 
+def ps_single_quote(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
 def publish_source_text() -> str:
-    return "\n".join(
-        [
-            SCRIPT.read_text(encoding="utf-8"),
-            *(path.read_text(encoding="utf-8") for path in PUBLISH_HELPERS),
-        ]
-    )
+    return SCRIPT.read_text(encoding="utf-8")
 
 
 class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
-    def test_publish_helpers_are_dot_sourced_once(self) -> None:
+    def test_publish_implementation_is_consolidated_in_entrypoint(self) -> None:
         entrypoint = SCRIPT.read_text(encoding="utf-8")
-        composed = publish_source_text()
 
-        for helper in PUBLISH_HELPERS:
-            self.assertEqual(entrypoint.count(f'"{helper.name}"'), 1)
+        for helper_name in (
+            "publish-local-codex.hashing.ps1",
+            "publish-local-codex.proof.ps1",
+            "publish-local-codex.desktop.ps1",
+            "publish-local-codex.build.ps1",
+            "publish-local-codex.apply.ps1",
+        ):
+            self.assertNotIn(helper_name, entrypoint)
         for function_name in (
             "Get-RepoRoot",
             "Get-RunningCodexTargetProcesses",
             "Set-ProcessEnvironmentVariable",
             "Publish-CodexBinary",
         ):
-            self.assertEqual(composed.count(f"function {function_name}"), 1)
+            self.assertEqual(entrypoint.count(f"function {function_name}"), 1)
 
-    def test_hashing_helper_is_dot_sourced_without_unsafe_cache(self) -> None:
+    def test_hashing_and_metadata_cache_are_in_entrypoint(self) -> None:
         publish_script = publish_source_text()
-        hashing_helper = HASHING_HELPER.read_text(encoding="utf-8")
 
-        self.assertIn(
-            '. (Join-Path $PSScriptRoot "publish-local-codex.hashing.ps1")',
-            publish_script,
-        )
-        self.assertIn("function Get-FileSha256", hashing_helper)
-        self.assertNotIn("Get-FileSha256Cached", hashing_helper)
-        self.assertNotIn("FileSha256Cache", hashing_helper)
-        self.assertNotIn("function Get-FileSha256Cached", publish_script)
-        self.assertNotIn("function Get-CachedFileSha256", publish_script)
-        self.assertNotIn("function Remove-StaleFileSha256CacheEntries", publish_script)
+        self.assertIn("function Get-FileSha256", publish_script)
+        self.assertIn("LocalPublishContentHashCache", publish_script)
+        self.assertIn("Get-CachedLocalPublishFileSha256", publish_script)
+        self.assertIn("LastWriteTimeUtcTicks", publish_script)
+        self.assertIn("$before.Length -ne $after.Length", publish_script)
 
-    def test_publish_binary_proof_uses_direct_hashing_not_metadata_cache(self) -> None:
+    def test_publish_binary_proof_force_refreshes_cached_source_hashes(self) -> None:
         publish_script = publish_source_text()
 
         self.assertIn('$sourceSha256Mode = "hashed"', publish_script)
-        self.assertIn("$sourceSha256 = Get-FileSha256 $SourceExe", publish_script)
         self.assertIn(
-            "$sourceCodeModeHostSha256 = Get-FileSha256 $SourceCodeModeHostExe",
+            "$sourceSha256 = Get-CachedLocalPublishFileSha256 "
+            "-Path $SourceExe -ForceRefresh",
+            publish_script,
+        )
+        self.assertIn(
+            "$sourceCodeModeHostSha256 = Get-CachedLocalPublishFileSha256 "
+            "-Path $SourceCodeModeHostExe -ForceRefresh",
             publish_script,
         )
         self.assertIn(
@@ -104,13 +102,23 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
             "$codeModeHostTargetBeforeSha256 = Get-FileSha256 $codeModeHostTargetPath",
             publish_script,
         )
-        self.assertNotIn("Get-FileSha256Cached $SourceExe", publish_script)
-        self.assertNotIn("Get-FileSha256Cached $targetPath", publish_script)
         self.assertIn("$sourceSha256,\n            $targetSha256", publish_script)
         self.assertIn(
             'Write-ProofLine "codexPostPublishVerify" "sha256 ok"', publish_script
         )
         self.assertIn("running-target process detection failed", publish_script)
+
+    def test_user_path_edits_preserve_expandable_registry_values(self) -> None:
+        publish_script = publish_source_text()
+
+        self.assertIn("DoNotExpandEnvironmentNames", publish_script)
+        self.assertIn("RegistryValueKind]::ExpandString", publish_script)
+        self.assertIn("ExpandEnvironmentVariables", publish_script)
+        self.assertIn("foreach ($process in $candidates)", publish_script)
+        self.assertIn(
+            "post-close running-target process probe failed",
+            SCRIPT.read_text(encoding="utf-8"),
+        )
 
     def test_publish_build_includes_cli_and_code_mode_host_packages(self) -> None:
         publish_script = publish_source_text()
@@ -140,45 +148,27 @@ class PublishLocalCodexSourceLayoutTest(unittest.TestCase):
         )
         self.assertIn("Set-CodexRustMsvcLinkerEnvironment", publish_script)
 
-    def test_just_publish_recipes_configure_desktop_local_cli(self) -> None:
+    def test_just_exposes_only_final_publish_recipe(self) -> None:
         justfile = (SCRIPT.parent.parent / "justfile").read_text(encoding="utf-8")
 
-        self.assertIn(
-            'publish-local-codex.ps1" -DryRun -ConfigureDesktopLocalCli', justfile
-        )
-        self.assertIn(
-            'publish-local-codex.ps1" -DryRun -SkipBuild -FailOnStaleSourceBuild -ConfigureDesktopLocalCli',
-            justfile,
-        )
-        self.assertIn(
-            'publish-local-codex.ps1" -AutoSkipBuild -ConfigureDesktopLocalCli',
-            justfile,
-        )
-        self.assertIn("publish-local-codex-final *args:", justfile)
+        self.assertEqual(justfile.count("publish-local-codex-final *args:"), 2)
         self.assertIn(
             "-AutoSkipBuild -Profile release -RunDoctor -CloseRunningTargetTimeoutSeconds 30",
             justfile,
         )
-        self.assertIn("publish-local-codex-final-dry-run *args:", justfile)
-        self.assertIn(
-            "-DryRun -AutoSkipBuild -Profile release -RunDoctor -CloseRunningTargetTimeoutSeconds 30",
-            justfile,
-        )
-        self.assertIn("publish-local-codex-runtime-proof *args:", justfile)
-        self.assertIn(
-            "-DryRun -SkipBuild -RunDoctor -RuntimeProof -FailOnStaleSourceBuild",
-            justfile,
-        )
-        self.assertIn("publish-local-codex-final-test-run *args:", justfile)
-        self.assertIn(
-            "-TestRun -AutoSkipBuild -Profile release -RunDoctor -CloseRunningTargetTimeoutSeconds 30",
-            justfile,
-        )
-        self.assertIn("publish-local-codex-build-only *args:", justfile)
-        self.assertIn('publish-local-codex.ps1" -BuildOnly', justfile)
         self.assertIn(
             "-ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User", justfile
         )
+        for recipe in (
+            "publish-local-codex",
+            "publish-local-codex-dry-run",
+            "publish-local-codex-final-dry-run",
+            "publish-local-codex-runtime-proof",
+            "publish-local-codex-final-test-run",
+            "publish-local-codex-build-only",
+            "validate-local-publish",
+        ):
+            self.assertNotIn(f"{recipe} *args:", justfile)
 
     def test_default_local_publish_target_is_not_openai_appdata_bin(self) -> None:
         publish_script = publish_source_text()
@@ -199,7 +189,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $tokens = $null
 $errors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile('{PUBLISH_HELPERS[0]}', [ref]$tokens, [ref]$errors)
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('{SCRIPT}', [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) {{
     throw "Failed to parse publish script: $($errors[0].Message)"
 }}
@@ -266,6 +256,57 @@ $configFailure = '{{"checks":{{"auth.credentials":{{"status":"fail"}},"config.lo
         self.assertNotIn("codegen-units", local_release_block)
         self.assertNotIn("debug", local_release_block)
         self.assertNotIn("strip", local_release_block)
+
+
+class PublishLocalCodexHelperBehaviorTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.shell = powershell()
+        if cls.shell is None:
+            raise unittest.SkipTest("PowerShell is not available")
+
+    def test_version_probe_drains_large_stderr_without_deadlock(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            helper_exe = Path(temp_dir) / "noisy-version.exe"
+            source = (
+                "using System; public static class Program { "
+                "public static int Main(string[] args) { "
+                "Console.Error.Write(new string('x', 65536)); "
+                'Console.Out.WriteLine("codex noisy 1.0"); return 0; } }'
+            )
+            command = (
+                f". {ps_single_quote(SCRIPT)} -ImportOnly; "
+                f"Add-Type -TypeDefinition {ps_single_quote(source)} "
+                f"-OutputAssembly {ps_single_quote(helper_exe)} "
+                "-OutputType ConsoleApplication; "
+                f"$lines = @(Get-VersionProofLines -Path {ps_single_quote(helper_exe)} "
+                "-TimeoutMilliseconds 5000); Write-Output $lines[0]"
+            )
+            result = subprocess.run(
+                [
+                    self.shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    command,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=30,
+                creationflags=CREATE_NO_WINDOW,
+                env=clean_env(),
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(result.stdout.strip(), "codex noisy 1.0")
 
 
 if __name__ == "__main__":

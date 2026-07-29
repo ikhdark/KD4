@@ -1,6 +1,6 @@
 # Repository policy
 
-Policy revision: `2026-07-28.1`.
+Policy revision: `2026-07-29.1`.
 
 ## Project context
 
@@ -16,7 +16,7 @@ Policy revision: `2026-07-28.1`.
   user explicitly requests upstream, product-facing, or distribution-ready
   changes.
 - The standing objective is to improve, audit, and optimize the checkout while
-  keeping changes reviewable, local-build focused, and easy to validate.
+  keeping changes reviewable, local-build focused.
 
 ### Source of truth and ownership
 
@@ -57,114 +57,40 @@ Policy revision: `2026-07-28.1`.
   completion requires rebuilding and updating or replacing the local binary,
   then restarting the Desktop app.
 
-## Validation and local-build proof
-
-- Rust crates: work from `codex-rs` and prefer the focused crate `just` recipe
-  or focused Cargo check/test.
-- App-server schema or protocol: run focused app-server tests and
-  `just app-server-schema-check`. Use the force or raw generator recipes only
-  for intentional contract regeneration.
-- Configuration schema: run focused config/core tests and
-  `just config-schema-check`. Use force or raw generator recipes only for
-  intentional `codex-rs/core/config.schema.json` regeneration.
-- Python SDK changes: use focused `uv run pytest` and `uv run ruff check .`;
-  regenerate locks or artifacts only for touched SDK surfaces.
-- Scripts: run syntax checks and the closest script tests; do not hand-edit
-  generated locks such as `scripts/uv.lock`.
-- Root maintenance: prefer matching root `package.json` scripts.
-- Local publish: use `just publish-local-codex-dry-run` for path proof and
-  `just publish-local-codex-final` before claiming installed replacement.
-- For a local-build claim, prove only the applicable links: relevant crates
-  compile, focused tests pass, the local `codex` binary builds, publish or
-  dry-run paths succeed when touched, installed replacement is correct when
-  touched, and the active desktop/app-server uses the local build after
-  rebuild, publish, and restart.
-- `CODEX_LOCAL_PUBLISH_DIR` is `C:\Users\kuh\Desktop\LOCAL-KD`, so the expected
-  publish target is `C:\Users\kuh\Desktop\LOCAL-KD\codex.exe`. Desktop-visible
-  completion also requires the running process path, local binary hash/version,
-  relevant app-server initialize/model metadata, and a user-visible screenshot
-  or equivalent evidence. State whether `just publish-local-codex-final` and a
-  Desktop restart remain required.
-- Tooling success alone does not prove a runtime bug is fixed; require the
-  focused failing test or approved final gate.
-
-### Protected paths and state
-
-- Do not hand-edit `codex-rs/target`, `node_modules`, `codex-rs/vendor`,
-  `third_party`, or `codex-rs/app-server-protocol/schema`.
-<!-- PROJECT-CONTEXT: END -->
-
 ## Instruction scope
 
-This file applies repository-wide.
-
-Before editing, locate applicable instructions with:
-
-```text
-rg --files --hidden -g AGENTS.md
-```
+Budget is not a constraint. Do not reduce investigation quality, skip needed code reading, or stop early to conserve tokens, context, commands, or compute.
 
 Read the closest relevant `AGENTS.md`. A nearer file augments this policy and
 takes precedence inside its subtree. Never rely on an instruction file that is
 absent from the working tree.
 
-Keep repository-wide rules in this root file and subtree-specific rules in the
-nearest nested `AGENTS.md`. README and background documentation are not loaded
-automatically as instructions.
+When the user presents a file path, read the entire file.
 
-Use ownership maps or source-of-truth documents when ownership is ambiguous,
-the change is cross-cutting, or a runtime-to-install path must be traced. For a
+Use ownership maps or source-of-truth documents for a
 clear local owner, do not expand into unrelated ownership documents.
+
+You are encouraged but not required to use the MCP/Plug-in "Repo-Atlas" when you need to understand the workspace.
 
 ## Operating defaults
 
-Use the smallest investigation, edit, communication, and validation that safely
-completes the request.
+Use the fastest investigation, edit, communication, and validation/tests that safely
+completes the request, keep correctness with speed.
 
-- For clear implementation requests, start work without announcing a lane,
-  plan, tool sequence, or validation intent.
-- Do not narrate routine searches, edits, or successful checks. Report only a
-  material scope expansion, conflicting task-relevant edits, a blocker, a
-  safety or compatibility decision, or information the user requested.
-- Do not ask for confirmation when the request is clear and safe.
-- For reviews, rankings, brainstorms, recommendations, or “what would you fix”
-  requests, return findings first and do not edit until the user asks.
-- Ignore unrelated dirty-worktree changes, untracked files, generated outputs,
-  and failures outside the accepted scope.
-- Preserve unrelated local edits. Overlapping edits from other agents are
-  expected. Compare competing versions once, keep or combine the best
-  compatible task-relevant behavior, coordinate directly when needed, and
-  continue without restarting or repeatedly revisiting the overlap.
-- Verify drift-prone facts only when the task depends on them. Examples include
-  the current branch, remotes, installed paths, active processes, available
-  recipes, and generated-artifact freshness.
-- Do not mix cleanup, optional refactoring, dependency changes, formatting
-  churn, release work, or generated-output changes into a focused fix unless
-  one is required for correctness.
-- Preserve established public, stored-data, configuration, security,
-  installation, and compatibility behavior unless the user requests a change.
-- Do not alter approval, permission, sandbox, patch-guard, stale-read,
-  validation-gating, or execution-safety behavior as part of unrelated work.
-- Read-only agents may investigate in parallel to help other busy agents. They
-  may inspect relevant or adjacent contract surfaces but must not edit them;
-  report findings to the busy agent, who retains edit ownership for the owned
-  surface.
-- Before finishing, review the task-relevant diff and result once, and fix any
-  problems found. Do not loop on unchanged checks or repeatedly revisit settled
+- When working on a task, ignore ALL UNRELATED FILES.
+- Do NOT start implementing until you COMPLETELY UNDERSTAND the required files/folders/code/workspace that you will need to know for the task, budget is not a concern, do not skip out on exploring and understanding to simply make things cheaper.
+- Update files that mentioned the file you deleted.
+- You are allowed to improve the implementation while doing so if you have gathered enough proven information on the task.
+- Overlapping edits from other agents are expected. Compare competing versions once, keep or combine the best compatible task-relevant behavior, coordinate directly when needed, and continue with the rest of your assigned task.
+- Read-only agents are encouraged but not required for any task invovling a high amount of files.
+- Do not loop on unchanged checks or repeatedly revisit completed
   work.
-- Do not stop after the first fixes or rush to finish. Confirm test outcomes
-  instead of assuming a test run is green, and do not treat green tests alone
-  as completion. Continue until the complete task-relevant behavior is
-  implemented correctly.
 - When checking for bugs, do not stop merely because the first bug was found. Continue
   across the accepted scope until relevant surfaces have at least been surveyed and the
   remaining candidates are confirmed, rejected, duplicated, deferred with a concrete
   missing fact, blocked, out of scope, or disproportionately expensive to resolve
   relative to their likely value. Never invent or pad findings to satisfy an expected
   count.
-- A confirmed finding must identify the violated contract or invariant, the reachable
-  causal path or missing required transition, the practical consequence, and fresh
-  supporting evidence with precise locators or receipt IDs. Report plausible
-  evidence-backed issues that could not be confirmed separately as unconfirmed risks,
-  each with the exact missing fact and why investigation stopped.
-- Do NOT turn a directed fix into a broad fix. Stay focused on the task at hand.
+- Do NOT turn a directed fix into a broad fix.
+- You are required to do one "double check" at the end of your task, a "double check" is simply reviewing your own code and making sure no bugs have been overlooked or created, fix whatever you find in your double check.
+- If while implementing you run into validation/test/implementation blockers, fix them but make sure to remember there will most likely be multiple agents working, so do not fight over blockers to simply complete your task, stop and think collectively on the best answer to the problem. 

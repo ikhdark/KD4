@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from scripts import rust_build_status
+from scripts import rust_build_status_support
 from scripts import tool_versions
 
 
@@ -103,7 +104,7 @@ class BuildToolingStorageTest(unittest.TestCase):
             "MSVC linker config aarch64-pc-windows-msvc: (unset)",
             report,
         )
-        self.assertIn("active Rust jobs: 2 total, 1 shared-target, 1 lane", report)
+        self.assertIn("active Rust processes: 2 total, 1 shared-target, 1 lane", report)
         self.assertIn(
             "shared-target jobs are active; prefer `just test-lane-fast <lane> ...`",
             report,
@@ -119,7 +120,23 @@ class BuildToolingStorageTest(unittest.TestCase):
         self.assertIn("Get-CimInstance Win32_Process -Filter", command)
         self.assertIn("Name = 'cargo.exe'", command)
         self.assertIn("Name = 'pwsh.exe'", command)
+        self.assertIn("$selfPid = $PID", command)
+        self.assertIn("ProcessId != $selfPid", command)
         self.assertNotIn("Where-Object", command)
+
+    def test_windows_process_discovery_warns_on_failure(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                rust_build_status.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired("powershell", 10),
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(rust_build_status.active_rust_processes_windows(), [])
+
+        self.assertIn("warning: Windows Rust process scan failed", stderr.getvalue())
 
     def test_posix_process_matching_ignores_cargo_substrings(self) -> None:
         self.assertFalse(
@@ -180,6 +197,32 @@ class BuildToolingStorageTest(unittest.TestCase):
         self.assertIn("just cargo-lane <lane>", report)
         self.assertNotIn("dev-small", report)
         self.assertNotIn("schema-probe-plan", report)
+
+    def test_directory_size_skips_reparse_points(self) -> None:
+        class FakeReparseEntry:
+            path = "outside"
+
+            def is_junction(self) -> bool:
+                return True
+
+            def is_dir(self, *, follow_symlinks: bool) -> bool:
+                raise AssertionError("reparse point should be skipped before traversal")
+
+            def stat(self, *, follow_symlinks: bool):
+                raise AssertionError("junction probe should be sufficient")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                mock.patch.object(rust_build_status_support.os, "name", "nt"),
+                mock.patch.object(
+                    rust_build_status_support.os,
+                    "scandir",
+                    return_value=contextlib.nullcontext([FakeReparseEntry()]),
+                ),
+            ):
+                size, errors = rust_build_status.directory_size_bytes(Path(temp_dir))
+
+        self.assertEqual((size, errors), (0, 0))
 
     def test_prune_stray_target_dirs_removes_read_only_trees(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -371,6 +414,61 @@ class BuildToolingStorageTest(unittest.TestCase):
 
             self.assertEqual(removed, [])
             self.assertTrue(stray.exists())
+
+    def test_prune_strays_warns_and_skips_outside_target_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir) / "repo"
+            target_root = repo_root / "codex-rs" / "target"
+            target_root.mkdir(parents=True)
+            outside = Path(temp_dir) / "outside"
+            outside.mkdir()
+            stderr = io.StringIO()
+
+            with (
+                mock.patch.object(
+                    rust_build_status,
+                    "stray_cargo_target_dirs",
+                    return_value=[outside],
+                ),
+                contextlib.redirect_stderr(stderr),
+            ):
+                removed = rust_build_status.prune_stray_cargo_target_dirs(
+                    repo_root=repo_root
+                )
+
+            self.assertEqual(removed, [])
+            self.assertTrue(outside.exists())
+            self.assertIn("warning: skipping stray target outside", stderr.getvalue())
+
+    def test_prune_strays_warns_when_delete_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            stray = repo_root / "codex-rs" / "target" / "stray"
+            stray.mkdir(parents=True)
+            stderr = io.StringIO()
+
+            with (
+                mock.patch.object(
+                    rust_build_status,
+                    "stray_cargo_target_dirs",
+                    return_value=[stray],
+                ),
+                mock.patch.object(
+                    rust_build_status, "cargo_lock_is_busy", return_value=False
+                ),
+                mock.patch.object(
+                    rust_build_status,
+                    "remove_tree_allow_readonly",
+                    side_effect=OSError("denied"),
+                ),
+                contextlib.redirect_stderr(stderr),
+            ):
+                removed = rust_build_status.prune_stray_cargo_target_dirs(
+                    repo_root=repo_root
+                )
+
+            self.assertEqual(removed, [])
+            self.assertIn("warning: failed to prune stray target", stderr.getvalue())
 
     def test_prune_stale_lanes_keeps_two_newest_warm_lanes_per_base(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -568,8 +666,29 @@ class BuildToolingStorageTest(unittest.TestCase):
         self.assertIn("prunable:", report)
         self.assertIn("stale-2", report)
         self.assertIn("safe prune suggestions:", report)
-        self.assertIn("Remove-Item -Recurse -LiteralPath", report)
+        self.assertIn("Remove-Item -Recurse -Force -LiteralPath", report)
         self.assertNotIn("active\\debug", report)
+
+    def test_build_doctor_displays_reserved_lane_without_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            with mock.patch.dict(
+                rust_build_status.os.environ,
+                {"CODEX_CARGO_LANE_ACTIVE_NAMES": "reserved"},
+                clear=True,
+            ):
+                snapshot = rust_build_status.BuildStatusSnapshot.collect(
+                    repo_root=repo_root,
+                    processes=[],
+                )
+            report = rust_build_status.build_doctor_report(
+                repo_root=repo_root,
+                snapshot=snapshot,
+                tool_lookup=lambda _name: None,
+                env={},
+            )
+
+        self.assertIn("active lanes: reserved", report)
 
 
 if __name__ == "__main__":

@@ -477,6 +477,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
                 sort_direction: SortDirection::Desc,
                 search_term: None,
             },
+            /*include_empty_preview*/ false,
             /*include_thread_id_tiebreaker*/ false,
         );
         builder.push(" AND threads.title = ");
@@ -601,6 +602,7 @@ ON CONFLICT(child_thread_id) DO NOTHING
                 sort_direction: SortDirection::Desc,
                 search_term: None,
             },
+            /*include_empty_preview*/ false,
             sort_key == crate::SortKey::RecencyAt,
         );
         push_thread_order_and_limit(
@@ -1319,7 +1321,12 @@ WITH RECURSIVE subtree(child_thread_id, parent_thread_id) AS (
     };
     let include_thread_id_tiebreaker =
         relation_filter.is_some() || filters.sort_key == SortKey::RecencyAt;
-    push_thread_filters(builder, filters, include_thread_id_tiebreaker);
+    push_thread_filters(
+        builder,
+        filters,
+        relation_filter.is_some(),
+        include_thread_id_tiebreaker,
+    );
     match relation_filter {
         Some(crate::ThreadRelationFilter::DirectChildrenOf(parent_thread_id)) => {
             builder.push(" AND listed_edge.parent_thread_id = ");
@@ -1419,6 +1426,7 @@ pub struct ThreadFilterOptions<'a> {
 pub(super) fn push_thread_filters<'a>(
     builder: &mut QueryBuilder<Sqlite>,
     options: ThreadFilterOptions<'a>,
+    include_empty_preview: bool,
     include_thread_id_tiebreaker: bool,
 ) {
     let ThreadFilterOptions {
@@ -1437,7 +1445,9 @@ pub(super) fn push_thread_filters<'a>(
     } else {
         builder.push(" AND threads.archived = 0");
     }
-    builder.push(" AND threads.preview <> ''");
+    if !include_empty_preview {
+        builder.push(" AND threads.preview <> ''");
+    }
     if !allowed_sources.is_empty() {
         builder.push(" AND threads.source IN (");
         let mut separated = builder.separated(", ");
@@ -2116,6 +2126,10 @@ mod tests {
             (grandchild_id, 1_700_000_300),
         ] {
             let mut metadata = test_thread_metadata(&codex_home, thread_id, codex_home.clone());
+            if thread_id == first_child_id {
+                metadata.preview = None;
+                metadata.first_user_message = None;
+            }
             metadata.created_at =
                 DateTime::<Utc>::from_timestamp(created_at, 0).expect("valid timestamp");
             metadata.updated_at = metadata.created_at;
@@ -2264,14 +2278,15 @@ mod tests {
             )
         );
 
-        runtime
-            .upsert_thread_spawn_edge(
-                grandchild_id,
-                parent_id,
-                DirectionalThreadSpawnEdgeStatus::Open,
-            )
+        sqlx::query(
+            "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id, status) VALUES (?, ?, ?)",
+        )
+            .bind(grandchild_id.to_string())
+            .bind(parent_id.to_string())
+            .bind(DirectionalThreadSpawnEdgeStatus::Open.as_ref())
+            .execute(runtime.pool.as_ref())
             .await
-            .expect("cycle-closing spawn edge insert should succeed");
+            .expect("preexisting cycle edge should insert directly");
         let cyclic_descendants = runtime
             .list_threads_by_relation(
                 /*page_size*/ 10,

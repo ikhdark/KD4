@@ -105,6 +105,7 @@ WINDOWS_RUST_PROCESS_FILTER = " OR ".join(
     f"Name = '{name}.exe'"
     for name in (*RUST_PROCESS_NAMES, *RUST_WRAPPER_PROCESS_NAMES)
 )
+WINDOWS_PROCESS_SCAN_TIMEOUT_SECONDS = 10
 DEFAULT_LANE_SIZE_WORKERS = 2
 MAX_LANE_SIZE_WORKERS = 4
 DEFAULT_PRUNE_KEEP_WARM_PER_BASE = 1
@@ -241,7 +242,9 @@ def active_rust_processes() -> list[RustProcess]:
 def active_rust_processes_windows() -> list[RustProcess]:
     shell = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
     command = (
-        f'Get-CimInstance Win32_Process -Filter "{WINDOWS_RUST_PROCESS_FILTER}" | '
+        "$selfPid = $PID; "
+        f'Get-CimInstance Win32_Process -Filter "({WINDOWS_RUST_PROCESS_FILTER}) '
+        'AND ProcessId != $selfPid" | '
         "Select-Object Name,ProcessId,CommandLine | ConvertTo-Json -Compress"
     )
     try:
@@ -250,17 +253,22 @@ def active_rust_processes_windows() -> list[RustProcess]:
             check=True,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=WINDOWS_PROCESS_SCAN_TIMEOUT_SECONDS,
             creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
         )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        print(f"warning: Windows Rust process scan failed: {exc}", file=sys.stderr)
         return []
 
     if not result.stdout.strip():
         return []
     try:
         payload = json.loads(result.stdout)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        print(
+            f"warning: Windows Rust process scan returned invalid JSON: {exc}",
+            file=sys.stderr,
+        )
         return []
     rows = payload if isinstance(payload, list) else [payload]
     processes = []
@@ -817,7 +825,10 @@ def remove_tree_allow_readonly(path: Path) -> None:
         os.chmod(name, 0o700)
         function(name)
 
-    shutil.rmtree(path, onerror=handle_remove_error)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=handle_remove_error)
+    else:
+        shutil.rmtree(path, onerror=handle_remove_error)
 
 
 def prune_stray_cargo_target_dirs(
@@ -836,9 +847,11 @@ def prune_stray_cargo_target_dirs(
             continue
         resolved_path = path.resolve()
         if resolved_path.parent != resolved_target_root:
-            raise ValueError(
-                f"refusing to prune stray target outside {resolved_target_root}: {resolved_path}"
+            print(
+                f"warning: skipping stray target outside {resolved_target_root}: {resolved_path}",
+                file=sys.stderr,
             )
+            continue
         if cargo_lock_is_busy(resolved_path):
             continue
         if not dry_run:
@@ -846,9 +859,12 @@ def prune_stray_cargo_target_dirs(
                 if is_indirect_directory(path) or cargo_lock_is_busy(path):
                     continue
                 remove_tree_allow_readonly(path)
-            except OSError:
-                if cargo_lock_is_busy(path):
-                    continue
+            except OSError as exc:
+                if not cargo_lock_is_busy(path):
+                    print(
+                        f"warning: failed to prune stray target {path}: {exc}",
+                        file=sys.stderr,
+                    )
                 continue
         removed.append(path)
     return removed

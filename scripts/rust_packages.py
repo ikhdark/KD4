@@ -48,23 +48,30 @@ def nearest_package_root(
 
     visited: list[Path] = []
     repo_bound = repo_root.resolve(strict=False) if repo_root is not None else None
+    normalized_repo_bound = (
+        _normalized_path(repo_bound) if repo_bound is not None else None
+    )
     if repo_bound is not None and not _is_within_or_same(current, repo_bound):
         if package_root_cache is not None:
             package_root_cache[current] = None
         return None
 
-    codex_rs_root = (repo_root / "codex-rs") if repo_root is not None else None
+    codex_rs_root = (repo_bound / "codex-rs") if repo_bound is not None else None
     result: Path | None = None
     while current.name and current != current.parent:
+        if package_root_cache is not None and current in package_root_cache:
+            result = package_root_cache[current]
+            break
         visited.append(current)
+        if current.name == "codex-rs" or current == codex_rs_root:
+            break
         manifest = current / CARGO_MANIFEST
         if manifest.is_file():
             result = current
             break
-        if current.name == "codex-rs" or current == codex_rs_root:
-            break
-        if repo_bound is not None and _normalized_path(current) == _normalized_path(
-            repo_bound
+        if (
+            normalized_repo_bound is not None
+            and _normalized_path(current) == normalized_repo_bound
         ):
             break
         current = current.parent

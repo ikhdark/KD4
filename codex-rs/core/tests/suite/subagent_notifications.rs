@@ -39,6 +39,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use test_case::test_case;
@@ -71,6 +72,16 @@ fn body_contains(req: &wiremock::Request, text: &str) -> bool {
     decoded_body(req)
         .and_then(|body| String::from_utf8(body).ok())
         .is_some_and(|body| body.contains(text))
+}
+
+fn prompt_cache_key(req: &wiremock::Request) -> Option<String> {
+    decoded_body(req)
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+        .and_then(|body| {
+            body.get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
 }
 
 fn request_has_input_type(req: &wiremock::Request, ty: &str) -> bool {
@@ -895,9 +906,19 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
     )
     .await;
 
+    let parent_prompt_cache_key = Arc::new(Mutex::new(None::<String>));
+    let child_parent_prompt_cache_key = Arc::clone(&parent_prompt_cache_key);
     let _child_request_log = mount_sse_once_match(
         &server,
-        |req: &wiremock::Request| body_contains(req, CHILD_PROMPT),
+        move |req: &wiremock::Request| {
+            let parent_key = child_parent_prompt_cache_key
+                .lock()
+                .expect("parent prompt cache key lock poisoned")
+                .clone();
+            req.url.path() == "/v1/responses"
+                && parent_key.is_some()
+                && prompt_cache_key(req) != parent_key
+        },
         sse(vec![
             ev_response_created("resp-child-1"),
             ev_assistant_message("msg-child-1", "child done"),
@@ -926,7 +947,14 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
     let test = builder.build(&server).await?;
 
     test.submit_turn(TURN_0_FORK_PROMPT).await?;
-    let _ = seed_turn.single_request();
+    let seed_request = seed_turn.single_request();
+    let seed_prompt_cache_key = seed_request.body_json()["prompt_cache_key"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("seed request should include prompt_cache_key"))?;
+    *parent_prompt_cache_key
+        .lock()
+        .expect("parent prompt cache key lock poisoned") = Some(seed_prompt_cache_key.clone());
 
     test.submit_turn(TURN_1_PROMPT).await?;
     let _ = spawn_turn.single_request();
@@ -939,13 +967,30 @@ async fn spawned_child_receives_forked_parent_context() -> Result<()> {
             .unwrap_or_default()
             .into_iter()
             .find(|request| {
-                body_contains(request, CHILD_PROMPT) && !body_contains(request, SPAWN_CALL_ID)
+                request.url.path() == "/v1/responses"
+                    && prompt_cache_key(request)
+                        .is_some_and(|request_key| request_key != seed_prompt_cache_key)
             })
         {
             break request;
         }
         if Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for forked child request");
+            let observed = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|request| {
+                    (
+                        request.url.path().to_string(),
+                        prompt_cache_key(&request),
+                        body_contains(&request, TURN_0_FORK_PROMPT),
+                        body_contains(&request, TURN_1_PROMPT),
+                        body_contains(&request, SPAWN_CALL_ID),
+                    )
+                })
+                .collect::<Vec<_>>();
+            anyhow::bail!("timed out waiting for forked child request; observed={observed:?}");
         }
         sleep(Duration::from_millis(10)).await;
     };

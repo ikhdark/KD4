@@ -530,7 +530,7 @@ impl LocalAgentTaskStore {
         }
         let mut transaction = self.pool.begin().await?;
         lock_attempt_tx(&mut transaction, call.attempt_id).await?;
-        require_active_current_attempt_tx(&mut transaction, call.attempt_id).await?;
+        let attempt = require_active_current_attempt_tx(&mut transaction, call.attempt_id).await?;
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, body_json, status FROM validation_calls WHERE call_id = ?",
         )
@@ -559,6 +559,8 @@ impl LocalAgentTaskStore {
             if existing.status.is_terminal()
                 || !call.status.is_terminal()
                 || existing.command_summary != call.command_summary
+                || existing.resolved_executable != call.resolved_executable
+                || existing.proof_kind != call.proof_kind
                 || call.recorded_at < existing.recorded_at
             {
                 return Err(StoreError::ValidationCallImmutable(call.call_id));
@@ -576,6 +578,42 @@ impl LocalAgentTaskStore {
                 return Err(StoreError::ValidationCallImmutable(call.call_id));
             }
         } else {
+            if call.status != crate::ValidationCallStatus::Running {
+                return Err(StoreError::ValidationCallImmutable(call.call_id));
+            }
+            if call.proof_kind == crate::ValidationProofKind::Focused {
+                if !call
+                    .resolved_executable
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path).is_absolute())
+                {
+                    return Err(StoreError::InvalidAssignment(
+                        "focused validation requires absolute resolved executable provenance"
+                            .to_string(),
+                    ));
+                }
+                let assignment =
+                    load_assignment_tx(&mut transaction, attempt.assignment_id).await?;
+                if !matches!(
+                    assignment.role,
+                    AgentRole::Worker | AgentRole::Verifier | AgentRole::Integrator
+                ) {
+                    return Err(StoreError::InvalidAssignment(format!(
+                        "{:?} assignments are not authorized to run focused validation",
+                        assignment.role
+                    )));
+                }
+                if !assignment
+                    .required_evidence
+                    .iter()
+                    .any(|requirement| requirement == &call.command_summary)
+                {
+                    return Err(StoreError::InvalidAssignment(format!(
+                        "focused validation command is not an exact required-evidence match: {}",
+                        call.command_summary
+                    )));
+                }
+            }
             sqlx::query("INSERT INTO validation_calls (call_id, attempt_id, body_json, status, recorded_at) VALUES (?, ?, ?, ?, ?)")
                 .bind(&call.call_id)
                 .bind(call.attempt_id.to_string())
@@ -651,12 +689,20 @@ impl LocalAgentTaskStore {
                     "validation call {call_id} has inconsistent persisted identity or status"
                 )));
             }
+            let completion_proof = call.status.is_success()
+                && call.proof_kind == crate::ValidationProofKind::Focused
+                && call
+                    .resolved_executable
+                    .as_deref()
+                    .is_some_and(|path| Path::new(path).is_absolute());
             if !call.status.is_terminal()
-                || draft.status == AgentStatusClaim::Completed && !call.status.is_success()
+                || draft.status == AgentStatusClaim::Completed && !completion_proof
             {
                 invalid_statuses.push(call_id.clone());
             }
-            validation_summaries.insert(call.command_summary);
+            if completion_proof {
+                validation_summaries.insert(call.command_summary);
+            }
         }
         if !invalid_calls.is_empty() {
             return Err(StoreError::ValidationCallOwnership {

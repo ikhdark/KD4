@@ -16,6 +16,7 @@ use codex_agent_task_store::CriterionResult;
 use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::ValidationCall;
 use codex_agent_task_store::ValidationCallStatus;
+use codex_agent_task_store::ValidationProofKind;
 
 fn metric_input() -> TaskMetricInput {
     TaskMetricInput {
@@ -150,6 +151,15 @@ fn completed_task_with_validation(
                 call_id: (*call_id).to_string(),
                 attempt_id,
                 command_summary: "focused validation".to_string(),
+                resolved_executable: Some(
+                    std::fs::canonicalize(
+                        std::env::current_exe().expect("current test executable"),
+                    )
+                    .expect("current test executable canonicalizes")
+                    .to_string_lossy()
+                    .into_owned(),
+                ),
+                proof_kind: ValidationProofKind::Focused,
                 status: *status,
                 recorded_at: now,
             })
@@ -173,6 +183,17 @@ fn completed_receipt_with_succeeded_validation_is_first_pass_success() {
     );
 
     assert!(super::terminal_input(&task).first_pass_validation_succeeded);
+}
+
+#[test]
+fn legacy_unclassified_success_is_not_first_pass_validation() {
+    let mut task = completed_task_with_validation(
+        &["validation-1"],
+        &[("validation-1", ValidationCallStatus::Succeeded)],
+    );
+    task.validation_calls[0].proof_kind = ValidationProofKind::LegacyUnclassified;
+
+    assert!(!super::terminal_input(&task).first_pass_validation_succeeded);
 }
 
 #[test]

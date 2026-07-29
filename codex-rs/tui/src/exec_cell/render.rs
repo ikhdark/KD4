@@ -112,9 +112,7 @@ pub(crate) fn output_lines(
         include_angle_pipe,
         include_prefix,
     } = params;
-    let CommandOutput {
-        aggregated_output, ..
-    } = match output {
+    let output = match output {
         Some(output) if only_err && output.exit_code == 0 => {
             return OutputLines {
                 lines: Vec::new(),
@@ -130,14 +128,12 @@ pub(crate) fn output_lines(
         }
     };
 
-    let src = aggregated_output;
-    let lines: Vec<&str> = src.lines().collect();
-    let total = lines.len();
+    let (total, retained) = output.line_counts();
     let mut out: Vec<Line<'static>> = Vec::new();
 
-    let head_end = total.min(line_limit);
-    for (i, raw) in lines[..head_end].iter().enumerate() {
-        let mut line = ansi_escape_line(raw);
+    let head_end = total.min(line_limit).min(retained);
+    for (i, raw) in output.lines().take(head_end).enumerate() {
+        let mut line = ansi_escape_line(raw.as_ref());
         let prefix = if !include_prefix {
             ""
         } else if i == 0 && include_angle_pipe {
@@ -152,24 +148,19 @@ pub(crate) fn output_lines(
         out.push(line);
     }
 
-    let show_ellipsis = total > 2 * line_limit;
-    let omitted = if show_ellipsis {
-        Some(total - 2 * line_limit)
-    } else {
-        None
-    };
-    if show_ellipsis {
-        let omitted = total - 2 * line_limit;
+    let tail_len = total
+        .saturating_sub(head_end)
+        .min(line_limit)
+        .min(retained.saturating_sub(head_end));
+    let omitted = total.saturating_sub(head_end + tail_len);
+    let omitted = (omitted > 0).then_some(omitted);
+    if let Some(omitted) = omitted {
         out.push(ExecCell::output_ellipsis_line(omitted));
     }
 
-    let tail_start = if show_ellipsis {
-        total - line_limit
-    } else {
-        head_end
-    };
-    for raw in lines[tail_start..].iter() {
-        let mut line = ansi_escape_line(raw);
+    let tail = output.lines().rev().take(tail_len).collect_vec();
+    for raw in tail.into_iter().rev() {
+        let mut line = ansi_escape_line(raw.as_ref());
         if include_prefix {
             line.spans.insert(0, "    ".into());
         }
@@ -223,7 +214,10 @@ impl HistoryCell for ExecCell {
                 if !call.is_unified_exec_interaction() {
                     let wrap_width = width.max(1) as usize;
                     let wrap_opts = RtOptions::new(wrap_width);
-                    for unwrapped in output.formatted_output.lines().map(ansi_escape_line) {
+                    for unwrapped in output
+                        .transcript_lines()
+                        .map(|line| ansi_escape_line(line.as_ref()))
+                    {
                         let wrapped = adaptive_wrap_line(&unwrapped, wrap_opts.clone());
                         push_owned_lines(&wrapped, &mut lines);
                     }
@@ -737,11 +731,7 @@ mod tests {
 
         // Baseline: how many screen lines would we get if we simply wrapped
         // all logical lines without any truncation?
-        let output = CommandOutput {
-            exit_code: 0,
-            aggregated_output,
-            formatted_output: String::new(),
-        };
+        let output = CommandOutput::new(0, aggregated_output, String::new());
         let width = 20;
         let layout = EXEC_DISPLAY_LAYOUT;
         let raw_output = output_lines(
@@ -864,11 +854,8 @@ mod tests {
 
     #[test]
     fn output_lines_ellipsis_includes_transcript_hint() {
-        let output = CommandOutput {
-            exit_code: 0,
-            aggregated_output: (1..=7).map(|n| n.to_string()).join("\n"),
-            formatted_output: String::new(),
-        };
+        let output =
+            CommandOutput::new(0, (1..=7).map(|n| n.to_string()).join("\n"), String::new());
 
         let rendered: Vec<String> = output_lines(
             Some(&output),
@@ -890,6 +877,32 @@ mod tests {
                 .any(|line| line.contains("… +3 lines (ctrl + t to view transcript)")),
             "expected logical truncation to include transcript hint, got: {rendered:?}"
         );
+    }
+
+    #[test]
+    fn streamed_output_uses_bounded_live_storage() {
+        let mut cell = new_active_exec_command(
+            "call-id".to_string(),
+            vec!["bash".into(), "-lc".into(), "echo output".into()],
+            None,
+            Vec::new(),
+            ExecCommandSource::Agent,
+            /*interaction_input*/ None,
+            /*animations_enabled*/ false,
+        );
+        let streamed = format!("head-{}-tail", "x".repeat(1024 * 1024));
+
+        assert!(cell.append_output("call-id", &streamed));
+        let output = cell.calls[0].output.as_ref().expect("streamed output");
+        let preview = output.lines().next().expect("preview line");
+        let transcript = output.transcript_lines().next().expect("transcript line");
+
+        assert_eq!(output.line_counts(), (1, 1));
+        assert!(preview.contains("bytes omitted"));
+        assert!(preview.starts_with("head-"));
+        assert!(preview.ends_with("-tail"));
+        assert!(preview.len() < streamed.len());
+        assert_eq!(preview, transcript);
     }
 
     #[test]
@@ -998,22 +1011,18 @@ mod tests {
         let command = vec![
             "powershell.exe".into(),
             "-Command".into(),
-            r"& 'C:\Users\Alice\private\kds.exe' --agent -- cargo test".into(),
+            r"& 'C:\Users\Alice\private\diagnostic.exe' --agent -- cargo test".into(),
         ];
         let call = ExecCall {
             call_id: "call-id".to_string(),
             command: command.clone(),
-            display_label: Some("KDWireGuard -".to_string()),
+            display_label: Some("Diagnostic -".to_string()),
             parsed: vec![ParsedCommand::Search {
                 cmd: "rg display_label".to_string(),
                 query: Some("display_label".to_string()),
                 path: None,
             }],
-            output: Some(CommandOutput {
-                exit_code: 0,
-                formatted_output: String::new(),
-                aggregated_output: String::new(),
-            }),
+            output: Some(CommandOutput::new(0, String::new(), String::new())),
             source: ExecCommandSource::Agent,
             start_time: None,
             duration: None,
@@ -1033,10 +1042,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert_eq!(rendered[0], "• Ran KDWireGuard -");
+        assert_eq!(rendered[0], "• Ran Diagnostic -");
         assert_eq!(cell.calls[0].command, command);
         assert!(!rendered[0].contains("Alice"));
-        assert!(expanded.contains(r"C:\Users\Alice\private\kds.exe"));
+        assert!(expanded.contains("diagnostic.exe"));
         assert!(expanded.contains("--agent -- cargo test"));
     }
 
@@ -1090,11 +1099,7 @@ mod tests {
             command: vec!["bash".into(), "-lc".into(), "echo done".into()],
             display_label: None,
             parsed: Vec::new(),
-            output: Some(CommandOutput {
-                exit_code: 0,
-                formatted_output: String::new(),
-                aggregated_output: url.to_string(),
-            }),
+            output: Some(CommandOutput::new(0, url.to_string(), String::new())),
             source: ExecCommandSource::UserShell,
             start_time: None,
             duration: None,
@@ -1128,11 +1133,7 @@ mod tests {
             command: vec!["bash".into(), "-lc".into(), "echo done".into()],
             display_label: None,
             parsed: Vec::new(),
-            output: Some(CommandOutput {
-                exit_code: 0,
-                formatted_output: url.to_string(),
-                aggregated_output: url.to_string(),
-            }),
+            output: Some(CommandOutput::new(0, url.to_string(), url.to_string())),
             source: ExecCommandSource::Agent,
             start_time: None,
             duration: None,

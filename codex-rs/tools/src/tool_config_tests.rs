@@ -165,6 +165,11 @@ fn unified_exec_feature_mode_follows_composition_dependencies() {
 #[test]
 fn request_user_input_modes_follow_default_mode_feature() {
     let mut features = Features::with_defaults();
+    assert_eq!(
+        request_user_input_available_modes(&features),
+        vec![ModeKind::Default, ModeKind::Plan]
+    );
+
     features.disable(Feature::DefaultModeRequestUserInput);
     assert_eq!(
         request_user_input_available_modes(&features),

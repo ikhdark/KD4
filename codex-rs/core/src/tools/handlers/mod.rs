@@ -41,8 +41,6 @@ pub(crate) mod test_sync_spec;
 mod tool_search;
 pub(crate) mod tool_search_spec;
 pub(crate) mod unified_exec;
-mod verify_local;
-pub(crate) mod verify_local_spec;
 mod view_image;
 pub(crate) mod view_image_spec;
 mod wait_for_environment;
@@ -92,8 +90,6 @@ pub(crate) use tool_search::ToolSearchHandlerCache;
 pub use unified_exec::ExecCommandHandler;
 pub(crate) use unified_exec::ExecCommandHandlerOptions;
 pub use unified_exec::WriteStdinHandler;
-pub use verify_local::VerifyLocalHandler;
-pub(crate) use verify_local::run_automatic_verify_local_plan;
 pub use view_image::ViewImageHandler;
 pub(crate) use wait_for_environment::WaitForEnvironmentHandler;
 

@@ -4,6 +4,7 @@ use crate::agent::task_capabilities::TypedToolClass;
 use crate::agent::task_capabilities::TypedToolRequest;
 use crate::agent::task_capabilities::authorize_typed_tool;
 use crate::agent::task_capabilities::classify_typed_tool;
+use crate::agent::task_capabilities::is_independent_review_source;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -21,6 +22,7 @@ use codex_mcp::ToolInfo;
 use codex_protocol::dynamic_tools::DynamicToolSpec;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::SearchToolCallParams;
+use codex_protocol::protocol::SessionSource;
 use codex_tools::DiscoverableTool;
 use codex_tools::ToolCall as ExtensionToolCall;
 use codex_tools::ToolExecutor;
@@ -253,6 +255,26 @@ impl ToolRouter {
         } else {
             ExternalMutationIntent::MayMutate
         };
+        let collaboration_namespace = step_context
+            .turn
+            .provider
+            .capabilities()
+            .namespace_tools
+            .then_some(
+                step_context
+                    .turn
+                    .config
+                    .multi_agent_v2
+                    .tool_namespace
+                    .as_deref(),
+            )
+            .flatten();
+        authorize_independent_review_tool_call(
+            &step_context.turn.session_source,
+            collaboration_namespace,
+            &call,
+            external_mutation_intent,
+        )?;
         authorize_bound_typed_tool_call(
             session.as_ref(),
             step_context.as_ref(),
@@ -305,7 +327,7 @@ fn collect_proven_read_only_external_tools(
             .annotations
             .as_ref()
             .and_then(|annotations| annotations.read_only_hint)
-            == Some(true);
+            .unwrap_or_else(|| is_allowlisted_read_only_external_tool(&name));
         external_tool_read_only
             .entry(name)
             .and_modify(|all_read_only| *all_read_only &= read_only)
@@ -315,6 +337,69 @@ fn collect_proven_read_only_external_tools(
         .into_iter()
         .filter_map(|(name, read_only)| read_only.then_some(name))
         .collect()
+}
+
+fn is_allowlisted_read_only_external_tool(name: &ToolName) -> bool {
+    match (name.namespace.as_deref(), name.name.as_str()) {
+        (
+            Some("mcp__repo_atlas"),
+            "batch" | "cochange" | "context_for" | "contract" | "crate_graph" | "crate_summary"
+            | "find_def" | "find_refs" | "impact" | "index_status" | "outline" | "repo_facts"
+            | "select_root" | "slice" | "trace" | "where_belongs",
+        ) => true,
+        (
+            Some("mcp__codex_apps__github"),
+            "fetch"
+            | "fetch_blob"
+            | "fetch_commit"
+            | "fetch_commit_workflow_runs"
+            | "fetch_file"
+            | "fetch_issue"
+            | "fetch_issue_comments"
+            | "fetch_pr"
+            | "fetch_pr_comments"
+            | "fetch_pr_file_patch"
+            | "fetch_pr_patch"
+            | "fetch_workflow_job_logs"
+            | "fetch_workflow_job_steps"
+            | "fetch_workflow_run_artifacts"
+            | "fetch_workflow_run_jobs",
+        ) => true,
+        _ => false,
+    }
+}
+
+fn authorize_independent_review_tool_call(
+    session_source: &SessionSource,
+    collaboration_namespace: Option<&str>,
+    call: &ToolCall,
+    external_mutation_intent: ExternalMutationIntent,
+) -> Result<(), FunctionCallError> {
+    if !is_independent_review_source(session_source) {
+        return Ok(());
+    }
+    let class = classify_typed_tool(
+        call.tool_name.namespace.as_deref(),
+        &call.tool_name.name,
+        collaboration_namespace,
+    );
+    let allowed = matches!(
+        class,
+        TypedToolClass::AgentCommunication
+            | TypedToolClass::OwnTask
+            | TypedToolClass::ReadSearch
+            | TypedToolClass::Diff
+            | TypedToolClass::Shell
+    ) || (class == TypedToolClass::DynamicExternal
+        && external_mutation_intent == ExternalMutationIntent::ProvenReadOnly);
+    if allowed {
+        Ok(())
+    } else {
+        Err(FunctionCallError::RespondToModel(format!(
+            "{}: independent review capability denied: only read-only repository inspection tools are available",
+            call.tool_name.name
+        )))
+    }
 }
 
 async fn authorize_bound_typed_tool_call(

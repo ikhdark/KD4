@@ -14,10 +14,11 @@ reuse_ready_file="${CODEX_EXEC_SERVER_REUSE_READY_FILE:-1}"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-tui-with-exec-server.XXXXXX")"
 stdout_log="$tmp_dir/exec-server.stdout"
 stderr_log="$tmp_dir/exec-server.stderr"
+stdout_fifo="$tmp_dir/exec-server.stdout.fifo"
 server_pid=""
-server_stdout_fd=""
+server_stdout_fd=3
+server_stdout_drain_pid=""
 server_process_group=0
-started_server=0
 exec_server_url="${CODEX_EXEC_SERVER_URL:-}"
 
 cleanup() {
@@ -29,6 +30,10 @@ cleanup() {
     fi
     wait "$server_pid" >/dev/null 2>&1 || true
   fi
+  if [[ -n "$server_stdout_drain_pid" ]]; then
+    wait "$server_stdout_drain_pid" >/dev/null 2>&1 || true
+  fi
+  exec 3<&- || true
   rm -rf "$tmp_dir"
 }
 
@@ -50,7 +55,11 @@ probe_exec_server_url() {
   fi
 
   "$python_bin" - "$url" <<'PY'
+import base64
+import hashlib
+import os
 import socket
+import ssl
 import sys
 from urllib.parse import urlparse
 
@@ -58,37 +67,84 @@ parsed = urlparse(sys.argv[1])
 if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
     raise SystemExit(1)
 port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+path = parsed.path or "/"
+if parsed.query:
+    path += f"?{parsed.query}"
+host = parsed.hostname
+if ":" in host:
+    host = f"[{host}]"
+default_port = 443 if parsed.scheme == "wss" else 80
+host_header = host if port == default_port else f"{host}:{port}"
+key = base64.b64encode(os.urandom(16)).decode("ascii")
+request = (
+    f"GET {path} HTTP/1.1\r\n"
+    f"Host: {host_header}\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    f"Sec-WebSocket-Key: {key}\r\n"
+    "Sec-WebSocket-Version: 13\r\n"
+    "\r\n"
+).encode("ascii")
 try:
-    with socket.create_connection((parsed.hostname, port), timeout=1.0):
-        pass
-except OSError:
+    sock = socket.create_connection((parsed.hostname, port), timeout=1.0)
+    if parsed.scheme == "wss":
+        sock = ssl.create_default_context().wrap_socket(
+            sock, server_hostname=parsed.hostname
+        )
+    with sock:
+        sock.settimeout(1.0)
+        sock.sendall(request)
+        response = bytearray()
+        while b"\r\n\r\n" not in response and len(response) <= 16_384:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+except (OSError, ssl.SSLError):
+    raise SystemExit(1)
+
+header, separator, _ = bytes(response).partition(b"\r\n\r\n")
+if not separator:
+    raise SystemExit(1)
+lines = header.decode("iso-8859-1").split("\r\n")
+if not lines or not lines[0].startswith("HTTP/1.1 101"):
+    raise SystemExit(1)
+headers = {}
+for line in lines[1:]:
+    name, delimiter, value = line.partition(":")
+    if delimiter:
+        headers[name.strip().lower()] = value.strip()
+expected_accept = base64.b64encode(
+    hashlib.sha1(
+        (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+    ).digest()
+).decode("ascii")
+if headers.get("upgrade", "").lower() != "websocket":
+    raise SystemExit(1)
+if "upgrade" not in {
+    token.strip().lower() for token in headers.get("connection", "").split(",")
+}:
+    raise SystemExit(1)
+if headers.get("sec-websocket-accept") != expected_accept:
     raise SystemExit(1)
 PY
 }
 
 candidate_bin() {
   local name="$1"
-  local profile
-  for profile in release debug; do
-    if [[ -x "$cargo_root/target/$profile/$name" ]]; then
-      printf '%s\n' "$cargo_root/target/$profile/$name"
-      return 0
-    fi
-    if [[ -x "$cargo_root/target/$profile/$name.exe" ]]; then
-      printf '%s\n' "$cargo_root/target/$profile/$name.exe"
-      return 0
-    fi
-  done
+  if [[ -x "$cargo_root/target/$build_profile/$name" ]]; then
+    printf '%s\n' "$cargo_root/target/$build_profile/$name"
+    return 0
+  fi
+  if [[ -x "$cargo_root/target/$build_profile/$name.exe" ]]; then
+    printf '%s\n' "$cargo_root/target/$build_profile/$name.exe"
+    return 0
+  fi
   return 1
 }
 
 target_bin() {
-  local name="$1"
-  if [[ -x "$cargo_root/target/$build_profile/$name" ]]; then
-    printf '%s\n' "$cargo_root/target/$build_profile/$name"
-  else
-    printf '%s\n' "$cargo_root/target/$build_profile/$name.exe"
-  fi
+  candidate_bin "$1"
 }
 
 resolve_bin() {
@@ -160,7 +216,7 @@ load_cached_url() {
     return 1
   fi
   local cached
-  IFS= read -r cached <"$ready_file" || return 1
+  IFS= read -r cached <"$ready_file" || [[ -n "$cached" ]] || return 1
   cached="${cached%$'\r'}"
   if is_ws_url "$cached" && probe_exec_server_url "$cached"; then
     exec_server_url="$cached"
@@ -188,8 +244,8 @@ resolve_binaries() {
     else
       build_tui_binary
     fi
-    codex_bin="${codex_bin:-$(target_bin codex)}"
-    tui_bin="${tui_bin:-$(target_bin codex-tui)}"
+    codex_bin="${codex_bin:-$(target_bin codex || true)}"
+    tui_bin="${tui_bin:-$(target_bin codex-tui || true)}"
   fi
 }
 
@@ -197,27 +253,48 @@ resolve_tui_binary() {
   tui_bin="$(resolve_bin "${CODEX_TUI_BIN:-}" codex-tui || true)"
   if [[ -z "$tui_bin" ]]; then
     build_tui_binary
-    tui_bin="$(target_bin codex-tui)"
+    tui_bin="$(target_bin codex-tui || true)"
   fi
 }
 
 start_exec_server() {
   local server_cmd=("$codex_bin" exec-server --listen "$listen_url")
   if [[ ! -x "$codex_bin" ]]; then
-    server_cmd=(cargo run --quiet -p codex-cli --bin codex -- exec-server --listen "$listen_url")
+    if [[ "$build_missing_binaries" == 0 ]]; then
+      echo "codex binary for profile '$build_profile' was not found and CODEX_BUILD_MISSING_BINARIES=0" >&2
+      exit 1
+    fi
+    local cargo_profile_args=()
+    if [[ "$build_profile" == "release" ]]; then
+      cargo_profile_args+=(--release)
+    elif [[ "$build_profile" != "debug" ]]; then
+      cargo_profile_args+=(--profile "$build_profile")
+    fi
+    server_cmd=(
+      cargo run --quiet --manifest-path "$cargo_root/Cargo.toml"
+      "${cargo_profile_args[@]}" -p codex-cli --bin codex --
+      exec-server --listen "$listen_url"
+    )
   fi
 
+  mkfifo "$stdout_fifo"
   if command -v setsid >/dev/null 2>&1; then
-    coproc EXEC_SERVER { setsid "${server_cmd[@]}" 2>"$stderr_log"; }
+    setsid "${server_cmd[@]}" >"$stdout_fifo" 2>"$stderr_log" &
     server_process_group=1
   else
-    coproc EXEC_SERVER { "${server_cmd[@]}" 2>"$stderr_log"; }
+    "${server_cmd[@]}" >"$stdout_fifo" 2>"$stderr_log" &
     server_process_group=0
   fi
 
-  server_pid="$EXEC_SERVER_PID"
-  server_stdout_fd="${EXEC_SERVER[0]}"
-  started_server=1
+  server_pid=$!
+  exec 3<"$stdout_fifo"
+}
+
+drain_exec_server_stdout() {
+  local line
+  while IFS= read -r -u "$server_stdout_fd" line; do
+    printf '%s\n' "${line%$'\r'}" >>"$stdout_log"
+  done
 }
 
 wait_for_exec_server_url() {
@@ -225,12 +302,14 @@ wait_for_exec_server_url() {
   local line
 
   while (( SECONDS < deadline )); do
-    if IFS= read -r -t 0.25 -u "$server_stdout_fd" line; then
+    if IFS= read -r -t 1 -u "$server_stdout_fd" line; then
       line="${line%$'\r'}"
       printf '%s\n' "$line" >>"$stdout_log"
       if is_ws_url "$line"; then
         exec_server_url="$line"
         persist_ready_url
+        drain_exec_server_stdout &
+        server_stdout_drain_pid=$!
         return 0
       fi
       continue
@@ -241,6 +320,7 @@ wait_for_exec_server_url() {
       echo "failed to start codex exec-server" >&2
       exit 1
     fi
+    sleep 0.1
   done
 
   dump_startup_logs
@@ -257,8 +337,19 @@ run_tui() {
     return
   fi
 
-  cd "$cargo_root"
-  cargo run --quiet -p codex-tui --bin codex-tui -- -c mcp_oauth_credentials_store=file "$@"
+  if [[ "$build_missing_binaries" == 0 ]]; then
+    echo "codex-tui binary for profile '$build_profile' was not found and CODEX_BUILD_MISSING_BINARIES=0" >&2
+    exit 1
+  fi
+  local cargo_profile_args=()
+  if [[ "$build_profile" == "release" ]]; then
+    cargo_profile_args+=(--release)
+  elif [[ "$build_profile" != "debug" ]]; then
+    cargo_profile_args+=(--profile "$build_profile")
+  fi
+  cargo run --quiet --manifest-path "$cargo_root/Cargo.toml" \
+    "${cargo_profile_args[@]}" -p codex-tui --bin codex-tui -- \
+    -c mcp_oauth_credentials_store=file "$@"
 }
 
 if ! is_ws_url "$exec_server_url"; then

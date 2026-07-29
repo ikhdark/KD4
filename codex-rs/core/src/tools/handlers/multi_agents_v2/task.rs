@@ -33,7 +33,9 @@ use codex_agent_task_store::RepoScope;
 use codex_agent_task_store::RiskDomain;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::TaskActor;
+use codex_agent_task_store::ValidationCall;
 use codex_agent_task_store::ValidationCallStatus;
+use codex_agent_task_store::ValidationProofKind;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
@@ -303,7 +305,7 @@ async fn derive_review_reason(
     let successful_validation_ids = task
         .validation_calls
         .iter()
-        .filter(|call| call.status == ValidationCallStatus::Succeeded)
+        .filter(|call| is_successful_focused_validation(call))
         .map(|call| call.call_id.as_str())
         .collect::<BTreeSet<_>>();
     let focused_validation_succeeded = !draft.validation_call_ids.is_empty()
@@ -349,6 +351,15 @@ async fn derive_review_reason(
             derived.decision.reasons.join("; ")
         )
     }))
+}
+
+fn is_successful_focused_validation(call: &ValidationCall) -> bool {
+    call.proof_kind == ValidationProofKind::Focused
+        && call
+            .resolved_executable
+            .as_deref()
+            .is_some_and(|path| Path::new(path).is_absolute())
+        && call.status == ValidationCallStatus::Succeeded
 }
 
 async fn build_evaluation_context(

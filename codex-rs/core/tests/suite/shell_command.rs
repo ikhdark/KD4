@@ -95,7 +95,7 @@ fn assert_shell_command_output(output: &str, expected: &str) -> Result<()> {
         .to_string();
 
     let expected_pattern = format!(
-        r"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nRaw output artifact: .+? \([0-9]+ bytes retained before model summarization\)\nOutput:\n{expected}\n?$"
+        r"(?s)^Exit code: 0\nWall time: [0-9]+(?:\.[0-9]+)? seconds\nRaw output artifact: .+? \([0-9]+ bytes retained\)\nOutput:\n{expected}\n?$"
     );
 
     assert_regex_match(&expected_pattern, &normalized_output);

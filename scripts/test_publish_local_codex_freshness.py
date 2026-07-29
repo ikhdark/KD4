@@ -221,7 +221,7 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
             self.assertIn("buildCommand: cargo --config", result.stdout)
             self.assertNotIn("buildCommand: <skipped>", result.stdout)
 
-    def test_auto_skip_build_scans_committed_split_publish_helpers(self) -> None:
+    def test_auto_skip_build_scans_committed_publish_entrypoint(self) -> None:
         self.init_repo_fixture()
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
@@ -231,16 +231,16 @@ class PublishLocalCodexFreshnessTest(PublishLocalCodexTestBase):
                 temp_path / "fake-codex.cmd",
                 timestamp=source_timestamp,
             )
-            helper = self.repo_root / "scripts" / "publish-local-codex.build.ps1"
-            helper.parent.mkdir(parents=True)
-            helper.write_text("# split publish helper\n", encoding="utf-8")
-            self.run_git("add", "scripts/publish-local-codex.build.ps1")
-            self.run_git("commit", "--quiet", "-m", "add split publish helper")
-            os.utime(helper, (source_timestamp + 10, source_timestamp + 10))
+            entrypoint = self.repo_root / "scripts" / "publish-local-codex.ps1"
+            entrypoint.parent.mkdir(parents=True)
+            entrypoint.write_text("# publish entrypoint\n", encoding="utf-8")
+            self.run_git("add", "scripts/publish-local-codex.ps1")
+            self.run_git("commit", "--quiet", "-m", "add publish entrypoint")
+            os.utime(entrypoint, (source_timestamp + 10, source_timestamp + 10))
             self.assertEqual(self.run_git("status", "--porcelain").stdout, "")
             self.write_build_stamp("release", source_timestamp, fake_codex)
-            helper.write_text("# changed split publish helper\n", encoding="utf-8")
-            os.utime(helper, (source_timestamp + 10, source_timestamp + 10))
+            entrypoint.write_text("# changed publish entrypoint\n", encoding="utf-8")
+            os.utime(entrypoint, (source_timestamp + 10, source_timestamp + 10))
 
             result = self.run_script(
                 "-DryRun",

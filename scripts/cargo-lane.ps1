@@ -4,6 +4,22 @@ $ProgressPreference = "SilentlyContinue"
 
 . (Join-Path $PSScriptRoot "common-rust-env.ps1")
 
+function Test-CargoLaneCommandToken {
+    param(
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $false
+    }
+    if ($Value -match "[\\/]") {
+        return $true
+    }
+
+    $leaf = [System.IO.Path]::GetFileNameWithoutExtension($Value)
+    return $leaf -in @("cargo", "just", "rustup", "powershell", "pwsh")
+}
+
 function Parse-CargoLaneArguments {
     param(
         [object[]]$RawArgs
@@ -27,6 +43,9 @@ function Parse-CargoLaneArguments {
                 throw "-Lane requires a value."
             }
             $parsedLane = [string]$RawArgs[$i]
+            if ($parsedLane.StartsWith("-", [StringComparison]::Ordinal)) {
+                throw "-Lane requires a value that does not start with '-'."
+            }
             continue
         }
         if ($arg.StartsWith("-Lane:", [StringComparison]::OrdinalIgnoreCase)) {
@@ -54,6 +73,9 @@ function Parse-CargoLaneArguments {
             continue
         }
         if ($null -eq $parsedLane -and -not $arg.StartsWith("-", [StringComparison]::Ordinal)) {
+            if (Test-CargoLaneCommandToken -Value $arg) {
+                throw "First positional argument '$arg' looks like a command. Pass -Lane <name> before the command."
+            }
             $parsedLane = $arg
             continue
         }
@@ -63,6 +85,9 @@ function Parse-CargoLaneArguments {
 
     if ([string]::IsNullOrWhiteSpace($parsedLane)) {
         throw "-Lane is required."
+    }
+    if ($parsedLane.StartsWith("-", [StringComparison]::Ordinal)) {
+        throw "-Lane requires a value that does not start with '-'."
     }
     if ($parsedLane -notmatch "^[A-Za-z0-9_.-]+$") {
         throw "Lane '$parsedLane' contains unsupported characters."
@@ -304,6 +329,9 @@ function Test-ExclusiveLaneFileBusy {
     catch [System.IO.IOException] {
         return $true
     }
+    catch [System.UnauthorizedAccessException] {
+        return $true
+    }
     finally {
         if ($null -ne $stream) {
             $stream.Dispose()
@@ -475,11 +503,24 @@ function Invoke-CargoLanePrune {
     $env:CODEX_CARGO_LANE_ACTIVE_NAMES = ($active | Select-Object -Unique) -join ";"
     $env:CODEX_CARGO_LANES_ROOT = $LanesRoot
     $pruneSucceeded = $false
+    $pruneFailure = $null
     try {
         $scriptPath = Join-Path $RepoRoot "scripts\rust_build_status.py"
-        $global:LASTEXITCODE = $null
-        & python $scriptPath prune --skip-disk-report --keep-warm-per-base 1 --max-age-days $maxAgeDays @maxLaneArgs | Out-Null
-        $pruneSucceeded = $LASTEXITCODE -eq 0
+        $python = Get-Command python -ErrorAction SilentlyContinue
+        if ($null -eq $python) {
+            $pruneFailure = "python executable was not found"
+        }
+        else {
+            $global:LASTEXITCODE = $null
+            & $python.Source $scriptPath prune --skip-disk-report --keep-warm-per-base 1 --max-age-days $maxAgeDays @maxLaneArgs | Out-Null
+            $pruneSucceeded = $LASTEXITCODE -eq 0
+            if (-not $pruneSucceeded) {
+                $pruneFailure = "prune command exited with code $LASTEXITCODE"
+            }
+        }
+    }
+    catch {
+        $pruneFailure = $_.Exception.Message
     }
     finally {
         $env:CODEX_CARGO_LANE_ACTIVE_NAMES = $previousActiveNames
@@ -489,7 +530,8 @@ function Invoke-CargoLanePrune {
         [IO.File]::WriteAllText($stampPath, (Get-Date).ToUniversalTime().ToString("o"))
     }
     else {
-        Write-Warning "Cargo lane pruning failed; leaving the GC stamp unchanged so the next run can retry."
+        $detail = if ([string]::IsNullOrWhiteSpace($pruneFailure)) { "" } else { " ($pruneFailure)" }
+        Write-Warning "Cargo lane pruning failed$detail; leaving the GC stamp unchanged so the next run can retry."
     }
 }
 
@@ -693,10 +735,10 @@ function Enable-SccacheForLane {
 $repoRoot = Get-RepoRoot
 $rustRoot = Join-Path $repoRoot "codex-rs"
 if (-not [string]::IsNullOrWhiteSpace($LanesRoot)) {
-    $cargoLanesRoot = [System.IO.Path]::GetFullPath($LanesRoot)
+    $cargoLanesRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LanesRoot)
 }
 elseif (-not [string]::IsNullOrWhiteSpace($env:CODEX_CARGO_LANES_ROOT)) {
-    $cargoLanesRoot = [System.IO.Path]::GetFullPath($env:CODEX_CARGO_LANES_ROOT)
+    $cargoLanesRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($env:CODEX_CARGO_LANES_ROOT)
 }
 else {
     $cargoLanesRoot = Join-Path $rustRoot "target\lanes"
@@ -712,11 +754,19 @@ $candidateLane = Resolve-CargoLaneName -RequestedLane $requestedLane -CommandArg
 $reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $activeLaneNames
 $resolvedLane = $reservation.Lane
 $targetDir = $reservation.TargetDir
+if ($requestedLane -ne "auto" -and $resolvedLane -ne $requestedLane) {
+    Write-Warning "Requested Cargo lane '$requestedLane' is busy; using '$resolvedLane'."
+}
 [IO.File]::WriteAllText(
     (Join-Path $targetDir ".lane-last-used"),
     (Get-Date).ToUniversalTime().ToString("o")
 )
-Invoke-CargoLanePrune -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot -ActiveNames $activeLaneNames -ExcludedNames @($resolvedLane)
+try {
+    Invoke-CargoLanePrune -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot -ActiveNames $activeLaneNames -ExcludedNames @($resolvedLane)
+}
+catch {
+    Write-Warning "Cargo lane pruning failed unexpectedly ($($_.Exception.Message)); continuing without pruning."
+}
 
 if ([string]::IsNullOrWhiteSpace($env:RUST_MIN_STACK)) {
     $env:RUST_MIN_STACK = "8388608"

@@ -52,6 +52,9 @@ _TRANSLATION_TABLE = str.maketrans(substitutions)
 # text files with CRLF endings (core.autocrlf), so flagging \r would fail
 # every clean file.
 _INVALID_ASCII_RE = re.compile(rb"[^\x09\x0A\x0D\x20-\x7E]")
+_INVALID_TEXT_RE = re.compile(
+    rf"[^\x09\x0A\x0D\x20-\x7E{re.escape(''.join(map(chr, allowed_unicode_codepoints)))}]"
+)
 _READ_CHUNK_SIZE = 1024 * 1024
 _OUTPUT_BATCH_CHARS = 64 * 1024
 _safe_char_cache: dict[int, str] = {}
@@ -97,27 +100,42 @@ def lint_utf8_ascii_check(filename: Path) -> bool:
     byte_col = 1
     byte_offset = 0
 
-    with open(filename, "rb") as f:
-        while chunk := f.read(_READ_CHUNK_SIZE):
-            decoder_has_pending_bytes = bool(decoder.getstate()[0])
-            if chunk.isascii() and not decoder_has_pending_bytes:
-                line, col = scan_ascii_chunk(chunk, line, col, reporter)
-            else:
-                try:
-                    text = decoder.decode(chunk, final=False)
-                except UnicodeDecodeError as e:
-                    print_decode_error(e, chunk, byte_offset, byte_line, byte_col)
-                    reporter.flush()
-                    return True
-                line, col = scan_text(text, line, col, reporter)
+    try:
+        with open(filename, "rb") as f:
+            while chunk := f.read(_READ_CHUNK_SIZE):
+                pending = decoder.getstate()[0]
+                if chunk.isascii() and not pending:
+                    line, col = scan_ascii_chunk(chunk, line, col, reporter)
+                else:
+                    try:
+                        text = decoder.decode(chunk, final=False)
+                    except UnicodeDecodeError as error:
+                        print_decode_error(
+                            error,
+                            byte_offset - len(pending),
+                            byte_line,
+                            max(1, byte_col - len(pending)),
+                        )
+                        reporter.flush()
+                        return True
+                    line, col = scan_text(text, line, col, reporter)
 
-            byte_line, byte_col = advance_position_bytes(chunk, byte_line, byte_col)
-            byte_offset += len(chunk)
+                byte_line, byte_col = advance_position_bytes(chunk, byte_line, byte_col)
+                byte_offset += len(chunk)
+    except OSError as error:
+        print_file_error(filename, "read", error)
+        return True
 
+    pending = decoder.getstate()[0]
     try:
         text = decoder.decode(b"", final=True)
-    except UnicodeDecodeError as e:
-        print_decode_error(e, b"", byte_offset, byte_line, byte_col)
+    except UnicodeDecodeError as error:
+        print_decode_error(
+            error,
+            byte_offset - len(pending),
+            byte_line,
+            max(1, byte_col - len(pending)),
+        )
         reporter.flush()
         return True
     scan_text(text, line, col, reporter)
@@ -130,24 +148,32 @@ def lint_utf8_ascii_fix(filename: Path) -> bool:
     try:
         with open(filename, "rb") as f:
             raw = f.read()
+    except OSError as error:
+        print_file_error(filename, "read", error)
+        return True
+    try:
         if raw.isascii() and _INVALID_ASCII_RE.search(raw) is None:
             return False
         text = raw.decode("utf-8")
-    except UnicodeDecodeError as e:
-        print_decode_error(e, raw, 0, 1, 1)
+    except UnicodeDecodeError as error:
+        print_decode_error(error, 0, 1, 1)
         return True
 
     reporter = ErrorReporter()
     scan_text(text, 1, 1, reporter)
     reporter.flush()
 
-    if reporter.has_errors:
+    if reporter.fixable_count:
         print(f"Attempting to fix {filename}...")
         new_contents = text.translate(_TRANSLATION_TABLE)
         # newline="" prevents \r\n in the decoded text from being re-expanded
         # to \r\r\n by platform newline translation.
-        with open(filename, "w", encoding="utf-8", newline="") as f:
-            f.write(new_contents)
+        try:
+            with open(filename, "w", encoding="utf-8", newline="") as f:
+                f.write(new_contents)
+        except OSError as error:
+            print_file_error(filename, "write", error)
+            return True
         print(
             f"Fixed {reporter.fixable_count} of {reporter.error_count} errors in {filename}."
         )
@@ -211,37 +237,41 @@ def scan_ascii_chunk(
 def scan_text(
     text: str, line: int, col: int, reporter: ErrorReporter
 ) -> tuple[int, int]:
-    for char in text:
+    pos = 0
+    for match in _INVALID_TEXT_RE.finditer(text):
+        line, col = advance_position_text(text[pos : match.start()], line, col)
+        char = match.group()
         codepoint = ord(char)
-        if char == "\n":
-            line += 1
-            col = 1
-            continue
-        if (
-            not (0x20 <= codepoint <= 0x7E)
-            and codepoint not in (0x09, 0x0D)
-            and codepoint not in allowed_unicode_codepoints
-        ):
-            reporter.invalid_character(line, col, char, codepoint)
+        reporter.invalid_character(line, col, char, codepoint)
         col += 1
-    return line, col
+        pos = match.end()
+    return advance_position_text(text[pos:], line, col)
 
 
 def advance_position_bytes(data: bytes, line: int, col: int) -> tuple[int, int]:
-    last_newline = data.rfind(b"\n")
-    if last_newline == -1:
+    newline_count = data.count(b"\n")
+    carriage_return_count = data.count(b"\r")
+    break_count = newline_count + carriage_return_count - data.count(b"\r\n")
+    if not break_count:
         return line, col + len(data)
-    return line + data.count(b"\n"), len(data) - last_newline
+    last_break_end = max(data.rfind(b"\n"), data.rfind(b"\r")) + 1
+    return line + break_count, len(data) - last_break_end + 1
+
+
+def advance_position_text(text: str, line: int, col: int) -> tuple[int, int]:
+    newline_count = text.count("\n")
+    carriage_return_count = text.count("\r")
+    break_count = newline_count + carriage_return_count - text.count("\r\n")
+    if not break_count:
+        return line, col + len(text)
+    last_break_end = max(text.rfind("\n"), text.rfind("\r")) + 1
+    return line + break_count, len(text) - last_break_end + 1
 
 
 def print_decode_error(
-    error: UnicodeDecodeError,
-    data: bytes,
-    byte_offset: int,
-    line: int,
-    col: int,
+    error: UnicodeDecodeError, byte_offset: int, line: int, col: int
 ) -> None:
-    partial = data[: error.start]
+    partial = error.object[: error.start]
     line, col = advance_position_bytes(partial, line, col)
     sys.stdout.write(
         "UTF-8 decoding error:\n"
@@ -249,6 +279,10 @@ def print_decode_error(
         f"  reason: {error.reason}\n"
         f"  location: line {line}, column {col}\n"
     )
+
+
+def print_file_error(filename: Path, action: str, error: OSError) -> None:
+    print(f"Could not {action} {filename}: {error}", file=sys.stderr)
 
 
 def safe_char_display(char: str, codepoint: int) -> str:

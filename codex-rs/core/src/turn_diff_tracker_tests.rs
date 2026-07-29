@@ -8,7 +8,6 @@ use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use std::fs;
 use std::path::Path;
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 use std::time::Instant;
@@ -49,15 +48,6 @@ async fn apply_verified_patch(root: &Path, patch: &str) -> AppliedPatchDelta {
 
 fn tracker_with_root(root: &Path) -> TurnDiffTracker {
     TurnDiffTracker::with_environment_display_roots([("".to_string(), root.to_path_buf())])
-}
-
-fn verify_local_proof_command() -> Vec<String> {
-    vec![
-        "just".into(),
-        "verify-local".into(),
-        "--fast".into(),
-        "--json".into(),
-    ]
 }
 
 trait TestTurnDiffTrackerExt {
@@ -135,42 +125,6 @@ async fn validation_freshness_tracks_format_timeout_broad_success_and_staleness(
 }
 
 #[tokio::test]
-async fn verified_validation_clears_only_the_paths_it_covered() {
-    let dir = tempdir().expect("tempdir");
-    let mut tracker = tracker_with_root(dir.path());
-    for (path, content) in [("a.txt", "foo"), ("b.txt", "bar")] {
-        let delta = apply_verified_patch(
-            dir.path(),
-            &format!("*** Begin Patch\n*** Add File: {path}\n+{content}\n*** End Patch"),
-        )
-        .await;
-        tracker.track_delta("", &delta);
-    }
-
-    assert!(!tracker.record_verified_validation(
-        verify_local_proof_command(),
-        "",
-        &[PathBuf::from("a.txt")],
-        false,
-    ));
-    assert!(tracker.has_unvalidated_mutation());
-
-    assert!(tracker.record_verified_validation(
-        verify_local_proof_command(),
-        "",
-        &[PathBuf::from("b.txt")],
-        false,
-    ));
-    assert_eq!(
-        tracker.validation_freshness_status(),
-        ValidationFreshnessStatus::PassedAfterLastMutation
-    );
-
-    tracker.record_unknown_mutation();
-    assert!(tracker.record_verified_validation(verify_local_proof_command(), "", &[], true,));
-}
-
-#[tokio::test]
 async fn scoped_shell_validation_clears_only_matching_changed_paths() {
     let dir = tempdir().expect("tempdir");
     let mut tracker = tracker_with_root(dir.path());
@@ -196,12 +150,6 @@ async fn scoped_shell_validation_clears_only_matching_changed_paths() {
         tracker.validation_freshness_status(),
         ValidationFreshnessStatus::ScopedValidationIncomplete
     );
-    assert!(tracker.record_verified_validation(
-        verify_local_proof_command(),
-        "",
-        &[PathBuf::from("src/b.rs")],
-        false,
-    ));
 }
 
 #[tokio::test]
@@ -252,12 +200,6 @@ async fn package_scoped_validation_maps_codex_package_to_its_crate_directory() {
         tracker.validation_freshness_status(),
         ValidationFreshnessStatus::ScopedValidationIncomplete
     );
-    assert!(tracker.record_verified_validation(
-        verify_local_proof_command(),
-        "",
-        &[PathBuf::from("codex-rs/protocol/src/b.rs")],
-        false,
-    ));
 }
 
 #[tokio::test]
@@ -443,12 +385,6 @@ async fn command_validation_clears_only_its_environment() {
         tracker.validation_freshness_status(),
         ValidationFreshnessStatus::ScopedValidationIncomplete
     );
-    assert!(tracker.record_verified_validation(
-        verify_local_proof_command(),
-        "second",
-        &[PathBuf::from("src/lib.rs")],
-        false,
-    ));
 }
 
 #[tokio::test]
@@ -478,38 +414,6 @@ async fn command_validation_uses_exact_environment_when_roots_are_identical() {
         tracker.validation_freshness_status(),
         ValidationFreshnessStatus::ScopedValidationIncomplete
     );
-    assert!(tracker.record_verified_validation(
-        verify_local_proof_command(),
-        "second",
-        &[PathBuf::from("src/lib.rs")],
-        false,
-    ));
-}
-
-#[tokio::test]
-async fn verified_validation_requires_the_real_command_and_normalizes_paths() {
-    let dir = tempdir().expect("tempdir");
-    let mut tracker = tracker_with_root(dir.path());
-    let delta = apply_verified_patch(
-        dir.path(),
-        "*** Begin Patch\n*** Add File: src/lib.rs\n+changed\n*** End Patch",
-    )
-    .await;
-    tracker.track_delta("", &delta);
-
-    assert!(!tracker.record_verified_validation(
-        vec!["echo".into(), "VERIFIED".into()],
-        "",
-        &[PathBuf::from("src/lib.rs")],
-        false,
-    ));
-    assert!(tracker.has_unvalidated_mutation());
-    assert!(tracker.record_verified_validation(
-        verify_local_proof_command(),
-        "",
-        &[dir.path().join("src/../src/lib.rs")],
-        false,
-    ));
 }
 
 #[test]
@@ -1047,12 +951,18 @@ async fn preserves_committed_change_order_with_delete_then_move_overwrite() {
     fs::write(dir.path().join("b.txt"), "existing\n").expect("seed destination");
 
     let mut tracker = tracker_with_root(dir.path());
-    let ordered_patch = apply_verified_patch(
+    let delete_destination = apply_verified_patch(
         dir.path(),
-        "*** Begin Patch\n*** Delete File: b.txt\n*** Update File: a.txt\n*** Move to: b.txt\n@@\n-from\n+new\n*** End Patch",
+        "*** Begin Patch\n*** Delete File: b.txt\n*** End Patch",
     )
     .await;
-    tracker.track_delta("", &ordered_patch);
+    tracker.track_delta("", &delete_destination);
+    let move_source = apply_verified_patch(
+        dir.path(),
+        "*** Begin Patch\n*** Update File: a.txt\n*** Move to: b.txt\n@@\n-from\n+new\n*** End Patch",
+    )
+    .await;
+    tracker.track_delta("", &move_source);
 
     let left_oid_a = git_blob_sha1_hex("from\n");
     let left_oid_b = git_blob_sha1_hex("existing\n");

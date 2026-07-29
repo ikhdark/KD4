@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import base64
+import hashlib
 import os
 import shutil
 import socket
@@ -7,9 +9,9 @@ import stat
 import subprocess
 import tempfile
 import textwrap
+import threading
 import unittest
 from pathlib import Path
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "run_tui_with_exec_server.sh"
@@ -49,18 +51,73 @@ def bash_available() -> bool:
     )
 
 
+def serve_websocket_handshake(listener: socket.socket) -> threading.Thread:
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            request = bytearray()
+            while b"\r\n\r\n" not in request:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    return
+                request.extend(chunk)
+            headers = {}
+            for line in bytes(request).decode("iso-8859-1").split("\r\n")[1:]:
+                name, delimiter, value = line.partition(":")
+                if delimiter:
+                    headers[name.strip().lower()] = value.strip()
+            key = headers["sec-websocket-key"]
+            accept = base64.b64encode(
+                hashlib.sha1(
+                    (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")
+                ).digest()
+            ).decode("ascii")
+            connection.sendall(
+                (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n"
+                    "\r\n"
+                ).encode("ascii")
+            )
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return thread
+
+
+def serve_plain_http(listener: socket.socket) -> threading.Thread:
+    def serve() -> None:
+        connection, _ = listener.accept()
+        with connection:
+            connection.recv(4096)
+            connection.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return thread
+
+
 @unittest.skipUnless(bash_available(), "bash is required for shell launcher tests")
 class RunTuiWithExecServerTest(unittest.TestCase):
-    def run_script(self, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    def run_script(
+        self,
+        env: dict[str, str],
+        *,
+        cwd: Path = REPO_ROOT,
+        script: Path = SCRIPT,
+    ) -> subprocess.CompletedProcess[str]:
         merged_env = os.environ.copy()
         merged_env.update(env)
         return subprocess.run(
-            [BASH, bash_path(SCRIPT), "--probe"],
-            cwd=REPO_ROOT,
+            [BASH, bash_path(script), "--probe"],
+            cwd=cwd,
             env=merged_env,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
             timeout=10,
             check=False,
         )
@@ -173,7 +230,9 @@ class RunTuiWithExecServerTest(unittest.TestCase):
             listener.listen(1)
             self.addCleanup(listener.close)
             _, port = listener.getsockname()
-            ready.write_text(f"ws://127.0.0.1:{port}\n", encoding="utf-8")
+            handshake_thread = serve_websocket_handshake(listener)
+            self.addCleanup(handshake_thread.join, 2)
+            ready.write_text(f"ws://127.0.0.1:{port}", encoding="utf-8")
             tui = root / "codex-tui"
             bin_dir = root / "bin"
             bin_dir.mkdir()
@@ -219,7 +278,14 @@ class RunTuiWithExecServerTest(unittest.TestCase):
             root = Path(tmp)
             log = root / "calls.log"
             ready = root / "ready.url"
-            ready.write_text("ws://127.0.0.1:9\n", encoding="utf-8")
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            self.addCleanup(listener.close)
+            _, port = listener.getsockname()
+            http_thread = serve_plain_http(listener)
+            self.addCleanup(http_thread.join, 2)
+            ready.write_text(f"ws://127.0.0.1:{port}\n", encoding="utf-8")
             bin_dir = root / "bin"
             bin_dir.mkdir()
             cli = bin_dir / "codex"
@@ -274,7 +340,7 @@ class RunTuiWithExecServerTest(unittest.TestCase):
                 ready.read_text(encoding="utf-8").strip(), "ws://127.0.0.1:4567"
             )
 
-    def test_disabled_build_uses_quiet_cargo_run_fallback(self) -> None:
+    def test_disabled_build_does_not_invoke_cargo(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             log = root / "calls.log"
@@ -286,13 +352,7 @@ class RunTuiWithExecServerTest(unittest.TestCase):
                     f"""\
                     #!/usr/bin/env bash
                     echo "cargo $*" >> {bash_path(log)}
-                    if [[ "$*" == build* ]]; then
-                      exit 95
-                    fi
-                    if [[ "$*" == *"codex-cli"* ]]; then
-                      printf 'ws://127.0.0.1:7654\\n'
-                      sleep 2
-                    fi
+                    exit 95
                     """
                 ),
             )
@@ -307,11 +367,110 @@ class RunTuiWithExecServerTest(unittest.TestCase):
                 }
             )
 
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("CODEX_BUILD_MISSING_BINARIES=0", result.stderr)
+            self.assertFalse(
+                log.exists(), "cargo must not run when builds are disabled"
+            )
+
+    def test_cargo_run_fallback_uses_manifest_and_preserves_launch_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launch_dir = root / "launch"
+            launch_dir.mkdir()
+            log = root / "calls.log"
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            write_executable(
+                bin_dir / "cargo",
+                textwrap.dedent(
+                    f"""\
+                    #!/usr/bin/env bash
+                    echo "$PWD|cargo $*" >> {bash_path(log)}
+                    if [[ "$*" == *"codex-cli"* ]]; then
+                      printf 'ws://127.0.0.1:7654\\n'
+                      sleep 2
+                    fi
+                    """
+                ),
+            )
+
+            result = self.run_script(
+                {
+                    "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                    "CODEX_CLI_BIN": bash_path(root / "missing-codex"),
+                    "CODEX_TUI_BIN": bash_path(root / "missing-codex-tui"),
+                    "CODEX_EXEC_SERVER_START_TIMEOUT_SECONDS": "2",
+                },
+                cwd=launch_dir,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(calls), 2)
+            working_directories = [line.split("|", 1)[0] for line in calls]
+            self.assertEqual(working_directories[0], working_directories[1])
+            self.assertTrue(
+                working_directories[0].replace("\\", "/").endswith("/launch")
+            )
+            self.assertFalse(
+                working_directories[0].replace("\\", "/").endswith("/codex-rs")
+            )
+            self.assertTrue(
+                all(
+                    "--manifest-path" in line
+                    and "/codex-rs/Cargo.toml" in line.replace("\\", "/")
+                    for line in calls
+                )
+            )
+
+    def test_binary_discovery_respects_requested_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_repo = root / "repo"
+            scripts_dir = fake_repo / "scripts"
+            scripts_dir.mkdir(parents=True)
+            copied_script = scripts_dir / SCRIPT.name
+            shutil.copyfile(SCRIPT, copied_script)
+            copied_script.chmod(copied_script.stat().st_mode | stat.S_IXUSR)
+            log = root / "calls.log"
+            for profile in ("debug", "release"):
+                target = fake_repo / "codex-rs" / "target" / profile
+                target.mkdir(parents=True)
+                write_executable(
+                    target / "codex",
+                    textwrap.dedent(
+                        f"""\
+                        #!/usr/bin/env bash
+                        echo "{profile} cli" >> {bash_path(log)}
+                        printf 'ws://127.0.0.1:4567\\n'
+                        sleep 2
+                        """
+                    ),
+                )
+                write_executable(
+                    target / "codex-tui",
+                    textwrap.dedent(
+                        f"""\
+                        #!/usr/bin/env bash
+                        echo "{profile} tui" >> {bash_path(log)}
+                        """
+                    ),
+                )
+
+            result = self.run_script(
+                {
+                    "CODEX_BUILD_PROFILE": "debug",
+                    "CODEX_EXEC_SERVER_START_TIMEOUT_SECONDS": "2",
+                },
+                script=copied_script,
+            )
+
             self.assertEqual(result.returncode, 0, result.stderr)
             calls = log.read_text(encoding="utf-8")
-            self.assertIn("cargo run --quiet -p codex-cli --bin codex", calls)
-            self.assertIn("cargo run --quiet -p codex-tui --bin codex-tui", calls)
-            self.assertNotIn("cargo build", calls)
+            self.assertIn("debug cli", calls)
+            self.assertIn("debug tui", calls)
+            self.assertNotIn("release", calls)
 
     def test_failure_logs_are_capped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

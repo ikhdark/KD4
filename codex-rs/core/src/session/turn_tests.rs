@@ -612,7 +612,7 @@ async fn stop_hook_continuation_preserves_finalization_warning_for_the_final_res
                         "plan": [{
                             "id": "phase-68-warning",
                             "step": "exercise stop-hook continuation",
-                            "status": "completed",
+                            "status": "implemented",
                             "acceptance_criteria": [
                                 "warning is emitted after continuation"
                             ],
@@ -641,9 +641,6 @@ async fn stop_hook_continuation_preserves_finalization_warning_for_the_final_res
             write_one_shot_stop_hook(home).expect("write stop-hook fixture");
         })
         .with_workspace_setup(|cwd, _fs| async move {
-            let scripts = cwd.join("scripts");
-            tokio::fs::create_dir_all(scripts.as_path()).await?;
-            tokio::fs::write(scripts.join("verify_local.py").as_path(), "").await?;
             tokio::fs::write(cwd.join("kd4_features.toml").as_path(), "").await?;
             Ok(())
         })

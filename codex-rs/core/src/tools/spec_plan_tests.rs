@@ -372,36 +372,6 @@ fn set_primary_environment_cwd(turn: &mut TurnContext, cwd: &Path) {
 }
 
 #[tokio::test]
-async fn verify_local_is_registered_only_for_a_supported_local_repo() {
-    let unsupported = tempfile::tempdir().expect("tempdir");
-    let unavailable = probe(|turn| set_primary_environment_cwd(turn, unsupported.path())).await;
-    unavailable.assert_visible_lacks(&["verify_local"]);
-    unavailable.assert_registered_lacks(&["verify_local"]);
-
-    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("codex-core should be nested under the repository root");
-    let available = probe(|turn| set_primary_environment_cwd(turn, repo_root)).await;
-    available.assert_visible_contains(&["verify_local"]);
-    available.assert_registered_contains(&["verify_local"]);
-    assert!(!has_parameter(
-        available.visible_spec("verify_local"),
-        "environment_id"
-    ));
-
-    let multiple = probe(|turn| {
-        set_primary_environment_cwd(turn, repo_root);
-        duplicate_primary_environment(turn);
-    })
-    .await;
-    assert!(has_parameter(
-        multiple.visible_spec("verify_local"),
-        "environment_id"
-    ));
-}
-
-#[tokio::test]
 async fn source_tools_are_registered_only_when_enabled() {
     let disabled = probe(|_| {}).await;
     disabled.assert_visible_lacks(&["search_source", "read_file_span"]);

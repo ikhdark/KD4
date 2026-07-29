@@ -129,8 +129,10 @@ def parse_worktree_status(status_text: str) -> WorktreeState:
 
 def parse_merge_forecast(completed: subprocess.CompletedProcess[str]) -> MergeForecast:
     lines = [line.rstrip() for line in completed.stdout.splitlines()]
-    result_tree = next(
-        (line for line in lines if re.fullmatch(r"[0-9a-f]{40,64}", line)), None
+    result_tree = (
+        lines[0]
+        if lines and re.fullmatch(r"[0-9a-f]{40,64}", lines[0]) is not None
+        else None
     )
     conflict_messages = tuple(line for line in lines if line.startswith("CONFLICT "))
     first_blank = lines.index("") if "" in lines else len(lines)
@@ -140,10 +142,6 @@ def parse_merge_forecast(completed: subprocess.CompletedProcess[str]) -> MergeFo
         if line and line != result_tree and not line.startswith("Auto-merging ")
     ]
     conflict_paths = set(candidate_paths)
-    for message in conflict_messages:
-        match = re.search(r" in (.+)$", message)
-        if match:
-            conflict_paths.add(match.group(1))
     if completed.returncode == 0:
         status = "clean"
     elif completed.returncode == 1 and conflict_messages:
@@ -257,18 +255,27 @@ def audit_repository(
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as temporary:
-        json.dump(payload, temporary, indent=2, sort_keys=True)
-        temporary.write("\n")
-        temporary_path = Path(temporary.name)
-    os.replace(temporary_path, path)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(payload, temporary, indent=2, sort_keys=True)
+            temporary.write("\n")
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
 
 
 def build_parser() -> argparse.ArgumentParser:

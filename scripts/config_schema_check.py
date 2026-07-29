@@ -32,20 +32,31 @@ def repo_root() -> Path:
 
 def run(args: Sequence[str], *, cwd: Path) -> int:
     print("$ " + " ".join(str(arg) for arg in args), flush=True)
-    return subprocess.run(list(args), cwd=cwd).returncode
+    try:
+        return subprocess.run(list(args), cwd=cwd).returncode
+    except OSError as error:
+        print(f"Could not run {args[0]}: {error}", file=sys.stderr)
+        return 127 if isinstance(error, FileNotFoundError) else 1
 
 
 def schema_inputs_changed(root: Path) -> bool:
-    completed = subprocess.run(
-        ["git", "status", "--porcelain", "--", *SCHEMA_INPUTS],
-        cwd=root,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain", "--", *SCHEMA_INPUTS],
+            cwd=root,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as error:
+        print(
+            f"Could not run git to inspect config schema input status: {error}",
+            file=sys.stderr,
+        )
+        return True
     if completed.returncode != 0:
         print(
             "Could not inspect config schema input status; regenerating.",

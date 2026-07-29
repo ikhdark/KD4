@@ -119,9 +119,9 @@ fn validate_request_user_input_questions(
             return Err("question header must be 12 characters or fewer");
         }
         if let Some(options) = &question.options
-            && !(2..=3).contains(&options.len())
+            && !(2..=4).contains(&options.len())
         {
-            return Err("question options must contain 2 to 3 choices");
+            return Err("question options must contain 2 to 4 choices");
         }
     }
 

@@ -23,8 +23,7 @@ is the current source map for the checked-in script tooling.
 ## Routing
 
 - Local Codex runtime-bundle replacement and desktop/CLI publish proof:
-  `publish-local-codex.ps1`, `publish-local-codex.hashing.ps1`, and
-  `test_publish_local_codex.py`.
+  `publish-local-codex.ps1` and `test_publish_local_codex.py`.
 - Rust build lanes, target cleanup, and build-status diagnostics:
   `cargo-lane.ps1`, `cargo-lane-trash-cleanup.ps1`, `rust_build_status.py`,
   `common-rust-env.ps1`, `invoke-rust-perf-env.ps1`, and `sccache-perf.ps1`.
@@ -47,12 +46,8 @@ is the current source map for the checked-in script tooling.
   and publishes `codex.exe` plus `codex-code-mode-host.exe` beside each other.
   Preserve dry-run, per-artifact backup, bundle rollback, doctor, hash/version
   proof, process detection, and process-closing protections. Final local publish
-  proof should stay on the optimized `release` profile via
-  `just publish-local-codex-final`; use `local-release` and `-BuildOnly` only to
-  warm or iterate on the exact publish target without replacing the installed
-  binaries.
-- `publish-local-codex.hashing.ps1`: hashing/version helper code for publish
-  proof. Keep output contracts stable for publish tests and doctor reporting.
+  proof stays on the optimized `release` profile through the sole public recipe,
+  `just publish-local-codex-final`.
 - `test_publish_local_codex.py`: focused coverage for local publish behavior.
 - `cargo-lane.ps1`: isolated Cargo/just lane runner for concurrent Rust work.
   Preserve stop-parsing and argument-forwarding behavior.

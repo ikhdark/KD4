@@ -51,7 +51,7 @@ fn can_run_on_shell_test() {
     if cfg!(windows) {
         assert!(shell_works(
             get_shell(ShellType::PowerShell, /*path*/ None),
-            "Out-String 'Works'",
+            "Write-Output 'Works'",
             /*required*/ true,
         ));
         assert!(shell_works(

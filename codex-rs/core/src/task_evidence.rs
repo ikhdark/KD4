@@ -30,11 +30,10 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
-const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 3;
+const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 4;
 const FILE_HASH_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_COMMAND_RECEIPTS: usize = 256;
 const MAX_EDIT_RECEIPTS: usize = 256;
-const MAX_VALIDATION_RECEIPTS: usize = 64;
 const MAX_EXTERNAL_EVIDENCE_RECEIPTS: usize = 256;
 const EXTERNAL_EVIDENCE_INLINE_PAYLOAD_BYTES: usize = 16 * 1024;
 const EXTERNAL_EVIDENCE_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
@@ -69,14 +68,6 @@ pub(crate) struct TaskEvidenceLedger {
     persistence_test_control: Arc<std::sync::Mutex<Option<PersistenceTestControl>>>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct TaskEvidenceValidationStart {
-    epoch: u64,
-    file_snapshots: BTreeMap<String, FileHashSnapshot>,
-    owned_file_paths: BTreeSet<String>,
-    artifact_snapshots: BTreeMap<String, FileHashSnapshot>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PersistOutcome {
     Persisted,
@@ -108,27 +99,19 @@ struct TaskEvidenceDocument {
     edit_intents: Vec<EditIntent>,
     edit_receipts: Vec<EditReceipt>,
     command_receipts: Vec<CommandReceipt>,
-    validation_receipts: Vec<ValidationReceipt>,
     #[serde(default)]
     external_evidence: Vec<ExternalEvidenceReceipt>,
     generated_artifact_requirements: Vec<GeneratedArtifactRequirement>,
-    generated_artifact_hashes: BTreeMap<String, FileHashSnapshot>,
     #[serde(default)]
     latest_generated_artifact_hashes: BTreeMap<String, FileHashSnapshot>,
     latest_file_hashes: BTreeMap<String, FileHashSnapshot>,
     risks: Vec<EvidenceRisk>,
-    verify_plan_epoch: Option<u64>,
-    validation_epoch: Option<u64>,
     desktop_activation_receipt: Option<DesktopActivationReceipt>,
-    #[serde(default)]
-    automatic_plan_attempt_epoch: Option<u64>,
     repair_turns_used: u8,
     #[serde(default = "initial_receipt_sequence")]
     next_edit_receipt_sequence: u64,
     #[serde(default = "initial_receipt_sequence")]
     next_command_receipt_sequence: u64,
-    #[serde(default = "initial_receipt_sequence")]
-    next_validation_receipt_sequence: u64,
     #[serde(default = "initial_receipt_sequence")]
     next_external_evidence_receipt_sequence: u64,
     #[serde(default)]
@@ -157,7 +140,6 @@ struct EvidencePlanStep {
     risks: Vec<String>,
     requires_desktop_activation: bool,
     edit_paths: BTreeSet<String>,
-    validation_receipt_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,21 +199,6 @@ struct CommandReceipt {
     possible_mutation: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ValidationReceipt {
-    id: String,
-    recorded_at: String,
-    epoch: u64,
-    step_id: Option<String>,
-    mode: String,
-    verdict: Option<String>,
-    tool_success: bool,
-    proof_bearing: bool,
-    active_files: Vec<FileHashSnapshot>,
-    stale_reasons: Vec<String>,
-    payload: Option<Value>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum EvidenceCompleteness {
@@ -269,10 +236,6 @@ struct GeneratedArtifactRequirement {
     id: String,
     step_id: Option<String>,
     path: Option<String>,
-    validation_command: Vec<String>,
-    source: String,
-    #[serde(default)]
-    validation_receipt_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -368,24 +331,18 @@ impl TaskEvidenceLedger {
                 edit_intents: Vec::new(),
                 edit_receipts: Vec::new(),
                 command_receipts: Vec::new(),
-                validation_receipts: Vec::new(),
                 external_evidence: Vec::new(),
                 generated_artifact_requirements: Vec::new(),
-                generated_artifact_hashes: BTreeMap::new(),
                 latest_generated_artifact_hashes: BTreeMap::new(),
                 latest_file_hashes: BTreeMap::new(),
                 risks: storage_failure_reason
                     .as_deref()
                     .map(|reason| vec![task_evidence_storage_risk(reason, 0)])
                     .unwrap_or_default(),
-                verify_plan_epoch: None,
-                validation_epoch: None,
                 desktop_activation_receipt: None,
-                automatic_plan_attempt_epoch: None,
                 repair_turns_used: 0,
                 next_edit_receipt_sequence: initial_receipt_sequence(),
                 next_command_receipt_sequence: initial_receipt_sequence(),
-                next_validation_receipt_sequence: initial_receipt_sequence(),
                 next_external_evidence_receipt_sequence: initial_receipt_sequence(),
                 host_mutation_revision: 0,
                 completion: None,
@@ -418,6 +375,20 @@ impl TaskEvidenceLedger {
                     "disabling evidence-only task ledger because initial persistence could not be established"
                 );
                 return Self::disabled();
+            }
+            if mode == TaskEvidenceMode::Kd4Completion && persisted == PersistOutcome::Failed {
+                let mut guard = ledger.document.lock().await;
+                if let Some(document) = guard.as_mut() {
+                    upsert_risk(
+                        document,
+                        task_evidence_storage_risk(
+                            "initial task-evidence document could not be durably persisted",
+                            document.evidence_epoch,
+                        ),
+                    );
+                    document.updated_at = timestamp();
+                    document.revision = document.revision.saturating_add(1);
+                }
             }
         }
         let referenced_artifact_ids = document
@@ -503,51 +474,6 @@ impl TaskEvidenceLedger {
         repository_roots_match(repo_root, candidate)
     }
 
-    pub(crate) async fn begin_verify_local_validation(
-        &self,
-        requested_paths: &[PathBuf],
-    ) -> Option<TaskEvidenceValidationStart> {
-        if !self.allows_kd4_completion() {
-            return None;
-        }
-        let repo_root = self.repo_root.as_ref()?;
-        let requested_paths = requested_paths
-            .iter()
-            .map(|path| normalize_input_path(repo_root, Some(repo_root), path))
-            .collect::<BTreeSet<_>>();
-        let (epoch, mut owned_file_paths, artifact_paths) = {
-            let guard = self.document.lock().await;
-            let document = guard.as_ref()?;
-            let artifact_paths = document
-                .generated_artifact_requirements
-                .iter()
-                .filter_map(|requirement| requirement.path.clone())
-                .collect::<BTreeSet<_>>();
-            (
-                document.evidence_epoch,
-                task_owned_file_paths(document),
-                artifact_paths,
-            )
-        };
-        owned_file_paths.extend(requested_paths);
-        let mut file_paths = owned_file_paths.clone();
-        file_paths.extend(git_dirty_paths(repo_root).await);
-        let mut file_snapshots = BTreeMap::new();
-        for path in file_paths {
-            file_snapshots.insert(path.clone(), snapshot_file(repo_root, &path).await);
-        }
-        let mut artifact_snapshots = BTreeMap::new();
-        for path in artifact_paths {
-            artifact_snapshots.insert(path.clone(), snapshot_file(repo_root, &path).await);
-        }
-        Some(TaskEvidenceValidationStart {
-            epoch,
-            file_snapshots,
-            owned_file_paths,
-            artifact_snapshots,
-        })
-    }
-
     pub(crate) async fn record_plan_update(&self, update: &UpdatePlanArgs) -> UpdatePlanArgs {
         if !self.allows_kd4_completion() {
             return update.clone();
@@ -576,11 +502,7 @@ impl TaskEvidenceLedger {
                     let material_step_change =
                         old.is_none_or(|step| !step_materially_matches_item(step, item));
                     material_plan_change |= material_step_change;
-                    let status = normalize_requested_status(
-                        &item.status,
-                        old.map(|step| &step.status),
-                        material_step_change,
-                    );
+                    let status = normalize_requested_status(&item.status);
                     normalized.push(EvidencePlanStep {
                         id,
                         step: item.step.clone(),
@@ -594,9 +516,6 @@ impl TaskEvidenceLedger {
                         edit_paths: old
                             .filter(|_| !material_step_change)
                             .map_or_else(BTreeSet::new, |step| step.edit_paths.clone()),
-                        validation_receipt_ids: old
-                            .filter(|_| !material_step_change)
-                            .map_or_else(Vec::new, |step| step.validation_receipt_ids.clone()),
                     });
                 }
                 material_plan_change |= previous
@@ -609,7 +528,9 @@ impl TaskEvidenceLedger {
                 sync_plan_structure_state(document, &duplicate_explicit_ids);
                 rebuild_declared_requirements_and_risks(document);
                 sync_plan_structure_state(document, &duplicate_explicit_ids);
-                promote_steps_with_fresh_evidence(document);
+                if plan_is_terminally_acknowledged(document) {
+                    resolve_recoverable_runtime_risks(document);
+                }
                 document.updated_at = timestamp();
                 document.completion = None;
                 UpdatePlanArgs {
@@ -750,7 +671,6 @@ impl TaskEvidenceLedger {
                             {
                                 step.status = StepStatus::Implemented;
                             }
-                            step.validation_receipt_ids.clear();
                         }
                     }
                     if affected_steps.is_empty() {
@@ -874,193 +794,6 @@ impl TaskEvidenceLedger {
         self.persist_document(&snapshot).await;
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn record_verify_local(
-        &self,
-        mode: &str,
-        verdict: Option<&str>,
-        tool_success: bool,
-        proof_bearing: bool,
-        validation_start: Option<&TaskEvidenceValidationStart>,
-        active_files: &[PathBuf],
-        stale_reasons: &[String],
-        payload: Option<&Value>,
-    ) -> bool {
-        if !self.allows_kd4_completion() {
-            return false;
-        }
-        let Some(repo_root) = self.repo_root.as_ref() else {
-            return false;
-        };
-        let normalized_active_files = active_files
-            .iter()
-            .map(|path| normalize_input_path(repo_root, Some(repo_root), path))
-            .collect::<Vec<_>>();
-        let mut checked_paths = normalized_active_files
-            .iter()
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if let Some(start) = validation_start {
-            checked_paths.extend(start.owned_file_paths.iter().cloned());
-        }
-        let mut validation_end_files = BTreeMap::new();
-        for path in checked_paths {
-            validation_end_files.insert(path.clone(), snapshot_file(repo_root, &path).await);
-        }
-        let file_snapshots = normalized_active_files
-            .iter()
-            .filter_map(|path| validation_end_files.get(path).cloned())
-            .collect::<Vec<_>>();
-        let mut validation_start_files = BTreeMap::new();
-        let mut validation_end_artifacts = BTreeMap::new();
-        if let Some(start) = validation_start {
-            for path in validation_end_files.keys() {
-                if let Some(snapshot) = start.file_snapshots.get(path) {
-                    validation_start_files.insert(path.clone(), snapshot.clone());
-                }
-            }
-            for path in start.artifact_snapshots.keys() {
-                validation_end_artifacts.insert(path.clone(), snapshot_file(repo_root, path).await);
-            }
-        }
-        let snapshots_unchanged = validation_start.is_some_and(|start| {
-            normalized_active_files
-                .iter()
-                .all(|path| start.file_snapshots.contains_key(path))
-                && validation_start_files == validation_end_files
-                && start.artifact_snapshots == validation_end_artifacts
-        });
-
-        let Some((accepted_proof, snapshot)) = self
-            .update_document(|document| {
-                let run_matches_start = validation_start.is_some_and(|start| {
-                    start.epoch == document.evidence_epoch && snapshots_unchanged
-                });
-                let accepted_proof = proof_bearing && tool_success && run_matches_start;
-                let receipt_id =
-                    next_receipt_id("validation", &mut document.next_validation_receipt_sequence);
-                document.validation_receipts.push(ValidationReceipt {
-                    id: receipt_id.clone(),
-                    recorded_at: timestamp(),
-                    epoch: document.evidence_epoch,
-                    step_id: document.active_step_id.clone(),
-                    mode: mode.to_string(),
-                    verdict: verdict.map(str::to_string),
-                    tool_success,
-                    proof_bearing,
-                    active_files: file_snapshots.clone(),
-                    stale_reasons: stale_reasons.to_vec(),
-                    payload: payload.cloned(),
-                });
-                trim_to_last(&mut document.validation_receipts, MAX_VALIDATION_RECEIPTS);
-
-                if mode == "plan" && tool_success && run_matches_start {
-                    document.verify_plan_epoch = Some(document.evidence_epoch);
-                    rebuild_verifier_requirements(document, payload);
-                }
-                if accepted_proof {
-                    document.validation_epoch = Some(document.evidence_epoch);
-                    for snapshot in validation_end_files.values() {
-                        document
-                            .latest_file_hashes
-                            .insert(snapshot.path.clone(), snapshot.clone());
-                    }
-                    for snapshot in validation_end_artifacts.values() {
-                        document
-                            .generated_artifact_hashes
-                            .insert(snapshot.path.clone(), snapshot.clone());
-                        document
-                            .latest_generated_artifact_hashes
-                            .insert(snapshot.path.clone(), snapshot.clone());
-                    }
-                    for step in &mut document.plan {
-                        let edit_free_step_is_ready = step.edit_paths.is_empty()
-                            && matches!(
-                                step.status,
-                                StepStatus::Implemented
-                                    | StepStatus::Completed
-                                    | StepStatus::Passed
-                            );
-                        let edited_step_is_covered = !step.edit_paths.is_empty()
-                            && step.edit_paths.iter().all(|path| {
-                                file_snapshots.iter().any(|active| {
-                                    active.read_error.is_none()
-                                        && path_is_covered(path, &active.path)
-                                })
-                            });
-                        if edit_free_step_is_ready || edited_step_is_covered {
-                            step.validation_receipt_ids.push(receipt_id.clone());
-                            step.validation_receipt_ids.sort();
-                            step.validation_receipt_ids.dedup();
-                        }
-                    }
-                    for requirement in &mut document.generated_artifact_requirements {
-                        if requirement.path.is_none()
-                            && verifier_requirement_satisfied(requirement, payload)
-                        {
-                            requirement.validation_receipt_ids.push(receipt_id.clone());
-                            requirement.validation_receipt_ids.sort();
-                            requirement.validation_receipt_ids.dedup();
-                        }
-                    }
-                    resolve_risks_by_source(document, "verify_local");
-                    resolve_risks_by_source(document, "generated_artifact_freshness");
-                    resolve_risks_by_source(document, "freshness");
-                } else if proof_bearing && tool_success && !run_matches_start {
-                    upsert_risk(
-                        document,
-                        EvidenceRisk {
-                            id: "verify-local-concurrent-change".to_string(),
-                            description: "task-controlled files, generated artifacts, or the evidence epoch changed while verify_local was running"
-                                .to_string(),
-                            source: "verify_local".to_string(),
-                            blocking: false,
-                            resolved: false,
-                            epoch: document.evidence_epoch,
-                        },
-                    );
-                } else if verdict == Some("NEEDS_REGEN") {
-                    upsert_risk(
-                        document,
-                        EvidenceRisk {
-                            id: "verify-local-needs-regen".to_string(),
-                            description:
-                                "verify_local reported required generated artifacts are stale"
-                                    .to_string(),
-                            source: "verify_local".to_string(),
-                            blocking: true,
-                            resolved: false,
-                            epoch: document.evidence_epoch,
-                        },
-                    );
-                } else if !stale_reasons.is_empty() {
-                    for (index, reason) in stale_reasons.iter().enumerate() {
-                        upsert_risk(
-                            document,
-                            EvidenceRisk {
-                                id: format!("verify-local-stale-{index}"),
-                                description: reason.clone(),
-                                source: "verify_local".to_string(),
-                                blocking: false,
-                                resolved: false,
-                                epoch: document.evidence_epoch,
-                            },
-                        );
-                    }
-                }
-                promote_steps_with_fresh_evidence(document);
-                document.updated_at = timestamp();
-                document.completion = None;
-                accepted_proof
-            })
-            .await
-        else {
-            return false;
-        };
-        self.persist_document(&snapshot).await;
-        accepted_proof
-    }
-
     pub(crate) async fn take_finalization_warning(&self) -> Option<String> {
         if !self.allows_kd4_completion() {
             return None;
@@ -1100,33 +833,6 @@ impl TaskEvidenceLedger {
         ))
     }
 
-    pub(crate) async fn take_automatic_verify_plan_request(&self) -> Option<Vec<String>> {
-        if !self.allows_kd4_completion() {
-            return None;
-        }
-        let (changed_paths, snapshot) = self
-            .update_document(|document| {
-                let has_mutation = !document.edit_receipts.is_empty()
-                    || document
-                        .command_receipts
-                        .iter()
-                        .any(|receipt| receipt.possible_mutation);
-                if !has_mutation
-                    || document.verify_plan_epoch == Some(document.evidence_epoch)
-                    || document.automatic_plan_attempt_epoch == Some(document.evidence_epoch)
-                {
-                    return None;
-                }
-                document.automatic_plan_attempt_epoch = Some(document.evidence_epoch);
-                document.updated_at = timestamp();
-                Some(document.latest_file_hashes.keys().cloned().collect())
-            })
-            .await?;
-        let changed_paths = changed_paths?;
-        self.persist_document(&snapshot).await;
-        Some(changed_paths)
-    }
-
     pub(crate) async fn completion_gate(&self) -> Option<TaskCompletionGate> {
         if !self.allows_kd4_completion() {
             return None;
@@ -1139,7 +845,9 @@ impl TaskEvidenceLedger {
                     if !task_is_tracked(document) {
                         return None;
                     }
-                    promote_steps_with_fresh_evidence(document);
+                    if self.evidence_path.is_some() {
+                        resolve_risk(document, "task-evidence-storage-failure");
+                    }
                     let gate = derive_completion_gate(document, self.evidence_path.as_deref());
                     document.completion = Some(gate.clone());
                     document.updated_at = timestamp();
@@ -1153,10 +861,11 @@ impl TaskEvidenceLedger {
                 PersistOutcome::Superseded => continue,
                 PersistOutcome::Failed => {
                     return Some(
-                        self.demote_gate_for_persistence(
+                        self.block_gate_for_persistence(
                             gate,
                             Some(snapshot.revision),
                             "task-evidence persistence failed; completion is not durably recorded",
+                            true,
                         )
                         .await,
                     );
@@ -1165,32 +874,53 @@ impl TaskEvidenceLedger {
         }
         let gate = latest_gate?;
         Some(
-            self.demote_gate_for_persistence(
+            self.block_gate_for_persistence(
                 gate,
                 None,
                 "task-evidence changed repeatedly while completion was being persisted; a stable completion snapshot was not recorded",
+                false,
             )
             .await,
         )
     }
 
-    async fn demote_gate_for_persistence(
+    async fn block_gate_for_persistence(
         &self,
         mut gate: TaskCompletionGate,
         snapshot_revision: Option<u64>,
         reason: &str,
+        record_storage_risk: bool,
     ) -> TaskCompletionGate {
         gate.reasons.push(reason.to_string());
         gate.reasons.sort();
         gate.reasons.dedup();
-        if gate.status == TaskCompletionStatus::Passed {
-            gate.status = TaskCompletionStatus::Partial;
-        }
-        let mut guard = self.document.lock().await;
-        if let Some(document) = guard.as_mut()
-            && snapshot_revision == Some(document.revision)
-        {
-            document.completion = Some(gate.clone());
+        gate.status = TaskCompletionStatus::Blocked;
+        let snapshot = {
+            let mut guard = self.document.lock().await;
+            guard.as_mut().map(|document| {
+                if record_storage_risk {
+                    upsert_risk(
+                        document,
+                        task_evidence_storage_risk(reason, document.evidence_epoch),
+                    );
+                }
+                if snapshot_revision.is_some() && snapshot_revision != Some(document.revision) {
+                    let current_gate =
+                        derive_completion_gate(document, self.evidence_path.as_deref());
+                    gate.reasons.extend(current_gate.reasons);
+                    gate.reasons.sort();
+                    gate.reasons.dedup();
+                }
+                document.completion = Some(gate.clone());
+                document.updated_at = timestamp();
+                document.revision = document.revision.saturating_add(1);
+                document.clone()
+            })
+        };
+        if let Some(snapshot) = snapshot {
+            // The original write may have failed transiently. Persist the blocking
+            // storage risk once more without recursing if storage remains unavailable.
+            let _ = self.persist_document(&snapshot).await;
         }
         gate
     }
@@ -1214,7 +944,6 @@ impl TaskEvidenceLedger {
                     binary_sha1,
                     runtime_evidence,
                 });
-                promote_steps_with_fresh_evidence(document);
                 document.updated_at = timestamp();
                 document.completion = None;
             })
@@ -1232,19 +961,24 @@ impl TaskEvidenceLedger {
         let Some(repo_root) = self.repo_root.as_ref() else {
             return;
         };
-        let (expected, expected_artifacts) = {
+        let (expected, previous_artifacts, artifact_paths) = {
             let guard = self.document.lock().await;
             guard
                 .as_ref()
                 .map(|document| {
                     (
                         document.latest_file_hashes.clone(),
-                        document.generated_artifact_hashes.clone(),
+                        document.latest_generated_artifact_hashes.clone(),
+                        document
+                            .generated_artifact_requirements
+                            .iter()
+                            .filter_map(|requirement| requirement.path.clone())
+                            .collect::<BTreeSet<_>>(),
                     )
                 })
                 .unwrap_or_default()
         };
-        if expected.is_empty() && expected_artifacts.is_empty() {
+        if expected.is_empty() && artifact_paths.is_empty() {
             return;
         }
         let mut changed = Vec::new();
@@ -1254,14 +988,15 @@ impl TaskEvidenceLedger {
                 changed.push((previous, current));
             }
         }
-        let mut changed_artifacts = Vec::new();
-        for (path, previous) in expected_artifacts {
-            let current = snapshot_file(repo_root, &path).await;
-            if current != previous {
-                changed_artifacts.push((previous, current));
-            }
+        let mut current_artifacts = BTreeMap::new();
+        let mut changed_artifacts = false;
+        for path in artifact_paths {
+            let current = snapshot_generated_artifact(repo_root, &path).await;
+            changed_artifacts |= previous_artifacts.get(&path) != Some(&current);
+            current_artifacts.insert(path, current);
         }
-        if changed.is_empty() && changed_artifacts.is_empty() {
+        changed_artifacts |= previous_artifacts.len() != current_artifacts.len();
+        if changed.is_empty() && !changed_artifacts {
             return;
         }
 
@@ -1274,17 +1009,18 @@ impl TaskEvidenceLedger {
                     })
                     .map(|(_, current)| current)
                     .collect::<Vec<_>>();
-                let changed_artifacts = changed_artifacts
-                    .into_iter()
-                    .filter(|(previous, current)| {
-                        document.generated_artifact_hashes.get(&current.path) == Some(previous)
-                    })
-                    .map(|(_, current)| current)
-                    .collect::<Vec<_>>();
-                if changed.is_empty() && changed_artifacts.is_empty() {
+                let artifact_state_is_current =
+                    document.latest_generated_artifact_hashes == previous_artifacts;
+                if changed.is_empty() && (!changed_artifacts || !artifact_state_is_current) {
                     return;
                 }
-                invalidate_for_mutation(document);
+                let prior_artifact_state_exists = changed_artifacts
+                    && !previous_artifacts.is_empty()
+                    && artifact_state_is_current;
+                let changed_files = !changed.is_empty();
+                if changed_files || prior_artifact_state_exists {
+                    invalidate_for_mutation(document);
+                }
                 let epoch = document.evidence_epoch;
                 for current in changed {
                     let path = current.path.clone();
@@ -1293,51 +1029,32 @@ impl TaskEvidenceLedger {
                     } else {
                         resolve_risk(document, &unreadable_file_risk_id(&path));
                     }
-                    document
-                        .latest_file_hashes
-                        .insert(path.clone(), current);
+                    document.latest_file_hashes.insert(path.clone(), current);
                     for step in &mut document.plan {
                         if step.edit_paths.contains(&path)
                             && !matches!(step.status, StepStatus::Blocked | StepStatus::Skipped)
                         {
                             step.status = StepStatus::Implemented;
-                            step.validation_receipt_ids.clear();
                         }
                     }
                 }
-                for current in changed_artifacts {
-                    let path = current.path.clone();
-                    document.generated_artifact_hashes.remove(&path);
-                    document
-                        .latest_generated_artifact_hashes
-                        .insert(path.clone(), current);
+                document.latest_generated_artifact_hashes = current_artifacts;
+                if changed_files || prior_artifact_state_exists {
                     upsert_risk(
                         document,
                         EvidenceRisk {
-                            id: generated_artifact_freshness_risk_id(&path),
-                            description: format!(
-                                "generated artifact `{path}` changed or became unreadable after validation"
-                            ),
-                            source: "generated_artifact_freshness".to_string(),
-                            blocking: true,
+                            id: format!("external-change-{epoch}"),
+                            description: "a task-controlled file changed after its recorded state"
+                                .to_string(),
+                            source: "freshness".to_string(),
+                            blocking: false,
                             resolved: false,
                             epoch,
                         },
                     );
                 }
-                upsert_risk(
-                    document,
-                    EvidenceRisk {
-                        id: format!("external-change-{epoch}"),
-                        description: "a task-controlled file changed after its recorded evidence"
-                            .to_string(),
-                        source: "freshness".to_string(),
-                        blocking: false,
-                        resolved: false,
-                        epoch,
-                    },
-                );
                 document.updated_at = timestamp();
+                document.completion = None;
             })
             .await
         else {
@@ -1825,8 +1542,8 @@ fn extract_external_evidence_metadata(
     let Some(producer) = meta.get("producer").and_then(Value::as_str) else {
         return Err("MCP evidenceMeta producer is malformed and was ignored");
     };
-    if !matches!(producer, "kds" | "kdwg" | "repo-atlas") {
-        return Err("MCP evidenceMeta producer is unknown and was ignored");
+    if producer.trim().is_empty() {
+        return Err("MCP evidenceMeta producer is malformed and was ignored");
     }
     let Some(evidence_bearing) = meta.get("evidenceBearing").and_then(Value::as_bool) else {
         return Err("MCP evidenceMeta evidenceBearing is malformed and was ignored");
@@ -2082,7 +1799,7 @@ async fn quarantine_evidence_file(path: &Path, kind: &str) -> io::Result<PathBuf
 }
 
 fn migrate_document(document: &mut TaskEvidenceDocument) {
-    document.schema_version = TASK_EVIDENCE_SCHEMA_VERSION;
+    let legacy_completion_model = document.schema_version < TASK_EVIDENCE_SCHEMA_VERSION;
     document.next_edit_receipt_sequence =
         document
             .next_edit_receipt_sequence
@@ -2098,15 +1815,6 @@ fn migrate_document(document: &mut TaskEvidenceDocument) {
             .max(next_sequence_after_ids(
                 document
                     .command_receipts
-                    .iter()
-                    .map(|receipt| receipt.id.as_str()),
-            ));
-    document.next_validation_receipt_sequence =
-        document
-            .next_validation_receipt_sequence
-            .max(next_sequence_after_ids(
-                document
-                    .validation_receipts
                     .iter()
                     .map(|receipt| receipt.id.as_str()),
             ));
@@ -2140,17 +1848,6 @@ fn migrate_document(document: &mut TaskEvidenceDocument) {
         let id = next_receipt_id("command", &mut document.next_command_receipt_sequence);
         document.command_receipts[index].id = id;
     }
-    let (duplicate_validation_indices, duplicate_validation_ids) = duplicate_receipt_indices(
-        document
-            .validation_receipts
-            .iter()
-            .enumerate()
-            .map(|(index, receipt)| (index, receipt.id.as_str())),
-    );
-    for index in duplicate_validation_indices {
-        let id = next_receipt_id("validation", &mut document.next_validation_receipt_sequence);
-        document.validation_receipts[index].id = id;
-    }
     let (duplicate_external_indices, _) = duplicate_receipt_indices(
         document
             .external_evidence
@@ -2165,20 +1862,6 @@ fn migrate_document(document: &mut TaskEvidenceDocument) {
         );
         document.external_evidence[index].id = id;
     }
-    if !duplicate_validation_ids.is_empty() {
-        for step in &mut document.plan {
-            step.validation_receipt_ids
-                .retain(|id| !duplicate_validation_ids.contains(id));
-        }
-        for requirement in &mut document.generated_artifact_requirements {
-            requirement
-                .validation_receipt_ids
-                .retain(|id| !duplicate_validation_ids.contains(id));
-        }
-    }
-    if document.latest_generated_artifact_hashes.is_empty() {
-        document.latest_generated_artifact_hashes = document.generated_artifact_hashes.clone();
-    }
     let owned_file_paths = task_owned_file_paths(document);
     document
         .latest_file_hashes
@@ -2189,14 +1872,34 @@ fn migrate_document(document: &mut TaskEvidenceDocument) {
         if !used_ids.insert(step.id.clone()) {
             duplicate_step_ids.insert(step.id.clone());
             step.id = unique_step_id(&step.id, index, &mut used_ids);
-            step.validation_receipt_ids.clear();
             if step.status == StepStatus::Passed {
                 step.status = StepStatus::Implemented;
             }
         }
     }
+    if legacy_completion_model {
+        for step in &mut document.plan {
+            if matches!(step.status, StepStatus::Passed | StepStatus::Completed) {
+                step.status = StepStatus::Implemented;
+            }
+        }
+        document.completion = None;
+        document.risks.retain(|risk| {
+            matches!(
+                risk.source.as_str(),
+                "edit"
+                    | "command"
+                    | "freshness"
+                    | "plan"
+                    | "plan_structure"
+                    | "task_evidence_storage"
+            )
+        });
+        document.latest_generated_artifact_hashes.clear();
+    }
+    rebuild_declared_requirements_and_risks(document);
     sync_plan_structure_state(document, &duplicate_step_ids);
-    promote_steps_with_fresh_evidence(document);
+    document.schema_version = TASK_EVIDENCE_SCHEMA_VERSION;
 }
 
 const fn initial_receipt_sequence() -> u64 {
@@ -2252,10 +1955,7 @@ fn atomic_write_evidence(path: &Path, bytes: &[u8]) -> io::Result<()> {
 
 fn find_kd4_repo_root(cwd: &Path) -> Option<PathBuf> {
     cwd.ancestors()
-        .find(|candidate| {
-            candidate.join("scripts").join("verify_local.py").is_file()
-                && candidate.join("kd4_features.toml").is_file()
-        })
+        .find(|candidate| candidate.join("kd4_features.toml").is_file())
         .map(Path::to_path_buf)
 }
 
@@ -2270,58 +1970,7 @@ fn task_owned_file_paths(document: &TaskEvidenceDocument) -> BTreeSet<String> {
     for receipt in &document.edit_receipts {
         paths.extend(receipt.files.iter().map(|file| file.path.clone()));
     }
-    for receipt in &document.validation_receipts {
-        paths.extend(receipt.active_files.iter().map(|file| file.path.clone()));
-    }
     paths
-}
-
-async fn git_dirty_paths(repo_root: &Path) -> BTreeSet<String> {
-    let output = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .await;
-    let Ok(output) = output else {
-        return BTreeSet::new();
-    };
-    if !output.status.success() {
-        return BTreeSet::new();
-    }
-    parse_git_porcelain_paths(&output.stdout)
-}
-
-fn parse_git_porcelain_paths(output: &[u8]) -> BTreeSet<String> {
-    let mut paths = BTreeSet::new();
-    let mut records = output
-        .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty());
-    while let Some(record) = records.next() {
-        if record.len() < 4 || record[2] != b' ' {
-            return BTreeSet::new();
-        }
-        insert_git_porcelain_path(&mut paths, &record[3..]);
-        if record[..2]
-            .iter()
-            .any(|status| matches!(*status, b'R' | b'C'))
-        {
-            let Some(original_path) = records.next() else {
-                return BTreeSet::new();
-            };
-            insert_git_porcelain_path(&mut paths, original_path);
-        }
-    }
-    paths
-}
-
-fn insert_git_porcelain_path(paths: &mut BTreeSet<String>, path: &[u8]) {
-    if let Ok(path) = std::str::from_utf8(path)
-        && !path.is_empty()
-    {
-        paths.insert(normalize_slashes(path));
-    }
 }
 
 fn effective_step_id(item: &PlanItemArg, index: usize, used_ids: &mut BTreeSet<String>) -> String {
@@ -2350,19 +1999,9 @@ fn unique_step_id(base: &str, index: usize, used_ids: &mut BTreeSet<String>) -> 
     }
 }
 
-fn normalize_requested_status(
-    requested: &StepStatus,
-    previous: Option<&StepStatus>,
-    material_step_change: bool,
-) -> StepStatus {
+fn normalize_requested_status(requested: &StepStatus) -> StepStatus {
     match requested {
-        StepStatus::Passed | StepStatus::Completed => {
-            if !material_step_change && previous == Some(&StepStatus::Passed) {
-                StepStatus::Passed
-            } else {
-                StepStatus::Implemented
-            }
-        }
+        StepStatus::Completed => StepStatus::Passed,
         status => status.clone(),
     }
 }
@@ -2449,22 +2088,19 @@ fn sync_plan_structure_state(
 }
 
 fn rebuild_declared_requirements_and_risks(document: &mut TaskEvidenceDocument) {
-    document
-        .generated_artifact_requirements
-        .retain(|requirement| requirement.source == "verify_local");
+    document.generated_artifact_requirements.clear();
     document.risks.retain(|risk| risk.source != "plan");
     let mut requirements = Vec::new();
     let mut risks = Vec::new();
     for step in &document.plan {
-        for (index, path) in step.generated_artifacts.iter().enumerate() {
-            requirements.push(GeneratedArtifactRequirement {
-                id: format!("plan:{}:artifact:{index}", step.id),
-                step_id: Some(step.id.clone()),
-                path: Some(normalize_slashes(path)),
-                validation_command: Vec::new(),
-                source: "plan".to_string(),
-                validation_receipt_ids: Vec::new(),
-            });
+        if step.status != StepStatus::Skipped {
+            for (index, path) in step.generated_artifacts.iter().enumerate() {
+                requirements.push(GeneratedArtifactRequirement {
+                    id: format!("plan:{}:artifact:{index}", step.id),
+                    step_id: Some(step.id.clone()),
+                    path: Some(normalize_slashes(path)),
+                });
+            }
         }
         for (index, description) in step.risks.iter().enumerate() {
             risks.push(EvidenceRisk {
@@ -2483,238 +2119,83 @@ fn rebuild_declared_requirements_and_risks(document: &mut TaskEvidenceDocument) 
     document.risks.extend(risks);
 }
 
-fn rebuild_verifier_requirements(document: &mut TaskEvidenceDocument, payload: Option<&Value>) {
-    document
-        .generated_artifact_requirements
-        .retain(|requirement| requirement.source != "verify_local");
-    let Some(planned) = payload
-        .and_then(|value| value.get("planned"))
-        .and_then(Value::as_array)
-    else {
-        return;
-    };
-    for item in planned {
-        let kind = item.get("kind").and_then(Value::as_str).unwrap_or_default();
-        if !matches!(kind, "surface_validation" | "surface_regen") {
-            continue;
-        }
-        let id = item
-            .get("id")
-            .and_then(Value::as_str)
-            .unwrap_or("surface-validation")
-            .to_string();
-        let validation_command = item
-            .get("command")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(str::to_string)
-            .collect();
-        document
-            .generated_artifact_requirements
-            .push(GeneratedArtifactRequirement {
-                id,
-                step_id: document.active_step_id.clone(),
-                path: None,
-                validation_command,
-                source: "verify_local".to_string(),
-                validation_receipt_ids: Vec::new(),
-            });
-    }
-}
-
-fn promote_steps_with_fresh_evidence(document: &mut TaskEvidenceDocument) {
-    let mut demoted = true;
-    while demoted {
-        demoted = false;
-        for index in 0..document.plan.len() {
-            if document.plan[index].status == StepStatus::Passed
-                && !step_has_fresh_evidence(document, index)
-            {
-                document.plan[index].status = StepStatus::Implemented;
-                demoted = true;
-            }
-        }
-    }
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for index in 0..document.plan.len() {
-            if !matches!(
-                document.plan[index].status,
-                StepStatus::Implemented | StepStatus::Completed | StepStatus::Passed
-            ) {
-                continue;
-            }
-            if step_has_fresh_evidence(document, index)
-                && document.plan[index].status != StepStatus::Passed
-            {
-                document.plan[index].status = StepStatus::Passed;
-                changed = true;
-            }
-        }
-    }
-    for risk in &mut document.risks {
-        if let Some(step_id) = risk
-            .id
-            .strip_prefix("plan:")
-            .and_then(|id| id.split(':').next())
-        {
-            risk.resolved = document
-                .plan
-                .iter()
-                .any(|step| step.id == step_id && step.status == StepStatus::Passed);
-        }
-    }
-}
-
-fn step_has_fresh_evidence(document: &TaskEvidenceDocument, index: usize) -> bool {
-    let step = &document.plan[index];
-    if document.verify_plan_epoch != Some(document.evidence_epoch)
-        || document.validation_epoch != Some(document.evidence_epoch)
-    {
-        return false;
-    }
-    if step.depends_on.iter().any(|dependency| {
-        !document.plan.iter().any(|candidate| {
-            candidate.id == *dependency
-                && matches!(candidate.status, StepStatus::Passed | StepStatus::Skipped)
-        })
-    }) {
-        return false;
-    }
-    if step.validation_receipt_ids.is_empty() {
-        return false;
-    }
-    let validation = step
-        .validation_receipt_ids
-        .iter()
-        .rev()
-        .find_map(|receipt_id| {
-            document.validation_receipts.iter().rev().find(|receipt| {
-                receipt.id == *receipt_id
-                    && receipt.proof_bearing
-                    && receipt.tool_success
-                    && receipt.epoch == document.evidence_epoch
-            })
-        });
-    let Some(validation) = validation else {
-        return false;
-    };
-    if step.edit_paths.iter().any(|path| {
-        !validation
-            .active_files
-            .iter()
-            .any(|active| active.read_error.is_none() && path_is_covered(path, &active.path))
-    }) {
-        return false;
-    }
-    if step.requires_desktop_activation
+fn plan_is_terminally_acknowledged(document: &TaskEvidenceDocument) -> bool {
+    !document.plan.is_empty()
         && document
-            .desktop_activation_receipt
-            .as_ref()
-            .is_none_or(|receipt| receipt.epoch != document.evidence_epoch)
-    {
-        return false;
-    }
-    for artifact in &step.generated_artifacts {
-        let normalized = normalize_slashes(artifact);
-        if !generated_artifact_is_fresh(document, &normalized) {
-            return false;
+            .plan
+            .iter()
+            .all(|step| matches!(step.status, StepStatus::Passed | StepStatus::Skipped))
+}
+
+fn resolve_recoverable_runtime_risks(document: &mut TaskEvidenceDocument) {
+    for risk in &mut document.risks {
+        if !risk.blocking && matches!(risk.source.as_str(), "edit" | "command" | "freshness") {
+            risk.resolved = true;
         }
     }
-    true
 }
 
 fn edit_outcome_succeeded(outcome: &str) -> bool {
     outcome == "completed"
 }
 
-fn generated_artifact_is_fresh(document: &TaskEvidenceDocument, path: &str) -> bool {
+fn generated_artifact_is_currently_available(document: &TaskEvidenceDocument, path: &str) -> bool {
     let normalized = normalize_slashes(path);
-    let Some(baseline) = document.generated_artifact_hashes.get(&normalized) else {
+    let Some(current) = document.latest_generated_artifact_hashes.get(&normalized) else {
         return false;
     };
-    let Some(latest) = document.latest_generated_artifact_hashes.get(&normalized) else {
-        return false;
-    };
-    baseline.exists
-        && latest.exists
-        && baseline.read_error.is_none()
-        && latest.read_error.is_none()
-        && baseline.sha1.is_some()
-        && baseline.sha1 == latest.sha1
+    current.exists && current.read_error.is_none() && current.sha1.is_some()
 }
 
-fn verifier_requirement_satisfied(
-    requirement: &GeneratedArtifactRequirement,
-    payload: Option<&Value>,
-) -> bool {
-    if requirement.validation_command.is_empty() {
-        return false;
-    }
-    payload
-        .and_then(|value| value.get("results"))
-        .and_then(Value::as_array)
-        .is_some_and(|results| {
-            results.iter().any(|result| {
-                result.get("id").and_then(Value::as_str) == Some(requirement.id.as_str())
-                    && result.get("status").and_then(Value::as_str) == Some("VERIFIED")
-                    && result.get("exit_code").and_then(Value::as_i64) == Some(0)
-                    && result.get("timed_out").and_then(Value::as_bool) == Some(false)
-                    && result
-                        .get("command")
-                        .and_then(Value::as_array)
-                        .is_some_and(|command| {
-                            command.len() == requirement.validation_command.len()
-                                && command.iter().zip(&requirement.validation_command).all(
-                                    |(actual, expected)| actual.as_str() == Some(expected.as_str()),
-                                )
-                        })
-            })
-        })
-}
-
-fn pathless_requirement_has_fresh_receipt(
-    document: &TaskEvidenceDocument,
-    requirement: &GeneratedArtifactRequirement,
-) -> bool {
-    requirement
-        .validation_receipt_ids
-        .iter()
-        .rev()
-        .any(|receipt_id| {
-            document.validation_receipts.iter().rev().any(|receipt| {
-                receipt.id == *receipt_id
-                    && receipt.epoch == document.evidence_epoch
-                    && receipt.tool_success
-                    && receipt.proof_bearing
-                    && receipt.verdict.as_deref() == Some("VERIFIED")
-                    && requirement
-                        .step_id
-                        .as_ref()
-                        .is_none_or(|step_id| receipt.step_id.as_ref() == Some(step_id))
-                    && verifier_requirement_satisfied(requirement, receipt.payload.as_ref())
-            })
-        })
-}
-
-fn command_display(command: &[String]) -> String {
-    if command.is_empty() {
-        return "<missing command>".to_string();
-    }
-    command
-        .iter()
-        .map(|argument| {
-            if argument.is_empty() || argument.chars().any(char::is_whitespace) {
-                format!("{argument:?}")
-            } else {
-                argument.clone()
+fn dependency_cycle_members(document: &TaskEvidenceDocument) -> BTreeSet<String> {
+    fn visit<'a>(
+        id: &'a str,
+        steps: &BTreeMap<&'a str, &'a EvidencePlanStep>,
+        states: &mut BTreeMap<&'a str, u8>,
+        stack: &mut Vec<&'a str>,
+        cycle_members: &mut BTreeSet<String>,
+    ) {
+        match states.get(id).copied() {
+            Some(2) => return,
+            Some(1) => {
+                if let Some(cycle_start) = stack.iter().position(|candidate| *candidate == id) {
+                    cycle_members.extend(
+                        stack[cycle_start..]
+                            .iter()
+                            .map(|member| (*member).to_string()),
+                    );
+                }
+                return;
             }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+            _ => {}
+        }
+        let Some(step) = steps.get(id) else {
+            return;
+        };
+        states.insert(id, 1);
+        stack.push(id);
+        for dependency in &step.depends_on {
+            if steps.contains_key(dependency.as_str()) {
+                visit(dependency, steps, states, stack, cycle_members);
+            }
+        }
+        stack.pop();
+        states.insert(id, 2);
+    }
+
+    let steps = document
+        .plan
+        .iter()
+        .filter(|step| step.status != StepStatus::Skipped)
+        .map(|step| (step.id.as_str(), step))
+        .collect::<BTreeMap<_, _>>();
+    let mut states = BTreeMap::new();
+    let mut stack = Vec::new();
+    let mut cycle_members = BTreeSet::new();
+    for id in steps.keys().copied() {
+        visit(id, &steps, &mut states, &mut stack, &mut cycle_members);
+    }
+    cycle_members
 }
 
 fn derive_completion_gate(
@@ -2735,32 +2216,62 @@ fn derive_completion_gate(
     if !blocked_steps.is_empty() {
         blocked.push(format!("blocked plan steps: {}", blocked_steps.join(", ")));
     }
-    let unresolved_steps = document
+    let unacknowledged_steps = document
         .plan
         .iter()
-        .enumerate()
-        .filter(|(index, step)| {
-            step.status != StepStatus::Skipped
-                && (step.status != StepStatus::Passed || !step_has_fresh_evidence(document, *index))
-        })
-        .map(|(_, step)| format!("{} ({:?})", step.id, step.status))
+        .filter(|step| !matches!(step.status, StepStatus::Passed | StepStatus::Skipped))
+        .map(|step| format!("{} ({:?})", step.id, step.status))
         .collect::<Vec<_>>();
-    if !unresolved_steps.is_empty() {
+    if !unacknowledged_steps.is_empty() {
         partial.push(format!(
-            "plan steps lack fresh passing evidence: {}",
-            unresolved_steps.join(", ")
+            "plan steps are not acknowledged as passed: {}",
+            unacknowledged_steps.join(", ")
         ));
     }
-    if document.verify_plan_epoch != Some(document.evidence_epoch) {
-        partial.push("verify_local planning is missing or stale".to_string());
+    let steps_by_id = document
+        .plan
+        .iter()
+        .map(|step| (step.id.as_str(), step))
+        .collect::<BTreeMap<_, _>>();
+    for step in document
+        .plan
+        .iter()
+        .filter(|step| step.status != StepStatus::Skipped)
+    {
+        for dependency in &step.depends_on {
+            if dependency == &step.id {
+                blocked.push(format!("plan step `{}` cannot depend on itself", step.id));
+                continue;
+            }
+            let Some(dependency_step) = steps_by_id.get(dependency.as_str()) else {
+                blocked.push(format!(
+                    "plan step `{}` depends on missing step `{dependency}`",
+                    step.id
+                ));
+                continue;
+            };
+            if !matches!(
+                dependency_step.status,
+                StepStatus::Passed | StepStatus::Skipped
+            ) {
+                partial.push(format!(
+                    "plan step `{}` depends on unfinished step `{dependency}` ({:?})",
+                    step.id, dependency_step.status
+                ));
+            }
+        }
     }
-    if document.validation_epoch != Some(document.evidence_epoch) {
-        partial.push("proof-bearing verify_local validation is missing or stale".to_string());
+    let cycle_members = dependency_cycle_members(document);
+    if !cycle_members.is_empty() {
+        blocked.push(format!(
+            "plan dependency cycle includes: {}",
+            cycle_members.into_iter().collect::<Vec<_>>().join(", ")
+        ));
     }
     if document
         .plan
         .iter()
-        .any(|step| step.requires_desktop_activation)
+        .any(|step| step.status != StepStatus::Skipped && step.requires_desktop_activation)
         && document
             .desktop_activation_receipt
             .as_ref()
@@ -2770,16 +2281,11 @@ fn derive_completion_gate(
     }
     for requirement in &document.generated_artifact_requirements {
         if let Some(path) = requirement.path.as_ref() {
-            if !generated_artifact_is_fresh(document, path) {
+            if !generated_artifact_is_currently_available(document, path) {
                 blocked.push(format!(
-                    "required generated artifact is missing, unreadable, or stale: {path}"
+                    "required generated artifact is missing, unreadable, or unhashable: {path}"
                 ));
             }
-        } else if !pathless_requirement_has_fresh_receipt(document, requirement) {
-            blocked.push(format!(
-                "required verifier command lacks a matching fresh passing result: {}",
-                command_display(&requirement.validation_command)
-            ));
         }
     }
     for snapshot in document
@@ -2820,39 +2326,23 @@ fn derive_completion_gate(
 
 fn invalidate_for_mutation(document: &mut TaskEvidenceDocument) {
     document.host_mutation_revision = document.host_mutation_revision.saturating_add(1);
-    invalidate_evidence(document, true, true);
-}
-
-fn invalidate_for_plan_change(document: &mut TaskEvidenceDocument) {
-    invalidate_evidence(document, false, false);
-}
-
-fn invalidate_evidence(
-    document: &mut TaskEvidenceDocument,
-    reset_repair_budget: bool,
-    file_mutation: bool,
-) {
     document.evidence_epoch = document.evidence_epoch.saturating_add(1);
-    if file_mutation {
-        document.last_mutation_at = Some(timestamp());
-    }
-    document.verify_plan_epoch = None;
-    document.validation_epoch = None;
+    document.last_mutation_at = Some(timestamp());
     document.desktop_activation_receipt = None;
-    document.automatic_plan_attempt_epoch = None;
-    if reset_repair_budget {
-        document.repair_turns_used = 0;
-    }
+    document.repair_turns_used = 0;
     document.completion = None;
     for step in &mut document.plan {
         if step.status == StepStatus::Passed {
             step.status = StepStatus::Implemented;
         }
-        step.validation_receipt_ids.clear();
     }
-    for requirement in &mut document.generated_artifact_requirements {
-        requirement.validation_receipt_ids.clear();
-    }
+}
+
+fn invalidate_for_plan_change(document: &mut TaskEvidenceDocument) {
+    document.evidence_epoch = document.evidence_epoch.saturating_add(1);
+    document.desktop_activation_receipt = None;
+    document.latest_generated_artifact_hashes.clear();
+    document.completion = None;
 }
 
 fn task_is_tracked(document: &TaskEvidenceDocument) -> bool {
@@ -2866,14 +2356,6 @@ fn task_is_tracked(document: &TaskEvidenceDocument) -> bool {
             .risks
             .iter()
             .any(|risk| risk.source == "task_evidence_storage" && !risk.resolved)
-}
-
-fn resolve_risks_by_source(document: &mut TaskEvidenceDocument, source: &str) {
-    for risk in &mut document.risks {
-        if risk.source == source {
-            risk.resolved = true;
-        }
-    }
 }
 
 fn resolve_risk(document: &mut TaskEvidenceDocument, id: &str) {
@@ -2910,11 +2392,6 @@ fn task_evidence_storage_risk(reason: &str, epoch: u64) -> EvidenceRisk {
 fn unreadable_file_risk_id(path: &str) -> String {
     let digest = sha1_hex(normalize_slashes(path).as_bytes());
     format!("unreadable-file-{}", &digest[..16])
-}
-
-fn generated_artifact_freshness_risk_id(path: &str) -> String {
-    let digest = sha1_hex(normalize_slashes(path).as_bytes());
-    format!("generated-artifact-freshness-{}", &digest[..16])
 }
 
 fn upsert_risk(document: &mut TaskEvidenceDocument, risk: EvidenceRisk) {
@@ -2976,6 +2453,61 @@ async fn snapshot_file(repo_root: &Path, normalized: &str) -> FileHashSnapshot {
     }
 }
 
+async fn snapshot_generated_artifact(repo_root: &Path, normalized: &str) -> FileHashSnapshot {
+    let normalized = normalize_slashes(normalized);
+    let path = Path::new(&normalized);
+    if path.is_absolute() {
+        return rejected_generated_artifact_snapshot(&normalized, "AbsoluteArtifactPath");
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return rejected_generated_artifact_snapshot(&normalized, "PathTraversalOutsideRepository");
+    }
+    let absolute = repo_root.join(path);
+    if !generated_artifact_path_is_contained(repo_root, &absolute) {
+        return rejected_generated_artifact_snapshot(&normalized, "OutsideRepository");
+    }
+    snapshot_file(repo_root, &normalized).await
+}
+
+fn generated_artifact_path_is_contained(repo_root: &Path, candidate: &Path) -> bool {
+    let Ok(canonical_repo_root) = dunce::canonicalize(repo_root) else {
+        return false;
+    };
+    let mut existing_ancestor = candidate.to_path_buf();
+    loop {
+        match dunce::canonicalize(&existing_ancestor) {
+            Ok(canonical_candidate) => {
+                return canonical_candidate == canonical_repo_root
+                    || canonical_candidate
+                        .strip_prefix(&canonical_repo_root)
+                        .is_ok();
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if !existing_ancestor.pop() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
+fn rejected_generated_artifact_snapshot(normalized: &str, reason: &str) -> FileHashSnapshot {
+    FileHashSnapshot {
+        path: normalize_slashes(normalized),
+        sha1: None,
+        exists: false,
+        read_error: Some(reason.to_string()),
+    }
+}
+
 async fn sha1_file(path: &Path) -> io::Result<String> {
     let mut file = tokio::fs::File::open(path).await?;
     let mut hasher = Sha1::new();
@@ -2988,12 +2520,6 @@ async fn sha1_file(path: &Path) -> io::Result<String> {
         hasher.update(&buffer[..bytes_read]);
     }
     Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn path_is_covered(path: &str, active: &str) -> bool {
-    let path = normalize_slashes(path);
-    let active = normalize_slashes(active);
-    path == active || path.starts_with(&format!("{active}/"))
 }
 
 fn sha1_hex(bytes: &[u8]) -> String {
@@ -3029,15 +2555,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path().join("repo");
         let codex_home = temp.path().join("home");
-        tokio::fs::create_dir_all(repo.join("scripts"))
-            .await
-            .expect("scripts");
         tokio::fs::create_dir_all(repo.join(".git"))
             .await
             .expect("git dir");
-        tokio::fs::write(repo.join("scripts/verify_local.py"), "# fixture")
-            .await
-            .expect("verifier");
         tokio::fs::write(repo.join("kd4_features.toml"), "# fixture")
             .await
             .expect("manifest");
@@ -3065,93 +2585,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_completed_is_reopened_until_fresh_evidence_exists() {
+    async fn legacy_completed_is_canonicalized_to_passed() {
         let (_temp, ledger) = ledger_fixture().await;
         let normalized = ledger
             .record_plan_update(&plan(StepStatus::Completed))
             .await;
-        assert_eq!(normalized.plan[0].status, StepStatus::Implemented);
+        assert_eq!(normalized.plan[0].status, StepStatus::Passed);
         let gate = ledger.completion_gate().await.expect("gate");
-        assert_eq!(gate.status, TaskCompletionStatus::Partial);
-        assert!(
-            gate.reasons
-                .iter()
-                .any(|reason| reason.contains("verify_local planning"))
-        );
-    }
-
-    #[tokio::test]
-    async fn edit_after_validation_reopens_step_and_stales_receipts() {
-        let (temp, ledger) = ledger_fixture().await;
-        let repo = temp.path().join("repo");
-        tokio::fs::create_dir_all(repo.join("src"))
-            .await
-            .expect("src");
-        tokio::fs::write(repo.join("src/lib.rs"), "pub fn value() -> u8 { 1 }")
-            .await
-            .expect("source");
-        ledger
-            .record_plan_update(&plan(StepStatus::InProgress))
-            .await;
-        let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo");
-        ledger
-            .record_edit_intent("patch-1", cwd.as_path(), &[PathBuf::from("src/lib.rs")])
-            .await;
-        tokio::fs::write(repo.join("src/lib.rs"), "pub fn value() -> u8 { 2 }")
-            .await
-            .expect("source update");
-        ledger.record_edit_result("patch-1", "completed").await;
-        let plan_validation_start = ledger
-            .begin_verify_local_validation(&[])
-            .await
-            .expect("plan validation start");
-        ledger
-            .record_verify_local(
-                "plan",
-                Some("PLANNED"),
-                true,
-                false,
-                Some(&plan_validation_start),
-                &[PathBuf::from("src/lib.rs")],
-                &[],
-                Some(&serde_json::json!({"planned": []})),
-            )
-            .await;
-        let final_validation_start = ledger
-            .begin_verify_local_validation(&[])
-            .await
-            .expect("final validation start");
-        ledger
-            .record_verify_local(
-                "final",
-                Some("VERIFIED"),
-                true,
-                true,
-                Some(&final_validation_start),
-                &[PathBuf::from("src/lib.rs")],
-                &[],
-                Some(&serde_json::json!({"verdict": "VERIFIED"})),
-            )
-            .await;
-        assert_eq!(
-            ledger.completion_gate().await.expect("gate").status,
-            TaskCompletionStatus::Passed
-        );
-
-        ledger
-            .record_edit_intent("patch-2", cwd.as_path(), &[PathBuf::from("src/lib.rs")])
-            .await;
-        tokio::fs::write(repo.join("src/lib.rs"), "pub fn value() -> u8 { 3 }")
-            .await
-            .expect("second update");
-        ledger.record_edit_result("patch-2", "completed").await;
-        let gate = ledger.completion_gate().await.expect("gate");
-        assert_eq!(gate.status, TaskCompletionStatus::Partial);
-        assert!(
-            gate.reasons
-                .iter()
-                .any(|reason| reason.contains("missing or stale"))
-        );
+        assert_eq!(gate.status, TaskCompletionStatus::Passed);
     }
 
     #[tokio::test]
@@ -3179,39 +2620,11 @@ mod tests {
     async fn finalization_warning_is_bounded_and_does_not_request_a_turn() {
         let (_temp, ledger) = ledger_fixture().await;
         ledger
-            .record_plan_update(&plan(StepStatus::Completed))
+            .record_plan_update(&plan(StepStatus::InProgress))
             .await;
         let warning = ledger.take_finalization_warning().await.expect("warning");
         assert!(warning.contains("No automatic repair turn was started"));
         assert!(ledger.take_finalization_warning().await.is_none());
-    }
-
-    #[tokio::test]
-    async fn automatic_verify_plan_is_requested_once_per_mutation_epoch() {
-        let (temp, ledger) = ledger_fixture().await;
-        let repo = temp.path().join("repo");
-        tokio::fs::create_dir_all(repo.join("src"))
-            .await
-            .expect("src");
-        tokio::fs::write(repo.join("src/lib.rs"), "pub fn value() -> u8 { 1 }")
-            .await
-            .expect("source");
-        ledger
-            .record_plan_update(&plan(StepStatus::InProgress))
-            .await;
-        ledger
-            .record_edit_intent("patch-1", &repo, &[PathBuf::from("src/lib.rs")])
-            .await;
-        tokio::fs::write(repo.join("src/lib.rs"), "pub fn value() -> u8 { 2 }")
-            .await
-            .expect("source update");
-        ledger.record_edit_result("patch-1", "completed").await;
-
-        assert_eq!(
-            ledger.take_automatic_verify_plan_request().await,
-            Some(vec!["src/lib.rs".to_string()])
-        );
-        assert_eq!(ledger.take_automatic_verify_plan_request().await, None);
     }
 }
 

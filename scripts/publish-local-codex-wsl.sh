@@ -1,6 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+readonly -a ALL_PARAMETERS=(
+  DryRun SkipBuild AutoSkipBuild NoSccache SkipPreflightCheck BuildOnly TestRun
+  Profile PrintBuiltCodexPath RepoRoot SourceExe SourceCodeModeHostExe InstallDir
+  BackupDir RunDoctor FastProof DoctorOnNoop FailOnStaleSourceBuild RuntimeProof
+  AllowRustyV8Download RustyV8Archive ConfigureDesktopLocalCli RestartDesktop
+  DesktopCliEnvironmentTarget LocalCodexHome LocalCodexSqliteHome
+  AllowRunningTarget CloseRunningTargetTimeoutSeconds
+)
+readonly -a PATH_PARAMETERS=(
+  RepoRoot SourceExe SourceCodeModeHostExe InstallDir BackupDir RustyV8Archive
+  LocalCodexHome LocalCodexSqliteHome
+)
+
 main() {
   if ! command -v powershell.exe >/dev/null 2>&1; then
     echo "powershell.exe is required. Run Windows local publish recipes from Windows PowerShell instead." >&2
@@ -20,9 +33,12 @@ main() {
   local -a translated_args
   translate_args translated_args "$@"
 
-  if [[ -n "${CODEX_LOCAL_PUBLISH_DIR:-}" && "$CODEX_LOCAL_PUBLISH_DIR" == /* ]]; then
+  if [[ -n "${CODEX_LOCAL_PUBLISH_DIR:-}" ]]; then
+    if [[ "$CODEX_LOCAL_PUBLISH_DIR" == /* ]]; then
+      CODEX_LOCAL_PUBLISH_DIR="$(wslpath -w "$CODEX_LOCAL_PUBLISH_DIR")"
+    fi
     export CODEX_LOCAL_PUBLISH_DIR
-    CODEX_LOCAL_PUBLISH_DIR="$(wslpath -w "$CODEX_LOCAL_PUBLISH_DIR")"
+    export_wslenv_publish_dir
   fi
 
   if has_repo_root_arg "${translated_args[@]}"; then
@@ -33,10 +49,10 @@ main() {
 }
 
 has_repo_root_arg() {
-  local arg arg_lower
+  local arg parameter
   for arg in "$@"; do
-    arg_lower="${arg,,}"
-    if [[ "$arg_lower" == "-reporoot" || "$arg_lower" == "-reporoot="* ]]; then
+    parameter="$(resolve_parameter_name "${arg%%[=:]*}")"
+    if [[ "${parameter,,}" == "reporoot" ]]; then
       return 0
     fi
   done
@@ -47,40 +63,81 @@ translate_args() {
   local -n out_ref="$1"
   shift
   out_ref=()
-  local path_flags=(
-    -RepoRoot
-    -SourceExe
-    -SourceCodeModeHostExe
-    -InstallDir
-    -BackupDir
-    -RustyV8Archive
-    -LocalCodexHome
-    -LocalCodexSqliteHome
-  )
   local expect_path=0
-  local arg arg_lower flag flag_lower value
+  local arg arg_name parameter delimiter value
   for arg in "$@"; do
     if [[ "$expect_path" -eq 1 ]]; then
       out_ref+=("$(translate_path_arg "$arg")")
       expect_path=0
       continue
     fi
-    arg_lower="${arg,,}"
-    for flag in "${path_flags[@]}"; do
-      flag_lower="${flag,,}"
-      if [[ "$arg_lower" == "$flag_lower" ]]; then
-        out_ref+=("$arg")
+    delimiter=""
+    if [[ "$arg" == -*=* ]]; then
+      delimiter="="
+    elif [[ "$arg" == -*:* ]]; then
+      delimiter=":"
+    fi
+    parameter="$(resolve_parameter_name "${arg%%[=:]*}")"
+    if is_path_parameter "$parameter"; then
+      if [[ -z "$delimiter" ]]; then
+        arg_name="${arg#-}"
+        if [[ "${arg_name,,}" == "${parameter,,}" ]]; then
+          out_ref+=("$arg")
+        else
+          out_ref+=("-$parameter")
+        fi
         expect_path=1
-        continue 2
+      else
+        value="${arg#*"$delimiter"}"
+        out_ref+=("-$parameter$delimiter$(translate_path_arg "$value")")
       fi
-      if [[ "$arg_lower" == "$flag_lower="* ]]; then
-        value="${arg#*=}"
-        out_ref+=("$flag=$(translate_path_arg "$value")")
-        continue 2
-      fi
-    done
+      continue
+    fi
     out_ref+=("$arg")
   done
+}
+
+resolve_parameter_name() {
+  local raw="${1#-}"
+  local raw_lower="${raw,,}"
+  local candidate
+  local -a matches=()
+  for candidate in "${ALL_PARAMETERS[@]}"; do
+    if [[ "${candidate,,}" == "$raw_lower"* ]]; then
+      matches+=("$candidate")
+    fi
+  done
+  if [[ "${#matches[@]}" -eq 1 ]]; then
+    printf '%s\n' "${matches[0]}"
+  fi
+}
+
+is_path_parameter() {
+  local parameter="$1"
+  local candidate
+  for candidate in "${PATH_PARAMETERS[@]}"; do
+    if [[ "$candidate" == "$parameter" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+export_wslenv_publish_dir() {
+  local entry
+  local -a kept=()
+  local -a existing=()
+  IFS=: read -r -a existing <<< "${WSLENV:-}"
+  for entry in "${existing[@]}"; do
+    if [[ -n "$entry" && "${entry%%/*}" != "CODEX_LOCAL_PUBLISH_DIR" ]]; then
+      kept+=("$entry")
+    fi
+  done
+  if [[ "${#kept[@]}" -eq 0 ]]; then
+    export WSLENV="CODEX_LOCAL_PUBLISH_DIR"
+  else
+    export WSLENV="CODEX_LOCAL_PUBLISH_DIR:$(IFS=:; printf '%s' "${kept[*]}")"
+  fi
 }
 
 translate_path_arg() {

@@ -10,7 +10,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
-$root = [System.IO.Path]::GetFullPath($LanesRoot)
+$root = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LanesRoot)
 if (-not (Test-Path -LiteralPath $root -PathType Container)) {
     exit 0
 }

@@ -12,7 +12,6 @@ from scripts.publish_local_codex_test_support import PublishLocalCodexTestBase
 
 
 SCRIPT = Path(__file__).resolve().parent / "publish-local-codex.ps1"
-HASHING_HELPER = Path(__file__).resolve().parent / "publish-local-codex.hashing.ps1"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 RUN_TIMEOUT_SECONDS = 120
 FIXTURE_TIME = 946684900
@@ -33,6 +32,8 @@ def ps_single_quote(value: str | Path) -> str:
 
 PUBLISH_ENV_VARS = (
     "CODEX_LOCAL_PUBLISH_DIR",
+    "CODEX_LOCAL_CODEX_HOME",
+    "CODEX_LOCAL_CODEX_SQLITE_HOME",
     "CODEX_HOME",
     "CODEX_SQLITE_HOME",
     "CODEX_CLI_PATH",
@@ -140,6 +141,39 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             self.assertIn("-RustyV8Archive", result.stdout)
             self.assertIn("-AllowRustyV8Download", result.stdout)
 
+    def test_rusty_v8_gate_covers_local_release_and_debug_archives(self) -> None:
+        self.write_cargo_lock_with_v8()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            user_profile = temp_path / "profile"
+            user_profile.mkdir()
+            env = self.publish_env_without_v8_archive(user_profile)
+
+            for profile, archive_profile in (
+                ("local-release", "release"),
+                ("debug", "debug"),
+            ):
+                with self.subTest(profile=profile):
+                    result = self.run_script(
+                        "-DryRun",
+                        "-Profile",
+                        profile,
+                        "-InstallDir",
+                        str(temp_path / profile),
+                        env=env,
+                    )
+
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                    )
+                    self.assertIn(
+                        self.rusty_v8_archive_name(archive_profile),
+                        result.stdout,
+                    )
+                    self.assertIn("v8ArchiveStatus: missing", result.stdout)
+
     def test_publish_fails_before_cargo_when_windows_rusty_v8_archive_missing(
         self,
     ) -> None:
@@ -184,7 +218,7 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             )
             archive = temp_path / self.rusty_v8_archive_name()
             archive.write_bytes(b"fake rusty v8 archive")
-            checksum = self.write_rusty_v8_checksum(archive)
+            checksum = self.write_rusty_v8_checksum(archive, binary_marker=True)
             fake_bin = temp_path / "bin"
             fake_bin.mkdir()
             fake_cargo = fake_bin / "cargo.cmd"
@@ -316,7 +350,7 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             self.assert_proof_value(
                 result.stdout,
                 "officialEnvCleanup",
-                "CODEX_HOME unset, CODEX_CLI_PATH unset, CODEX_SQLITE_HOME unset",
+                "skipped: Process-scoped routing does not modify persisted User environment",
             )
             self.assert_proof_value(
                 result.stdout,
@@ -389,14 +423,14 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
         )
         self.assert_proof_value(result.stdout, "targetPath", str(expected_target))
         self.assert_proof_value(result.stdout, "localCodexHome", str(expected_home))
-        self.assert_proof_value(result.stdout, "localCodexHomeScope", "Process")
+        self.assert_proof_value(result.stdout, "localCodexHomeScope", "User")
         self.assert_proof_value(result.stdout, "localCodexHomeAction", "would create")
         self.assert_proof_value(
             result.stdout,
             "localCodexSqliteHome",
             str(expected_home / "sqlite"),
         )
-        self.assert_proof_value(result.stdout, "localCodexSqliteHomeScope", "Process")
+        self.assert_proof_value(result.stdout, "localCodexSqliteHomeScope", "User")
         self.assert_proof_value(
             result.stdout, "localCodexSqliteHomeAction", "would create"
         )
@@ -485,7 +519,7 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             self.assertIn("targetBeforeLastWriteUtc:", result.stdout)
             self.assertIn("targetBeforeStale: True", result.stdout)
             self.assertIn(
-                "targetBeforeStaleRemedy: Run just publish-local-codex and restart Codex Desktop.",
+                "targetBeforeStaleRemedy: Run just publish-local-codex-final, then restart Codex Desktop.",
                 result.stdout,
             )
 
@@ -524,7 +558,7 @@ class PublishLocalCodexDryRunTest(PublishLocalCodexTestBase):
             self.assertIn("sourceBuildStale: True", result.stdout)
             self.assert_publish_readiness(result.stdout, "blocked: source build stale")
             self.assertIn(
-                "sourceBuildStaleRemedy: Run just publish-local-codex -Profile release -RunDoctor without -SkipBuild, then restart Codex Desktop.",
+                "sourceBuildStaleRemedy: Run just publish-local-codex-final, then restart Codex Desktop.",
                 result.stdout,
             )
             self.assertIn("binaryChanged: false", result.stdout)

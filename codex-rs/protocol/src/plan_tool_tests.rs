@@ -125,6 +125,21 @@ fn update_plan_rejects_missing_dependency_targets() {
 }
 
 #[test]
+fn update_plan_rejects_active_self_dependency() {
+    let err = serde_json::from_value::<UpdatePlanArgs>(json!({
+        "plan": [{
+            "id": "implement",
+            "step": "Implement",
+            "status": "pending",
+            "depends_on": ["implement"]
+        }]
+    }))
+    .expect_err("active self dependency should fail");
+
+    assert!(err.to_string().contains("cannot depend on itself"));
+}
+
+#[test]
 fn update_plan_rejects_dependency_cycles() {
     let err = serde_json::from_value::<UpdatePlanArgs>(json!({
         "plan": [
@@ -135,4 +150,44 @@ fn update_plan_rejects_dependency_cycles() {
     .expect_err("dependency cycle should fail");
 
     assert!(err.to_string().contains("dependency cycle"));
+}
+
+#[test]
+fn update_plan_accepts_dependencies_declared_only_by_skipped_items() {
+    let args = serde_json::from_value::<UpdatePlanArgs>(json!({
+        "plan": [
+            {
+                "id": "one",
+                "step": "one",
+                "status": "skipped",
+                "depends_on": ["two"]
+            },
+            {
+                "id": "two",
+                "step": "two",
+                "status": "skipped",
+                "depends_on": ["one"]
+            },
+            {
+                "id": "self",
+                "step": "self",
+                "status": "skipped",
+                "depends_on": ["self"]
+            },
+            {
+                "id": "missing",
+                "step": "missing",
+                "status": "skipped",
+                "depends_on": ["not-present"]
+            }
+        ]
+    }))
+    .expect("skipped dependencies should not constrain completion");
+
+    assert_eq!(args.plan.len(), 4);
+    assert!(
+        args.plan
+            .iter()
+            .all(|item| item.status == StepStatus::Skipped)
+    );
 }

@@ -5150,7 +5150,9 @@ async fn sqlite_home_defaults_to_codex_home_for_workspace_write() -> std::io::Re
     )
     .await?;
 
-    assert_eq!(config.sqlite_home, codex_home.path().to_path_buf());
+    let expected_sqlite_home = resolve_sqlite_home_env(config.cwd.as_path())
+        .unwrap_or_else(|| codex_home.path().to_path_buf());
+    assert_eq!(config.sqlite_home, expected_sqlite_home);
 
     Ok(())
 }

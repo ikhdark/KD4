@@ -37,7 +37,9 @@ WINDOWS_ABSOLUTE_PATH_RE = re.compile(
     r"(?i)(?<![A-Za-z0-9_])(?:[A-Z]:[\\/]|\\\\[^\\/\s]+[\\/][^\\/\s]+)"
     r"(?:[^\s\"'<>|]*)"
 )
-POSIX_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_:])/(?:[^/\s\"'<>|]+/)*[^/\s\"'<>|]*")
+POSIX_ABSOLUTE_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_:])/(?:[^/\s\"'<>|]+/)*[^/\s\"'<>|]*"
+)
 WALL_TIME_OUTPUT_RE = re.compile(
     r"^Wall time: [0-9]+(?:\.[0-9]+)? seconds\r?\nOutput:(?:\r?\n)?",
 )
@@ -51,7 +53,6 @@ FORBIDDEN_INVESTIGATION_FIELDS = {
 }
 PLUGIN_MENTIONS = {
     "kds": "[@kds](plugin://kds@local-kds)",
-    "kdwg": "[@wiring-guard](plugin://wiring-guard@local-wiring-guards)",
     "repo-atlas": "[@repo-atlas](plugin://repo-atlas@repo-atlas-local)",
 }
 
@@ -72,7 +73,9 @@ class Redactor:
                 value = str(path.resolve())
             except OSError:
                 value = str(path.absolute())
-            resolved.extend((value, value.replace("\\", "\\\\"), value.replace("\\", "/")))
+            resolved.extend(
+                (value, value.replace("\\", "\\\\"), value.replace("\\", "/"))
+            )
         self._paths = sorted(set(resolved), key=len, reverse=True)
 
     def text(self, value: object) -> str:
@@ -133,7 +136,11 @@ class Scenario:
                 self._capture_outputs(body)
                 response_id = f"resp-{self.case.name}-{self.requests}"
                 missing = next(
-                    (call for call in self.case.calls if call.call_id not in self.outputs),
+                    (
+                        call
+                        for call in self.case.calls
+                        if call.call_id not in self.outputs
+                    ),
                     None,
                 )
                 if missing is not None:
@@ -241,18 +248,26 @@ class Scenario:
             call_id = item.get("call_id")
             if call_id in expected and call_id not in self.outputs:
                 if "output" not in item:
-                    raise SmokeFailure(f"tool output {call_id!r} omitted its output value")
+                    raise SmokeFailure(
+                        f"tool output {call_id!r} omitted its output value"
+                    )
                 self.outputs[str(call_id)] = item["output"]
 
     def assert_finished(self) -> None:
         with self.lock:
             if self.failure is not None:
-                raise SmokeFailure(f"loopback Responses scenario failed: {self.failure}")
+                raise SmokeFailure(
+                    f"loopback Responses scenario failed: {self.failure}"
+                )
             missing = [
-                call.call_id for call in self.case.calls if call.call_id not in self.outputs
+                call.call_id
+                for call in self.case.calls
+                if call.call_id not in self.outputs
             ]
             if missing:
-                raise SmokeFailure(f"model did not return tool output for {len(missing)} call(s)")
+                raise SmokeFailure(
+                    f"model did not return tool output for {len(missing)} call(s)"
+                )
             if self.final_responses < 1:
                 raise SmokeFailure("model session did not request its final response")
 
@@ -316,7 +331,6 @@ def tool_search_is_advertised(tools: object) -> bool:
 def tool_search_query(invocation: ToolInvocation) -> str:
     queries = {
         ("kds", "KDS"): "KDS compact noisy diagnostic command output",
-        ("kdwg", "KDWG"): "KDWG static implementation wiring check",
         ("repo_atlas", "select_root"): "Repo Atlas select repository root",
         ("repo_atlas", "find_def"): "Repo Atlas find exact symbol definition",
         ("repo_atlas", "trace"): "Repo Atlas approximate symbol trace",
@@ -331,8 +345,7 @@ def advertised_tool_summary(body: dict[str, Any]) -> str:
     tools = body.get("tools")
     if not isinstance(tools, list):
         return (
-            f"request keys={','.join(sorted(body))}; "
-            f"tools type={type(tools).__name__}"
+            f"request keys={','.join(sorted(body))}; tools type={type(tools).__name__}"
         )
     identities: list[str] = []
     for tool in tools:
@@ -348,7 +361,6 @@ def plugin_request_summary(provider: str, body: dict[str, Any]) -> str:
     plugin_uri = PLUGIN_MENTIONS[provider].split("(", 1)[1][:-1]
     plugin_skill = {
         "kds": "kds:kds",
-        "kdwg": "wiring-guard:wire-implementations",
         "repo-atlas": "repo-atlas:repo-atlas",
     }[provider]
     return (
@@ -384,13 +396,17 @@ class LoopbackResponsesServer(http.server.ThreadingHTTPServer):
     def current_scenario(self) -> Scenario:
         with self._scenario_lock:
             if self._scenario is None:
-                raise SmokeFailure("loopback Responses request arrived without an active case")
+                raise SmokeFailure(
+                    "loopback Responses request arrived without an active case"
+                )
             return self._scenario
 
     def release(self, scenario: Scenario) -> None:
         with self._scenario_lock:
             if self._scenario is not scenario:
-                raise SmokeFailure("loopback Responses scenario ownership changed unexpectedly")
+                raise SmokeFailure(
+                    "loopback Responses scenario ownership changed unexpectedly"
+                )
             self._scenario = None
 
 
@@ -542,7 +558,9 @@ def git_output(
             creationflags=creationflags,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SmokeFailure(f"provider Git inspection failed: {redactor.text(exc)}") from exc
+        raise SmokeFailure(
+            f"provider Git inspection failed: {redactor.text(exc)}"
+        ) from exc
     if completed.returncode != 0:
         raise SmokeFailure(
             "provider Git inspection failed: "
@@ -602,7 +620,9 @@ def source_fingerprint(
             digest.update(b"<missing>")
             continue
         if is_reparse_or_link(path) or not path.is_file():
-            raise SmokeFailure("provider source fingerprint encountered a non-regular file")
+            raise SmokeFailure(
+                "provider source fingerprint encountered a non-regular file"
+            )
         with path.open("rb") as handle:
             while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)
@@ -630,7 +650,9 @@ def stage_provider(
         if not source.exists():
             continue
         if is_reparse_or_link(source) or not source.is_file():
-            raise SmokeFailure("provider staging rejects links, reparses, and non-regular files")
+            raise SmokeFailure(
+                "provider staging rejects links, reparses, and non-regular files"
+            )
         target = destination / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
@@ -714,10 +736,7 @@ def install_provider(
         )
         return
 
-    if provider == "kdwg":
-        marketplace = "local-wiring-guards"
-        selector = "wiring-guard@local-wiring-guards"
-    elif provider == "repo-atlas":
+    if provider == "repo-atlas":
         marketplace = "repo-atlas-local"
         selector = "repo-atlas@repo-atlas-local"
     else:
@@ -736,7 +755,9 @@ def install_provider(
         or plugin["source"].get("source") != "local"
         for plugin in plugins
     ):
-        raise SmokeFailure(f"{provider} smoke lifecycle accepts only local plugin sources")
+        raise SmokeFailure(
+            f"{provider} smoke lifecycle accepts only local plugin sources"
+        )
 
     run_command(
         [
@@ -822,19 +843,6 @@ def kds_fixture(noisy: bool) -> dict[str, str]:
             "        os._exit(3)\n\n"
             "if __name__ == '__main__':\n"
             "    unittest.main()\n"
-        )
-    }
-
-
-def kdwg_fixture() -> dict[str, str]:
-    return {
-        "app.py": (
-            "def reset():\n"
-            "    return 'reset'\n\n"
-            "def unused():\n"
-            "    return 'unused'\n\n"
-            "def dispatch():\n"
-            "    return reset()\n"
         )
     }
 
@@ -927,42 +935,6 @@ def make_case(
                 },
             ),
             kds_fixture(noisy=True),
-        )
-    if provider == "kdwg" and ordinal in {0, 1}:
-        expected_target = "reset" if ordinal == 0 else "unused"
-        target = ToolInvocation(
-            "kdwg",
-            "KDWG",
-            "kdwg-wired-call" if ordinal == 0 else "kdwg-gaps-call",
-            {
-                "command": [
-                    "check",
-                    "--expect",
-                    "app.py::dispatch",
-                    f"app.py::{expected_target}",
-                ],
-                "cwd": str(repo),
-            },
-        )
-        verdict = "WIRED" if ordinal == 0 else "GAPS_FOUND"
-        return (
-            CaseSpec(
-                name="kdwg-wired" if ordinal == 0 else "kdwg-gaps",
-                provider=provider,
-                producer="kdwg",
-                expected_server_name="kdwg",
-                expected_operation="check",
-                target=target,
-                calls=(target,),
-                expected_completeness="complete",
-                expected_truncated=False,
-                expected_approximate=False,
-                expected_tool_success=ordinal == 0,
-                expected_snapshot="present",
-                expected_model_fields={"verdict": verdict},
-                expected_content_markers=(verdict,),
-            ),
-            kdwg_fixture(),
         )
     if provider == "repo-atlas" and ordinal in {0, 1}:
         select = ToolInvocation(
@@ -1150,13 +1122,17 @@ def parse_model_structured_output(
         raise SmokeFailure(f"{case.name} model-visible output is empty")
     match = WALL_TIME_OUTPUT_RE.match(text)
     if match is None:
-        raise SmokeFailure(f"{case.name} model-visible output omitted its wall-time wrapper")
+        raise SmokeFailure(
+            f"{case.name} model-visible output omitted its wall-time wrapper"
+        )
     payload_text = text[match.end() :]
     try:
         value = json.loads(payload_text)
     except json.JSONDecodeError:
         if case.name != "kds-noisy-partial":
-            raise SmokeFailure(f"{case.name} model-visible structured result is not JSON")
+            raise SmokeFailure(
+                f"{case.name} model-visible structured result is not JSON"
+            )
         required_fragments = (
             '"evidenceMeta"',
             '"payloadCompleteness":"partial"',
@@ -1168,7 +1144,9 @@ def parse_model_structured_output(
             )
         return None
     if not isinstance(value, dict):
-        raise SmokeFailure(f"{case.name} model-visible structured result is not an object")
+        raise SmokeFailure(
+            f"{case.name} model-visible structured result is not an object"
+        )
     evidence_meta = value.get("evidenceMeta")
     if not isinstance(evidence_meta, dict):
         raise SmokeFailure(f"{case.name} model-visible result omitted evidenceMeta")
@@ -1184,7 +1162,11 @@ def parse_model_structured_output(
         ) from exc
     for key, expected in case.expected_model_fields.items():
         if value.get(key) != expected:
-            report = redactor.text(value.get("report", "")).replace("\r", " ").replace("\n", " ")
+            report = (
+                redactor.text(value.get("report", ""))
+                .replace("\r", " ")
+                .replace("\n", " ")
+            )
             raise SmokeFailure(
                 f"{case.name} model-visible field {key!r} was {value.get(key)!r}, "
                 f"expected {expected!r}; report={report[:300]!r}"
@@ -1270,7 +1252,9 @@ def decode_artifact(home: Path, thread_id: str, artifact_id: str) -> bytes:
         try:
             value = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise SmokeFailure("external evidence artifact chunk is invalid JSON") from exc
+            raise SmokeFailure(
+                "external evidence artifact chunk is invalid JSON"
+            ) from exc
         if not isinstance(value, str):
             raise SmokeFailure("external evidence artifact chunk is not a JSON string")
         chunks.append(value)
@@ -1295,7 +1279,9 @@ def verify_receipt(
     receipt = receipts[0]
     if not isinstance(receipt, dict):
         raise SmokeFailure(f"{case.name} external evidence receipt is not an object")
-    if not isinstance(receipt.get("id"), str) or not RECEIPT_ID_RE.fullmatch(receipt["id"]):
+    if not isinstance(receipt.get("id"), str) or not RECEIPT_ID_RE.fullmatch(
+        receipt["id"]
+    ):
         raise SmokeFailure(f"{case.name} external evidence receipt ID is invalid")
     expected = {
         "producer": case.producer,
@@ -1330,7 +1316,9 @@ def verify_receipt(
     payload = receipt.get("payload")
     artifact_id = receipt.get("payload_artifact_id")
     if not isinstance(payload, dict):
-        raise SmokeFailure(f"{case.name} receipt omitted its retained payload or summary")
+        raise SmokeFailure(
+            f"{case.name} receipt omitted its retained payload or summary"
+        )
     if artifact_id is None:
         canonical = canonical_json_bytes(payload)
         retention = "inline"
@@ -1339,14 +1327,20 @@ def verify_receipt(
             raise SmokeFailure(f"{case.name} receipt artifact ID is invalid")
         artifact = payload.get("artifact")
         if not isinstance(artifact, dict):
-            raise SmokeFailure(f"{case.name} externalized payload omitted its artifact summary")
+            raise SmokeFailure(
+                f"{case.name} externalized payload omitted its artifact summary"
+            )
         if artifact.get("id") != artifact_id:
-            raise SmokeFailure(f"{case.name} artifact summary ID does not match its receipt")
+            raise SmokeFailure(
+                f"{case.name} artifact summary ID does not match its receipt"
+            )
         if artifact.get("encoding") != ARTIFACT_HEADER.decode("ascii").strip():
             raise SmokeFailure(f"{case.name} artifact summary encoding is invalid")
         summary = payload.get("evidenceMetaSummary")
         if not isinstance(summary, dict):
-            raise SmokeFailure(f"{case.name} externalized payload omitted evidence metadata")
+            raise SmokeFailure(
+                f"{case.name} externalized payload omitted evidence metadata"
+            )
         if (
             summary.get("producer") != case.producer
             or summary.get("schemaVersion") != 1
@@ -1358,14 +1352,18 @@ def verify_receipt(
         try:
             payload = json.loads(canonical)
         except json.JSONDecodeError as exc:
-            raise SmokeFailure(f"{case.name} retained canonical payload is invalid JSON") from exc
+            raise SmokeFailure(
+                f"{case.name} retained canonical payload is invalid JSON"
+            ) from exc
 
     result_sha256 = receipt.get("result_sha256")
     if not isinstance(result_sha256, str) or not SHA256_RE.fullmatch(result_sha256):
         raise SmokeFailure(f"{case.name} receipt result hash is invalid")
     actual_sha256 = hashlib.sha256(canonical).hexdigest()
     if actual_sha256 != result_sha256:
-        raise SmokeFailure(f"{case.name} retained payload hash does not match its receipt")
+        raise SmokeFailure(
+            f"{case.name} retained payload hash does not match its receipt"
+        )
     if canonical != canonical_json_bytes(payload):
         raise SmokeFailure(f"{case.name} artifact bytes are not canonical JSON")
     if not isinstance(payload, dict):
@@ -1414,7 +1412,9 @@ def verify_receipt(
         raise SmokeFailure(f"{case.name} retained provider text is empty")
     for marker in case.expected_content_markers:
         if marker not in text:
-            raise SmokeFailure(f"{case.name} retained provider text lost marker {marker!r}")
+            raise SmokeFailure(
+                f"{case.name} retained provider text lost marker {marker!r}"
+            )
     return retention
 
 
@@ -1426,7 +1426,8 @@ def verify_evidence_only_state(document: dict[str, Any]) -> None:
     present = FORBIDDEN_INVESTIGATION_FIELDS.intersection(document)
     if present:
         raise SmokeFailure(
-            "provider created deferred investigation state: " + ", ".join(sorted(present))
+            "provider created deferred investigation state: "
+            + ", ".join(sorted(present))
         )
 
 
@@ -1518,13 +1519,14 @@ def assert_no_temp_processes(temp_root: Path, env: dict[str, str]) -> None:
             return
         time.sleep(0.1)
     count = cleanup_temp_processes(temp_root, env)
-    raise SmokeFailure(f"{count} temporary plugin process(es) outlived their KD4 session")
+    raise SmokeFailure(
+        f"{count} temporary plugin process(es) outlived their KD4 session"
+    )
 
 
 def provider_paths(args: argparse.Namespace) -> dict[str, Path]:
     return {
         "kds": args.kds.resolve(),
-        "kdwg": args.kdwg.resolve(),
         "repo-atlas": args.repo_atlas.resolve(),
     }
 
@@ -1555,7 +1557,9 @@ def validate_inputs(
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise SmokeFailure(f"KD4 binary could not be inspected: {redactor.text(exc)}") from exc
+        raise SmokeFailure(
+            f"KD4 binary could not be inspected: {redactor.text(exc)}"
+        ) from exc
     if version.returncode != 0:
         raise SmokeFailure("KD4 binary version inspection failed")
 
@@ -1565,7 +1569,7 @@ def parse_args() -> argparse.Namespace:
     desktop = repository.parent
     parser = argparse.ArgumentParser(
         description=(
-            "Exercise installed KDS, KDWG, and Repo Atlas MCP results through "
+            "Exercise installed KDS and Repo Atlas MCP results through "
             "KD4 evidence-only persistence. Requires the explicit --run guard."
         )
     )
@@ -1587,12 +1591,6 @@ def parse_args() -> argparse.Namespace:
         help="local KDS checkout",
     )
     parser.add_argument(
-        "--kdwg",
-        type=Path,
-        default=desktop / "KDWG",
-        help="local KDWG checkout",
-    )
-    parser.add_argument(
         "--repo-atlas",
         type=Path,
         default=desktop / "repo-atlas",
@@ -1600,7 +1598,9 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     if not args.run:
-        parser.error("--run is required; the smoke test installs local plugins into temp homes")
+        parser.error(
+            "--run is required; the smoke test installs local plugins into temp homes"
+        )
     return args
 
 
@@ -1645,7 +1645,9 @@ def main() -> int:
                 redactor=redactor,
             )
             if source_after_staging != source_before_staging:
-                raise SmokeFailure(f"{provider} provider checkout changed during staging")
+                raise SmokeFailure(
+                    f"{provider} provider checkout changed during staging"
+                )
             home = temp_root / "homes" / provider
             home.mkdir(parents=True, exist_ok=False)
             (home / "config.toml").write_text(
@@ -1682,7 +1684,9 @@ def main() -> int:
                     base_env=environment,
                     redactor=redactor,
                 )
-                model_structured = parse_model_structured_output(case, model_output, redactor)
+                model_structured = parse_model_structured_output(
+                    case, model_output, redactor
+                )
                 document = load_evidence_document(home, thread_id)
                 retention = verify_receipt(
                     case,
@@ -1699,10 +1703,13 @@ def main() -> int:
                 )
                 passed += 1
 
-        print(f"PASS integrated provider evidence smoke: {passed}/6 cases")
+        print(f"PASS integrated provider evidence smoke: {passed}/4 cases")
         return 0
     except Exception as exc:  # noqa: BLE001 - one redacted, nonzero smoke report
-        print(f"FAIL integrated provider evidence smoke: {redactor.text(exc)}", file=sys.stderr)
+        print(
+            f"FAIL integrated provider evidence smoke: {redactor.text(exc)}",
+            file=sys.stderr,
+        )
         return 1
     finally:
         server.shutdown()
@@ -1712,7 +1719,10 @@ def main() -> int:
             try:
                 cleanup_temp_processes(temp_root, cleanup_env)
             except Exception as exc:  # noqa: BLE001 - cleanup must not expose paths
-                print(f"FAIL temporary process cleanup: {redactor.text(exc)}", file=sys.stderr)
+                print(
+                    f"FAIL temporary process cleanup: {redactor.text(exc)}",
+                    file=sys.stderr,
+                )
         temp_directory.cleanup()
 
 

@@ -1396,11 +1396,13 @@ async fn encoded_command_policy_reason_uses_plain_safety_command() {
     let manager = ExecPolicyManager::new(Arc::new(parser.build()));
     let encoded = vec![
         "pwsh".to_string(),
+        "-NoProfile".to_string(),
         "-EncodedCommand".to_string(),
         "ZwBpAHQAIABzAHQAYQB0AHUAcwA=".to_string(),
     ];
     let inspectable = vec![
         "pwsh".to_string(),
+        "-NoProfile".to_string(),
         "-Command".to_string(),
         "git status".to_string(),
     ];

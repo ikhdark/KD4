@@ -19,6 +19,7 @@ use codex_agent_task_store::StoreResult;
 use codex_agent_task_store::TaskActor;
 use codex_agent_task_store::ValidationCall;
 use codex_agent_task_store::ValidationCallStatus;
+use codex_agent_task_store::ValidationProofKind;
 use codex_otel::SessionTelemetry;
 use codex_protocol::AgentPath;
 use codex_protocol::protocol::SessionSource;
@@ -36,6 +37,16 @@ use super::task_metrics::TaskMetricRuntime;
 use super::task_metrics::terminal_metrics_ready;
 
 const MAX_RESTART_BINDINGS: usize = 256;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FocusedValidationToken {
+    assignment_id: AssignmentId,
+    attempt_id: codex_agent_task_store::AttemptId,
+    call_id: String,
+    command_summary: String,
+    resolved_executable: String,
+}
+
 #[derive(Default)]
 struct BindingIndex {
     by_agent_path: HashMap<String, AgentTaskBinding>,
@@ -226,26 +237,64 @@ impl AgentTaskCoordinator {
         Ok(binding)
     }
 
-    pub(crate) async fn record_validation_call_for_source(
+    pub(crate) async fn begin_focused_validation_for_source(
         &self,
         session_source: &SessionSource,
         call_id: String,
         command_summary: String,
-        status: ValidationCallStatus,
-    ) -> StoreResult<bool> {
+        resolved_executable: String,
+    ) -> StoreResult<Option<FocusedValidationToken>> {
         let Some(binding) = self.binding_for_source(session_source) else {
-            return Ok(false);
+            return Ok(None);
+        };
+        let token = FocusedValidationToken {
+            assignment_id: binding.assignment_id,
+            attempt_id: binding.attempt_id,
+            call_id,
+            command_summary,
+            resolved_executable,
         };
         self.required_store()?
             .record_validation_call(ValidationCall {
-                call_id,
-                attempt_id: binding.attempt_id,
-                command_summary,
+                call_id: token.call_id.clone(),
+                attempt_id: token.attempt_id,
+                command_summary: token.command_summary.clone(),
+                resolved_executable: Some(token.resolved_executable.clone()),
+                proof_kind: ValidationProofKind::Focused,
+                status: ValidationCallStatus::Running,
+                recorded_at: Utc::now(),
+            })
+            .await?;
+        Ok(Some(token))
+    }
+
+    pub(crate) async fn finish_focused_validation(
+        &self,
+        token: FocusedValidationToken,
+        status: ValidationCallStatus,
+    ) -> StoreResult<()> {
+        if !status.is_terminal() {
+            return Err(StoreError::InvalidAssignment(
+                "focused validation finish requires a terminal status".to_string(),
+            ));
+        }
+        let store = self.required_store()?;
+        let task = store.get_agent_task(token.assignment_id, Some(0)).await?;
+        if task.current_attempt.attempt_id != token.attempt_id {
+            return Err(StoreError::AttemptNotActive(token.attempt_id));
+        }
+        store
+            .record_validation_call(ValidationCall {
+                call_id: token.call_id,
+                attempt_id: token.attempt_id,
+                command_summary: token.command_summary,
+                resolved_executable: Some(token.resolved_executable),
+                proof_kind: ValidationProofKind::Focused,
                 status,
                 recorded_at: Utc::now(),
             })
             .await?;
-        Ok(true)
+        Ok(())
     }
 
     pub(crate) fn record_task_usage_for_source(

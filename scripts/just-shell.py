@@ -8,10 +8,14 @@ portable placeholder, `{args}`, for forwarding variadic recipe arguments.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+from decimal import Decimal
+from decimal import InvalidOperation
 from hashlib import sha256
 from collections.abc import Callable
 from collections.abc import Mapping
@@ -95,7 +99,6 @@ def rust_tool_env(
     *,
     os_name: str,
     which: Callable[[str], str | None],
-    can_run: Callable[[list[str]], bool] | None = None,
     cache_dir: Path | None = None,
     repo_root: Path | None = None,
     platform_name: str | None = None,
@@ -210,9 +213,49 @@ def sccache_cache_size(env: Mapping[str, str]) -> str:
 
 
 def expected_sccache_stats_cache_size(value: str) -> str:
-    if value.endswith("G") and value[:-1].isdigit():
-        return f"{value[:-1]} GiB"
-    return value
+    match = re.fullmatch(
+        r"\s*(\d+(?:\.\d+)?)\s*([KMGTPE])(?:i?B)?\s*", value, re.IGNORECASE
+    )
+    if match is None:
+        return value.strip()
+    amount, unit = match.groups()
+    return f"{amount} {unit.upper()}iB"
+
+
+def sccache_cache_size_bytes(value: str) -> int | None:
+    match = re.fullmatch(
+        r"\s*(\d+(?:\.\d+)?)\s*([KMGTPE]?)(?:i?B)?\s*",
+        value,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    amount, unit = match.groups()
+    multipliers = {
+        "": 1,
+        "K": 1024,
+        "M": 1024**2,
+        "G": 1024**3,
+        "T": 1024**4,
+        "P": 1024**5,
+        "E": 1024**6,
+    }
+    try:
+        size = Decimal(amount) * multipliers[unit.upper()]
+    except InvalidOperation:
+        return None
+    if size != size.to_integral_value() or size > 2**63 - 1:
+        return None
+    return int(size)
+
+
+def sccache_cache_sizes_match(configured: str, reported: str) -> bool:
+    configured_bytes = sccache_cache_size_bytes(configured)
+    reported_bytes = sccache_cache_size_bytes(reported)
+    if configured_bytes is None or reported_bytes is None:
+        # Unknown formats must not bounce a shared server on every recipe run.
+        return True
+    return configured_bytes == reported_bytes
 
 
 def sccache_stats_max_cache_size(stdout: str) -> str | None:
@@ -260,7 +303,7 @@ def ensure_sccache_server_env(
     actual_cache_size = sccache_stats_max_cache_size(stats.stdout)
     if actual_cache_size is None:
         return False
-    if actual_cache_size == expected_sccache_stats_cache_size(cache_size):
+    if sccache_cache_sizes_match(cache_size, actual_cache_size):
         write_cached_tool_run(cache_key, cache_dir, True)
         return False
 
@@ -296,9 +339,12 @@ def ensure_sccache_server_env(
         )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    if verified.returncode != 0 or sccache_stats_max_cache_size(
-        verified.stdout
-    ) != expected_sccache_stats_cache_size(cache_size):
+    verified_cache_size = sccache_stats_max_cache_size(verified.stdout)
+    if (
+        verified.returncode != 0
+        or verified_cache_size is None
+        or not sccache_cache_sizes_match(cache_size, verified_cache_size)
+    ):
         return False
     write_cached_tool_run(cache_key, cache_dir, True)
     return True
@@ -408,10 +454,9 @@ def cached_tool_runs(command: list[str], *, cache_dir: Path | None = None) -> bo
     result = tool_runs(command)
     if result is None:
         # A timeout/launch failure is transient (machine under load, AV
-        # rescan); do not poison the 1-hour cache with "fail", which would
-        # brick every Windows recipe with a misleading version error.
-        TOOL_RUN_RESULTS[key] = False
-        return False
+        # rescan). Let the real invocation proceed and report its own error if
+        # the tool is actually unusable; do not cache an inconclusive probe.
+        return True
     TOOL_RUN_RESULTS[key] = result
     write_cached_tool_run(command, cache_dir, result)
     return result
@@ -495,13 +540,30 @@ def write_cached_tool_run(
 ) -> None:
     if cache_dir is None:
         return
+    temporary_path: Path | None = None
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        tool_run_cache_path(command, cache_dir).write_text(
-            "ok" if result else "fail", encoding="utf-8"
-        )
+        destination = tool_run_cache_path(command, cache_dir)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=cache_dir,
+            prefix=f".{destination.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary.write("ok" if result else "fail")
+            temporary_path = Path(temporary.name)
+        os.replace(temporary_path, destination)
+        temporary_path = None
     except OSError:
         return
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
 
 
 def warn_once(

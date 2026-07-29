@@ -1,3 +1,4 @@
+use crate::agent::task_capabilities::validate_independent_review_stdin;
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -71,6 +72,8 @@ impl WriteStdinHandler {
         };
 
         let args: WriteStdinArgs = parse_arguments(&arguments)?;
+        validate_independent_review_stdin(&turn.session_source, &args.chars)
+            .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
         let mut response = session
             .services
             .unified_exec_manager

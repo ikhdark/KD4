@@ -28,12 +28,38 @@ function Set-CodexRustSccacheEnvironment {
     $env:SCCACHE_CACHE_SIZE = Get-CodexRustSccacheCacheSize
 }
 
-function Get-CodexRustSccacheExpectedStatsCacheSize {
-    $cacheSize = Get-CodexRustSccacheCacheSize
-    if ($cacheSize -match "^(\d+)G$") {
-        return "$($matches[1]) GiB"
+function ConvertTo-CodexRustByteSize {
+    param(
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value) -or $Value -notmatch "^\s*(\d+(?:\.\d+)?)\s*([KMGTPE]?)(?:i?B)?\s*$") {
+        return $null
     }
-    return $cacheSize
+
+    $number = [decimal]0
+    if (-not [decimal]::TryParse(
+            $matches[1],
+            [Globalization.NumberStyles]::AllowDecimalPoint,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [ref]$number
+        )) {
+        return $null
+    }
+    $multipliers = @{
+        "" = [decimal]1
+        "K" = [decimal]1024
+        "M" = [decimal]1048576
+        "G" = [decimal]1073741824
+        "T" = [decimal]1099511627776
+        "P" = [decimal]1125899906842624
+        "E" = [decimal]1152921504606846976
+    }
+    $bytes = $number * $multipliers[$matches[2].ToUpperInvariant()]
+    if ($bytes -ne [decimal]::Truncate($bytes) -or $bytes -gt [int64]::MaxValue) {
+        return $null
+    }
+    return [int64]$bytes
 }
 
 function Get-CodexRustSccacheStatsMaxCacheSize {
@@ -58,7 +84,13 @@ function Test-CodexRustSccacheStatsCacheSize {
     if ($null -eq $actual) {
         return $true
     }
-    return $actual -eq (Get-CodexRustSccacheExpectedStatsCacheSize)
+    $expectedBytes = ConvertTo-CodexRustByteSize -Value (Get-CodexRustSccacheCacheSize)
+    $actualBytes = ConvertTo-CodexRustByteSize -Value $actual
+    if ($null -eq $expectedBytes -or $null -eq $actualBytes) {
+        # Unknown formats should not bounce a shared server on every lane run.
+        return $true
+    }
+    return $actualBytes -eq $expectedBytes
 }
 
 function Ensure-CodexRustSccacheServer {
@@ -181,7 +213,7 @@ function Get-CargoSubcommandIndex {
         }
 
         $optionName = ($arg -split "=", 2)[0]
-        if ($globalOptionsWithValue -contains $optionName -and $arg -notmatch "=") {
+        if ($globalOptionsWithValue -ccontains $optionName -and $arg -notmatch "=") {
             $index += 2
         }
         else {

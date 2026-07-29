@@ -47,12 +47,6 @@ def exclusive_file_lock(lock_path: Path):
     while fd is None:
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(
-                fd,
-                f"pid={os.getpid()} thread={threading.get_ident()}\n".encode("utf-8"),
-            )
-            stat_result = os.fstat(fd)
-            lock_identity = (stat_result.st_dev, stat_result.st_ino)
         except FileExistsError:
             try:
                 lock_stat = lock_path.stat()
@@ -70,6 +64,40 @@ def exclusive_file_lock(lock_path: Path):
                 # open raises PermissionError — keep waiting, don't crash.
                 pass
             time.sleep(LOCK_POLL_SECONDS)
+            continue
+
+        try:
+            stat_result = os.fstat(fd)
+            lock_identity = (stat_result.st_dev, stat_result.st_ino)
+            payload = f"pid={os.getpid()} thread={threading.get_ident()}\n".encode(
+                "utf-8"
+            )
+            if os.write(fd, payload) != len(payload):
+                raise OSError(f"short write while initializing lock {lock_path}")
+        except BaseException as exc:
+            cleanup_error: OSError | None = None
+            try:
+                os.close(fd)
+            except OSError as close_error:
+                cleanup_error = close_error
+            finally:
+                fd = None
+            try:
+                lock_stat = lock_path.stat()
+                if lock_identity is None or lock_identity == (
+                    lock_stat.st_dev,
+                    lock_stat.st_ino,
+                ):
+                    lock_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as unlink_error:
+                cleanup_error = cleanup_error or unlink_error
+            if cleanup_error is not None:
+                raise RuntimeError(
+                    f"failed to clean up uninitialized lock {lock_path}: {cleanup_error}"
+                ) from exc
+            raise
 
     try:
         yield
@@ -120,7 +148,9 @@ def process_is_running(pid: int) -> bool:
 def worker_count_for(item_count: int, requested: int | None = None) -> int:
     item_count = max(1, item_count)
     if requested is not None:
-        return max(1, min(item_count, requested))
+        if requested <= 0:
+            raise ValueError("requested worker count must be > 0")
+        return min(item_count, requested)
     return min(item_count, max(1, (os.cpu_count() or 1)))
 
 
@@ -426,9 +456,14 @@ def extract_zstd_archive(archive_path: Path, dest: Path) -> None:
 
     temp_path = dest.parent / f".{dest.name}.{uuid.uuid4().hex}.tmp"
     try:
-        subprocess.check_call(
-            ["zstd", "-f", "-d", str(archive_path), "-o", str(temp_path)]
-        )
+        try:
+            subprocess.check_call(
+                ["zstd", "-f", "-d", str(archive_path), "-o", str(temp_path)]
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError(
+                "zstd is required to extract native npm artifacts; install it and retry"
+            ) from exc
         temp_path.replace(dest)
     finally:
         temp_path.unlink(missing_ok=True)

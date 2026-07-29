@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import contextlib
+import io
 import json
 import importlib.util
 from pathlib import Path
@@ -254,37 +256,41 @@ class BuildToolingPolicyTest(unittest.TestCase):
             if "__pycache__" not in path.parts and ".venv" not in path.parts
         )
 
-        self.assertEqual(root_maintenance.PYTHON_RUFF_TARGETS, expected_ruff_targets)
         self.assertEqual(
-            root_maintenance.PYTHON_UNITTEST_TARGETS, expected_unittest_targets
+            root_maintenance.python_source_targets(), expected_ruff_targets
         )
         self.assertEqual(
-            root_maintenance.python_test_targets(["scripts.test_verify_local"], []),
-            ["scripts.test_verify_local"],
+            root_maintenance.python_unittest_targets(), expected_unittest_targets
         )
         self.assertEqual(
-            root_maintenance.python_test_targets([], ["scripts/verify_local.py"]),
-            ["scripts.test_verify_local"],
+            root_maintenance.python_test_targets(
+                ["scripts.test_build_tooling_policy"], []
+            ),
+            ["scripts.test_build_tooling_policy"],
+        )
+        self.assertEqual(
+            root_maintenance.python_test_targets([], ["scripts/root_maintenance.py"]),
+            ["scripts.test_build_tooling_policy"],
         )
         with mock.patch.object(
             root_maintenance,
             "git_changed_paths",
-            return_value=["scripts/verify_local.py", "docs/example.md"],
+            return_value=["scripts/root_maintenance.py", "docs/example.md"],
         ):
             self.assertEqual(
                 root_maintenance.expand_changed_paths([None]),
-                ["scripts/verify_local.py", "docs/example.md"],
+                ["scripts/root_maintenance.py", "docs/example.md"],
             )
         with mock.patch.object(
             root_maintenance,
             "git_changed_paths",
-            return_value=["scripts/verify_local.py"],
+            return_value=["scripts/root_maintenance.py"],
         ):
             self.assertEqual(
                 root_maintenance.python_test_targets(
                     [], root_maintenance.expand_changed_paths([None])
                 ),
-                ["scripts.test_verify_local"],
+                ["scripts.test_build_tooling_policy"],
             )
         self.assertEqual(
             root_maintenance.test_module_for_changed_path("docs/example.md"),
@@ -315,6 +321,16 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 "scripts.test_publish_local_codex_freshness",
             ),
         )
+        self.assertEqual(root_maintenance.python_lint_targets(["docs/example.md"]), [])
+        self.assertEqual(
+            root_maintenance.python_test_targets([], ["docs/example.md"]), []
+        )
+        self.assertEqual(
+            root_maintenance.test_modules_for_changed_path(
+                "Scripts/Test_Asciicheck.PY"
+            ),
+            ("scripts.test_asciicheck",),
+        )
 
     def test_root_maintenance_script_audit_plan_covers_every_script_type(self) -> None:
         root_maintenance = load_root_maintenance_module()
@@ -339,11 +355,8 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("shell syntax", labels)
         javascript_targets = [
             target
-            for target in root_maintenance.SCRIPT_AUDIT_TARGETS
-            if root_maintenance.script_kind_for_path(
-                root_maintenance.REPO_ROOT / target
-            )
-            == "javascript"
+            for target, kind in root_maintenance.script_kind_map().items()
+            if kind == "javascript"
         ]
         self.assertEqual(
             any(label.startswith("JavaScript syntax:") for label in labels),
@@ -363,6 +376,20 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 "scripts/rust_build_status.py"
             ),
             ("scripts.test_build_tooling_storage",),
+        )
+        shell_command = dict(commands)["shell syntax"]
+        self.assertIn("-c", shell_command)
+        self.assertNotIn("-lc", shell_command)
+        self.assertIn("$'s/\\r$//'", shell_command[-1])
+
+        commands_without_tests, _missing = root_maintenance.script_audit_commands(
+            include_tests=True,
+            test_targets=[],
+            resolve_tool=tools.get,
+        )
+        self.assertNotIn(
+            "script unit tests",
+            [label for label, _command in commands_without_tests],
         )
 
     def test_root_maintenance_script_audit_current_tree_has_no_hard_findings(
@@ -396,15 +423,21 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
     def test_root_maintenance_git_paths_use_nul_delimiters(self) -> None:
         root_maintenance = load_root_maintenance_module()
-        completed = subprocess.CompletedProcess(
+        tracked = subprocess.CompletedProcess(
             ["git"],
             0,
-            stdout="scripts/line\nbreak.py\0scripts/ trailing .py\0",
+            stdout="scripts/line\nbreak.py\0",
+            stderr="",
+        )
+        untracked = subprocess.CompletedProcess(
+            ["git"],
+            0,
+            stdout="scripts/ trailing .py\0",
             stderr="",
         )
 
         with mock.patch.object(
-            root_maintenance.subprocess, "run", return_value=completed
+            root_maintenance.subprocess, "run", side_effect=[tracked, untracked]
         ) as run:
             paths = root_maintenance.git_changed_paths()
 
@@ -412,7 +445,54 @@ class BuildToolingPolicyTest(unittest.TestCase):
             paths,
             ["scripts/line\nbreak.py", "scripts/ trailing .py"],
         )
-        self.assertIn("-z", run.call_args.args[0])
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("-z", run.call_args_list[0].args[0])
+        self.assertIn("--others", run.call_args_list[1].args[0])
+
+    def test_root_maintenance_empty_changed_selection_is_a_noop(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+
+        with (
+            mock.patch.object(root_maintenance, "git_changed_paths", return_value=[]),
+            mock.patch.object(root_maintenance, "run") as run,
+        ):
+            self.assertEqual(
+                root_maintenance.main(["format-python", "--write", "--changed"]), 0
+            )
+            self.assertEqual(root_maintenance.main(["test-python", "--changed"]), 0)
+
+        run.assert_not_called()
+
+    def test_root_maintenance_prettier_does_not_scan_script_inventory(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+
+        with (
+            mock.patch.object(
+                root_maintenance,
+                "script_inventory",
+                side_effect=AssertionError("unexpected script scan"),
+            ),
+            mock.patch.object(root_maintenance, "run", return_value=0) as run,
+        ):
+            self.assertEqual(root_maintenance.main(["format-prettier"]), 0)
+
+        run.assert_called_once()
+
+    def test_root_maintenance_missing_command_is_reported(self) -> None:
+        root_maintenance = load_root_maintenance_module()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(
+                root_maintenance.subprocess,
+                "run",
+                side_effect=FileNotFoundError("missing"),
+            ),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(root_maintenance.run(["missing-tool"]), 127)
+
+        self.assertIn("Could not run missing-tool", stderr.getvalue())
 
     def test_root_maintenance_uv_commands_use_frozen_lock(self) -> None:
         root_maintenance = load_root_maintenance_module()
@@ -425,19 +505,19 @@ class BuildToolingPolicyTest(unittest.TestCase):
         with mock.patch.object(root_maintenance, "run", side_effect=fake_run):
             self.assertEqual(
                 root_maintenance.main(
-                    ["format-python", "--changed", "scripts/verify_local.py"]
+                    ["format-python", "--changed", "scripts/root_maintenance.py"]
                 ),
                 0,
             )
             self.assertEqual(
                 root_maintenance.main(
-                    ["lint-python", "--changed", "scripts/verify_local.py"]
+                    ["lint-python", "--changed", "scripts/root_maintenance.py"]
                 ),
                 0,
             )
             self.assertEqual(
                 root_maintenance.main(
-                    ["test-python", "--module", "scripts.test_verify_local"]
+                    ["test-python", "--module", "scripts.test_build_tooling_policy"]
                 ),
                 0,
             )
@@ -542,6 +622,44 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 )
             )
 
+    def test_rust_package_search_reuses_cached_ancestor(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            package_root = repo_root / "codex-rs" / "crate"
+            nested = package_root / "src" / "nested"
+            nested.mkdir(parents=True)
+            cache = {package_root: package_root}
+
+            self.assertEqual(
+                rust_packages.nearest_package_root(
+                    nested,
+                    repo_root=repo_root,
+                    package_root_cache=cache,
+                ),
+                package_root,
+            )
+            self.assertEqual(cache[nested], package_root)
+
+    def test_rust_package_search_skips_virtual_workspace_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            codex_rs_root = repo_root / "codex-rs"
+            source = codex_rs_root / "workspace-file.rs"
+            codex_rs_root.mkdir()
+            (codex_rs_root / "Cargo.toml").write_text(
+                '[workspace]\nmembers = ["crate"]\n',
+                encoding="utf-8",
+            )
+            source.write_text("", encoding="utf-8")
+
+            self.assertIsNone(
+                rust_packages.nearest_package_root(
+                    source,
+                    repo_root=repo_root,
+                    assume_file=True,
+                )
+            )
+
     def test_formatter_group_decodes_command_output_as_utf8(self) -> None:
         format_script = load_format_module()
         group = format_script.FormatterGroup(
@@ -612,13 +730,9 @@ class BuildToolingPolicyTest(unittest.TestCase):
 
     def test_dependency_policy_gate_runs_offline_cargo_deny(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
-        rules = (REPO_ROOT / "scripts" / "verify_local_rules.toml").read_text(
-            encoding="utf-8"
-        )
 
         self.assertIn("cargo deny check bans sources licenses", justfile)
         self.assertIn("cargo tree -d --workspace --target all", justfile)
-        self.assertIn('validation_command = ["just", "deps-policy-check"]', rules)
 
     def test_unix_lane_recipes_mirror_windows_focused_lanes(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")

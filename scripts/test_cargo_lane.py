@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import os
+import stat
 import shutil
 import subprocess
 import sys
@@ -12,11 +13,16 @@ import unittest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "cargo-lane.ps1"
+CLEANUP_SCRIPT = REPO_ROOT / "scripts" / "cargo-lane-trash-cleanup.ps1"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def powershell() -> str | None:
     return shutil.which("pwsh") or shutil.which("powershell")
+
+
+def ps_single_quote(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 @unittest.skipUnless(os.name == "nt", "cargo-lane is Windows-only")
@@ -94,6 +100,134 @@ class CargoLaneTest(unittest.TestCase):
             timestamp = time.time() - (days_old * 24 * 60 * 60)
             os.utime(path, (timestamp, timestamp))
         return path
+
+    def test_rejects_command_mistaken_for_positional_lane(self) -> None:
+        result = self.run_fake_cargo("cargo", "check")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("looks like a command", result.stderr)
+        self.assertIn("-Lane <name>", result.stderr)
+
+    def test_lane_option_rejects_another_option_as_its_value(self) -> None:
+        result = self.run_script("-Lane", "-Fetch")
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not start with '-'", result.stderr)
+
+    def test_missing_python_does_not_block_lane_command(self) -> None:
+        lane = f"unit-no-python-{os.getpid()}"
+        fake_bin = self.fake_cargo_bin()
+        path_without_python = (
+            f"{fake_bin}{os.pathsep}{os.environ['SystemRoot']}\\System32"
+        )
+
+        result = self.run_script(
+            "-Lane",
+            lane,
+            "cargo",
+            "check",
+            extra_env={
+                "PATH": path_without_python,
+                "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "0",
+            },
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("cargo-args:check --target-dir", result.stdout)
+        self.assertIn("python executable was not found", result.stdout + result.stderr)
+
+    def test_explicit_busy_lane_reports_effective_suffix(self) -> None:
+        lane = f"unit-explicit-busy-{os.getpid()}"
+
+        result = self.run_fake_cargo(
+            "-Lane",
+            lane,
+            "cargo",
+            "check",
+            extra_env={"CODEX_CARGO_LANE_ACTIVE_NAMES": lane},
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        warning_output = result.stdout + result.stderr
+        self.assertIn(f"'{lane}' is busy", warning_output)
+        self.assertIn(f"'{lane}-2'", warning_output)
+        self.assertIn(f"--target-dir {self.lane_path(f'{lane}-2')}", result.stdout)
+
+    def test_relative_lanes_root_follows_powershell_location(self) -> None:
+        relative_root = "relative-lanes"
+        command = (
+            f"Set-Location {ps_single_quote(self.temp_root)}; "
+            f"& {ps_single_quote(SCRIPT)} -LanesRoot {relative_root} "
+            "-Lane relative cmd.exe /d /c echo ok"
+        )
+        env = os.environ.copy()
+        env["CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE"] = "1"
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=30,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertTrue((self.temp_root / relative_root / "relative").is_dir())
+
+    def test_cleanup_relative_root_follows_powershell_location(self) -> None:
+        relative_root = self.temp_root / "cleanup-lanes"
+        trash = relative_root / "old.trash-20260728123456789"
+        trash.mkdir(parents=True)
+        command = (
+            f"Set-Location {ps_single_quote(self.temp_root)}; "
+            f"& {ps_single_quote(CLEANUP_SCRIPT)} -LanesRoot cleanup-lanes "
+            "-MaxPasses 1 -RetryDelaySeconds 0"
+        )
+
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=30,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertFalse(trash.exists())
 
     def hold_lane_lock(
         self,
@@ -252,6 +386,24 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn(f"--target-dir {explicit_target}", result.stdout)
         self.assertNotIn(str(self.lanes_root), result.stdout)
 
+    def test_lowercase_c_is_not_treated_as_value_taking_uppercase_option(self) -> None:
+        lane = f"unit-lower-c-{os.getpid()}"
+
+        result = self.run_fake_cargo(
+            "-Lane",
+            lane,
+            "cargo",
+            "-c",
+            "check",
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn(f"check --target-dir {self.lane_path(lane)}", result.stdout)
+
     def test_existing_equals_cargo_target_dir_is_not_duplicated(self) -> None:
         package = f"unit-explicit-equals-target-{os.getpid()}"
         explicit_target = "explicit-equals-target"
@@ -359,6 +511,31 @@ class CargoLaneTest(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 lock_process.kill()
                 lock_process.wait(timeout=5)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn(f"--target-dir {self.lane_path(f'{package}-2')}", result.stdout)
+
+    def test_auto_lane_treats_read_only_lock_as_busy(self) -> None:
+        package = f"unit-core-readonly-{os.getpid()}"
+        lane = self.make_lane(package)
+        lock_path = lane / ".cargo-lock"
+        lock_path.write_text("stale", encoding="utf-8")
+        lock_path.chmod(stat.S_IREAD)
+        try:
+            result = self.run_fake_cargo(
+                "-Lane",
+                "auto",
+                "cargo",
+                "check",
+                "-p",
+                package,
+            )
+        finally:
+            lock_path.chmod(stat.S_IWRITE)
 
         self.assertEqual(
             result.returncode,

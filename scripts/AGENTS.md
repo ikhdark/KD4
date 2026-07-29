@@ -39,7 +39,7 @@ Use this section first. Read [`../SOURCEMAP.md`](../SOURCEMAP.md) only when the
 owner crosses script/package boundaries or remains ambiguous.
 
 - Local Codex binary publish/replacement proof: `publish-local-codex.ps1`,
-  `publish-local-codex.hashing.ps1`, `test_publish_local_codex.py`.
+  `test_publish_local_codex.py`.
 - Rust lanes, target cleanup, and build diagnostics: `cargo-lane.ps1`,
   `cargo-lane-trash-cleanup.ps1`, `rust_build_status.py`, `common-rust-env.ps1`,
   `invoke-rust-perf-env.ps1`, `sccache-perf.ps1`.
@@ -59,11 +59,10 @@ owner crosses script/package boundaries or remains ambiguous.
 
 ## High-Risk Surfaces
 
-- Publish scripts must preserve dry-run, backup, rollback, doctor,
+- The publish script must preserve dry-run, backup, rollback, doctor,
   hash/version proof, process detection, process-closing protections, and the
-  optimized `release` profile for final `just publish-local-codex-final` proof.
-  Use `local-release` and `-BuildOnly` only to warm or iterate without replacing
-  the installed binary.
+  optimized `release` profile for the sole public publish recipe,
+  `just publish-local-codex-final`.
 - Cargo lane scripts must preserve stop-parsing, argument forwarding, isolated
   target directories, and active-process checks before cleanup.
 - Package staging must keep generated package layout aligned with

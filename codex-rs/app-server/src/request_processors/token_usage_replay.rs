@@ -12,7 +12,6 @@
 use std::sync::Arc;
 
 use codex_app_server_protocol::ServerNotification;
-use codex_app_server_protocol::Thread;
 use codex_app_server_protocol::ThreadHistoryBuilder;
 use codex_app_server_protocol::ThreadTokenUsage;
 use codex_app_server_protocol::ThreadTokenUsageUpdatedNotification;
@@ -22,6 +21,8 @@ use codex_core::CodexThread;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::RolloutItem;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_rollout::is_persisted_rollout_item;
 
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingMessageSender;
@@ -37,16 +38,15 @@ pub(super) async fn send_thread_token_usage_update_to_connection(
     outgoing: &Arc<OutgoingMessageSender>,
     connection_id: ConnectionId,
     thread_id: ThreadId,
-    thread: &Thread,
     conversation: &CodexThread,
-    token_usage_turn_id: Option<String>,
+    token_usage_turn_id: String,
 ) {
     let Some(info) = conversation.token_usage_info().await else {
         return;
     };
     let notification = ThreadTokenUsageUpdatedNotification {
         thread_id: thread_id.to_string(),
-        turn_id: token_usage_turn_id.unwrap_or_else(|| latest_token_usage_turn_id(thread)),
+        turn_id: token_usage_turn_id,
         token_usage: ThreadTokenUsage::from(info),
     };
     outgoing
@@ -66,35 +66,55 @@ struct TokenUsageTurnOwner {
     position: Option<usize>,
 }
 
-pub(super) fn latest_token_usage_turn_id_from_rollout_items(
+#[derive(Default)]
+pub(super) struct TokenUsageReplay {
+    turn_owner: Option<TokenUsageTurnOwner>,
+}
+
+impl TokenUsageReplay {
+    fn observe_rollout_item(&mut self, builder: &ThreadHistoryBuilder, item: &RolloutItem) {
+        if matches!(item, RolloutItem::EventMsg(EventMsg::TokenCount(_))) {
+            self.turn_owner = builder.active_turn_id().map(|id| TokenUsageTurnOwner {
+                id: id.to_string(),
+                position: builder.active_turn_position(),
+            });
+        }
+    }
+
+    pub(super) fn into_turn_id(self, turns: &[Turn]) -> String {
+        self.turn_owner
+            .and_then(|owner| owner.resolve(turns))
+            .unwrap_or_else(|| latest_token_usage_turn_id(turns))
+    }
+}
+
+impl TokenUsageTurnOwner {
+    fn resolve(self, turns: &[Turn]) -> Option<String> {
+        let positional_turn = self.position.and_then(|position| turns.get(position));
+        if positional_turn.is_some_and(|turn| turn.id == self.id) {
+            return Some(self.id);
+        }
+        if turns.iter().any(|turn| turn.id == self.id) {
+            return Some(self.id);
+        }
+        positional_turn.map(|turn| turn.id.clone())
+    }
+}
+
+pub(super) fn build_turns_with_token_usage_replay(
     rollout_items: &[RolloutItem],
-    turns: &[Turn],
-) -> Option<String> {
+) -> (Vec<Turn>, TokenUsageReplay) {
     let mut builder = ThreadHistoryBuilder::new();
-    let mut token_usage_turn_owner = None;
+    let mut token_usage_replay = TokenUsageReplay::default();
 
     for item in rollout_items {
-        if matches!(item, RolloutItem::EventMsg(EventMsg::TokenCount(_))) {
-            token_usage_turn_owner =
-                builder
-                    .active_turn_snapshot()
-                    .map(|turn| TokenUsageTurnOwner {
-                        id: turn.id,
-                        position: builder.active_turn_position(),
-                    });
+        if is_persisted_rollout_item(item, ThreadHistoryMode::Legacy) {
+            token_usage_replay.observe_rollout_item(&builder, item);
+            builder.handle_rollout_item(item);
         }
-        builder.handle_rollout_item(item);
     }
 
-    let owner = token_usage_turn_owner?;
-    if turns.iter().any(|turn| turn.id == owner.id) {
-        Some(owner.id)
-    } else {
-        owner
-            .position
-            .and_then(|position| turns.get(position))
-            .map(|turn| turn.id.clone())
-    }
+    (builder.finish(), token_usage_replay)
 }
 
 /// Chooses a fallback turn id that should own a replayed token usage update.
@@ -102,13 +122,12 @@ pub(super) fn latest_token_usage_turn_id_from_rollout_items(
 /// Normal replay derives the owner from the rollout position of the latest
 /// `TokenCount` event. This fallback only preserves a stable wire shape for
 /// unusual histories where that rollout information cannot be read.
-fn latest_token_usage_turn_id(thread: &Thread) -> String {
-    thread
-        .turns
+fn latest_token_usage_turn_id(turns: &[Turn]) -> String {
+    turns
         .iter()
         .rev()
         .find(|turn| matches!(turn.status, TurnStatus::Completed | TurnStatus::Failed))
-        .or_else(|| thread.turns.last())
+        .or_else(|| turns.last())
         .map(|turn| turn.id.clone())
         .unwrap_or_default()
 }
@@ -116,7 +135,6 @@ fn latest_token_usage_turn_id(thread: &Thread) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codex_app_server_protocol::build_turns_from_rollout_items;
     use codex_protocol::protocol::AgentMessageEvent;
     use codex_protocol::protocol::TokenCountEvent;
     use codex_protocol::protocol::UserMessageEvent;
@@ -125,24 +143,18 @@ mod tests {
     #[test]
     fn replay_attribution_uses_already_loaded_history() {
         let rollout_items = token_usage_history();
-        let turns = build_turns_from_rollout_items(&rollout_items);
+        let (turns, replay) = build_turns_with_token_usage_replay(&rollout_items);
 
-        assert_eq!(
-            latest_token_usage_turn_id_from_rollout_items(&rollout_items, turns.as_slice()),
-            Some(turns[0].id.clone())
-        );
+        assert_eq!(replay.into_turn_id(&turns), turns[0].id);
     }
 
     #[test]
     fn replay_attribution_falls_back_to_rebuilt_turn_position() {
         let rollout_items = token_usage_history();
-        let mut turns = build_turns_from_rollout_items(&rollout_items);
+        let (mut turns, replay) = build_turns_with_token_usage_replay(&rollout_items);
         turns[0].id = "rebuilt-turn-id".to_string();
 
-        assert_eq!(
-            latest_token_usage_turn_id_from_rollout_items(&rollout_items, turns.as_slice()),
-            Some("rebuilt-turn-id".to_string())
-        );
+        assert_eq!(replay.into_turn_id(&turns), "rebuilt-turn-id");
     }
 
     fn token_usage_history() -> Vec<RolloutItem> {

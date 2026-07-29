@@ -82,6 +82,15 @@ fn completed_receipt(validation_call_ids: Vec<String>) -> ReceiptDraft {
     }
 }
 
+fn resolved_test_executable() -> Option<String> {
+    Some(
+        std::fs::canonicalize(std::env::current_exe().expect("current test executable"))
+            .expect("current test executable canonicalizes")
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 fn relation_draft(root_session_id: &str, role: AgentRole, target: AssignmentId) -> AssignmentDraft {
     let (capability_profile, kind) = match role {
         AgentRole::Reviewer => (CapabilityProfile::ReadSearchDiff, RelationKind::Review),
@@ -201,9 +210,11 @@ async fn dependency_validation_returns_every_blocker() {
 #[tokio::test]
 async fn receipts_are_sealed_and_validation_calls_are_attempt_owned() {
     let fixture = Fixture::new().await;
+    let mut first_draft = worker_draft("root", "first");
+    first_draft.required_evidence = vec!["focused test".to_string()];
     let (first, first_attempt) = fixture
         .store
-        .create_assignment(fixture.repo.path(), worker_draft("root", "first"))
+        .create_assignment(fixture.repo.path(), first_draft)
         .await
         .expect("first assignment");
     let (_, second_attempt) = fixture
@@ -217,11 +228,26 @@ async fn receipts_are_sealed_and_validation_calls_are_attempt_owned() {
             call_id: "call-1".to_string(),
             attempt_id: first_attempt.attempt_id,
             command_summary: "focused test".to_string(),
+            resolved_executable: resolved_test_executable(),
+            proof_kind: ValidationProofKind::Focused,
+            status: ValidationCallStatus::Running,
+            recorded_at: Utc::now(),
+        })
+        .await
+        .expect("validation call starts");
+    fixture
+        .store
+        .record_validation_call(ValidationCall {
+            call_id: "call-1".to_string(),
+            attempt_id: first_attempt.attempt_id,
+            command_summary: "focused test".to_string(),
+            resolved_executable: resolved_test_executable(),
+            proof_kind: ValidationProofKind::Focused,
             status: ValidationCallStatus::Succeeded,
             recorded_at: Utc::now(),
         })
         .await
-        .expect("validation call records");
+        .expect("validation call finishes");
     assert!(
         matches!(
             fixture
@@ -264,29 +290,95 @@ async fn receipts_are_sealed_and_validation_calls_are_attempt_owned() {
 #[tokio::test]
 async fn validation_calls_allow_only_running_to_terminal_transitions() {
     let fixture = Fixture::new().await;
+    let mut draft = worker_draft("root", "src");
+    draft.required_evidence = vec!["focused test".to_string()];
     let (_, attempt) = fixture
         .store
-        .create_assignment(fixture.repo.path(), worker_draft("root", "src"))
+        .create_assignment(fixture.repo.path(), draft)
         .await
         .expect("worker assignment");
     let started_at = Utc::now();
+    assert!(matches!(
+        fixture
+            .store
+            .record_validation_call(ValidationCall {
+                call_id: "missing-provenance".to_string(),
+                attempt_id: attempt.attempt_id,
+                command_summary: "focused test".to_string(),
+                resolved_executable: None,
+                proof_kind: ValidationProofKind::Focused,
+                status: ValidationCallStatus::Running,
+                recorded_at: started_at,
+            })
+            .await,
+        Err(StoreError::InvalidAssignment(_))
+    ));
+    assert!(matches!(
+        fixture
+            .store
+            .record_validation_call(ValidationCall {
+                call_id: "missing-start".to_string(),
+                attempt_id: attempt.attempt_id,
+                command_summary: "focused test".to_string(),
+                resolved_executable: resolved_test_executable(),
+                proof_kind: ValidationProofKind::Focused,
+                status: ValidationCallStatus::Succeeded,
+                recorded_at: started_at,
+            })
+            .await,
+        Err(StoreError::ValidationCallImmutable(_))
+    ));
+    assert!(matches!(
+        fixture
+            .store
+            .record_validation_call(ValidationCall {
+                call_id: "wrong-command".to_string(),
+                attempt_id: attempt.attempt_id,
+                command_summary: "cargo test -p other".to_string(),
+                resolved_executable: resolved_test_executable(),
+                proof_kind: ValidationProofKind::Focused,
+                status: ValidationCallStatus::Running,
+                recorded_at: started_at,
+            })
+            .await,
+        Err(StoreError::InvalidAssignment(_))
+    ));
     fixture
         .store
         .record_validation_call(ValidationCall {
             call_id: "transition".to_string(),
             attempt_id: attempt.attempt_id,
             command_summary: "focused test".to_string(),
+            resolved_executable: resolved_test_executable(),
+            proof_kind: ValidationProofKind::Focused,
             status: ValidationCallStatus::Running,
             recorded_at: started_at,
         })
         .await
         .expect("running call records");
+    assert!(matches!(
+        fixture
+            .store
+            .record_validation_call(ValidationCall {
+                call_id: "transition".to_string(),
+                attempt_id: attempt.attempt_id,
+                command_summary: "focused test".to_string(),
+                resolved_executable: resolved_test_executable(),
+                proof_kind: ValidationProofKind::LegacyUnclassified,
+                status: ValidationCallStatus::Succeeded,
+                recorded_at: started_at + Duration::milliseconds(500),
+            })
+            .await,
+        Err(StoreError::ValidationCallImmutable(_))
+    ));
     fixture
         .store
         .record_validation_call(ValidationCall {
             call_id: "transition".to_string(),
             attempt_id: attempt.attempt_id,
             command_summary: "focused test".to_string(),
+            resolved_executable: resolved_test_executable(),
+            proof_kind: ValidationProofKind::Focused,
             status: ValidationCallStatus::Succeeded,
             recorded_at: started_at + Duration::seconds(1),
         })
@@ -299,6 +391,8 @@ async fn validation_calls_allow_only_running_to_terminal_transitions() {
                 call_id: "transition".to_string(),
                 attempt_id: attempt.attempt_id,
                 command_summary: "focused test".to_string(),
+                resolved_executable: resolved_test_executable(),
+                proof_kind: ValidationProofKind::Focused,
                 status: ValidationCallStatus::Failed,
                 recorded_at: started_at + Duration::seconds(2),
             })
@@ -306,27 +400,48 @@ async fn validation_calls_allow_only_running_to_terminal_transitions() {
         Err(StoreError::ValidationCallImmutable(_))
     ));
 
+    for call_id in ["still-running", "failed", "cancelled"] {
+        fixture
+            .store
+            .record_validation_call(ValidationCall {
+                call_id: call_id.to_string(),
+                attempt_id: attempt.attempt_id,
+                command_summary: "focused test".to_string(),
+                resolved_executable: resolved_test_executable(),
+                proof_kind: ValidationProofKind::Focused,
+                status: ValidationCallStatus::Running,
+                recorded_at: started_at + Duration::seconds(3),
+            })
+            .await
+            .expect("additional validation call starts");
+    }
     for (call_id, status) in [
-        ("still-running", ValidationCallStatus::Running),
         ("failed", ValidationCallStatus::Failed),
+        ("cancelled", ValidationCallStatus::Cancelled),
     ] {
         fixture
             .store
             .record_validation_call(ValidationCall {
                 call_id: call_id.to_string(),
                 attempt_id: attempt.attempt_id,
-                command_summary: "additional focused test".to_string(),
+                command_summary: "focused test".to_string(),
+                resolved_executable: resolved_test_executable(),
+                proof_kind: ValidationProofKind::Focused,
                 status,
-                recorded_at: started_at + Duration::seconds(3),
+                recorded_at: started_at + Duration::seconds(4),
             })
             .await
-            .expect("additional validation call records");
+            .expect("additional validation call finishes");
     }
     let error = fixture
         .store
         .submit_agent_receipt(
             attempt.attempt_id,
-            completed_receipt(vec!["still-running".to_string(), "failed".to_string()]),
+            completed_receipt(vec![
+                "still-running".to_string(),
+                "failed".to_string(),
+                "cancelled".to_string(),
+            ]),
         )
         .await
         .expect_err("completed receipt rejects non-successful calls");
@@ -335,7 +450,25 @@ async fn validation_calls_allow_only_running_to_terminal_transitions() {
     };
     assert_eq!(
         call_ids,
-        vec!["still-running".to_string(), "failed".to_string()]
+        vec![
+            "still-running".to_string(),
+            "failed".to_string(),
+            "cancelled".to_string()
+        ]
+    );
+    let task = fixture
+        .store
+        .get_agent_task(attempt.assignment_id, Some(0))
+        .await
+        .expect("validation calls reload");
+    assert_eq!(task.validation_calls.len(), 4);
+    assert_eq!(
+        task.validation_calls
+            .iter()
+            .map(|call| call.call_id.as_str())
+            .collect::<HashSet<_>>()
+            .len(),
+        4
     );
     fixture
         .store
@@ -352,11 +485,101 @@ async fn validation_calls_allow_only_running_to_terminal_transitions() {
                 call_id: "after-seal".to_string(),
                 attempt_id: attempt.attempt_id,
                 command_summary: "too late".to_string(),
+                resolved_executable: resolved_test_executable(),
+                proof_kind: ValidationProofKind::Focused,
                 status: ValidationCallStatus::Succeeded,
                 recorded_at: Utc::now(),
             })
             .await,
         Err(StoreError::AttemptNotActive(_))
+    ));
+}
+
+#[tokio::test]
+async fn focused_validation_start_rejects_unauthorized_roles() {
+    let fixture = Fixture::new().await;
+    let mut draft = worker_draft("root", "src");
+    draft.role = AgentRole::Explorer;
+    draft.capability_profile = CapabilityProfile::ReadSearch;
+    draft.write_scope.clear();
+    draft.required_evidence = vec!["focused test".to_string()];
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .expect("explorer assignment");
+    assert!(matches!(
+        fixture
+            .store
+            .record_validation_call(ValidationCall {
+                call_id: "explorer-validation".to_string(),
+                attempt_id: attempt.attempt_id,
+                command_summary: "focused test".to_string(),
+                resolved_executable: resolved_test_executable(),
+                proof_kind: ValidationProofKind::Focused,
+                status: ValidationCallStatus::Running,
+                recorded_at: Utc::now(),
+            })
+            .await,
+        Err(StoreError::InvalidAssignment(_))
+    ));
+}
+
+#[tokio::test]
+async fn legacy_unclassified_validation_defaults_on_old_json_and_cannot_complete() {
+    let fixture = Fixture::new().await;
+    let mut draft = worker_draft("root", "src");
+    draft.required_evidence = vec!["focused test".to_string()];
+    let (_, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .expect("worker assignment");
+    let focused = ValidationCall {
+        call_id: "legacy".to_string(),
+        attempt_id: attempt.attempt_id,
+        command_summary: "focused test".to_string(),
+        resolved_executable: resolved_test_executable(),
+        proof_kind: ValidationProofKind::Focused,
+        status: ValidationCallStatus::Running,
+        recorded_at: Utc::now(),
+    };
+    let mut old_json = serde_json::to_value(focused).expect("validation call serializes");
+    old_json
+        .as_object_mut()
+        .expect("validation call is an object")
+        .remove("proof_kind");
+    old_json
+        .as_object_mut()
+        .expect("validation call is an object")
+        .remove("resolved_executable");
+    let legacy: ValidationCall =
+        serde_json::from_value(old_json).expect("old validation call JSON remains readable");
+    assert_eq!(legacy.proof_kind, ValidationProofKind::LegacyUnclassified);
+    fixture
+        .store
+        .record_validation_call(legacy.clone())
+        .await
+        .expect("legacy validation call starts");
+    fixture
+        .store
+        .record_validation_call(ValidationCall {
+            status: ValidationCallStatus::Succeeded,
+            recorded_at: legacy.recorded_at + Duration::seconds(1),
+            ..legacy
+        })
+        .await
+        .expect("legacy validation call finishes");
+
+    assert!(matches!(
+        fixture
+            .store
+            .submit_agent_receipt(
+                attempt.attempt_id,
+                completed_receipt(vec!["legacy".to_string()])
+            )
+            .await,
+        Err(StoreError::ValidationCallStatusInvalid { .. })
     ));
 }
 

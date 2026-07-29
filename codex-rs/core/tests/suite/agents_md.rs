@@ -165,7 +165,7 @@ async fn submit_thread_turn(thread: &Arc<codex_core::CodexThread>, prompt: &str)
     Ok(())
 }
 
-fn request_body_contains(request: &wiremock::Request, text: &str) -> bool {
+fn request_body_text(request: &wiremock::Request) -> Option<String> {
     let is_zstd = request
         .headers
         .get("content-encoding")
@@ -181,7 +181,80 @@ fn request_body_contains(request: &wiremock::Request, text: &str) -> bool {
         Some(request.body.clone())
     };
     body.and_then(|body| String::from_utf8(body).ok())
-        .is_some_and(|body| body.contains(text))
+}
+
+fn request_body_contains(request: &wiremock::Request, text: &str) -> bool {
+    request_body_text(request).is_some_and(|body| body.contains(text))
+}
+
+fn request_prompt_cache_key(request: &wiremock::Request) -> Option<String> {
+    request_body_text(request)
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .and_then(|body| body["prompt_cache_key"].as_str().map(str::to_string))
+}
+
+fn has_function_call_output(request: &wiremock::Request, call_id: &str) -> bool {
+    request_body_text(request)
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .and_then(|body| {
+            body.get("input")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some("function_call_output")
+                    && item.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id)
+            })
+        })
+}
+
+fn function_call_output(request: &wiremock::Request, call_id: &str) -> Option<String> {
+    request_body_text(request)
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .and_then(|body| {
+            body.get("input")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .and_then(|items| {
+            items.into_iter().find_map(|item| {
+                (item.get("type").and_then(serde_json::Value::as_str)
+                    == Some("function_call_output")
+                    && item.get("call_id").and_then(serde_json::Value::as_str) == Some(call_id))
+                .then(|| {
+                    item.get("output")
+                        .map(serde_json::Value::to_string)
+                        .unwrap_or_default()
+                })
+            })
+        })
+}
+
+fn request_user_texts(request: &wiremock::Request) -> Vec<String> {
+    request_body_text(request)
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .and_then(|body| {
+            body.get("input")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|item| item.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .filter_map(|item| {
+            item.get("content")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .flatten()
+        .filter_map(|content| {
+            content
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(|text| text.chars().take(80).collect())
+        })
+        .collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -596,16 +669,24 @@ async fn fresh_thread_composes_global_before_project_and_reports_sources() -> Re
     );
     test.submit_turn("second turn").await?;
 
-    // Assert the running thread keeps its original rendering and structured prefix even though
-    // both files at the reported source paths now contain different text.
+    // Assert the running thread keeps its original structured prefix and appends one replacement
+    // fragment after both files at the reported source paths change.
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 2);
     let expected_contents =
         format!("{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{PROJECT_INSTRUCTIONS}");
     let expected_fragment = expected_instruction_fragment(&test.config.cwd, &expected_contents);
+    let replacement_contents = format!(
+        "These AGENTS.md instructions replace all previously provided AGENTS.md instructions.\n\n{GLOBAL_INSTRUCTIONS}\n\n{PROJECT_SEPARATOR}\n\n{NEW_PROJECT_INSTRUCTIONS}"
+    );
+    let replacement_fragment =
+        expected_instruction_fragment(&test.config.cwd, &replacement_contents);
     let fragments = instruction_fragments(&requests[0]);
     assert_eq!(fragments, vec![expected_fragment.clone()]);
-    assert_single_instruction_fragment(&requests[1], &expected_fragment);
+    assert_eq!(
+        instruction_fragments(&requests[1]),
+        vec![expected_fragment.clone(), replacement_fragment]
+    );
     let rendered = fragments
         .into_iter()
         .next()
@@ -1042,22 +1123,9 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
         ]),
     )
     .await;
-    let child_mock = responses::mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| {
-            request_body_contains(request, SPAWN_CHILD_PROMPT)
-                && !request_body_contains(request, SPAWN_CALL_ID)
-        },
-        responses::sse(vec![
-            responses::ev_response_created("child-response"),
-            responses::ev_assistant_message("child-message", "done"),
-            responses::ev_completed("child-response"),
-        ]),
-    )
-    .await;
     responses::mount_sse_once_match(
         &server,
-        |request: &wiremock::Request| request_body_contains(request, SPAWN_CALL_ID),
+        |request: &wiremock::Request| has_function_call_output(request, SPAWN_CALL_ID),
         responses::sse(vec![
             responses::ev_response_created("spawn-follow-up-response"),
             responses::ev_assistant_message("spawn-follow-up-message", "child started"),
@@ -1089,6 +1157,23 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
     );
     test.submit_turn(SPAWN_SEED_PROMPT).await?;
     let seed_request = seed_mock.single_request();
+    let parent_prompt_cache_key = seed_request.body_json()["prompt_cache_key"]
+        .as_str()
+        .expect("parent seed request should carry a prompt cache key")
+        .to_string();
+    let child_mock = responses::mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            request_prompt_cache_key(request)
+                .is_some_and(|cache_key| cache_key != parent_prompt_cache_key)
+        },
+        responses::sse(vec![
+            responses::ev_response_created("child-response"),
+            responses::ev_assistant_message("child-message", "done"),
+            responses::ev_completed("child-response"),
+        ]),
+    )
+    .await;
 
     // Add a preferred override, then spawn a full-history child while observing its thread ID.
     let new_source = write_global_file(
@@ -1106,19 +1191,45 @@ async fn run_subagent_global_instruction_case(fork_context: bool) -> Result<()> 
     let spawn_request = spawn_mock.single_request();
     let child_request = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            if let Some(request) = child_mock.requests().into_iter().find(|request| {
-                request
-                    .message_input_texts("user")
-                    .iter()
-                    .any(|text| text == SPAWN_CHILD_PROMPT)
-            }) {
+            if let Some(request) = child_mock.requests().into_iter().next() {
                 break request;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .map_err(|_| anyhow!("timed out waiting for the subagent request"))?;
+    .await;
+    let child_request = match child_request {
+        Ok(request) => request,
+        Err(_) => {
+            let diagnostics = server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|request| {
+                    let body = request_body_text(&request).unwrap_or_default();
+                    format!(
+                        "path={}, model={:?}, cache_key={:?}, user_texts={:?}, function_output={:?}, spawn_call={}",
+                        request.url.path(),
+                        serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|value| value["model"].as_str().map(str::to_string)),
+                        serde_json::from_str::<serde_json::Value>(&body)
+                            .ok()
+                            .and_then(|value| {
+                                value["prompt_cache_key"].as_str().map(str::to_string)
+                            }),
+                        request_user_texts(&request),
+                        function_call_output(&request, SPAWN_CALL_ID),
+                        body.contains(SPAWN_CALL_ID),
+                    )
+                })
+                .collect::<Vec<_>>();
+            return Err(anyhow!(
+                "timed out waiting for the subagent request; observed requests: {diagnostics:?}"
+            ));
+        }
+    };
 
     // Assert parent and child report and render the parent's creation-time snapshot exactly once.
     let expected_fragment = expected_provider_only_instruction_fragment(OLD_GLOBAL_INSTRUCTIONS);

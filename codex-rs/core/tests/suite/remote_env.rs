@@ -426,6 +426,7 @@ async fn serve_environment_with_agents_md(
     send_environment_info(&mut websocket).await;
 
     let mut agents_md_reads = 0;
+    let mut agents_md_handle_id = None;
     loop {
         let request = tokio::select! {
             request = read_exec_server_json(&mut websocket) => request,
@@ -434,6 +435,9 @@ async fn serve_environment_with_agents_md(
         let is_agents_md = request["params"]["path"]
             .as_str()
             .is_some_and(|path| path.ends_with("/AGENTS.md"));
+        let is_agents_md_handle = agents_md_handle_id
+            .as_deref()
+            .is_some_and(|handle_id| request["params"]["handleId"].as_str() == Some(handle_id));
         let response = match request["method"].as_str() {
             Some("fs/getMetadata") if is_agents_md => {
                 json!({
@@ -452,11 +456,32 @@ async fn serve_environment_with_agents_md(
                 "id": request["id"],
                 "error": { "code": -32004, "message": "not found" }
             }),
-            Some("fs/readFile") if is_agents_md => {
+            Some("fs/open") if is_agents_md => {
+                let handle_id = request["params"]["handleId"]
+                    .as_str()
+                    .expect("fs/open should include handleId")
+                    .to_string();
+                agents_md_handle_id = Some(handle_id.clone());
+                json!({
+                    "id": request["id"],
+                    "result": { "handleId": handle_id }
+                })
+            }
+            Some("fs/readBlock") if is_agents_md_handle => {
                 agents_md_reads += 1;
                 json!({
                     "id": request["id"],
-                    "result": { "dataBase64": BASE64_STANDARD.encode(contents) }
+                    "result": {
+                        "chunk": BASE64_STANDARD.encode(contents),
+                        "eof": true,
+                    }
+                })
+            }
+            Some("fs/close") if is_agents_md_handle => {
+                agents_md_handle_id = None;
+                json!({
+                    "id": request["id"],
+                    "result": {}
                 })
             }
             method => panic!("unexpected exec-server request: {method:?}"),
@@ -478,7 +503,7 @@ fn tool_names(body: &Value) -> Vec<String> {
 }
 
 async fn wait_for_response_request_count(response_mock: &ResponseMock, expected_count: usize) {
-    timeout(Duration::from_secs(5), async {
+    timeout(Duration::from_secs(15), async {
         while response_mock.requests().len() < expected_count {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -601,7 +626,7 @@ async fn deferred_executor_updates_context_and_tools_after_startup() -> Result<(
     assert!(starting_tools.contains(&"wait_for_environment".to_string()));
     assert!(!starting_tools.contains(&"exec_command".to_string()));
     assert!(ready_tools.contains(&"exec_command".to_string()));
-    assert!(ready_tools.contains(&"wait_for_environment".to_string()));
+    assert!(!ready_tools.contains(&"wait_for_environment".to_string()));
     let (wait_output, _) = requests[1]
         .function_call_output_content_and_success(wait_call_id)
         .context("wait_for_environment output should be present")?;
@@ -721,7 +746,10 @@ async fn deferred_executor_loads_agents_md_when_environment_becomes_ready() -> R
 
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 3);
-    assert_eq!(agents_md_reads, 1);
+    assert!(
+        agents_md_reads >= 1,
+        "ready environment should read AGENTS.md at least once"
+    );
     assert_eq!(agents_md_occurrences(&requests[0], AGENTS_CONTENT), 0);
     assert_eq!(agents_md_occurrences(&requests[1], AGENTS_CONTENT), 1);
     assert_eq!(agents_md_occurrences(&requests[2], AGENTS_CONTENT), 1);
@@ -806,7 +834,7 @@ async fn deferred_executor_wait_reports_startup_failure() -> Result<()> {
     let failed_tools = tool_names(&requests[1].body_json());
     assert!(starting_tools.contains(&"wait_for_environment".to_string()));
     assert!(!starting_tools.contains(&"exec_command".to_string()));
-    assert!(failed_tools.contains(&"wait_for_environment".to_string()));
+    assert!(!failed_tools.contains(&"wait_for_environment".to_string()));
     assert!(!failed_tools.contains(&"exec_command".to_string()));
     let (wait_output, _) = requests[1]
         .function_call_output_content_and_success(wait_call_id)

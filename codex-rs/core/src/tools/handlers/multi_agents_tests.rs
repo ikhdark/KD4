@@ -816,6 +816,7 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
                     }],
                     "write_scope": [{"path": risk_path.clone(), "recursive": false}],
                     "risk_hints": [format!("path:{risk_path}")],
+                    "required_evidence": ["focused validation"],
                     "stop_condition": "stop after reporting evidence"
                 }
             })),
@@ -902,18 +903,28 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         .expect("spawned typed agent should have a config snapshot")
         .session_source;
     let validation_call_id = format!("validation-{}", ThreadId::new());
-    assert!(
-        agent_control
-            .task_coordinator()
-            .record_validation_call_for_source(
-                &child_source,
-                validation_call_id.clone(),
-                "focused validation".to_string(),
-                codex_agent_task_store::ValidationCallStatus::Succeeded,
-            )
-            .await
-            .expect("validation call should persist for the bound attempt")
-    );
+    let validation_token = agent_control
+        .task_coordinator()
+        .begin_focused_validation_for_source(
+            &child_source,
+            validation_call_id.clone(),
+            "focused validation".to_string(),
+            std::fs::canonicalize(std::env::current_exe().expect("current test executable"))
+                .expect("current test executable canonicalizes")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .await
+        .expect("validation call should start for the bound attempt")
+        .expect("child source should retain its typed binding");
+    agent_control
+        .task_coordinator()
+        .finish_focused_validation(
+            validation_token,
+            codex_agent_task_store::ValidationCallStatus::Succeeded,
+        )
+        .await
+        .expect("validation call should finish for the same bound attempt");
     let (mut child_session, mut child_turn) = make_session_and_context().await;
     child_session.services.agent_control = agent_control.clone();
     child_session.thread_id = child_thread_id;
@@ -2345,6 +2356,7 @@ async fn multi_agent_v2_list_agents_returns_completed_status_without_encrypted_s
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: child_turn.sub_id.clone(),
                 last_agent_message: Some("done".to_string()),
+                error: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2796,6 +2808,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: first_turn.sub_id.clone(),
                 last_agent_message: Some("first done".to_string()),
+                error: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,
@@ -2839,6 +2852,7 @@ async fn multi_agent_v2_followup_task_completion_notifies_parent_on_every_turn()
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: second_turn.sub_id.clone(),
                 last_agent_message: Some("second done".to_string()),
+                error: None,
                 completed_at: None,
                 duration_ms: None,
                 time_to_first_token_ms: None,

@@ -90,6 +90,7 @@ pub(crate) async fn run_command(
 
     if let Some(mut stdin) = child.stdin.take()
         && let Err(err) = stdin.write_all(input_json.as_bytes()).await
+        && err.kind() != io::ErrorKind::BrokenPipe
     {
         let _ = child.kill().await;
         return finish_command_run(
@@ -333,5 +334,45 @@ fn default_shell_command() -> Command {
         let mut command = Command::new(shell);
         command.arg("-lc");
         command
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use codex_protocol::protocol::HookEventName;
+    use codex_protocol::protocol::HookSource;
+    use codex_utils_absolute_path::AbsolutePathBuf;
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn retains_output_when_hook_closes_stdin_early() {
+        let cwd = AbsolutePathBuf::current_dir().expect("current directory");
+        let handler = ConfiguredHandler {
+            event_name: HookEventName::PreToolUse,
+            matcher: None,
+            command: "echo retained-hook-output".to_string(),
+            timeout_sec: 5,
+            status_message: None,
+            source_path: cwd.join("hooks.json"),
+            source: HookSource::User,
+            display_order: 0,
+            env: HashMap::new(),
+        };
+        let shell = CommandShell {
+            program: String::new(),
+            args: Vec::new(),
+        };
+        let input_json = "x".repeat(4 * 1024 * 1024);
+
+        let result = run_command(&shell, &handler, 0, &input_json, cwd.as_path()).await;
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout.trim(), "retained-hook-output");
+        assert_eq!(result.stderr, "");
+        assert_eq!(result.error, None);
     }
 }

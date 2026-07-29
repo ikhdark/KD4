@@ -11,7 +11,6 @@ from scripts.publish_local_codex_test_support import PublishLocalCodexTestBase
 
 
 SCRIPT = Path(__file__).resolve().parent / "publish-local-codex.ps1"
-HASHING_HELPER = Path(__file__).resolve().parent / "publish-local-codex.hashing.ps1"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 RUN_TIMEOUT_SECONDS = 120
 FIXTURE_TIME = 946684900
@@ -32,6 +31,8 @@ def ps_single_quote(value: str | Path) -> str:
 
 PUBLISH_ENV_VARS = (
     "CODEX_LOCAL_PUBLISH_DIR",
+    "CODEX_LOCAL_CODEX_HOME",
+    "CODEX_LOCAL_CODEX_SQLITE_HOME",
     "CODEX_HOME",
     "CODEX_SQLITE_HOME",
     "CODEX_CLI_PATH",
@@ -50,7 +51,7 @@ def clean_env() -> dict[str, str]:
 
 
 class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
-    def test_actual_release_build_skips_preflight_and_uses_target_dir_argument(
+    def test_actual_release_build_runs_preflight_and_uses_target_dir_argument(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -70,6 +71,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                     [
                         "@echo off",
                         "echo fake cargo %*",
+                        "echo cargo progress 1>&2",
                         "echo cargoTargetDirEnv=%CARGO_TARGET_DIR%",
                         "exit /b 0",
                     ]
@@ -96,10 +98,26 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertIn("fake cargo --config ", result.stdout)
             self.assertIn(" build --target-dir ", result.stdout)
             self.assertIn("target\\publish-release", result.stdout)
-            self.assertNotRegex(result.stdout, r"fake cargo .* check ")
+            self.assertRegex(result.stdout, r"fake cargo .* check ")
             self.assertIn("cargoTargetDirEnv=", result.stdout)
             self.assertNotIn("inherited-target", result.stdout)
             self.assert_no_publish_temps(install_dir)
+
+            skipped = self.run_script(
+                "-SkipPreflightCheck",
+                "-SourceExe",
+                str(fake_codex),
+                "-InstallDir",
+                str(install_dir),
+                env=env,
+            )
+            self.assertEqual(
+                skipped.returncode,
+                0,
+                f"stdout:\n{skipped.stdout}\nstderr:\n{skipped.stderr}",
+            )
+            self.assertNotRegex(skipped.stdout, r"fake cargo .* check ")
+            self.assertRegex(skipped.stdout, r"fake cargo .* build ")
 
     def test_new_content_stamp_overrides_old_sidecar_mtime(self) -> None:
         self.init_repo_fixture()
@@ -245,6 +263,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                     [
                         "@echo off",
                         'if "%1"=="doctor" (',
+                        "echo doctor warning 1>&2",
                         'echo {"checks":{"auth.credentials":{"status":"fail"},"local_publish.readiness":{"status":"warning","summary":"doctor is not running from the local publish target"},"desktop.runtime_chain":{"status":"ok","summary":"desktop runtime chain evidence collected"},"app_server.status":{"status":"ok","summary":"background server reachable"},"network.websocket_reachability":{"status":"warning"}}}',
                         "exit /b 1",
                         ")",
@@ -298,6 +317,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertIn("buildCommand: <skipped>", result.stdout)
             self.assertNotIn("fake cargo --config ", result.stdout)
             self.assertIn(f'doctorCommand: "{fake_codex}" doctor --json', result.stdout)
+            self.assertIn("doctor warning", result.stdout)
             self.assertIn(
                 "doctorStatus: warning: auth.credentials missing", result.stdout
             )
@@ -381,6 +401,56 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
             self.assertIn("[build]", result.stdout)
             self.assertIn('rustc-wrapper = ""', result.stdout)
             self.assert_no_publish_temps(install_dir)
+
+    def test_missing_sccache_clears_stale_inherited_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            install_dir = temp_path / "install"
+            install_dir.mkdir()
+            fake_codex = self.copy_valid_codex(
+                temp_path / "fake-codex.exe",
+                timestamp=FIXTURE_TIME + 450,
+                append_padding=True,
+            )
+            fake_bin = temp_path / "bin"
+            fake_bin.mkdir()
+            (fake_bin / "cargo.cmd").write_text(
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        "echo rustcWrapperEnv=%RUSTC_WRAPPER%",
+                        "echo cargoBuildRustcWrapperEnv=%CARGO_BUILD_RUSTC_WRAPPER%",
+                        "exit /b 0",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            env = clean_env()
+            env["PATH"] = str(fake_bin)
+            env["RUSTC_WRAPPER"] = "sccache"
+            env["CARGO_BUILD_RUSTC_WRAPPER"] = "sccache.exe"
+
+            result = self.run_script(
+                "-Profile",
+                "local-release",
+                "-SkipPreflightCheck",
+                "-SourceExe",
+                str(fake_codex),
+                "-InstallDir",
+                str(install_dir),
+                env=env,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertIn("rustcWrapper: <none: sccache not found>", result.stdout)
+            self.assertIn("rustcWrapperEnv=", result.stdout)
+            self.assertIn("cargoBuildRustcWrapperEnv=", result.stdout)
+            self.assertNotIn("rustcWrapperEnv=sccache", result.stdout)
+            self.assertNotIn("cargoBuildRustcWrapperEnv=sccache", result.stdout)
 
     def test_publish_build_sets_version_metadata_env(self) -> None:
         self.init_repo_fixture()

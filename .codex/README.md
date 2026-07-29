@@ -31,3 +31,9 @@ Project-local runtime configuration lives in `.codex/config.toml`. Project agent
 definitions live in `.codex/agents/`; every `config_file` entry must resolve to
 a tracked, schema-valid role file. Roles inherit parent settings except where
 their role file explicitly overrides a supported configuration key.
+
+The `kd4_explorer`, `kd4_worker`, `kd4_reviewer`, `kd4_verifier`, and
+`kd4_integrator` names are typed-capable aliases for their built-in role kinds.
+The reviewer alias remains mutation-denied while retaining repository reads,
+diffs, proven read-only shell commands, Repo Atlas lookups, and fetch-only
+GitHub inspection.

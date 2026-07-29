@@ -394,7 +394,7 @@ async fn read_only_preflight_repair_executes_and_releases_process_id() {
             .as_str()
             .is_some_and(|repair| repair.contains("known_flag_typo"))
     );
-    assert!(code_mode["raw_output_artifact"].is_string());
+    assert!(code_mode["raw_output_artifact_id"].is_string());
 
     let process_id = session
         .services
@@ -622,6 +622,11 @@ async fn unpolled_background_failure_finalizes_artifact_and_attempt_ledger() {
         .expect("allow the bounded background test command");
     let session = Arc::new(session);
     let turn = Arc::new(turn);
+    let artifact_directory = turn
+        .config
+        .codex_home
+        .join("tool-output")
+        .join(session.thread_id.to_string());
     let invocation = ToolInvocation {
         session: Arc::clone(&session),
         step_context: StepContext::for_test(Arc::clone(&turn)),
@@ -662,11 +667,10 @@ async fn unpolled_background_failure_finalizes_artifact_and_attempt_ledger() {
         .await
         .expect("background process must be tracked while it is running")
         .key;
-    let artifact_path = PathBuf::from(
-        code_mode["raw_output_artifact"]
-            .as_str()
-            .expect("raw output artifact path"),
-    );
+    let artifact_id = code_mode["raw_output_artifact_id"]
+        .as_str()
+        .expect("raw output artifact id");
+    let artifact_path = artifact_directory.join(format!("{artifact_id}.log"));
 
     let mut retained = String::new();
     let mut consecutive_failures = 0;
@@ -715,6 +719,11 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
         .expect("allow the bounded large-output test command");
     let session = Arc::new(session);
     let turn = Arc::new(turn);
+    let artifact_directory = turn
+        .config
+        .codex_home
+        .join("tool-output")
+        .join(session.thread_id.to_string());
     let invocation = ToolInvocation {
         session,
         step_context: StepContext::for_test(Arc::clone(&turn)),
@@ -748,11 +757,10 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
     });
     assert_eq!(code_mode["exit_code"], 0);
     assert!(code_mode.get("session_id").is_none());
-    let artifact_path = PathBuf::from(
-        code_mode["raw_output_artifact"]
-            .as_str()
-            .expect("raw output artifact path"),
-    );
+    let artifact_id = code_mode["raw_output_artifact_id"]
+        .as_str()
+        .expect("raw output artifact id");
+    let artifact_path = artifact_directory.join(format!("{artifact_id}.log"));
     let artifact = tokio::fs::read(&artifact_path)
         .await
         .expect("read raw output artifact");

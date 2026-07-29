@@ -59,13 +59,22 @@ def git_config(name: str) -> str | None:
 
 def path_kind(path: Path) -> str:
     text = path.as_posix()
-    if text.startswith("/mnt/") or text.startswith("/run/desktop/mnt/host/"):
-        return "wsl-windows-mount"
     if os.name == "nt":
         return "windows"
-    if "microsoft" in platform.uname().release.lower():
+    is_wsl = "microsoft" in platform.uname().release.lower() or bool(
+        os.environ.get("WSL_INTEROP")
+    )
+    if is_wsl:
+        if text.startswith("/mnt/") or text.startswith("/run/desktop/mnt/host/"):
+            return "wsl-windows-mount"
         return "wsl-native"
     return platform.system().lower() or "unknown"
+
+
+def fsmonitor_enabled(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 def timed_status(timeout: float) -> tuple[float | None, bool]:
@@ -109,7 +118,7 @@ def recommendations(
     unreadable_pytest_caches: Sequence[str] = (),
 ) -> tuple[str, ...]:
     items: list[str] = []
-    if fsmonitor not in {"true", "builtin"}:
+    if not fsmonitor_enabled(fsmonitor):
         items.append(
             "Enable Git FSMonitor for this repo: `git config core.fsmonitor true`."
         )

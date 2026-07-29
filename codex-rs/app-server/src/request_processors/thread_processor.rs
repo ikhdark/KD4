@@ -2854,7 +2854,7 @@ impl ThreadRequestProcessor {
                     "thread",
                 );
 
-                let mut thread = match self
+                let (mut thread, token_usage_turn_id) = match self
                     .load_thread_from_resume_source_or_send_internal(
                         thread_id,
                         codex_thread.as_ref(),
@@ -2901,7 +2901,6 @@ impl ThreadRequestProcessor {
                 let active_permission_profile = thread_response_active_permission_profile(
                     config_snapshot.active_permission_profile,
                 );
-                let token_usage_thread = include_turns.then(|| thread.clone());
                 let mut initial_turns_page = if let Some(params) = initial_turns_page.as_ref() {
                     match build_thread_resume_initial_turns_page(
                         response_history.get_rollout_items(),
@@ -2950,11 +2949,7 @@ impl ThreadRequestProcessor {
                     .await;
                 // `excludeTurns` is explicitly the cheap resume path, so avoid
                 // rebuilding history only to attribute a replayed usage update.
-                if let Some(token_usage_thread) = token_usage_thread {
-                    let token_usage_turn_id = latest_token_usage_turn_id_from_rollout_items(
-                        response_history.get_rollout_items(),
-                        token_usage_thread.turns.as_slice(),
-                    );
+                if let Some(token_usage_turn_id) = token_usage_turn_id {
                     // The client needs restored usage before it starts another turn.
                     // Sending after the response preserves JSON-RPC request ordering while
                     // still filling the status line before the next turn lifecycle begins.
@@ -2962,7 +2957,6 @@ impl ThreadRequestProcessor {
                         &self.outgoing,
                         connection_id,
                         thread_id,
-                        &token_usage_thread,
                         codex_thread.as_ref(),
                         token_usage_turn_id,
                     )
@@ -3289,16 +3283,34 @@ impl ThreadRequestProcessor {
         fallback_provider: &str,
         include_turns: bool,
     ) -> Thread {
+        self.stored_thread_to_api_thread_with_token_usage(
+            stored_thread,
+            fallback_provider,
+            include_turns,
+        )
+        .0
+    }
+
+    fn stored_thread_to_api_thread_with_token_usage(
+        &self,
+        stored_thread: StoredThread,
+        fallback_provider: &str,
+        include_turns: bool,
+    ) -> (Thread, Option<String>) {
         let (mut thread, history) =
             thread_from_stored_thread(stored_thread, fallback_provider, &self.config.cwd);
-        if include_turns && let Some(history) = history {
-            populate_thread_turns_from_history(
+        let token_usage_turn_id = include_turns.then(|| {
+            let items = history
+                .as_ref()
+                .map(|history| history.items.as_slice())
+                .unwrap_or_default();
+            super::thread_lifecycle::populate_thread_turns_from_history_with_token_usage(
                 &mut thread,
-                &history.items,
+                items,
                 /*active_turn*/ None,
-            );
-        }
-        thread
+            )
+        });
+        (thread, token_usage_turn_id)
     }
 
     async fn read_stored_thread_for_new_fork(
@@ -3324,7 +3336,7 @@ impl ThreadRequestProcessor {
         rollout_path: &Path,
         resume_source_thread: Option<StoredThread>,
         include_turns: bool,
-    ) -> std::result::Result<Thread, String> {
+    ) -> std::result::Result<(Thread, Option<String>), String> {
         let config_snapshot = thread.config_snapshot().await;
         let session_id = thread.session_configured().session_id.to_string();
         let thread = match thread_history {
@@ -3403,16 +3415,20 @@ impl ThreadRequestProcessor {
         thread.id = thread_id.to_string();
         thread.session_id = session_id;
         thread.path = Some(rollout_path.to_path_buf());
-        if include_turns {
+        let token_usage_turn_id = if include_turns {
             let history_items = thread_history.get_rollout_items();
-            populate_thread_turns_from_history(
-                &mut thread,
-                history_items,
-                /*active_turn*/ None,
-            );
-        }
+            Some(
+                super::thread_lifecycle::populate_thread_turns_from_history_with_token_usage(
+                    &mut thread,
+                    history_items,
+                    /*active_turn*/ None,
+                ),
+            )
+        } else {
+            None
+        };
         self.attach_thread_name(thread_id, &mut thread).await;
-        Ok(thread)
+        Ok((thread, token_usage_turn_id))
     }
 
     async fn attach_thread_name(&self, thread_id: ThreadId, thread: &mut Thread) {
@@ -3607,11 +3623,11 @@ impl ThreadRequestProcessor {
 
         // Persistent forks materialize their own rollout immediately. Ephemeral forks stay
         // pathless, so they rebuild their visible history from the copied source history instead.
-        let mut thread = if session_configured.rollout_path.is_some() {
+        let (mut thread, token_usage_turn_id) = if session_configured.rollout_path.is_some() {
             let stored_thread = self
                 .read_stored_thread_for_new_fork(thread_id, include_turns)
                 .await?;
-            self.stored_thread_to_api_thread(
+            self.stored_thread_to_api_thread_with_token_usage(
                 stored_thread,
                 fallback_model_provider.as_str(),
                 include_turns,
@@ -3626,14 +3642,14 @@ impl ThreadRequestProcessor {
             );
             thread.preview = preview_from_rollout_items(&history_items);
             thread.forked_from_id = Some(source_thread_id.to_string());
-            if include_turns {
-                populate_thread_turns_from_history(
+            let token_usage_turn_id = include_turns.then(|| {
+                super::thread_lifecycle::populate_thread_turns_from_history_with_token_usage(
                     &mut thread,
                     &history_items,
                     /*active_turn*/ None,
-                );
-            }
-            thread
+                )
+            });
+            (thread, token_usage_turn_id)
         };
         if let Some(name) = source_thread_name {
             set_thread_name_from_title(&mut thread, name);
@@ -3682,24 +3698,18 @@ impl ThreadRequestProcessor {
 
         let notif = thread_started_notification(thread);
         let connection_id = request_id.connection_id;
-        let token_usage_thread = include_turns.then(|| response.thread.clone());
         self.outgoing
             .send_response_with_thread_originator(request_id, response, thread_originator)
             .await;
         // `excludeTurns` is the cheap fork path, so skip restored usage replay
         // instead of rebuilding history only to attribute a historical update.
-        if let Some(token_usage_thread) = token_usage_thread {
-            let token_usage_turn_id = latest_token_usage_turn_id_from_rollout_items(
-                &history_items,
-                token_usage_thread.turns.as_slice(),
-            );
+        if let Some(token_usage_turn_id) = token_usage_turn_id {
             // Mirror the resume contract for forks: the new thread is usable as soon
             // as the response arrives, so restored usage must follow immediately.
             send_thread_token_usage_update_to_connection(
                 &self.outgoing,
                 connection_id,
                 thread_id,
-                &token_usage_thread,
                 forked_thread.as_ref(),
                 token_usage_turn_id,
             )

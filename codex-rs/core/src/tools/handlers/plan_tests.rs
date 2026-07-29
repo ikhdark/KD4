@@ -26,12 +26,9 @@ async fn enable_task_evidence(
     let temp = tempfile::tempdir().expect("task evidence tempdir");
     let repo = temp.path().join("repo");
     let codex_home = temp.path().join("codex-home");
-    tokio::fs::create_dir_all(repo.join("scripts"))
+    tokio::fs::create_dir_all(&repo)
         .await
-        .expect("task evidence scripts directory");
-    tokio::fs::write(repo.join("scripts/verify_local.py"), "# fixture")
-        .await
-        .expect("task evidence verifier fixture");
+        .expect("task evidence repo fixture");
     tokio::fs::write(repo.join("kd4_features.toml"), "# fixture")
         .await
         .expect("task evidence manifest fixture");
@@ -143,22 +140,104 @@ fn unchanged_plan_output_remains_compact() {
     assert_eq!(output.code_mode_result(&payload), serde_json::json!({}));
 }
 
-#[tokio::test]
-async fn normalized_plan_output_reports_downgraded_success_statuses() {
-    for requested_status in [StepStatus::Passed, StepStatus::Completed] {
-        let (result, _) = invoke_normalized_plan_update(plan_update_args(
-            Some("step"),
-            "Implement the step",
-            requested_status,
-        ))
-        .await;
+#[test]
+fn generated_artifact_schema_requires_repository_relative_paths() {
+    let tool = serde_json::to_value(create_update_plan_tool()).expect("serialize update_plan");
+    let artifact_schema = tool
+        .pointer("/parameters/properties/plan/items/properties/generated_artifacts")
+        .expect("generated_artifacts schema");
+    let description = artifact_schema
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .expect("generated_artifacts description");
+    let item_description = artifact_schema
+        .pointer("/items/description")
+        .and_then(serde_json::Value::as_str)
+        .expect("generated_artifacts item description");
 
-        assert_eq!(result["message"], PLAN_UPDATED_MESSAGE);
-        assert_eq!(
-            result["normalized_plan"]["plan"][0]["status"],
-            "implemented"
-        );
-    }
+    assert!(description.contains("Repository-relative"));
+    assert!(description.contains("remain inside the repository"));
+    assert!(item_description.contains("repository-relative"));
+}
+
+#[tokio::test]
+async fn normalized_plan_output_reports_completed_as_passed() {
+    let (result, persisted) = invoke_normalized_plan_update(plan_update_args(
+        Some("step"),
+        "Implement the step",
+        StepStatus::Completed,
+    ))
+    .await;
+
+    assert_eq!(result["message"], PLAN_UPDATED_MESSAGE);
+    assert_eq!(result["normalized_plan"]["plan"][0]["status"], "passed");
+    assert_eq!(persisted["plan"][0]["status"], "passed");
+}
+
+#[tokio::test]
+async fn skipped_dependency_cycle_reaches_plan_handler_and_persists() {
+    let args = serde_json::from_value::<UpdatePlanArgs>(serde_json::json!({
+        "plan": [
+            {
+                "id": "first",
+                "step": "Skip the first step",
+                "status": "skipped",
+                "depends_on": ["second"]
+            },
+            {
+                "id": "second",
+                "step": "Skip the second step",
+                "status": "skipped",
+                "depends_on": ["first"]
+            },
+            {
+                "id": "self-skipped",
+                "step": "Skip a self-referential step",
+                "status": "skipped",
+                "depends_on": ["self-skipped"]
+            },
+            {
+                "id": "missing-skipped",
+                "step": "Skip a step with an unavailable prerequisite",
+                "status": "skipped",
+                "depends_on": ["not-present"]
+            },
+            {
+                "id": "finish",
+                "step": "Finish the active work",
+                "status": "completed"
+            }
+        ]
+    }))
+    .expect("skipped dependency cycle should deserialize");
+
+    let (result, persisted) = invoke_normalized_plan_update(args).await;
+
+    assert_eq!(result["message"], PLAN_UPDATED_MESSAGE);
+    assert_eq!(result["normalized_plan"]["plan"][0]["status"], "skipped");
+    assert_eq!(result["normalized_plan"]["plan"][1]["status"], "skipped");
+    assert_eq!(result["normalized_plan"]["plan"][2]["status"], "skipped");
+    assert_eq!(result["normalized_plan"]["plan"][3]["status"], "skipped");
+    assert_eq!(result["normalized_plan"]["plan"][4]["status"], "passed");
+    assert_eq!(persisted["plan"][0]["status"], "skipped");
+    assert_eq!(
+        persisted["plan"][0]["depends_on"],
+        serde_json::json!(["second"])
+    );
+    assert_eq!(persisted["plan"][1]["status"], "skipped");
+    assert_eq!(
+        persisted["plan"][1]["depends_on"],
+        serde_json::json!(["first"])
+    );
+    assert_eq!(
+        persisted["plan"][2]["depends_on"],
+        serde_json::json!(["self-skipped"])
+    );
+    assert_eq!(
+        persisted["plan"][3]["depends_on"],
+        serde_json::json!(["not-present"])
+    );
+    assert_eq!(persisted["plan"][4]["status"], "passed");
 }
 
 #[tokio::test]

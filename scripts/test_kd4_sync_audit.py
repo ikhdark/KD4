@@ -80,6 +80,55 @@ class Kd4SyncAuditTest(unittest.TestCase):
         self.assertEqual(audit.worktree.untracked_paths, 1)
         self.assertFalse(audit.safe_for_in_place_sync)
 
+    def test_modify_delete_message_does_not_add_prose_as_conflict_path(self) -> None:
+        tree = "a" * 40
+        completed = subprocess.CompletedProcess(
+            ["git", "merge-tree"],
+            1,
+            stdout=(
+                f"{tree}\n"
+                "shared.txt\n"
+                "\n"
+                "CONFLICT (modify/delete): shared.txt deleted in HEAD and "
+                "modified in upstream. Version upstream of shared.txt left in tree.\n"
+            ),
+            stderr="",
+        )
+
+        forecast = kd4_sync_audit.parse_merge_forecast(completed)
+
+        self.assertEqual(forecast.conflict_paths, ("shared.txt",))
+
+    def test_hex_conflict_path_is_not_mistaken_for_result_tree(self) -> None:
+        hex_path = "b" * 40
+        completed = subprocess.CompletedProcess(
+            ["git", "merge-tree"],
+            1,
+            stdout=(
+                "merge-tree-error\n"
+                f"{hex_path}\n"
+                "\n"
+                f"CONFLICT (content): Merge conflict in {hex_path}\n"
+            ),
+            stderr="",
+        )
+
+        forecast = kd4_sync_audit.parse_merge_forecast(completed)
+
+        self.assertIsNone(forecast.result_tree)
+        self.assertEqual(forecast.conflict_paths, (hex_path,))
+
+    def test_atomic_json_writer_removes_temp_file_on_serialization_error(
+        self,
+    ) -> None:
+        target = self.repo / "audit.json"
+
+        with self.assertRaises(TypeError):
+            kd4_sync_audit.write_json_atomic(target, {"bad": object()})
+
+        self.assertEqual(list(self.repo.glob("*.tmp")), [])
+        self.assertFalse(target.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -74,20 +74,17 @@ def load_toml(path: Path):
 class BuildToolingEnvironmentTest(unittest.TestCase):
     def test_local_just_shell_sets_sccache_without_probe(self) -> None:
         just_shell = load_just_shell_module()
-        can_run_calls = []
 
         updates = just_shell.rust_tool_env(
             {"PATH": "ignored"},
             os_name="posix",
             which=lambda program: f"/tools/{program}" if program == "sccache" else None,
-            can_run=lambda command: can_run_calls.append(command) or False,
             repo_root=REPO_ROOT,
         )
 
         self.assertEqual(updates["RUSTC_WRAPPER"], "/tools/sccache")
         self.assertEqual(updates["SCCACHE_BASEDIR"], str(REPO_ROOT))
         self.assertEqual(updates["SCCACHE_CACHE_SIZE"], "80G")
-        self.assertEqual(can_run_calls, [])
 
     def test_local_just_shell_sets_sccache_env_for_existing_sccache_wrapper(
         self,
@@ -174,6 +171,43 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
                 ["/tools/sccache", "--show-stats"],
             ],
         )
+
+    def test_local_just_shell_compares_sccache_sizes_by_bytes(self) -> None:
+        just_shell = load_just_shell_module()
+
+        expected_sizes = {
+            "512M": "512 MiB",
+            "1T": "1 TiB",
+            "80GB": "80 GiB",
+            "80GiB": "80 GiB",
+            "1024G": "1 TiB",
+        }
+        for configured, reported in expected_sizes.items():
+            with self.subTest(configured=configured):
+                calls = []
+
+                def fake_run(command, **_kwargs):
+                    calls.append(command)
+                    return subprocess.CompletedProcess(
+                        command,
+                        0,
+                        stdout=f"Max cache size                       {reported}\n",
+                        stderr="",
+                    )
+
+                restarted = just_shell.ensure_sccache_server_env(
+                    {
+                        "RUSTC_WRAPPER": "/tools/sccache",
+                        "SCCACHE_CACHE_SIZE": configured,
+                    },
+                    which=lambda program: (
+                        f"/tools/{program}" if program == "sccache" else None
+                    ),
+                    run=fake_run,
+                )
+
+                self.assertFalse(restarted)
+                self.assertEqual(calls, [["/tools/sccache", "--show-stats"]])
 
     def test_local_just_shell_does_not_cache_failed_sccache_restart(self) -> None:
         just_shell = load_just_shell_module()
@@ -263,7 +297,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
     def test_windows_local_just_shell_uses_lld_link_when_available(self) -> None:
         just_shell = load_just_shell_module()
-        can_run_calls = []
 
         updates = just_shell.rust_tool_env(
             {},
@@ -271,7 +304,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             which=lambda program: (
                 "C:/LLVM/bin/lld-link.exe" if program == "lld-link" else None
             ),
-            can_run=lambda command: can_run_calls.append(command) or True,
         )
 
         self.assertEqual(updates["CARGO_NET_GIT_FETCH_WITH_CLI"], "true")
@@ -280,7 +312,6 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             "C:/LLVM/bin/lld-link.exe",
         )
         self.assertNotIn("CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER", updates)
-        self.assertEqual(can_run_calls, [])
 
     def test_windows_local_just_shell_uses_scoop_lld_link_when_not_on_path(
         self,
@@ -511,6 +542,44 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
 
         run.assert_called_once()
 
+    def test_local_just_shell_inconclusive_tool_probe_proceeds_without_cache(
+        self,
+    ) -> None:
+        just_shell = load_just_shell_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir)
+            command = ["tool", "--version"]
+            with mock.patch.object(just_shell, "tool_runs", return_value=None) as run:
+                self.assertTrue(
+                    just_shell.cached_tool_runs(command, cache_dir=cache_dir)
+                )
+                self.assertTrue(
+                    just_shell.cached_tool_runs(command, cache_dir=cache_dir)
+                )
+
+            self.assertFalse(
+                just_shell.tool_run_cache_path(command, cache_dir).exists()
+            )
+
+        self.assertEqual(run.call_count, 2)
+
+    def test_local_just_shell_writes_probe_cache_by_atomic_replace(self) -> None:
+        just_shell = load_just_shell_module()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_dir = Path(temp_dir)
+            command = ["tool", "--version"]
+            original_replace = just_shell.os.replace
+            with mock.patch.object(
+                just_shell.os, "replace", wraps=original_replace
+            ) as replace:
+                just_shell.write_cached_tool_run(command, cache_dir, True)
+
+            self.assertTrue(just_shell.read_cached_tool_run(command, cache_dir))
+            replace.assert_called_once()
+            self.assertEqual(list(cache_dir.glob("*.tmp")), [])
+
     def test_local_just_shell_tool_probe_cache_tracks_tool_identity(self) -> None:
         just_shell = load_just_shell_module()
 
@@ -667,7 +736,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         cli_dev_sqlx = cli_manifest["dev-dependencies"]["sqlx"]
         self.assertEqual(cli_dev_sqlx, {"workspace": True})
 
-    def test_default_test_recipe_uses_upstream_nextest_defaults(self) -> None:
+    def test_default_test_recipes_use_bounded_nextest_profiles(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
         nextest = load_toml(REPO_ROOT / "codex-rs" / ".config" / "nextest.toml")
 
@@ -679,6 +748,9 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast',
             justfile,
         )
+        self.assertEqual(nextest["profile"]["default"]["test-threads"], 6)
+        local_profile = nextest["profile"]["local"]
+        self.assertEqual(local_profile["inherits"], "default")
         fast_profile = nextest["profile"]["fast"]
         self.assertEqual(fast_profile["inherits"], "local")
         self.assertEqual(fast_profile["retries"], 0)
@@ -688,7 +760,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         }
         self.assertIn(
             local_app_server_override,
-            nextest["profile"]["local"]["overrides"],
+            local_profile["overrides"],
         )
         self.assertIn(local_app_server_override, fast_profile["overrides"])
         self.assertIn(
@@ -723,17 +795,33 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             justfile,
         )
 
-    def test_cargo_config_uses_adaptive_jobs_and_nonduplicated_windows_flags(
+    def test_cargo_config_caps_parallelism_and_nonduplicated_windows_flags(
         self,
     ) -> None:
         cargo_config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
-        self.assertEqual(cargo_config["build"]["jobs"], -2)
+        self.assertEqual(cargo_config["build"]["jobs"], 6)
+        self.assertEqual(
+            cargo_config["env"]["RUST_TEST_THREADS"],
+            {"value": "6", "force": False},
+        )
+        self.assertIn('rust_parallelism := "6"', justfile)
         self.assertIn(
-            'env_var_or_default("CARGO_BUILD_JOBS", "-2")',
+            'env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)',
             justfile,
         )
+        self.assertIn(
+            'env_var_or_default("RUST_TEST_THREADS", rust_parallelism)',
+            justfile,
+        )
+        self.assertIn(
+            'env_var_or_default("NEXTEST_TEST_THREADS", rust_parallelism)',
+            justfile,
+        )
+        self.assertIn("export CARGO_BUILD_JOBS := cargo_build_jobs", justfile)
+        self.assertIn("export RUST_TEST_THREADS := rust_test_threads", justfile)
+        self.assertIn("export NEXTEST_TEST_THREADS := nextest_test_threads", justfile)
 
         targets = cargo_config["target"]
         msvc_flags = targets['cfg(all(windows, target_env = "msvc"))']["rustflags"]
@@ -794,7 +882,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             ("cargo", f"+{tool_versions.RUSTFMT_TOOLCHAIN}", "fmt", "--check"),
         )
         self.assertEqual(command.cwd, REPO_ROOT / "codex-rs")
-        self.assertFalse(command.discard_stderr)
+        self.assertFalse(hasattr(command, "discard_stderr"))
 
     def test_formatter_full_path_includes_prettier_targets(self) -> None:
         format_script = load_format_module()
@@ -825,6 +913,22 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             )
 
         self.assertEqual([group.name for group in groups], ["Python scripts"])
+
+    def test_formatter_explains_fast_local_only_conflict(self) -> None:
+        format_script = load_format_module()
+        stderr = io.StringIO()
+
+        with (
+            mock.patch("sys.stderr", stderr),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            format_script.main(["--fast-local", "--only", "prettier"])
+
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn(
+            "--fast-local excludes formatter groups selected by --only: prettier",
+            stderr.getvalue(),
+        )
 
     def test_ci_formatter_jobs_install_and_use_pinned_nightly_rustfmt(self) -> None:
         workflow_paths = [
@@ -870,25 +974,20 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             setup_windows,
         )
 
-    def test_publish_build_enables_static_crt_outside_cargo_config(self) -> None:
+    def test_publish_build_uses_static_crt_from_cargo_config_once(self) -> None:
         script_root = REPO_ROOT / "scripts"
         publish_entrypoint = (script_root / "publish-local-codex.ps1").read_text(
             encoding="utf-8"
         )
-        publish_script = "\n".join(
-            [
-                publish_entrypoint,
-                (script_root / "publish-local-codex.build.ps1").read_text(
-                    encoding="utf-8"
-                ),
-            ]
+        cargo_config = (REPO_ROOT / "codex-rs" / ".cargo" / "config.toml").read_text(
+            encoding="utf-8"
         )
 
-        self.assertIn('"publish-local-codex.build.ps1"', publish_entrypoint)
-        self.assertIn("Enable-StaticMsvcRustFlagsForPublish", publish_script)
-        self.assertIn("CARGO_TARGET_*_RUSTFLAGS", publish_script)
-        self.assertIn("target-feature=+crt-static", publish_script)
-        self.assertNotIn("$env:RUSTFLAGS", publish_script)
+        self.assertIn("function Invoke-CodexBuild", publish_entrypoint)
+        self.assertIn("target-feature=+crt-static", cargo_config)
+        self.assertIn("via codex-rs/.cargo/config.toml", publish_entrypoint)
+        self.assertNotIn("CARGO_TARGET_*_RUSTFLAGS", publish_entrypoint)
+        self.assertNotIn("$env:RUSTFLAGS", publish_entrypoint)
 
 
 if __name__ == "__main__":

@@ -11,29 +11,31 @@ import argparse
 import difflib
 import re
 import sys
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence, TextIO
+from typing import TextIO
 
 # Markers for the Table of Contents section
 BEGIN_TOC: str = "<!-- Begin ToC -->"
 END_TOC: str = "<!-- End ToC -->"
 DEFAULT_DIFF_MAX_LINES = 200
 HEADING_RE = re.compile(r"^(#{2,6})\s+(.*)$")
-CODE_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+CODE_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+LINE_ENDING_RE = re.compile(r"(\r\n|\r|\n)")
 PUNCT_TRANSLATION = str.maketrans(
     {
         chr(value): None
         for value in range(128)
-        if not chr(value).isalnum() and chr(value) not in " -"
+        if not chr(value).isalnum() and chr(value) not in " -_"
     }
 )
 DASH_TRANSLATION = str.maketrans(
     {
         "\u00a0": " ",
-        "\u2011": "-",
-        "\u2013": "-",
-        "\u2014": "-",
+        "\u2011": None,
+        "\u2013": None,
+        "\u2014": None,
     }
 )
 
@@ -44,6 +46,12 @@ class TocParseResult:
     end_idx: int
     current: list[str]
     expected: list[str]
+
+
+@dataclass(frozen=True)
+class MarkdownLine:
+    text: str
+    ending: str
 
 
 def main() -> int:
@@ -72,15 +80,11 @@ def generate_toc_lines(lines: Iterable[str]) -> list[str]:
     Generate markdown list lines for headings (## to ######) in content.
     """
     toc: list[str] = []
-    code_fence: str | None = None
+    code_fence: tuple[str, int] | None = None
     used_slugs: dict[str, int] = {}
     for line in lines:
-        if match := CODE_FENCE_RE.match(line):
-            marker = match.group(1)
-            if code_fence is None:
-                code_fence = marker
-            elif code_fence == marker:
-                code_fence = None
+        code_fence, is_fence_line = advance_code_fence(line, code_fence)
+        if is_fence_line:
             continue
         if code_fence is not None:
             continue
@@ -95,6 +99,25 @@ def generate_toc_lines(lines: Iterable[str]) -> list[str]:
     return toc
 
 
+def advance_code_fence(
+    line: str, code_fence: tuple[str, int] | None
+) -> tuple[tuple[str, int] | None, bool]:
+    match = CODE_FENCE_RE.match(line)
+    if match is None:
+        return code_fence, False
+    marker = match.group(1)
+    if code_fence is None:
+        return (marker[0], len(marker)), True
+    marker_char, marker_length = code_fence
+    if (
+        marker[0] == marker_char
+        and len(marker) >= marker_length
+        and not match.group(2).strip()
+    ):
+        return None, True
+    return code_fence, True
+
+
 def disambiguate_slug(slug: str, used_slugs: dict[str, int]) -> str:
     count = used_slugs.get(slug, 0)
     used_slugs[slug] = count + 1
@@ -106,7 +129,7 @@ def disambiguate_slug(slug: str, used_slugs: dict[str, int]) -> str:
 def slugify_heading(text: str) -> str:
     slug = text.lower().translate(DASH_TRANSLATION)
     slug = slug.translate(PUNCT_TRANSLATION)
-    return slug.strip().replace(" ", "-")
+    return slug.replace(" ", "-")
 
 
 def parse_markdown_toc(lines: Sequence[str]) -> TocParseResult | None:
@@ -115,16 +138,20 @@ def parse_markdown_toc(lines: Sequence[str]) -> TocParseResult | None:
     current: list[str] = []
     heading_lines: list[str] = []
     in_toc = False
+    code_fence: tuple[str, int] | None = None
 
     for idx, line in enumerate(lines):
         stripped = line.strip()
-        if stripped == BEGIN_TOC:
+        previous_fence = code_fence
+        code_fence, is_fence_line = advance_code_fence(line, code_fence)
+        markers_allowed = previous_fence is None and not is_fence_line
+        if markers_allowed and stripped == BEGIN_TOC:
             if begin_idx != -1:
                 raise ValueError("duplicate ToC begin marker")
             begin_idx = idx
             in_toc = True
             continue
-        if stripped == END_TOC:
+        if markers_allowed and stripped == END_TOC:
             if not in_toc or end_idx != -1:
                 raise ValueError("unexpected ToC end marker")
             end_idx = idx
@@ -147,6 +174,17 @@ def parse_markdown_toc(lines: Sequence[str]) -> TocParseResult | None:
         current=current,
         expected=generate_toc_lines(heading_lines),
     )
+
+
+def split_markdown_lines(content: str) -> list[MarkdownLine]:
+    parts = LINE_ENDING_RE.split(content)
+    lines = [
+        MarkdownLine(parts[index], parts[index + 1])
+        for index in range(0, len(parts) - 1, 2)
+    ]
+    if parts[-1]:
+        lines.append(MarkdownLine(parts[-1], ""))
+    return lines
 
 
 def print_toc_diff(
@@ -179,8 +217,10 @@ def check_or_fix(
     if not readme_path.is_file():
         print(f"Error: file not found: {readme_path}", file=sys.stderr)
         return 1
-    content = readme_path.read_text(encoding="utf-8")
-    lines = content.splitlines()
+    with readme_path.open("r", encoding="utf-8", newline="") as readme_file:
+        content = readme_file.read()
+    markdown_lines = split_markdown_lines(content)
+    lines = [line.text for line in markdown_lines]
     try:
         parsed = parse_markdown_toc(lines)
     except ValueError as exc:
@@ -196,17 +236,29 @@ def check_or_fix(
         return 0
     if not fix:
         print(
-            "ERROR: README ToC is out of date. Diff between existing and generated ToC:"
+            "ERROR: README ToC is out of date. Diff between existing and generated ToC:",
+            file=sys.stderr,
         )
-        print_toc_diff(parsed.current, parsed.expected, max_lines=diff_max_lines)
+        print_toc_diff(
+            parsed.current,
+            parsed.expected,
+            max_lines=diff_max_lines,
+            stream=sys.stderr,
+        )
         return 1
-    # rebuild file with updated ToC
-    prefix = lines[: parsed.begin_idx + 1]
-    suffix = lines[parsed.end_idx :]
-    new_lines = prefix + [""] + parsed.expected + [""] + suffix
-    # newline="" keeps LF as-is; the default translation re-expands \n to
-    # os.linesep and rewrites the whole file as CRLF on Windows.
-    readme_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8", newline="")
+    newline = markdown_lines[parsed.begin_idx].ending
+    if not newline:
+        newline = next((line.ending for line in markdown_lines if line.ending), "\n")
+    prefix = "".join(
+        line.text + line.ending for line in markdown_lines[: parsed.begin_idx + 1]
+    )
+    suffix = "".join(
+        line.text + line.ending for line in markdown_lines[parsed.end_idx :]
+    )
+    generated_toc = "".join(f"{line}{newline}" for line in parsed.expected)
+    new_content = prefix + newline + generated_toc + newline + suffix
+    with readme_path.open("w", encoding="utf-8", newline="") as readme_file:
+        readme_file.write(new_content)
     print(f"Updated ToC in {readme_path}.")
     return 0
 

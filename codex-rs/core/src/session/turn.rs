@@ -423,28 +423,6 @@ pub(crate) async fn run_turn(
 
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
-                    if let Some(changed_paths) = sess
-                        .services
-                        .task_evidence
-                        .take_automatic_verify_plan_request()
-                        .await
-                        && let Err(err) = crate::tools::handlers::run_automatic_verify_local_plan(
-                            Arc::clone(&sess),
-                            Arc::clone(&step_context),
-                            Arc::clone(&turn_diff_tracker),
-                            changed_paths,
-                            cancellation_token.child_token(),
-                        )
-                        .await
-                    {
-                        sess.send_event(
-                            &turn_context,
-                            EventMsg::Warning(WarningEvent {
-                                message: format!("automatic verify_local plan failed: {err:?}"),
-                            }),
-                        )
-                        .await;
-                    }
                     let stop_outcome = run_turn_stop_hooks(
                         &sess,
                         &turn_context,

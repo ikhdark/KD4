@@ -5,6 +5,7 @@ use similar::TextDiff;
 use std::sync::OnceLock;
 
 use crate::responses::ResponsesRequest;
+use codex_core::compact::SUMMARY_PREFIX;
 use codex_protocol::protocol::APPS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::PLUGINS_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
@@ -417,10 +418,8 @@ fn canonicalize_snapshot_text(text: &str) -> String {
     if text.starts_with("You are performing a CONTEXT CHECKPOINT COMPACTION.") {
         return "<SUMMARIZATION_PROMPT>".to_string();
     }
-    if text.starts_with("Another language model started to solve this problem")
-        && let Some((_, summary)) = text.split_once('\n')
-    {
-        return format!("<COMPACTION_SUMMARY>\n{summary}");
+    if let Some(summary) = text.strip_prefix(SUMMARY_PREFIX) {
+        return format!("<COMPACTION_SUMMARY>\n{}", summary.trim_start_matches('\n'));
     }
     normalize_dynamic_snapshot_paths(text)
 }

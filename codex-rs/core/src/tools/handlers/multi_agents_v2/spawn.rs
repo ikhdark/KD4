@@ -454,14 +454,16 @@ impl TypedAssignmentArgs {
 
 fn parse_typed_role(agent_type: Option<&str>) -> Result<AgentRole, FunctionCallError> {
     match agent_type.map(str::trim).filter(|role| !role.is_empty()) {
-        Some("explorer") => Ok(AgentRole::Explorer),
-        Some("worker") => Ok(AgentRole::Worker),
-        Some("reviewer") => Ok(AgentRole::Reviewer),
-        Some("verifier") => Ok(AgentRole::Verifier),
-        Some("integrator") => Ok(AgentRole::Integrator),
-        Some(role) => Err(FunctionCallError::RespondToModel(format!(
-            "spawn_agent: typed assignments require a built-in agent_type; unsupported role {role:?}"
-        ))),
+        Some(role) => match role.strip_prefix("kd4_").unwrap_or(role) {
+            "explorer" => Ok(AgentRole::Explorer),
+            "worker" => Ok(AgentRole::Worker),
+            "reviewer" => Ok(AgentRole::Reviewer),
+            "verifier" => Ok(AgentRole::Verifier),
+            "integrator" => Ok(AgentRole::Integrator),
+            _ => Err(FunctionCallError::RespondToModel(format!(
+                "spawn_agent: typed assignments require a supported agent_type; unsupported role {role:?}"
+            ))),
+        },
         None => Err(FunctionCallError::RespondToModel(
             "spawn_agent: typed assignments require an explicit agent_type".to_string(),
         )),
@@ -619,6 +621,22 @@ mod tests {
             Err(FunctionCallError::RespondToModel(message))
                 if message.contains("require fork_turns=\"none\"")
         ));
+    }
+
+    #[test]
+    fn kd4_role_configs_are_typed_role_aliases() {
+        for (agent_type, expected) in [
+            ("kd4_explorer", AgentRole::Explorer),
+            ("kd4_worker", AgentRole::Worker),
+            ("kd4_reviewer", AgentRole::Reviewer),
+            ("kd4_verifier", AgentRole::Verifier),
+            ("kd4_integrator", AgentRole::Integrator),
+        ] {
+            assert_eq!(
+                parse_typed_role(Some(agent_type)).expect("KD4 role should support typed tasks"),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -96,7 +96,7 @@ exit 99
                 fixture_root,
                 """export CALL_LOG="$PWD/calls.log"
 export PATH="$PWD/fake-bin:$PATH"
-export CODEX_DEBUG_USE_EXISTING_BINARY=1
+export CODEX_DEBUG_USE_EXISTING_BINARY=true
 bash scripts/debug-codex.sh "$@"
 """,
                 "value with spaces",
@@ -127,7 +127,7 @@ exit 37
                 fixture_root,
                 """export CALL_LOG="$PWD/calls.log"
 export PATH="$PWD/fake-bin:$PATH"
-unset CODEX_DEBUG_USE_EXISTING_BINARY
+export CODEX_DEBUG_USE_EXISTING_BINARY=true
 bash scripts/debug-codex.sh "$@"
 """,
                 "value with spaces",
@@ -135,6 +135,7 @@ bash scripts/debug-codex.sh "$@"
             )
 
             self.assertEqual(result.returncode, 37, result.stderr)
+            self.assertIn("CODEX_DEBUG_USE_EXISTING_BINARY is enabled", result.stderr)
             lines = (
                 (fixture_root / "calls.log").read_text(encoding="utf-8").splitlines()
             )

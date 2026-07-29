@@ -1,6 +1,12 @@
 [build]
-# Keep the desktop and editor responsive while scaling to the host CPU count.
-jobs = -2
+# Bound compiler fanout so local Cargo commands do not saturate the host.
+# CARGO_BUILD_JOBS or Cargo's -j/--jobs flag can opt into a different limit.
+jobs = 6
+
+[env]
+# Bound direct `cargo test` libtest fanout. An existing process environment
+# value or libtest's `--test-threads` flag can opt into a different limit.
+RUST_TEST_THREADS = { value = "6", force = false }
 
 [target.'cfg(all(windows, target_env = "msvc"))']
 rustflags = ["-C", "link-arg=/STACK:8388608", "-C", "target-feature=+crt-static"]

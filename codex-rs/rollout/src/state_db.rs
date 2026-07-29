@@ -454,7 +454,6 @@ pub async fn list_threads_db(
                         item.rollout_path.display()
                     );
                     warn!("state db discrepancy during list_threads_db: stale_db_path_dropped");
-                    let _ = ctx.delete_thread(item.id).await;
                 }
             }
             page.items = valid_items;

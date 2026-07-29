@@ -171,6 +171,14 @@ impl Session {
         let mut surviving_compaction_count = 0u64;
         let mut has_surviving_legacy_compaction_without_window_number = false;
         let mut window = None;
+        let has_segmented_turn_boundaries = rollout_items.iter().any(|item| {
+            matches!(
+                item,
+                RolloutItem::EventMsg(
+                    EventMsg::TurnStarted(_) | EventMsg::UserMessage(_) | EventMsg::TurnComplete(_)
+                )
+            )
+        });
         // Rollback is "drop the newest N user turns". While scanning in reverse, that becomes
         // "skip the next N user-turn segments we finalize".
         let mut pending_rollback_turns = 0usize;
@@ -227,9 +235,12 @@ impl Session {
                     }
                 }
                 RolloutItem::EventMsg(EventMsg::ThreadRolledBack(rollback)) => {
-                    discarded_history_effect_indexes.insert(index);
-                    pending_rollback_turns = pending_rollback_turns
-                        .saturating_add(usize::try_from(rollback.num_turns).unwrap_or(usize::MAX));
+                    if has_segmented_turn_boundaries {
+                        discarded_history_effect_indexes.insert(index);
+                        pending_rollback_turns = pending_rollback_turns.saturating_add(
+                            usize::try_from(rollback.num_turns).unwrap_or(usize::MAX),
+                        );
+                    }
                 }
                 RolloutItem::EventMsg(EventMsg::TurnComplete(event)) => {
                     let active_segment =

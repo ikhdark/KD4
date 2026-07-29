@@ -29,9 +29,17 @@ class ReadmeTocTest(unittest.TestCase):
             [
                 "- [Install & Setup](#install--setup)",
                 "  - [API\u00a0Reference](#api-reference)",
-                "    - [Fast\u2011Path \u2014 Notes!](#fast-path---notes)",
+                "    - [Fast\u2011Path \u2014 Notes!](#fastpath--notes)",
             ],
         )
+
+    def test_slugify_preserves_underscores_and_removes_unicode_dashes(self) -> None:
+        self.assertEqual(
+            readme_toc.slugify_heading("run_tui_with_exec_server.sh"),
+            "run_tui_with_exec_serversh",
+        )
+        self.assertEqual(readme_toc.slugify_heading("A \u2013 B"), "a--b")
+        self.assertEqual(readme_toc.slugify_heading("A \u2014 B"), "a--b")
 
     def test_generate_toc_lines_disambiguates_duplicate_slugs(self) -> None:
         lines = [
@@ -58,6 +66,20 @@ class ReadmeTocTest(unittest.TestCase):
                     "~~~",
                     "## Still Code",
                     "```",
+                    "## Real",
+                ]
+            ),
+            ["- [Real](#real)"],
+        )
+
+    def test_generate_toc_lines_requires_closing_fence_at_least_as_long(self) -> None:
+        self.assertEqual(
+            readme_toc.generate_toc_lines(
+                [
+                    "````text",
+                    "```",
+                    "## Still Code",
+                    "````",
                     "## Real",
                 ]
             ),
@@ -113,6 +135,25 @@ class ReadmeTocTest(unittest.TestCase):
         self.assertEqual(parsed.current, ["unexpected prose"])
         self.assertNotEqual(parsed.current, parsed.expected)
 
+    def test_parse_toc_ignores_markers_inside_code_fences(self) -> None:
+        lines = [
+            "````markdown",
+            readme_toc.BEGIN_TOC,
+            "```",
+            readme_toc.END_TOC,
+            "````",
+            readme_toc.BEGIN_TOC,
+            "- [Current](#current)",
+            readme_toc.END_TOC,
+            "## Current",
+        ]
+
+        parsed = readme_toc.parse_markdown_toc(lines)
+
+        self.assertEqual(parsed.begin_idx, 5)
+        self.assertEqual(parsed.end_idx, 7)
+        self.assertEqual(parsed.expected, ["- [Current](#current)"])
+
     def test_parse_toc_rejects_duplicate_or_unexpected_markers(self) -> None:
         malformed = (
             [readme_toc.BEGIN_TOC, readme_toc.BEGIN_TOC, readme_toc.END_TOC],
@@ -131,17 +172,8 @@ class ReadmeTocTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "README.md"
             path.write_text(
-                "\n".join(
-                    [
-                        "# Title",
-                        readme_toc.BEGIN_TOC,
-                        "- [Old](#old)",
-                        readme_toc.END_TOC,
-                        "",
-                        "## New Section",
-                    ]
-                )
-                + "\n",
+                f"# Title\n{readme_toc.BEGIN_TOC}\n- [Old](#old)\n"
+                f"{readme_toc.END_TOC}\n\n## New Section\n",
                 encoding="utf-8",
             )
 
@@ -150,20 +182,55 @@ class ReadmeTocTest(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(
                 path.read_text(encoding="utf-8"),
-                "\n".join(
-                    [
-                        "# Title",
-                        readme_toc.BEGIN_TOC,
-                        "",
-                        "- [New Section](#new-section)",
-                        "",
-                        readme_toc.END_TOC,
-                        "",
-                        "## New Section",
-                    ]
-                )
-                + "\n",
+                f"# Title\n{readme_toc.BEGIN_TOC}\n\n"
+                f"- [New Section](#new-section)\n\n{readme_toc.END_TOC}\n\n"
+                "## New Section\n",
             )
+
+    def test_fix_preserves_crlf_and_nonstandard_separators_outside_toc(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "README.md"
+            original = (
+                "# Title\r\n"
+                f"{readme_toc.BEGIN_TOC}\r\n"
+                "- [Old](#old)\r\n"
+                f"{readme_toc.END_TOC}\r\n"
+                "Before\x85After\r\n"
+                "## New Section\r\n"
+            )
+            path.write_text(original, encoding="utf-8", newline="")
+
+            result = readme_toc.check_or_fix(path, fix=True)
+
+            self.assertEqual(result, 0)
+            with path.open("r", encoding="utf-8", newline="") as readme_file:
+                updated = readme_file.read()
+            self.assertIn("Before\x85After\r\n", updated)
+            self.assertNotIn("\n", updated.replace("\r\n", ""))
+            self.assertIn("- [New Section](#new-section)\r\n", updated)
+
+    def test_out_of_date_error_is_written_to_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "README.md"
+            path.write_text(
+                f"{readme_toc.BEGIN_TOC}\n"
+                "- [Old](#old)\n"
+                f"{readme_toc.END_TOC}\n"
+                "## New\n",
+                encoding="utf-8",
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                contextlib.redirect_stdout(stdout),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = readme_toc.check_or_fix(path, fix=False)
+
+            self.assertEqual(result, 1)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("out of date", stderr.getvalue())
 
     def test_capped_diff_reports_truncation(self) -> None:
         current = [f"- [Old {index}](#old-{index})" for index in range(12)]

@@ -9,6 +9,8 @@ use codex_agent_task_store::RiskDomain;
 use codex_agent_task_store::RiskFacts;
 use codex_agent_task_store::RiskGateDecision;
 use codex_agent_task_store::evaluate_risk_gate;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
@@ -43,6 +45,47 @@ pub(crate) struct TypedToolRequest<'a> {
     pub class: TypedToolClass,
     pub external_mutation_intent: ExternalMutationIntent,
     pub repo_paths: &'a [String],
+}
+
+pub(crate) fn is_independent_review_source(source: &SessionSource) -> bool {
+    match source {
+        SessionSource::SubAgent(SubAgentSource::Review) => true,
+        SessionSource::SubAgent(SubAgentSource::ThreadSpawn {
+            agent_role: Some(role),
+            ..
+        }) => matches!(role.as_str(), "reviewer" | "kd4_reviewer"),
+        _ => false,
+    }
+}
+
+pub(crate) fn validate_independent_review_shell(
+    source: &SessionSource,
+    inspection_command: bool,
+    sandbox_override: bool,
+    additional_permissions: bool,
+) -> Result<(), &'static str> {
+    if !is_independent_review_source(source) {
+        return Ok(());
+    }
+    if sandbox_override || additional_permissions {
+        return Err(
+            "independent reviewers cannot request shell sandbox overrides or additional permissions",
+        );
+    }
+    if !inspection_command {
+        return Err("independent reviewers may run only shell commands proven read-only");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_independent_review_stdin(
+    source: &SessionSource,
+    chars: &str,
+) -> Result<(), &'static str> {
+    if is_independent_review_source(source) && !chars.is_empty() {
+        return Err("independent reviewers may only poll read-only shell commands");
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -207,6 +250,7 @@ pub(crate) fn classify_typed_tool(
         &[
             "search_source",
             "read_file_span",
+            "read_tool_output",
             "tool_search",
             "view_image",
             "list_mcp_resources",
@@ -221,15 +265,7 @@ pub(crate) fn classify_typed_tool(
     if matches_name(name, &["git_diff"]) {
         return TypedToolClass::Diff;
     }
-    if matches_name(
-        name,
-        &[
-            "shell_command",
-            "exec_command",
-            "write_stdin",
-            "verify_local",
-        ],
-    ) {
+    if matches_name(name, &["shell_command", "exec_command", "write_stdin"]) {
         return TypedToolClass::Shell;
     }
     if name == "apply_patch" {
@@ -243,8 +279,8 @@ pub(crate) fn classify_typed_tool(
 
 /// Applies the typed capability profile to a classified tool call.
 ///
-/// Shell authorization is intentionally coarse here. The shell handler admits only commands that
-/// the shared command-safety classifier proves read-only, plus the bounded `verify_local` tool.
+/// Shell authorization is intentionally coarse here. Shell execution handlers admit only commands
+/// that the shared command-safety classifier proves read-only.
 /// Source mutation is authorized only for structured edits whose complete path set is in scope.
 pub(crate) fn authorize_typed_tool(
     assignment: &Assignment,
@@ -423,7 +459,8 @@ fn profile_allows_diff(profile: CapabilityProfile) -> bool {
 fn profile_allows_shell(profile: CapabilityProfile) -> bool {
     matches!(
         profile,
-        CapabilityProfile::ReadSearchShell
+        CapabilityProfile::ReadSearchDiff
+            | CapabilityProfile::ReadSearchShell
             | CapabilityProfile::ScopedSourceWrite
             | CapabilityProfile::IntegratorSourceWrite
     )

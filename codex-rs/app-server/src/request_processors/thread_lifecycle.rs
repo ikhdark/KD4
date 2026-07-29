@@ -549,13 +549,15 @@ pub(super) async fn handle_pending_thread_resume_request(
     let request_id = pending.request_id;
     let connection_id = request_id.connection_id;
     let mut thread = pending.thread_summary;
-    if pending.include_turns {
-        populate_thread_turns_from_history(
+    let token_usage_turn_id = if pending.include_turns {
+        Some(populate_thread_turns_from_history_with_token_usage(
             &mut thread,
             &pending.history_items,
             active_turn.as_ref(),
-        );
-    }
+        ))
+    } else {
+        None
+    };
 
     let thread_status = thread_watch_manager
         .loaded_status_for_thread(&thread.id)
@@ -566,7 +568,6 @@ pub(super) async fn handle_pending_thread_resume_request(
         thread_status,
         has_live_in_progress_turn,
     );
-    let token_usage_thread = pending.include_turns.then(|| thread.clone());
     let mut initial_turns_page = if let Some(params) = pending.initial_turns_page.as_ref() {
         match super::thread_processor::build_thread_resume_initial_turns_page(
             &pending.history_items,
@@ -661,18 +662,13 @@ pub(super) async fn handle_pending_thread_resume_request(
         .await;
     // Match cold resume: metadata-only resume should attach the listener without
     // paying the cost of turn reconstruction for historical usage replay.
-    if let Some(token_usage_thread) = token_usage_thread {
-        let token_usage_turn_id = latest_token_usage_turn_id_from_rollout_items(
-            &pending.history_items,
-            token_usage_thread.turns.as_slice(),
-        );
+    if let Some(token_usage_turn_id) = token_usage_turn_id {
         // Rejoining a loaded thread has the same UI contract as a cold resume, but
         // uses the live conversation state instead of reconstructing a new session.
         send_thread_token_usage_update_to_connection(
             outgoing,
             connection_id,
             conversation_id,
-            &token_usage_thread,
             conversation.as_ref(),
             token_usage_turn_id,
         )
@@ -743,6 +739,21 @@ pub(crate) fn populate_thread_turns_from_history(
         merge_turn_history_with_active_turn(&mut turns, active_turn.clone());
     }
     thread.turns = turns;
+}
+
+pub(super) fn populate_thread_turns_from_history_with_token_usage(
+    thread: &mut Thread,
+    items: &[RolloutItem],
+    active_turn: Option<&Turn>,
+) -> String {
+    let (mut turns, token_usage_replay) =
+        super::token_usage_replay::build_turns_with_token_usage_replay(items);
+    if let Some(active_turn) = active_turn {
+        merge_turn_history_with_active_turn(&mut turns, active_turn.clone());
+    }
+    let token_usage_turn_id = token_usage_replay.into_turn_id(&turns);
+    thread.turns = turns;
+    token_usage_turn_id
 }
 
 pub(super) async fn resolve_pending_server_request(

@@ -17,10 +17,30 @@ function ConvertTo-SafeCargoLaneName {
     )
 
     $safe = ([string]$Value -replace "[^A-Za-z0-9_.-]", "-").Trim("-")
-    if ([string]::IsNullOrWhiteSpace($safe) -or $safe -in @(".", "..")) {
+    if ([string]::IsNullOrWhiteSpace($safe) -or $safe -match "^\.+$") {
         throw "Cargo target lane cannot be empty."
     }
     return $safe
+}
+
+function Restore-ProcessEnvironmentVariable {
+    param(
+        [string]$Name,
+        [AllowNull()]
+        [string]$Value,
+        [bool]$WasSet
+    )
+
+    if ($WasSet) {
+        [System.Environment]::SetEnvironmentVariable(
+            $Name,
+            $Value,
+            [System.EnvironmentVariableTarget]::Process
+        )
+    }
+    else {
+        Remove-Item "Env:$Name" -ErrorAction SilentlyContinue
+    }
 }
 
 function Test-StringArrayEqual {
@@ -106,6 +126,12 @@ $oldCargoIncremental = $env:CARGO_INCREMENTAL
 $oldCargoTargetDir = $env:CARGO_TARGET_DIR
 $oldRustcWrapper = $env:RUSTC_WRAPPER
 $oldWindowsMsvcLinker = $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
+$hadSccacheBaseDir = Test-Path Env:SCCACHE_BASEDIR
+$hadSccacheCacheSize = Test-Path Env:SCCACHE_CACHE_SIZE
+$hadCargoIncremental = Test-Path Env:CARGO_INCREMENTAL
+$hadCargoTargetDir = Test-Path Env:CARGO_TARGET_DIR
+$hadRustcWrapper = Test-Path Env:RUSTC_WRAPPER
+$hadWindowsMsvcLinker = Test-Path Env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER
 $oldNativeCommandUseErrorActionPreference = Get-Variable -Name PSNativeCommandUseErrorActionPreference -ValueOnly -ErrorAction SilentlyContinue
 $hadNativeCommandUseErrorActionPreference = $null -ne (Get-Variable -Name PSNativeCommandUseErrorActionPreference -ErrorAction SilentlyContinue)
 $didPushLocation = $false
@@ -171,8 +197,9 @@ try {
     $program = $ProgramArgs[0]
     $arguments = @($ProgramArgs | Select-Object -Skip 1)
     & $program @arguments
+    $invokeOk = $?
     if ($null -eq $LASTEXITCODE) {
-        if ($?) {
+        if ($invokeOk) {
             $exitCode = 0
         }
         else {
@@ -187,12 +214,12 @@ finally {
     if ($didPushLocation) {
         Pop-Location -StackName $locationStackName
     }
-    $env:SCCACHE_BASEDIR = $oldSccacheBaseDir
-    $env:SCCACHE_CACHE_SIZE = $oldSccacheCacheSize
-    $env:CARGO_INCREMENTAL = $oldCargoIncremental
-    $env:CARGO_TARGET_DIR = $oldCargoTargetDir
-    $env:RUSTC_WRAPPER = $oldRustcWrapper
-    $env:CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER = $oldWindowsMsvcLinker
+    Restore-ProcessEnvironmentVariable -Name "SCCACHE_BASEDIR" -Value $oldSccacheBaseDir -WasSet $hadSccacheBaseDir
+    Restore-ProcessEnvironmentVariable -Name "SCCACHE_CACHE_SIZE" -Value $oldSccacheCacheSize -WasSet $hadSccacheCacheSize
+    Restore-ProcessEnvironmentVariable -Name "CARGO_INCREMENTAL" -Value $oldCargoIncremental -WasSet $hadCargoIncremental
+    Restore-ProcessEnvironmentVariable -Name "CARGO_TARGET_DIR" -Value $oldCargoTargetDir -WasSet $hadCargoTargetDir
+    Restore-ProcessEnvironmentVariable -Name "RUSTC_WRAPPER" -Value $oldRustcWrapper -WasSet $hadRustcWrapper
+    Restore-ProcessEnvironmentVariable -Name "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER" -Value $oldWindowsMsvcLinker -WasSet $hadWindowsMsvcLinker
     if ($hadNativeCommandUseErrorActionPreference) {
         $PSNativeCommandUseErrorActionPreference = $oldNativeCommandUseErrorActionPreference
     }

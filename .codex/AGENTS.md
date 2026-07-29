@@ -32,7 +32,6 @@ Generated or local runtime state includes:
 
 - `.codex/environments/environment.toml`
 - `.codex/harness/runs/**`
-- `.codex/verify-local/**`
 - `.codex/app-asar-backups/**`
 - `.codex/app-asar-work/**`, except durable instructions explicitly kept there
 - `.codex/codex-desktop-patched/**`

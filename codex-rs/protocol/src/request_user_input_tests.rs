@@ -15,7 +15,7 @@ fn request_user_input_accepts_three_questions_and_preserves_optional_fields() {
                 "question": "Pick one",
                 "isOther": true,
                 "isSecret": true,
-                "options": option_json(3)
+                "options": option_json(4)
             }
         ],
         "autoResolutionMs": 42
@@ -25,7 +25,7 @@ fn request_user_input_accepts_three_questions_and_preserves_optional_fields() {
     assert_eq!(args.questions.len(), 3);
     assert!(args.questions[2].is_other);
     assert!(args.questions[2].is_secret);
-    assert_eq!(args.questions[2].options.as_ref().map(Vec::len), Some(3));
+    assert_eq!(args.questions[2].options.as_ref().map(Vec::len), Some(4));
     assert_eq!(args.auto_resolution_ms, Some(42));
 }
 
@@ -86,24 +86,24 @@ fn request_user_input_counts_header_characters_not_bytes() {
 }
 
 #[test]
-fn request_user_input_accepts_two_or_three_options() {
-    for count in [2, 3] {
+fn request_user_input_accepts_two_to_four_options() {
+    for count in [2, 3, 4] {
         serde_json::from_value::<RequestUserInputArgs>(json!({
             "questions": [question_json("q1", "Mode", count)]
         }))
-        .expect("two or three options should deserialize");
+        .expect("two to four options should deserialize");
     }
 }
 
 #[test]
 fn request_user_input_rejects_option_count_outside_bounds() {
-    for count in [0, 1, 4] {
+    for count in [0, 1, 5] {
         let err = serde_json::from_value::<RequestUserInputArgs>(json!({
             "questions": [question_json("q1", "Mode", count)]
         }))
-        .expect_err("option count outside 2..=3 should fail");
+        .expect_err("option count outside 2..=4 should fail");
 
-        assert!(err.to_string().contains("2 to 3 choices"));
+        assert!(err.to_string().contains("2 to 4 choices"));
     }
 }
 

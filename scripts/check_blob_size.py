@@ -9,6 +9,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 
 DEFAULT_MAX_BYTES = 500 * 1024
@@ -27,6 +28,10 @@ class ChangedBlob:
 class ChangedPath:
     path: str
     is_binary: bool
+
+
+class BlobLookupError(RuntimeError):
+    """A requested path cannot be resolved to a blob at the selected revision."""
 
 
 def run_git(*args: str, input_text: str | None = None) -> str:
@@ -49,7 +54,12 @@ def load_allowlist(path: Path) -> set[str]:
     allowlist: set[str] = set()
     with path.open(encoding="utf-8") as handle:
         for raw_line in handle:
-            line = raw_line.split("#", 1)[0].strip()
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            inline_comment = line.find(" #")
+            if inline_comment >= 0:
+                line = line[:inline_comment].rstrip()
             if line:
                 allowlist.add(line)
     return allowlist
@@ -96,7 +106,6 @@ def get_changed_paths(
     if paths is not None:
         if not include_kind:
             return [ChangedPath(path=path, is_binary=False) for path in paths]
-        args.extend(["--", *paths])
         output = run_git_func(*args)
         binary_by_path = {
             changed.path: changed.is_binary for changed in parse_numstat_z(output)
@@ -116,14 +125,44 @@ def batch_blob_sizes(
         return {}
     input_text = "".join(f"{commit}:{path}\0" for path in paths)
     output = run_git_func(
-        "cat-file", "-Z", "--batch-check=%(objectsize)", input_text=input_text
+        "cat-file",
+        "-Z",
+        "--batch-check=%(objecttype) %(objectsize)",
+        input_text=input_text,
     )
-    sizes = [int(entry) for entry in output.split("\0") if entry]
-    if len(sizes) != len(paths):
-        raise RuntimeError(
-            f"git cat-file returned {len(sizes)} size(s) for {len(paths)} path(s)"
+    entries = output.split("\0")
+    if entries and entries[-1] == "":
+        entries.pop()
+    if len(entries) != len(paths):
+        raise BlobLookupError(
+            f"git cat-file returned {len(entries)} result(s) for {len(paths)} path(s)"
         )
-    return dict(zip(paths, sizes, strict=True))
+    sizes: dict[str, int] = {}
+    for path, entry in zip(paths, entries, strict=True):
+        if entry.endswith(" missing"):
+            raise BlobLookupError(
+                f"{path!r} does not exist as a blob at {commit!r} "
+                f"(git cat-file returned {entry!r})"
+            )
+        fields = entry.split(" ", 1)
+        if len(fields) != 2:
+            raise BlobLookupError(
+                f"{path!r} does not exist as a blob at {commit!r} "
+                f"(git cat-file returned {entry!r})"
+            )
+        object_type, size_text = fields
+        if object_type != "blob":
+            raise BlobLookupError(
+                f"{path!r} is not a blob at {commit!r} (object type is {object_type!r})"
+            )
+        try:
+            sizes[path] = int(size_text)
+        except ValueError as exc:
+            raise BlobLookupError(
+                f"git cat-file returned an invalid size for {path!r} at {commit!r} "
+                f"(git cat-file returned {entry!r})"
+            ) from exc
+    return sizes
 
 
 def collect_changed_blobs(
@@ -229,7 +268,7 @@ def blob_status(blob: ChangedBlob, violation_paths: set[str]) -> str:
     return "ok"
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Fail if changed blobs exceed the configured size budget."
     )
@@ -265,7 +304,7 @@ def main() -> int:
         type=Path,
         help="Read changed repo-relative paths from a newline- or NUL-delimited file.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     allowlist = load_allowlist(args.allowlist)
     paths = None
@@ -274,13 +313,17 @@ def main() -> int:
     elif args.paths_file is not None:
         paths = load_paths_file(args.paths_file)
 
-    blobs = collect_changed_blobs(
-        args.base,
-        args.head,
-        allowlist,
-        paths=paths,
-        include_kind=args.include_kind,
-    )
+    try:
+        blobs = collect_changed_blobs(
+            args.base,
+            args.head,
+            allowlist,
+            paths=paths,
+            include_kind=args.include_kind,
+        )
+    except BlobLookupError as exc:
+        print(f"Blob size check failed: {exc}", file=sys.stderr)
+        return 2
     violations = [
         blob
         for blob in blobs

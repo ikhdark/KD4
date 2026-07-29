@@ -78,7 +78,7 @@ mod tests {
             prompt.starts_with("You are Codex, a coding agent operating in a shared workspace.")
         );
         assert!(prompt.contains("# Instruction precedence"));
-        assert!(prompt.contains("# Working with the user"));
+        assert!(prompt.contains("# Communication"));
         assert!(!prompt.contains("{{ user_first_name }}"));
     }
 }

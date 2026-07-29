@@ -12,7 +12,6 @@ from scripts.publish_local_codex_test_support import PublishLocalCodexTestBase
 
 
 SCRIPT = Path(__file__).resolve().parent / "publish-local-codex.ps1"
-HASHING_HELPER = Path(__file__).resolve().parent / "publish-local-codex.hashing.ps1"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 RUN_TIMEOUT_SECONDS = 120
 FIXTURE_TIME = 946684900
@@ -33,6 +32,8 @@ def ps_single_quote(value: str | Path) -> str:
 
 PUBLISH_ENV_VARS = (
     "CODEX_LOCAL_PUBLISH_DIR",
+    "CODEX_LOCAL_CODEX_HOME",
+    "CODEX_LOCAL_CODEX_SQLITE_HOME",
     "CODEX_HOME",
     "CODEX_SQLITE_HOME",
     "CODEX_CLI_PATH",

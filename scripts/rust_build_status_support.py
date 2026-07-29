@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
 import shutil
+import stat
 import tomllib
 from typing import Callable
 from typing import Mapping
@@ -62,6 +63,8 @@ def directory_size_bytes(path: Path) -> tuple[int, int]:
             with os.scandir(current) as entries:
                 for entry in entries:
                     try:
+                        if _is_reparse_point(entry):
+                            continue
                         if entry.is_dir(follow_symlinks=False):
                             stack.append(entry.path)
                         elif entry.is_file(follow_symlinks=False):
@@ -71,6 +74,23 @@ def directory_size_bytes(path: Path) -> tuple[int, int]:
         except OSError:
             errors += 1
     return total, errors
+
+
+def _is_reparse_point(entry: os.DirEntry[str]) -> bool:
+    if os.name != "nt":
+        return False
+    junction_probe = getattr(entry, "is_junction", None)
+    if callable(junction_probe):
+        try:
+            if junction_probe():
+                return True
+        except OSError:
+            return True
+    try:
+        attributes = getattr(entry.stat(follow_symlinks=False), "st_file_attributes", 0)
+    except OSError:
+        return True
+    return bool(attributes & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
 
 def bounded_size_workers(size_workers: int, path_count: int) -> int:
@@ -173,13 +193,13 @@ def build_doctor_report(
         )
 
     lines.append(
-        f"active Rust jobs: {len(processes)} total, {len(shared)} shared-target, {len(lane_processes)} lane"
+        f"active Rust processes: {len(processes)} total, {len(shared)} shared-target, {len(lane_processes)} lane"
     )
     if shared:
         lines.append(
             "shared-target jobs are active; prefer `just test-lane-fast <lane> ...`"
         )
-    if lane_processes:
+    if snapshot.active_lanes:
         active_lanes = sorted(snapshot.active_lanes)
         lines.append(
             "active lanes: " + ", ".join(lane for lane in active_lanes if lane)
@@ -316,7 +336,7 @@ def target_optimize_report(
 
 def powershell_remove_item_command(path: Path) -> str:
     escaped = str(path).replace("'", "''")
-    return f"Remove-Item -Recurse -LiteralPath '{escaped}'"
+    return f"Remove-Item -Recurse -Force -LiteralPath '{escaped}'"
 
 
 def warn_bytes_from_gib(warn_gib: float) -> int:

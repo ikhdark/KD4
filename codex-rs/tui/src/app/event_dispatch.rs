@@ -334,8 +334,15 @@ impl App {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }
             AppEvent::CodexOp(op) => {
+                let is_user_turn = matches!(&op, AppCommand::UserTurn { .. });
                 self.chat_widget.prepare_local_op_submission(&op);
-                self.submit_active_thread_op(app_server, op).await?;
+                if let Err(err) = self.submit_active_thread_op(app_server, op).await {
+                    if is_user_turn {
+                        self.chat_widget.on_error(format!("{err:#}"));
+                    } else {
+                        return Err(err);
+                    }
+                }
             }
             AppEvent::RetrySafetyBufferedTurn {
                 thread_id,

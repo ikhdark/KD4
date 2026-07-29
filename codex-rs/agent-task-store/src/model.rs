@@ -336,11 +336,23 @@ impl ValidationCallStatus {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationProofKind {
+    #[default]
+    LegacyUnclassified,
+    Focused,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ValidationCall {
     pub call_id: String,
     pub attempt_id: AttemptId,
     pub command_summary: String,
+    #[serde(default)]
+    pub resolved_executable: Option<String>,
+    #[serde(default)]
+    pub proof_kind: ValidationProofKind,
     pub status: ValidationCallStatus,
     pub recorded_at: DateTime<Utc>,
 }

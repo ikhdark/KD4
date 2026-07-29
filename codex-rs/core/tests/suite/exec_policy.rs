@@ -164,8 +164,8 @@ async fn unified_exec_disabled_windows_sandbox_rejects_managed_read_only_command
 
 #[tokio::test]
 async fn execpolicy_blocks_shell_invocation() -> Result<()> {
-    let mut builder = test_codex().with_config(|config| {
-        let policy_path = config.codex_home.join("rules").join("policy.rules");
+    let mut builder = test_codex().with_pre_build_hook(|codex_home| {
+        let policy_path = codex_home.join("rules").join("policy.rules");
         fs::create_dir_all(
             policy_path
                 .parent()
@@ -183,7 +183,9 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()> {
 
     let call_id = "shell-forbidden";
     let args = json!({
-        "command": "echo blocked",
+        "kind": "argv",
+        "program": "echo",
+        "args": ["blocked"],
         "timeout_ms": 1_000,
     });
 
@@ -196,7 +198,7 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()> {
         ]),
     )
     .await;
-    mount_sse_once(
+    let results_mock = mount_sse_once(
         &server,
         sse(vec![
             ev_assistant_message("msg-1", "done"),
@@ -235,23 +237,19 @@ async fn execpolicy_blocks_shell_invocation() -> Result<()> {
         })
         .await?;
 
-    let EventMsg::ExecCommandEnd(end) = wait_for_event(&test.codex, |event| {
-        matches!(event, EventMsg::ExecCommandEnd(_))
-    })
-    .await
-    else {
-        unreachable!()
-    };
     wait_for_event(&test.codex, |event| {
         matches!(event, EventMsg::TurnComplete(_))
     })
     .await;
 
+    let output_item = results_mock.single_request().function_call_output(call_id);
+    let output = output_item
+        .get("output")
+        .and_then(Value::as_str)
+        .expect("function call output should include a string output payload");
     assert!(
-        end.aggregated_output
-            .contains("policy forbids commands starting with `echo`"),
-        "unexpected output: {}",
-        end.aggregated_output
+        output.contains("policy forbids commands starting with `echo`"),
+        "unexpected output: {output}",
     );
 
     Ok(())

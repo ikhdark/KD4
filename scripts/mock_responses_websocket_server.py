@@ -7,14 +7,23 @@ import json
 import sys
 from typing import Any
 
+
+class MissingWebsocketsError(RuntimeError):
+    pass
+
+
 try:
     import websockets
+    from websockets.exceptions import ConnectionClosed
 except ModuleNotFoundError:
+
+    class ConnectionClosed(Exception):
+        pass
 
     class _MissingWebsockets:
         @staticmethod
         async def serve(*_args: Any, **_kwargs: Any) -> None:
-            raise RuntimeError(
+            raise MissingWebsocketsError(
                 "The mock Responses WebSocket server requires the 'websockets' package."
             )
 
@@ -136,6 +145,7 @@ def _log_conn(message: str, *, quiet: bool) -> None:
     if quiet:
         return
     sys.stdout.write(f"[conn] {_utc_iso()} {message}\n")
+    sys.stdout.flush()
 
 
 def _print_request(
@@ -152,12 +162,7 @@ def _print_request(
     else:
         body = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
     sys.stdout.write(f"{prefix} {_utc_iso()}\n{body}\n")
-
-
-def _message_size(message: str | bytes) -> int:
-    if isinstance(message, bytes):
-        return len(message)
-    return len(message.encode("utf-8"))
+    sys.stdout.flush()
 
 
 async def _recv_json(
@@ -166,16 +171,8 @@ async def _recv_json(
     *,
     quiet: bool,
     log_json: str,
-    max_message_bytes: int,
 ) -> Any:
     msg = await websocket.recv()
-    if _message_size(msg) > max_message_bytes:
-        _log_conn(
-            f"rejecting oversized message ({_message_size(msg)} > {max_message_bytes})",
-            quiet=quiet,
-        )
-        await websocket.close(code=1009, reason="message too large")
-        raise _ConnectionAbort
     try:
         if isinstance(msg, bytes):
             payload = json.loads(msg.decode("utf-8"))
@@ -215,12 +212,14 @@ async def _handle_connection(
     expected_path: str = PATH,
     quiet: bool = False,
     log_json: str = "pretty",
-    max_message_bytes: int = DEFAULT_MAX_MESSAGE_BYTES,
-) -> None:
-    # websockets v15 exposes the request path here.
+) -> bool:
+    # Modern websockets releases expose the request path here.
     path = getattr(getattr(websocket, "request", None), "path", None)
     if path is None:
-        # Older handler signatures could pass `path` separately; accept if unavailable.
+        # Legacy releases expose the path directly on the protocol.
+        path = getattr(websocket, "path", None)
+    if path is None:
+        # Accept if the handler API doesn't expose a path at all.
         path = "(unknown)"
 
     _log_conn(f"connected path={path}", quiet=quiet)
@@ -229,7 +228,7 @@ async def _handle_connection(
     if path_no_qs != "(unknown)" and path_no_qs != expected_path:
         _log_conn(f"rejecting unexpected path (expected {expected_path})", quiet=quiet)
         await websocket.close(code=1008, reason="unexpected websocket path")
-        return
+        return False
 
     # Request 1: provoke a function call (mirrors `codex-rs/core/tests/suite/agent_websocket.rs`).
     try:
@@ -238,7 +237,6 @@ async def _handle_connection(
             "req1",
             quiet=quiet,
             log_json=log_json,
-            max_message_bytes=max_message_bytes,
         )
         await _send_events(websocket, REQUEST_1_EVENT_JSON, quiet=quiet)
 
@@ -248,14 +246,14 @@ async def _handle_connection(
             "req2",
             quiet=quiet,
             log_json=log_json,
-            max_message_bytes=max_message_bytes,
         )
         await _send_events(websocket, REQUEST_2_EVENT_JSON, quiet=quiet)
     except _ConnectionAbort:
-        return
+        return False
 
     _log_conn("closing", quiet=quiet)
     await websocket.close()
+    return True
 
 
 def _config_snippet(ws_uri: str) -> str:
@@ -280,18 +278,18 @@ async def _serve(
 
     async def handler(ws: Any) -> None:
         nonlocal sessions_seen
+        completed = False
         try:
-            await _handle_connection(
+            completed = await _handle_connection(
                 ws,
                 expected_path=PATH,
                 quiet=quiet,
                 log_json=log_json,
-                max_message_bytes=max_message_bytes,
             )
-        except websockets.exceptions.ConnectionClosedOK:
+        except ConnectionClosed:
             return
         finally:
-            if max_sessions is not None:
+            if completed and max_sessions is not None:
                 sessions_seen += 1
                 if sessions_seen >= max_sessions:
                     finished.set()
@@ -306,6 +304,11 @@ async def _serve(
         )
     except OSError as err:
         sys.stderr.write(f"[server] failed to bind ws://{HOST}:{port}: {err}\n")
+        sys.stderr.flush()
+        return 2
+    except MissingWebsocketsError as err:
+        sys.stderr.write(f"[server] failed to start: {err}\n")
+        sys.stderr.flush()
         return 2
     bound_port = server.sockets[0].getsockname()[1]
     ws_uri = f"ws://{HOST}:{bound_port}"
@@ -369,8 +372,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         type=_positive_int,
         default=DEFAULT_MAX_MESSAGE_BYTES,
         help=(
-            "Reject inbound messages above this size and pass the same cap to "
-            f"websockets (default: {DEFAULT_MAX_MESSAGE_BYTES})."
+            "Set the websockets inbound message cap "
+            f"(default: {DEFAULT_MAX_MESSAGE_BYTES})."
         ),
     )
     parser.add_argument(

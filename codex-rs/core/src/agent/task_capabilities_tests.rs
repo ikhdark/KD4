@@ -8,6 +8,9 @@ use codex_agent_task_store::AttemptId;
 use codex_agent_task_store::AttributionConfidence;
 use codex_agent_task_store::MutationEvidence;
 use codex_agent_task_store::RelationKind;
+use codex_protocol::ThreadId;
+use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::SubAgentSource;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 use tempfile::TempDir;
@@ -23,7 +26,6 @@ impl RepoFixture {
             "src/nested",
             "codex-rs/protocol/src",
             "codex-rs/target/debug",
-            ".codex/verify-local",
             "build/artifacts",
         ] {
             std::fs::create_dir_all(root.path().join(directory))
@@ -149,8 +151,11 @@ fn tool_classification_separates_typed_authority() {
     for (name, class) in [
         ("search_source", TypedToolClass::ReadSearch),
         ("read_file_span", TypedToolClass::ReadSearch),
+        ("read_tool_output", TypedToolClass::ReadSearch),
         ("git_diff", TypedToolClass::Diff),
         ("shell_command", TypedToolClass::Shell),
+        ("exec_command", TypedToolClass::Shell),
+        ("write_stdin", TypedToolClass::Shell),
         ("apply_patch", TypedToolClass::StructuredEdit),
         ("mcp__server__read", TypedToolClass::DynamicExternal),
         ("future_unclassified_tool", TypedToolClass::Unknown),
@@ -234,7 +239,8 @@ fn profiles_receive_only_their_declared_tool_classes() {
                 .is_ok(),
             matches!(
                 profile,
-                CapabilityProfile::ReadSearchShell
+                CapabilityProfile::ReadSearchDiff
+                    | CapabilityProfile::ReadSearchShell
                     | CapabilityProfile::ScopedSourceWrite
                     | CapabilityProfile::IntegratorSourceWrite
             )
@@ -266,6 +272,47 @@ fn profiles_receive_only_their_declared_tool_classes() {
             Err(CapabilityPolicyError::UnknownToolDenied)
         );
     }
+}
+
+#[test]
+fn independent_review_sources_include_automatic_and_kd4_reviewers() {
+    assert!(is_independent_review_source(&SessionSource::SubAgent(
+        SubAgentSource::Review
+    )));
+    for role in ["reviewer", "kd4_reviewer"] {
+        assert!(is_independent_review_source(&SessionSource::SubAgent(
+            SubAgentSource::ThreadSpawn {
+                parent_thread_id: ThreadId::new(),
+                depth: 1,
+                agent_path: None,
+                agent_nickname: None,
+                agent_role: Some(role.to_string()),
+            }
+        )));
+    }
+    assert!(!is_independent_review_source(&SessionSource::SubAgent(
+        SubAgentSource::ThreadSpawn {
+            parent_thread_id: ThreadId::new(),
+            depth: 1,
+            agent_path: None,
+            agent_nickname: None,
+            agent_role: Some("kd4_verifier".to_string()),
+        }
+    )));
+}
+
+#[test]
+fn independent_review_shell_policy_is_read_only_on_every_shell_route() {
+    let reviewer = SessionSource::SubAgent(SubAgentSource::Review);
+    assert!(validate_independent_review_shell(&reviewer, true, false, false).is_ok());
+    assert!(validate_independent_review_shell(&reviewer, false, false, false).is_err());
+    assert!(validate_independent_review_shell(&reviewer, true, true, false).is_err());
+    assert!(validate_independent_review_shell(&reviewer, true, false, true).is_err());
+    assert!(validate_independent_review_stdin(&reviewer, "").is_ok());
+    assert!(validate_independent_review_stdin(&reviewer, "y\n").is_err());
+
+    assert!(validate_independent_review_shell(&SessionSource::Cli, false, true, true).is_ok());
+    assert!(validate_independent_review_stdin(&SessionSource::Cli, "y\n").is_ok());
 }
 
 #[test]

@@ -238,47 +238,6 @@ impl TurnDiffTracker {
         }
     }
 
-    pub(crate) fn record_verified_validation(
-        &mut self,
-        command: Vec<String>,
-        environment_id: &str,
-        active_files: &[PathBuf],
-        clear_unknown_mutation: bool,
-    ) -> bool {
-        if !is_verify_local_proof_command(&command) {
-            return false;
-        }
-        let covered_candidates = active_files
-            .iter()
-            .flat_map(|path| {
-                let mut candidates = vec![TrackedPath::new(environment_id, path)];
-                if path.is_relative()
-                    && let Some(root) = self.display_roots_by_environment.get(environment_id)
-                {
-                    candidates.push(TrackedPath::new(environment_id, root.join(path).as_path()));
-                }
-                candidates
-            })
-            .collect::<Vec<_>>();
-        self.unvalidated_paths.retain(|path| {
-            !covered_candidates.iter().any(|covered| {
-                path.environment_id == covered.environment_id
-                    && (path.path == covered.path || path.path.starts_with(&covered.path))
-            })
-        });
-        if clear_unknown_mutation && self.can_clear_unknown_for_environment(environment_id) {
-            self.unvalidated_unknown_mutation = false;
-        }
-
-        self.has_successful_validation = true;
-        let all_current_mutations_covered = !self.has_unvalidated_mutation();
-        if all_current_mutations_covered {
-            self.last_post_mutation_validation_status =
-                ValidationFreshnessStatus::PassedAfterLastMutation;
-        }
-        all_current_mutations_covered
-    }
-
     pub(crate) fn has_unvalidated_mutation(&self) -> bool {
         self.unvalidated_unknown_mutation || !self.unvalidated_paths.is_empty()
     }
@@ -789,7 +748,6 @@ fn is_validation_tokens(tokens: &[String]) -> bool {
                     | "test-lane-fast"
                     | "check"
                     | "check-lane"
-                    | "verify-local"
                     | "fix"
             )
         ),
@@ -820,16 +778,6 @@ fn is_validation_tokens(tokens: &[String]) -> bool {
         }),
         _ => false,
     }
-}
-
-fn is_verify_local_proof_command(command: &[String]) -> bool {
-    let tokens = normalized_command_tokens(command);
-    let tokens = unwrap_command_tokens(&tokens);
-    matches!(tokens, [first, second, ..] if command_basename(first) == "just" && second == "verify-local")
-        && tokens
-            .iter()
-            .any(|token| matches!(token.as_str(), "--fast" | "--final"))
-        && tokens.iter().any(|token| token == "--json")
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -965,23 +913,6 @@ fn just_validation_coverage(tokens: &[String], cwd: Option<&Path>) -> Validation
     let Some(recipe) = tokens.get(1).map(String::as_str) else {
         return ValidationCoverage::ScopedUnknown;
     };
-    if recipe == "verify-local" {
-        if tokens.iter().any(|token| token == "--plan") {
-            return ValidationCoverage::ScopedUnknown;
-        }
-        let paths = tokens
-            .iter()
-            .filter_map(|token| token.strip_prefix("--changed="))
-            .map(|path| resolve_scope_path(path, cwd))
-            .collect::<Vec<_>>();
-        if !paths.is_empty() {
-            return ValidationCoverage::Paths(paths);
-        }
-        if tokens.iter().any(|token| token == "--all-dirty") {
-            return ValidationCoverage::All;
-        }
-        return ValidationCoverage::ScopedUnknown;
-    }
     if let Some(package) = flag_value(tokens, &["-p", "--package"]) {
         return package_validation_coverage(package, cwd);
     }

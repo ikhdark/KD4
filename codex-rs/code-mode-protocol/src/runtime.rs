@@ -10,7 +10,11 @@ use crate::ToolDefinition;
 
 pub const DEFAULT_EXEC_YIELD_TIME_MS: u64 = 10_000;
 pub const DEFAULT_WAIT_YIELD_TIME_MS: u64 = 10_000;
-pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 10_000;
+/// Default for a successful exec result when no per-call limit is requested.
+///
+/// Failure/timeout and high-signal diagnostic defaults are selected adaptively
+/// by the core output-budget resolver.
+pub const DEFAULT_MAX_OUTPUT_TOKENS_PER_EXEC_CALL: usize = 4_000;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ExecuteRequest {

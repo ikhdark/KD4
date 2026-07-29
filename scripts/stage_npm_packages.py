@@ -99,6 +99,12 @@ class WorkflowArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkflowRunReference:
+    github_repo: str
+    run_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class StagePackageResult:
     package: str
     pack_output: Path
@@ -120,6 +126,13 @@ def _gha_enabled() -> bool:
 
 def _gha_escape(value: str) -> str:
     return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be > 0")
+    return parsed
 
 
 @contextmanager
@@ -177,7 +190,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-download-workers",
-        type=int,
+        type=positive_int,
         default=None,
         help=(
             "Maximum parallel GitHub artifact downloads "
@@ -187,7 +200,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-stage-workers",
-        type=int,
+        type=positive_int,
         default=1,
         help="Maximum packages to stage in parallel (default: 1).",
     )
@@ -231,14 +244,37 @@ def github_repo_cache_key(github_repo: str) -> str:
     return github_repo.replace("/", "__")
 
 
-def github_repo_from_workflow_url(workflow_url: str) -> str | None:
+def parse_workflow_run_url(workflow_url: str) -> WorkflowRunReference:
     parsed = urlparse(workflow_url)
-    if parsed.netloc.lower() != "github.com":
-        return None
     parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) >= 4 and parts[2] == "actions" and parts[3] == "runs":
-        return f"{parts[0]}/{parts[1]}"
-    return None
+    has_valid_attempt_suffix = (
+        len(parts) == 7 and parts[5] == "attempts" and parts[6].isdigit()
+    )
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.netloc.casefold() != "github.com"
+        or len(parts) not in (5, 7)
+        or parts[2] != "actions"
+        or parts[3] != "runs"
+        or not parts[4].isdigit()
+        or (len(parts) == 7 and not has_valid_attempt_suffix)
+    ):
+        raise ValueError(
+            "workflow URL must match "
+            "https://github.com/<owner>/<repo>/actions/runs/<run-id>"
+            "[/attempts/<attempt-id>]"
+        )
+    return WorkflowRunReference(
+        github_repo=f"{parts[0]}/{parts[1]}",
+        run_id=parts[4],
+    )
+
+
+def github_repo_from_workflow_url(workflow_url: str) -> str | None:
+    try:
+        return parse_workflow_run_url(workflow_url).github_repo
+    except ValueError:
+        return None
 
 
 @cache
@@ -360,7 +396,34 @@ def resolve_workflow_url(
 
 
 def workflow_id_from_url(workflow_url: str) -> str:
-    return workflow_url.rstrip("/").split("/")[-1]
+    return parse_workflow_run_url(workflow_url).run_id
+
+
+def warn_if_head_mismatch(
+    expected_head_sha: str,
+    *,
+    repo_root: Path = REPO_ROOT,
+) -> None:
+    try:
+        current_head_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(
+            f"warning: unable to compare checkout HEAD with workflow {expected_head_sha}: {exc}",
+            file=sys.stderr,
+        )
+        return
+    if current_head_sha.casefold() != expected_head_sha.casefold():
+        print(
+            "warning: current checkout HEAD "
+            f"{current_head_sha or '(unknown)'} does not match workflow HEAD "
+            f"{expected_head_sha}; staged sources may not match the native artifacts",
+            file=sys.stderr,
+        )
 
 
 @cache
@@ -771,9 +834,24 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     runner_temp = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()))
-    github_repo = args.github_repo or (
+    workflow_repo = (
         github_repo_from_workflow_url(args.workflow_url) if args.workflow_url else None
     )
+    if args.workflow_url and workflow_repo is None:
+        raise ValueError(
+            "could not derive a GitHub repository from --workflow-url; expected "
+            "https://github.com/<owner>/<repo>/actions/runs/<run-id>"
+        )
+    if (
+        workflow_repo is not None
+        and args.github_repo is not None
+        and workflow_repo.casefold() != args.github_repo.casefold()
+    ):
+        raise ValueError(
+            f"--workflow-url belongs to {workflow_repo}, but --github-repo selects "
+            f"{args.github_repo}"
+        )
+    github_repo = args.github_repo or workflow_repo
     github_repo = resolve_github_repo(github_repo)
 
     packages = expand_packages(list(args.packages))
@@ -854,7 +932,7 @@ def main() -> int:
                 )
 
         if resolved_head_sha:
-            print(f"should `git checkout {resolved_head_sha}`", flush=True)
+            warn_if_head_mismatch(resolved_head_sha)
 
         for result in stage_packages(
             packages,

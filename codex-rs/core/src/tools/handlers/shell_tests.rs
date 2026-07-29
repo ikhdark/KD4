@@ -1,12 +1,16 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use codex_exec_server::Environment;
 use codex_protocol::models::ActivePermissionProfile;
+use codex_protocol::models::AdditionalPermissionProfile;
+use codex_protocol::models::NetworkPermissions;
 use codex_protocol::models::ShellCommandToolCallParams;
 use pretty_assertions::assert_eq;
 
 use crate::config::PermissionProfileSnapshot;
+use crate::exec::ExecExpiration;
 use crate::exec_env::CODEX_PERMISSION_PROFILE_ENV_VAR;
 use crate::exec_env::create_env;
 use crate::exec_env::inject_permission_profile_env;
@@ -71,6 +75,556 @@ fn retry_guard_counts_operational_rejections_but_not_user_declines() {
     assert_eq!(super::retry_exit_code(&user_declined), None);
 }
 
+#[test]
+fn independent_review_rejects_non_inspection_before_validation() {
+    let reviewer = codex_protocol::protocol::SessionSource::SubAgent(
+        codex_protocol::protocol::SubAgentSource::Review,
+    );
+    assert!(
+        crate::agent::task_capabilities::validate_independent_review_shell(
+            &reviewer, false, false, false
+        )
+        .is_err()
+    );
+}
+
+fn validation_argv(program: &str, args: &[&str]) -> Vec<String> {
+    std::iter::once(program.to_string())
+        .chain(args.iter().map(|arg| (*arg).to_string()))
+        .collect()
+}
+
+fn validation_summary(command: &[String]) -> String {
+    CommandInvocation::Argv {
+        program: command[0].clone(),
+        args: command[1..].to_vec(),
+    }
+    .display_command()
+}
+
+fn admit_validation(command: Vec<String>) -> Result<String, String> {
+    let repo_root = std::env::current_dir().expect("test process has a current directory");
+    admit_validation_in_repo(command, &repo_root)
+}
+
+fn admit_validation_in_repo(
+    command: Vec<String>,
+    repo_root: &std::path::Path,
+) -> Result<String, String> {
+    let summary = validation_summary(&command);
+    super::focused_validation_command_summary(
+        &command,
+        &summary,
+        /*direct_argv*/ true,
+        repo_root,
+        repo_root,
+        &ExecExpiration::Timeout(Duration::from_secs(60)),
+        /*sandbox_override*/ false,
+        /*additional_permissions*/ false,
+        /*prefix_rule*/ false,
+    )
+}
+
+#[cfg(unix)]
+fn create_directory_link(target: &std::path::Path, link: &std::path::Path) {
+    std::os::unix::fs::symlink(target, link).expect("directory symlink is created");
+}
+
+#[cfg(windows)]
+fn create_directory_link(target: &std::path::Path, link: &std::path::Path) {
+    let status = std::process::Command::new("cmd")
+        .args(["/c", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .status()
+        .expect("junction command starts");
+    assert!(status.success(), "directory junction is created");
+}
+
+#[cfg(unix)]
+fn remove_directory_link(link: &std::path::Path) {
+    std::fs::remove_file(link).expect("directory symlink is removed");
+}
+
+#[cfg(windows)]
+fn remove_directory_link(link: &std::path::Path) {
+    std::fs::remove_dir(link).expect("directory junction is removed");
+}
+
+#[test]
+fn focused_validation_accepts_closed_cargo_just_and_python_forms() {
+    for command in [
+        validation_argv("cargo", &["check", "-p", "codex-core"]),
+        validation_argv(
+            "cargo",
+            &["test", "-p", "codex-core", "--lib", "--", "--nocapture"],
+        ),
+        validation_argv("just", &["source-map-check"]),
+        validation_argv("just", &["fmt-check"]),
+        validation_argv("just", &["test-fast", "-p", "codex-core"]),
+        validation_argv(
+            "just",
+            &[
+                "test-compile",
+                "-p",
+                "codex-core",
+                "-E",
+                "test(focused_validation)",
+            ],
+        ),
+        validation_argv(
+            "just",
+            &["test-lane", "typed-validation", "-p", "codex-core"],
+        ),
+        validation_argv(
+            "just",
+            &["test-lane-fast", "typed-validation", "-p", "codex-core"],
+        ),
+        validation_argv("just", &["test-lane-main", "-p", "codex-core"]),
+        validation_argv("just", &["test-lane-package", "codex-core"]),
+        validation_argv(
+            "just",
+            &["check-lane", "codex-core", "--features", "test-support"],
+        ),
+        validation_argv("python", &["-m", "unittest", "scripts.test_policy"]),
+        validation_argv(
+            "python",
+            &[
+                "-m",
+                "unittest",
+                "discover",
+                "--start-directory=scripts",
+                "--pattern",
+                "test_*.py",
+            ],
+        ),
+        validation_argv(
+            "python3",
+            &[
+                "-m",
+                "pytest",
+                "-q",
+                "--ignore=scripts/generated",
+                "scripts/tests/test_policy.py::test_closed",
+            ],
+        ),
+    ] {
+        assert_eq!(
+            admit_validation(command.clone()),
+            Ok(validation_summary(&command))
+        );
+    }
+}
+
+#[test]
+fn focused_validation_rejects_mutating_or_redirected_cargo_and_just_forms() {
+    for command in [
+        validation_argv("cargo", &["run"]),
+        validation_argv("cargo", &["install", "cargo-nextest"]),
+        validation_argv("cargo", &["fix"]),
+        validation_argv("cargo", &["--locked", "test"]),
+        validation_argv("cargo", &["test", "--manifest-path", "../other/Cargo.toml"]),
+        validation_argv("cargo", &["test", "--config=net.git-fetch-with-cli=true"]),
+        validation_argv("cargo", &["check", "--target-dir", "../target"]),
+        validation_argv("cargo", &["test", "-Zunstable-options"]),
+        validation_argv("cargo", &["test", ">", "results.txt"]),
+        validation_argv("just", &["fmt"]),
+        validation_argv("just", &["fix"]),
+        validation_argv("just", &["test-force"]),
+        validation_argv("just", &["publish"]),
+        validation_argv("just", &["cleanup"]),
+        validation_argv("just", &["write-config-schema"]),
+        validation_argv("just", &["test-fast", "--justfile", "../Justfile"]),
+        validation_argv("just", &["source-map-check", "publish"]),
+        validation_argv("just", &["fmt-check", "test-fast"]),
+        validation_argv("just", &["test-lane"]),
+        validation_argv("just", &["test-lane", "..", "-p", "codex-core"]),
+        validation_argv("just", &["test-lane", "../shared", "-p", "codex-core"]),
+        validation_argv(
+            "just",
+            &["test-lane-fast", "C:\\outside", "-p", "codex-core"],
+        ),
+        validation_argv("just", &["test-lane-package", "/tmp/output"]),
+        validation_argv("just", &["test-lane-package", "~cache"]),
+        validation_argv("just", &["check-lane", "-p"]),
+    ] {
+        assert!(
+            admit_validation(command.clone()).is_err(),
+            "unexpected admission: {}",
+            validation_summary(&command)
+        );
+    }
+}
+
+#[test]
+fn focused_validation_rejects_nextest_debug_archive_config_and_output_controls() {
+    for forwarded in [
+        vec!["--debugger", "lldb"],
+        vec!["--tracer", "strace"],
+        vec!["archive"],
+        vec!["--archive-file", "result.tar.zst"],
+        vec!["--extract-to", "target/extracted"],
+        vec!["--persist-extract-tempdir"],
+        vec!["--remap-path-prefix", "old=new"],
+        vec!["--workspace-remap", "workspace"],
+        vec!["--target-dir-remap", "target"],
+        vec!["--cargo-metadata", "metadata.json"],
+        vec!["--binaries-metadata", "binaries.json"],
+        vec!["--config-file", "nextest.toml"],
+        vec!["--tool-config-file", "tool.toml"],
+        vec!["--user-config-file", "user.toml"],
+        vec!["--profile", "local"],
+        vec!["--cargo-profile", "dev"],
+        vec!["--metadata"],
+        vec!["--rerun", "previous"],
+        vec!["--output", "json"],
+        vec!["--output-dir", "reports"],
+        vec!["--success-output", "final"],
+        vec!["--message-format", "libtest-json"],
+        vec!["--no-tests", "pass"],
+        vec!["--flaky-result", "pass"],
+        vec!["--pass-on-success"],
+    ] {
+        let mut args = vec!["test-fast"];
+        args.extend(forwarded);
+        let command = validation_argv("just", &args);
+        assert!(
+            admit_validation(command.clone()).is_err(),
+            "unexpected admission: {}",
+            validation_summary(&command)
+        );
+    }
+}
+
+#[test]
+fn focused_validation_rejects_python_code_config_plugins_and_outside_paths() {
+    for command in [
+        validation_argv("python", &["-c", "print('no')"]),
+        validation_argv("python", &["scripts/test_policy.py"]),
+        validation_argv("python", &["-m", "compileall", "."]),
+        validation_argv("python", &["-m", "pytest", "-c", "../pytest.ini"]),
+        validation_argv("python", &["-m", "pytest", "-p", "arbitrary_plugin"]),
+        validation_argv("python", &["-m", "pytest", "--trace"]),
+        validation_argv("python", &["-m", "pytest", "--pdb"]),
+        validation_argv(
+            "python",
+            &["-m", "pytest", "--pdbcls=debugpy._vendored.pydevd:PyDB"],
+        ),
+        validation_argv("python", &["-m", "pytest", "--rootdir=..", "tests"]),
+        validation_argv("python", &["-m", "pytest", "--ignore=../../x"]),
+        validation_argv(
+            "python",
+            &["-m", "pytest", "--ignore", "C:\\outside\\tests"],
+        ),
+        validation_argv("python", &["-m", "pytest", "--junitxml=C:\\outside.xml"]),
+        validation_argv(
+            "python",
+            &["-m", "pytest", "--junitxml", "reports/results.xml"],
+        ),
+        validation_argv("python", &["-m", "pytest", "../outside/test_policy.py"]),
+        validation_argv("python", &["-m", "pytest", "@pytest-args.txt"]),
+        validation_argv(
+            "python",
+            &["-m", "unittest", "discover", "--start-directory=.."],
+        ),
+        validation_argv("python", &["-m", "unittest", "--start-directory=.."]),
+        validation_argv(
+            "python",
+            &["-m", "unittest", "discover", "-s", "C:\\outside\\tests"],
+        ),
+        validation_argv("python", &["-m", "unittest", "..\\outside\\test_policy.py"]),
+    ] {
+        assert!(
+            admit_validation(command.clone()).is_err(),
+            "unexpected admission: {}",
+            validation_summary(&command)
+        );
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn focused_validation_resolves_python_paths_through_links_and_existing_ancestors() {
+    let repository = tempfile::tempdir().expect("repository tempdir");
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    let inside_tests = repository.path().join("tests");
+    std::fs::create_dir(&inside_tests).expect("inside test directory is created");
+    std::fs::write(
+        inside_tests.join("test_inside.py"),
+        b"def test_inside(): pass\n",
+    )
+    .expect("inside test file is created");
+    std::fs::write(
+        outside.path().join("test_external.py"),
+        b"def test_external(): pass\n",
+    )
+    .expect("outside test file is created");
+    let linked_tests = repository.path().join("linked_tests");
+    create_directory_link(outside.path(), &linked_tests);
+
+    let escaped_pytest = admit_validation_in_repo(
+        validation_argv("python", &["-m", "pytest", "linked_tests/test_external.py"]),
+        repository.path(),
+    );
+    let escaped_discovery = admit_validation_in_repo(
+        validation_argv(
+            "python",
+            &["-m", "unittest", "discover", "-s", "linked_tests"],
+        ),
+        repository.path(),
+    );
+    let escaped_module = admit_validation_in_repo(
+        validation_argv("python", &["-m", "unittest", "linked_tests.test_external"]),
+        repository.path(),
+    );
+    let inside_existing = admit_validation_in_repo(
+        validation_argv("python", &["-m", "pytest", "tests/test_inside.py"]),
+        repository.path(),
+    );
+    let inside_nonexistent = admit_validation_in_repo(
+        validation_argv("python", &["-m", "pytest", "tests/future/test_new.py"]),
+        repository.path(),
+    );
+    let inside_module = admit_validation_in_repo(
+        validation_argv("python", &["-m", "unittest", "tests.test_inside"]),
+        repository.path(),
+    );
+    remove_directory_link(&linked_tests);
+
+    assert!(escaped_pytest.is_err());
+    assert!(escaped_discovery.is_err());
+    assert!(escaped_module.is_err());
+    assert!(inside_existing.is_ok());
+    assert!(inside_nonexistent.is_ok());
+    assert!(inside_module.is_ok());
+}
+
+#[test]
+fn focused_validation_pins_trusted_executable_and_rejects_path_shadowing() {
+    let repository = tempfile::tempdir().expect("repository tempdir");
+    let fake_name = if cfg!(windows) {
+        "python.exe"
+    } else {
+        "python"
+    };
+    std::fs::copy(
+        std::env::current_exe().expect("current test executable"),
+        repository.path().join(fake_name),
+    )
+    .expect("fake executable is copied into repository");
+
+    let nominal = validation_argv("python", &["-m", "pytest"]);
+    let relative_path = std::env::join_paths([std::path::Path::new(".")])
+        .expect("relative PATH joins")
+        .to_string_lossy()
+        .into_owned();
+    let relative_env = std::collections::HashMap::from([("PATH".to_string(), relative_path)]);
+    let mut relative_execution = nominal.clone();
+    assert!(
+        super::pin_focused_validation_executable(
+            &mut relative_execution,
+            &nominal,
+            &relative_env,
+            repository.path(),
+            repository.path(),
+        )
+        .is_err()
+    );
+
+    let repo_path = std::env::join_paths([repository.path()])
+        .expect("repository PATH joins")
+        .to_string_lossy()
+        .into_owned();
+    let repo_env = std::collections::HashMap::from([("PATH".to_string(), repo_path)]);
+    let mut repo_execution = nominal.clone();
+    assert!(
+        super::pin_focused_validation_executable(
+            &mut repo_execution,
+            &nominal,
+            &repo_env,
+            repository.path(),
+            repository.path(),
+        )
+        .is_err()
+    );
+
+    let current_executable =
+        std::fs::canonicalize(std::env::current_exe().expect("current test executable"))
+            .expect("current test executable canonicalizes");
+    let trusted_program = current_executable
+        .file_name()
+        .expect("current test executable has a filename")
+        .to_string_lossy()
+        .into_owned();
+    let trusted_parent = current_executable
+        .parent()
+        .expect("current test executable has a parent");
+    let trusted_path = std::env::join_paths([trusted_parent])
+        .expect("trusted PATH joins")
+        .to_string_lossy()
+        .into_owned();
+    let trusted_env = std::collections::HashMap::from([("PATH".to_string(), trusted_path)]);
+    let trusted_nominal = vec![trusted_program];
+    let mut trusted_execution = trusted_nominal.clone();
+    let resolved = super::pin_focused_validation_executable(
+        &mut trusted_execution,
+        &trusted_nominal,
+        &trusted_env,
+        repository.path(),
+        repository.path(),
+    )
+    .expect("trusted executable resolves and pins");
+    assert_eq!(resolved, current_executable.to_string_lossy());
+    assert_eq!(trusted_execution[0], resolved);
+}
+
+#[test]
+fn focused_validation_rejects_sticky_pregranted_permissions() {
+    let pregranted = super::super::EffectiveAdditionalPermissions {
+        sandbox_permissions: SandboxPermissions::WithAdditionalPermissions,
+        additional_permissions: Some(AdditionalPermissionProfile {
+            network: Some(NetworkPermissions {
+                enabled: Some(true),
+            }),
+            file_system: None,
+        }),
+        permissions_preapproved: true,
+    };
+    assert!(
+        super::reject_focused_effective_permissions(/*focused_validation*/ true, &pregranted,)
+            .is_err()
+    );
+    assert!(
+        super::reject_focused_effective_permissions(/*focused_validation*/ false, &pregranted,)
+            .is_ok()
+    );
+}
+
+#[test]
+fn focused_validation_rejects_wrappers_chaining_and_noncanonical_summary() {
+    for command in [
+        validation_argv("cmd", &["/c", "cargo", "test"]),
+        validation_argv("pwsh", &["-Command", "cargo test"]),
+        validation_argv("cargo", &["test", "&&", "git", "status"]),
+        validation_argv("cargo", &["test", "2>", "results.txt"]),
+    ] {
+        assert!(admit_validation(command).is_err());
+    }
+
+    let command = validation_argv("cargo", &["test"]);
+    assert!(
+        super::focused_validation_command_summary(
+            &command,
+            "cargo  test",
+            /*direct_argv*/ true,
+            std::path::Path::new("repo"),
+            std::path::Path::new("repo"),
+            &ExecExpiration::Timeout(Duration::from_secs(60)),
+            /*sandbox_override*/ false,
+            /*additional_permissions*/ false,
+            /*prefix_rule*/ false,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn focused_validation_requires_repo_root_explicit_timeout_and_default_permissions() {
+    let command = validation_argv("cargo", &["test"]);
+    let summary = validation_summary(&command);
+    let check = |direct_argv,
+                 cwd: &std::path::Path,
+                 expiration: &ExecExpiration,
+                 sandbox_override,
+                 additional_permissions,
+                 prefix_rule| {
+        super::focused_validation_command_summary(
+            &command,
+            &summary,
+            direct_argv,
+            cwd,
+            std::path::Path::new("repo"),
+            expiration,
+            sandbox_override,
+            additional_permissions,
+            prefix_rule,
+        )
+    };
+
+    for (direct_argv, cwd, expiration, sandbox_override, additional_permissions, prefix_rule) in [
+        (
+            false,
+            "repo",
+            ExecExpiration::Timeout(Duration::from_secs(60)),
+            false,
+            false,
+            false,
+        ),
+        (
+            true,
+            "repo/subdir",
+            ExecExpiration::Timeout(Duration::from_secs(60)),
+            false,
+            false,
+            false,
+        ),
+        (
+            true,
+            "repo",
+            ExecExpiration::DefaultTimeout,
+            false,
+            false,
+            false,
+        ),
+        (
+            true,
+            "repo",
+            ExecExpiration::Timeout(Duration::from_millis(
+                super::MAX_FOCUSED_VALIDATION_TIMEOUT_MS + 1,
+            )),
+            false,
+            false,
+            false,
+        ),
+        (
+            true,
+            "repo",
+            ExecExpiration::Timeout(Duration::from_secs(60)),
+            true,
+            false,
+            false,
+        ),
+        (
+            true,
+            "repo",
+            ExecExpiration::Timeout(Duration::from_secs(60)),
+            false,
+            true,
+            false,
+        ),
+        (
+            true,
+            "repo",
+            ExecExpiration::Timeout(Duration::from_secs(60)),
+            false,
+            false,
+            true,
+        ),
+    ] {
+        assert!(
+            check(
+                direct_argv,
+                std::path::Path::new(cwd),
+                &expiration,
+                sandbox_override,
+                additional_permissions,
+                prefix_rule,
+            )
+            .is_err()
+        );
+    }
+}
+
 /// The logic for is_known_safe_command() has heuristics for known shells,
 /// so we must ensure the commands generated by [ShellCommandHandler] can be
 /// recognized as safe if the `command` is safe.
@@ -106,12 +660,16 @@ fn commands_generated_by_shell_command_handler_can_be_matched_by_is_known_safe_c
 }
 
 fn assert_safe(shell: &Shell, command: &str) {
-    assert!(is_known_safe_command(&shell.derive_exec_args(
-        command, /* use_login_shell */ /*use_login_shell*/ true
-    )));
-    assert!(is_known_safe_command(&shell.derive_exec_args(
-        command, /* use_login_shell */ /*use_login_shell*/ false
-    )));
+    let login_command_is_safe =
+        is_known_safe_command(&shell.derive_exec_args(command, /*use_login_shell*/ true));
+    if shell.shell_type == ShellType::PowerShell {
+        assert!(!login_command_is_safe);
+    } else {
+        assert!(login_command_is_safe);
+    }
+    assert!(is_known_safe_command(
+        &shell.derive_exec_args(command, /*use_login_shell*/ false)
+    ));
 }
 
 #[test]

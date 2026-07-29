@@ -208,13 +208,12 @@ impl ToolEmitter {
         environment_id: String,
     ) -> Self {
         let parsed_cmd = parse_command(&command);
-        let display_label = crate::tools::command_display_label::for_command(&command);
         Self::Shell {
             command,
             cwd: PathUri::from_abs_path(&cwd),
             source,
             parsed_cmd,
-            display_label,
+            display_label: None,
             environment_id,
         }
     }
@@ -239,13 +238,12 @@ impl ToolEmitter {
         environment_id: String,
     ) -> Self {
         let parsed_cmd = parse_command(command);
-        let display_label = crate::tools::command_display_label::for_command(command);
         Self::UnifiedExec {
             command: command.to_vec(),
             cwd,
             source,
             parsed_cmd,
-            display_label,
+            display_label: None,
             process_id,
             environment_id,
         }
@@ -437,7 +435,23 @@ impl ToolEmitter {
         output: &ExecToolCallOutput,
         ctx: ToolEventCtx<'_>,
     ) -> String {
-        super::format_exec_output_for_model(output, ctx.turn.model_info.truncation_policy.into())
+        let truncation_policy = ctx.turn.model_info.truncation_policy.into();
+        match self {
+            Self::Shell { command, .. } | Self::UnifiedExec { command, .. } => {
+                let command_text = command.join(" ");
+                let projected = super::project_exec_output_for_model_with_budget(
+                    output,
+                    truncation_policy,
+                    /*requested_limit*/ None,
+                    Some(&command_text),
+                );
+                debug_assert!(!projected.truncation_metadata.is_truncated() || projected.reduced);
+                projected.text
+            }
+            Self::ApplyPatch { .. } => {
+                super::format_exec_output_for_model(output, truncation_policy)
+            }
+        }
     }
 
     pub async fn finish(
@@ -779,22 +793,38 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::Mutex;
 
-    async fn enable_task_evidence_for_repo(session: &mut Arc<Session>, repo: &Path) {
-        tokio::fs::create_dir_all(repo.join("scripts"))
+    async fn enable_task_evidence_for_repo(session: &mut Arc<Session>, repo: &Path) -> PathBuf {
+        tokio::fs::create_dir_all(repo)
             .await
-            .expect("scripts directory");
-        tokio::fs::write(repo.join("scripts/verify_local.py"), "# fixture")
-            .await
-            .expect("verifier fixture");
+            .expect("task evidence repo fixture");
         tokio::fs::write(repo.join("kd4_features.toml"), "# fixture")
             .await
             .expect("feature manifest fixture");
-        let ledger =
-            TaskEvidenceLedger::load_or_new(repo.join(".codex-home"), ThreadId::new(), repo).await;
+        let codex_home = repo.join(".codex-home");
+        let thread_id = ThreadId::new();
+        let evidence_path = codex_home
+            .join("task-evidence")
+            .join(format!("{thread_id}.json"));
+        let ledger = TaskEvidenceLedger::load_or_new(codex_home, thread_id, repo).await;
         Arc::get_mut(session)
             .expect("single session reference")
             .services
             .task_evidence = ledger;
+        evidence_path
+    }
+
+    async fn latest_evidence_file_paths(evidence_path: &Path) -> Vec<String> {
+        let bytes = tokio::fs::read(evidence_path)
+            .await
+            .expect("task evidence file");
+        let document: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("valid task evidence");
+        document["latest_file_hashes"]
+            .as_object()
+            .expect("latest file hashes")
+            .keys()
+            .cloned()
+            .collect()
     }
 
     fn set_turn_environments(turn: &mut Arc<TurnContext>, environments: &[(&str, &Path)]) {
@@ -816,6 +846,42 @@ mod tests {
                 )
             })
             .collect();
+    }
+
+    #[test]
+    fn command_emitters_leave_provider_specific_display_labels_unset() {
+        let dir = tempdir().expect("tempdir");
+        let cwd = AbsolutePathBuf::from_absolute_path(dir.path()).expect("absolute cwd");
+        let command = vec![
+            "kds".to_string(),
+            "--agent".to_string(),
+            "--".to_string(),
+            "cargo".to_string(),
+            "test".to_string(),
+        ];
+
+        let shell = ToolEmitter::shell(
+            command.clone(),
+            cwd.clone(),
+            ExecCommandSource::Agent,
+            String::new(),
+        );
+        let ToolEmitter::Shell { display_label, .. } = shell else {
+            panic!("expected shell emitter");
+        };
+        assert_eq!(display_label, None);
+
+        let unified = ToolEmitter::unified_exec(
+            &command,
+            PathUri::from_abs_path(&cwd),
+            ExecCommandSource::Agent,
+            None,
+            String::new(),
+        );
+        let ToolEmitter::UnifiedExec { display_label, .. } = unified else {
+            panic!("expected unified exec emitter");
+        };
+        assert_eq!(display_label, None);
     }
 
     async fn assert_failed_apply_patch_tracks_committed_delta(
@@ -1013,7 +1079,7 @@ mod tests {
 
         let (mut session, mut turn, _rx_event) =
             make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        enable_task_evidence_for_repo(&mut session, &repo).await;
+        let evidence_path = enable_task_evidence_for_repo(&mut session, &repo).await;
         set_turn_environments(
             &mut turn,
             &[
@@ -1057,15 +1123,11 @@ mod tests {
             .expect("successful patch");
 
         assert_eq!(
-            session
-                .services
-                .task_evidence
-                .take_automatic_verify_plan_request()
-                .await,
-            Some(vec![
+            latest_evidence_file_paths(&evidence_path).await,
+            vec![
                 "selected/dest.txt".to_string(),
                 "selected/source.txt".to_string(),
-            ])
+            ]
         );
     }
 
@@ -1080,7 +1142,7 @@ mod tests {
 
         let (mut session, mut turn, _rx_event) =
             make_session_and_context_with_dynamic_tools_and_rx(Vec::new()).await;
-        enable_task_evidence_for_repo(&mut session, &repo).await;
+        let evidence_path = enable_task_evidence_for_repo(&mut session, &repo).await;
         set_turn_environments(
             &mut turn,
             &[
@@ -1122,14 +1184,7 @@ mod tests {
             .await
             .expect("successful patch");
 
-        assert_eq!(
-            session
-                .services
-                .task_evidence
-                .take_automatic_verify_plan_request()
-                .await,
-            None
-        );
+        assert!(latest_evidence_file_paths(&evidence_path).await.is_empty());
     }
 
     #[tokio::test]

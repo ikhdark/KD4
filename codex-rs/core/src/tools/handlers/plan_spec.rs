@@ -29,7 +29,7 @@ pub fn create_update_plan_tool() -> ToolSpec {
                     json!("completed"),
                 ],
                 Some(
-                    "Step status. `completed` is a legacy alias that still requires fresh evidence before it becomes passed."
+                    "Step status. `passed` is the caller's explicit completion acknowledgement; `completed` is a legacy alias canonicalized to `passed`. Later file or command mutations reopen passed work as implemented."
                         .to_string(),
                 ),
             ),
@@ -58,8 +58,13 @@ pub fn create_update_plan_tool() -> ToolSpec {
         (
             "generated_artifacts".to_string(),
             JsonSchema::array(
-                JsonSchema::string(Some("Required generated artifact path.".to_string())),
-                Some("Generated artifacts required before this step can pass.".to_string()),
+                JsonSchema::string(Some(
+                    "Required repository-relative generated artifact path.".to_string(),
+                )),
+                Some(
+                    "Repository-relative generated artifacts that must remain inside the repository and currently exist, be readable, and be hashable for completion."
+                        .to_string(),
+                ),
             ),
         ),
         (
@@ -104,7 +109,8 @@ pub fn create_update_plan_tool() -> ToolSpec {
 Provide an optional explanation and a list of plan items, each with a step and status.
 At most one step can be in_progress at a time.
 Use stable ids, dependencies, and acceptance criteria for implementation work. Editing can make a
-step implemented; only fresh required evidence can make it passed.
+step implemented. Set a step to passed only when its acceptance criteria are satisfied; completion
+still checks declared artifacts, Desktop activation, plan structure, and blocking risks.
 "#
         .to_string(),
         strict: false,

@@ -12,8 +12,6 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parent / "publish-local-codex.ps1"
-HASHING_HELPER = Path(__file__).resolve().parent / "publish-local-codex.hashing.ps1"
-PROOF_HELPER = Path(__file__).resolve().parent / "publish-local-codex.proof.ps1"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 RUN_TIMEOUT_SECONDS = 120
 FIXTURE_TIME = 946684900
@@ -34,6 +32,8 @@ def ps_single_quote(value: str | Path) -> str:
 
 PUBLISH_ENV_VARS = (
     "CODEX_LOCAL_PUBLISH_DIR",
+    "CODEX_LOCAL_CODEX_HOME",
+    "CODEX_LOCAL_CODEX_SQLITE_HOME",
     "CODEX_HOME",
     "CODEX_SQLITE_HOME",
     "CODEX_CLI_PATH",
@@ -139,13 +139,18 @@ class PublishLocalCodexTestBase(unittest.TestCase):
             return "aarch64-pc-windows-msvc"
         return "x86_64-pc-windows-msvc"
 
-    def rusty_v8_archive_name(self) -> str:
-        return f"rusty_v8_release_{self.expected_windows_rusty_v8_target()}.lib.gz"
+    def rusty_v8_archive_name(self, archive_profile: str = "release") -> str:
+        return (
+            f"rusty_v8_{archive_profile}_"
+            f"{self.expected_windows_rusty_v8_target()}.lib.gz"
+        )
 
-    def rusty_v8_archive_url(self, version: str = "149.2.0") -> str:
+    def rusty_v8_archive_url(
+        self, version: str = "149.2.0", archive_profile: str = "release"
+    ) -> str:
         return (
             f"https://github.com/denoland/rusty_v8/releases/download/v{version}/"
-            f"{self.rusty_v8_archive_name()}"
+            f"{self.rusty_v8_archive_name(archive_profile)}"
         )
 
     def rusty_v8_cache_path(self, user_profile: Path, version: str = "149.2.0") -> Path:
@@ -153,13 +158,18 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         return user_profile / ".cargo" / ".rusty_v8" / cache_name
 
     def write_rusty_v8_checksum(
-        self, archive_path: Path, version: str = "149.2.0"
+        self,
+        archive_path: Path,
+        version: str = "149.2.0",
+        *,
+        binary_marker: bool = False,
     ) -> str:
         checksum = hashlib.sha256(archive_path.read_bytes()).hexdigest()
         checksum_dir = self.repo_root / "third_party" / "v8"
         checksum_dir.mkdir(parents=True, exist_ok=True)
+        marker = "*" if binary_marker else " "
         (checksum_dir / f"rusty_v8_{version.replace('.', '_')}.sha256").write_text(
-            f"{checksum}  {self.rusty_v8_archive_name()}\n",
+            f"{checksum} {marker}{self.rusty_v8_archive_name()}\n",
             encoding="utf-8",
         )
         return checksum
@@ -203,8 +213,7 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         command = (
             "Set-StrictMode -Version Latest; "
             "$ErrorActionPreference = 'Stop'; "
-            f". {ps_single_quote(HASHING_HELPER)}; "
-            f". {ps_single_quote(PROOF_HELPER)}; "
+            f". {ps_single_quote(SCRIPT)} -ImportOnly; "
             f"$fingerprint = Get-LocalPublishBuildInputFingerprint -RepoRoot {ps_single_quote(self.repo_root)}; "
             f"Write-BuildStamp -StampPath {ps_single_quote(stamp)} "
             f"-Profile {ps_single_quote(profile)} "
@@ -246,7 +255,7 @@ class PublishLocalCodexTestBase(unittest.TestCase):
 
     def touch_unrelated_source(self, timestamp: float) -> Path:
         docs = self.repo_root / "docs"
-        docs.mkdir()
+        docs.mkdir(exist_ok=True)
         unrelated = docs / "notes.md"
         unrelated.write_text(f"changed at {timestamp}\n", encoding="utf-8")
         os.utime(unrelated, (timestamp, timestamp))

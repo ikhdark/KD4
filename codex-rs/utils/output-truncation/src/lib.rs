@@ -9,6 +9,199 @@ use codex_utils_string::truncate_middle_with_token_budget;
 
 pub use codex_protocol::protocol::TruncationPolicy;
 
+pub const DEFAULT_SUCCESS_OUTPUT_TOKENS: usize = 4_000;
+pub const DEFAULT_FAILURE_OUTPUT_TOKENS: usize = 8_000;
+pub const DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS: usize = 10_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputOutcome {
+    Success,
+    Failure,
+    TimedOut,
+}
+
+impl OutputOutcome {
+    pub fn from_exit_status(exit_code: Option<i32>, timed_out: bool) -> Self {
+        if timed_out {
+            Self::TimedOut
+        } else if exit_code == Some(0) {
+            Self::Success
+        } else {
+            Self::Failure
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruncationReason {
+    NotTruncated,
+    RequestedLimit,
+    DefaultLimit,
+    HardLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputLimitResolution {
+    pub requested_limit: Option<usize>,
+    pub default_limit: usize,
+    pub hard_limit: usize,
+    pub applied_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TruncationMetadata {
+    pub requested_limit: Option<usize>,
+    pub default_limit: usize,
+    pub hard_limit: usize,
+    pub applied_limit: usize,
+    /// Estimated token count of the body before token-budget truncation.
+    pub original_size: usize,
+    /// Estimated token count of source body content retained after truncation.
+    ///
+    /// This excludes any warning header added by formatted truncation helpers.
+    pub retained_size: usize,
+    pub truncation_reason: TruncationReason,
+}
+
+impl TruncationMetadata {
+    pub fn is_truncated(self) -> bool {
+        self.truncation_reason != TruncationReason::NotTruncated
+    }
+}
+
+impl OutputLimitResolution {
+    pub fn metadata(self, original_size: usize, was_truncated: bool) -> TruncationMetadata {
+        let selected_limit = self.requested_limit.unwrap_or(self.default_limit);
+        let retained_size = if was_truncated {
+            original_size.min(self.applied_limit)
+        } else {
+            original_size
+        };
+        let truncation_reason = if !was_truncated {
+            TruncationReason::NotTruncated
+        } else if self.hard_limit < selected_limit {
+            TruncationReason::HardLimit
+        } else if self.requested_limit.is_some() {
+            TruncationReason::RequestedLimit
+        } else {
+            TruncationReason::DefaultLimit
+        };
+
+        TruncationMetadata {
+            requested_limit: self.requested_limit,
+            default_limit: self.default_limit,
+            hard_limit: self.hard_limit,
+            applied_limit: self.applied_limit,
+            original_size,
+            retained_size,
+            truncation_reason,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruncatedTextOutput {
+    pub text: String,
+    pub metadata: TruncationMetadata,
+}
+
+pub fn adaptive_output_budget_description() -> String {
+    format!(
+        "Defaults adaptively to {DEFAULT_SUCCESS_OUTPUT_TOKENS} tokens for success, \
+         {DEFAULT_FAILURE_OUTPUT_TOKENS} for failure/timeout, and up to \
+         {DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS} for high-signal diagnostics"
+    )
+}
+
+pub fn resolve_output_limits(
+    requested_limit: Option<usize>,
+    outcome: OutputOutcome,
+    command_text: Option<&str>,
+    output_text: &str,
+    hard_limit: usize,
+) -> OutputLimitResolution {
+    let default_limit = if is_high_signal_diagnostic(command_text, output_text) {
+        DEFAULT_DIAGNOSTIC_OUTPUT_TOKENS
+    } else {
+        match outcome {
+            OutputOutcome::Success => DEFAULT_SUCCESS_OUTPUT_TOKENS,
+            OutputOutcome::Failure | OutputOutcome::TimedOut => DEFAULT_FAILURE_OUTPUT_TOKENS,
+        }
+    };
+
+    OutputLimitResolution {
+        requested_limit,
+        default_limit,
+        hard_limit,
+        applied_limit: requested_limit.unwrap_or(default_limit).min(hard_limit),
+    }
+}
+
+pub fn truncate_text_with_output_limit(
+    content: &str,
+    limits: OutputLimitResolution,
+) -> TruncatedTextOutput {
+    let text = truncate_text(content, TruncationPolicy::Tokens(limits.applied_limit));
+    let metadata = limits.metadata(approx_token_count(content), text != content);
+    TruncatedTextOutput { text, metadata }
+}
+
+pub fn formatted_truncate_text_with_output_limit(
+    content: &str,
+    limits: OutputLimitResolution,
+) -> TruncatedTextOutput {
+    let mut truncated = truncate_text_with_output_limit(content, limits);
+    if truncated.metadata.is_truncated() {
+        truncated.text = format!(
+            "Warning: truncated output (original token count: {})\nTotal output lines: {}\n\n{}",
+            truncated.metadata.original_size,
+            content.lines().count(),
+            truncated.text
+        );
+    }
+    truncated
+}
+
+fn is_high_signal_diagnostic(command_text: Option<&str>, output_text: &str) -> bool {
+    let command = command_text.unwrap_or_default().to_ascii_lowercase();
+    let diagnostic_command = [
+        "cargo check",
+        "cargo test",
+        "cargo nextest",
+        "cargo clippy",
+        "rustc ",
+        "pytest",
+        "python -m unittest",
+        "npm test",
+        "npm run test",
+        "pnpm test",
+        "yarn test",
+        "dotnet test",
+        "go test",
+        "just test",
+        "just check",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle));
+    if diagnostic_command {
+        return true;
+    }
+
+    let output = output_text.to_ascii_lowercase();
+    [
+        "stack backtrace:",
+        "traceback (most recent call last):",
+        "thread 'main' panicked at",
+        "error[e",
+        "test result: failed",
+        "failures:",
+        "compiler error",
+        "caused by:",
+    ]
+    .iter()
+    .any(|needle| output.contains(needle))
+}
+
 pub fn formatted_truncate_text(content: &str, policy: TruncationPolicy) -> String {
     if content.len() <= policy.byte_budget() {
         return content.to_string();

@@ -3,9 +3,11 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use codex_config::Constrained;
 use codex_features::Feature;
 use codex_login::CodexAuth;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
@@ -342,7 +344,7 @@ async fn run_pre_turn_auto_session(mode: Mode) -> Result<Capture> {
                 responses::ev_assistant_message("pre-turn-first-message", "PRE_TURN_FIRST_REPLY"),
                 responses::ev_completed_with_tokens(
                     "pre-turn-first-response",
-                    /*total_tokens*/ 500,
+                    /*total_tokens*/ 80_000,
                 ),
             ]),
             after_compact_response_body("pre_turn_auto"),
@@ -352,7 +354,7 @@ async fn run_pre_turn_auto_session(mode: Mode) -> Result<Capture> {
                 responses::ev_assistant_message("pre-turn-first-message", "PRE_TURN_FIRST_REPLY"),
                 responses::ev_completed_with_tokens(
                     "pre-turn-first-response",
-                    /*total_tokens*/ 500,
+                    /*total_tokens*/ 80_000,
                 ),
             ]),
             compaction_v2_response_body(),
@@ -400,7 +402,7 @@ async fn run_mid_turn_auto_session(mode: Mode) -> Result<Capture> {
                 responses::ev_function_call("mid-turn-call", DUMMY_FUNCTION_NAME, "{}"),
                 responses::ev_completed_with_tokens(
                     "mid-turn-call-response",
-                    /*total_tokens*/ 500,
+                    /*total_tokens*/ 80_000,
                 ),
             ]),
             after_compact_response_body("mid_turn_auto"),
@@ -410,7 +412,7 @@ async fn run_mid_turn_auto_session(mode: Mode) -> Result<Capture> {
                 responses::ev_function_call("mid-turn-call", DUMMY_FUNCTION_NAME, "{}"),
                 responses::ev_completed_with_tokens(
                     "mid-turn-call-response",
-                    /*total_tokens*/ 500,
+                    /*total_tokens*/ 80_000,
                 ),
             ]),
             compaction_v2_response_body(),
@@ -491,7 +493,7 @@ async fn build_auto_harness(mode: Mode) -> Result<TestCodexHarness> {
         mode,
         RunSettings::default(),
         /*hooks*/ false,
-        Some(200),
+        Some(50_000),
     )
     .await
 }
@@ -522,6 +524,7 @@ async fn build_harness_inner(
         ))
         .expect("fixed cwd should be absolute");
         config.developer_instructions = Some("PARITY_DEVELOPER_INSTRUCTIONS".to_string());
+        config.permissions.approval_policy = Constrained::allow_any(AskForApproval::Never);
         if settings.service_tier_fast {
             config.service_tier = Some(ServiceTier::Fast.request_value().to_string());
         }
@@ -941,6 +944,7 @@ fn normalize_string(value: &str) -> String {
     normalize_raw_output_artifact_paths(&mut text);
     normalize_tmp_prefix_before_marker(&mut text, "/skills/");
     normalize_tmp_prefix_before_marker(&mut text, "\\skills\\");
+    normalize_temp_roots(&mut text);
 
     let skills_open_tag = "<skills_instructions>";
     let skills_close_tag = "</skills_instructions>";
@@ -994,6 +998,51 @@ fn normalize_raw_output_artifact_paths(text: &mut String) {
     }
 }
 
+fn normalize_temp_roots(text: &mut String) {
+    const PLACEHOLDER: &str = "<TEMP_ROOT>";
+    const MARKERS: [&str; 4] = [
+        "\\AppData\\Local\\Temp\\.tmp",
+        "/AppData/Local/Temp/.tmp",
+        "/private/tmp/.tmp",
+        "/tmp/.tmp",
+    ];
+
+    for marker in MARKERS {
+        let mut search_start = 0;
+        while let Some(relative_marker_index) = text[search_start..].find(marker) {
+            let marker_index = search_start + relative_marker_index;
+            let prefix = &text[..marker_index];
+            let root_start = match marker {
+                "\\AppData\\Local\\Temp\\.tmp" => prefix
+                    .rfind(":\\Users\\")
+                    .and_then(|colon_index| colon_index.checked_sub(1)),
+                "/AppData/Local/Temp/.tmp" => prefix
+                    .rfind(":/Users/")
+                    .and_then(|colon_index| colon_index.checked_sub(1)),
+                _ => Some(marker_index),
+            };
+            let Some(root_start) = root_start else {
+                search_start = marker_index + marker.len();
+                continue;
+            };
+
+            let id_start = marker_index + marker.len();
+            let id_len = text[id_start..]
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+                .map(char::len_utf8)
+                .sum::<usize>();
+            if id_len == 0 {
+                search_start = id_start;
+                continue;
+            }
+
+            text.replace_range(root_start..id_start + id_len, PLACEHOLDER);
+            search_start = root_start + PLACEHOLDER.len();
+        }
+    }
+}
+
 #[test]
 fn normalize_string_rewrites_dynamic_skill_instructions() {
     let text = normalize_string(
@@ -1004,6 +1053,21 @@ fn normalize_string_rewrites_dynamic_skill_instructions() {
     assert_eq!(
         text,
         "before\n<skills_instructions>\n...\n</skills_instructions>\nafter"
+    );
+}
+
+#[test]
+fn normalize_string_rewrites_temp_roots() {
+    let text = normalize_string(
+        "roots: C:\\Users\\runneradmin\\AppData\\Local\\Temp\\.tmpAbC123\\workspace, \
+         C:/Users/runneradmin/AppData/Local/Temp/.tmpDef456/workspace, \
+         /tmp/.tmpGhi789/workspace, /private/tmp/.tmpJkl012/workspace",
+    );
+
+    assert_eq!(
+        text,
+        "roots: <TEMP_ROOT>\\workspace, <TEMP_ROOT>/workspace, \
+         <TEMP_ROOT>/workspace, <TEMP_ROOT>/workspace"
     );
 }
 

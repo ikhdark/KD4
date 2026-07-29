@@ -17,7 +17,7 @@ pub enum StepStatus {
     Blocked,
     Skipped,
     /// Legacy success state retained for older clients. The task-evidence
-    /// ledger treats this as an implementation claim until fresh proof exists.
+    /// ledger canonicalizes this to `Passed`.
     Completed,
 }
 
@@ -37,6 +37,8 @@ pub struct PlanItemArg {
     pub acceptance_criteria: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_paths: Vec<String>,
+    /// Repository-relative artifact paths that must remain within the repository
+    /// and be readable and hashable for completion.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub generated_artifacts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -187,13 +189,17 @@ fn validate_plan_items(plan: &[PlanItemArg]) -> Result<(), String> {
                     item.step
                 ));
             }
-            if item.id.as_deref() == Some(dependency.as_str()) {
+            if item.status != StepStatus::Skipped && item.id.as_deref() == Some(dependency.as_str())
+            {
                 return Err(format!("plan step `{dependency}` cannot depend on itself"));
             }
         }
     }
 
-    for item in plan {
+    for item in plan
+        .iter()
+        .filter(|item| item.status != StepStatus::Skipped)
+    {
         for dependency in &item.depends_on {
             if !explicit_ids.contains_key(dependency.as_str()) {
                 return Err(format!(
@@ -203,10 +209,15 @@ fn validate_plan_items(plan: &[PlanItemArg]) -> Result<(), String> {
         }
     }
 
+    let active_ids = explicit_ids
+        .iter()
+        .filter(|(_, item)| item.status != StepStatus::Skipped)
+        .map(|(id, item)| (*id, *item))
+        .collect::<BTreeMap<_, _>>();
     let mut visited = BTreeSet::new();
     let mut visiting = BTreeSet::new();
-    for id in explicit_ids.keys().copied() {
-        visit_dependency(id, &explicit_ids, &mut visiting, &mut visited)?;
+    for id in active_ids.keys().copied() {
+        visit_dependency(id, &active_ids, &mut visiting, &mut visited)?;
     }
     Ok(())
 }
@@ -225,7 +236,9 @@ fn visit_dependency<'a>(
     }
     if let Some(item) = items.get(id) {
         for dependency in &item.depends_on {
-            visit_dependency(dependency, items, visiting, visited)?;
+            if items.contains_key(dependency.as_str()) {
+                visit_dependency(dependency, items, visiting, visited)?;
+            }
         }
     }
     visiting.remove(id);

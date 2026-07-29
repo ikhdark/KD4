@@ -257,6 +257,53 @@ class StageNpmPackagesTests(unittest.TestCase):
             "local/fork",
         )
 
+    def test_workflow_run_id_ignores_attempt_suffix(self) -> None:
+        self.assertEqual(
+            stage.workflow_id_from_url(
+                "https://github.com/local/fork/actions/runs/12345/attempts/2"
+            ),
+            "12345",
+        )
+
+    def test_workflow_url_parser_rejects_non_https_and_unknown_suffixes(self) -> None:
+        for workflow_url in (
+            "http://github.com/local/fork/actions/runs/12345",
+            "https://github.com/local/fork/actions/runs/12345/jobs/7",
+            "https://github.com/local/fork/actions/runs/12345/attempts/latest",
+        ):
+            with (
+                self.subTest(workflow_url=workflow_url),
+                self.assertRaisesRegex(ValueError, "workflow URL must match"),
+            ):
+                stage.workflow_id_from_url(workflow_url)
+
+    def test_invalid_workflow_url_does_not_fall_back_to_another_repo(self) -> None:
+        args = types.SimpleNamespace(
+            output_dir=self.root / "out",
+            workflow_url="https://github.example/local/fork/actions/runs/12345",
+            github_repo=None,
+        )
+        with (
+            mock.patch.object(stage, "parse_args", return_value=args),
+            mock.patch.object(stage, "resolve_github_repo") as resolve_repo,
+            self.assertRaisesRegex(ValueError, "could not derive a GitHub repository"),
+        ):
+            stage.main()
+
+        resolve_repo.assert_not_called()
+
+    def test_workflow_url_repo_mismatch_is_rejected(self) -> None:
+        args = types.SimpleNamespace(
+            output_dir=self.root / "out",
+            workflow_url="https://github.com/local/fork/actions/runs/12345",
+            github_repo="other/fork",
+        )
+        with (
+            mock.patch.object(stage, "parse_args", return_value=args),
+            self.assertRaisesRegex(ValueError, "belongs to local/fork"),
+        ):
+            stage.main()
+
     def test_release_workflow_lookup_uses_selected_repo_and_workflow(self) -> None:
         with mock.patch.object(
             stage.subprocess,
@@ -282,6 +329,33 @@ class StageNpmPackagesTests(unittest.TestCase):
                 stage.DEFAULT_GHA_DOWNLOAD_WORKERS,
             )
             self.assertEqual(stage.download_worker_count_for(100, requested=4), 4)
+
+    def test_worker_counts_reject_non_positive_values(self) -> None:
+        for requested in (0, -1):
+            with (
+                self.subTest(requested=requested),
+                self.assertRaisesRegex(ValueError, "must be > 0"),
+            ):
+                stage.worker_count_for(4, requested=requested)
+
+    def test_worker_cli_options_reject_zero(self) -> None:
+        for option in ("--max-download-workers", "--max-stage-workers"):
+            argv = [
+                "stage_npm_packages.py",
+                "--release-version",
+                "1.2.3",
+                "--package",
+                "codex",
+                option,
+                "0",
+            ]
+            with (
+                self.subTest(option=option),
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(sys, "stderr", io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                stage.parse_args()
 
     def test_list_workflow_artifacts_is_cached_per_repo_and_workflow(self) -> None:
         with mock.patch.object(
@@ -552,6 +626,18 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertEqual(observed_output[0].parent, dest.parent)
         self.assertFalse(observed_output[0].exists())
 
+    def test_extract_zstd_archive_explains_missing_zstd(self) -> None:
+        archive_path = self.root / "artifact.zst"
+        archive_path.write_text("archive", encoding="utf-8")
+
+        with (
+            mock.patch.object(
+                stage.subprocess, "check_call", side_effect=FileNotFoundError
+            ),
+            self.assertRaisesRegex(RuntimeError, "zstd is required"),
+        ):
+            stage.extract_zstd_archive(archive_path, self.root / "out" / "codex")
+
     def test_failed_binary_extract_preserves_existing_vendor_binary(self) -> None:
         target = "x86_64-unknown-linux-musl"
         component = stage.BinaryComponent("codex", "codex", "codex")
@@ -599,6 +685,30 @@ class StageNpmPackagesTests(unittest.TestCase):
                 self.fail("lock should not have been acquired")
 
         self.assertTrue(lock_path.exists())
+
+    def test_lock_initialization_failure_closes_and_removes_lock(self) -> None:
+        lock_path = self.root / "cache" / ".artifact.lock"
+
+        with (
+            mock.patch.object(stage.os, "write", side_effect=OSError("disk full")),
+            self.assertRaisesRegex(OSError, "disk full"),
+        ):
+            with stage.exclusive_file_lock(lock_path):
+                self.fail("lock should not have been acquired")
+
+        self.assertFalse(lock_path.exists())
+
+    def test_head_mismatch_emits_real_warning(self) -> None:
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                stage.subprocess, "check_output", return_value="current-head\n"
+            ),
+            mock.patch.object(sys, "stderr", stderr),
+        ):
+            stage.warn_if_head_mismatch("workflow-head", repo_root=self.root)
+
+        self.assertIn("does not match workflow HEAD workflow-head", stderr.getvalue())
 
     def test_stage_packages_returns_results_in_package_order(self) -> None:
         calls: list[tuple[str, bool]] = []

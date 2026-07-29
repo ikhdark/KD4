@@ -18,6 +18,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 PACKAGE_JSON = REPO_ROOT / "package.json"
 
 
+class PackageJsonError(RuntimeError):
+    pass
+
+
 @dataclass(frozen=True)
 class ToolCheck:
     name: str
@@ -36,20 +40,32 @@ def run_version(command: Sequence[str]) -> str | None:
             cwd=REPO_ROOT,
             text=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
-    output = completed.stdout.strip().splitlines()
-    return output[0].strip() if completed.returncode == 0 and output else None
+    if completed.returncode != 0:
+        return None
+    for stream in (completed.stdout, completed.stderr):
+        output = (stream or "").strip().splitlines()
+        if output:
+            return output[0].strip()
+    return None
 
 
 def package_manager_pin() -> str:
     if not PACKAGE_JSON.exists():
         return "pnpm"
-    data = json.loads(PACKAGE_JSON.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(PACKAGE_JSON.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PackageJsonError(f"could not read {PACKAGE_JSON}: {error}") from None
+    if not isinstance(data, dict):
+        raise PackageJsonError(f"{PACKAGE_JSON} must contain a JSON object")
     value = str(data.get("packageManager", "pnpm"))
     return value.split("+", 1)[0]
 
@@ -160,10 +176,20 @@ def collect_checks() -> list[ToolCheck]:
     ]
 
 
+def tool_status(check: ToolCheck) -> str:
+    if check.ok:
+        return "ok"
+    if check.path is None:
+        return "missing"
+    if check.version is None:
+        return "unavailable"
+    return "mismatch"
+
+
 def print_text(checks: Sequence[ToolCheck]) -> None:
     print("Local development tool check")
     for check in checks:
-        status = "ok" if check.ok else "missing"
+        status = tool_status(check)
         detail = check.version or check.path or check.guidance
         print(f"- {check.name}: {status} ({detail})")
         if not check.ok:
@@ -178,21 +204,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--no-fail",
         action="store_true",
-        help="Always exit 0 after reporting missing tools.",
+        help="Always exit 0 after reporting tool-check failures.",
     )
     args = parser.parse_args(argv)
 
-    checks = collect_checks()
-    missing = [check for check in checks if check.required and not check.ok]
+    try:
+        checks = collect_checks()
+    except PackageJsonError as error:
+        print(f"Development environment check failed: {error}", file=sys.stderr)
+        return 1
+    failed = [check for check in checks if check.required and not check.ok]
     if args.json:
         print(
             json.dumps(
-                {"ok": not missing, "checks": [asdict(c) for c in checks]}, indent=2
+                {"ok": not failed, "checks": [asdict(c) for c in checks]}, indent=2
             )
         )
     else:
         print_text(checks)
-    return 0 if args.no_fail or not missing else 1
+    return 0 if args.no_fail or not failed else 1
 
 
 if __name__ == "__main__":

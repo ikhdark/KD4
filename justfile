@@ -5,8 +5,13 @@ set shell := ["python3", "-c", 'import os, runpy; runpy.run_path(os.environ["JUS
 set windows-shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST_SHELL"], run_name="__main__")']
 
 rust_min_stack := "8388608" # 8 MiB
-cargo_build_jobs := env_var_or_default("CARGO_BUILD_JOBS", "-2") # Leave two logical CPUs free on any host.
+rust_parallelism := "6" # Keep local builds and tests responsive; standard env/CLI overrides still win.
+cargo_build_jobs := env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)
 export CARGO_BUILD_JOBS := cargo_build_jobs
+rust_test_threads := env_var_or_default("RUST_TEST_THREADS", rust_parallelism)
+export RUST_TEST_THREADS := rust_test_threads
+nextest_test_threads := env_var_or_default("NEXTEST_TEST_THREADS", rust_parallelism)
+export NEXTEST_TEST_THREADS := nextest_test_threads
 python := if os_family() == "windows" { "python" } else { "python3" }
 
 # Display help
@@ -78,10 +83,6 @@ fmt-full:
 # Check formatting without modifying files.
 fmt-check:
     {{ python }} ../scripts/format.py --check
-
-[no-cd]
-verify-local *args:
-    @{{ python }} {{ justfile_directory() }}/scripts/verify_local.py {args}
 
 [no-cd]
 check-kd4-features *args:
@@ -185,26 +186,6 @@ install:
 
 [no-cd]
 [windows]
-publish-local-codex-dry-run *args:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -DryRun -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User {args}
-
-[no-cd]
-[unix]
-publish-local-codex-dry-run *args:
-    @{{ justfile_directory() }}/scripts/publish-local-codex-wsl.sh -DryRun -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User {args}
-
-[no-cd]
-[windows]
-publish-local-codex *args:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -AutoSkipBuild -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User {args}
-
-[no-cd]
-[unix]
-publish-local-codex *args:
-    @{{ justfile_directory() }}/scripts/publish-local-codex-wsl.sh -AutoSkipBuild -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User {args}
-
-[no-cd]
-[windows]
 publish-local-codex-final *args:
     @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -AutoSkipBuild -Profile release -RunDoctor -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User {args}
 
@@ -212,46 +193,6 @@ publish-local-codex-final *args:
 [unix]
 publish-local-codex-final *args:
     @{{ justfile_directory() }}/scripts/publish-local-codex-wsl.sh -AutoSkipBuild -Profile release -RunDoctor -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User {args}
-
-[no-cd]
-[windows]
-publish-local-codex-final-dry-run *args:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -DryRun -AutoSkipBuild -Profile release -RunDoctor -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User {args}
-
-[no-cd]
-[unix]
-publish-local-codex-final-dry-run *args:
-    @{{ justfile_directory() }}/scripts/publish-local-codex-wsl.sh -DryRun -AutoSkipBuild -Profile release -RunDoctor -CloseRunningTargetTimeoutSeconds 30 -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User {args}
-
-[no-cd]
-[windows]
-publish-local-codex-runtime-proof *args:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -DryRun -SkipBuild -RunDoctor -RuntimeProof -FailOnStaleSourceBuild -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User {args}
-
-[no-cd]
-[unix]
-publish-local-codex-runtime-proof *args:
-    @{{ justfile_directory() }}/scripts/publish-local-codex-wsl.sh -DryRun -SkipBuild -RunDoctor -RuntimeProof -FailOnStaleSourceBuild -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User {args}
-
-[no-cd]
-[windows]
-publish-local-codex-final-test-run *args:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -TestRun -AutoSkipBuild -Profile release -RunDoctor -CloseRunningTargetTimeoutSeconds 30 {args}
-
-[no-cd]
-[unix]
-publish-local-codex-final-test-run *args:
-    @{{ justfile_directory() }}/scripts/publish-local-codex-wsl.sh -TestRun -AutoSkipBuild -Profile release -RunDoctor -CloseRunningTargetTimeoutSeconds 30 {args}
-
-[no-cd]
-[windows]
-publish-local-codex-build-only *args:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -BuildOnly {args}
-
-[no-cd]
-[unix]
-publish-local-codex-build-only *args:
-    @{{ justfile_directory() }}/scripts/publish-local-codex-wsl.sh -BuildOnly {args}
 
 [no-cd]
 [windows]
@@ -407,12 +348,6 @@ validate-crate crate:
 validate-crate-full crate:
     just fmt-check
     just test-fast -p {{ crate }}
-
-# Validation ladder: prove local publish wiring without replacing the installed binary.
-[no-cd]
-[windows]
-validate-local-publish *args:
-    @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\publish-local-codex.ps1" -DryRun -SkipBuild -FailOnStaleSourceBuild -ConfigureDesktopLocalCli -DesktopCliEnvironmentTarget User {args}
 
 [unix]
 cargo-lane lane *args:

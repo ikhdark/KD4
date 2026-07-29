@@ -106,7 +106,7 @@ def scenario_catalog(repo_root: Path = REPO_ROOT) -> dict[str, Scenario]:
             (sys.executable, "scripts/check_kd4_features.py", "--json"),
             repo_root,
             5,
-            "repository",
+            "validation",
         ),
         "installed-codex-version": Scenario(
             "installed-codex-version",
@@ -114,20 +114,6 @@ def scenario_catalog(repo_root: Path = REPO_ROOT) -> dict[str, Scenario]:
             repo_root,
             5,
             "startup",
-        ),
-        "verify-local-plan": Scenario(
-            "verify-local-plan",
-            (
-                sys.executable,
-                "scripts/verify_local.py",
-                "--plan",
-                "--changed",
-                "kd4_features.toml",
-                "--json",
-            ),
-            repo_root,
-            3,
-            "validation",
         ),
         "focused-core-test": Scenario(
             "focused-core-test",
@@ -138,7 +124,7 @@ def scenario_catalog(repo_root: Path = REPO_ROOT) -> dict[str, Scenario]:
                 "-p",
                 "codex-core",
                 "-E",
-                "test(verify_local_is_registered_only_for_a_supported_local_repo)",
+                "test(source_tools_are_registered_only_when_enabled)",
             ),
             codex_rs,
             2,
@@ -168,7 +154,7 @@ def scenario_catalog(repo_root: Path = REPO_ROOT) -> dict[str, Scenario]:
         ),
         "desktop-publish-dry-run": Scenario(
             "desktop-publish-dry-run",
-            ("just", "publish-local-codex-final-dry-run"),
+            ("just", "publish-local-codex-final", "-DryRun"),
             repo_root,
             2,
             "desktop-publish",
@@ -183,7 +169,6 @@ PROFILE_SCENARIOS = {
         "git-status",
         "feature-check",
         "installed-codex-version",
-        "verify-local-plan",
         "focused-core-test",
         "local-cli-build",
         "app-server-initialize-test",
@@ -317,7 +302,7 @@ def environment_metadata(repo_root: Path, *, hash_binary: bool) -> dict[str, Any
         "repository": str(repo_root.resolve()),
         "head": _git_text(repo_root, "rev-parse", "HEAD"),
         "branch": _git_text(repo_root, "branch", "--show-current"),
-        "dirtyPaths": len(status.splitlines()) if status else 0,
+        "dirtyPaths": len(status.splitlines()) if status is not None else None,
         "platform": platform.platform(),
         "python": sys.version,
         "cpuCount": os.cpu_count(),
@@ -328,18 +313,27 @@ def environment_metadata(repo_root: Path, *, hash_binary: bool) -> dict[str, Any
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path = path.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-        delete=False,
-    ) as temporary:
-        json.dump(payload, temporary, indent=2, sort_keys=True)
-        temporary.write("\n")
-        temporary_path = Path(temporary.name)
-    os.replace(temporary_path, path)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(payload, temporary, indent=2, sort_keys=True)
+            temporary.write("\n")
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except OSError:
+                pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -379,7 +373,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"p95={result.p95_ms}ms"
             )
 
-    failed = [result.name for result in results if result.status == "failed"]
+    failed = [result.name for result in results if not result.passed]
     payload = {
         "schemaVersion": 1,
         "profile": args.profile,

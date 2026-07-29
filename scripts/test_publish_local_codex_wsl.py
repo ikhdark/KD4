@@ -68,6 +68,7 @@ printf 'WIN<%s>\\n' "$2"
 set -euo pipefail
 printf 'env=%s\\n' "${CODEX_LOCAL_PUBLISH_DIR:-}" > "$POWERSHELL_LOG"
 printf 'arg=%s\\n' "$@" >> "$POWERSHELL_LOG"
+printf '%s\\n' "${WSLENV:-}" > "$WSLENV_LOG"
 exit "${POWERSHELL_EXIT:-0}"
 """,
         )
@@ -78,12 +79,15 @@ exit "${POWERSHELL_EXIT:-0}"
         *args: str,
         publish_dir: str | None = None,
         powershell_exit: int = 0,
+        wslenv: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env.pop("CODEX_LOCAL_PUBLISH_DIR", None)
         env["POWERSHELL_EXIT"] = str(powershell_exit)
         if publish_dir is not None:
             env["CODEX_LOCAL_PUBLISH_DIR"] = publish_dir
+        if wslenv is not None:
+            env["WSLENV"] = wslenv
         return subprocess.run(
             [
                 self.bash,
@@ -91,6 +95,7 @@ exit "${POWERSHELL_EXIT:-0}"
                 """export PATH="$PWD/fake-bin:$PATH"
 export POWERSHELL_LOG="$PWD/powershell.log"
 export WSLPATH_LOG="$PWD/wslpath.log"
+export WSLENV_LOG="$PWD/wslenv.log"
 bash scripts/publish-local-codex-wsl.sh "$@"
 """,
                 "bash",
@@ -173,11 +178,16 @@ bash scripts/publish-local-codex-wsl.sh "$@"
                 "-sOuRcEcOdEmOdEhOsTeXe=/mnt/c/build/host binary.exe",
                 "-lOcAlCoDeXhOmE=/home/user/local codex",
                 publish_dir="/mnt/e/local kd",
+                wslenv="FOO/u:CODEX_LOCAL_PUBLISH_DIR/p:BAR",
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
             lines = self.powershell_log(fixture_root)
             self.assertEqual(lines[0], "env=WIN</mnt/e/local kd>")
+            self.assertEqual(
+                (fixture_root / "wslenv.log").read_text(encoding="utf-8").strip(),
+                "CODEX_LOCAL_PUBLISH_DIR:FOO/u:BAR",
+            )
             self.assertEqual(
                 lines[1:5],
                 ["arg=-NoProfile", "arg=-ExecutionPolicy", "arg=Bypass", "arg=-File"],
@@ -191,6 +201,31 @@ bash scripts/publish-local-codex-wsl.sh "$@"
                     "arg=-RepoRoot=WIN</mnt/z/custom repo>",
                     "arg=-SourceCodeModeHostExe=WIN</mnt/c/build/host binary.exe>",
                     "arg=-LocalCodexHome=WIN</home/user/local codex>",
+                ],
+            )
+
+    def test_colon_and_unambiguous_abbreviated_path_flags_are_translated(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture_root = Path(temp_dir)
+            self.prepare_fixture(fixture_root)
+
+            result = self.run_bridge(
+                fixture_root,
+                "-Repo:/mnt/z/repo",
+                "-Install:/mnt/e/install",
+                "-LocalCodexH:/home/user/codex",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = self.powershell_log(fixture_root)
+            self.assertEqual(
+                lines[6:],
+                [
+                    "arg=-RepoRoot:WIN</mnt/z/repo>",
+                    "arg=-InstallDir:WIN</mnt/e/install>",
+                    "arg=-LocalCodexHome:WIN</home/user/codex>",
                 ],
             )
 

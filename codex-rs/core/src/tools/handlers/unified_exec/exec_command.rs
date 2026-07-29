@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::agent::task_capabilities::validate_independent_review_shell;
 use crate::function_tool::FunctionCallError;
 use crate::maybe_emit_implicit_skill_invocation;
 use crate::shell::Shell;
@@ -41,6 +42,7 @@ use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
 use codex_sandboxing::SandboxManager;
 use codex_sandboxing::SandboxType;
 use codex_sandboxing::SandboxablePreference;
+use codex_shell_command::is_safe_command::is_known_safe_command;
 use codex_shell_command::shell_detect::detect_shell_type;
 use codex_tools::ToolName;
 use codex_tools::ToolSpec;
@@ -346,6 +348,13 @@ impl ExecCommandHandler {
         } else {
             original_resolved_command
         };
+        validate_independent_review_shell(
+            &turn.session_source,
+            is_known_safe_command(&resolved_command.safety_command),
+            args.sandbox_permissions.requests_sandbox_override(),
+            args.additional_permissions.is_some(),
+        )
+        .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
         let hook_command = command_invocation.display_command();
         // Implicit skill detection requires a native path, so foreign PathUri
         // workdirs are intentionally skipped here.

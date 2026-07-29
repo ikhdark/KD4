@@ -1004,6 +1004,7 @@ impl Session {
             });
         let completed_at = timing_snapshot.completed_at_unix_secs;
         let duration_ms = timing_snapshot.duration_ms;
+        let error = turn_context.terminal_error.lock().await.clone();
         let event = if let Some(reason) = abort_reason.as_ref() {
             EventMsg::TurnAborted(TurnAbortedEvent {
                 turn_id: Some(turn_context.sub_id.clone()),
@@ -1016,6 +1017,7 @@ impl Session {
             EventMsg::TurnComplete(TurnCompleteEvent {
                 turn_id: turn_context.sub_id.clone(),
                 last_agent_message,
+                error,
                 completion,
                 completed_at,
                 duration_ms,
@@ -1145,6 +1147,7 @@ impl Session {
                 EventMsg::TurnComplete(TurnCompleteEvent {
                     turn_id: turn_context.sub_id.clone(),
                     last_agent_message: None,
+                    error: None,
                     completion: None,
                     completed_at: timing_snapshot.completed_at_unix_secs,
                     duration_ms: timing_snapshot.duration_ms,

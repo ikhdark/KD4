@@ -7,6 +7,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import check_kd4_features
 
@@ -165,6 +166,138 @@ class CheckKd4FeaturesTest(unittest.TestCase):
         self.assertIn(
             "invalid-evidence-path", {finding.code for finding in result.findings}
         )
+
+    def test_unhashable_feature_id_reports_finding(self) -> None:
+        manifest = self.write_manifest(self.valid_evidence())
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8").replace(
+                'id = "feature"', 'id = ["feature"]'
+            ),
+            encoding="utf-8",
+        )
+
+        result = check_kd4_features.validate_manifest(
+            manifest, repo_root=self.repo_root
+        )
+
+        self.assertFalse(result.ok)
+        self.assertIn("missing-field", {finding.code for finding in result.findings})
+
+    def test_empty_regex_is_not_silently_ignored(self) -> None:
+        evidence = self.valid_evidence().replace(
+            'contains = "def main()"',
+            'contains = "def main()"\nregex = ""',
+        )
+
+        result = check_kd4_features.validate_manifest(
+            self.write_manifest(evidence), repo_root=self.repo_root
+        )
+
+        matches = [
+            finding
+            for finding in result.findings
+            if finding.code == "invalid-evidence-match"
+        ]
+        self.assertTrue(matches)
+        self.assertIn("exactly one", matches[0].message)
+
+    def test_empty_regex_alone_reports_non_empty_requirement(self) -> None:
+        evidence = self.valid_evidence().replace(
+            'contains = "def main()"',
+            'regex = ""',
+        )
+
+        result = check_kd4_features.validate_manifest(
+            self.write_manifest(evidence), repo_root=self.repo_root
+        )
+
+        self.assertTrue(
+            any(
+                finding.code == "invalid-evidence-match"
+                and "non-empty string" in finding.message
+                for finding in result.findings
+            )
+        )
+
+    def test_missing_owner_has_one_root_cause_finding(self) -> None:
+        manifest = self.write_manifest(self.valid_evidence())
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8").replace(
+                'owner = "owner"\n',
+                "",
+            ),
+            encoding="utf-8",
+        )
+
+        result = check_kd4_features.validate_manifest(
+            manifest, repo_root=self.repo_root
+        )
+
+        owner_findings = [
+            finding
+            for finding in result.findings
+            if "owner" in finding.message or finding.code == "invalid-owner"
+        ]
+        self.assertEqual(
+            [finding.code for finding in owner_findings], ["missing-field"]
+        )
+
+    def test_evidence_text_is_cached_across_features(self) -> None:
+        manifest = self.repo_root / "kd4_features.toml"
+        manifest.write_text(
+            textwrap.dedent(
+                """
+                schema_version = 1
+
+                [[features]]
+                id = "one"
+                version = 1
+                status = "disabled"
+                capability_kind = "library"
+                owner = "owner"
+                summary = "one"
+                upstream_equivalent = "none"
+                config_keys = []
+                [[features.evidence]]
+                kind = "module"
+                path = "src/feature.py"
+                contains = "def main()"
+
+                [[features]]
+                id = "two"
+                version = 1
+                status = "disabled"
+                capability_kind = "library"
+                owner = "owner"
+                summary = "two"
+                upstream_equivalent = "none"
+                config_keys = []
+                [[features.evidence]]
+                kind = "module"
+                path = "src/feature.py"
+                contains = "return 'live'"
+                """
+            ),
+            encoding="utf-8",
+        )
+        original_read_text = Path.read_text
+        evidence_reads = 0
+
+        def count_reads(path: Path, *args: object, **kwargs: object) -> str:
+            nonlocal evidence_reads
+            if path == self.repo_root / "src" / "feature.py":
+                evidence_reads += 1
+            return original_read_text(path, *args, **kwargs)
+
+        with mock.patch.object(
+            Path, "read_text", autospec=True, side_effect=count_reads
+        ):
+            result = check_kd4_features.validate_manifest(
+                manifest, repo_root=self.repo_root
+            )
+
+        self.assertTrue(result.ok, result.findings)
+        self.assertEqual(evidence_reads, 1)
 
     def test_strict_mode_promotes_orphan_to_error(self) -> None:
         manifest = self.write_manifest(self.valid_evidence())

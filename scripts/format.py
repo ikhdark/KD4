@@ -5,7 +5,7 @@ import argparse
 import shlex
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +23,6 @@ from scripts.tool_versions import RUSTFMT_TOOLCHAIN  # noqa: E402
 class Command:
     args: tuple[str, ...]
     cwd: Path = REPO_ROOT
-    discard_stderr: bool = False
 
 
 @dataclass(frozen=True)
@@ -158,9 +157,7 @@ def run_formatter_group(group: FormatterGroup) -> FormatterResult:
                 command.args,
                 cwd=command.cwd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL
-                if command.discard_stderr
-                else subprocess.STDOUT,
+                stderr=subprocess.STDOUT,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -179,7 +176,7 @@ def run_formatter_group(group: FormatterGroup) -> FormatterResult:
     return FormatterResult(group.name, "".join(output), 0)
 
 
-def main() -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--check",
@@ -203,8 +200,15 @@ def main() -> int:
         ),
         help="run only the named formatter group; may be provided multiple times",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     selected_groups = {name.lower() for name in args.only} if args.only else None
+    if args.fast_local and selected_groups:
+        incompatible_groups = sorted(selected_groups - {"just", "rust"})
+        if incompatible_groups:
+            parser.error(
+                "--fast-local excludes formatter groups selected by --only: "
+                + ", ".join(incompatible_groups)
+            )
     groups = formatter_groups(
         check=args.check,
         fast_local=args.fast_local,

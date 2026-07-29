@@ -113,8 +113,8 @@ pub fn create_spawn_agent_tool_v2(options: SpawnAgentToolOptions) -> ToolSpec {
     );
     if options.hide_agent_type_model_reasoning {
         hide_spawn_agent_metadata_options(&mut properties);
-        // Typed assignments require an explicit built-in role even when optional legacy spawn
-        // metadata is hidden.
+        // Typed assignments require an explicit typed-capable role even when optional legacy
+        // spawn metadata is hidden.
         properties.insert(
             "agent_type".to_string(),
             JsonSchema::string(Some(options.agent_type_description.clone())),
@@ -801,7 +801,7 @@ fn typed_assignment_schema() -> JsonSchema {
         Some(false.into()),
     );
     schema.description = Some(
-        "Durable typed assignment. Use either assignment or legacy message, never both. Typed assignments require an explicit built-in agent_type."
+        "Durable typed assignment. Use either assignment or legacy message, never both. Typed assignments require an explicit typed-capable agent_type (a built-in role or its configured kd4_ alias)."
             .to_string(),
     );
     schema
@@ -901,7 +901,7 @@ The spawned agent will have the same tools as you and the ability to spawn its o
 Only call this tool for a concrete, bounded subtask that can run independently alongside useful local work; otherwise continue locally.
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
-Use `assignment` for durable typed coordination or `message` for a legacy plain-text task; exactly one is required. Typed assignments require an explicit built-in `agent_type` and return an `assignment_id`.
+Use `assignment` for durable typed coordination or `message` for a legacy plain-text task; exactly one is required. Typed assignments require an explicit typed-capable `agent_type` (a built-in role or its configured `kd4_` alias) and return an `assignment_id`.
 
     {full_history_override_guidance}
 Note that passing `fork_turns="none"` will not pass any surrounding context to the spawned subagent, which may cause the agent to lack the context it needs to complete its task, whereas `fork_turns="all"` will provide the subagent with all surrounding context."#

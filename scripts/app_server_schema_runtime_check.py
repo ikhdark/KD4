@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -24,22 +25,33 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
-def run(args: list[str], *, cwd: Path) -> int:
-    print("$ " + " ".join(args), flush=True)
-    return subprocess.run(args, cwd=cwd).returncode
+def run(args: Sequence[str], *, cwd: Path) -> int:
+    print("$ " + shlex.join(str(arg) for arg in args), flush=True)
+    try:
+        return subprocess.run(list(args), cwd=cwd).returncode
+    except OSError as error:
+        print(f"Could not run {args[0]}: {error}", file=sys.stderr)
+        return 127
 
 
 def schema_inputs_changed(root: Path) -> bool:
-    completed = subprocess.run(
-        ["git", "status", "--porcelain", "--", *SCHEMA_INPUTS],
-        cwd=root,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain", "--", *SCHEMA_INPUTS],
+            cwd=root,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    except OSError as error:
+        print(
+            f"Could not run git to inspect app-server schema input status: {error}",
+            file=sys.stderr,
+        )
+        return True
     if completed.returncode != 0:
         print(
             "Could not inspect schema input status; regenerating schemas.",
@@ -175,7 +187,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return runtime_code
     if generated_changed:
         print("Schema regeneration changed generated outputs; review and include them.")
-        return 1
+        if args.mode != "force":
+            return 1
     return 0
 
 

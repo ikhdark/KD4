@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 
-import importlib.util
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
-import tomllib
 import unittest
 
 
@@ -33,41 +31,8 @@ def ps_single_quote(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
-def load_just_shell_module():
-    path = REPO_ROOT / "scripts" / "just-shell.py"
-    spec = importlib.util.spec_from_file_location("just_shell", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_format_module():
-    path = REPO_ROOT / "scripts" / "format.py"
-    spec = importlib.util.spec_from_file_location("format_script", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_root_maintenance_module():
-    path = REPO_ROOT / "scripts" / "root_maintenance.py"
-    spec = importlib.util.spec_from_file_location("root_maintenance", path)
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def load_toml(path: Path):
-    return tomllib.loads(path.read_text(encoding="utf-8"))
-
-
 class BuildToolingPerformanceTest(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
     def test_perf_env_no_sccache_leaves_incremental_and_uses_lane(self) -> None:
         shell = pwsh_only()
         if shell is None:
@@ -97,6 +62,8 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 ),
             ],
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             check=False,
             env=env,
@@ -161,6 +128,8 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                     ),
                 ],
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 check=False,
                 env=env,
@@ -174,7 +143,10 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         )
         self.assertIn("cargoTargetDir=<explicit command argument>", result.stdout)
         self.assertIn("targetenv=", result.stdout)
-        self.assertIn(f"--target-dir {explicit_target}", result.stdout)
+        self.assertIn(
+            subprocess.list2cmdline(["--target-dir", str(explicit_target)]),
+            result.stdout,
+        )
         self.assertNotIn("stale-target-env", result.stdout)
         self.assertNotIn("perf-explicit-target", result.stdout)
 
@@ -185,29 +157,34 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             self.skipTest("pwsh is not available")
         script = REPO_ROOT / "scripts" / "invoke-rust-perf-env.ps1"
 
-        result = subprocess.run(
-            [
-                shell,
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-Command",
-                (
-                    f"$programArgs = @({ps_single_quote(shell)}, '-NoProfile', "
-                    "'-Command', 'exit 0'); "
-                    f"& {ps_single_quote(script)} -CargoTargetLane '..' "
-                    f"-WorkingDirectory {ps_single_quote(REPO_ROOT)} "
-                    "-ProgramArgs $programArgs"
-                ),
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-            creationflags=CREATE_NO_WINDOW,
-        )
+        for lane in ("..", "..."):
+            with self.subTest(lane=lane):
+                result = subprocess.run(
+                    [
+                        shell,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        (
+                            f"$programArgs = @({ps_single_quote(shell)}, '-NoProfile', "
+                            "'-Command', 'exit 0'); "
+                            f"& {ps_single_quote(script)} "
+                            f"-CargoTargetLane {ps_single_quote(lane)} "
+                            f"-WorkingDirectory {ps_single_quote(REPO_ROOT)} "
+                            "-ProgramArgs $programArgs"
+                        ),
+                    ],
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    capture_output=True,
+                    check=False,
+                    creationflags=CREATE_NO_WINDOW,
+                )
 
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Cargo target lane", result.stderr)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("Cargo target lane", result.stderr)
 
     @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
     def test_perf_env_keeps_same_length_cargo_watch_rewrite(self) -> None:
@@ -253,6 +230,8 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                     ),
                 ],
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 check=False,
                 env=env,
@@ -292,6 +271,86 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 ),
             ],
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+    @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
+    def test_perf_env_non_native_failure_returns_nonzero(self) -> None:
+        shell = pwsh_only()
+        if shell is None:
+            self.skipTest("pwsh is not available")
+        script = REPO_ROOT / "scripts" / "invoke-rust-perf-env.ps1"
+
+        result = subprocess.run(
+            [
+                shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                (
+                    f". {ps_single_quote(script)} "
+                    "-ProgramArgs @('Get-Item', 'Z:\\missing-kd4-path', "
+                    "'-ErrorAction', 'Continue')"
+                ),
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            1,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+
+    @unittest.skipUnless(os.name == "nt", "invoke-rust-perf-env is Windows-only")
+    def test_perf_env_restore_helper_preserves_empty_environment_variable(
+        self,
+    ) -> None:
+        shell = pwsh_only()
+        if shell is None:
+            self.skipTest("pwsh is not available")
+        script = REPO_ROOT / "scripts" / "invoke-rust-perf-env.ps1"
+        command = (
+            "$tokens = $null; $errors = $null; "
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile("
+            f"{ps_single_quote(script)}, [ref]$tokens, [ref]$errors); "
+            "$function = $ast.Find({ param($node) "
+            "$node -is [System.Management.Automation.Language.FunctionDefinitionAst] "
+            "-and $node.Name -eq 'Restore-ProcessEnvironmentVariable' }, $true); "
+            "Invoke-Expression $function.Extent.Text; "
+            "[Environment]::SetEnvironmentVariable("
+            "'KD4_EMPTY_RESTORE_TEST', '', [EnvironmentVariableTarget]::Process); "
+            "$old = [Environment]::GetEnvironmentVariable("
+            "'KD4_EMPTY_RESTORE_TEST', 'Process'); "
+            "$had = Test-Path Env:KD4_EMPTY_RESTORE_TEST; "
+            "Remove-Item Env:KD4_EMPTY_RESTORE_TEST; "
+            "Restore-ProcessEnvironmentVariable "
+            "-Name 'KD4_EMPTY_RESTORE_TEST' -Value $old -WasSet $had; "
+            "if (-not (Test-Path Env:KD4_EMPTY_RESTORE_TEST) -or "
+            "$env:KD4_EMPTY_RESTORE_TEST -ne '') { exit 1 }"
+        )
+
+        result = subprocess.run(
+            [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             check=False,
             creationflags=CREATE_NO_WINDOW,
@@ -325,7 +384,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 "\r\n".join(
                     [
                         "@echo off",
-                        'echo %*>>"%FAKE_SCCACHE_CALLS%"',
+                        '>>"%FAKE_SCCACHE_CALLS%" echo(%*',
                         'if "%1"=="--show-stats" (',
                         '  type "%FAKE_SCCACHE_STATS%"',
                         "  exit /b 0",
@@ -368,6 +427,8 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                     ),
                 ],
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 check=False,
                 env=env,
@@ -403,30 +464,87 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             (" 100G ", "cacheSize=100G"),
             ("   ", "cacheSize=80G"),
         ):
-            env = os.environ.copy()
-            env["CODEX_SCCACHE_CACHE_SIZE"] = override
-            result = subprocess.run(
-                [
-                    shell,
-                    "-NoProfile",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    command,
-                ],
-                text=True,
-                capture_output=True,
-                check=False,
-                env=env,
-                creationflags=CREATE_NO_WINDOW,
-            )
+            with self.subTest(override=override):
+                env = os.environ.copy()
+                env["CODEX_SCCACHE_CACHE_SIZE"] = override
+                result = subprocess.run(
+                    [
+                        shell,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        command,
+                    ],
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    capture_output=True,
+                    check=False,
+                    env=env,
+                    creationflags=CREATE_NO_WINDOW,
+                )
 
-            self.assertEqual(
-                result.returncode,
-                0,
-                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
-            )
-            self.assertIn(expected, result.stdout)
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+                )
+                self.assertIn(expected, result.stdout)
+
+    @unittest.skipUnless(os.name == "nt", "common-rust-env is Windows-only")
+    def test_common_rust_env_compares_cache_sizes_by_bytes(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+        script = REPO_ROOT / "scripts" / "common-rust-env.ps1"
+        command = (
+            "Set-StrictMode -Version Latest; "
+            "$ErrorActionPreference = 'Stop'; "
+            f". {ps_single_quote(script)}; "
+            "$cases = @("
+            "@('80GB', '80 GiB', $true), "
+            "@('80g', '80 GiB', $true), "
+            "@('500M', '500 MiB', $true), "
+            "@('1T', '1 TiB', $true), "
+            "@('1024G', '1 TiB', $true), "
+            "@('80G', '10 GiB', $false), "
+            "@('vendor-format', '80 GiB', $true)"
+            "); "
+            "foreach ($case in $cases) { "
+            "$env:CODEX_SCCACHE_CACHE_SIZE = $case[0]; "
+            "$actual = Test-CodexRustSccacheStatsCacheSize "
+            "-Stats @('Max cache size                       ' + $case[1]); "
+            "Write-Output ($actual -eq $case[2]) "
+            "}"
+        )
+
+        result = subprocess.run(
+            [
+                shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                command,
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertEqual(
+            [line.strip() for line in result.stdout.splitlines() if line.strip()],
+            ["True"] * 7,
+        )
 
     @unittest.skipUnless(os.name == "nt", "sccache-perf is Windows-only")
     def test_sccache_perf_restart_ignores_stop_failure_and_checks_start(self) -> None:
@@ -443,7 +561,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 "\r\n".join(
                     [
                         "@echo off",
-                        'echo %*>>"%FAKE_SCCACHE_CALLS%"',
+                        '>>"%FAKE_SCCACHE_CALLS%" echo(%*',
                         'if "%1"=="--stop-server" exit /b 7',
                         'if "%1"=="--start-server" exit /b 0',
                         'if "%1"=="--show-stats" (',
@@ -472,6 +590,8 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                     "restart",
                 ],
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 check=False,
                 env=env,
@@ -507,7 +627,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                 "\r\n".join(
                     [
                         "@echo off",
-                        'echo %*>>"%FAKE_SCCACHE_CALLS%"',
+                        '>>"%FAKE_SCCACHE_CALLS%" echo(%*',
                         'if "%1"=="--show-stats" (',
                         "  echo Max cache size                       80 GiB",
                         "  exit /b 0",
@@ -535,6 +655,8 @@ class BuildToolingPerformanceTest(unittest.TestCase):
                     "reset",
                 ],
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 check=False,
                 env=env,
@@ -550,6 +672,60 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             call_lines,
             ["--show-stats", "--zero-stats"],
         )
+
+    @unittest.skipUnless(os.name == "nt", "sccache-perf is Windows-only")
+    def test_sccache_perf_reports_command_removed_after_lookup(self) -> None:
+        shell = powershell()
+        if shell is None:
+            self.skipTest("PowerShell is not available")
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            temp_root = Path(tempdir)
+            fake_bin = temp_root / "bin"
+            fake_bin.mkdir()
+            calls = temp_root / "sccache-calls.txt"
+            (fake_bin / "sccache.cmd").write_text(
+                "\r\n".join(
+                    [
+                        "@echo off",
+                        '>>"%FAKE_SCCACHE_CALLS%" echo(%*',
+                        'if "%1"=="--show-stats" (',
+                        "  echo Max cache size                       80 GiB",
+                        '  del "%~f0"',
+                        "  exit /b 0",
+                        ")",
+                        "exit /b 0",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+            env["FAKE_SCCACHE_CALLS"] = str(calls)
+            script = REPO_ROOT / "scripts" / "sccache-perf.ps1"
+
+            result = subprocess.run(
+                [
+                    shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(script),
+                    "reset",
+                ],
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                check=False,
+                env=env,
+                creationflags=CREATE_NO_WINDOW,
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("sccache --zero-stats failed to launch", result.stderr)
 
     def test_justfile_bench_and_validation_fast_paths_are_explicit(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -613,9 +789,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
             check=True,
             creationflags=CREATE_NO_WINDOW,
         ).stdout.splitlines()
-        expected_eol_attributes = [
-            f"{path}: eol: lf" for path in expected_agent_files
-        ]
+        expected_eol_attributes = [f"{path}: eol: lf" for path in expected_agent_files]
         root_text = (REPO_ROOT / "AGENTS.md").read_text(encoding="utf-8")
         normalized_root = " ".join(root_text.split())
 

@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import kd4_perf_snapshot
 
@@ -76,6 +77,40 @@ class Kd4PerfSnapshotTest(unittest.TestCase):
             self.assertEqual(
                 json.loads(target.read_text(encoding="utf-8")), {"ok": True}
             )
+
+    def test_atomic_json_writer_removes_temporary_file_on_serialization_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            target = Path(tempdir) / "snapshot.json"
+
+            with self.assertRaises(TypeError):
+                kd4_perf_snapshot.write_json_atomic(target, {"bad": object()})
+
+            self.assertEqual(list(Path(tempdir).glob("*.tmp")), [])
+            self.assertFalse(target.exists())
+
+    def test_environment_metadata_distinguishes_git_failure_from_clean_tree(
+        self,
+    ) -> None:
+        with mock.patch.object(kd4_perf_snapshot, "_git_text", return_value=None):
+            metadata = kd4_perf_snapshot.environment_metadata(
+                Path.cwd(), hash_binary=False
+            )
+
+        self.assertIsNone(metadata["dirtyPaths"])
+
+    def test_environment_metadata_reports_zero_dirty_paths_for_clean_tree(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            kd4_perf_snapshot, "_git_text", side_effect=["", "head", "main"]
+        ):
+            metadata = kd4_perf_snapshot.environment_metadata(
+                Path.cwd(), hash_binary=False
+            )
+
+        self.assertEqual(metadata["dirtyPaths"], 0)
 
 
 if __name__ == "__main__":
