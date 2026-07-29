@@ -16,7 +16,6 @@ use std::sync::Arc;
 
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
-use crate::tools::command_output_artifact::read_tool_output_artifact;
 use crate::tools::context::ExecCommandToolOutput;
 use crate::tools::context::ToolCallSource;
 use crate::tools::context::ToolInvocation;
@@ -395,9 +394,7 @@ async fn read_only_preflight_repair_executes_and_releases_process_id() {
             .as_str()
             .is_some_and(|repair| repair.contains("known_flag_typo"))
     );
-    assert!(code_mode["raw_output_artifact_id"].is_string());
-    assert!(code_mode.get("raw_output_artifact").is_none());
-    assert!(code_mode.get("raw_output_artifact_error").is_none());
+    assert!(code_mode["raw_output_artifact"].is_string());
 
     let process_id = session
         .services
@@ -614,8 +611,6 @@ async fn unpolled_background_failure_finalizes_artifact_and_attempt_ledger() {
     tokio::fs::create_dir_all(turn.config.codex_home.as_path())
         .await
         .expect("create test codex home");
-    let codex_home = turn.config.codex_home.clone();
-    let thread_id = session.thread_id.to_string();
     session
         .services
         .exec_policy
@@ -667,18 +662,18 @@ async fn unpolled_background_failure_finalizes_artifact_and_attempt_ledger() {
         .await
         .expect("background process must be tracked while it is running")
         .key;
-    let artifact_id = code_mode["raw_output_artifact_id"]
-        .as_str()
-        .expect("raw output artifact id");
-    assert!(code_mode.get("raw_output_artifact").is_none());
+    let artifact_path = PathBuf::from(
+        code_mode["raw_output_artifact"]
+            .as_str()
+            .expect("raw output artifact path"),
+    );
 
     let mut retained = String::new();
     let mut consecutive_failures = 0;
     for _ in 0..100 {
-        retained =
-            read_tool_output_artifact(codex_home.as_path(), &thread_id, artifact_id, 1, 10, 65_536)
-                .await
-                .unwrap_or_default();
+        retained = tokio::fs::read_to_string(&artifact_path)
+            .await
+            .unwrap_or_default();
         consecutive_failures = session
             .services
             .command_execution
@@ -709,8 +704,6 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
     tokio::fs::create_dir_all(turn.config.codex_home.as_path())
         .await
         .expect("create test codex home");
-    let codex_home = turn.config.codex_home.clone();
-    let thread_id = session.thread_id.to_string();
     session
         .services
         .exec_policy
@@ -755,31 +748,26 @@ async fn foreground_output_artifact_retains_bytes_beyond_transcript_cap() {
     });
     assert_eq!(code_mode["exit_code"], 0);
     assert!(code_mode.get("session_id").is_none());
-    let artifact_id = code_mode["raw_output_artifact_id"]
-        .as_str()
-        .expect("raw output artifact id");
-    assert!(code_mode.get("raw_output_artifact").is_none());
-    let begin =
-        read_tool_output_artifact(codex_home.as_path(), &thread_id, artifact_id, 1, 1, 65_536)
-            .await
-            .expect("read artifact prefix");
-    let middle =
-        read_tool_output_artifact(codex_home.as_path(), &thread_id, artifact_id, 3, 3, 65_536)
-            .await
-            .expect("read artifact middle");
-    let end =
-        read_tool_output_artifact(codex_home.as_path(), &thread_id, artifact_id, 5, 5, 65_536)
-            .await
-            .expect("read artifact suffix");
-    assert!(
-        code_mode["raw_output_artifact_bytes"]
-            .as_u64()
-            .is_some_and(|retained_bytes| retained_bytes
-                > u64::try_from(segment_bytes * 2).unwrap_or(u64::MAX))
+    let artifact_path = PathBuf::from(
+        code_mode["raw_output_artifact"]
+            .as_str()
+            .expect("raw output artifact path"),
     );
-    assert!(begin.contains("BEGIN"));
-    assert!(middle.contains("MIDDLE_MARKER"));
-    assert!(end.contains("END"));
+    let artifact = tokio::fs::read(&artifact_path)
+        .await
+        .expect("read raw output artifact");
+    assert!(artifact.len() > segment_bytes * 2);
+    assert!(artifact.starts_with(b"BEGIN"));
+    assert!(
+        artifact
+            .windows(b"MIDDLE_MARKER".len())
+            .any(|window| window == b"MIDDLE_MARKER")
+    );
+    assert!(artifact.ends_with(b"END\r\n") || artifact.ends_with(b"END\n"));
+    assert_eq!(
+        code_mode["raw_output_artifact_bytes"],
+        artifact.len() as u64
+    );
     let model_output = code_mode["output"].as_str().expect("model output");
     assert!(model_output.len() < segment_bytes);
     assert!(!model_output.contains("MIDDLE_MARKER"));

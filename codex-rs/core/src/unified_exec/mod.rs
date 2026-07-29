@@ -43,7 +43,6 @@ use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
-use crate::task_evidence::TaskMutationGuard;
 use crate::tools::command_execution::CommandAttemptKey;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -137,7 +136,6 @@ pub(crate) struct ExecCommandRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
-    pub mutation_guard: Option<TaskMutationGuard>,
 }
 
 #[derive(Debug)]
@@ -147,7 +145,6 @@ pub(crate) struct WriteStdinRequest<'a> {
     pub yield_time_ms: u64,
     pub max_output_tokens: Option<usize>,
     pub truncation_policy: TruncationPolicy,
-    pub mutation_guard: Option<TaskMutationGuard>,
 }
 
 #[derive(Default)]
@@ -236,7 +233,6 @@ struct ProcessEntry {
     network_approval: Option<DeferredNetworkApproval>,
     session: Weak<Session>,
     last_used: tokio::time::Instant,
-    mutation_guard: Option<TaskMutationGuard>,
 }
 
 #[cfg(test)]

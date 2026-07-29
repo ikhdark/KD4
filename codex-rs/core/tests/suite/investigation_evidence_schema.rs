@@ -8,11 +8,11 @@ fn evidence_schema() -> Value {
     .expect("investigation evidence schema should be valid JSON")
 }
 
-fn provider_example() -> Value {
+fn kds_example() -> Value {
     json!({
         "evidenceMeta": {
             "schemaVersion": 1,
-            "producer": "diagnostic-provider",
+            "producer": "kds",
             "operation": "compact",
             "evidenceBearing": true,
             "payloadCompleteness": "complete",
@@ -32,19 +32,19 @@ fn evidence_meta_v1_accepts_provider_examples() {
     let schema = evidence_schema();
     let validator =
         jsonschema::validator_for(&schema).expect("investigation evidence schema should compile");
-    let mut interrupted_provider = provider_example();
-    interrupted_provider["evidenceMeta"]["payloadCompleteness"] = json!("unknown");
-    interrupted_provider["evidenceMeta"]["truncated"] = json!(true);
-    interrupted_provider["evidenceMeta"]["limitations"] =
+    let mut interrupted_kds = kds_example();
+    interrupted_kds["evidenceMeta"]["payloadCompleteness"] = json!("unknown");
+    interrupted_kds["evidenceMeta"]["truncated"] = json!(true);
+    interrupted_kds["evidenceMeta"]["limitations"] =
         json!(["child process did not provide a normal exit code"]);
-    interrupted_provider["omittedBytes"] = json!(17);
+    interrupted_kds["omittedBytes"] = json!(17);
     let examples = [
-        provider_example(),
-        interrupted_provider,
+        kds_example(),
+        interrupted_kds,
         json!({
             "evidenceMeta": {
                 "schemaVersion": 1,
-                "producer": "wiring-provider",
+                "producer": "kdwg",
                 "operation": "check",
                 "evidenceBearing": true,
                 "payloadCompleteness": "partial",
@@ -64,7 +64,7 @@ fn evidence_meta_v1_accepts_provider_examples() {
         json!({
             "evidenceMeta": {
                 "schemaVersion": 1,
-                "producer": "repository-provider",
+                "producer": "repo-atlas",
                 "operation": "trace",
                 "evidenceBearing": true,
                 "payloadCompleteness": "partial",
@@ -92,38 +92,35 @@ fn evidence_meta_v1_rejects_invalid_contract_values() {
     let schema = evidence_schema();
     let validator =
         jsonschema::validator_for(&schema).expect("investigation evidence schema should compile");
-    let mut unknown_version = provider_example();
+    let mut unknown_version = kds_example();
     unknown_version["evidenceMeta"]["schemaVersion"] = json!(2);
 
-    let mut missing_producer = provider_example();
+    let mut missing_producer = kds_example();
     missing_producer["evidenceMeta"]
         .as_object_mut()
         .expect("evidenceMeta should be an object")
         .remove("producer");
 
-    let mut invalid_completeness = provider_example();
+    let mut invalid_completeness = kds_example();
     invalid_completeness["evidenceMeta"]["payloadCompleteness"] = json!("full");
 
-    let mut non_string_limitation = provider_example();
+    let mut non_string_limitation = kds_example();
     non_string_limitation["evidenceMeta"]["limitations"] = json!(["bounded", 7]);
 
-    let mut truncated_complete = provider_example();
+    let mut truncated_complete = kds_example();
     truncated_complete["evidenceMeta"]["truncated"] = json!(true);
 
-    let mut empty_limitation = provider_example();
+    let mut empty_limitation = kds_example();
     empty_limitation["evidenceMeta"]["limitations"] = json!([""]);
 
-    let mut empty_snapshot = provider_example();
+    let mut empty_snapshot = kds_example();
     empty_snapshot["evidenceMeta"]["snapshot"] = json!("");
 
-    let mut blank_limitation = provider_example();
+    let mut blank_limitation = kds_example();
     blank_limitation["evidenceMeta"]["limitations"] = json!(["   "]);
 
-    let mut blank_snapshot = provider_example();
+    let mut blank_snapshot = kds_example();
     blank_snapshot["evidenceMeta"]["snapshot"] = json!("   ");
-
-    let mut blank_producer = provider_example();
-    blank_producer["evidenceMeta"]["producer"] = json!("   ");
 
     for invalid in [
         unknown_version,
@@ -135,7 +132,6 @@ fn evidence_meta_v1_rejects_invalid_contract_values() {
         empty_snapshot,
         blank_limitation,
         blank_snapshot,
-        blank_producer,
     ] {
         assert!(
             !validator.is_valid(&invalid),

@@ -223,7 +223,7 @@ below.
 | Model requests and retries | `codex-rs/core/src/client.rs` | model-provider, backend/client crates, auth, telemetry, response debug context |
 | Tool planning and dispatch | `codex-rs/core/src/tools`, `codex-rs/tools` | built-in handlers, extension tools, MCP calls, approvals, shell and sandbox owners |
 | Retained command output | `codex-rs/core/src/tools/command_output_artifact.rs` | unified exec and shell producers, `ExecCommandToolOutput` model/code-mode projection, opaque current-thread `read_tool_output` handler/spec, generic retention and receipt-scoped protected evidence-artifact lifecycle |
-| Task lifecycle and external evidence ledger | `codex-rs/core/src/task_evidence.rs`, `codex-rs/core/src/tools/handlers/task_state.rs` | session initialization, runtime task classification, mutation reservations, exact-state closure and independent review, final-output authorization, KD4 completion-only plan/validation callers, direct MCP handler receipt capture, thread-scoped output artifacts for oversized canonical payloads |
+| Task and external evidence ledger | `codex-rs/core/src/task_evidence.rs` | session initialization, KD4 completion-only plan/validation callers, direct MCP handler receipt capture, thread-scoped output artifacts for oversized canonical payloads |
 | Shell execution and approvals | `codex-rs/core/src/exec.rs`, `codex-rs/core/src/exec_policy.rs` | shell-command, shell-escalation, execpolicy, sandboxing, platform sandboxes |
 | Configuration resolution | `codex-rs/config`, `codex-rs/core/src/config`, `codex-rs/features` | profiles, permissions, requirements, hooks, MCP, schema generator, consuming runtime |
 | Interactive presentation | `codex-rs/tui/src/app.rs`, `codex-rs/tui/src/chatwidget.rs` | app-server session bridge, bottom pane, history cells, protocol conversion, snapshots |
@@ -324,7 +324,7 @@ remain required.
 | Python SDK | focused `uv run pytest` and `uv run ruff check .` |
 | Package/archive flow | package-local tests followed by the relevant staging or dry-run proof |
 | Local publish wiring | `just publish-local-codex-dry-run`; installed replacement requires `just publish-local-codex-final` |
-| Installed provider external-evidence path | `python scripts/investigation_evidence_smoke.py --run`; uses staged local KDS and Repo Atlas plugins, disposable Git repositories and Codex homes, and a loopback model endpoint |
+| Installed provider external-evidence path | `python scripts/investigation_evidence_smoke.py --run`; uses staged local KDS/KDWG/Repo Atlas plugins, disposable Git repositories and Codex homes, and a loopback model endpoint |
 | Repository-scoped final validation | `just verify-local <args>` or `scripts/verify_local.py` through its documented bounded flow |
 
 Green tooling alone does not prove runtime behavior. Use the focused failing

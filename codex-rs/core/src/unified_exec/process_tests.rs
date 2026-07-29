@@ -190,7 +190,6 @@ async fn store_process_for_test(
             network_approval: None,
             session: Arc::downgrade(session),
             last_used: Instant::now(),
-            mutation_guard: None,
         },
     );
 }

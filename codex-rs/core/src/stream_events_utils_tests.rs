@@ -8,7 +8,6 @@ use super::last_assistant_message_from_item;
 use super::response_item_may_include_external_context;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
-use crate::session::tests::make_session_and_context_with_rx;
 use crate::tools::ToolRouter;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::turn_diff_tracker::TurnDiffTracker;
@@ -25,7 +24,6 @@ use codex_protocol::models::LocalShellExecAction;
 use codex_protocol::models::LocalShellStatus;
 use codex_protocol::models::MessagePhase;
 use codex_protocol::models::ResponseItem;
-use codex_protocol::protocol::EventMsg;
 use pretty_assertions::assert_eq;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -473,47 +471,4 @@ fn completed_item_keeps_mailbox_delivery_open_for_commentary_messages() {
     assert!(!completed_item_defers_mailbox_delivery_to_next_turn(
         &item, /*plan_mode*/ false,
     ));
-}
-
-#[tokio::test]
-async fn provisional_final_is_persisted_without_item_lifecycle_events() {
-    let (session, turn_context, rx_event) = make_session_and_context_with_rx().await;
-    while rx_event.try_recv().is_ok() {}
-    let item = assistant_output_text("provisional final");
-
-    session
-        .record_conversation_items_for_model_history_and_rollout_only(
-            &turn_context,
-            std::slice::from_ref(&item),
-        )
-        .await;
-
-    let history = session.clone_history().await;
-    let [
-        ResponseItem::Message {
-            role,
-            content,
-            phase,
-            ..
-        },
-    ] = history.raw_items()
-    else {
-        panic!("expected exactly one persisted provisional assistant message");
-    };
-    assert_eq!(role, "assistant");
-    assert_eq!(phase, &None);
-    assert_eq!(
-        content,
-        &[ContentItem::OutputText {
-            text: "provisional final".to_string(),
-        }]
-    );
-    let events = std::iter::from_fn(|| rx_event.try_recv().ok()).collect::<Vec<_>>();
-    assert!(
-        events.iter().all(|event| !matches!(
-            event.msg,
-            EventMsg::ItemStarted(_) | EventMsg::ItemCompleted(_)
-        )),
-        "provisional final emitted item lifecycle events: {events:?}"
-    );
 }

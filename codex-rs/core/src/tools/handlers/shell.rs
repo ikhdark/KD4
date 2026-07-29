@@ -275,25 +275,6 @@ async fn run_exec_like_with_exit_code_inner(
         )));
     }
 
-    let review_delegate = matches!(
-        &turn.session_source,
-        codex_protocol::protocol::SessionSource::SubAgent(
-            codex_protocol::protocol::SubAgentSource::Review
-        )
-    );
-    let _task_mutation_guard = session
-        .services
-        .task_evidence
-        .guard_normalized_command(
-            &safety_command,
-            Some(exec_params.cwd.as_path()),
-            &turn.sub_id,
-            review_delegate,
-            tool_name.name == "verify_local",
-        )
-        .await
-        .map_err(FunctionCallError::RespondToModel)?;
-
     if let Some(attempt_key) = attempt_key.as_ref() {
         session
             .services

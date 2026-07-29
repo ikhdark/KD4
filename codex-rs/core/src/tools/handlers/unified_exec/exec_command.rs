@@ -465,24 +465,6 @@ impl ExecCommandHandler {
         .with_input_context(&input_context)
         .with_runtime_context(&runtime_context)
         .with_repository_epoch(repository_epoch);
-        let review_delegate = matches!(
-            &turn.session_source,
-            codex_protocol::protocol::SessionSource::SubAgent(
-                codex_protocol::protocol::SubAgentSource::Review
-            )
-        );
-        let task_mutation_guard = session
-            .services
-            .task_evidence
-            .guard_normalized_command(
-                &safety_command,
-                native_cwd.as_ref().map(|cwd| cwd.as_path()),
-                &turn.sub_id,
-                review_delegate,
-                false,
-            )
-            .await
-            .map_err(FunctionCallError::RespondToModel)?;
         session
             .services
             .command_execution
@@ -585,7 +567,6 @@ impl ExecCommandHandler {
                         .permissions_preapproved,
                     justification,
                     prefix_rule,
-                    mutation_guard: task_mutation_guard,
                 },
                 process_id_reservation,
                 &context,
@@ -701,12 +682,6 @@ impl ExecCommandHandler {
 impl CoreToolRuntime for ExecCommandHandler {
     fn tool_execution_timing(&self) -> ToolExecutionTiming {
         ToolExecutionTiming::NestedRuntime
-    }
-
-    fn waits_for_runtime_cancellation(&self) -> bool {
-        // Cancellation can race the interval after process launch but before
-        // the mutation guard is transferred into the process store.
-        true
     }
 
     fn matches_kind(&self, payload: &ToolPayload) -> bool {

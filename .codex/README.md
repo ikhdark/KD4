@@ -9,6 +9,7 @@ default.
 | Need | Authoritative file |
 | --- | --- |
 | Edit anything under `.codex` | [`AGENTS.md`](AGENTS.md) |
+| Configure KD4 agent roles, limits, and reasoning | [`config.toml`](config.toml) and [`agents/`](agents/) |
 | Prepare ignored files for a Codex worktree | [`environments/README.md`](environments/README.md) |
 | Plan or preserve evidence for a durable task | [`harness/README.md`](harness/README.md) |
 | Implement or change KD4 repository behavior | [`../AGENTS.md`](../AGENTS.md) |
@@ -21,11 +22,12 @@ harness maintenance is actually requested.
 
 ## Source And State Boundary
 
-Durable policy, templates, environment source, and fork-local skills are
-reviewable source. Generated runs, verification output, app backups, patched-app
-trees, and specialist-tool sessions are local state; the exact boundary is owned
-by [`AGENTS.md`](AGENTS.md).
+Durable policy, custom agent roles, templates, environment source, and
+fork-local skills are reviewable source. Generated runs, verification output,
+app backups, patched-app trees, and specialist-tool sessions are local state;
+the exact boundary is owned by [`AGENTS.md`](AGENTS.md).
 
-Project-local runtime configuration may be added as `.codex/config.toml` only
-when this checkout needs an explicit setting. Its absence is intentional and is
-not a missing setup step.
+Project-local runtime configuration lives in `.codex/config.toml`. Project agent
+definitions live in `.codex/agents/`; every `config_file` entry must resolve to
+a tracked, schema-valid role file. Roles inherit parent settings except where
+their role file explicitly overrides a supported configuration key.

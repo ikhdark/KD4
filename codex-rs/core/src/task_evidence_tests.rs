@@ -199,9 +199,9 @@ async fn record_fixture_evidence(
 }
 
 #[tokio::test]
-async fn external_evidence_extracts_generic_v1_envelope() {
+async fn external_evidence_extracts_kds_v1_envelope() {
     let (_temp, ledger) = record_fixture_evidence(&evidence_result(
-        "diagnostic-provider",
+        "kds",
         "diagnostic",
         serde_json::json!({"facts": [1]}),
     ))
@@ -211,7 +211,7 @@ async fn external_evidence_extracts_generic_v1_envelope() {
         .as_ref()
         .and_then(|document| document.external_evidence.last())
         .expect("receipt");
-    assert_eq!(receipt.producer, "diagnostic-provider");
+    assert_eq!(receipt.producer, "kds");
     assert_eq!(receipt.producer_schema_version, 1);
     assert_eq!(receipt.server_name, "server");
     assert_eq!(receipt.tool_name, "raw-tool");
@@ -219,9 +219,9 @@ async fn external_evidence_extracts_generic_v1_envelope() {
 }
 
 #[tokio::test]
-async fn external_evidence_keeps_nonzero_verdict_transport_successful() {
+async fn external_evidence_keeps_kdwg_nonzero_verdict_transport_successful() {
     let result = evidence_result(
-        "wiring-provider",
+        "kdwg",
         "static wiring failed",
         serde_json::json!({"exit_code": 7, "verdict": "FAILED"}),
     );
@@ -235,9 +235,9 @@ async fn external_evidence_keeps_nonzero_verdict_transport_successful() {
 }
 
 #[tokio::test]
-async fn external_evidence_accepts_unregistered_v1_producer() {
+async fn external_evidence_extracts_repo_atlas_v1_envelope() {
     let result = evidence_result(
-        "future-provider",
+        "repo-atlas",
         "symbol context",
         serde_json::json!({"symbols": ["alpha"]}),
     );
@@ -247,14 +247,14 @@ async fn external_evidence_accepts_unregistered_v1_producer() {
         .as_ref()
         .and_then(|document| document.external_evidence.last())
         .expect("receipt");
-    assert_eq!(receipt.producer, "future-provider");
+    assert_eq!(receipt.producer, "repo-atlas");
     assert_eq!(receipt.payload_completeness, EvidenceCompleteness::Complete);
 }
 
 #[tokio::test]
 async fn external_evidence_unknown_schema_is_ignored_with_warning() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
-    let mut result = evidence_result("diagnostic-provider", "diagnostic", serde_json::json!({}));
+    let mut result = evidence_result("kds", "diagnostic", serde_json::json!({}));
     result.structured_content.as_mut().expect("structured")["evidenceMeta"]["schemaVersion"] =
         serde_json::json!(2);
     assert!(matches!(
@@ -273,18 +273,6 @@ async fn external_evidence_unknown_schema_is_ignored_with_warning() {
             .external_evidence
             .is_empty()
     );
-}
-
-#[tokio::test]
-async fn external_evidence_blank_producer_is_ignored_with_warning() {
-    let (_temp, _repo, ledger) = ledger_fixture().await;
-    let result = evidence_result("   ", "diagnostic", serde_json::json!({}));
-    assert!(matches!(
-        ledger
-            .record_external_mcp_evidence("server", "tool", "call", &result)
-            .await,
-        ExternalEvidenceCapture::Warning(_)
-    ));
 }
 
 #[tokio::test]
@@ -307,12 +295,12 @@ async fn unrelated_generic_complete_field_is_not_external_evidence() {
 #[test]
 fn external_evidence_hash_is_stable_under_object_key_reordering() {
     let left = evidence_result(
-        "test-provider",
+        "kds",
         "same",
         serde_json::from_str(r#"{"b":2,"a":{"z":1,"y":0}}"#).expect("json"),
     );
     let right = evidence_result(
-        "test-provider",
+        "kds",
         "same",
         serde_json::from_str(r#"{"a":{"y":0,"z":1},"b":2}"#).expect("json"),
     );
@@ -323,8 +311,8 @@ fn external_evidence_hash_is_stable_under_object_key_reordering() {
 
 #[test]
 fn external_evidence_hash_includes_text_content() {
-    let left = evidence_result("test-provider", "first", serde_json::json!({"value": 1}));
-    let right = evidence_result("test-provider", "second", serde_json::json!({"value": 1}));
+    let left = evidence_result("kds", "first", serde_json::json!({"value": 1}));
+    let right = evidence_result("kds", "second", serde_json::json!({"value": 1}));
     let left = serde_json::to_vec(&canonical_mcp_result_payload(&left)).expect("canonical");
     let right = serde_json::to_vec(&canonical_mcp_result_payload(&right)).expect("canonical");
     assert_ne!(Sha256::digest(left), Sha256::digest(right));
@@ -332,11 +320,7 @@ fn external_evidence_hash_includes_text_content() {
 
 #[tokio::test]
 async fn external_evidence_inline_payload_round_trips() {
-    let result = evidence_result(
-        "test-provider",
-        "small",
-        serde_json::json!({"value": [1, 2]}),
-    );
+    let result = evidence_result("kds", "small", serde_json::json!({"value": [1, 2]}));
     let expected = canonical_mcp_result_payload(&result);
     let (_temp, ledger) = record_fixture_evidence(&result).await;
     let guard = ledger.document.lock().await;
@@ -351,7 +335,7 @@ async fn external_evidence_inline_payload_round_trips() {
 #[tokio::test]
 async fn oversized_external_evidence_uses_opaque_artifact_id() {
     let result = evidence_result(
-        "test-provider",
+        "kds",
         &"large-payload-".repeat(3_000),
         serde_json::json!({"value": "large"}),
     );
@@ -403,11 +387,7 @@ async fn oversized_external_evidence_uses_opaque_artifact_id() {
 
 #[tokio::test]
 async fn oversized_external_evidence_summary_is_bounded_under_adversarial_metadata() {
-    let mut result = evidence_result(
-        "test-provider",
-        "small text",
-        serde_json::json!({"value": 1}),
-    );
+    let mut result = evidence_result("kds", "small text", serde_json::json!({"value": 1}));
     let huge = "x".repeat(EXTERNAL_EVIDENCE_INLINE_PAYLOAD_BYTES * 4);
     let structured = result.structured_content.as_mut().expect("structured");
     structured["evidenceMeta"]["operation"] = Value::String(huge.clone());
@@ -429,7 +409,7 @@ async fn oversized_external_evidence_summary_is_bounded_under_adversarial_metada
         serde_json::to_vec(payload).expect("summary").len()
             <= EXTERNAL_EVIDENCE_INLINE_PAYLOAD_BYTES
     );
-    assert_eq!(payload["evidenceMetaSummary"]["producer"], "test-provider");
+    assert_eq!(payload["evidenceMetaSummary"]["producer"], "kds");
     assert_eq!(payload["evidenceMetaSummary"]["schemaVersion"], 1);
     assert_eq!(
         payload["evidenceMetaSummary"]["payloadCompleteness"],
@@ -449,7 +429,7 @@ async fn oversized_external_evidence_summary_is_bounded_under_adversarial_metada
 #[tokio::test]
 async fn referenced_external_evidence_artifact_survives_restart_and_retention_pressure() {
     let result = evidence_result(
-        "test-provider",
+        "kds",
         &"restart-retained-".repeat(2_000),
         serde_json::json!({"value": 1}),
     );
@@ -509,7 +489,7 @@ async fn referenced_external_evidence_artifact_survives_restart_and_retention_pr
 #[tokio::test]
 async fn restart_drops_external_receipt_whose_payload_artifact_is_missing() {
     let result = evidence_result(
-        "test-provider",
+        "kds",
         &"missing-on-restart-".repeat(2_000),
         serde_json::json!({"value": 1}),
     );
@@ -573,12 +553,12 @@ async fn restart_drops_external_receipt_whose_payload_artifact_is_missing() {
 #[tokio::test]
 async fn trimming_and_persistence_failure_cleanup_external_evidence_artifacts() {
     let first = evidence_result(
-        "test-provider",
+        "kds",
         &"first-artifact-".repeat(2_000),
         serde_json::json!({"value": 1}),
     );
     let second = evidence_result(
-        "test-provider",
+        "kds",
         &"second-artifact-".repeat(2_000),
         serde_json::json!({"value": 2}),
     );
@@ -724,7 +704,7 @@ async fn documents_without_external_evidence_still_load() {
 
 #[tokio::test]
 async fn duplicate_external_receipt_ids_are_repaired_by_migration() {
-    let result = evidence_result("test-provider", "one", serde_json::json!({}));
+    let result = evidence_result("kds", "one", serde_json::json!({}));
     let (_temp, _repo, ledger) = ledger_fixture().await;
     for call in ["call-1", "call-2"] {
         assert_eq!(
@@ -1636,7 +1616,7 @@ async fn cancelled_external_persistence_success_keeps_receipt_and_artifact() {
     let ledger = Arc::new(ledger);
     let (started, release) = install_persistence_test_control(&ledger, false);
     let result = evidence_result(
-        "test-provider",
+        "kds",
         &"large evidence ".repeat(2_000),
         serde_json::json!({"provider": "snapshot"}),
     );
@@ -1689,7 +1669,7 @@ async fn cancelled_external_persistence_failure_rolls_back_receipt_and_artifact(
     let ledger = Arc::new(ledger);
     let (started, release) = install_persistence_test_control(&ledger, true);
     let result = evidence_result(
-        "test-provider",
+        "kds",
         &"large evidence ".repeat(2_000),
         serde_json::json!({"provider": "snapshot"}),
     );

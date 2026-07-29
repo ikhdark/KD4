@@ -2871,25 +2871,6 @@ impl Session {
         turn_context: &TurnContext,
         items: &[ResponseItem],
     ) {
-        self.record_conversation_items_internal(turn_context, items, true)
-            .await;
-    }
-
-    pub(crate) async fn record_conversation_items_for_model_history_and_rollout_only(
-        &self,
-        turn_context: &TurnContext,
-        items: &[ResponseItem],
-    ) {
-        self.record_conversation_items_internal(turn_context, items, false)
-            .await;
-    }
-
-    async fn record_conversation_items_internal(
-        &self,
-        turn_context: &TurnContext,
-        items: &[ResponseItem],
-        send_raw_items: bool,
-    ) {
         let items = self.prepare_conversation_items_for_history(turn_context, items);
         let items = items.as_ref();
         {
@@ -2905,9 +2886,7 @@ impl Session {
             .begin_local_phase(TurnLocalPhase::Persistence);
         self.persist_rollout_response_items(items).await;
         drop(persistence_timing_guard);
-        if send_raw_items {
-            self.send_raw_response_items(turn_context, items).await;
-        }
+        self.send_raw_response_items(turn_context, items).await;
     }
 
     pub(crate) async fn record_step_world_state_if_changed(

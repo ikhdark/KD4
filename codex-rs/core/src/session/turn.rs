@@ -62,7 +62,6 @@ use crate::stream_events_utils::last_assistant_message_from_item;
 use crate::stream_events_utils::mark_thread_memory_mode_polluted_if_external_context;
 use crate::stream_events_utils::raw_assistant_output_text_from_item;
 use crate::stream_events_utils::record_completed_response_item_with_finalized_facts;
-use crate::task_evidence::TaskPhase;
 use crate::tasks::emit_compact_metric;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
@@ -142,16 +141,6 @@ use tracing::trace_span;
 use tracing::warn;
 
 const POST_SAMPLING_TOKEN_ESTIMATE_TARGET: &str = "codex_core::post_sampling_token_estimate";
-
-fn is_task_lifecycle_final_item(item: &ResponseItem) -> bool {
-    match item {
-        ResponseItem::Message { role, phase, .. } => {
-            role == "assistant" && !matches!(phase, Some(MessagePhase::Commentary))
-        }
-        ResponseItem::AgentMessage { .. } => true,
-        _ => false,
-    }
-}
 
 /// Takes initial turn input and runs a loop where, at each sampling request,
 /// the model replies with either:
@@ -297,48 +286,6 @@ pub(crate) async fn run_turn(
             Some(step_context) => step_context,
             None => sess.capture_step_context(Arc::clone(&turn_context)).await,
         };
-        if sess
-            .services
-            .task_evidence
-            .inspect_status()
-            .await
-            .is_some_and(|status| status.phase == TaskPhase::Reviewing)
-        {
-            let review_packet = sess
-                .services
-                .task_evidence
-                .prepare_review()
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
-            if let Some(review_packet) = review_packet {
-                let review_status = crate::tasks::run_task_evidence_review(
-                    Arc::clone(&sess),
-                    Arc::clone(&turn_extension_data),
-                    Arc::clone(&turn_context),
-                    review_packet,
-                    cancellation_token.child_token(),
-                )
-                .await
-                .map_err(CodexErr::InvalidRequest)?;
-                if review_status.is_none() {
-                    return Err(CodexErr::TurnAborted);
-                }
-            } else {
-                sess.record_conversation_items(
-                    &turn_context,
-                    &[ResponseItem::Message {
-                        id: Some(ResponseItemId::new("msg")),
-                        role: "user".to_string(),
-                        content: vec![ContentItem::InputText {
-                            text: "Runtime lifecycle gate: repository drift invalidated closure before independent review. Re-evaluate the current state and submit fresh closure evidence.".to_string(),
-                        }],
-                        phase: None,
-                        internal_chat_message_metadata_passthrough: None,
-                    }],
-                )
-                .await;
-            }
-        }
         let sampling_request_result: CodexResult<_> = async {
             super::time_reminder::maybe_record_current_time_reminder(
                 sess.as_ref(),
@@ -2745,67 +2692,6 @@ async fn try_run_sampling_request(
                     continue;
                 }
 
-                if !plan_mode
-                    && sess.services.task_evidence.allows_kd4_completion()
-                    && is_task_lifecycle_final_item(&item)
-                {
-                    let item_id = item
-                        .id()
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| format!("{}-provisional-final", turn_context.sub_id));
-                    let authorized = sess
-                        .services
-                        .task_evidence
-                        .authorize_final_item(&turn_context.sub_id, &item_id)
-                        .await
-                        .map_err(CodexErr::InvalidRequest)?;
-                    if !authorized {
-                        sess.record_conversation_items_for_model_history_and_rollout_only(
-                            &turn_context,
-                            std::slice::from_ref(&item),
-                        )
-                        .await;
-                        let status = sess.services.task_evidence.inspect_status().await;
-                        let instruction = match status.as_ref().map(|status| status.phase) {
-                            Some(TaskPhase::Unclassified) => {
-                                "Runtime lifecycle gate: classify this task with `task_state.classify` before mutation or finalization."
-                            }
-                            Some(TaskPhase::Investigating) => {
-                                "Runtime lifecycle gate: submit the required batched investigation checkpoint with `task_state.submit_investigation_checkpoint`; do not finalize yet."
-                            }
-                            Some(TaskPhase::Reviewing) => {
-                                "Runtime lifecycle gate: independent closure review is pending; wait for its result before finalizing."
-                            }
-                            Some(TaskPhase::Fixing | TaskPhase::Closing | TaskPhase::Ready)
-                            | None => {
-                                "Runtime lifecycle gate: repair remaining findings or submit fresh exact-state evidence with `task_state.submit_closure`; do not finalize yet."
-                            }
-                        };
-                        let detail = status
-                            .as_ref()
-                            .map(|status| status.message.as_str())
-                            .filter(|message| !message.is_empty())
-                            .unwrap_or(
-                                "final output is not authorized for the current evidence revision",
-                            );
-                        sess.record_conversation_items(
-                            &turn_context,
-                            &[ResponseItem::Message {
-                                id: Some(ResponseItemId::new("msg")),
-                                role: "user".to_string(),
-                                content: vec![ContentItem::InputText {
-                                    text: format!("{instruction}\n\nRuntime status: {detail}"),
-                                }],
-                                phase: None,
-                                internal_chat_message_metadata_passthrough: None,
-                            }],
-                        )
-                        .await;
-                        needs_follow_up = true;
-                        continue;
-                    }
-                }
-
                 let mut ctx = HandleOutputCtx {
                     sess: sess.clone(),
                     turn_context: turn_context.clone(),
@@ -2886,10 +2772,7 @@ async fn try_run_sampling_request(
                 .await
                 {
                     let mut turn_item = turn_item;
-                    let stream_item_to_client = !defer_streamed_turn_items_for_contributors
-                        && !(!plan_mode
-                            && sess.services.task_evidence.allows_kd4_completion()
-                            && is_task_lifecycle_final_item(&item));
+                    let stream_item_to_client = !defer_streamed_turn_items_for_contributors;
                     let mut seeded_parsed: Option<ParsedAssistantTextDelta> = None;
                     let mut seeded_item_id: Option<String> = None;
                     if stream_item_to_client

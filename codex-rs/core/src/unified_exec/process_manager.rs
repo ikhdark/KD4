@@ -335,28 +335,6 @@ fn fail_process_with_message(process: &UnifiedExecProcess, message: String) -> U
     UnifiedExecError::process_failed(process.failure_message().unwrap_or(message))
 }
 
-fn spawn_mutation_guard_exit_watcher(
-    process_store: Arc<tokio::sync::Mutex<ProcessStore>>,
-    process: Arc<UnifiedExecProcess>,
-    process_id: i32,
-) {
-    tokio::spawn(async move {
-        process.cancellation_token().cancelled().await;
-        if !process.has_exited() {
-            let _ = process.terminate_confirmed().await;
-        }
-        let mutation_guard = {
-            let mut store = process_store.lock().await;
-            store
-                .processes
-                .get_mut(&process_id)
-                .filter(|entry| Arc::ptr_eq(&entry.process, &process))
-                .and_then(|entry| entry.mutation_guard.take())
-        };
-        drop(mutation_guard);
-    });
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn emit_failed_initial_exec_end_if_unstored(
     process_started_alive: bool,
@@ -474,16 +452,13 @@ impl UnifiedExecProcessManager {
             store.remove(process_id)
         };
         if let Some(entry) = removed {
-            if entry.mutation_guard.is_some() && !entry.process.has_exited() {
-                let _ = entry.process.terminate_confirmed().await;
-            }
             unregister_network_approval_for_entry(&entry).await;
         }
     }
 
     pub(crate) async fn exec_command(
         &self,
-        mut request: ExecCommandRequest,
+        request: ExecCommandRequest,
         mut process_id_reservation: ProcessIdReservation,
         context: &UnifiedExecContext,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
@@ -557,7 +532,6 @@ impl UnifiedExecProcessManager {
                 deferred_network_approval.clone(),
                 Arc::clone(&transcript),
                 Arc::clone(&initial_exec_command_active),
-                request.mutation_guard.take(),
             )
             .await;
             Some(InitialExecCommandGuard {
@@ -733,33 +707,21 @@ impl UnifiedExecProcessManager {
 
     pub(crate) async fn write_stdin(
         &self,
-        mut request: WriteStdinRequest<'_>,
+        request: WriteStdinRequest<'_>,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let process_id = request.process_id;
 
         // Different terminal sessions can be polled concurrently, but reads and
         // writes against one terminal must not overlap because they share a
         // draining output buffer and process lifecycle.
-        let (locked_process, mutation_guard_installed) = {
-            let mut store = self.process_store.lock().await;
+        let locked_process = {
+            let store = self.process_store.lock().await;
             let entry = store
                 .processes
-                .get_mut(&process_id)
+                .get(&process_id)
                 .ok_or(UnifiedExecError::UnknownProcessId { process_id })?;
-            let mutation_guard_installed =
-                request.mutation_guard.is_some() && entry.mutation_guard.is_none();
-            if mutation_guard_installed {
-                entry.mutation_guard = request.mutation_guard.take();
-            }
-            (Arc::clone(&entry.process), mutation_guard_installed)
+            Arc::clone(&entry.process)
         };
-        if mutation_guard_installed {
-            spawn_mutation_guard_exit_watcher(
-                Arc::clone(&self.process_store),
-                Arc::clone(&locked_process),
-                process_id,
-            );
-        }
         let _interaction_guard = locked_process.interaction_lock().lock_owned().await;
 
         let PreparedProcessHandles {
@@ -1003,9 +965,7 @@ impl UnifiedExecProcessManager {
         network_approval: Option<DeferredNetworkApproval>,
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
         initial_exec_command_active: Arc<AtomicBool>,
-        mutation_guard: Option<crate::task_evidence::TaskMutationGuard>,
     ) {
-        let mutation_guard_present = mutation_guard.is_some();
         let entry = ProcessEntry {
             process: Arc::clone(&process),
             call_id: context.call_id.clone(),
@@ -1017,7 +977,6 @@ impl UnifiedExecProcessManager {
             network_approval,
             session: Arc::downgrade(&context.session),
             last_used: started_at,
-            mutation_guard,
         };
         let pruned_entry = {
             let mut store = self.process_store.lock().await;
@@ -1026,13 +985,6 @@ impl UnifiedExecProcessManager {
             process_id_reservation.transfer_to_store();
             pruned_entry
         };
-        if mutation_guard_present {
-            spawn_mutation_guard_exit_watcher(
-                Arc::clone(&self.process_store),
-                Arc::clone(&process),
-                process_id,
-            );
-        }
         // prune_processes_if_needed runs while holding process_store; do async
         // network-approval cleanup only after dropping that lock.
         if let Some(pruned_entry) = pruned_entry {
@@ -1044,11 +996,7 @@ impl UnifiedExecProcessManager {
                 .command_execution
                 .finish_running_process(pruned_entry.process_id, Some(exit_code))
                 .await;
-            if pruned_entry.mutation_guard.is_some() {
-                let _ = pruned_entry.process.terminate_confirmed().await;
-            } else {
-                pruned_entry.process.terminate();
-            }
+            pruned_entry.process.terminate();
         }
 
         context
