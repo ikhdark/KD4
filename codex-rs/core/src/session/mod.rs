@@ -159,6 +159,7 @@ use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use futures::future::Shared;
 use futures::prelude::*;
+use futures::stream::FuturesOrdered;
 use rmcp::model::RequestId;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -3180,6 +3181,49 @@ impl Session {
         }
     }
 
+    async fn poll_thread_context_contributors(&self) -> Vec<PromptFragment> {
+        // Poll contributors concurrently, but yield their fragments in registration order.
+        let mut pending = FuturesOrdered::new();
+        for contributor in self.services.extensions.context_contributors() {
+            pending.push_back(contributor.contribute_thread_context(
+                &self.services.session_extension_data,
+                &self.services.thread_extension_data,
+            ));
+        }
+
+        let mut fragments = Vec::new();
+        while let Some(contributed_fragments) = pending.next().await {
+            fragments.extend(contributed_fragments);
+        }
+        fragments
+    }
+
+    async fn poll_turn_context_contributors(
+        &self,
+        turn_context: &TurnContext,
+    ) -> Vec<PromptFragment> {
+        // Poll contributors concurrently, but yield their fragments in registration order.
+        let mut pending = FuturesOrdered::new();
+        for contributor in self.services.extensions.context_contributors() {
+            pending.push_back(
+                contributor.contribute_turn_context(TurnContextContributionInput {
+                    thread_id: self.thread_id(),
+                    turn_id: turn_context.sub_id.as_str(),
+                    session_store: &self.services.session_extension_data,
+                    thread_store: &self.services.thread_extension_data,
+                    turn_store: turn_context.extension_data.as_ref(),
+                    model_context_window: turn_context.model_context_window(),
+                }),
+            );
+        }
+
+        let mut fragments = Vec::new();
+        while let Some(contributed_fragments) = pending.next().await {
+            fragments.extend(contributed_fragments);
+        }
+        fragments
+    }
+
     async fn build_turn_context_contribution_items(
         &self,
         turn_context: &TurnContext,
@@ -3187,27 +3231,14 @@ impl Session {
         let mut developer_sections = Vec::new();
         let mut contextual_user_sections = Vec::new();
         let mut separate_developer_sections = Vec::new();
-        let context_contributors = self.services.extensions.context_contributors().to_vec();
 
-        for contributor in &context_contributors {
-            for fragment in contributor
-                .contribute_turn_context(TurnContextContributionInput {
-                    thread_id: self.thread_id(),
-                    turn_id: turn_context.sub_id.as_str(),
-                    session_store: &self.services.session_extension_data,
-                    thread_store: &self.services.thread_extension_data,
-                    turn_store: turn_context.extension_data.as_ref(),
-                    model_context_window: turn_context.model_context_window(),
-                })
-                .await
-            {
-                push_prompt_fragment(
-                    fragment,
-                    &mut developer_sections,
-                    &mut contextual_user_sections,
-                    &mut separate_developer_sections,
-                );
-            }
+        for fragment in self.poll_turn_context_contributors(turn_context).await {
+            push_prompt_fragment(
+                fragment,
+                &mut developer_sections,
+                &mut contextual_user_sections,
+                &mut separate_developer_sections,
+            );
         }
 
         let mut items = Vec::with_capacity(3);
@@ -3398,42 +3429,21 @@ impl Session {
         {
             contextual_user_sections.push(recommended_plugins.render());
         }
-        let context_contributors = self.services.extensions.context_contributors().to_vec();
-        for contributor in &context_contributors {
-            for fragment in contributor
-                .contribute_thread_context(
-                    &self.services.session_extension_data,
-                    &self.services.thread_extension_data,
-                )
-                .await
-            {
-                push_prompt_fragment(
-                    fragment,
-                    &mut developer_sections,
-                    &mut contextual_user_sections,
-                    &mut separate_developer_sections,
-                );
-            }
+        for fragment in self.poll_thread_context_contributors().await {
+            push_prompt_fragment(
+                fragment,
+                &mut developer_sections,
+                &mut contextual_user_sections,
+                &mut separate_developer_sections,
+            );
         }
-        for contributor in &context_contributors {
-            for fragment in contributor
-                .contribute_turn_context(TurnContextContributionInput {
-                    thread_id: self.thread_id(),
-                    turn_id: turn_context.sub_id.as_str(),
-                    session_store: &self.services.session_extension_data,
-                    thread_store: &self.services.thread_extension_data,
-                    turn_store: turn_context.extension_data.as_ref(),
-                    model_context_window: turn_context.model_context_window(),
-                })
-                .await
-            {
-                push_prompt_fragment(
-                    fragment,
-                    &mut developer_sections,
-                    &mut contextual_user_sections,
-                    &mut separate_developer_sections,
-                );
-            }
+        for fragment in self.poll_turn_context_contributors(turn_context).await {
+            push_prompt_fragment(
+                fragment,
+                &mut developer_sections,
+                &mut contextual_user_sections,
+                &mut separate_developer_sections,
+            );
         }
         // This is full-context metadata. Steady-state context diffs should not re-emit it.
         if turn_context.config.features.enabled(Feature::TokenBudget)

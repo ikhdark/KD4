@@ -503,26 +503,6 @@ config_keys = []
 retired_paths = ["codex-rs/config/src/coding_budgets.rs"]
 
 [[features]]
-id = "kd4-harness"
-version = 1
-status = "enabled"
-capability_kind = "guidance"
-owner = ".codex/harness"
-summary = "Fork-local durable planning, evidence, handoff, and completion workflow."
-upstream_equivalent = "none"
-config_keys = []
-
-[[features.evidence]]
-kind = "entrypoint"
-path = ".codex/harness/workflow.md"
-contains = "# KD4 Harness Workflow"
-
-[[features.evidence]]
-kind = "registration"
-path = ".codex/skills/kd4-harness/SKILL.md"
-contains = ".codex/harness/workflow.md"
-
-[[features]]
 id = "task-evidence-completion-gate"
 version = 3
 status = "enabled"

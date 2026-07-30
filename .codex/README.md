@@ -14,11 +14,9 @@ default.
 | Plan or preserve evidence for a durable task | [`harness/README.md`](harness/README.md) |
 | Implement or change KD4 repository behavior | [`../AGENTS.md`](../AGENTS.md) |
 | Follow the optional durable-artifact lifecycle | [`harness/workflow.md`](harness/workflow.md) |
-| Create, audit, or run durable harness artifacts | [`skills/kd4-harness/SKILL.md`](skills/kd4-harness/SKILL.md) |
 
 Use the smallest relevant surface. Routine work does not need a harness run
-directory, and the harness skill should load only when durable workflow state or
-harness maintenance is actually requested.
+directory.
 
 ## Source And State Boundary
 

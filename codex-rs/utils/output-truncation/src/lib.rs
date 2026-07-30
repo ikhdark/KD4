@@ -33,14 +33,6 @@ impl OutputOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TruncationReason {
-    NotTruncated,
-    RequestedLimit,
-    DefaultLimit,
-    HardLimit,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputLimitResolution {
     pub requested_limit: Option<usize>,
     pub default_limit: usize,
@@ -48,61 +40,10 @@ pub struct OutputLimitResolution {
     pub applied_limit: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TruncationMetadata {
-    pub requested_limit: Option<usize>,
-    pub default_limit: usize,
-    pub hard_limit: usize,
-    pub applied_limit: usize,
-    /// Estimated token count of the body before token-budget truncation.
-    pub original_size: usize,
-    /// Estimated token count of source body content retained after truncation.
-    ///
-    /// This excludes any warning header added by formatted truncation helpers.
-    pub retained_size: usize,
-    pub truncation_reason: TruncationReason,
-}
-
-impl TruncationMetadata {
-    pub fn is_truncated(self) -> bool {
-        self.truncation_reason != TruncationReason::NotTruncated
-    }
-}
-
-impl OutputLimitResolution {
-    pub fn metadata(self, original_size: usize, was_truncated: bool) -> TruncationMetadata {
-        let selected_limit = self.requested_limit.unwrap_or(self.default_limit);
-        let retained_size = if was_truncated {
-            original_size.min(self.applied_limit)
-        } else {
-            original_size
-        };
-        let truncation_reason = if !was_truncated {
-            TruncationReason::NotTruncated
-        } else if self.hard_limit < selected_limit {
-            TruncationReason::HardLimit
-        } else if self.requested_limit.is_some() {
-            TruncationReason::RequestedLimit
-        } else {
-            TruncationReason::DefaultLimit
-        };
-
-        TruncationMetadata {
-            requested_limit: self.requested_limit,
-            default_limit: self.default_limit,
-            hard_limit: self.hard_limit,
-            applied_limit: self.applied_limit,
-            original_size,
-            retained_size,
-            truncation_reason,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TruncatedTextOutput {
     pub text: String,
-    pub metadata: TruncationMetadata,
+    pub was_truncated: bool,
 }
 
 pub fn adaptive_output_budget_description() -> String {
@@ -142,8 +83,11 @@ pub fn truncate_text_with_output_limit(
     limits: OutputLimitResolution,
 ) -> TruncatedTextOutput {
     let text = truncate_text(content, TruncationPolicy::Tokens(limits.applied_limit));
-    let metadata = limits.metadata(approx_token_count(content), text != content);
-    TruncatedTextOutput { text, metadata }
+    let was_truncated = text != content;
+    TruncatedTextOutput {
+        text,
+        was_truncated,
+    }
 }
 
 pub fn formatted_truncate_text_with_output_limit(
@@ -151,10 +95,10 @@ pub fn formatted_truncate_text_with_output_limit(
     limits: OutputLimitResolution,
 ) -> TruncatedTextOutput {
     let mut truncated = truncate_text_with_output_limit(content, limits);
-    if truncated.metadata.is_truncated() {
+    if truncated.was_truncated {
         truncated.text = format!(
             "Warning: truncated output (original token count: {})\nTotal output lines: {}\n\n{}",
-            truncated.metadata.original_size,
+            approx_token_count(content),
             content.lines().count(),
             truncated.text
         );

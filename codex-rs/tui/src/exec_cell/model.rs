@@ -67,7 +67,6 @@ impl CommandOutput {
 pub(crate) struct ExecCall {
     pub(crate) call_id: String,
     pub(crate) command: Vec<String>,
-    pub(crate) display_label: Option<String>,
     pub(crate) parsed: Vec<ParsedCommand>,
     pub(crate) output: Option<CommandOutput>,
     pub(crate) source: ExecCommandSource,
@@ -94,7 +93,6 @@ impl ExecCell {
         &self,
         call_id: String,
         command: Vec<String>,
-        display_label: Option<String>,
         parsed: Vec<ParsedCommand>,
         source: ExecCommandSource,
         interaction_input: Option<String>,
@@ -102,7 +100,6 @@ impl ExecCell {
         let call = ExecCall {
             call_id,
             command,
-            display_label,
             parsed,
             output: None,
             source,
@@ -197,8 +194,7 @@ impl ExecCell {
     }
 
     pub(super) fn is_exploring_call(call: &ExecCall) -> bool {
-        call.display_label.is_none()
-            && !matches!(call.source, ExecCommandSource::UserShell)
+        !matches!(call.source, ExecCommandSource::UserShell)
             && !call.parsed.is_empty()
             && call.parsed.iter().all(|p| {
                 matches!(

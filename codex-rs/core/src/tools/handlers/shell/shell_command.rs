@@ -316,7 +316,6 @@ impl ShellCommandHandler {
             track_validation_freshness: true,
             attempt_key: Some(attempt_key),
             repair_notice,
-            capture_exec_output: false,
         })
         .await
         .map(boxed_tool_output)

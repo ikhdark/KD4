@@ -6647,11 +6647,15 @@
     "FuzzyFileSearchSessionCompletedNotification": {
       "$schema": "http://json-schema.org/draft-07/schema#",
       "properties": {
+        "query": {
+          "type": "string"
+        },
         "sessionId": {
           "type": "string"
         }
       },
       "required": [
+        "query",
         "sessionId"
       ],
       "title": "FuzzyFileSearchSessionCompletedNotification",
@@ -15990,6 +15994,12 @@
               "format": "int64",
               "type": [
                 "integer",
+                "null"
+              ]
+            },
+            "error": {
+              "type": [
+                "string",
                 "null"
               ]
             },

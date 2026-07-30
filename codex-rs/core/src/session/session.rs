@@ -536,6 +536,11 @@ impl Session {
             }
             InitialHistory::Resumed(resumed_history) => resumed_history.conversation_id,
         };
+        let rollback_created_persistence_on_error = !config.ephemeral
+            && matches!(
+                &initial_history,
+                InitialHistory::New | InitialHistory::Cleared | InitialHistory::Forked(_)
+            );
         let startup_timing = StartupTimingState::new(thread_id.to_string());
         let resumed_session_id = match &initial_history {
             InitialHistory::Resumed(resumed) => {
@@ -738,18 +743,18 @@ impl Session {
                 error!("failed to initialize thread persistence: {e:#}");
                 e
             })?);
-        if initial_multi_agent_version == Some(MultiAgentVersion::V2)
-            && let Some(state_runtime) = state_db_ctx.as_ref()
-        {
-            agent_control
-                .task_coordinator()
-                .initialize(Arc::clone(state_runtime), session_id.to_string())
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!("failed to initialize typed agent task store: {error}")
-                })?;
-        }
         let session_result: anyhow::Result<Arc<Self>> = async {
+            if initial_multi_agent_version == Some(MultiAgentVersion::V2)
+                && let Some(state_runtime) = state_db_ctx.as_ref()
+            {
+                agent_control
+                    .task_coordinator()
+                    .initialize(Arc::clone(state_runtime), session_id.to_string())
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("failed to initialize typed agent task store: {error}")
+                    })?;
+            }
             let rollout_path = if let Some(live_thread) = live_thread_init.as_ref() {
                 live_thread.local_rollout_path().await?
             } else {
@@ -932,10 +937,7 @@ impl Session {
                 )],
             );
             let agents_md_manager = Arc::new(AgentsMdManager::new(user_instructions));
-            agents_md_manager
-                .refresh(config.as_ref(), &resolved_environments)
-                .await;
-            let plugin_skill_errors = warm_plugins_and_skills_for_session_init(
+            let plugin_skill_warmup = warm_plugins_and_skills_for_session_init(
                 Arc::clone(&config),
                 Arc::clone(&plugins_manager),
                 Arc::clone(&skills_service),
@@ -944,8 +946,11 @@ impl Session {
             .instrument(info_span!(
                 "session_init.plugin_skill_warmup",
                 otel.name = "session_init.plugin_skill_warmup",
-            ))
-            .await;
+            ));
+            let ((), plugin_skill_errors) = tokio::join!(
+                agents_md_manager.refresh(config.as_ref(), &resolved_environments),
+                plugin_skill_warmup,
+            );
             for err in &plugin_skill_errors {
                 error!(
                     "failed to load skill {}: {}",
@@ -1323,6 +1328,13 @@ impl Session {
             }
             Err(err) => {
                 live_thread_init.discard().await;
+                if rollback_created_persistence_on_error {
+                    crate::thread_manager::rollback_created_thread_persistence(
+                        &thread_store,
+                        thread_id,
+                    )
+                    .await;
+                }
                 Err(err)
             }
         }

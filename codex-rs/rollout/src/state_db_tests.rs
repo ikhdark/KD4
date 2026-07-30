@@ -165,6 +165,76 @@ async fn reconcile_rollout_preserves_existing_explicit_title() -> anyhow::Result
     Ok(())
 }
 
+#[tokio::test]
+async fn list_threads_db_preserves_order_while_filtering_rollout_paths() -> anyhow::Result<()> {
+    let home = TempDir::new().expect("temp dir");
+    let runtime =
+        codex_state::StateRuntime::init(home.path().to_path_buf(), "test-provider".to_string())
+            .await?;
+    let base_time = "2026-06-01T14:26:25Z".parse::<DateTime<Utc>>()?;
+    let mut expected_ids = Vec::new();
+    let mut expected_compressed_path = None;
+
+    for index in 0..12 {
+        let thread_id = ThreadId::new();
+        let rollout_path =
+            write_rollout_with_user_message(home.path(), thread_id, &format!("message {index}"))?;
+        let mut thread =
+            metadata::extract_metadata_from_rollout(rollout_path.as_path(), "test-provider")
+                .await?
+                .metadata;
+        let timestamp = base_time + chrono::Duration::seconds(index);
+        thread.created_at = timestamp;
+        thread.updated_at = timestamp;
+        thread.recency_at = timestamp;
+        runtime.upsert_thread(&thread).await?;
+
+        if index == 3 {
+            std::fs::remove_file(rollout_path)?;
+        } else {
+            expected_ids.push(thread_id);
+            if index == 7 {
+                let compressed_path =
+                    crate::compression::compressed_rollout_path(rollout_path.as_path());
+                std::fs::rename(rollout_path, compressed_path.as_path())?;
+                expected_compressed_path = Some((thread_id, compressed_path));
+            }
+        }
+    }
+
+    let page = list_threads_db(
+        Some(runtime.as_ref()),
+        home.path(),
+        20,
+        /*cursor*/ None,
+        ThreadSortKey::CreatedAt,
+        SortDirection::Asc,
+        &[SessionSource::Cli],
+        /*model_providers*/ None,
+        /*cwd_filters*/ None,
+        /*relation_filter*/ None,
+        /*archived*/ false,
+        /*search_term*/ None,
+    )
+    .await
+    .expect("thread listing should succeed");
+
+    assert_eq!(
+        page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+        expected_ids
+    );
+    let (compressed_id, compressed_path) =
+        expected_compressed_path.expect("compressed fixture should be recorded");
+    assert_eq!(
+        page.items
+            .iter()
+            .find(|item| item.id == compressed_id)
+            .map(|item| item.rollout_path.clone()),
+        Some(compressed_path)
+    );
+    Ok(())
+}
+
 fn write_rollout_with_user_message(
     home: &Path,
     thread_id: ThreadId,

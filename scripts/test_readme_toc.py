@@ -122,6 +122,22 @@ class ReadmeTocTest(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertIn("no markers found", output.getvalue())
 
+    def test_check_can_require_markers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "SOURCEMAP.md"
+            path.write_text("# Source Map\n\n## Inventory\n", encoding="utf-8")
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stderr(stderr):
+                result = readme_toc.check_or_fix(
+                    path,
+                    fix=False,
+                    require_markers=True,
+                )
+
+            self.assertEqual(result, 1)
+            self.assertIn("required ToC markers not found", stderr.getvalue())
+
     def test_parse_toc_keeps_unexpected_content_so_check_fails(self) -> None:
         lines = [
             readme_toc.BEGIN_TOC,

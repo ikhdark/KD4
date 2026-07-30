@@ -544,7 +544,7 @@ fn force_terminate_process(pid: u32) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn force_terminate_process_group(pid: u32) -> Result<()> {
+pub(crate) fn force_terminate_process_group(pid: u32) -> Result<()> {
     let raw_pid = libc::pid_t::try_from(pid)
         .with_context(|| format!("pid-managed updater pid {pid} is out of range"))?;
     let result = unsafe { libc::kill(-raw_pid, libc::SIGKILL) };

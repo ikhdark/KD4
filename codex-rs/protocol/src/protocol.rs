@@ -3600,10 +3600,6 @@ pub struct ExecCommandBeginEvent {
     pub started_at_ms: i64,
     /// The command to be executed.
     pub command: Vec<String>,
-    /// Optional short label for collapsed command activity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub display_label: Option<String>,
     /// The command's working directory if not the default cwd for the agent.
     pub cwd: PathUri,
     pub parsed_cmd: Vec<ParsedCommand>,
@@ -3630,10 +3626,6 @@ pub struct ExecCommandEndEvent {
     pub completed_at_ms: i64,
     /// The command that was executed.
     pub command: Vec<String>,
-    /// Optional short label for collapsed command activity.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub display_label: Option<String>,
     /// The command's working directory if not the default cwd for the agent.
     pub cwd: PathUri,
     pub parsed_cmd: Vec<ParsedCommand>,
@@ -5534,7 +5526,6 @@ mod tests {
                 id: "exec-1".into(),
                 process_id: Some("pid-1".into()),
                 command: vec!["echo".into(), "done".into()],
-                display_label: Some("Example -".into()),
                 cwd: cwd.clone(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo done".into(),
@@ -5558,7 +5549,6 @@ mod tests {
                 id: "exec-1".into(),
                 process_id: Some("pid-1".into()),
                 command: vec!["echo".into(), "done".into()],
-                display_label: Some("Example -".into()),
                 cwd,
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo done".into(),
@@ -5581,9 +5571,8 @@ mod tests {
                 call_id,
                 turn_id,
                 started_at_ms: 10,
-                display_label: Some(display_label),
                 ..
-            })] if call_id == "exec-1" && turn_id == "turn-1" && display_label == "Example -"
+            })] if call_id == "exec-1" && turn_id == "turn-1"
         ));
         assert!(matches!(
             completed
@@ -5594,12 +5583,10 @@ mod tests {
                 turn_id,
                 completed_at_ms: 20,
                 aggregated_output,
-                display_label: Some(display_label),
                 ..
             })] if call_id == "exec-1"
                 && turn_id == "turn-1"
                 && aggregated_output == "done\n"
-                && display_label == "Example -"
         ));
     }
 

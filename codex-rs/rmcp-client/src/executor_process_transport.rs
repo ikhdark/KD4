@@ -46,6 +46,7 @@ use tracing::info;
 use tracing::warn;
 
 static PROCESS_COUNTER: AtomicUsize = AtomicUsize::new(1);
+const MCP_STDIO_MAX_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Default)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
@@ -53,11 +54,33 @@ struct LineBuffer {
     bytes: BytesMut,
     /// Prefix already scanned and known not to contain a newline.
     scanned_len: usize,
+    /// Length of the unterminated line at the end of `bytes`.
+    trailing_line_len: usize,
 }
 
 impl LineBuffer {
-    fn extend_from_slice(&mut self, bytes: &[u8]) {
+    fn extend_from_slice(
+        &mut self,
+        bytes: &[u8],
+        max_line_bytes: usize,
+    ) -> Result<(), LineLimitExceeded> {
+        let mut trailing_line_len = self.trailing_line_len;
+        let mut remaining = bytes;
+        while let Some(newline_index) = memchr(b'\n', remaining) {
+            if trailing_line_len.saturating_add(newline_index) > max_line_bytes {
+                return Err(LineLimitExceeded);
+            }
+            trailing_line_len = 0;
+            remaining = &remaining[newline_index + 1..];
+        }
+        trailing_line_len = trailing_line_len.saturating_add(remaining.len());
+        if trailing_line_len > max_line_bytes {
+            return Err(LineLimitExceeded);
+        }
+
         self.bytes.extend_from_slice(bytes);
+        self.trailing_line_len = trailing_line_len;
+        Ok(())
     }
 
     fn take_line(&mut self) -> Option<BytesMut> {
@@ -79,9 +102,19 @@ impl LineBuffer {
         }
 
         self.scanned_len = 0;
+        self.trailing_line_len = 0;
         Some(self.bytes.split())
     }
+
+    fn clear(&mut self) {
+        self.bytes.clear();
+        self.scanned_len = 0;
+        self.trailing_line_len = 0;
+    }
 }
+
+#[derive(Debug)]
+struct LineLimitExceeded;
 
 // Remote public implementation.
 
@@ -309,7 +342,18 @@ impl ExecutorProcessTransport {
             // accepted defensively because the executor process API has a
             // unified stream enum, but remote MCP starts with `tty=false`.
             ExecOutputStream::Stdout | ExecOutputStream::Pty => {
-                self.stdout.extend_from_slice(&bytes);
+                if self
+                    .stdout
+                    .extend_from_slice(&bytes, MCP_STDIO_MAX_LINE_BYTES)
+                    .is_err()
+                {
+                    warn!(
+                        "Remote MCP server stdout line exceeded the {MCP_STDIO_MAX_LINE_BYTES}-byte limit ({}); closing transport",
+                        self.program_name
+                    );
+                    self.stdout.clear();
+                    self.closed = true;
+                }
             }
             // Stderr is intentionally out-of-band. It should help debug server
             // startup failures without entering rmcp framing.
@@ -346,7 +390,18 @@ impl ExecutorProcessTransport {
     fn push_stderr(&mut self, bytes: &[u8]) {
         // Keep stderr line-oriented in logs so a chatty MCP server does not
         // produce one log record per byte chunk.
-        self.stderr.extend_from_slice(bytes);
+        if self
+            .stderr
+            .extend_from_slice(bytes, MCP_STDIO_MAX_LINE_BYTES)
+            .is_err()
+        {
+            warn!(
+                "MCP server stderr line exceeded the {MCP_STDIO_MAX_LINE_BYTES}-byte limit ({}); discarding buffered diagnostics",
+                self.program_name
+            );
+            self.stderr.clear();
+            return;
+        }
         while let Some(line) = self.stderr.take_line() {
             let line = Self::trim_trailing_carriage_return(line);
             info!(

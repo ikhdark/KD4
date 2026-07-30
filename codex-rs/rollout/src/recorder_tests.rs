@@ -835,6 +835,7 @@ async fn list_threads_db_enabled_repairs_stale_rollout_paths() -> std::io::Resul
     builder.model_provider = Some(config.model_provider_id.clone());
     builder.cwd = home.path().to_path_buf();
     let mut metadata = builder.build(config.model_provider_id.as_str());
+    metadata.title = "SQLite title".to_string();
     metadata.first_user_message = Some("Hello from user".to_string());
     metadata.preview = metadata.first_user_message.clone();
     runtime
@@ -858,6 +859,7 @@ async fn list_threads_db_enabled_repairs_stale_rollout_paths() -> std::io::Resul
     )
     .await?;
     assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].title.as_deref(), Some("SQLite title"));
     assert_eq!(page.items[0].path, real_path);
 
     let repaired_path = runtime
@@ -1135,6 +1137,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         path: filesystem_path.clone(),
         thread_id: Some(filesystem_thread_id),
         first_user_message: Some("filesystem message".to_string()),
+        title: None,
         preview: Some("filesystem preview".to_string()),
         cwd: None,
         git_branch: Some("filesystem-branch".to_string()),
@@ -1155,6 +1158,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         path: state_path,
         thread_id: Some(state_thread_id),
         first_user_message: Some("state message".to_string()),
+        title: Some("state title".to_string()),
         preview: Some("state preview".to_string()),
         cwd: Some(PathBuf::from("/tmp/state-cwd")),
         git_branch: Some("state-branch".to_string()),
@@ -1180,6 +1184,7 @@ fn fill_missing_thread_item_metadata_preserves_identity_and_prefers_state_git_fi
         item.first_user_message.as_deref(),
         Some("filesystem message")
     );
+    assert_eq!(item.title.as_deref(), Some("state title"));
     assert_eq!(item.preview.as_deref(), Some("filesystem preview"));
     assert_eq!(item.cwd.as_deref(), Some(Path::new("/tmp/state-cwd")));
     assert_eq!(item.git_branch.as_deref(), Some("state-branch"));

@@ -1,7 +1,5 @@
-use std::collections::HashMap;
 use std::collections::HashSet;
 
-use codex_protocol::ThreadId;
 use codex_rollout::RolloutConfig;
 use codex_rollout::RolloutRecorder;
 use codex_rollout::find_thread_names_by_ids;
@@ -11,6 +9,7 @@ use super::LocalThreadStore;
 use super::helpers::distinct_thread_metadata_title;
 use super::helpers::set_thread_name_from_title;
 use super::helpers::stored_thread_from_rollout_item;
+use super::helpers::thread_item_titles;
 use crate::ListThreadsParams;
 use crate::SortDirection;
 use crate::ThreadPage;
@@ -65,6 +64,7 @@ pub(super) async fn list_threads(
         .as_ref()
         .and_then(|cursor| serde_json::to_value(cursor).ok())
         .and_then(|value| value.as_str().map(str::to_owned));
+    let (mut names, resolved_title_ids) = thread_item_titles(&page.items);
     let mut items = page
         .items
         .into_iter()
@@ -81,20 +81,25 @@ pub(super) async fn list_threads(
         .iter()
         .map(|thread| thread.thread_id)
         .collect::<HashSet<_>>();
-    let mut names = HashMap::<ThreadId, String>::with_capacity(thread_ids.len());
+    let mut unresolved_thread_ids = thread_ids
+        .difference(&resolved_title_ids)
+        .copied()
+        .collect::<HashSet<_>>();
     if let Some(state_db_ctx) = store.state_db().await {
-        for &thread_id in &thread_ids {
+        for thread_id in unresolved_thread_ids.clone() {
             let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await else {
                 continue;
             };
             if let Some(title) = distinct_thread_metadata_title(&metadata) {
+                unresolved_thread_ids.remove(&thread_id);
                 names.insert(thread_id, title);
             }
         }
     }
-    if names.len() < thread_ids.len()
+    if !unresolved_thread_ids.is_empty()
         && let Ok(legacy_names) =
-            find_thread_names_by_ids(store.config.codex_home.as_path(), &thread_ids).await
+            find_thread_names_by_ids(store.config.codex_home.as_path(), &unresolved_thread_ids)
+                .await
     {
         for (thread_id, title) in legacy_names {
             names.entry(thread_id).or_insert(title);
@@ -335,6 +340,70 @@ mod tests {
             page.items[0].first_user_message.as_deref(),
             Some("plain preview")
         );
+        assert_eq!(page.items[0].name.as_deref(), Some("needle title"));
+    }
+
+    #[tokio::test]
+    async fn list_threads_falls_back_to_legacy_name_for_default_sqlite_title() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let uuid = Uuid::from_u128(104);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let rollout_path =
+            write_session_file(home.path(), "2025-01-03T12-30-00", uuid).expect("session file");
+        codex_rollout::append_thread_name(home.path(), thread_id, "Legacy chosen name")
+            .await
+            .expect("write legacy name");
+
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        runtime
+            .mark_backfill_complete(/*last_watermark*/ None)
+            .await
+            .expect("backfill should be complete");
+        let mut builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            rollout_path,
+            Utc::now(),
+            SessionSource::Cli,
+        );
+        builder.model_provider = Some(config.default_model_provider_id.clone());
+        builder.cwd = home.path().to_path_buf();
+        builder.cli_version = Some("test_version".to_string());
+        let mut metadata = builder.build(config.default_model_provider_id.as_str());
+        metadata.title = "Hello from user".to_string();
+        metadata.first_user_message = Some("Hello from user".to_string());
+        metadata.preview = metadata.first_user_message.clone();
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("state db upsert should succeed");
+        let store = LocalThreadStore::new(config, Some(runtime));
+
+        let page = store
+            .list_threads(ListThreadsParams {
+                page_size: 10,
+                cursor: None,
+                sort_key: ThreadSortKey::CreatedAt,
+                sort_direction: SortDirection::Desc,
+                allowed_sources: Vec::new(),
+                model_providers: None,
+                cwd_filters: None,
+                archived: false,
+                search_term: None,
+                relation_filter: None,
+                use_state_db_only: true,
+            })
+            .await
+            .expect("thread listing");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].thread_id, thread_id);
+        assert_eq!(page.items[0].name.as_deref(), Some("Legacy chosen name"));
     }
 
     #[tokio::test]

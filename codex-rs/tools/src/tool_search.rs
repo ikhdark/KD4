@@ -9,6 +9,7 @@ use crate::default_namespace_description;
 #[derive(Clone, PartialEq)]
 pub struct ToolSearchEntry {
     pub search_text: String,
+    pub tool_names: Vec<String>,
     pub output: LoadableToolSpec,
 }
 
@@ -32,6 +33,7 @@ impl ToolSearchInfo {
         spec: ToolSpec,
         source_info: Option<ToolSearchSourceInfo>,
     ) -> Option<Self> {
+        let tool_names = tool_names(&spec);
         let output = match spec {
             ToolSpec::Function(mut tool) => {
                 tool.defer_loading = Some(true);
@@ -57,10 +59,28 @@ impl ToolSearchInfo {
         Some(Self {
             entry: ToolSearchEntry {
                 search_text,
+                tool_names,
                 output,
             },
             source_info,
         })
+    }
+}
+
+fn tool_names(spec: &ToolSpec) -> Vec<String> {
+    match spec {
+        ToolSpec::Function(tool) => vec![tool.name.clone()],
+        ToolSpec::Namespace(namespace) => namespace
+            .tools
+            .iter()
+            .map(|tool| {
+                let ResponsesApiNamespaceTool::Function(tool) = tool;
+                tool.name.clone()
+            })
+            .collect(),
+        ToolSpec::ToolSearch { .. } | ToolSpec::WebSearch { .. } | ToolSpec::Freeform(_) => {
+            Vec::new()
+        }
     }
 }
 

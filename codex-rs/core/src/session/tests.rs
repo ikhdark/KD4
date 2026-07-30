@@ -8385,6 +8385,68 @@ struct TurnContextExtensionTestContributor;
 struct TurnContextExtensionTestState {
     expected_model_context_window: Option<i64>,
 }
+struct ConcurrentContextTestContributor {
+    thread_text: &'static str,
+    turn_text: &'static str,
+    gate: Arc<Semaphore>,
+    waits_for_later_contributor: bool,
+}
+
+impl ConcurrentContextTestContributor {
+    fn contribute<'a>(
+        &'a self,
+        text: &'static str,
+    ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        Box::pin(async move {
+            if self.waits_for_later_contributor {
+                self.gate
+                    .acquire()
+                    .await
+                    .expect("context contributor test gate should remain open")
+                    .forget();
+            } else {
+                self.gate.add_permits(1);
+            }
+            vec![codex_extension_api::PromptFragment::developer_policy(text)]
+        })
+    }
+}
+
+impl codex_extension_api::ContextContributor for ConcurrentContextTestContributor {
+    fn contribute_thread_context<'a>(
+        &'a self,
+        _session_store: &'a codex_extension_api::ExtensionData,
+        _thread_store: &'a codex_extension_api::ExtensionData,
+    ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        self.contribute(self.thread_text)
+    }
+
+    fn contribute_turn_context<'a>(
+        &'a self,
+        _input: codex_extension_api::TurnContextContributionInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        self.contribute(self.turn_text)
+    }
+}
+
+fn concurrent_context_test_registry()
+-> Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>> {
+    let gate = Arc::new(Semaphore::new(0));
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(Arc::new(ConcurrentContextTestContributor {
+        thread_text: "concurrent thread first",
+        turn_text: "concurrent turn first",
+        gate: Arc::clone(&gate),
+        waits_for_later_contributor: true,
+    }));
+    builder.prompt_contributor(Arc::new(ConcurrentContextTestContributor {
+        thread_text: "concurrent thread second",
+        turn_text: "concurrent turn second",
+        gate,
+        waits_for_later_contributor: false,
+    }));
+    Arc::new(builder.build())
+}
 
 impl codex_extension_api::ContextContributor for PromptExtensionTestContributor {
     fn contribute_thread_context<'a>(
@@ -8487,6 +8549,53 @@ async fn build_initial_context_includes_turn_context_fragments_from_extensions()
             .flatten()
             .any(|text| *text == "turn context extension enabled"),
         "expected turn context extension developer text, got {developer_messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn build_initial_context_polls_context_contributors_concurrently_and_applies_in_order() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.services.extensions = concurrent_context_test_registry();
+    let turn_context = Arc::new(turn_context);
+
+    let initial_context = timeout(
+        Duration::from_secs(5),
+        build_initial_context(&session, &turn_context),
+    )
+    .await
+    .expect("context contributors should be polled concurrently");
+    let contributed_texts = developer_input_texts(&initial_context)
+        .into_iter()
+        .filter(|text| text.starts_with("concurrent "))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        contributed_texts,
+        vec![
+            "concurrent thread first",
+            "concurrent thread second",
+            "concurrent turn first",
+            "concurrent turn second",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn turn_context_refresh_polls_contributors_concurrently_and_applies_in_order() {
+    let (mut session, turn_context) = make_session_and_context().await;
+    session.services.extensions = concurrent_context_test_registry();
+
+    let context_items = timeout(
+        Duration::from_secs(5),
+        session.build_turn_context_contribution_items(&turn_context),
+    )
+    .await
+    .expect("turn context contributors should be polled concurrently");
+    let contributed_texts = developer_input_texts(&context_items);
+
+    assert_eq!(
+        contributed_texts,
+        vec!["concurrent turn first", "concurrent turn second"]
     );
 }
 

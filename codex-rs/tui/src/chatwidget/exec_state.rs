@@ -7,7 +7,6 @@ use crate::exec_command::split_command_string;
 
 pub(super) struct RunningCommand {
     pub(super) command: Vec<String>,
-    pub(super) display_label: Option<String>,
     pub(super) parsed_cmd: Vec<ParsedCommand>,
     pub(super) source: ExecCommandSource,
 }

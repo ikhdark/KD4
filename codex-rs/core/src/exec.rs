@@ -1186,6 +1186,7 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
     );
     let mut tmp = [0u8; READ_CHUNK_SIZE];
     let mut emitted_deltas: usize = 0;
+    let mut pending_delta = Vec::with_capacity(READ_CHUNK_SIZE);
 
     loop {
         let n = reader.read(&mut tmp).await?;
@@ -1196,23 +1197,14 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
         if let Some(stream) = &stream
             && emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
         {
-            let chunk = tmp[..n].to_vec();
-            let msg = EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
-                call_id: stream.call_id.clone(),
-                stream: if is_stderr {
-                    ExecOutputStream::Stderr
-                } else {
-                    ExecOutputStream::Stdout
-                },
-                chunk,
-            });
-            let event = Event {
-                id: stream.sub_id.clone(),
-                msg,
-            };
-            #[allow(clippy::let_unit_value)]
-            let _ = stream.tx_event.send(event).await;
-            emitted_deltas += 1;
+            pending_delta.extend_from_slice(&tmp[..n]);
+            while emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
+                && let Some(chunk) =
+                    take_utf8_safe_output_chunk(&mut pending_delta, /*flush_incomplete*/ false)
+            {
+                send_output_delta(stream, is_stderr, chunk).await;
+                emitted_deltas += 1;
+            }
         }
 
         if let Some(max_bytes) = max_bytes {
@@ -1223,10 +1215,74 @@ async fn read_output<R: AsyncRead + Unpin + Send + 'static>(
         // Continue reading to EOF to avoid back-pressure
     }
 
+    if let Some(stream) = &stream {
+        while emitted_deltas < MAX_EXEC_OUTPUT_DELTAS_PER_CALL
+            && let Some(chunk) =
+                take_utf8_safe_output_chunk(&mut pending_delta, /*flush_incomplete*/ true)
+        {
+            send_output_delta(stream, is_stderr, chunk).await;
+            emitted_deltas += 1;
+        }
+    }
+
     Ok(StreamOutput {
         text: buf,
         truncated_after_lines: None,
     })
+}
+
+fn take_utf8_safe_output_chunk(pending: &mut Vec<u8>, flush_incomplete: bool) -> Option<Vec<u8>> {
+    if pending.is_empty() {
+        return None;
+    }
+
+    // Keep only a trailing sequence that could become valid after the next read.
+    // Definitively invalid bytes stay in the emitted chunk so downstream lossy
+    // decoding retains its existing behavior.
+    let max_len = pending.len().min(READ_CHUNK_SIZE);
+    let split = complete_utf8_prefix_len(&pending[..max_len]);
+    if split > 0 {
+        return Some(pending.drain(..split).collect());
+    }
+    if flush_incomplete && pending.len() <= READ_CHUNK_SIZE {
+        return Some(std::mem::take(pending));
+    }
+    None
+}
+
+fn complete_utf8_prefix_len(bytes: &[u8]) -> usize {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        match std::str::from_utf8(&bytes[offset..]) {
+            Ok(_) => return bytes.len(),
+            Err(error) => {
+                offset += error.valid_up_to();
+                let Some(error_len) = error.error_len() else {
+                    return offset;
+                };
+                offset += error_len;
+            }
+        }
+    }
+    bytes.len()
+}
+
+async fn send_output_delta(stream: &StdoutStream, is_stderr: bool, chunk: Vec<u8>) {
+    let msg = EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+        call_id: stream.call_id.clone(),
+        stream: if is_stderr {
+            ExecOutputStream::Stderr
+        } else {
+            ExecOutputStream::Stdout
+        },
+        chunk,
+    });
+    let event = Event {
+        id: stream.sub_id.clone(),
+        msg,
+    };
+    #[allow(clippy::let_unit_value)]
+    let _ = stream.tx_event.send(event).await;
 }
 
 #[cfg(unix)]

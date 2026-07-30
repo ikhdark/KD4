@@ -1,15 +1,18 @@
 # Investigation evaluation corpus
 
 This directory owns the frozen, local-only evaluation corpus used to measure
-the investigation evidence work described in
-`Investigation_Harness_Rewritten.md`. The corpus measures model behavior; it
-does not grant completion authority and it does not implement investigation
-checkpoints, hypotheses, stopping, or refutation.
+the behavior governed by the
+[investigation evidence contract](../../docs/investigation-evidence-v1.md).
+The corpus measures model behavior; it does not grant completion authority and
+it does not implement investigation checkpoints, hypotheses, stopping, or
+refutation.
 
-## Frozen baseline
+## Frozen fixtures
 
-The first corpus is frozen at KD4 commit
-`d5d9f02dbcf010f9b6247aeae4247b614b8527c0`.
+Each fixture patch adds isolated files under `investigation_cases/` to an empty
+Git index. Corpus validation rejects modifications to existing files, so the
+fixtures do not depend on any repository commit remaining reachable after a
+history rewrite.
 
 The before-change baseline uses:
 
@@ -29,16 +32,15 @@ machine-specific model output are local-only and must not be committed.
 
 - `cases.jsonl` is the frozen manifest.
 - `prompts/` contains one repository-relative audit prompt per case.
-- `patches/` contains small reversible fixture patches applied to the recorded
-  base commit.
+- `patches/` contains self-contained new-file fixture patches.
 - `validate_cases.py` validates manifest shape, category coverage, referenced
-  files, base commits, and patch applicability.
+  files, fixture isolation, and patch applicability against an empty index.
 - `score_results.py` validates locally recorded results and reports aggregate
   metrics.
 
 The seeded fixtures are intentionally isolated under `investigation_cases/` in
-disposable worktrees. They do not modify production code and are never applied
-to the working checkout.
+disposable repositories. They do not modify production code and are never
+applied to the working checkout.
 
 ## Validate the corpus
 
@@ -48,19 +50,23 @@ From the KD4 repository root:
 python scripts/investigation_eval/validate_cases.py
 ```
 
+Use `--show-fingerprints` to print the exact fingerprint that each result
+wrapper must record. The fingerprint binds the manifest record, prompt, and
+patch bytes.
+
 ## Record a run
 
 For each case:
 
-1. Create a disposable Git worktree at the case's `base_commit`.
-2. Apply the referenced patch when one is present.
+1. Create an empty disposable directory and run `git init` in it.
+2. Apply the referenced patch from the KD4 checkout when one is present.
 3. Read the referenced prompt verbatim.
 4. Run the recorded KD4 binary and fixed settings:
 
    ```text
    codex exec --ephemeral --ignore-user-config --model gpt-5.6-sol \
      -c model_reasoning_effort="max" --sandbox read-only --json \
-     -C <disposable-worktree> <prompt>
+     -C <disposable-repository> <prompt>
    ```
 
 5. Preserve the complete JSONL event stream without alteration in the result's
@@ -70,14 +76,14 @@ For each case:
    changing its meaning.
 7. Save the wrapper as
    `.codex/evals/investigation/<run-name>/<case-id>.json`.
-8. Remove the disposable worktree.
+8. Remove the disposable repository.
 
 The result wrapper is:
 
 ```json
 {
   "case_id": "stable-case-id",
-  "base_commit": "full commit sha",
+  "case_fingerprint": "lowercase SHA-256 from validate_cases.py --show-fingerprints",
   "completed_at": "RFC 3339 timestamp",
   "model": {
     "name": "gpt-5.6-sol",
@@ -121,8 +127,9 @@ python scripts/investigation_eval/score_results.py \
   --results .codex/evals/investigation/baseline
 ```
 
-The scorer defaults to the frozen baseline binary hash. For an after-change run,
-pass the SHA-256 of the exact resulting binary recorded in every wrapper:
+By default, the scorer derives the binary SHA-256 from the first wrapper and
+requires every other wrapper in the run to match it. To assert a particular
+binary explicitly, pass its SHA-256:
 
 ```text
 python scripts/investigation_eval/score_results.py \

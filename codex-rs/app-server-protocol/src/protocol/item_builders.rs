@@ -82,7 +82,6 @@ pub fn build_command_execution_approval_request_item(
     ThreadItem::CommandExecution {
         id: payload.call_id.clone(),
         command: command_display_string(&payload.command),
-        display_label: None,
         cwd: payload.cwd.clone().into(),
         process_id: None,
         source: CommandExecutionSource::Agent,
@@ -104,7 +103,6 @@ pub fn build_command_execution_begin_item(payload: &ExecCommandBeginEvent) -> Th
     ThreadItem::CommandExecution {
         id: payload.call_id.clone(),
         command: command_display_string(&payload.command),
-        display_label: payload.display_label.clone(),
         cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
         source: payload.source.into(),
@@ -128,7 +126,6 @@ pub fn build_command_execution_end_item(payload: &ExecCommandEndEvent) -> Thread
     ThreadItem::CommandExecution {
         id: payload.call_id.clone(),
         command: command_display_string(&payload.command),
-        display_label: payload.display_label.clone(),
         cwd: payload.cwd.clone().into(),
         process_id: payload.process_id.clone(),
         source: payload.source.into(),
@@ -271,7 +268,6 @@ pub fn build_item_from_guardian_event(
             Some(ThreadItem::CommandExecution {
                 id: id.clone(),
                 command,
-                display_label: None,
                 cwd: cwd.clone().into(),
                 process_id: None,
                 source: CommandExecutionSource::Agent,
@@ -308,7 +304,6 @@ pub fn build_item_from_guardian_event(
             Some(ThreadItem::CommandExecution {
                 id: id.clone(),
                 command,
-                display_label: None,
                 cwd: cwd.clone().into(),
                 process_id: None,
                 source: CommandExecutionSource::Agent,

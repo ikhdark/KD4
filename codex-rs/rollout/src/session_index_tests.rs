@@ -9,7 +9,105 @@ use codex_protocol::protocol::SessionSource;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::io::Read as _;
+use std::process::Child;
+use std::process::Command;
+use std::process::Stdio;
+use std::sync::mpsc;
+use std::time::Duration;
+use std::time::Instant;
 use tempfile::TempDir;
+
+const LOCK_HOLDER_CHILD_TEST: &str = "session_index::tests::session_index_lock_holder_child";
+const LOCK_HOLDER_CODEX_HOME_ENV: &str = "CODEX_SESSION_INDEX_LOCK_HOLDER_CODEX_HOME";
+const LOCK_HOLDER_READY_PATH_ENV: &str = "CODEX_SESSION_INDEX_LOCK_HOLDER_READY_PATH";
+const LOCK_HOLDER_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct SessionIndexLockHolder {
+    child: Option<Child>,
+}
+
+impl SessionIndexLockHolder {
+    fn spawn(codex_home: &Path, ready_file: &Path) -> std::io::Result<Self> {
+        let child = Command::new(std::env::current_exe()?)
+            .arg("--exact")
+            .arg(LOCK_HOLDER_CHILD_TEST)
+            .arg("--ignored")
+            .stdin(Stdio::piped())
+            .env(LOCK_HOLDER_CODEX_HOME_ENV, codex_home)
+            .env(LOCK_HOLDER_READY_PATH_ENV, ready_file)
+            .spawn()?;
+        let mut holder = Self { child: Some(child) };
+        let started = Instant::now();
+        while !ready_file.exists() {
+            if let Some(status) = holder.child_mut().try_wait()? {
+                holder.child.take();
+                return Err(std::io::Error::other(format!(
+                    "session index lock holder exited before acquiring the lock: {status}"
+                )));
+            }
+            if started.elapsed() > LOCK_HOLDER_TIMEOUT {
+                let timeout_error = std::io::Error::other(
+                    "timed out waiting for child process to acquire session index lock",
+                );
+                return match holder.stop() {
+                    Ok(()) => Err(timeout_error),
+                    Err(cleanup_error) => Err(std::io::Error::other(format!(
+                        "{timeout_error}; child cleanup failed: {cleanup_error}"
+                    ))),
+                };
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(holder)
+    }
+
+    fn stop(mut self) -> std::io::Result<()> {
+        self.stop_inner()
+    }
+
+    fn stop_inner(&mut self) -> std::io::Result<()> {
+        let child = self.child_mut();
+        drop(child.stdin.take());
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                self.child.take();
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other(format!(
+                        "session index lock holder exited with status {status}"
+                    )))
+                };
+            }
+            if started.elapsed() > LOCK_HOLDER_TIMEOUT {
+                child.kill()?;
+                let status = child.wait()?;
+                self.child.take();
+                return Err(std::io::Error::other(format!(
+                    "timed out waiting for session index lock holder to exit; killed child with status {status}"
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut Child {
+        self.child
+            .as_mut()
+            .expect("session index lock holder should still be running")
+    }
+}
+
+impl Drop for SessionIndexLockHolder {
+    fn drop(&mut self) {
+        if self.child.is_some() {
+            let _ = self.stop_inner();
+        }
+    }
+}
+
 fn write_index(path: &Path, lines: &[SessionIndexEntry]) -> std::io::Result<()> {
     let mut out = String::new();
     for entry in lines {
@@ -52,6 +150,147 @@ fn write_rollout_with_metadata(path: &Path, thread_id: ThreadId) -> std::io::Res
     };
     let body = serde_json::to_string(&line).map_err(std::io::Error::other)?;
     std::fs::write(path, format!("{body}\n"))
+}
+
+#[test]
+fn append_waits_for_session_index_lock_held_by_another_process() -> std::io::Result<()> {
+    let temp = TempDir::new()?;
+    let ready_file = temp.path().join("lock-holder-ready");
+    let lock_holder = SessionIndexLockHolder::spawn(temp.path(), &ready_file)?;
+
+    let entry = SessionIndexEntry {
+        id: ThreadId::new(),
+        thread_name: "cross-process".to_string(),
+        updated_at: "2024-01-01T00:00:00Z".to_string(),
+    };
+    let expected = entry.clone();
+    let codex_home = temp.path().to_path_buf();
+    let (result_tx, result_rx) = mpsc::channel();
+    let append_thread = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build Tokio runtime");
+        let result = runtime.block_on(append_session_index_entry(&codex_home, &entry));
+        let _ = result_tx.send(result);
+    });
+
+    let append_was_blocked = matches!(
+        result_rx.recv_timeout(Duration::from_millis(200)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    );
+
+    lock_holder.stop()?;
+    assert!(
+        append_was_blocked,
+        "append should wait while another process holds the session index lock"
+    );
+    result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(std::io::Error::other)??;
+    append_thread
+        .join()
+        .map_err(|_| std::io::Error::other("append thread panicked"))?;
+
+    let contents = std::fs::read_to_string(session_index_path(temp.path()))?;
+    let entries = contents
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<Result<Vec<SessionIndexEntry>, _>>()
+        .map_err(std::io::Error::other)?;
+    assert_eq!(entries, vec![expected]);
+    Ok(())
+}
+
+#[test]
+fn cross_process_lock_wait_does_not_block_another_index() -> std::io::Result<()> {
+    let locked_home = TempDir::new()?;
+    let other_home = TempDir::new()?;
+    let ready_file = locked_home.path().join("lock-holder-ready");
+    let lock_holder = SessionIndexLockHolder::spawn(locked_home.path(), &ready_file)?;
+
+    let blocked_entry = SessionIndexEntry {
+        id: ThreadId::new(),
+        thread_name: "blocked".to_string(),
+        updated_at: "2024-01-01T00:00:00Z".to_string(),
+    };
+    let blocked_home = locked_home.path().to_path_buf();
+    let (blocked_tx, blocked_rx) = mpsc::channel();
+    let blocked_thread = std::thread::spawn(move || {
+        let result = append_session_index_entry_blocking(&blocked_home, &blocked_entry);
+        let _ = blocked_tx.send(result);
+    });
+    let blocked_on_held_index = matches!(
+        blocked_rx.recv_timeout(Duration::from_millis(200)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    );
+
+    let other_entry = SessionIndexEntry {
+        id: ThreadId::new(),
+        thread_name: "unrelated".to_string(),
+        updated_at: "2024-01-01T00:00:00Z".to_string(),
+    };
+    let other_home = other_home.path().to_path_buf();
+    let (other_tx, other_rx) = mpsc::channel();
+    let other_thread = std::thread::spawn(move || {
+        let result = append_session_index_entry_blocking(&other_home, &other_entry);
+        let _ = other_tx.send(result);
+    });
+    let other_result = other_rx.recv_timeout(Duration::from_secs(2));
+    let other_completed_while_locked = other_result.is_ok();
+
+    let stop_result = lock_holder.stop();
+    let blocked_result = blocked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(std::io::Error::other)?;
+    let final_other_result = match other_result {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => other_rx
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(std::io::Error::other)?,
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other(
+            "unrelated append thread disconnected",
+        )),
+    };
+    let blocked_join = blocked_thread
+        .join()
+        .map_err(|_| std::io::Error::other("blocked append thread panicked"));
+    let other_join = other_thread
+        .join()
+        .map_err(|_| std::io::Error::other("unrelated append thread panicked"));
+
+    stop_result?;
+    blocked_result?;
+    final_other_result?;
+    blocked_join?;
+    other_join?;
+    assert!(
+        blocked_on_held_index,
+        "append should wait on the index locked by another process"
+    );
+    assert!(
+        other_completed_while_locked,
+        "a cross-process wait for one index must not block an unrelated index"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "child process for append_waits_for_session_index_lock_held_by_another_process"]
+fn session_index_lock_holder_child() -> std::io::Result<()> {
+    let codex_home = std::env::var_os(LOCK_HOLDER_CODEX_HOME_ENV).ok_or_else(|| {
+        std::io::Error::other(format!("missing required {LOCK_HOLDER_CODEX_HOME_ENV}"))
+    })?;
+    let ready_file = std::env::var_os(LOCK_HOLDER_READY_PATH_ENV).ok_or_else(|| {
+        std::io::Error::other(format!("missing required {LOCK_HOLDER_READY_PATH_ENV}"))
+    })?;
+
+    with_session_index_lock(Path::new(&codex_home), || {
+        std::fs::write(ready_file, b"ready")?;
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input)?;
+        Ok(())
+    })
 }
 
 #[test]

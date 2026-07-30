@@ -60,7 +60,6 @@ fn exec_command_trace_payloads_use_inferred_native_cwd() -> anyhow::Result<()> {
         turn_id: "turn-1".to_string(),
         started_at_ms: 1234,
         command: vec!["pwd".to_string()],
-        display_label: Some("Inspect working directory".to_string()),
         cwd: "file:///C:/windows".parse()?,
         parsed_cmd: Vec::new(),
         source: ExecCommandSource::Agent,
@@ -72,7 +71,6 @@ fn exec_command_trace_payloads_use_inferred_native_cwd() -> anyhow::Result<()> {
         turn_id: "turn-1".to_string(),
         completed_at_ms: 2345,
         command: vec!["pwd".to_string()],
-        display_label: None,
         cwd: "file:///workspace/project".parse()?,
         parsed_cmd: Vec::new(),
         source: ExecCommandSource::UnifiedExecInteraction,
@@ -98,7 +96,6 @@ fn exec_command_trace_payloads_use_inferred_native_cwd() -> anyhow::Result<()> {
             "turn_id": "turn-1",
             "started_at_ms": 1234,
             "command": ["pwd"],
-            "display_label": "Inspect working directory",
             "cwd": r"C:\windows",
             "parsed_cmd": [],
             "source": "agent"

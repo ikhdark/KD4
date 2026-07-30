@@ -9,9 +9,27 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$cargoLanesRootMarkerName = ".codex-cargo-lanes-root"
+$cargoLanesRootMarkerContent = "codex-kd cargo lanes root v1"
 
 $root = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LanesRoot)
 if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+    exit 0
+}
+$rootMarkerPath = Join-Path $root $cargoLanesRootMarkerName
+if (-not (Test-Path -LiteralPath $rootMarkerPath -PathType Leaf)) {
+    exit 0
+}
+try {
+    $rootMarker = Get-Item -LiteralPath $rootMarkerPath -Force
+    if (
+        (($rootMarker.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) -or
+        ([IO.File]::ReadAllText($rootMarkerPath).Trim() -cne $cargoLanesRootMarkerContent)
+    ) {
+        exit 0
+    }
+}
+catch {
     exit 0
 }
 if ($MaxPasses -lt 1) {

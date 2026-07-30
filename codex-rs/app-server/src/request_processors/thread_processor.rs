@@ -227,6 +227,10 @@ fn has_model_resume_override(
             .is_some_and(|overrides| overrides.contains_key("model_reasoning_effort"))
 }
 
+fn should_finalize_failed_fork(rollback_succeeded: bool, thread_id_still_loaded: bool) -> bool {
+    rollback_succeeded || !thread_id_still_loaded
+}
+
 fn validate_dynamic_tools(tools: &[DynamicToolSpec]) -> Result<(), String> {
     const DYNAMIC_TOOL_NAME_MAX_LEN: usize = 128;
     const DYNAMIC_TOOL_NAMESPACE_MAX_LEN: usize = 64;
@@ -2430,7 +2434,7 @@ impl ThreadRequestProcessor {
             .map_err(|err| invalid_request(format!("invalid thread id: {err}")))?;
 
         let items = self
-            .load_thread_turns_list_history(thread_uuid)
+            .load_thread_list_history(thread_uuid, "thread/turns/list")
             .await
             .map_err(thread_read_view_error)?;
         // This API optimizes network transfer by letting clients page through a
@@ -2486,30 +2490,52 @@ impl ThreadRequestProcessor {
             .map(|value| value as usize)
             .unwrap_or(THREAD_ITEMS_DEFAULT_LIMIT)
             .clamp(1, THREAD_ITEMS_MAX_LIMIT);
-        let page = self
+        let sort_direction = sort_direction.unwrap_or(SortDirection::Asc);
+        let page = match self
             .thread_store
             .list_items(StoreListItemsParams {
                 thread_id,
-                turn_id,
+                turn_id: turn_id.clone(),
                 include_archived: true,
-                cursor,
+                cursor: cursor.clone(),
                 page_size,
-                sort_direction: match sort_direction.unwrap_or(SortDirection::Asc) {
+                sort_direction: match sort_direction {
                     SortDirection::Asc => StoreSortDirection::Asc,
                     SortDirection::Desc => StoreSortDirection::Desc,
                 },
             })
             .await
-            .map_err(|err| match err {
-                ThreadStoreError::InvalidRequest { message } => invalid_request(message),
-                ThreadStoreError::Unsupported { .. } => {
-                    method_not_found("thread/items/list is not supported yet")
-                }
-                ThreadStoreError::ThreadNotFound { thread_id } => {
-                    invalid_request(format!("no rollout found for thread id {thread_id}"))
-                }
-                err => internal_error(format!("failed to list thread items: {err}")),
-            })?;
+        {
+            Ok(page) => page,
+            Err(ThreadStoreError::Unsupported { .. }) => {
+                // Legacy/local stores persist rollout history but do not maintain the
+                // projected item index used by `list_items`. Rebuild the same API
+                // projection from history so callers can page items without a migration.
+                let history = self
+                    .load_thread_list_history(thread_id, "thread/items/list")
+                    .await
+                    .map_err(thread_read_view_error)?;
+                return paginate_reconstructed_thread_items(
+                    reconstruct_thread_items(&history, turn_id.as_deref()),
+                    cursor.as_deref(),
+                    page_size,
+                    sort_direction,
+                );
+            }
+            Err(ThreadStoreError::InvalidRequest { message }) => {
+                return Err(invalid_request(message));
+            }
+            Err(ThreadStoreError::ThreadNotFound { thread_id }) => {
+                return Err(invalid_request(format!(
+                    "no rollout found for thread id {thread_id}"
+                )));
+            }
+            Err(err) => {
+                return Err(internal_error(format!(
+                    "failed to list thread items: {err}"
+                )));
+            }
+        };
         let data =
             page.items
                 .into_iter()
@@ -2531,9 +2557,10 @@ impl ThreadRequestProcessor {
         })
     }
 
-    async fn load_thread_turns_list_history(
+    async fn load_thread_list_history(
         &self,
         thread_id: ThreadId,
+        operation: &'static str,
     ) -> Result<Vec<RolloutItem>, ThreadReadViewError> {
         match self
             .thread_store
@@ -2579,16 +2606,16 @@ impl ThreadRequestProcessor {
             })?;
         let config_snapshot = thread.config_snapshot().await;
         if config_snapshot.ephemeral {
-            return Err(ThreadReadViewError::InvalidRequest(
-                "ephemeral threads do not support thread/turns/list".to_string(),
-            ));
+            return Err(ThreadReadViewError::InvalidRequest(format!(
+                "ephemeral threads do not support {operation}"
+            )));
         }
 
         thread
             .load_history(/*include_archived*/ true)
             .await
             .map(|history| history.items)
-            .map_err(|err| thread_turns_list_history_load_error(thread_id, err))
+            .map_err(|err| thread_list_history_load_error(thread_id, operation, err))
     }
 
     pub(crate) fn thread_created_receiver(&self) -> broadcast::Receiver<ThreadId> {
@@ -3584,31 +3611,104 @@ impl ThreadRequestProcessor {
                 err => internal_error(format!("error forking thread: {err}")),
             })?;
 
-        Self::set_app_server_client_info(
-            forked_thread.as_ref(),
-            app_server_client_name,
-            app_server_client_version,
-        )
-        .await?;
-        if session_configured.rollout_path.is_some()
-            && let Some(name) = source_thread_name.clone()
-        {
-            self.thread_manager
-                .update_thread_metadata(
-                    thread_id,
-                    StoreThreadMetadataPatch {
-                        name: Some(Some(name)),
-                        ..Default::default()
-                    },
-                    /*include_archived*/ true,
+        let fork_setup_result = async {
+            Self::set_app_server_client_info(
+                forked_thread.as_ref(),
+                app_server_client_name,
+                app_server_client_version,
+            )
+            .await?;
+            if session_configured.rollout_path.is_some()
+                && let Some(name) = source_thread_name.clone()
+            {
+                self.thread_manager
+                    .update_thread_metadata(
+                        thread_id,
+                        StoreThreadMetadataPatch {
+                            name: Some(Some(name)),
+                            ..Default::default()
+                        },
+                        /*include_archived*/ true,
+                    )
+                    .await
+                    .map_err(|err| core_thread_write_error("inherit source thread name", err))?;
+            }
+
+            let instruction_sources = forked_thread.legacy_instruction_sources().await;
+
+            // Persistent forks materialize their own rollout immediately. Ephemeral forks stay
+            // pathless, so they rebuild their visible history from the copied source history
+            // instead.
+            let (thread, token_usage_turn_id) = if session_configured.rollout_path.is_some() {
+                let stored_thread = self
+                    .read_stored_thread_for_new_fork(thread_id, include_turns)
+                    .await?;
+                self.stored_thread_to_api_thread_with_token_usage(
+                    stored_thread,
+                    fallback_model_provider.as_str(),
+                    include_turns,
                 )
-                .await
-                .map_err(|err| core_thread_write_error("inherit source thread name", err))?;
+            } else {
+                let config_snapshot = forked_thread.config_snapshot().await;
+                let mut thread = build_thread_from_snapshot(
+                    thread_id,
+                    session_configured.session_id.to_string(),
+                    &config_snapshot,
+                    /*path*/ None,
+                );
+                thread.preview = preview_from_rollout_items(&history_items);
+                thread.forked_from_id = Some(source_thread_id.to_string());
+                let token_usage_turn_id = include_turns.then(|| {
+                    super::thread_lifecycle::populate_thread_turns_from_history_with_token_usage(
+                        &mut thread,
+                        &history_items,
+                        /*active_turn*/ None,
+                    )
+                });
+                (thread, token_usage_turn_id)
+            };
+            Ok::<_, JSONRPCErrorError>((instruction_sources, thread, token_usage_turn_id))
         }
+        .await;
+        let (instruction_sources, mut thread, token_usage_turn_id) = match fork_setup_result {
+            Ok(result) => result,
+            Err(err) => {
+                let rollback_succeeded = self
+                    .thread_manager
+                    .rollback_thread_spawn(thread_id, &forked_thread)
+                    .await;
+                let thread_id_still_loaded =
+                    !rollback_succeeded && self.thread_manager.get_thread(thread_id).await.is_ok();
+                if should_finalize_failed_fork(rollback_succeeded, thread_id_still_loaded) {
+                    self.finalize_thread_teardown(thread_id).await;
+                    if let Some(state_db) = self.state_db.as_ref()
+                        && let Err(cleanup_err) = state_db.delete_thread(thread_id).await
+                    {
+                        warn!(
+                            "failed to remove app-server state for rolled-back fork {thread_id}: \
+                             {cleanup_err}"
+                        );
+                    }
+                } else {
+                    warn!(
+                        "skipping app-server cleanup for failed fork {thread_id}: \
+                         a different thread instance is loaded under that id"
+                    );
+                }
+                return Err(err);
+            }
+        };
+        if let Some(name) = source_thread_name {
+            set_thread_name_from_title(&mut thread, name);
+        }
+        thread.session_id = session_configured.session_id.to_string();
+        thread.thread_source = forked_thread
+            .config_snapshot()
+            .await
+            .thread_source
+            .map(Into::into);
 
-        let instruction_sources = forked_thread.legacy_instruction_sources().await;
-
-        // Auto-attach a conversation listener when forking a thread.
+        // Auto-attach a conversation listener only after all fallible fork setup has completed.
         log_listener_attach_result(
             self.ensure_conversation_listener(
                 thread_id,
@@ -3620,46 +3720,6 @@ impl ThreadRequestProcessor {
             request_id.connection_id,
             "thread",
         );
-
-        // Persistent forks materialize their own rollout immediately. Ephemeral forks stay
-        // pathless, so they rebuild their visible history from the copied source history instead.
-        let (mut thread, token_usage_turn_id) = if session_configured.rollout_path.is_some() {
-            let stored_thread = self
-                .read_stored_thread_for_new_fork(thread_id, include_turns)
-                .await?;
-            self.stored_thread_to_api_thread_with_token_usage(
-                stored_thread,
-                fallback_model_provider.as_str(),
-                include_turns,
-            )
-        } else {
-            let config_snapshot = forked_thread.config_snapshot().await;
-            let mut thread = build_thread_from_snapshot(
-                thread_id,
-                session_configured.session_id.to_string(),
-                &config_snapshot,
-                /*path*/ None,
-            );
-            thread.preview = preview_from_rollout_items(&history_items);
-            thread.forked_from_id = Some(source_thread_id.to_string());
-            let token_usage_turn_id = include_turns.then(|| {
-                super::thread_lifecycle::populate_thread_turns_from_history_with_token_usage(
-                    &mut thread,
-                    &history_items,
-                    /*active_turn*/ None,
-                )
-            });
-            (thread, token_usage_turn_id)
-        };
-        if let Some(name) = source_thread_name {
-            set_thread_name_from_title(&mut thread, name);
-        }
-        thread.session_id = session_configured.session_id.to_string();
-        thread.thread_source = forked_thread
-            .config_snapshot()
-            .await
-            .thread_source
-            .map(Into::into);
 
         self.thread_watch_manager
             .upsert_thread_silently(thread.clone())
@@ -3892,6 +3952,138 @@ const THREAD_TURNS_DEFAULT_LIMIT: usize = 25;
 const THREAD_TURNS_MAX_LIMIT: usize = 100;
 const THREAD_ITEMS_DEFAULT_LIMIT: usize = 25;
 const THREAD_ITEMS_MAX_LIMIT: usize = 100;
+
+struct ReconstructedThreadItem {
+    turn_id: String,
+    item: ThreadItem,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconstructedThreadItemsCursor {
+    turn_id: String,
+    item_id: String,
+    include_anchor: bool,
+}
+
+fn reconstruct_thread_items(
+    rollout_items: &[RolloutItem],
+    turn_id_filter: Option<&str>,
+) -> Vec<ReconstructedThreadItem> {
+    build_legacy_api_turns_from_rollout_items(rollout_items)
+        .into_iter()
+        .filter(|turn| turn_id_filter.is_none_or(|turn_id| turn.id == turn_id))
+        .flat_map(|turn| {
+            let turn_id = turn.id;
+            turn.items
+                .into_iter()
+                .map(move |item| ReconstructedThreadItem {
+                    turn_id: turn_id.clone(),
+                    item,
+                })
+        })
+        .collect()
+}
+
+fn paginate_reconstructed_thread_items(
+    items: Vec<ReconstructedThreadItem>,
+    cursor: Option<&str>,
+    page_size: usize,
+    sort_direction: SortDirection,
+) -> Result<ThreadItemsListResponse, JSONRPCErrorError> {
+    if items.is_empty() {
+        return Ok(ThreadItemsListResponse {
+            data: Vec::new(),
+            next_cursor: None,
+            backwards_cursor: None,
+        });
+    }
+
+    let anchor = cursor
+        .map(parse_reconstructed_thread_items_cursor)
+        .transpose()?;
+    let anchor_index = anchor.as_ref().and_then(|anchor| {
+        items
+            .iter()
+            .position(|item| item.turn_id == anchor.turn_id && item.item.id() == anchor.item_id)
+    });
+    if anchor.is_some() && anchor_index.is_none() {
+        return Err(invalid_request(
+            "invalid cursor: anchor item is no longer present",
+        ));
+    }
+
+    let mut keyed_items: Vec<_> = items.into_iter().enumerate().collect();
+    match sort_direction {
+        SortDirection::Asc => {
+            if let (Some(anchor), Some(anchor_index)) = (anchor.as_ref(), anchor_index) {
+                keyed_items.retain(|(index, _)| {
+                    if anchor.include_anchor {
+                        *index >= anchor_index
+                    } else {
+                        *index > anchor_index
+                    }
+                });
+            }
+        }
+        SortDirection::Desc => {
+            keyed_items.reverse();
+            if let (Some(anchor), Some(anchor_index)) = (anchor.as_ref(), anchor_index) {
+                keyed_items.retain(|(index, _)| {
+                    if anchor.include_anchor {
+                        *index <= anchor_index
+                    } else {
+                        *index < anchor_index
+                    }
+                });
+            }
+        }
+    }
+
+    let more_items_available = keyed_items.len() > page_size;
+    keyed_items.truncate(page_size);
+    let backwards_cursor = keyed_items
+        .first()
+        .map(|(_, item)| {
+            serialize_reconstructed_thread_items_cursor(item, /*include_anchor*/ true)
+        })
+        .transpose()?;
+    let next_cursor = if more_items_available {
+        keyed_items
+            .last()
+            .map(|(_, item)| {
+                serialize_reconstructed_thread_items_cursor(item, /*include_anchor*/ false)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let data = keyed_items.into_iter().map(|(_, item)| item.item).collect();
+
+    Ok(ThreadItemsListResponse {
+        data,
+        next_cursor,
+        backwards_cursor,
+    })
+}
+
+fn serialize_reconstructed_thread_items_cursor(
+    item: &ReconstructedThreadItem,
+    include_anchor: bool,
+) -> Result<String, JSONRPCErrorError> {
+    serde_json::to_string(&ReconstructedThreadItemsCursor {
+        turn_id: item.turn_id.clone(),
+        item_id: item.item.id().to_string(),
+        include_anchor,
+    })
+    .map_err(|err| internal_error(format!("failed to serialize cursor: {err}")))
+}
+
+fn parse_reconstructed_thread_items_cursor(
+    cursor: &str,
+) -> Result<ReconstructedThreadItemsCursor, JSONRPCErrorError> {
+    serde_json::from_str(cursor).map_err(|_| invalid_request(format!("invalid cursor: {cursor}")))
+}
 
 fn thread_backwards_cursor_for_sort_key(
     thread: &StoredThread,
@@ -4185,8 +4377,9 @@ fn thread_store_resume_read_error(err: ThreadStoreError) -> JSONRPCErrorError {
     }
 }
 
-fn thread_turns_list_history_load_error(
+fn thread_list_history_load_error(
     thread_id: ThreadId,
+    operation: &'static str,
     err: ThreadStoreError,
 ) -> ThreadReadViewError {
     match err {
@@ -4194,7 +4387,7 @@ fn thread_turns_list_history_load_error(
             if message.starts_with("failed to resolve rollout path `") =>
         {
             ThreadReadViewError::InvalidRequest(format!(
-                "thread {thread_id} is not materialized yet; thread/turns/list is unavailable before first user message"
+                "thread {thread_id} is not materialized yet; {operation} is unavailable before first user message"
             ))
         }
         ThreadStoreError::InvalidRequest { message } => {

@@ -110,13 +110,11 @@ pub(super) struct RunExecLikeArgs {
     pub(super) track_validation_freshness: bool,
     pub(super) attempt_key: Option<CommandAttemptKey>,
     pub(super) repair_notice: Option<String>,
-    pub(super) capture_exec_output: bool,
 }
 
 pub(super) struct RunExecLikeResult {
     pub(super) output: FunctionToolOutput,
     pub(super) exit_code: Option<i32>,
-    pub(super) exec_output: Option<ExecToolCallOutput>,
 }
 
 pub(super) async fn run_exec_like(
@@ -337,6 +335,7 @@ fn child_env_value<'a>(
     env.get(name).map(|value| std::ffi::OsStr::new(value))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn focused_validation_command_summary(
     command: &[String],
     command_summary: &str,
@@ -815,12 +814,8 @@ fn safe_just_identifier(value: &str) -> bool {
         && value != "."
         && value != ".."
         && !value.contains("..")
-        && bytes
-            .first()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        && bytes
-            .last()
-            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
         && bytes
             .iter()
             .copied()
@@ -931,9 +926,7 @@ fn safe_repo_relative_path(value: &str) -> bool {
     {
         return false;
     }
-    !value
-        .split(|character| matches!(character, '/' | '\\'))
-        .any(|component| component == "..")
+    !value.split(['/', '\\']).any(|component| component == "..")
 }
 
 fn cargo_path_or_config_override(arg: &str) -> bool {
@@ -1001,7 +994,6 @@ async fn run_exec_like_with_exit_code_inner(
         track_validation_freshness,
         attempt_key,
         repair_notice,
-        capture_exec_output,
     } = args;
 
     let fs = turn_environment.environment.get_filesystem();
@@ -1131,7 +1123,6 @@ async fn run_exec_like_with_exit_code_inner(
         return Ok(RunExecLikeResult {
             output,
             exit_code: Some(0),
-            exec_output: None,
         });
     }
 
@@ -1202,14 +1193,7 @@ async fn run_exec_like_with_exit_code_inner(
         )
         .await
         .map(|result| result.output);
-    let exec_output = capture_exec_output
-        .then(|| clone_output_bearing_result(&out))
-        .flatten();
-    let exit_code = out
-        .as_ref()
-        .ok()
-        .map(|output| output.exit_code)
-        .or_else(|| exec_output.as_ref().map(|output| output.exit_code));
+    let exit_code = out.as_ref().ok().map(|output| output.exit_code);
     let retry_exit_code = retry_exit_code(&out);
     if let (Some(attempt_key), Some(retry_exit_code)) = (attempt_key.as_ref(), retry_exit_code) {
         session
@@ -1259,11 +1243,7 @@ async fn run_exec_like_with_exit_code_inner(
         .command_execution
         .observe_repository_revision(&turn.sub_id, observed_mutation_revision)
         .await;
-    let mut content = match finish_result {
-        Ok(content) => content,
-        Err(err) if exec_output.is_some() => err.to_string(),
-        Err(err) => return Err(err),
-    };
+    let mut content = finish_result?;
     if let Some(advisory) = advisory {
         content.push_str("\n\n");
         content.push_str(advisory);
@@ -1290,7 +1270,6 @@ async fn run_exec_like_with_exit_code_inner(
             post_tool_use_response,
         },
         exit_code,
-        exec_output,
     })
 }
 
@@ -1304,19 +1283,6 @@ fn retry_exit_code(out: &Result<ExecToolCallOutput, ToolError>) -> Option<i32> {
         Err(ToolError::Codex(_)) => Some(-1),
         Err(ToolError::Denied(_)) => None,
         Err(ToolError::Rejected(_)) => Some(-1),
-    }
-}
-
-fn clone_output_bearing_result(
-    out: &Result<ExecToolCallOutput, ToolError>,
-) -> Option<ExecToolCallOutput> {
-    match out {
-        Ok(output) => Some(output.clone()),
-        Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Timeout { output })))
-        | Err(ToolError::Codex(CodexErr::Sandbox(SandboxErr::Denied { output, .. }))) => {
-            Some((**output).clone())
-        }
-        Err(ToolError::Codex(_)) | Err(ToolError::Denied(_)) | Err(ToolError::Rejected(_)) => None,
     }
 }
 

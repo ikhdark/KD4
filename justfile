@@ -5,7 +5,7 @@ set shell := ["python3", "-c", 'import os, runpy; runpy.run_path(os.environ["JUS
 set windows-shell := ["python", "-c", 'import os, runpy; runpy.run_path(os.environ["JUST_SHELL"], run_name="__main__")']
 
 rust_min_stack := "8388608" # 8 MiB
-rust_parallelism := "6" # Keep local builds and tests responsive; standard env/CLI overrides still win.
+rust_parallelism := "16" # Keep local builds and tests responsive; standard env/CLI overrides still win.
 cargo_build_jobs := env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)
 export CARGO_BUILD_JOBS := cargo_build_jobs
 rust_test_threads := env_var_or_default("RUST_TEST_THREADS", rust_parallelism)
@@ -261,7 +261,7 @@ _core-test-helpers-windows-sandbox target_dir:
 
 [windows]
 test-fast-nosccache *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); $command_args = @("cargo", "nextest", "run") + $forwarded_args; & "{{ justfile_directory() }}\scripts\invoke-rust-perf-env.ps1" -NoSccache -CargoTargetLane "perf-nextest-nosccache" -WorkingDirectory "{{ justfile_directory() }}\codex-rs" -ProgramArgs $command_args; exit $LASTEXITCODE
+    $forwarded_args = @($args | Select-Object -Skip 1); $env:NEXTEST_PROFILE = "fast"; $command_args = @("cargo", "nextest", "run") + $forwarded_args; & "{{ justfile_directory() }}\scripts\invoke-rust-perf-env.ps1" -NoSccache -CargoTargetLane "perf-nextest-nosccache" -WorkingDirectory "{{ justfile_directory() }}\codex-rs" -ProgramArgs $command_args; exit $LASTEXITCODE
 
 [windows]
 test-compile *args:
@@ -269,11 +269,11 @@ test-compile *args:
 
 [unix]
 test-windows-sandbox-processes *args:
-    RUST_MIN_STACK={{ rust_min_stack }} cargo nextest run -p codex-windows-sandbox -E 'test(legacy_capture_cancellation_terminates_descendants_without_timeout) | test(controlling_ipc_eof_terminates_process_tree) | test(process_wait_failure_is_not_treated_as_exit) | test(invalid_process_wait_is_not_treated_as_exit)' "$@"
+    @python3 -c 'print("SKIP: test-windows-sandbox-processes requires a Windows host; no Windows process verification was run")'
 
 [windows]
 test-windows-sandbox-processes *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; cargo nextest run -p codex-windows-sandbox -E 'test(legacy_capture_cancellation_terminates_descendants_without_timeout) | test(controlling_ipc_eof_terminates_process_tree) | test(process_wait_failure_is_not_treated_as_exit) | test(invalid_process_wait_is_not_treated_as_exit)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo nextest run -p codex-core direct_exec_cancellation_terminates_windows_descendants @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS = "1"; cargo nextest run --no-tests=fail -p codex-utils-pty -E 'test(terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty) | test(normal_exit_preserves_descendants_for_pipe_and_conpty) | test(conpty_delivers_input_to_foreground_children) | test(conpty_ctrl_c_interrupts_powershell_foreground_child) | test(required_process_test_prerequisites_report_unverified_coverage)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo nextest run --no-tests=fail -p codex-windows-sandbox -E 'test(legacy_capture_cancellation_terminates_descendants_without_timeout) | test(controlling_ipc_eof_terminates_process_tree) | test(process_wait_failure_is_not_treated_as_exit) | test(invalid_process_wait_is_not_treated_as_exit)' @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo nextest run --no-tests=fail -p codex-core direct_exec_cancellation_terminates_windows_descendants @forwarded_args
 
 # Full local gate with benchmark startup smoke coverage.
 test-full *args:
@@ -549,7 +549,7 @@ app-server-runtime-check:
 source-map-check:
     {{ python }} "{{ justfile_directory() }}/scripts/source_map_check.py" "{{ justfile_directory() }}/SOURCEMAP.md"
     {{ python }} "{{ justfile_directory() }}/scripts/asciicheck.py" "{{ justfile_directory() }}/SOURCEMAP.md"
-    {{ python }} "{{ justfile_directory() }}/scripts/readme_toc.py" "{{ justfile_directory() }}/SOURCEMAP.md"
+    {{ python }} "{{ justfile_directory() }}/scripts/readme_toc.py" --require-markers "{{ justfile_directory() }}/SOURCEMAP.md"
 
 tui-large-widget-check:
     cargo nextest run -p codex-tui -E 'test(footer_collapse_snapshots) | test(handle_paste_large_uses_placeholder_and_replaces_on_submit) | test(resume_picker)'

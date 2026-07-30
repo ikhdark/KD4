@@ -13,6 +13,7 @@ use super::LocalThreadStore;
 use super::helpers::distinct_thread_metadata_title;
 use super::helpers::set_thread_name_from_title;
 use super::helpers::stored_thread_from_rollout_item;
+use super::helpers::thread_item_titles;
 use super::list_threads::list_rollout_threads;
 use crate::ListThreadsParams;
 use crate::SearchThreadsParams;
@@ -154,6 +155,8 @@ pub(super) async fn search_threads(
     .and_then(|cursor| serde_json::to_value(cursor).ok())
     .and_then(|value| value.as_str().map(str::to_owned));
 
+    let (names, resolved_title_ids) =
+        thread_item_titles(matching_items.iter().map(|item| &item.item));
     let mut items = matching_items
         .into_iter()
         .filter_map(|item| {
@@ -168,7 +171,7 @@ pub(super) async fn search_threads(
             })
         })
         .collect::<Vec<_>>();
-    set_thread_search_result_names(store, &mut items).await;
+    set_thread_search_result_names(store, &mut items, names, resolved_title_ids).await;
 
     Ok(ThreadSearchPage { items, next_cursor })
 }
@@ -200,25 +203,32 @@ fn cursor_from_thread_search_item(
 async fn set_thread_search_result_names(
     store: &LocalThreadStore,
     items: &mut [StoredThreadSearchResult],
+    mut names: HashMap<ThreadId, String>,
+    resolved_title_ids: HashSet<ThreadId>,
 ) {
     let thread_ids = items
         .iter()
         .map(|item| item.thread.thread_id)
         .collect::<HashSet<_>>();
-    let mut names = HashMap::<ThreadId, String>::with_capacity(thread_ids.len());
+    let mut unresolved_thread_ids = thread_ids
+        .difference(&resolved_title_ids)
+        .copied()
+        .collect::<HashSet<_>>();
     if let Some(state_db_ctx) = store.state_db().await {
-        for &thread_id in &thread_ids {
+        for thread_id in unresolved_thread_ids.clone() {
             let Ok(Some(metadata)) = state_db_ctx.get_thread(thread_id).await else {
                 continue;
             };
             if let Some(title) = distinct_thread_metadata_title(&metadata) {
+                unresolved_thread_ids.remove(&thread_id);
                 names.insert(thread_id, title);
             }
         }
     }
-    if names.len() < thread_ids.len()
+    if !unresolved_thread_ids.is_empty()
         && let Ok(legacy_names) =
-            find_thread_names_by_ids(store.config.codex_home.as_path(), &thread_ids).await
+            find_thread_names_by_ids(store.config.codex_home.as_path(), &unresolved_thread_ids)
+                .await
     {
         for (thread_id, title) in legacy_names {
             names.entry(thread_id).or_insert(title);

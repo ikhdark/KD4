@@ -38,13 +38,10 @@ use crate::tools::router::ToolCallSource;
 use codex_protocol::openai_models::ToolMode;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::OutputOutcome;
-use codex_utils_output_truncation::TruncationMetadata;
 use codex_utils_output_truncation::TruncationPolicy;
-use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::formatted_truncate_text_content_items_with_policy;
 use codex_utils_output_truncation::resolve_output_limits;
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
-use codex_utils_output_truncation::truncate_text;
 
 use delegate::CodeModeDispatchBroker;
 use delegate::CodeModeDispatchWorker;
@@ -188,35 +185,34 @@ pub(super) async fn handle_runtime_response(
     max_output_tokens: Option<usize>,
     started_at: std::time::Instant,
 ) -> Result<FunctionToolOutput, String> {
-    let script_status = format_script_status(&response);
     let hard_limit = TruncationPolicy::from(exec.turn.model_info.truncation_policy).token_budget();
+    let original_image_detail_supported = can_request_original_image_detail(&exec.turn.model_info);
 
-    match response {
+    Ok(format_runtime_response(
+        response,
+        max_output_tokens,
+        hard_limit,
+        original_image_detail_supported,
+        started_at,
+    ))
+}
+
+fn format_runtime_response(
+    response: RuntimeResponse,
+    max_output_tokens: Option<usize>,
+    hard_limit: usize,
+    original_image_detail_supported: bool,
+    started_at: std::time::Instant,
+) -> FunctionToolOutput {
+    let script_status = format_script_status(&response);
+    let (mut content_items, outcome, success) = match response {
         RuntimeResponse::Yielded { content_items, .. } => {
-            let mut content_items = into_function_call_output_content_items(content_items);
-            sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
-            let (truncated_items, _truncation_metadata) = truncate_code_mode_result(
-                content_items,
-                max_output_tokens,
-                OutputOutcome::TimedOut,
-                hard_limit,
-            );
-            content_items = truncated_items;
-            prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
-            Ok(FunctionToolOutput::from_content(content_items, Some(true)))
+            let content_items = into_function_call_output_content_items(content_items);
+            (content_items, OutputOutcome::TimedOut, true)
         }
         RuntimeResponse::Terminated { content_items, .. } => {
-            let mut content_items = into_function_call_output_content_items(content_items);
-            sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
-            let (truncated_items, _truncation_metadata) = truncate_code_mode_result(
-                content_items,
-                max_output_tokens,
-                OutputOutcome::Failure,
-                hard_limit,
-            );
-            content_items = truncated_items;
-            prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
-            Ok(FunctionToolOutput::from_content(content_items, Some(true)))
+            let content_items = into_function_call_output_content_items(content_items);
+            (content_items, OutputOutcome::Failure, true)
         }
         RuntimeResponse::Result {
             content_items,
@@ -224,35 +220,26 @@ pub(super) async fn handle_runtime_response(
             ..
         } => {
             let mut content_items = into_function_call_output_content_items(content_items);
-            sanitize_runtime_image_detail(exec.turn.as_ref(), &mut content_items);
             let success = error_text.is_none();
             if let Some(error_text) = error_text {
                 content_items.push(FunctionCallOutputContentItem::InputText {
                     text: format!("Script error:\n{error_text}"),
                 });
             }
-            let (truncated_items, _truncation_metadata) = truncate_code_mode_result(
-                content_items,
-                max_output_tokens,
-                if success {
-                    OutputOutcome::Success
-                } else {
-                    OutputOutcome::Failure
-                },
-                hard_limit,
-            );
-            content_items = truncated_items;
-            prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
-            Ok(FunctionToolOutput::from_content(
-                content_items,
-                Some(success),
-            ))
+            let outcome = if success {
+                OutputOutcome::Success
+            } else {
+                OutputOutcome::Failure
+            };
+            (content_items, outcome, success)
         }
-    }
-}
+    };
 
-fn sanitize_runtime_image_detail(turn: &TurnContext, items: &mut [FunctionCallOutputContentItem]) {
-    sanitize_image_detail_items(can_request_original_image_detail(&turn.model_info), items);
+    sanitize_image_detail_items(original_image_detail_supported, &mut content_items);
+    let mut content_items =
+        truncate_code_mode_result(content_items, max_output_tokens, outcome, hard_limit);
+    prepend_script_status(&mut content_items, &script_status, started_at.elapsed());
+    FunctionToolOutput::from_content(content_items, Some(success))
 }
 
 fn format_script_status(response: &RuntimeResponse) -> String {
@@ -286,7 +273,7 @@ fn truncate_code_mode_result(
     max_output_tokens: Option<usize>,
     outcome: OutputOutcome,
     hard_limit: usize,
-) -> (Vec<FunctionCallOutputContentItem>, TruncationMetadata) {
+) -> Vec<FunctionCallOutputContentItem> {
     let diagnostic_text = code_mode_text_content(&items);
     let limits = resolve_output_limits(
         max_output_tokens,
@@ -302,20 +289,10 @@ fn truncate_code_mode_result(
     {
         let (truncated_items, _) =
             formatted_truncate_text_content_items_with_policy(&items, policy);
-        let retained_text = truncate_text(&diagnostic_text, policy);
-        let metadata = limits.metadata(
-            approx_token_count(&diagnostic_text),
-            retained_text != diagnostic_text,
-        );
-        return (truncated_items, metadata);
+        return truncated_items;
     }
 
-    let truncated_items = truncate_function_output_items_with_policy(&items, policy);
-    let metadata = limits.metadata(
-        approx_token_count(&diagnostic_text),
-        truncated_items != items,
-    );
-    (truncated_items, metadata)
+    truncate_function_output_items_with_policy(&items, policy)
 }
 
 fn code_mode_text_content(items: &[FunctionCallOutputContentItem]) -> String {
@@ -416,12 +393,15 @@ fn build_freeform_tool_payload(
 }
 
 #[cfg(test)]
+#[path = "response_tests.rs"]
+mod response_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use super::CodeModeService;
     use super::OutputOutcome;
-    use super::TruncationMetadata;
     use super::build_nested_tool_payload;
     use super::truncate_code_mode_result;
     use crate::tools::context::ToolPayload;
@@ -472,7 +452,7 @@ mod tests {
             text: "0123456789012345678901234567890123456789".to_string(),
         }];
 
-        let (truncated_items, _) =
+        let truncated_items =
             truncate_code_mode_result(items, Some(5), OutputOutcome::Success, usize::MAX);
         assert_eq!(
             truncated_items,
@@ -488,25 +468,17 @@ mod tests {
     }
 
     #[test]
-    fn code_mode_truncation_applies_hard_limit_and_returns_metadata() {
+    fn code_mode_truncation_applies_hard_limit() {
         let items = vec![FunctionCallOutputContentItem::InputText {
             text: "x".repeat(400),
         }];
 
-        let (_, metadata) = truncate_code_mode_result(items, Some(20), OutputOutcome::Success, 5);
-
-        assert_eq!(
-            metadata,
-            TruncationMetadata {
-                requested_limit: Some(20),
-                default_limit: codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS,
-                hard_limit: 5,
-                applied_limit: 5,
-                original_size: 100,
-                retained_size: 5,
-                truncation_reason: codex_utils_output_truncation::TruncationReason::HardLimit,
-            }
-        );
+        let truncated = truncate_code_mode_result(items, Some(20), OutputOutcome::Success, 5);
+        let [FunctionCallOutputContentItem::InputText { text }] = truncated.as_slice() else {
+            panic!("expected one truncated text item");
+        };
+        assert!(text.starts_with("Warning: truncated output"));
+        assert!(text.contains("95 tokens truncated"));
     }
 
     #[tokio::test]

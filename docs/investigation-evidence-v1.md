@@ -66,6 +66,8 @@ The provider-owned name of the operation that produced the result.
   record reduced the declared result.
 - `unknown` means the provider cannot establish completeness.
 
+`complete` is valid only with `truncated: false`.
+
 When a provider knows that records were omitted but cannot establish whether
 delivery ended normally, `unknown` takes precedence and `truncated` remains
 `true`.
@@ -96,8 +98,8 @@ boilerplate when no material limitation applies.
 
 ### `snapshot`
 
-A provider-owned stable identity for the evidence source, or `null` when no
-snapshot applies.
+This required field is a provider-owned stable identity for the evidence
+source, or `null` when no snapshot applies.
 
 ## Structured error results
 

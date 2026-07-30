@@ -16,6 +16,7 @@ from validate_cases import (
     DEFAULT_CASES,
     REPO_ROOT,
     ValidationError,
+    case_fingerprint,
     load_cases,
     validate_cases,
 )
@@ -33,7 +34,6 @@ FROZEN_MODEL_SETTINGS = {
     "reasoning_effort": "max",
     "codex_version": "codex-cli 0.0.0",
 }
-FROZEN_BASELINE_BINARY_SHA256 = "e21c79b4c379b32151adcfe58e774a927d7a065d6effd03ec630fe101f6f3a09"
 FROZEN_EXECUTION = {
     "sandbox": "read-only",
     "session_persistence": "ephemeral",
@@ -75,7 +75,7 @@ def _is_rfc3339_timestamp(value: Any) -> bool:
 def _load_result(
     path: Path,
     case: dict[str, Any],
-    expected_binary_sha256: str,
+    expected_binary_sha256: str | None,
 ) -> dict[str, Any]:
     try:
         result = json.loads(path.read_text(encoding="utf-8"))
@@ -84,7 +84,7 @@ def _load_result(
     _require(isinstance(result, dict), f"{path}: result must be an object")
     required = {
         "case_id",
-        "base_commit",
+        "case_fingerprint",
         "completed_at",
         "model",
         "execution",
@@ -95,7 +95,10 @@ def _load_result(
     }
     _require(set(result) == required, f"{path}: result fields must be exactly {sorted(required)}")
     _require(result["case_id"] == case["id"], f"{path}: case_id mismatch")
-    _require(result["base_commit"] == case["base_commit"], f"{path}: base_commit mismatch")
+    _require(
+        result["case_fingerprint"] == case_fingerprint(case),
+        f"{path}: case_fingerprint does not match the current fixture",
+    )
     completed_at = result["completed_at"]
     _require(
         _is_rfc3339_timestamp(completed_at),
@@ -117,10 +120,11 @@ def _load_result(
         model_settings == FROZEN_MODEL_SETTINGS,
         f"{path}: model settings do not match the frozen corpus",
     )
-    _require(
-        model["binary_sha256"] == expected_binary_sha256,
-        f"{path}: binary_sha256 does not match the expected run binary",
-    )
+    if expected_binary_sha256 is not None:
+        _require(
+            model["binary_sha256"] == expected_binary_sha256,
+            f"{path}: binary_sha256 does not match the expected run binary",
+        )
 
     execution = result["execution"]
     _require(isinstance(execution, dict), f"{path}: execution must be an object")
@@ -185,7 +189,7 @@ def _ratio(numerator: int, denominator: int) -> float:
 def score(
     cases: list[dict[str, Any]],
     results_dir: Path,
-    expected_binary_sha256: str = FROZEN_BASELINE_BINARY_SHA256,
+    expected_binary_sha256: str | None = None,
 ) -> dict[str, Any]:
     expected_total = 0
     matched_expected = 0
@@ -200,11 +204,14 @@ def score(
     model_costs: list[float] = []
     tool_costs: list[float] = []
     case_scores: list[dict[str, Any]] = []
+    run_binary_sha256 = expected_binary_sha256
 
     for case in cases:
         result_path = results_dir / f"{case['id']}.json"
         _require(result_path.is_file(), f"missing result: {result_path}")
-        result = _load_result(result_path, case, expected_binary_sha256)
+        result = _load_result(result_path, case, run_binary_sha256)
+        if run_binary_sha256 is None:
+            run_binary_sha256 = result["model"]["binary_sha256"]
         confirmed = [
             finding for finding in result["reported_findings"] if finding["status"] == "confirmed"
         ]
@@ -262,6 +269,7 @@ def score(
 
     return {
         "cases": len(cases),
+        "binary_sha256": run_binary_sha256,
         "confirmed_finding_recall": _ratio(matched_expected, expected_total),
         "precision": _ratio(matched_confirmed, confirmed_total),
         "expected_findings": expected_total,
@@ -285,8 +293,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cases", default=str(DEFAULT_CASES), help="case manifest JSONL path")
     parser.add_argument(
         "--binary-sha256",
-        default=FROZEN_BASELINE_BINARY_SHA256,
-        help="exact binary SHA-256 recorded by this run (defaults to the frozen baseline binary)",
+        help="optional expected binary SHA-256; otherwise derive it from the first result",
     )
     return parser.parse_args()
 
@@ -294,10 +301,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
     try:
-        _require(
-            SHA256_RE.fullmatch(args.binary_sha256) is not None,
-            "--binary-sha256 must be a lowercase SHA-256",
-        )
+        if args.binary_sha256 is not None:
+            _require(
+                SHA256_RE.fullmatch(args.binary_sha256) is not None,
+                "--binary-sha256 must be a lowercase SHA-256",
+            )
         cases_path = Path(args.cases)
         if not cases_path.is_absolute():
             cases_path = (REPO_ROOT / cases_path).resolve()

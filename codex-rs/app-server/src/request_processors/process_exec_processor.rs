@@ -36,6 +36,8 @@ use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::command_exec::StdinWriteRequest;
+use crate::command_exec::spawn_stdin_writer;
 use crate::error_code::internal_error;
 use crate::error_code::invalid_params;
 use crate::error_code::invalid_request;
@@ -204,6 +206,7 @@ struct ConnectionProcessHandle {
 #[derive(Clone)]
 struct ProcessSession {
     control_tx: mpsc::Sender<ProcessControlRequest>,
+    write_tx: mpsc::Sender<StdinWriteRequest>,
 }
 
 enum ProcessControl {
@@ -238,6 +241,7 @@ struct RunProcessParams {
     process_handle: String,
     spawned: SpawnedProcess,
     control_rx: mpsc::Receiver<ProcessControlRequest>,
+    write_rx: mpsc::Receiver<StdinWriteRequest>,
     stream_stdin: bool,
     stream_stdout_stderr: bool,
     expiration: ExecExpiration,
@@ -285,6 +289,9 @@ impl ProcessExecManager {
         let stream_stdout_stderr = tty || stream_stdout_stderr;
         let arg0 = None;
         let (control_tx, control_rx) = mpsc::channel(32);
+        // Stdin writes preserve ordered backpressure on a dedicated worker so a
+        // slow child cannot block kill, resize, expiration, or exit handling.
+        let (write_tx, write_rx) = mpsc::channel(32);
         let process_key = ConnectionProcessHandle {
             connection_id: request_id.connection_id,
             process_handle: process_handle.clone(),
@@ -299,7 +306,10 @@ impl ProcessExecManager {
                     )));
                 }
                 Entry::Vacant(entry) => {
-                    entry.insert(ProcessSession { control_tx });
+                    entry.insert(ProcessSession {
+                        control_tx,
+                        write_tx,
+                    });
                 }
             }
         }
@@ -340,6 +350,7 @@ impl ProcessExecManager {
                 process_handle,
                 spawned,
                 control_rx,
+                write_rx,
                 stream_stdin,
                 stream_stdout_stderr,
                 expiration,
@@ -459,14 +470,26 @@ impl ProcessExecManager {
             .cloned()
             .ok_or_else(|| no_active_process_error(&process_key.process_handle))?;
         let (response_tx, response_rx) = oneshot::channel();
-        session
-            .control_tx
-            .send(ProcessControlRequest {
-                control,
-                response_tx: Some(response_tx),
-            })
-            .await
-            .map_err(|_| process_no_longer_running_error(&process_key.process_handle))?;
+        let send_result = match control {
+            ProcessControl::Write { delta, close_stdin } => session
+                .write_tx
+                .send(StdinWriteRequest {
+                    delta,
+                    close_stdin,
+                    response_tx: Some(response_tx),
+                })
+                .await
+                .map_err(|_| ()),
+            control => session
+                .control_tx
+                .send(ProcessControlRequest {
+                    control,
+                    response_tx: Some(response_tx),
+                })
+                .await
+                .map_err(|_| ()),
+        };
+        send_result.map_err(|_| process_no_longer_running_error(&process_key.process_handle))?;
         response_rx
             .await
             .map_err(|_| process_no_longer_running_error(&process_key.process_handle))?
@@ -480,6 +503,7 @@ async fn run_process(params: RunProcessParams) {
         process_handle,
         spawned,
         control_rx,
+        write_rx,
         stream_stdin,
         stream_stdout_stderr,
         expiration,
@@ -495,9 +519,16 @@ async fn run_process(params: RunProcessParams) {
         stderr_rx,
         exit_rx,
     } = spawned;
+    let session = Arc::new(session);
     tokio::pin!(exit_rx);
     let mut expiration_outcome = None;
     let (stdio_timeout_tx, stdio_timeout_rx) = watch::channel(false);
+    let stdin_writer_handle = spawn_stdin_writer(
+        Arc::clone(&session),
+        write_rx,
+        stream_stdin,
+        "stdin streaming is not enabled for this process",
+    );
 
     let stdout_handle = collect_spawn_process_output(SpawnProcessOutputParams {
         connection_id: request_id.connection_id,
@@ -526,14 +557,9 @@ async fn run_process(params: RunProcessParams) {
                 match control {
                     Some(ProcessControlRequest { control, response_tx }) => {
                         let result = match control {
-                            ProcessControl::Write { delta, close_stdin } => {
-                                handle_process_write(
-                                    &session,
-                                    stream_stdin,
-                                    delta,
-                                    close_stdin,
-                                ).await
-                            }
+                            ProcessControl::Write { .. } => Err(internal_error(
+                                "stdin write was routed to the process control queue",
+                            )),
                             ProcessControl::Resize { size } => {
                                 handle_process_resize(&session, size)
                             }
@@ -570,6 +596,8 @@ async fn run_process(params: RunProcessParams) {
             }
         }
     };
+    stdin_writer_handle.abort();
+    let _ = stdin_writer_handle.await;
 
     // Give stdout/stderr readers a bounded grace period to drain after process exit.
     let timeout_handle = tokio::spawn(async move {
@@ -663,32 +691,6 @@ fn collect_spawn_process_output(
     })
 }
 
-async fn handle_process_write(
-    session: &ProcessHandle,
-    stream_stdin: bool,
-    delta: Vec<u8>,
-    close_stdin: bool,
-) -> Result<(), JSONRPCErrorError> {
-    if !stream_stdin {
-        return Err(invalid_request(
-            "stdin streaming is not enabled for this process",
-        ));
-    }
-    if !delta.is_empty() {
-        session
-            .writer_sender()
-            .send(delta)
-            .await
-            .map_err(|_| invalid_request("stdin is already closed"))?;
-    }
-    if close_stdin {
-        // Closing drops our sender; the writer task still drains any bytes
-        // accepted above before its receiver observes EOF and closes stdin.
-        session.close_stdin();
-    }
-    Ok(())
-}
-
 fn handle_process_resize(
     session: &ProcessHandle,
     size: TerminalSize,
@@ -720,4 +722,130 @@ fn no_active_process_error(process_handle: &str) -> JSONRPCErrorError {
 
 fn process_no_longer_running_error(process_handle: &str) -> JSONRPCErrorError {
     invalid_request(format!("process {process_handle:?} is no longer running"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use codex_utils_pty::ProcessDriver;
+    use codex_utils_pty::spawn_from_driver;
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::outgoing_message::OutgoingEnvelope;
+    use crate::outgoing_message::OutgoingMessage;
+
+    #[tokio::test]
+    async fn backpressured_stdin_does_not_block_kill_control() {
+        let (writer_tx, mut writer_rx) = mpsc::channel(1);
+        writer_tx
+            .try_send(vec![b'x'])
+            .expect("pre-fill driver stdin queue");
+        let (stdout_tx, stdout_rx) = tokio::sync::broadcast::channel(1);
+        let (stderr_tx, stderr_rx) = tokio::sync::broadcast::channel(1);
+        drop(stdout_tx);
+        drop(stderr_tx);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let terminated = Arc::new(AtomicBool::new(false));
+        let terminator_flag = Arc::clone(&terminated);
+        let spawned = spawn_from_driver(ProcessDriver {
+            writer_tx,
+            stdout_rx,
+            stderr_rx: Some(stderr_rx),
+            exit_rx,
+            terminator: Some(Box::new(move || {
+                terminator_flag.store(true, Ordering::SeqCst);
+            })),
+            writer_handle: None,
+            resizer: None,
+        });
+        let (control_tx, control_rx) = mpsc::channel(2);
+        let (write_tx, write_rx) = mpsc::channel(2);
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(1);
+        let run_handle = tokio::spawn(run_process(RunProcessParams {
+            outgoing: Arc::new(OutgoingMessageSender::new(
+                outgoing_tx,
+                codex_analytics::AnalyticsEventsClient::disabled(),
+            )),
+            request_id: ConnectionRequestId {
+                connection_id: ConnectionId(22),
+                request_id: codex_app_server_protocol::RequestId::Integer(22),
+            },
+            process_handle: "backpressured".to_string(),
+            spawned,
+            control_rx,
+            write_rx,
+            stream_stdin: true,
+            stream_stdout_stderr: false,
+            expiration: ExecExpiration::Cancellation(CancellationToken::new()),
+            output_bytes_cap: Some(DEFAULT_OUTPUT_BYTES_CAP),
+        }));
+
+        let (write_response_tx, mut write_response_rx) = oneshot::channel();
+        write_tx
+            .send(StdinWriteRequest {
+                delta: vec![b'y'],
+                close_stdin: false,
+                response_tx: Some(write_response_tx),
+            })
+            .await
+            .expect("queue stdin write");
+        let (kill_response_tx, kill_response_rx) = oneshot::channel();
+        control_tx
+            .send(ProcessControlRequest {
+                control: ProcessControl::Kill,
+                response_tx: Some(kill_response_tx),
+            })
+            .await
+            .expect("queue kill control");
+
+        assert!(
+            timeout(Duration::from_millis(100), &mut write_response_rx)
+                .await
+                .is_err(),
+            "backpressured write should remain pending",
+        );
+        timeout(Duration::from_secs(1), kill_response_rx)
+            .await
+            .expect("kill response timed out")
+            .expect("kill response sender dropped")
+            .expect("kill should succeed");
+        assert!(terminated.load(Ordering::SeqCst));
+
+        assert_eq!(writer_rx.recv().await, Some(vec![b'x']));
+        timeout(Duration::from_secs(1), write_response_rx)
+            .await
+            .expect("write should complete after backpressure clears")
+            .expect("write response sender dropped")
+            .expect("backpressured write should eventually succeed");
+        assert_eq!(writer_rx.recv().await, Some(vec![b'y']));
+
+        exit_tx.send(1).expect("publish driver exit");
+        let envelope = timeout(Duration::from_secs(1), outgoing_rx.recv())
+            .await
+            .expect("process exit notification timed out")
+            .expect("outgoing channel closed");
+        let OutgoingEnvelope::ToConnection {
+            message,
+            write_complete_tx,
+            ..
+        } = envelope
+        else {
+            panic!("process exit should use a targeted notification");
+        };
+        assert!(matches!(
+            message,
+            OutgoingMessage::AppServerNotification(ServerNotification::ProcessExited(_))
+        ));
+        write_complete_tx
+            .expect("process exit should request a writer receipt")
+            .send(())
+            .expect("run process should await the writer receipt");
+        timeout(Duration::from_secs(1), run_handle)
+            .await
+            .expect("run process did not finish")
+            .expect("run process task panicked");
+    }
 }

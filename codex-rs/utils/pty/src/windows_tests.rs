@@ -11,6 +11,7 @@ use std::time::Duration;
 
 const READY_MARKER: &str = "__CODEX_CHILD_READY__";
 const VALUE_MARKER: &str = "__CODEX_CHILD_VALUE__";
+const REQUIRE_PROCESS_TESTS_ENV: &str = "CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS";
 
 struct WindowsShell {
     name: &'static str,
@@ -30,6 +31,39 @@ fn find_powershell() -> Option<String> {
                 .filter(std::process::ExitStatus::success)
                 .map(|_| candidate.to_string())
         })
+}
+
+fn process_test_prerequisite<T>(
+    value: Option<T>,
+    prerequisite: &str,
+    test: &str,
+    required: bool,
+) -> anyhow::Result<Option<T>> {
+    let Some(value) = value else {
+        let message = format!(
+            "Windows process verification was not run: required prerequisite \
+             {prerequisite} is unavailable for `{test}`"
+        );
+        if required {
+            anyhow::bail!("{message}");
+        }
+        eprintln!("SKIP: {message}");
+        return Ok(None);
+    };
+    Ok(Some(value))
+}
+
+fn process_test_prerequisite_or_skip<T>(
+    value: Option<T>,
+    prerequisite: &str,
+    test: &str,
+) -> anyhow::Result<Option<T>> {
+    process_test_prerequisite(
+        value,
+        prerequisite,
+        test,
+        std::env::var_os(REQUIRE_PROCESS_TESTS_ENV).is_some(),
+    )
 }
 
 fn utf8_hex(value: &str) -> String {
@@ -161,8 +195,12 @@ async fn assert_normal_exit_preserves_descendant(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty() -> anyhow::Result<()>
 {
-    let Some(python) = find_python() else {
-        eprintln!("python not found; skipping Windows process-tree termination test");
+    let Some(python) = process_test_prerequisite_or_skip(
+        find_python(),
+        "Python executable (`python3` or `python`)",
+        "terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty",
+    )?
+    else {
         return Ok(());
     };
     let env: HashMap<String, String> = std::env::vars().collect();
@@ -172,8 +210,12 @@ async fn terminate_kills_descendants_for_best_effort_pipe_and_atomic_conpty() ->
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn normal_exit_preserves_descendants_for_pipe_and_conpty() -> anyhow::Result<()> {
-    let Some(python) = find_python() else {
-        eprintln!("python not found; skipping Windows process-tree natural-exit test");
+    let Some(python) = process_test_prerequisite_or_skip(
+        find_python(),
+        "Python executable (`python3` or `python`)",
+        "normal_exit_preserves_descendants_for_pipe_and_conpty",
+    )?
+    else {
         return Ok(());
     };
     let env: HashMap<String, String> = std::env::vars().collect();
@@ -183,8 +225,12 @@ async fn normal_exit_preserves_descendants_for_pipe_and_conpty() -> anyhow::Resu
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conpty_delivers_input_to_foreground_children() -> anyhow::Result<()> {
-    let Some(python) = find_python() else {
-        eprintln!("python not found; skipping ConPTY input test");
+    let Some(python) = process_test_prerequisite_or_skip(
+        find_python(),
+        "Python executable (`python3` or `python`)",
+        "conpty_delivers_input_to_foreground_children",
+    )?
+    else {
         return Ok(());
     };
     let code = format!(
@@ -198,7 +244,11 @@ async fn conpty_delivers_input_to_foreground_children() -> anyhow::Result<()> {
         args: vec!["/D".to_string(), "/Q".to_string()],
         child_command: format!("\"{}\" -u -c \"{code}\"", python.replace('"', "\"\"")),
     }];
-    if let Some(program) = find_powershell() {
+    if let Some(program) = process_test_prerequisite_or_skip(
+        find_powershell(),
+        "PowerShell executable (`pwsh.exe` or `powershell.exe`)",
+        "PowerShell subcase of conpty_delivers_input_to_foreground_children",
+    )? {
         shells.push(WindowsShell {
             name: "PowerShell",
             program,
@@ -256,7 +306,12 @@ async fn conpty_delivers_input_to_foreground_children() -> anyhow::Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn conpty_ctrl_c_interrupts_powershell_foreground_child() -> anyhow::Result<()> {
-    let Some(program) = find_powershell() else {
+    let Some(program) = process_test_prerequisite_or_skip(
+        find_powershell(),
+        "PowerShell executable (`pwsh.exe` or `powershell.exe`)",
+        "conpty_ctrl_c_interrupts_powershell_foreground_child",
+    )?
+    else {
         return Ok(());
     };
     let args = vec!["-NoLogo".to_string(), "-NoProfile".to_string()];
@@ -296,4 +351,28 @@ async fn conpty_ctrl_c_interrupts_powershell_foreground_child() -> anyhow::Resul
         String::from_utf8_lossy(&output)
     );
     Ok(())
+}
+
+#[test]
+fn required_process_test_prerequisites_report_unverified_coverage() {
+    for prerequisite in [
+        "Python executable (`python3` or `python`)",
+        "PowerShell executable (`pwsh.exe` or `powershell.exe`)",
+    ] {
+        let err = process_test_prerequisite::<()>(
+            None,
+            prerequisite,
+            "job_object_probe",
+            /*required*/ true,
+        )
+        .expect_err("a missing required prerequisite must fail verification");
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Windows process verification was not run: required prerequisite \
+                 {prerequisite} is unavailable for `job_object_probe`"
+            )
+        );
+    }
 }

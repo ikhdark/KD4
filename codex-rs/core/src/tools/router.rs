@@ -340,33 +340,45 @@ fn collect_proven_read_only_external_tools(
 }
 
 fn is_allowlisted_read_only_external_tool(name: &ToolName) -> bool {
-    match (name.namespace.as_deref(), name.name.as_str()) {
+    matches!(
+        (name.namespace.as_deref(), name.name.as_str()),
         (
             Some("mcp__repo_atlas"),
-            "batch" | "cochange" | "context_for" | "contract" | "crate_graph" | "crate_summary"
-            | "find_def" | "find_refs" | "impact" | "index_status" | "outline" | "repo_facts"
-            | "select_root" | "slice" | "trace" | "where_belongs",
-        ) => true,
-        (
+            "batch"
+                | "cochange"
+                | "context_for"
+                | "contract"
+                | "crate_graph"
+                | "crate_summary"
+                | "find_def"
+                | "find_refs"
+                | "impact"
+                | "index_status"
+                | "outline"
+                | "repo_facts"
+                | "select_root"
+                | "slice"
+                | "trace"
+                | "where_belongs",
+        ) | (
             Some("mcp__codex_apps__github"),
             "fetch"
-            | "fetch_blob"
-            | "fetch_commit"
-            | "fetch_commit_workflow_runs"
-            | "fetch_file"
-            | "fetch_issue"
-            | "fetch_issue_comments"
-            | "fetch_pr"
-            | "fetch_pr_comments"
-            | "fetch_pr_file_patch"
-            | "fetch_pr_patch"
-            | "fetch_workflow_job_logs"
-            | "fetch_workflow_job_steps"
-            | "fetch_workflow_run_artifacts"
-            | "fetch_workflow_run_jobs",
-        ) => true,
-        _ => false,
-    }
+                | "fetch_blob"
+                | "fetch_commit"
+                | "fetch_commit_workflow_runs"
+                | "fetch_file"
+                | "fetch_issue"
+                | "fetch_issue_comments"
+                | "fetch_pr"
+                | "fetch_pr_comments"
+                | "fetch_pr_file_patch"
+                | "fetch_pr_patch"
+                | "fetch_workflow_job_logs"
+                | "fetch_workflow_job_steps"
+                | "fetch_workflow_run_artifacts"
+                | "fetch_workflow_run_jobs",
+        )
+    )
 }
 
 fn authorize_independent_review_tool_call(

@@ -450,6 +450,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
         status,
         content_items,
         success,
+        error,
         duration_ms,
     } = started.item
     else {
@@ -462,6 +463,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
     assert_eq!(status, DynamicToolCallStatus::InProgress);
     assert_eq!(content_items, None);
     assert_eq!(success, None);
+    assert_eq!(error, None);
     assert_eq!(duration_ms, None);
 
     // Read the tool call request from the app server.
@@ -506,6 +508,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
         status,
         content_items,
         success,
+        error,
         duration_ms,
     } = completed.item
     else {
@@ -523,6 +526,7 @@ async fn dynamic_tool_call_round_trip_sends_text_content_items_to_model() -> Res
         }])
     );
     assert_eq!(success, Some(true));
+    assert_eq!(error, None);
     assert!(duration_ms.is_some());
 
     timeout(

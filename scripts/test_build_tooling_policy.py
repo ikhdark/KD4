@@ -118,14 +118,20 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn('let samples_dir = Path::new("src/assets/samples");', text)
         self.assertIn("if !samples_dir.exists()", text)
 
-    def test_repo_local_workflow_skill_has_one_owner(self) -> None:
-        skills_dir = REPO_ROOT / ".codex" / "skills"
-        if not skills_dir.exists():
-            self.skipTest("repo-local skills directory is not materialized")
-        actual = {path.name for path in skills_dir.iterdir() if path.is_dir()}
+    def test_retired_repo_local_harness_skill_has_no_registration(self) -> None:
+        features = load_toml(REPO_ROOT / "kd4_features.toml")["features"]
+        feature_ids = {feature["id"] for feature in features}
+        workspace_readme = (REPO_ROOT / ".codex" / "README.md").read_text(
+            encoding="utf-8"
+        )
+        harness_workflow = (REPO_ROOT / ".codex" / "harness" / "workflow.md").read_text(
+            encoding="utf-8"
+        )
 
-        self.assertIn("kd4-harness", actual)
-        self.assertNotIn("kd4-crosscheck-and-finish", actual)
+        self.assertNotIn("kd4-harness", feature_ids)
+        self.assertFalse((REPO_ROOT / ".codex" / "skills" / "kd4-harness").exists())
+        self.assertNotIn("skills/kd4-harness", workspace_readme)
+        self.assertNotIn("kd4-harness", harness_workflow)
 
     def test_repo_local_skill_frontmatter_names_match_folders(self) -> None:
         skills_dir = REPO_ROOT / ".codex" / "skills"
@@ -162,7 +168,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
         skill_names = sorted(
             path.name for path in skills_dir.iterdir() if path.is_dir()
         )
-        self.assertIn("kd4-harness", skill_names)
+        self.assertNotIn("kd4-harness", skill_names)
         self.assertIn("`.codex/skills`", agents)
         for phrase in ("fork-local skills", "validation workflows"):
             self.assertIn(phrase, normalized)
@@ -219,6 +225,14 @@ class BuildToolingPolicyTest(unittest.TestCase):
         )
         self.assertIn('"$BIN_PATH" --version >/dev/null', shell_installer)
         self.assertNotIn('visible_command_preverified="true"', shell_installer)
+        self.assertIn(
+            '[ -x "$release_dir/bin/codex-code-mode-host" ] &&',
+            shell_installer,
+        )
+        self.assertIn(
+            '"$stage_release/bin/codex-code-mode-host"',
+            shell_installer,
+        )
 
         self.assertIn(
             '$InstallMetadataFile = "codex-install.env"', powershell_installer
@@ -232,6 +246,161 @@ class BuildToolingPolicyTest(unittest.TestCase):
             'Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "version"',
             powershell_installer,
         )
+        self.assertIn('"bin\\codex-code-mode-host.exe"', powershell_installer)
+
+    def test_shell_installer_completeness_rejects_package_without_code_mode_host(
+        self,
+    ) -> None:
+        shell = shutil.which("sh")
+        if shell is None:
+            self.skipTest("shell is required for the Unix installer completeness test")
+
+        shell_installer_path = REPO_ROOT / "scripts" / "install" / "install.sh"
+        shell_installer = shell_installer_path.read_text(encoding="utf-8")
+
+        def shell_function(name: str) -> str:
+            start = shell_installer.index(f"{name}() {{")
+            end = shell_installer.index("\n}\n", start) + 3
+            return shell_installer[start:end]
+
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as temp_dir:
+            root = Path(temp_dir)
+            version = "1.2.3"
+            target = "test-target"
+            release_dir = root / f"{version}-{target}"
+            for relative in ("bin/codex", "codex", "codex-path/rg"):
+                path = release_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("#!/bin/sh\n", encoding="utf-8", newline="\n")
+                path.chmod(0o755)
+            (release_dir / "codex-package.json").touch()
+            with (release_dir / "codex-install.env").open(
+                "w", encoding="utf-8", newline="\n"
+            ) as metadata:
+                metadata.write(f"version={version}\ntarget={target}\nlayout=package\n")
+            shell_probe = root / "probe.sh"
+            shell_probe.write_text(
+                "\n".join(
+                    [
+                        "#!/bin/sh",
+                        'INSTALL_METADATA_FILE="codex-install.env"',
+                        shell_function("install_metadata_field"),
+                        shell_function("release_dir_is_complete"),
+                        'chmod 0755 "$1/bin/codex" "$1/codex" "$1/codex-path/rg"',
+                        'if [ -e "$1/bin/codex-code-mode-host" ]; then',
+                        '  chmod 0755 "$1/bin/codex-code-mode-host"',
+                        "fi",
+                        'release_dir_is_complete "$1" "$2" "$3" package',
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            missing_shell = subprocess.run(
+                [
+                    shell,
+                    shell_probe.relative_to(REPO_ROOT).as_posix(),
+                    release_dir.relative_to(REPO_ROOT).as_posix(),
+                    version,
+                    target,
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(missing_shell.returncode, 0)
+            shell_host = release_dir / "bin" / "codex-code-mode-host"
+            shell_host.write_text("#!/bin/sh\n", encoding="utf-8", newline="\n")
+            shell_host.chmod(0o755)
+            complete_shell = subprocess.run(
+                [
+                    shell,
+                    shell_probe.relative_to(REPO_ROOT).as_posix(),
+                    release_dir.relative_to(REPO_ROOT).as_posix(),
+                    version,
+                    target,
+                ],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(
+                complete_shell.returncode,
+                0,
+                f"stdout:\n{complete_shell.stdout}\nstderr:\n{complete_shell.stderr}",
+            )
+
+    def test_powershell_installer_completeness_rejects_package_without_code_mode_host(
+        self,
+    ) -> None:
+        ps = powershell()
+        if ps is None:
+            self.skipTest("PowerShell is required for the Windows installer test")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            windows_package = root / "windows-package"
+            for relative in (
+                "codex-package.json",
+                "bin/codex.exe",
+                "codex-path/apply_patch.bat",
+                "codex-path/applypatch.bat",
+                "codex-path/rg.exe",
+                "codex-resources/codex-command-runner.exe",
+                "codex-resources/codex-windows-sandbox-setup.exe",
+            ):
+                path = windows_package / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+
+            powershell_installer = REPO_ROOT / "scripts" / "install" / "install.ps1"
+
+            def run_powershell_probe(
+                expected: bool,
+            ) -> subprocess.CompletedProcess[str]:
+                command = (
+                    "$tokens = $null; $errors = $null; "
+                    f"$ast = [System.Management.Automation.Language.Parser]::ParseFile("
+                    f"{ps_single_quote(powershell_installer)}, "
+                    "[ref]$tokens, [ref]$errors); "
+                    "$function = $ast.FindAll({ param($node) "
+                    "$node -is [System.Management.Automation.Language.FunctionDefinitionAst] "
+                    "-and $node.Name -eq 'Test-PackageContentsAreComplete' }, $true); "
+                    "Invoke-Expression $function[0].Extent.Text; "
+                    f"$actual = Test-PackageContentsAreComplete -PackageDir "
+                    f"{ps_single_quote(windows_package)}; "
+                    f"if ($actual -ne ${str(expected).lower()}) {{ exit 9 }}"
+                )
+                return subprocess.run(
+                    [
+                        ps,
+                        "-NoProfile",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-Command",
+                        command,
+                    ],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+
+            missing_windows = run_powershell_probe(False)
+            self.assertEqual(
+                missing_windows.returncode,
+                0,
+                f"stdout:\n{missing_windows.stdout}\nstderr:\n{missing_windows.stderr}",
+            )
+            (windows_package / "bin" / "codex-code-mode-host.exe").touch()
+            complete_windows = run_powershell_probe(True)
+            self.assertEqual(
+                complete_windows.returncode,
+                0,
+                f"stdout:\n{complete_windows.stdout}\nstderr:\n{complete_windows.stderr}",
+            )
 
     def test_windows_installer_parses_the_first_nonempty_version_line(self) -> None:
         powershell_installer = (
@@ -717,6 +886,40 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "deps-policy-check *args:",
         ):
             self.assertIn(recipe, justfile)
+
+    def test_windows_process_suite_cannot_silently_skip_required_coverage(self) -> None:
+        justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
+        sandbox_tests = (
+            REPO_ROOT / "codex-rs/windows-sandbox-rs/src/unified_exec/tests.rs"
+        ).read_text(encoding="utf-8")
+        pty_tests = (
+            REPO_ROOT / "codex-rs/utils/pty/src/windows_tests.rs"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "SKIP: test-windows-sandbox-processes requires a Windows host; "
+            "no Windows process verification was run",
+            justfile,
+        )
+        self.assertGreaterEqual(justfile.count("--no-tests=fail"), 3)
+        self.assertIn("-p codex-utils-pty", justfile)
+        self.assertIn("CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS", justfile)
+        self.assertIn("CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS", sandbox_tests)
+        self.assertIn("CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS", pty_tests)
+        self.assertIn(
+            "required legacy sandbox prerequisite is",
+            sandbox_tests,
+        )
+        self.assertIn(
+            "Windows process verification was not run: required prerequisite",
+            pty_tests,
+        )
+        self.assertIn("Python executable (`python3` or `python`)", pty_tests)
+        self.assertIn(
+            "PowerShell executable (`pwsh.exe` or `powershell.exe`)",
+            pty_tests,
+        )
+        self.assertNotIn("python not found; skipping", pty_tests)
 
     def test_local_setup_recipes_avoid_stale_or_unlocked_dependency_state(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")

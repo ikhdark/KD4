@@ -245,6 +245,18 @@ impl ToolSearchHandler {
             return Ok(tools);
         }
 
+        let exact_matches = self
+            .search_infos
+            .iter()
+            .filter(|search_info| {
+                search_info
+                    .entry
+                    .tool_names
+                    .iter()
+                    .any(|name| normalize_tool_search_query(name) == key.query)
+            })
+            .collect::<Vec<_>>();
+        let exact_match_count = exact_matches.len();
         let candidate_limit = tool_search_candidate_limit(limit, self.search_infos.len());
         let mut ranked_results = self.search_engine.search(&key.query, candidate_limit);
         debug_assert!(ranked_results.len() <= candidate_limit);
@@ -262,7 +274,7 @@ impl ToolSearchHandler {
             .collect::<Vec<_>>();
         let candidate_count = candidates.len();
         let candidate_source_count = tool_search_info_diversity_count(candidates.iter().copied());
-        let results = diversify_search_results(candidates, limit);
+        let results = promote_exact_name_matches(exact_matches, candidates, limit);
         let result_count = results.len();
         let result_source_count = tool_search_info_diversity_count(results.iter().copied());
         let tools =
@@ -271,6 +283,7 @@ impl ToolSearchHandler {
             normalized_query_bytes = key.query.len(),
             effective_limit = limit,
             cache_hit = false,
+            exact_match_count,
             candidate_limit,
             candidate_count,
             candidate_source_count,
@@ -429,6 +442,23 @@ fn diversify_search_results(results: Vec<&ToolSearchInfo>, limit: usize) -> Vec<
     }
 
     diversified
+}
+
+fn promote_exact_name_matches<'a>(
+    exact_matches: Vec<&'a ToolSearchInfo>,
+    ranked_results: Vec<&'a ToolSearchInfo>,
+    limit: usize,
+) -> Vec<&'a ToolSearchInfo> {
+    let mut results = Vec::with_capacity(exact_matches.len().saturating_add(ranked_results.len()));
+    let mut seen = HashSet::<*const ToolSearchInfo>::new();
+
+    for result in exact_matches.into_iter().chain(ranked_results) {
+        if seen.insert(std::ptr::from_ref(result)) {
+            results.push(result);
+        }
+    }
+
+    diversify_search_results(results, limit)
 }
 
 fn tool_search_info_diversity_count<'a>(
@@ -873,6 +903,75 @@ mod tests {
         assert_eq!(namespaces, vec!["mcp__alpha", "mcp__beta", "mcp__gamma"]);
     }
 
+    #[test]
+    fn search_promotes_exact_normalized_tool_names_before_ranked_results() {
+        let handler = ToolSearchHandler::new(vec![
+            search_info("unrelated terms", None, "exact", "Target_Tool"),
+            search_info("target_tool target_tool", None, "ranked", "other_tool"),
+        ]);
+
+        let tools = handler
+            .search("  TARGET_TOOL  ", 2)
+            .expect("search should promote the exact normalized tool name");
+        let namespaces = tools
+            .iter()
+            .map(|tool| match tool {
+                LoadableToolSpec::Namespace(namespace) => namespace.name.as_str(),
+                LoadableToolSpec::Function(tool) => tool.name.as_str(),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(namespaces, vec!["mcp__exact", "mcp__ranked"]);
+    }
+
+    #[test]
+    fn exact_name_promotion_preserves_ranked_order_without_duplicates() {
+        let exact = search_info("exact", None, "exact", "target_tool");
+        let ranked_first = search_info("ranked-first", None, "ranked-first", "first");
+        let ranked_second = search_info("ranked-second", None, "ranked-second", "second");
+
+        let results = promote_exact_name_matches(
+            vec![&exact],
+            vec![&ranked_first, &exact, &ranked_second],
+            3,
+        );
+        let search_texts = results
+            .iter()
+            .map(|search_info| search_info.entry.search_text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(search_texts, vec!["exact", "ranked-first", "ranked-second"]);
+    }
+
+    #[test]
+    fn exact_name_promotion_does_not_crowd_out_other_sources() {
+        let mut search_infos = vec![
+            search_info_with_source("search shared capability", "beta", "beta_tool"),
+            search_info_with_source("search shared capability", "gamma", "gamma_tool"),
+        ];
+        search_infos.extend((0..20).map(|idx| {
+            search_info_with_source(
+                &format!("search shared capability {idx}"),
+                "alpha",
+                "search",
+            )
+        }));
+        let handler = ToolSearchHandler::new(search_infos);
+
+        let tools = handler
+            .search("search", 3)
+            .expect("exact-name search should preserve source diversity");
+        let namespaces = tools
+            .iter()
+            .map(|tool| match tool {
+                LoadableToolSpec::Namespace(namespace) => namespace.name.as_str(),
+                LoadableToolSpec::Function(tool) => tool.name.as_str(),
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(namespaces, vec!["mcp__alpha", "mcp__beta", "mcp__gamma"]);
+    }
+
     fn search_info_with_source(
         search_text: &str,
         source_name: &str,
@@ -890,6 +989,7 @@ mod tests {
         ToolSearchInfo {
             entry: ToolSearchEntry {
                 search_text: search_text.to_string(),
+                tool_names: vec![tool_name.to_string()],
                 output: LoadableToolSpec::Namespace(ResponsesApiNamespace {
                     name: format!("mcp__{namespace_name}"),
                     description: format!("Tools in the {namespace_name} namespace."),

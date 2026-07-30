@@ -6,7 +6,7 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 retries = 1
 # Avoid saturating developer machines when Nextest is invoked directly.
 # NEXTEST_TEST_THREADS or --test-threads can opt into a different limit.
-test-threads = 6
+test-threads = 16
 
 [profile.default.junit]
 path = "junit.xml"

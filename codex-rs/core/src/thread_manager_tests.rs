@@ -1223,6 +1223,121 @@ async fn subtree_listing_uses_injected_graph_store_without_state_db() {
 }
 
 #[tokio::test]
+async fn failed_new_thread_initialization_deletes_created_persistence() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config.experimental_thread_store = ThreadStoreConfig::InMemory {
+        id: format!("thread-manager-init-failure-{}", uuid::Uuid::new_v4()),
+    };
+    // `None` is checked directly after thread persistence is created, before
+    // shell detection can consult the host environment.
+    config
+        .features
+        .enable(Feature::ShellZshFork)
+        .expect("test config should allow shell_zsh_fork");
+    config.zsh_path = None;
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let thread_store = thread_store_from_config(&config, /*state_db*/ None);
+    let in_memory_store = thread_store
+        .as_any()
+        .downcast_ref::<InMemoryThreadStore>()
+        .expect("configured in-memory store");
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager,
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store.clone(),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+
+    let error = match manager.start_thread(config).await {
+        Ok(_) => panic!("the injected post-persistence initialization failure should be returned"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("zsh fork feature enabled, but no packaged zsh fork is available"),
+        "unexpected initialization failure: {error}"
+    );
+    assert!(manager.list_thread_ids().await.is_empty());
+
+    let calls = in_memory_store.calls().await;
+    assert_eq!(
+        calls.create_thread, 1,
+        "the fixture must reach persistence creation before the injected failure"
+    );
+    assert_eq!(calls.discard_thread, 1);
+    assert_eq!(calls.delete_thread, 1);
+}
+
+#[tokio::test]
+async fn rollback_thread_spawn_removes_exact_thread_and_persistence() {
+    let temp_dir = tempdir().expect("tempdir");
+    let mut config = test_config().await;
+    config.codex_home = temp_dir.path().join("codex-home").abs();
+    config.cwd = config.codex_home.abs();
+    config.experimental_thread_store = ThreadStoreConfig::InMemory {
+        id: format!("thread-manager-rollback-{}", uuid::Uuid::new_v4()),
+    };
+    std::fs::create_dir_all(&config.codex_home).expect("create codex home");
+
+    let auth_manager =
+        AuthManager::from_auth_for_testing(CodexAuth::create_dummy_chatgpt_auth_for_testing());
+    let thread_store = thread_store_from_config(&config, /*state_db*/ None);
+    let in_memory_store = thread_store
+        .as_any()
+        .downcast_ref::<InMemoryThreadStore>()
+        .expect("configured in-memory store");
+    let manager = ThreadManager::new(
+        &config,
+        auth_manager,
+        SessionSource::Exec,
+        Arc::new(codex_exec_server::EnvironmentManager::default_for_tests()),
+        empty_extension_registry(),
+        Arc::new(crate::test_support::EmptyUserInstructionsProvider),
+        /*analytics_events_client*/ None,
+        thread_store.clone(),
+        /*agent_graph_store*/ None,
+        TEST_INSTALLATION_ID.to_string(),
+        /*attestation_provider*/ None,
+        /*external_time_provider*/ None,
+    );
+
+    let started = manager
+        .start_thread(config)
+        .await
+        .expect("start thread to roll back");
+    assert!(
+        manager
+            .rollback_thread_spawn(started.thread_id, &started.thread)
+            .await
+    );
+    assert!(manager.list_thread_ids().await.is_empty());
+    assert!(manager.get_thread(started.thread_id).await.is_err());
+    assert!(
+        !manager
+            .rollback_thread_spawn(started.thread_id, &started.thread)
+            .await
+    );
+
+    let calls = in_memory_store.calls().await;
+    assert_eq!(calls.delete_thread, 1);
+}
+
+#[tokio::test]
 async fn rollout_path_resume_and_fork_read_history_through_thread_store() {
     let temp_dir = tempdir().expect("tempdir");
     let mut config = test_config().await;

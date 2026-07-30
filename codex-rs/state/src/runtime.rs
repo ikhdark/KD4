@@ -267,7 +267,11 @@ impl StateRuntime {
         let started = Instant::now();
         let thread_timestamp_millis_result: anyhow::Result<(Option<i64>, Option<i64>)> =
             sqlx::query_as(
-                "SELECT MAX(threads.updated_at_ms), MAX(threads.recency_at_ms) FROM threads",
+                r#"
+SELECT
+    (SELECT MAX(updated_at_ms) FROM threads),
+    (SELECT MAX(recency_at_ms) FROM threads)
+                "#,
             )
             .fetch_one(pool.as_ref())
             .await

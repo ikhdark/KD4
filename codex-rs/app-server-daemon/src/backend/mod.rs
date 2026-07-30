@@ -6,6 +6,8 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 pub(crate) use pid::PidBackend;
+#[cfg(unix)]
+pub(crate) use pid::force_terminate_process_group;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]

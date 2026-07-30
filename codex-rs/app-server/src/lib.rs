@@ -973,6 +973,12 @@ pub async fn run_main_with_transport_options(
                                 disconnect_sender,
                             } => {
                                 let outbound_initialized = Arc::new(AtomicBool::new(false));
+                                initialize_notification_sender
+                                    .connection_opened(
+                                        connection_id,
+                                        Arc::clone(&outbound_initialized),
+                                    )
+                                    .await;
                                 let outbound_experimental_api_enabled =
                                     Arc::new(AtomicBool::new(false));
                                 let outbound_opted_out_notification_methods =
@@ -1099,7 +1105,7 @@ pub async fn run_main_with_transport_options(
                                             warn!("dropping response from unknown connection: {connection_id:?}");
                                             continue;
                                         }
-                                        processor.process_response(response).await;
+                                        processor.process_response(connection_id, response).await;
                                     }
                                     JSONRPCMessage::Notification(notification) => {
                                         if !connections.contains_key(&connection_id) {
@@ -1113,7 +1119,7 @@ pub async fn run_main_with_transport_options(
                                             warn!("dropping error from unknown connection: {connection_id:?}");
                                             continue;
                                         }
-                                        processor.process_error(err).await;
+                                        processor.process_error(connection_id, err).await;
                                     }
                                 }
                             }

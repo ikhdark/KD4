@@ -105,8 +105,9 @@ async fn wait_for_session_updated(
 async fn wait_for_session_completed(
     mcp: &mut TestAppServer,
     session_id: &str,
+    query: &str,
 ) -> Result<FuzzyFileSearchSessionCompletedNotification> {
-    let description = format!("session completion for sessionId={session_id}");
+    let description = format!("session completion for sessionId={session_id}, query={query}");
     let notification = match timeout(
         DEFAULT_READ_TIMEOUT,
         mcp.read_stream_until_matching_notification(&description, |notification| {
@@ -121,7 +122,7 @@ async fn wait_for_session_completed(
             ) else {
                 return false;
             };
-            payload.session_id == session_id
+            payload.session_id == session_id && payload.query == query
         }),
     )
     .await
@@ -375,8 +376,9 @@ async fn test_fuzzy_file_search_session_streams_updates() -> Result<()> {
     assert_eq!(payload.files.len(), 1);
     assert_eq!(payload.files[0].root, root_path);
     assert_eq!(payload.files[0].path, "alpha.txt");
-    let completed = wait_for_session_completed(&mut mcp, session_id).await?;
+    let completed = wait_for_session_completed(&mut mcp, session_id, "alp").await?;
     assert_eq!(completed.session_id, session_id);
+    assert_eq!(completed.query, "alp");
 
     mcp.stop_fuzzy_file_search_session(session_id).await?;
 
@@ -423,7 +425,7 @@ async fn test_fuzzy_file_search_session_no_updates_after_complete_until_query_ed
     mcp.update_fuzzy_file_search_session(session_id, "alp")
         .await?;
     wait_for_session_updated(&mut mcp, session_id, "alp", FileExpectation::NonEmpty).await?;
-    wait_for_session_completed(&mut mcp, session_id).await?;
+    wait_for_session_completed(&mut mcp, session_id, "alp").await?;
     assert_no_session_updates_for(&mut mcp, session_id, STOP_GRACE_PERIOD, SHORT_READ_TIMEOUT)
         .await?;
 
@@ -482,7 +484,7 @@ async fn test_fuzzy_file_search_session_update_works_without_waiting_for_start_r
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_fuzzy_file_search_session_multiple_query_updates_work() -> Result<()> {
+async fn test_fuzzy_file_search_session_completions_identify_query() -> Result<()> {
     let codex_home = TempDir::new()?;
     let root = TempDir::new()?;
     std::fs::write(root.path().join("alpha.txt"), "contents")?;
@@ -502,15 +504,17 @@ async fn test_fuzzy_file_search_session_multiple_query_updates_work() -> Result<
         alp_payload.files.iter().all(|file| file.root == root_path),
         true
     );
-    wait_for_session_completed(&mut mcp, session_id).await?;
 
+    // Leave the first completion unconsumed so it cannot satisfy the wait for
+    // the newer query if the independently spawned notification arrives late.
     mcp.update_fuzzy_file_search_session(session_id, "zzzz")
         .await?;
     let zzzz_payload =
         wait_for_session_updated(&mut mcp, session_id, "zzzz", FileExpectation::Any).await?;
     assert_eq!(zzzz_payload.query, "zzzz");
     assert_eq!(zzzz_payload.files.is_empty(), true);
-    wait_for_session_completed(&mut mcp, session_id).await?;
+    let completed = wait_for_session_completed(&mut mcp, session_id, "zzzz").await?;
+    assert_eq!(completed.query, "zzzz");
 
     Ok(())
 }

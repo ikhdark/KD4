@@ -40,6 +40,8 @@ from scripts.rust_build_status_support import (  # noqa: E402
     lane_report,
     lane_report_lines,
     max_lane_bytes_from_args,
+    max_total_lane_bytes_from_args,
+    max_total_target_bytes_from_args,
     msvc_linkers_from_cargo_config,
     non_negative_int,
     positive_float,
@@ -47,6 +49,7 @@ from scripts.rust_build_status_support import (  # noqa: E402
     powershell_remove_item_command,
     target_disk_report,
     target_disk_report_lines,
+    target_non_lane_size_bytes,
     target_optimize_report,
     warn_bytes_from_gib,
 )
@@ -62,6 +65,8 @@ __all__ = [
     "lane_report",
     "lane_report_lines",
     "max_lane_bytes_from_args",
+    "max_total_lane_bytes_from_args",
+    "max_total_target_bytes_from_args",
     "msvc_linkers_from_cargo_config",
     "non_negative_int",
     "positive_float",
@@ -69,6 +74,7 @@ __all__ = [
     "powershell_remove_item_command",
     "target_disk_report",
     "target_disk_report_lines",
+    "target_non_lane_size_bytes",
     "target_optimize_report",
     "warn_bytes_from_gib",
 ]
@@ -98,7 +104,7 @@ WINDOWS_MSVC_TARGETS = (
 BYTES_PER_KIB = 1024
 BYTES_PER_MIB = BYTES_PER_KIB * 1024
 BYTES_PER_GIB = BYTES_PER_MIB * 1024
-DEFAULT_TARGET_WARN_BYTES = 50 * BYTES_PER_GIB
+DEFAULT_TARGET_WARN_BYTES = 250 * BYTES_PER_GIB
 TIMESTAMPED_LANE_RE = re.compile(r"^(?P<base>.+)-\d{14}$")
 LANE_SUFFIX_RE = re.compile(r"^(?P<base>.+)-(?P<suffix>\d+)$")
 WINDOWS_RUST_PROCESS_FILTER = " OR ".join(
@@ -111,6 +117,8 @@ MAX_LANE_SIZE_WORKERS = 4
 DEFAULT_PRUNE_KEEP_WARM_PER_BASE = 1
 DEFAULT_PRUNE_MAX_AGE_DAYS = 7.0
 LANE_LAST_USED_STAMP = ".lane-last-used"
+CARGO_LANES_ROOT_MARKER = ".codex-cargo-lanes-root"
+CARGO_LANES_ROOT_MARKER_CONTENT = "codex-kd cargo lanes root v1"
 PROTECTED_TARGET_DIR_NAMES = frozenset(
     {
         "debug",
@@ -129,17 +137,52 @@ RUST_PROCESS_TOKEN_RE = re.compile(
 )
 
 
+class CargoLanesRootValidationError(ValueError):
+    pass
+
+
+def default_cargo_lanes_root(repo_root: Path = REPO_ROOT) -> Path:
+    return (repo_root / "codex-rs" / "target" / "lanes").resolve()
+
+
 def cargo_lanes_root(
     repo_root: Path = REPO_ROOT,
     env: Mapping[str, str] = os.environ,
 ) -> Path:
     raw = env.get("CODEX_CARGO_LANES_ROOT", "").strip()
     if not raw:
-        return repo_root / "codex-rs" / "target" / "lanes"
+        return default_cargo_lanes_root(repo_root)
     path = Path(raw).expanduser()
     if not path.is_absolute():
         path = repo_root / path
     return path.resolve()
+
+
+def validate_cargo_lanes_root(
+    repo_root: Path = REPO_ROOT,
+    env: Mapping[str, str] = os.environ,
+) -> Path:
+    lane_root = cargo_lanes_root(repo_root, env)
+    if lane_root == default_cargo_lanes_root(repo_root):
+        return lane_root
+
+    marker = lane_root / CARGO_LANES_ROOT_MARKER
+    try:
+        marker_is_valid = (
+            lane_root.is_dir()
+            and not marker.is_symlink()
+            and stat.S_ISREG(marker.stat().st_mode)
+            and marker.read_text(encoding="utf-8").strip()
+            == CARGO_LANES_ROOT_MARKER_CONTENT
+        )
+    except (OSError, UnicodeError):
+        marker_is_valid = False
+    if not marker_is_valid:
+        raise CargoLanesRootValidationError(
+            f"refusing to prune unrecognized Cargo lanes root {lane_root}; "
+            f"custom roots require the {CARGO_LANES_ROOT_MARKER} marker"
+        )
+    return lane_root
 
 
 @dataclass(frozen=True)
@@ -500,8 +543,11 @@ def stray_cargo_target_dirs(*, repo_root: Path = REPO_ROOT) -> list[Path]:
 
 def lane_last_used_mtime(path: Path) -> float:
     stamp = path / LANE_LAST_USED_STAMP
-    if stamp.is_file():
-        return stamp.stat().st_mtime
+    try:
+        if stamp.is_file():
+            return stamp.stat().st_mtime
+    except OSError:
+        pass
     # Without the marker, the directory's own NTFS mtime only reflects
     # immediate-child churn, never rebuilds under debug/deps/... — so a
     # frequently-used markerless lane would look creation-era old. Take the
@@ -521,7 +567,9 @@ def lane_last_used_mtime(path: Path) -> float:
             newest = max(newest, candidate.stat().st_mtime)
         except OSError:
             continue
-    return newest or path.stat().st_mtime
+    # A concurrent GC may remove a lane after the directory snapshot was
+    # collected. Treat a vanished lane as oldest instead of failing diagnostics.
+    return newest
 
 
 def existing_lane_dirs(lane_root: Path) -> list[Path]:
@@ -651,11 +699,14 @@ def prunable_lane_dirs(
     keep_warm_per_base: int = DEFAULT_PRUNE_KEEP_WARM_PER_BASE,
     max_age_days: float | None = DEFAULT_PRUNE_MAX_AGE_DAYS,
     max_lane_bytes: int | None = None,
+    max_total_lane_bytes: int | None = None,
+    max_total_target_bytes: int | None = None,
     now_timestamp: float | None = None,
     lane_mtime: Callable[[Path], float] | None = None,
     lane_size: Callable[[Path], tuple[int, int]] | None = None,
     size_workers: int = DEFAULT_LANE_SIZE_WORKERS,
 ) -> list[Path]:
+    lane_root = validate_cargo_lanes_root(repo_root)
     snapshot = snapshot or BuildStatusSnapshot.collect(
         repo_root=repo_root,
         processes=processes,
@@ -668,27 +719,45 @@ def prunable_lane_dirs(
         lane_mtime=snapshot.lane_mtime,
     )
     now = time.time() if now_timestamp is None else now_timestamp
-    prunable: list[Path] = []
+    prunable: set[Path] = set()
     size_candidates: list[Path] = []
+    effective_max_total_lane_bytes = max_total_lane_bytes
+    if max_total_target_bytes is not None:
+        non_lane_size_bytes, _errors = target_non_lane_size_bytes(
+            repo_root=repo_root,
+            lane_root=lane_root,
+            size_workers=size_workers,
+        )
+        target_lane_budget = max(0, max_total_target_bytes - non_lane_size_bytes)
+        effective_max_total_lane_bytes = (
+            target_lane_budget
+            if effective_max_total_lane_bytes is None
+            else min(effective_max_total_lane_bytes, target_lane_budget)
+        )
 
     for path in lane_dirs:
         if is_timestamped_lane(path.name):
-            prunable.append(path)
+            prunable.add(path)
             continue
         if (
             max_age_days is not None
             and now - snapshot.lane_mtime(path) > max_age_days * 86400
         ):
-            prunable.append(path)
+            prunable.add(path)
             continue
         if keep_warm_per_base > 0 and path.name not in protected:
-            prunable.append(path)
+            prunable.add(path)
             continue
         if max_lane_bytes is not None:
             size_candidates.append(path)
             continue
-        if keep_warm_per_base <= 0 and max_age_days is None and max_lane_bytes is None:
-            prunable.append(path)
+        if (
+            keep_warm_per_base <= 0
+            and max_age_days is None
+            and max_lane_bytes is None
+            and effective_max_total_lane_bytes is None
+        ):
+            prunable.add(path)
 
     if max_lane_bytes is not None and size_candidates:
         for path, (size_bytes, _errors) in snapshot.lane_sizes(
@@ -697,7 +766,34 @@ def prunable_lane_dirs(
             lane_size=lane_size,
         ).items():
             if size_bytes > max_lane_bytes:
-                prunable.append(path)
+                prunable.add(path)
+
+    if effective_max_total_lane_bytes is not None and snapshot.lane_dirs:
+        lane_sizes = snapshot.lane_sizes(
+            snapshot.lane_dirs,
+            size_workers=size_workers,
+            lane_size=lane_size,
+        )
+        projected_total_bytes = sum(
+            size_bytes for size_bytes, _errors in lane_sizes.values()
+        )
+        projected_total_bytes -= sum(
+            lane_sizes[path][0] for path in prunable if path in lane_sizes
+        )
+        if projected_total_bytes > effective_max_total_lane_bytes:
+            lru_candidates = sorted(
+                (path for path in lane_dirs if path not in prunable),
+                key=lambda path: (
+                    snapshot.lane_mtime(path),
+                    path.name.casefold(),
+                    path.name,
+                ),
+            )
+            for path in lru_candidates:
+                prunable.add(path)
+                projected_total_bytes -= lane_sizes[path][0]
+                if projected_total_bytes <= effective_max_total_lane_bytes:
+                    break
 
     return sorted(prunable)
 
@@ -711,17 +807,19 @@ def prune_stale_lanes(
     keep_warm_per_base: int = DEFAULT_PRUNE_KEEP_WARM_PER_BASE,
     max_age_days: float | None = DEFAULT_PRUNE_MAX_AGE_DAYS,
     max_lane_bytes: int | None = None,
+    max_total_lane_bytes: int | None = None,
+    max_total_target_bytes: int | None = None,
     now_timestamp: float | None = None,
     lane_mtime: Callable[[Path], float] | None = None,
     lane_size: Callable[[Path], tuple[int, int]] | None = None,
     size_workers: int = DEFAULT_LANE_SIZE_WORKERS,
 ) -> list[Path]:
+    lane_root = validate_cargo_lanes_root(repo_root)
     snapshot = snapshot or BuildStatusSnapshot.collect(
         repo_root=repo_root,
         processes=processes,
         lane_mtime=lane_mtime,
     )
-    lane_root = cargo_lanes_root(repo_root)
     resolved_lane_root = lane_root.resolve()
     removed: list[Path] = []
     for path in prunable_lane_dirs(
@@ -731,11 +829,15 @@ def prune_stale_lanes(
         keep_warm_per_base=keep_warm_per_base,
         max_age_days=max_age_days,
         max_lane_bytes=max_lane_bytes,
+        max_total_lane_bytes=max_total_lane_bytes,
+        max_total_target_bytes=max_total_target_bytes,
         now_timestamp=now_timestamp,
         lane_mtime=lane_mtime,
         lane_size=lane_size,
         size_workers=size_workers,
     ):
+        if not path.exists():
+            continue
         if is_indirect_directory(path):
             print(f"warning: skipping indirect lane path: {path}", file=sys.stderr)
             continue
@@ -763,6 +865,8 @@ def prune_stale_lanes(
                 # Lanes routinely contain read-only files (registry-cache
                 # copies in build OUT_DIRs); bare rmtree would abort partway.
                 remove_tree_allow_readonly(path)
+            except FileNotFoundError:
+                continue
             except OSError as exc:
                 if not cargo_lock_is_busy(path) and not lane_active_lock_is_held(path):
                     print(
@@ -782,11 +886,14 @@ def prune_stale_lanes_plan(
     keep_warm_per_base: int = DEFAULT_PRUNE_KEEP_WARM_PER_BASE,
     max_age_days: float | None = DEFAULT_PRUNE_MAX_AGE_DAYS,
     max_lane_bytes: int | None = None,
+    max_total_lane_bytes: int | None = None,
+    max_total_target_bytes: int | None = None,
     now_timestamp: float | None = None,
     lane_mtime: Callable[[Path], float] | None = None,
     lane_size: Callable[[Path], tuple[int, int]] | None = None,
     size_workers: int = DEFAULT_LANE_SIZE_WORKERS,
 ) -> dict[str, object]:
+    validate_cargo_lanes_root(repo_root)
     snapshot = snapshot or BuildStatusSnapshot.collect(
         repo_root=repo_root,
         processes=processes,
@@ -799,6 +906,8 @@ def prune_stale_lanes_plan(
         keep_warm_per_base=keep_warm_per_base,
         max_age_days=max_age_days,
         max_lane_bytes=max_lane_bytes,
+        max_total_lane_bytes=max_total_lane_bytes,
+        max_total_target_bytes=max_total_target_bytes,
         now_timestamp=now_timestamp,
         lane_mtime=lane_mtime,
         lane_size=lane_size,
@@ -811,6 +920,8 @@ def prune_stale_lanes_plan(
         "keepWarmPerBase": keep_warm_per_base,
         "maxAgeDays": max_age_days,
         "maxLaneBytes": max_lane_bytes,
+        "maxTotalLaneBytes": max_total_lane_bytes,
+        "maxTotalTargetBytes": max_total_target_bytes,
         "lanes": [str(path) for path in lanes],
         "strayTargetDirs": [str(path) for path in strays],
     }
@@ -880,9 +991,12 @@ def prune_stale_lanes_report(
     keep_warm_per_base: int = DEFAULT_PRUNE_KEEP_WARM_PER_BASE,
     max_age_days: float | None = DEFAULT_PRUNE_MAX_AGE_DAYS,
     max_lane_bytes: int | None = None,
+    max_total_lane_bytes: int | None = None,
+    max_total_target_bytes: int | None = None,
     include_disk_report: bool = True,
     size_workers: int = DEFAULT_LANE_SIZE_WORKERS,
 ) -> str:
+    validate_cargo_lanes_root(repo_root)
     snapshot = snapshot or BuildStatusSnapshot.collect(
         repo_root=repo_root,
         processes=processes,
@@ -895,6 +1009,8 @@ def prune_stale_lanes_report(
         keep_warm_per_base=keep_warm_per_base,
         max_age_days=max_age_days,
         max_lane_bytes=max_lane_bytes,
+        max_total_lane_bytes=max_total_lane_bytes,
+        max_total_target_bytes=max_total_target_bytes,
         size_workers=size_workers,
     )
     removed_strays = prune_stray_cargo_target_dirs(
@@ -909,6 +1025,12 @@ def prune_stale_lanes_report(
         lines.append(f"max lane age: {max_age_days:g} days")
     if max_lane_bytes is not None:
         lines.append(f"max lane size: {format_bytes(max_lane_bytes)}")
+    if max_total_lane_bytes is not None:
+        lines.append(f"max aggregate lane size: {format_bytes(max_total_lane_bytes)}")
+    if max_total_target_bytes is not None:
+        lines.append(
+            f"max aggregate target size: {format_bytes(max_total_target_bytes)}"
+        )
     if removed:
         for path in removed:
             lines.append(f"{action}: {path}")
@@ -936,7 +1058,7 @@ def main(argv: list[str] | None = None) -> int:
     disk_parser = subparsers.add_parser(
         "disk", help="Show codex-rs/target disk usage and warnings."
     )
-    disk_parser.add_argument("--warn-gib", type=positive_float, default=50.0)
+    disk_parser.add_argument("--warn-gib", type=positive_float, default=250.0)
     prune_parser = subparsers.add_parser(
         "prune", help="Remove inactive target/lanes directories."
     )
@@ -959,51 +1081,63 @@ def main(argv: list[str] | None = None) -> int:
         keep_warm_per_base = 0
         max_age_days = None
 
-    if args.command == "doctor":
-        print(build_doctor_report())
-    elif args.command == "lanes":
-        print(lane_report())
-    elif args.command == "disk":
-        print(target_disk_report(warn_bytes=warn_bytes_from_gib(args.warn_gib)))
-    elif args.command == "prune":
-        if args.json_plan:
-            print(
-                json.dumps(
-                    prune_stale_lanes_plan(
+    try:
+        if args.command == "doctor":
+            print(build_doctor_report())
+        elif args.command == "lanes":
+            print(lane_report())
+        elif args.command == "disk":
+            print(target_disk_report(warn_bytes=warn_bytes_from_gib(args.warn_gib)))
+        elif args.command == "prune":
+            if args.json_plan:
+                print(
+                    json.dumps(
+                        prune_stale_lanes_plan(
+                            keep_warm_per_base=keep_warm_per_base,
+                            max_age_days=max_age_days,
+                            max_lane_bytes=max_lane_bytes_from_args(args),
+                            max_total_lane_bytes=max_total_lane_bytes_from_args(args),
+                            max_total_target_bytes=max_total_target_bytes_from_args(
+                                args
+                            ),
+                            size_workers=args.size_workers,
+                        ),
+                        separators=(",", ":"),
+                    )
+                )
+            else:
+                print(
+                    prune_stale_lanes_report(
+                        dry_run=args.dry_run,
+                        warn_bytes=warn_bytes_from_gib(args.warn_gib),
                         keep_warm_per_base=keep_warm_per_base,
                         max_age_days=max_age_days,
                         max_lane_bytes=max_lane_bytes_from_args(args),
+                        max_total_lane_bytes=max_total_lane_bytes_from_args(args),
+                        max_total_target_bytes=max_total_target_bytes_from_args(args),
+                        include_disk_report=not args.skip_disk_report,
                         size_workers=args.size_workers,
-                    ),
-                    separators=(",", ":"),
+                    )
                 )
-            )
-        else:
+        elif args.command == "optimize":
             print(
-                prune_stale_lanes_report(
+                target_optimize_report(
                     dry_run=args.dry_run,
                     warn_bytes=warn_bytes_from_gib(args.warn_gib),
                     keep_warm_per_base=keep_warm_per_base,
                     max_age_days=max_age_days,
                     max_lane_bytes=max_lane_bytes_from_args(args),
-                    include_disk_report=not args.skip_disk_report,
+                    max_total_lane_bytes=max_total_lane_bytes_from_args(args),
+                    max_total_target_bytes=max_total_target_bytes_from_args(args),
+                    include_prune_disk_report=args.include_prune_disk_report,
                     size_workers=args.size_workers,
                 )
             )
-    elif args.command == "optimize":
-        print(
-            target_optimize_report(
-                dry_run=args.dry_run,
-                warn_bytes=warn_bytes_from_gib(args.warn_gib),
-                keep_warm_per_base=keep_warm_per_base,
-                max_age_days=max_age_days,
-                max_lane_bytes=max_lane_bytes_from_args(args),
-                include_prune_disk_report=args.include_prune_disk_report,
-                size_workers=args.size_workers,
-            )
-        )
-    else:
-        parser.error(f"unknown command {args.command}")
+        else:
+            parser.error(f"unknown command {args.command}")
+    except CargoLanesRootValidationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     return 0
 
 

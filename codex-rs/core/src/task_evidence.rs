@@ -30,7 +30,7 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
-const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 4;
+const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 3;
 const FILE_HASH_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_COMMAND_RECEIPTS: usize = 256;
 const MAX_EDIT_RECEIPTS: usize = 256;
@@ -68,6 +68,8 @@ pub(crate) struct TaskEvidenceLedger {
     persistence_test_control: Arc<std::sync::Mutex<Option<PersistenceTestControl>>>,
 }
 
+type PersistenceWriteBarrierPair = (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PersistOutcome {
     Persisted,
@@ -78,8 +80,7 @@ enum PersistOutcome {
 #[derive(Clone)]
 #[cfg_attr(not(test), allow(dead_code))]
 struct PersistenceTestControl {
-    before_next_write:
-        Arc<std::sync::Mutex<Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>>>,
+    before_next_write: Arc<std::sync::Mutex<Option<PersistenceWriteBarrierPair>>>,
     fail_writes: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -277,8 +278,18 @@ impl TaskEvidenceLedger {
         let existing = load_existing_document(&evidence_path, &thread_id_text, &repo_root).await;
         let mut storage_failure_reason = None;
         let existing = match existing {
-            ExistingDocument::Loaded(document) => Some(*document),
+            ExistingDocument::Loaded {
+                document,
+                legacy_completion_model,
+            } => Some((*document, legacy_completion_model)),
             ExistingDocument::Missing => None,
+            ExistingDocument::NewerSchema { schema_version } => {
+                warn!(
+                    "disabling task evidence because {} uses newer schema version {schema_version}; refusing to modify it",
+                    evidence_path.display()
+                );
+                return Self::disabled();
+            }
             ExistingDocument::Rejected { kind, reason } => {
                 let quarantine = quarantine_evidence_file(&evidence_path, kind).await;
                 match quarantine {
@@ -300,8 +311,8 @@ impl TaskEvidenceLedger {
                 None
             }
         };
-        let document = if let Some(mut document) = existing {
-            migrate_document(&mut document);
+        let document = if let Some((mut document, legacy_completion_model)) = existing {
+            migrate_document_with_completion_model(&mut document, legacy_completion_model);
             document.start.repository_root.clone_from(&repository_root);
             document.updated_at = now;
             document.revision = document.revision.saturating_add(1);
@@ -311,7 +322,7 @@ impl TaskEvidenceLedger {
             TaskEvidenceDocument {
                 schema_version: TASK_EVIDENCE_SCHEMA_VERSION,
                 revision: 1,
-                thread_id: thread_id_text,
+                thread_id: thread_id_text.clone(),
                 started_at: now.clone(),
                 updated_at: now,
                 start: TaskStartState {
@@ -357,8 +368,8 @@ impl TaskEvidenceLedger {
         let writable_evidence_path = storage_failure_reason.is_none().then_some(evidence_path);
         let ledger = Self {
             mode,
-            codex_home: Some(codex_home),
-            thread_id: Some(thread_id.to_string()),
+            codex_home: Some(codex_home.clone()),
+            thread_id: Some(thread_id_text.clone()),
             evidence_path: writable_evidence_path,
             repo_root: Some(repo_root),
             document: Arc::new(Mutex::new(Some(document.clone()))),
@@ -398,14 +409,8 @@ impl TaskEvidenceLedger {
             .collect();
         let live_artifact_ids =
             crate::tools::command_output_artifact::reconcile_evidence_artifact_protection(
-                ledger
-                    .codex_home
-                    .as_deref()
-                    .expect("enabled ledger has a Codex home"),
-                ledger
-                    .thread_id
-                    .as_deref()
-                    .expect("enabled ledger has a thread id"),
+                &codex_home,
+                &thread_id_text,
                 &referenced_artifact_ids,
             )
             .await;
@@ -1114,11 +1119,11 @@ impl TaskEvidenceLedger {
             Ok(None) => return ExternalEvidenceCapture::Ignored,
             Err(message) => return ExternalEvidenceCapture::Warning(message),
         };
-        if self.evidence_path.is_none() {
+        let Some(evidence_path) = self.evidence_path.clone() else {
             return ExternalEvidenceCapture::Warning(
                 "external evidence persistence is unavailable for this task",
             );
-        }
+        };
         let external_evidence_permit = match Arc::clone(&self.external_evidence_gate)
             .acquire_owned()
             .await
@@ -1171,7 +1176,11 @@ impl TaskEvidenceLedger {
                     "external evidence thread identity is unavailable",
                 );
             };
-            let artifact_bytes = encode_external_evidence_artifact(&canonical_bytes);
+            let Some(artifact_bytes) = encode_external_evidence_artifact(&canonical_bytes) else {
+                return ExternalEvidenceCapture::Warning(
+                    "external evidence payload artifact could not be encoded",
+                );
+            };
             let pending = crate::tools::command_output_artifact::create_evidence_output_artifact(
                 codex_home,
                 thread_id,
@@ -1220,10 +1229,6 @@ impl TaskEvidenceLedger {
         let persistence_gate = Arc::clone(&self.persistence_gate);
         let last_persisted_revision = Arc::clone(&self.last_persisted_revision);
         let persistence_test_control = self.persistence_test_control();
-        let evidence_path = self
-            .evidence_path
-            .clone()
-            .expect("external evidence requires a persistence path");
         let codex_home = self.codex_home.clone();
         let thread_id = self.thread_id.clone();
         let mode = self.mode;
@@ -1417,7 +1422,7 @@ impl TaskEvidenceLedger {
             return self
                 .persistence_test_control
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
         }
         #[cfg(not(test))]
@@ -1440,16 +1445,15 @@ async fn persist_document_with_permit(
         }
     };
     match tokio::task::spawn_blocking(move || {
-        if let Some(control) = test_control.as_ref() {
-            if let Some((started, release)) = control
+        if let Some(control) = test_control.as_ref()
+            && let Some((started, release)) = control
                 .before_next_write
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take()
-            {
-                started.wait();
-                release.wait();
-            }
+        {
+            started.wait();
+            release.wait();
         }
         let last_revision = last_persisted_revision.load(Ordering::Acquire);
         let outcome = if last_revision > document.revision {
@@ -1569,6 +1573,9 @@ fn extract_external_evidence_metadata(
     let Some(truncated) = meta.get("truncated").and_then(Value::as_bool) else {
         return Err("MCP evidenceMeta truncated flag is malformed and was ignored");
     };
+    if payload_completeness == EvidenceCompleteness::Complete && truncated {
+        return Err("MCP evidenceMeta complete payload cannot be truncated and was ignored");
+    }
     let Some(approximate) = meta.get("approximate").and_then(Value::as_bool) else {
         return Err("MCP evidenceMeta approximate flag is malformed and was ignored");
     };
@@ -1583,6 +1590,8 @@ fn extract_external_evidence_metadata(
         return Err("MCP evidenceMeta limitations are malformed and were ignored");
     };
     let provider_snapshot = match meta.get("snapshot") {
+        // Keep ingress tolerant for providers deployed before snapshot became
+        // explicitly required by the producer contract.
         None | Some(Value::Null) => None,
         Some(Value::String(snapshot)) => Some(snapshot.clone()),
         Some(_) => return Err("MCP evidenceMeta snapshot is malformed and was ignored"),
@@ -1630,9 +1639,8 @@ const fn evidence_completeness_name(completeness: EvidenceCompleteness) -> &'sta
     }
 }
 
-fn encode_external_evidence_artifact(canonical_bytes: &[u8]) -> Vec<u8> {
-    let canonical = std::str::from_utf8(canonical_bytes)
-        .expect("canonical JSON serialization always produces valid UTF-8");
+fn encode_external_evidence_artifact(canonical_bytes: &[u8]) -> Option<Vec<u8>> {
+    let canonical = std::str::from_utf8(canonical_bytes).ok()?;
     let mut encoded = Vec::with_capacity(canonical_bytes.len() + 256);
     encoded.extend_from_slice(EXTERNAL_EVIDENCE_ARTIFACT_HEADER.as_bytes());
     let mut start = 0;
@@ -1641,13 +1649,12 @@ fn encode_external_evidence_artifact(canonical_bytes: &[u8]) -> Vec<u8> {
         while !canonical.is_char_boundary(end) {
             end -= 1;
         }
-        let line = serde_json::to_string(&canonical[start..end])
-            .expect("string serialization cannot fail");
+        let line = Value::String(canonical[start..end].to_string()).to_string();
         encoded.extend_from_slice(line.as_bytes());
         encoded.push(b'\n');
         start = end;
     }
-    encoded
+    Some(encoded)
 }
 
 fn workspace_root_fingerprint(start: &TaskStartState) -> String {
@@ -1655,15 +1662,23 @@ fn workspace_root_fingerprint(start: &TaskStartState) -> String {
         "repositoryRoot": start.repository_root,
         "repositoryUrl": start.repository_url,
     }));
-    let bytes =
-        serde_json::to_vec(&identity).expect("workspace identity serialization cannot fail");
-    format!("{:x}", Sha256::digest(bytes))
+    let serialized = identity.to_string();
+    format!("{:x}", Sha256::digest(serialized.as_bytes()))
 }
 
 enum ExistingDocument {
     Missing,
-    Loaded(Box<TaskEvidenceDocument>),
-    Rejected { kind: &'static str, reason: String },
+    Loaded {
+        document: Box<TaskEvidenceDocument>,
+        legacy_completion_model: bool,
+    },
+    NewerSchema {
+        schema_version: u64,
+    },
+    Rejected {
+        kind: &'static str,
+        reason: String,
+    },
 }
 
 async fn load_existing_document(
@@ -1690,11 +1705,7 @@ async fn load_existing_document(
             };
         }
     };
-    let schema_version = match value
-        .get("schema_version")
-        .and_then(Value::as_u64)
-        .and_then(|version| u32::try_from(version).ok())
-    {
+    let schema_version = match value.get("schema_version").and_then(Value::as_u64) {
         Some(schema_version) => schema_version,
         None => {
             return ExistingDocument::Rejected {
@@ -1703,12 +1714,18 @@ async fn load_existing_document(
             };
         }
     };
-    if !(1..=TASK_EVIDENCE_SCHEMA_VERSION).contains(&schema_version) {
+    if schema_version > u64::from(TASK_EVIDENCE_SCHEMA_VERSION) {
+        return ExistingDocument::NewerSchema { schema_version };
+    }
+    if schema_version == 0 {
         return ExistingDocument::Rejected {
             kind: "incompatible",
             reason: format!("unsupported schema version {schema_version}"),
         };
     }
+    let schema_version = schema_version as u32;
+    let legacy_completion_model = schema_version < TASK_EVIDENCE_SCHEMA_VERSION
+        || uses_retired_v3_completion_shape(schema_version, &value);
     let document = match serde_json::from_value::<TaskEvidenceDocument>(value) {
         Ok(document) => document,
         Err(err) => {
@@ -1731,7 +1748,22 @@ async fn load_existing_document(
             reason: "repository root does not match the requested checkout".to_string(),
         };
     }
-    ExistingDocument::Loaded(Box::new(document))
+    ExistingDocument::Loaded {
+        document: Box::new(document),
+        legacy_completion_model,
+    }
+}
+
+fn uses_retired_v3_completion_shape(schema_version: u32, value: &Value) -> bool {
+    schema_version == 3
+        && [
+            "validation_epoch",
+            "next_validation_receipt_sequence",
+            "validation_receipts",
+            "wiring_receipt",
+        ]
+        .iter()
+        .any(|field| value.get(*field).is_some())
 }
 
 fn recorded_repository_root_matches(recorded: &str, expected: &Path) -> bool {
@@ -1798,8 +1830,16 @@ async fn quarantine_evidence_file(path: &Path, kind: &str) -> io::Result<PathBuf
     Ok(quarantine)
 }
 
+#[cfg(test)]
 fn migrate_document(document: &mut TaskEvidenceDocument) {
     let legacy_completion_model = document.schema_version < TASK_EVIDENCE_SCHEMA_VERSION;
+    migrate_document_with_completion_model(document, legacy_completion_model);
+}
+
+fn migrate_document_with_completion_model(
+    document: &mut TaskEvidenceDocument,
+    legacy_completion_model: bool,
+) {
     document.next_edit_receipt_sequence =
         document
             .next_edit_receipt_sequence
@@ -2280,12 +2320,12 @@ fn derive_completion_gate(
         blocked.push("required Desktop activation receipt is missing or stale".to_string());
     }
     for requirement in &document.generated_artifact_requirements {
-        if let Some(path) = requirement.path.as_ref() {
-            if !generated_artifact_is_currently_available(document, path) {
-                blocked.push(format!(
-                    "required generated artifact is missing, unreadable, or unhashable: {path}"
-                ));
-            }
+        if let Some(path) = requirement.path.as_ref()
+            && !generated_artifact_is_currently_available(document, path)
+        {
+            blocked.push(format!(
+                "required generated artifact is missing, unreadable, or unhashable: {path}"
+            ));
         }
     }
     for snapshot in document

@@ -45,4 +45,8 @@ fn default_search_text_uses_model_visible_namespace_metadata_once() {
         search_info.entry.search_text,
         "codex_app Manage Codex automations. automation_update automation update Create or update automations. Automation options. mode Update mode. schedule Schedule settings. timezone IANA timezone."
     );
+    assert_eq!(
+        search_info.entry.tool_names,
+        vec!["automation_update".to_string()]
+    );
 }

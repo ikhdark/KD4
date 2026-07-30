@@ -50,7 +50,9 @@ is the current source map for the checked-in script tooling.
   `just publish-local-codex-final`.
 - `test_publish_local_codex.py`: focused coverage for local publish behavior.
 - `cargo-lane.ps1`: isolated Cargo/just lane runner for concurrent Rust work.
-  Preserve stop-parsing and argument-forwarding behavior.
+  Preserve stop-parsing and argument-forwarding behavior. When a lane uses
+  sccache, it defaults `CARGO_INCREMENTAL=0` unless the caller already set a
+  value, avoiding duplicate incremental and compiler-cache work.
 - `cargo-lane-trash-cleanup.ps1`: cleanup for lane trash/target artifacts. Never
   remove active build outputs without active-process checks.
 - `common-rust-env.ps1`: shared Rust build environment setup for Windows scripts.
@@ -58,6 +60,17 @@ is the current source map for the checked-in script tooling.
   `--target-dir` instead of exporting `CARGO_TARGET_DIR`, so sccache keys stay
   reusable across repeated local builds.
 - `rust_build_status.py`: reports active Rust/build processes and target state.
+  Automatic lane GC runs before builds at most hourly and always rechecks after
+  a build, keeps one warm lane per base, expires lanes after seven days, and
+  evicts least-recently-used inactive lanes to enforce both a 200 GiB lane
+  ceiling and a 250 GiB combined `codex-rs/target` ceiling. Override those byte
+  ceilings with `CODEX_CARGO_LANE_MAX_TOTAL_BYTES` and
+  `CODEX_CARGO_TARGET_MAX_TOTAL_BYTES` (`0` disables the matching ceiling).
+  Build-health disk warnings use the same 250 GiB default.
+  Manual prune/optimize commands accept the matching
+  `--max-total-lane-{gib,bytes}` and `--max-total-target-{gib,bytes}` options.
+  Cargo incremental compilation defaults off in this repository because sccache
+  already provides the shared compiler cache; callers can explicitly opt back in.
 - `rust_packages.py`: Rust package/workspace metadata helper. Prefer Cargo
   metadata over hand-maintained crate lists.
 - `invoke-rust-perf-env.ps1` and `sccache-perf.ps1`: local Rust performance and

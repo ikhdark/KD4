@@ -74,6 +74,17 @@ def load_toml(path: Path):
 
 
 class BuildToolingStorageTest(unittest.TestCase):
+    def test_cargo_config_disables_duplicate_incremental_cache_by_default(self) -> None:
+        config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
+
+        self.assertFalse(config["build"]["incremental"])
+
+    def test_missing_lane_mtime_is_safe_during_concurrent_gc(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            missing_lane = Path(temp_dir) / "already-pruned"
+
+            self.assertEqual(rust_build_status.lane_last_used_mtime(missing_lane), 0.0)
+
     def test_rust_build_doctor_reports_cache_linker_and_contention(self) -> None:
         report = rust_build_status.build_doctor_report(
             repo_root=REPO_ROOT,
@@ -274,6 +285,59 @@ class BuildToolingStorageTest(unittest.TestCase):
             self.assertEqual([path.name for path in removed], ["stale"])
             self.assertFalse(stale_lane.exists())
             self.assertTrue(active_lane.exists())
+
+    def test_prune_rejects_unmarked_custom_root_without_deleting_children(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            custom_root = Path(temp_dir) / "ordinary-root"
+            ordinary_dir = custom_root / "family-photos"
+            ordinary_dir.mkdir(parents=True)
+            (ordinary_dir / "photo.txt").write_text("keep", encoding="utf-8")
+            stderr = io.StringIO()
+
+            with (
+                mock.patch.dict(
+                    rust_build_status.os.environ,
+                    {"CODEX_CARGO_LANES_ROOT": str(custom_root)},
+                ),
+                contextlib.redirect_stderr(stderr),
+            ):
+                result = rust_build_status.main(
+                    ["prune", "--all", "--skip-disk-report"]
+                )
+
+            self.assertEqual(result, 2)
+            self.assertTrue(ordinary_dir.exists())
+            self.assertIn(
+                "refusing to prune unrecognized Cargo lanes root",
+                stderr.getvalue(),
+            )
+
+    def test_prune_accepts_marked_custom_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir) / "repo"
+            custom_root = Path(temp_dir) / "custom-lanes"
+            stale_lane = custom_root / "stale"
+            stale_lane.mkdir(parents=True)
+            (custom_root / rust_build_status.CARGO_LANES_ROOT_MARKER).write_text(
+                rust_build_status.CARGO_LANES_ROOT_MARKER_CONTENT + "\n",
+                encoding="utf-8",
+            )
+
+            with mock.patch.dict(
+                rust_build_status.os.environ,
+                {"CODEX_CARGO_LANES_ROOT": str(custom_root)},
+            ):
+                removed = rust_build_status.prune_stale_lanes(
+                    repo_root=repo_root,
+                    processes=[],
+                    keep_warm_per_base=0,
+                    max_age_days=None,
+                )
+
+            self.assertEqual(removed, [stale_lane])
+            self.assertFalse(stale_lane.exists())
 
     def test_locked_lane_is_active_and_not_pruned(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -566,6 +630,91 @@ class BuildToolingStorageTest(unittest.TestCase):
             self.assertEqual([path.name for path in removed], ["codex-core-2"])
             self.assertEqual(size_calls, ["codex-core"])
 
+    def test_prune_stale_lanes_applies_global_ceiling_by_inactive_lru(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            lane_root = repo_root / "codex-rs" / "target" / "lanes"
+            oldest = lane_root / "oldest"
+            newest = lane_root / "newest"
+            active = lane_root / "active"
+            for lane in (oldest, newest, active):
+                lane.mkdir(parents=True)
+                (lane / "artifact.txt").write_text(lane.name, encoding="utf-8")
+
+            lane_mtimes = {"oldest": 1.0, "newest": 2.0, "active": 3.0}
+            removed = rust_build_status.prune_stale_lanes(
+                repo_root=repo_root,
+                processes=[
+                    rust_build_status.RustProcess(
+                        pid=7,
+                        name="rustc.exe",
+                        command_line=f"rustc --out-dir {active}\\debug",
+                    )
+                ],
+                keep_warm_per_base=1,
+                max_age_days=None,
+                max_total_lane_bytes=120,
+                lane_mtime=lambda path: lane_mtimes[path.name],
+                lane_size=lambda _path: (60, 0),
+            )
+
+            self.assertEqual([path.name for path in removed], ["oldest"])
+            self.assertFalse(oldest.exists())
+            self.assertTrue(newest.exists())
+            self.assertTrue(active.exists())
+
+    def test_global_ceiling_accounts_for_lanes_already_selected_by_policy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            lane_root = repo_root / "codex-rs" / "target" / "lanes"
+            protected = lane_root / "codex-core"
+            warm_budget_victim = lane_root / "codex-core-2"
+            protected.mkdir(parents=True)
+            warm_budget_victim.mkdir(parents=True)
+
+            removed = rust_build_status.prune_stale_lanes(
+                repo_root=repo_root,
+                processes=[],
+                keep_warm_per_base=1,
+                max_age_days=None,
+                max_total_lane_bytes=60,
+                lane_mtime=lambda path: 1.0 if path == warm_budget_victim else 2.0,
+                lane_size=lambda _path: (60, 0),
+            )
+
+            self.assertEqual([path.name for path in removed], [warm_budget_victim.name])
+            self.assertTrue(protected.exists())
+            self.assertFalse(warm_budget_victim.exists())
+
+    def test_target_ceiling_subtracts_non_lane_target_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir)
+            target_root = repo_root / "codex-rs" / "target"
+            lane_root = target_root / "lanes"
+            oldest = lane_root / "oldest"
+            newest = lane_root / "newest"
+            for lane in (oldest, newest):
+                lane.mkdir(parents=True)
+            debug = target_root / "debug"
+            debug.mkdir()
+            (debug / "artifact.bin").write_bytes(b"x" * 80)
+
+            removed = rust_build_status.prune_stale_lanes(
+                repo_root=repo_root,
+                processes=[],
+                keep_warm_per_base=1,
+                max_age_days=None,
+                max_total_target_bytes=140,
+                lane_mtime=lambda path: 1.0 if path == oldest else 2.0,
+                lane_size=lambda _path: (60, 0),
+            )
+
+            self.assertEqual([path.name for path in removed], [oldest.name])
+            self.assertFalse(oldest.exists())
+            self.assertTrue(newest.exists())
+
     def test_prune_report_can_skip_disk_scan(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = Path(temp_dir)
@@ -594,6 +743,10 @@ class BuildToolingStorageTest(unittest.TestCase):
             ("--max-age-days", "-1"),
             ("--max-lane-gib", "-1"),
             ("--max-lane-bytes", "-1"),
+            ("--max-total-lane-gib", "-1"),
+            ("--max-total-lane-bytes", "-1"),
+            ("--max-total-target-gib", "-1"),
+            ("--max-total-target-bytes", "-1"),
             ("--size-workers", "0"),
         ):
             with (

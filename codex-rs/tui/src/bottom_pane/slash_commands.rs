@@ -10,6 +10,9 @@ use codex_utils_fuzzy_match::fuzzy_match;
 use crate::slash_command::SlashCommand;
 use crate::slash_command::built_in_slash_commands;
 
+const MIN_FUZZY_COMMAND_QUERY_CHARS: usize = 4;
+const MIN_DESCRIPTION_QUERY_CHARS: usize = 4;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ServiceTierCommand {
     pub(crate) id: String,
@@ -28,6 +31,13 @@ impl SlashCommandItem {
         match self {
             Self::Builtin(cmd) => cmd.command(),
             Self::ServiceTier(command) => &command.name,
+        }
+    }
+
+    pub(crate) fn description(&self) -> &str {
+        match self {
+            Self::Builtin(cmd) => cmd.description(),
+            Self::ServiceTier(command) => &command.description,
         }
     }
 
@@ -146,14 +156,63 @@ pub(crate) fn find_slash_command(
         .flatten()
 }
 
-pub(crate) fn has_slash_command_prefix(
+pub(crate) fn slash_command_name_prefix_matches(command_name: &str, query: &str) -> bool {
+    command_name
+        .to_lowercase()
+        .starts_with(&query.to_lowercase())
+}
+
+pub(crate) fn fuzzy_match_slash_command_name(
+    command_name: &str,
+    query: &str,
+    allow_non_prefix_fuzzy: bool,
+) -> Option<(Vec<usize>, i32)> {
+    let matched = fuzzy_match(command_name, query)?;
+    if slash_command_name_prefix_matches(command_name, query) {
+        return Some(matched);
+    }
+    if !allow_non_prefix_fuzzy {
+        return None;
+    }
+
+    let query_chars = query.chars().count();
+    let is_contiguous = matched
+        .0
+        .windows(2)
+        .all(|pair| pair[1] == pair[0].saturating_add(1));
+    (query_chars >= MIN_FUZZY_COMMAND_QUERY_CHARS || (query_chars >= 2 && is_contiguous))
+        .then_some(matched)
+}
+
+pub(crate) fn slash_command_description_matches(description: &str, query: &str) -> bool {
+    if query.chars().count() < MIN_DESCRIPTION_QUERY_CHARS {
+        return false;
+    }
+
+    let query = query.to_lowercase();
+    description
+        .to_lowercase()
+        .split(|ch: char| !ch.is_alphanumeric())
+        .any(|word| word.starts_with(&query))
+}
+
+pub(crate) fn has_slash_command_match(
     name: &str,
     flags: BuiltinCommandFlags,
     service_tier_commands: &[ServiceTierCommand],
 ) -> bool {
-    commands_for_input(flags, service_tier_commands)
-        .into_iter()
-        .any(|command| fuzzy_match(command.command(), name).is_some())
+    let commands = commands_for_input(flags, service_tier_commands);
+    if commands
+        .iter()
+        .any(|command| slash_command_name_prefix_matches(command.command(), name))
+    {
+        return true;
+    }
+
+    commands.iter().any(|command| {
+        fuzzy_match_slash_command_name(command.command(), name, true).is_some()
+            || slash_command_description_matches(command.description(), name)
+    })
 }
 
 #[cfg(test)]
@@ -225,6 +284,41 @@ mod tests {
         }];
 
         assert_eq!(find_slash_command("fast", flags, &commands), None);
+    }
+
+    #[test]
+    fn service_tier_description_word_prefix_matches_for_discovery() {
+        let commands = vec![ServiceTierCommand {
+            id: "priority".to_string(),
+            name: "fast".to_string(),
+            description: "zebra scheduling".to_string(),
+        }];
+
+        assert!(has_slash_command_match(
+            "zebr",
+            all_enabled_flags(),
+            &commands
+        ));
+    }
+
+    #[test]
+    fn builtin_description_matches_for_discovery() {
+        assert!(has_slash_command_match("syntax", all_enabled_flags(), &[]));
+    }
+
+    #[test]
+    fn fuzzy_command_name_matches_for_discovery() {
+        assert!(has_slash_command_match("cmpct", all_enabled_flags(), &[]));
+    }
+
+    #[test]
+    fn arbitrary_slash_tokens_do_not_match_command_names_or_descriptions() {
+        for name in ["notes", "todo", "ideas"] {
+            assert!(
+                !has_slash_command_match(name, all_enabled_flags(), &[]),
+                "expected /{name} to be treated as literal text"
+            );
+        }
     }
 
     #[test]

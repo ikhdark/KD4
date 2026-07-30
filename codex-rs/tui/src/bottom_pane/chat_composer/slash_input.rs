@@ -14,7 +14,7 @@ use crate::bottom_pane::slash_commands::BuiltinCommandFlags;
 use crate::bottom_pane::slash_commands::ServiceTierCommand;
 use crate::bottom_pane::slash_commands::SlashCommandItem;
 use crate::bottom_pane::slash_commands::find_slash_command;
-use crate::bottom_pane::slash_commands::has_slash_command_prefix;
+use crate::bottom_pane::slash_commands::has_slash_command_match;
 use crate::slash_command::SlashCommand;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
@@ -165,7 +165,7 @@ impl<'a> SlashInput<'a> {
             return rest.is_empty();
         }
 
-        has_slash_command_prefix(name, self.command_flags, self.service_tier_commands)
+        has_slash_command_match(name, self.command_flags, self.service_tier_commands)
     }
 
     pub(super) fn command_popup(&self, filter_text: &str) -> CommandPopup {

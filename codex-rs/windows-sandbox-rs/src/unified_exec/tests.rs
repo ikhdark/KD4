@@ -44,6 +44,7 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 static TEST_HOME_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LEGACY_PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+const REQUIRE_PROCESS_TESTS_ENV: &str = "CODEX_REQUIRE_WINDOWS_SANDBOX_PROCESS_TESTS";
 
 fn legacy_process_test_guard() -> MutexGuard<'static, ()> {
     LEGACY_PROCESS_TEST_LOCK
@@ -59,6 +60,11 @@ fn legacy_process_sandbox_available_or_asserts_fail_closed() -> bool {
         assert_eq!(
             err.to_string(),
             crate::LEGACY_RESTRICTED_TOKEN_UNSAFE_DELETE_ERROR
+        );
+        assert!(
+            std::env::var_os(REQUIRE_PROCESS_TESTS_ENV).is_none(),
+            "Windows process verification was not run: required legacy sandbox prerequisite is \
+             unavailable because this kernel cannot enforce delete-child process containment"
         );
     }
     available

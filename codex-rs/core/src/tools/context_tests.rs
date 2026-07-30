@@ -1,8 +1,6 @@
 use super::*;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::SearchToolCallParams;
-use codex_utils_output_truncation::DEFAULT_SUCCESS_OUTPUT_TOKENS;
-use codex_utils_output_truncation::TruncationReason;
 use core_test_support::assert_regex_match;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -490,7 +488,7 @@ fn exec_command_tool_output_formats_truncated_response() {
 }
 
 #[test]
-fn exec_command_projection_returns_hard_limit_truncation_metadata() {
+fn exec_command_projection_applies_hard_limit_and_reports_reduction() {
     let output = ExecCommandToolOutput {
         event_call_id: "call-hard-limit".to_string(),
         chunk_id: "chunk-hard-limit".to_string(),
@@ -506,18 +504,10 @@ fn exec_command_projection_returns_hard_limit_truncation_metadata() {
         repair_notice: None,
     };
 
-    assert_eq!(
-        output.projected_model_output().truncation_metadata,
-        TruncationMetadata {
-            requested_limit: Some(20),
-            default_limit: DEFAULT_SUCCESS_OUTPUT_TOKENS,
-            hard_limit: 5,
-            applied_limit: 5,
-            original_size: 100,
-            retained_size: 5,
-            truncation_reason: TruncationReason::HardLimit,
-        }
-    );
+    let projected = output.projected_model_output();
+    assert!(projected.reduced);
+    assert!(projected.text.contains("Warning: truncated output"));
+    assert!(projected.text.contains("95 tokens truncated"));
 }
 
 #[test]

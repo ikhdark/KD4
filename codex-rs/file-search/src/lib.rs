@@ -151,8 +151,9 @@ pub trait SessionReporter: Send + Sync + 'static {
     /// Called when the debounced top-N changes.
     fn on_update(&self, snapshot: &FileSearchSnapshot);
 
-    /// Called when the session becomes idle or is cancelled. Guaranteed to be called at least once per update_query.
-    fn on_complete(&self);
+    /// Called with the completed query when the session becomes idle or is cancelled.
+    /// Guaranteed to be called at least once per `update_query`.
+    fn on_complete(&self, query: &str);
 }
 
 pub struct FileSearchSession {
@@ -211,11 +212,8 @@ fn create_session_with_walk_limits(
     };
     let override_matcher = build_override_matcher(primary_search_directory, &exclude)?;
     let (work_tx, work_rx) = unbounded();
-
-    let notify_tx = work_tx.clone();
-    let notify = Arc::new(move || {
-        let _ = notify_tx.send(WorkSignal::NucleoNotify);
-    });
+    let nucleo_notify_queued = Arc::new(AtomicBool::new(false));
+    let notify = coalescing_nucleo_notify(work_tx.clone(), Arc::clone(&nucleo_notify_queued));
     let nucleo = Nucleo::new(
         Config::DEFAULT.match_paths(),
         notify,
@@ -239,7 +237,7 @@ fn create_session_with_walk_limits(
     });
 
     let matcher_inner = inner.clone();
-    thread::spawn(move || matcher_worker(matcher_inner, work_rx, nucleo));
+    thread::spawn(move || matcher_worker(matcher_inner, work_rx, nucleo_notify_queued, nucleo));
 
     let walker_inner = inner.clone();
     thread::spawn(move || walker_worker(walker_inner, override_matcher, injector));
@@ -396,6 +394,23 @@ enum WorkSignal {
     NucleoNotify,
     WalkComplete,
     Shutdown,
+}
+
+fn coalescing_nucleo_notify(
+    work_tx: Sender<WorkSignal>,
+    notify_queued: Arc<AtomicBool>,
+) -> Arc<dyn Fn() + Send + Sync> {
+    Arc::new(move || {
+        if notify_queued
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if work_tx.send(WorkSignal::NucleoNotify).is_err() {
+            notify_queued.store(false, Ordering::Release);
+        }
+    })
 }
 
 fn build_override_matcher(
@@ -577,6 +592,7 @@ fn reserve_walk_slot(counter: &AtomicUsize, limit: usize) -> bool {
 fn matcher_worker(
     inner: Arc<SessionInner>,
     work_rx: Receiver<WorkSignal>,
+    nucleo_notify_queued: Arc<AtomicBool>,
     mut nucleo: Nucleo<Arc<str>>,
 ) -> anyhow::Result<()> {
     const TICK_TIMEOUT_MS: u64 = 10;
@@ -611,6 +627,7 @@ fn matcher_worker(
                         next_notify = after(Duration::from_millis(0));
                     }
                     WorkSignal::NucleoNotify => {
+                        nucleo_notify_queued.store(false, Ordering::Release);
                         if !will_notify {
                             will_notify = true;
                             next_notify = after(Duration::from_millis(TICK_TIMEOUT_MS));
@@ -678,7 +695,7 @@ fn matcher_worker(
                     inner.reporter.on_update(&snapshot);
                 }
                 if !status.running && walk_complete {
-                    inner.reporter.on_complete();
+                    inner.reporter.on_complete(&last_query);
                 }
             }
             default(Duration::from_millis(100)) => {
@@ -692,7 +709,7 @@ fn matcher_worker(
     }
 
     // If we cancelled or otherwise exited the loop, make sure the reporter is notified.
-    inner.reporter.on_complete();
+    inner.reporter.on_complete(&last_query);
 
     Ok(())
 }
@@ -710,7 +727,7 @@ impl SessionReporter for RunReporter {
         *guard = snapshot.clone();
     }
 
-    fn on_complete(&self) {
+    fn on_complete(&self, _query: &str) {
         let (cv, mutex) = &self.completed;
         #[allow(clippy::unwrap_used)]
         let mut completed = mutex.lock().unwrap();
@@ -792,6 +809,25 @@ mod tests {
         assert_eq!(file_name_from_path(""), "");
     }
 
+    #[test]
+    fn nucleo_notifications_are_coalesced_before_queueing() {
+        let (work_tx, work_rx) = unbounded();
+        let notify_queued = Arc::new(AtomicBool::new(false));
+        let notify = coalescing_nucleo_notify(work_tx, Arc::clone(&notify_queued));
+
+        for _ in 0..FILE_SEARCH_MAX_WALK_ENTRIES {
+            notify();
+        }
+
+        assert_eq!(work_rx.len(), 1);
+        assert!(matches!(work_rx.recv(), Ok(WorkSignal::NucleoNotify)));
+        assert!(work_rx.is_empty());
+
+        notify_queued.store(false, Ordering::Release);
+        notify();
+        assert!(matches!(work_rx.recv(), Ok(WorkSignal::NucleoNotify)));
+    }
+
     #[derive(Default)]
     struct RecordingReporter {
         updates: Mutex<Vec<FileSearchSnapshot>>,
@@ -869,7 +905,7 @@ mod tests {
             self.update_cv.notify_all();
         }
 
-        fn on_complete(&self) {
+        fn on_complete(&self, _query: &str) {
             {
                 let mut complete_times = self.complete_times.lock().unwrap();
                 complete_times.push(Instant::now());

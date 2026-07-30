@@ -44,7 +44,6 @@ pub(crate) struct OutputLinesParams {
 pub(crate) fn new_active_exec_command(
     call_id: String,
     command: Vec<String>,
-    display_label: Option<String>,
     parsed: Vec<ParsedCommand>,
     source: ExecCommandSource,
     interaction_input: Option<String>,
@@ -54,7 +53,6 @@ pub(crate) fn new_active_exec_command(
         ExecCall {
             call_id,
             command,
-            display_label,
             parsed,
             output: None,
             source,
@@ -389,8 +387,6 @@ impl ExecCell {
 
         let cmd_display = if call.is_unified_exec_interaction() {
             format_unified_exec_interaction(&call.command, call.interaction_input.as_deref())
-        } else if let Some(display_label) = call.display_label.as_ref() {
-            display_label.clone()
         } else {
             strip_bash_lc_and_escape(&call.command)
         };
@@ -775,7 +771,6 @@ mod tests {
         let call = ExecCall {
             call_id: "call-id".to_string(),
             command: vec!["bash".into(), "-lc".into(), "echo long".into()],
-            display_label: None,
             parsed: Vec::new(),
             output: Some(output),
             source: ExecCommandSource::UserShell,
@@ -884,7 +879,6 @@ mod tests {
         let mut cell = new_active_exec_command(
             "call-id".to_string(),
             vec!["bash".into(), "-lc".into(), "echo output".into()],
-            None,
             Vec::new(),
             ExecCommandSource::Agent,
             /*interaction_input*/ None,
@@ -948,7 +942,6 @@ mod tests {
         let call = ExecCall {
             call_id: "call-id".to_string(),
             command: vec!["bash".into(), "-lc".into(), format!("echo {url}")],
-            display_label: None,
             parsed: Vec::new(),
             output: None,
             source: ExecCommandSource::UserShell,
@@ -981,7 +974,6 @@ mod tests {
         let call = ExecCall {
             call_id: "call-id".to_string(),
             command: vec!["bash".into(), "-lc".into(), "echo done".into()],
-            display_label: None,
             parsed: Vec::new(),
             output: None,
             source: ExecCommandSource::Agent,
@@ -1007,55 +999,11 @@ mod tests {
     }
 
     #[test]
-    fn display_label_replaces_only_the_command_activity_header() {
-        let command = vec![
-            "powershell.exe".into(),
-            "-Command".into(),
-            r"& 'C:\Users\Alice\private\diagnostic.exe' --agent -- cargo test".into(),
-        ];
-        let call = ExecCall {
-            call_id: "call-id".to_string(),
-            command: command.clone(),
-            display_label: Some("Diagnostic -".to_string()),
-            parsed: vec![ParsedCommand::Search {
-                cmd: "rg display_label".to_string(),
-                query: Some("display_label".to_string()),
-                path: None,
-            }],
-            output: Some(CommandOutput::new(0, String::new(), String::new())),
-            source: ExecCommandSource::Agent,
-            start_time: None,
-            duration: None,
-            interaction_input: None,
-        };
-
-        let cell = ExecCell::new(call, /*animations_enabled*/ false);
-        let rendered = cell
-            .display_lines(/*width*/ 80)
-            .iter()
-            .map(render_line_text)
-            .collect::<Vec<_>>();
-        let expanded = cell
-            .transcript_lines(/*width*/ 160)
-            .iter()
-            .map(render_line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert_eq!(rendered[0], "• Ran Diagnostic -");
-        assert_eq!(cell.calls[0].command, command);
-        assert!(!rendered[0].contains("Alice"));
-        assert!(expanded.contains("diagnostic.exe"));
-        assert!(expanded.contains("--agent -- cargo test"));
-    }
-
-    #[test]
     fn exploring_display_does_not_split_long_url_like_search_query() {
         let url_like = "example.test/api/v1/projects/alpha-team/releases/2026-02-17/builds/1234567890/artifacts/reports/performance/summary/detail/with/a/very/long/path";
         let call = ExecCall {
             call_id: "call-id".to_string(),
             command: vec!["bash".into(), "-lc".into(), "rg foo".into()],
-            display_label: None,
             parsed: vec![ParsedCommand::Search {
                 cmd: format!("rg {url_like}"),
                 query: Some(url_like.to_string()),
@@ -1097,7 +1045,6 @@ mod tests {
         let call = ExecCall {
             call_id: "call-id".to_string(),
             command: vec!["bash".into(), "-lc".into(), "echo done".into()],
-            display_label: None,
             parsed: Vec::new(),
             output: Some(CommandOutput::new(0, url.to_string(), String::new())),
             source: ExecCommandSource::UserShell,
@@ -1131,7 +1078,6 @@ mod tests {
         let call = ExecCall {
             call_id: "call-id".to_string(),
             command: vec!["bash".into(), "-lc".into(), "echo done".into()],
-            display_label: None,
             parsed: Vec::new(),
             output: Some(CommandOutput::new(0, url.to_string(), url.to_string())),
             source: ExecCommandSource::Agent,

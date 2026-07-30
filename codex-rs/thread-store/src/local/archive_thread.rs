@@ -52,10 +52,15 @@ pub(super) async fn archive_thread(
         }
     })?;
 
-    if let Some(ctx) = state_db_ctx {
-        let _ = ctx
+    if let Some(ctx) = state_db_ctx
+        && let Err(err) = ctx
             .mark_archived(thread_id, archived_path.as_path(), Utc::now())
-            .await;
+            .await
+    {
+        tracing::warn!(
+            "failed to update archived thread metadata after moving the rollout; \
+             filesystem state remains authoritative until reconciliation: {err}"
+        );
     }
     Ok(())
 }
@@ -67,6 +72,8 @@ mod tests {
     use codex_protocol::protocol::SessionSource;
     use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
     use pretty_assertions::assert_eq;
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::sqlite::SqlitePoolOptions;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -175,5 +182,80 @@ mod tests {
         assert_eq!(updated.rollout_path, archived_path);
         assert!(updated.archived_at.is_some());
         assert_eq!(updated.recency_at, metadata.recency_at);
+    }
+
+    #[tokio::test]
+    async fn archive_thread_keeps_rollout_archived_when_sqlite_metadata_update_fails() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let uuid = Uuid::from_u128(205);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        let active_path =
+            write_session_file(home.path(), "2025-01-03T12-30-00", uuid).expect("session file");
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = LocalThreadStore::new(config.clone(), Some(runtime.clone()));
+        let mut builder = codex_state::ThreadMetadataBuilder::new(
+            thread_id,
+            active_path.clone(),
+            Utc::now(),
+            SessionSource::Cli,
+        );
+        builder.model_provider = Some(config.default_model_provider_id.clone());
+        builder.cwd = home.path().to_path_buf();
+        let metadata = builder.build(config.default_model_provider_id.as_str());
+        runtime
+            .upsert_thread(&metadata)
+            .await
+            .expect("state db upsert should succeed");
+        install_archival_update_failure(&runtime).await;
+
+        store
+            .archive_thread(ArchiveThreadParams { thread_id })
+            .await
+            .expect("rollout move should remain successful");
+
+        let archived_path = home
+            .path()
+            .join(ARCHIVED_SESSIONS_SUBDIR)
+            .join(active_path.file_name().expect("file name"));
+        assert!(!active_path.exists());
+        assert!(archived_path.exists());
+        let unchanged = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("state db read should succeed")
+            .expect("thread metadata should exist");
+        assert_eq!(unchanged.rollout_path, active_path);
+        assert_eq!(unchanged.archived_at, None);
+    }
+
+    async fn install_archival_update_failure(runtime: &codex_state::StateRuntime) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(runtime.codex_home().join(codex_state::STATE_DB_FILENAME))
+                    .create_if_missing(false),
+            )
+            .await
+            .expect("open state db");
+        sqlx::query(
+            r#"
+CREATE TRIGGER fail_archival_update
+BEFORE UPDATE ON threads
+BEGIN
+    SELECT RAISE(FAIL, 'forced archival update failure');
+END
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("install archival update failure");
+        pool.close().await;
     }
 }

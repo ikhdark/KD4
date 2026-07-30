@@ -3,9 +3,7 @@ use crate::DEFAULT_FAILURE_OUTPUT_TOKENS;
 use crate::DEFAULT_SUCCESS_OUTPUT_TOKENS;
 use crate::OutputLimitResolution;
 use crate::OutputOutcome;
-use crate::TruncationMetadata;
 use crate::TruncationPolicy;
-use crate::TruncationReason;
 use crate::approx_token_count;
 use crate::approx_tokens_from_byte_count_i64;
 use crate::formatted_truncate_text;
@@ -13,6 +11,7 @@ use crate::formatted_truncate_text_content_items_with_policy;
 use crate::resolve_output_limits;
 use crate::truncate_function_output_items_with_policy;
 use crate::truncate_text;
+use crate::truncate_text_with_output_limit;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::FunctionCallOutputContentItem;
 use pretty_assertions::assert_eq;
@@ -417,71 +416,14 @@ fn adaptive_output_limits_resolve_defaults_override_and_hard_ceiling() {
 }
 
 #[test]
-fn output_limit_metadata_reports_the_limit_that_caused_truncation() {
-    let default_limits =
-        resolve_output_limits(None, OutputOutcome::Success, Some("echo ok"), "ok", 20_000);
-    assert_eq!(
-        default_limits.metadata(5_000, /*was_truncated*/ true),
-        TruncationMetadata {
-            requested_limit: None,
-            default_limit: DEFAULT_SUCCESS_OUTPUT_TOKENS,
-            hard_limit: 20_000,
-            applied_limit: DEFAULT_SUCCESS_OUTPUT_TOKENS,
-            original_size: 5_000,
-            retained_size: 4_000,
-            truncation_reason: TruncationReason::DefaultLimit,
-        }
-    );
+fn output_limit_truncation_reports_whether_text_was_reduced() {
+    let limits = resolve_output_limits(Some(5), OutputOutcome::Success, Some("echo ok"), "ok", 20);
 
-    let requested_limits = resolve_output_limits(
-        Some(3_000),
-        OutputOutcome::Success,
-        Some("echo ok"),
-        "ok",
-        20_000,
-    );
-    assert_eq!(
-        requested_limits.metadata(5_000, /*was_truncated*/ true),
-        TruncationMetadata {
-            requested_limit: Some(3_000),
-            default_limit: DEFAULT_SUCCESS_OUTPUT_TOKENS,
-            hard_limit: 20_000,
-            applied_limit: 3_000,
-            original_size: 5_000,
-            retained_size: 3_000,
-            truncation_reason: TruncationReason::RequestedLimit,
-        }
-    );
+    let retained = truncate_text_with_output_limit("short", limits);
+    assert_eq!(retained.text, "short");
+    assert!(!retained.was_truncated);
 
-    let hard_limits = resolve_output_limits(
-        Some(12_000),
-        OutputOutcome::Success,
-        Some("echo ok"),
-        "ok",
-        9_000,
-    );
-    assert_eq!(
-        hard_limits.metadata(10_000, /*was_truncated*/ true),
-        TruncationMetadata {
-            requested_limit: Some(12_000),
-            default_limit: DEFAULT_SUCCESS_OUTPUT_TOKENS,
-            hard_limit: 9_000,
-            applied_limit: 9_000,
-            original_size: 10_000,
-            retained_size: 9_000,
-            truncation_reason: TruncationReason::HardLimit,
-        }
-    );
-    assert_eq!(
-        hard_limits.metadata(100, /*was_truncated*/ false),
-        TruncationMetadata {
-            requested_limit: Some(12_000),
-            default_limit: DEFAULT_SUCCESS_OUTPUT_TOKENS,
-            hard_limit: 9_000,
-            applied_limit: 9_000,
-            original_size: 100,
-            retained_size: 100,
-            truncation_reason: TruncationReason::NotTruncated,
-        }
-    );
+    let truncated = truncate_text_with_output_limit(&"x".repeat(400), limits);
+    assert!(truncated.was_truncated);
+    assert_ne!(truncated.text, "x".repeat(400));
 }

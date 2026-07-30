@@ -15,6 +15,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = REPO_ROOT / "scripts" / "cargo-lane.ps1"
 CLEANUP_SCRIPT = REPO_ROOT / "scripts" / "cargo-lane-trash-cleanup.ps1"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+LANES_ROOT_MARKER = ".codex-cargo-lanes-root"
+LANES_ROOT_MARKER_CONTENT = "codex-kd cargo lanes root v1"
 
 
 def powershell() -> str | None:
@@ -44,11 +46,16 @@ class CargoLaneTest(unittest.TestCase):
         self,
         *args: str,
         extra_env: dict[str, str] | None = None,
+        lanes_root: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         if extra_env:
             env.update(extra_env)
         env.setdefault("CODEX_CARGO_LANE_DISABLE_BACKGROUND_DELETE", "1")
+        # Most lane-wrapper tests exercise naming, locking, and forwarding. Keep
+        # them isolated from the real repository's large non-lane target tree;
+        # target-budget tests opt back into the production default explicitly.
+        env.setdefault("CODEX_CARGO_TARGET_MAX_TOTAL_BYTES", "0")
         return subprocess.run(
             [
                 self.shell,
@@ -58,7 +65,7 @@ class CargoLaneTest(unittest.TestCase):
                 "-File",
                 str(SCRIPT),
                 "-LanesRoot",
-                str(self.lanes_root),
+                str(self.lanes_root if lanes_root is None else lanes_root),
                 *args,
             ],
             text=True,
@@ -71,6 +78,14 @@ class CargoLaneTest(unittest.TestCase):
 
     def lane_path(self, lane: str) -> str:
         return str(self.lanes_root / lane)
+
+    def mark_lanes_root(self, root: Path | None = None) -> None:
+        lane_root = self.lanes_root if root is None else root
+        lane_root.mkdir(parents=True, exist_ok=True)
+        (lane_root / LANES_ROOT_MARKER).write_text(
+            LANES_ROOT_MARKER_CONTENT + "\n",
+            encoding="utf-8",
+        )
 
     def fake_cargo_bin(self) -> Path:
         bin_dir = self.temp_root / "bin"
@@ -92,6 +107,7 @@ class CargoLaneTest(unittest.TestCase):
         return self.run_script(*args, extra_env=env)
 
     def make_lane(self, lane: str, *, size: int = 0, days_old: int = 0) -> Path:
+        self.mark_lanes_root()
         path = self.lanes_root / lane
         path.mkdir(parents=True, exist_ok=True)
         if size > 0:
@@ -139,6 +155,30 @@ class CargoLaneTest(unittest.TestCase):
         )
         self.assertIn("cargo-args:check --target-dir", result.stdout)
         self.assertIn("python executable was not found", result.stdout + result.stderr)
+
+    def test_lane_last_used_stamp_is_refreshed_after_command_finishes(self) -> None:
+        lane = f"unit-last-used-{os.getpid()}"
+        stamp = self.lanes_root / lane / ".lane-last-used"
+        stale_timestamp = time.time() - (30 * 24 * 60 * 60)
+        command = (
+            "import os, sys; "
+            "stamp = sys.argv[1]; "
+            "os.utime(stamp, (float(sys.argv[2]), float(sys.argv[2]))); "
+            "raise SystemExit(7)"
+        )
+
+        result = self.run_script(
+            "-Lane",
+            lane,
+            sys.executable,
+            "-c",
+            command,
+            str(stamp),
+            str(stale_timestamp),
+        )
+
+        self.assertEqual(result.returncode, 7)
+        self.assertGreater(stamp.stat().st_mtime, stale_timestamp + 60)
 
     def test_explicit_busy_lane_reports_effective_suffix(self) -> None:
         lane = f"unit-explicit-busy-{os.getpid()}"
@@ -194,9 +234,13 @@ class CargoLaneTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertTrue((self.temp_root / relative_root / "relative").is_dir())
+        self.assertTrue(
+            (self.temp_root / relative_root / LANES_ROOT_MARKER).is_file()
+        )
 
     def test_cleanup_relative_root_follows_powershell_location(self) -> None:
         relative_root = self.temp_root / "cleanup-lanes"
+        self.mark_lanes_root(relative_root)
         trash = relative_root / "old.trash-20260728123456789"
         trash.mkdir(parents=True)
         command = (
@@ -228,6 +272,69 @@ class CargoLaneTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertFalse(trash.exists())
+
+    def test_unmarked_custom_root_is_not_pruned(self) -> None:
+        unsafe_root = self.temp_root / "ordinary-root"
+        ordinary_dir = unsafe_root / "family-photos"
+        ordinary_dir.mkdir(parents=True)
+        (ordinary_dir / "photo.txt").write_text("keep", encoding="utf-8")
+
+        result = self.run_script(
+            "-Lane",
+            f"unit-unmarked-{os.getpid()}",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo ok",
+            lanes_root=unsafe_root,
+            extra_env={"CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "0"},
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertTrue(ordinary_dir.exists())
+        self.assertFalse((unsafe_root / LANES_ROOT_MARKER).exists())
+        self.assertIn(
+            "Skipping Cargo lane pruning for unrecognized lanes root",
+            result.stdout + result.stderr,
+        )
+
+    def test_cleanup_rejects_unmarked_root(self) -> None:
+        unsafe_root = self.temp_root / "ordinary-cleanup-root"
+        trash = unsafe_root / "family.trash-20260728123456789"
+        trash.mkdir(parents=True)
+
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CLEANUP_SCRIPT),
+                "-LanesRoot",
+                str(unsafe_root),
+                "-MaxPasses",
+                "1",
+                "-RetryDelaySeconds",
+                "0",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=30,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertTrue(trash.exists())
 
     def hold_lane_lock(
         self,
@@ -453,6 +560,7 @@ class CargoLaneTest(unittest.TestCase):
     def test_auto_lane_reuses_warm_idle_suffix_when_base_lane_is_active(self) -> None:
         package = f"unit-core-active-{os.getpid()}"
         warm_suffix = f"{package}-2"
+        self.mark_lanes_root()
         (self.lanes_root / warm_suffix).mkdir(parents=True, exist_ok=True)
 
         result = self.run_fake_cargo(
@@ -718,9 +826,11 @@ class CargoLaneTest(unittest.TestCase):
             "cmd.exe",
             "/d",
             "/c",
-            "echo %CARGO_HOME% %SCCACHE_BASEDIR% %SCCACHE_CACHE_SIZE%",
+            "echo incremental=%CARGO_INCREMENTAL% %CARGO_HOME% %SCCACHE_BASEDIR% %SCCACHE_CACHE_SIZE%",
             extra_env={
+                "CARGO_INCREMENTAL": "",
                 "LOCALAPPDATA": str(local_app_data),
+                "RUSTC_WRAPPER": "",
                 "USERPROFILE": str(user_profile),
                 "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
             },
@@ -740,6 +850,33 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn('rustc-wrapper = "sccache"', config_text)
         self.assertIn(str(REPO_ROOT), result.stdout)
         self.assertIn("80G", result.stdout)
+        self.assertIn("incremental=0", result.stdout)
+
+    def test_sccache_lane_preserves_explicit_cargo_incremental(self) -> None:
+        fake_bin = self.temp_root / "bin"
+        fake_bin.mkdir()
+        (fake_bin / "sccache.cmd").write_text("@echo off\r\n", encoding="utf-8")
+
+        result = self.run_script(
+            "-Lane",
+            f"unit-incremental-{os.getpid()}",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo incremental=%CARGO_INCREMENTAL%",
+            extra_env={
+                "CARGO_INCREMENTAL": "1",
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+                "RUSTC_WRAPPER": "",
+            },
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("incremental=1", result.stdout)
 
     def test_auto_lane_routes_release_builds_to_release_lane(self) -> None:
         for release_arg in ("--release", "-r", "--profile=release"):
@@ -794,6 +931,7 @@ class CargoLaneTest(unittest.TestCase):
         self.assertFalse(victim_path.exists())
 
     def test_trash_cleanup_worker_removes_existing_trash_dirs(self) -> None:
+        self.mark_lanes_root()
         for index in range(2):
             trash = self.lanes_root / f"unit-trash-{index}.trash-20260612000000000"
             trash.mkdir(parents=True)
@@ -885,6 +1023,117 @@ class CargoLaneTest(unittest.TestCase):
         self.assertFalse(oversized_path.exists())
         self.assertTrue(small_path.exists())
 
+    def test_gc_global_cap_evicts_oldest_idle_lane(self) -> None:
+        oldest_path = self.make_lane(
+            f"unit-lru-oldest-{os.getpid()}", size=2 * 1024 * 1024
+        )
+        newest_path = self.make_lane(
+            f"unit-lru-newest-{os.getpid()}", size=2 * 1024 * 1024
+        )
+        for path, days_old in ((oldest_path, 3), (newest_path, 1)):
+            stamp = path / ".lane-last-used"
+            stamp.write_text("test\n", encoding="utf-8")
+            timestamp = time.time() - (days_old * 24 * 60 * 60)
+            os.utime(stamp, (timestamp, timestamp))
+
+        result = self.run_script(
+            "-Lane",
+            f"unit-lru-active-{os.getpid()}",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo ok",
+            extra_env={
+                "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "0",
+                "CODEX_CARGO_LANE_MAX_AGE_DAYS": "3650",
+                "CODEX_CARGO_LANE_MAX_TOTAL_BYTES": str(3 * 1024 * 1024),
+            },
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertFalse(oldest_path.exists())
+        self.assertTrue(newest_path.exists())
+
+    def test_gc_defaults_lane_and_target_aggregate_caps(self) -> None:
+        fake_bin = self.fake_cargo_bin()
+        args_log = self.temp_root / "gc-args.txt"
+        (fake_bin / "python.cmd").write_text(
+            '@echo off\r\necho %* > "%CODEX_TEST_GC_ARGS_LOG%"\r\n',
+            encoding="utf-8",
+        )
+
+        result = self.run_script(
+            "-Lane",
+            f"unit-default-cap-{os.getpid()}",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo ok",
+            extra_env={
+                "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "0",
+                "CODEX_CARGO_TARGET_MAX_TOTAL_BYTES": "",
+                "CODEX_TEST_GC_ARGS_LOG": str(args_log),
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            },
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn(
+            "--max-total-lane-bytes 214748364800",
+            args_log.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "--max-total-target-bytes 268435456000",
+            args_log.read_text(encoding="utf-8"),
+        )
+
+    def test_post_build_gc_bypasses_fresh_hourly_stamp(self) -> None:
+        fake_bin = self.fake_cargo_bin()
+        args_log = self.temp_root / "post-build-gc-args.txt"
+        (fake_bin / "python.cmd").write_text(
+            '@echo off\r\necho %* >> "%CODEX_TEST_GC_ARGS_LOG%"\r\n',
+            encoding="utf-8",
+        )
+        self.mark_lanes_root()
+        stamp = self.lanes_root / ".gc-stamp"
+        stamp.write_text("fresh\n", encoding="utf-8")
+
+        result = self.run_script(
+            "-Lane",
+            f"unit-post-build-gc-{os.getpid()}",
+            "cmd.exe",
+            "/d",
+            "/c",
+            "echo ok",
+            extra_env={
+                "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "1",
+                "CODEX_CARGO_TARGET_MAX_TOTAL_BYTES": "",
+                "CODEX_TEST_GC_ARGS_LOG": str(args_log),
+                "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+            },
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertTrue(
+            args_log.exists(),
+            f"post-build GC was not invoked\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        invocations = args_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(invocations), 1)
+        self.assertIn("--max-total-target-bytes 268435456000", invocations[0])
+
     def test_gc_excludes_active_lanes_from_age_pruning(self) -> None:
         active = f"unit-active-old-{os.getpid()}"
         active_path = self.make_lane(active, days_old=30)
@@ -922,6 +1171,8 @@ class CargoLaneTest(unittest.TestCase):
                 "CODEX_CARGO_LANE_GC_INTERVAL_HOURS": "not-a-number",
                 "CODEX_CARGO_LANE_MAX_AGE_DAYS": "not-a-number",
                 "CODEX_CARGO_LANE_MAX_LANE_BYTES": "not-a-number",
+                "CODEX_CARGO_LANE_MAX_TOTAL_BYTES": "not-a-number",
+                "CODEX_CARGO_TARGET_MAX_TOTAL_BYTES": "not-a-number",
             },
         )
 

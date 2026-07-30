@@ -21,6 +21,7 @@ use codex_app_server_protocol::ThreadForkResponse;
 use codex_app_server_protocol::ThreadHistoryMode;
 use codex_app_server_protocol::ThreadItem;
 use codex_app_server_protocol::ThreadItemsListParams;
+use codex_app_server_protocol::ThreadItemsListResponse;
 use codex_app_server_protocol::ThreadListParams;
 use codex_app_server_protocol::ThreadListResponse;
 use codex_app_server_protocol::ThreadNameUpdatedNotification;
@@ -1304,10 +1305,24 @@ async fn thread_turns_list_rejects_unmaterialized_loaded_thread() -> Result<()> 
 }
 
 #[tokio::test]
-async fn thread_items_list_returns_unsupported() -> Result<()> {
+async fn thread_items_list_reconstructs_local_history_and_paginates() -> Result<()> {
     let server = create_mock_responses_server_repeating_assistant("Done").await;
     let codex_home = TempDir::new()?;
     create_config_toml(codex_home.path(), &server.uri())?;
+
+    let filename_ts = "2025-01-05T13-00-00";
+    let conversation_id = create_fake_rollout_with_text_elements(
+        codex_home.path(),
+        filename_ts,
+        "2025-01-05T13:00:00Z",
+        "first",
+        vec![],
+        Some("mock_provider"),
+        /*git_info*/ None,
+    )?;
+    let rollout_path = rollout_path(codex_home.path(), filename_ts, &conversation_id);
+    append_user_message(rollout_path.as_path(), "2025-01-05T13:01:00Z", "second")?;
+    append_user_message(rollout_path.as_path(), "2025-01-05T13:02:00Z", "third")?;
 
     let mut mcp = TestAppServer::builder()
         .with_codex_home(codex_home.path())
@@ -1318,24 +1333,105 @@ async fn thread_items_list_returns_unsupported() -> Result<()> {
 
     let read_id = mcp
         .send_thread_items_list_request(ThreadItemsListParams {
-            thread_id: "00000000-0000-4000-8000-000000000123".to_string(),
+            thread_id: conversation_id.clone(),
             turn_id: None,
             cursor: None,
-            limit: None,
-            sort_direction: None,
+            limit: Some(2),
+            sort_direction: Some(SortDirection::Asc),
         })
         .await?;
-    let read_err: JSONRPCError = timeout(
+    let read_resp: JSONRPCResponse = timeout(
         DEFAULT_READ_TIMEOUT,
-        mcp.read_stream_until_error_message(RequestId::Integer(read_id)),
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
     )
     .await??;
+    let ThreadItemsListResponse {
+        data,
+        next_cursor,
+        backwards_cursor,
+    } = to_response::<ThreadItemsListResponse>(read_resp)?;
+    assert_eq!(thread_item_user_texts(&data), vec!["first", "second"]);
+    let next_cursor = next_cursor.expect("expected nextCursor for the remaining item");
+    assert!(backwards_cursor.is_some());
 
-    assert_eq!(read_err.error.code, -32601);
-    assert_eq!(
-        read_err.error.message,
-        "thread/items/list is not supported yet"
-    );
+    let read_id = mcp
+        .send_thread_items_list_request(ThreadItemsListParams {
+            thread_id: conversation_id.clone(),
+            turn_id: None,
+            cursor: Some(next_cursor),
+            limit: Some(2),
+            sort_direction: Some(SortDirection::Asc),
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadItemsListResponse {
+        data,
+        next_cursor,
+        backwards_cursor,
+    } = to_response::<ThreadItemsListResponse>(read_resp)?;
+    assert_eq!(thread_item_user_texts(&data), vec!["third"]);
+    assert!(next_cursor.is_none());
+    let backwards_cursor = backwards_cursor.expect("expected backwardsCursor for the final item");
+
+    let read_id = mcp
+        .send_thread_items_list_request(ThreadItemsListParams {
+            thread_id: conversation_id.clone(),
+            turn_id: None,
+            cursor: Some(backwards_cursor),
+            limit: Some(2),
+            sort_direction: Some(SortDirection::Desc),
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadItemsListResponse { data, .. } = to_response::<ThreadItemsListResponse>(read_resp)?;
+    assert_eq!(thread_item_user_texts(&data), vec!["third", "second"]);
+
+    let turns_list_id = mcp
+        .send_thread_turns_list_request(ThreadTurnsListParams {
+            thread_id: conversation_id.clone(),
+            cursor: None,
+            limit: Some(10),
+            sort_direction: Some(SortDirection::Asc),
+            items_view: Some(TurnItemsView::Full),
+        })
+        .await?;
+    let turns_list_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(turns_list_id)),
+    )
+    .await??;
+    let ThreadTurnsListResponse { data: turns, .. } =
+        to_response::<ThreadTurnsListResponse>(turns_list_resp)?;
+    let second_turn_id = turns
+        .get(1)
+        .expect("expected second reconstructed turn")
+        .id
+        .clone();
+
+    let read_id = mcp
+        .send_thread_items_list_request(ThreadItemsListParams {
+            thread_id: conversation_id,
+            turn_id: Some(second_turn_id),
+            cursor: None,
+            limit: Some(10),
+            sort_direction: Some(SortDirection::Asc),
+        })
+        .await?;
+    let read_resp: JSONRPCResponse = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_response_message(RequestId::Integer(read_id)),
+    )
+    .await??;
+    let ThreadItemsListResponse { data, .. } = to_response::<ThreadItemsListResponse>(read_resp)?;
+    assert_eq!(thread_item_user_texts(&data), vec!["second"]);
 
     Ok(())
 }
@@ -1492,6 +1588,22 @@ fn turn_user_texts(turns: &[codex_app_server_protocol::Turn]) -> Vec<&str> {
     turns
         .iter()
         .filter_map(|turn| match turn.items.first()? {
+            ThreadItem::UserMessage { content, .. } => match content.first()? {
+                UserInput::Text { text, .. } => Some(text.as_str()),
+                UserInput::Image { .. }
+                | UserInput::LocalImage { .. }
+                | UserInput::Skill { .. }
+                | UserInput::Mention { .. } => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+fn thread_item_user_texts(items: &[ThreadItem]) -> Vec<&str> {
+    items
+        .iter()
+        .filter_map(|item| match item {
             ThreadItem::UserMessage { content, .. } => match content.first()? {
                 UserInput::Text { text, .. } => Some(text.as_str()),
                 UserInput::Image { .. }

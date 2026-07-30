@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::widgets::WidgetRef;
@@ -13,6 +15,9 @@ use super::slash_commands::BuiltinCommandFlags;
 use super::slash_commands::ServiceTierCommand;
 use super::slash_commands::SlashCommandItem;
 use super::slash_commands::commands_for_input;
+use super::slash_commands::fuzzy_match_slash_command_name;
+use super::slash_commands::slash_command_description_matches;
+use super::slash_commands::slash_command_name_prefix_matches;
 use crate::render::Insets;
 use crate::render::RectExt;
 use crate::slash_command::SlashCommand;
@@ -25,6 +30,15 @@ const COMMAND_COLUMN_WIDTH: ColumnWidthConfig = ColumnWidthConfig::new(
     ColumnWidthMode::AutoAllRows,
     /*name_column_width*/ None,
 );
+
+fn canonical_builtin_action(command: SlashCommand) -> SlashCommand {
+    match command {
+        SlashCommand::Quit => SlashCommand::Exit,
+        SlashCommand::Btw => SlashCommand::Side,
+        SlashCommand::MultiAgents => SlashCommand::Agent,
+        command => command,
+    }
+}
 
 /// A selectable item in the popup.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,57 +154,82 @@ impl CommandPopup {
         )
     }
 
-    /// Compute exact/prefix matches over built-in commands and user prompts,
-    /// paired with optional highlight indices. Preserves the original
-    /// presentation order for built-ins and prompts.
+    /// Compute matches over command names and description words, paired with
+    /// optional name highlight indices.
+    ///
+    /// Prefix matches suppress fuzzy alternatives. Without a prefix match,
+    /// longer queries and short contiguous substrings may match fuzzily.
+    /// Exact name matches rank first, followed by other name matches and then
+    /// description word-prefix matches. Equivalent built-ins collapse to the
+    /// highest-ranked matching name.
     fn filtered(&self) -> Vec<(CommandItem, Option<Vec<usize>>)> {
         let filter = self.command_filter.trim();
-        let mut out: Vec<(CommandItem, Option<Vec<usize>>)> = Vec::new();
         if filter.is_empty() {
-            for command in self.commands.iter() {
-                if matches!(command, CommandItem::Builtin(cmd) if ALIAS_COMMANDS.contains(cmd)) {
-                    continue;
-                }
-                out.push((command.clone(), None));
-            }
-            return out;
+            return self
+                .commands
+                .iter()
+                .filter(|command| {
+                    !matches!(command, CommandItem::Builtin(cmd) if ALIAS_COMMANDS.contains(cmd))
+                })
+                .cloned()
+                .map(|command| (command, None))
+                .collect();
         }
 
         let filter_lower = filter.to_lowercase();
-        let filter_chars = filter.chars().count();
-        let mut exact: Vec<(CommandItem, Option<Vec<usize>>)> = Vec::new();
-        let mut prefix: Vec<(CommandItem, Option<Vec<usize>>)> = Vec::new();
-        let indices_for = |offset| Some((offset..offset + filter_chars).collect());
-
-        let mut push_match =
-            |item: CommandItem, display: &str, name: Option<&str>, name_offset: usize| {
-                let display_lower = display.to_lowercase();
-                let name_lower = name.map(str::to_lowercase);
-                let display_exact = display_lower == filter_lower;
-                let name_exact = name_lower.as_deref() == Some(filter_lower.as_str());
-                if display_exact || name_exact {
-                    let offset = if display_exact { 0 } else { name_offset };
-                    exact.push((item, indices_for(offset)));
-                    return;
+        let has_name_prefix_match = self
+            .commands
+            .iter()
+            .any(|command| slash_command_name_prefix_matches(command.command(), filter));
+        let mut matches = self
+            .commands
+            .iter()
+            .filter_map(|command| {
+                let command_name = command.command();
+                let exact_name_match = command_name.to_lowercase() == filter_lower;
+                if let Some((indices, score)) =
+                    fuzzy_match_slash_command_name(command_name, filter, !has_name_prefix_match)
+                {
+                    return Some((
+                        command.clone(),
+                        Some(indices),
+                        score,
+                        exact_name_match,
+                        true,
+                    ));
                 }
-                let display_prefix = display_lower.starts_with(&filter_lower);
-                let name_prefix = name_lower
-                    .as_ref()
-                    .is_some_and(|name| name.starts_with(&filter_lower));
-                if display_prefix || name_prefix {
-                    let offset = if display_prefix { 0 } else { name_offset };
-                    prefix.push((item, indices_for(offset)));
+
+                // Alias descriptions duplicate their canonical command, so aliases
+                // should only surface when their own names match the query.
+                if matches!(command, CommandItem::Builtin(cmd) if ALIAS_COMMANDS.contains(cmd)) {
+                    return None;
                 }
-            };
 
-        for command in self.commands.iter() {
-            let display = command.command();
-            push_match(command.clone(), display, None, 0);
-        }
+                (!has_name_prefix_match
+                    && slash_command_description_matches(command.description(), filter))
+                .then(|| (command.clone(), None, 0, false, false))
+            })
+            .collect::<Vec<_>>();
 
-        out.extend(exact);
-        out.extend(prefix);
-        out
+        matches.sort_by(|a, b| {
+            b.3.cmp(&a.3)
+                .then_with(|| b.4.cmp(&a.4))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+
+        let mut seen_builtin_actions = HashSet::new();
+        matches
+            .into_iter()
+            .filter(
+                |(command, _indices, _score, _exact, _name_match)| match command {
+                    CommandItem::Builtin(command) => {
+                        seen_builtin_actions.insert(canonical_builtin_action(*command))
+                    }
+                    CommandItem::ServiceTier(_) => true,
+                },
+            )
+            .map(|(command, indices, _score, _exact, _name_match)| (command, indices))
+            .collect()
     }
 
     fn filtered_items(&self) -> Vec<CommandItem> {
@@ -368,13 +407,14 @@ mod tests {
     }
 
     #[test]
-    fn filtered_commands_keep_presentation_order_for_prefix() {
+    fn prefix_matches_keep_presentation_order_ahead_of_other_matches() {
         let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
         popup.on_composer_text_change("/m".to_string());
 
         let cmds: Vec<String> = popup
             .filtered_items()
             .into_iter()
+            .take(4)
             .map(|item| match item {
                 CommandItem::Builtin(cmd) => cmd.command().to_string(),
                 CommandItem::ServiceTier(command) => command.name,
@@ -431,21 +471,106 @@ mod tests {
     }
 
     #[test]
-    fn prefix_filter_limits_matches_for_ac() {
+    fn fuzzy_filter_matches_command_name_and_highlights_subsequence() {
+        let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
+        popup.on_composer_text_change("/cmpct".to_string());
+
+        assert_eq!(
+            popup.filtered_items().first().map(CommandItem::command),
+            Some("compact")
+        );
+        assert_eq!(
+            popup
+                .rows_from_matches(popup.filtered())
+                .first()
+                .and_then(|row| row.match_indices.clone()),
+            Some(vec![1, 3, 4, 6, 7])
+        );
+    }
+
+    #[test]
+    fn short_contiguous_fuzzy_filter_is_used_when_no_name_prefix_matches() {
         let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
         popup.on_composer_text_change("/ac".to_string());
 
-        let cmds: Vec<String> = popup
-            .filtered_items()
-            .into_iter()
-            .map(|item| match item {
-                CommandItem::Builtin(cmd) => cmd.command().to_string(),
-                CommandItem::ServiceTier(command) => command.name,
-            })
-            .collect();
         assert!(
-            !cmds.iter().any(|cmd| cmd == "compact"),
-            "expected prefix search for '/ac' to exclude 'compact', got {cmds:?}"
+            popup
+                .filtered_items()
+                .iter()
+                .any(|item| item.command() == "compact")
+        );
+    }
+
+    #[test]
+    fn short_filters_only_match_command_name_prefixes() {
+        for (filter, expected) in [
+            ("/ar", vec!["archive"]),
+            ("/bt", vec!["btw"]),
+            ("/mo", vec!["model"]),
+            ("/pet", vec!["pets"]),
+            ("/res", vec!["resume"]),
+            ("/si", vec!["side"]),
+        ] {
+            let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
+            popup.on_composer_text_change(filter.to_string());
+
+            let actual = popup
+                .filtered_items()
+                .iter()
+                .map(|item| item.command().to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                expected.into_iter().map(str::to_string).collect::<Vec<_>>(),
+                "unexpected matches for {filter}"
+            );
+        }
+    }
+
+    #[test]
+    fn equivalent_commands_are_deduped_after_matching() {
+        for (filter, equivalents) in [
+            ("/agent", ["agent", "subagents"]),
+            ("/it", ["exit", "quit"]),
+            ("/ephem", ["side", "btw"]),
+        ] {
+            let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
+            popup.on_composer_text_change(filter.to_string());
+
+            let aliases = popup
+                .filtered_items()
+                .iter()
+                .filter(|item| equivalents.contains(&item.command()))
+                .count();
+            assert_eq!(aliases, 1, "duplicate equivalent commands for {filter}");
+        }
+    }
+
+    #[test]
+    fn filter_matches_service_tier_description_word_prefix_without_name_highlights() {
+        let mut popup = CommandPopup::new(
+            CommandPopupFlags {
+                service_tier_commands_enabled: true,
+                ..CommandPopupFlags::default()
+            },
+            vec![ServiceTierCommand {
+                id: "priority".to_string(),
+                name: "fast".to_string(),
+                description: "zebra scheduling".to_string(),
+            }],
+        );
+        popup.on_composer_text_change("/zebr".to_string());
+
+        assert!(matches!(
+            popup.selected_item(),
+            Some(CommandItem::ServiceTier(ServiceTierCommand { name, .. })) if name == "fast"
+        ));
+        assert_eq!(
+            popup
+                .rows_from_matches(popup.filtered())
+                .first()
+                .and_then(|row| row.match_indices.as_ref()),
+            None
         );
     }
 
@@ -608,6 +733,24 @@ mod tests {
             }
             other => panic!("expected personality to be selected for exact match, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn filter_matches_builtin_description_without_name_highlights() {
+        let mut popup = CommandPopup::new(CommandPopupFlags::default(), Vec::new());
+        popup.on_composer_text_change("/syntax".to_string());
+
+        assert_eq!(
+            popup.selected_item(),
+            Some(CommandItem::Builtin(SlashCommand::Theme))
+        );
+        assert_eq!(
+            popup
+                .rows_from_matches(popup.filtered())
+                .first()
+                .and_then(|row| row.match_indices.clone()),
+            None
+        );
     }
 
     #[test]

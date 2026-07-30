@@ -2646,7 +2646,6 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         id: "exec-1".to_string(),
         process_id: Some("pid-1".to_string()),
         command: vec!["echo".to_string(), "done".to_string()],
-        display_label: Some("Diagnostic -".to_string()),
         cwd: PathUri::from_abs_path(&test_path_buf("/tmp").abs()),
         parsed_cmd: vec![codex_protocol::parse_command::ParsedCommand::Unknown {
             cmd: "echo done".to_string(),
@@ -2667,7 +2666,6 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
         ThreadItem::CommandExecution {
             id: "exec-1".to_string(),
             command: "echo done".to_string(),
-            display_label: Some("Diagnostic -".to_string()),
             cwd: LegacyAppPathString::from_abs_path(&test_path_buf("/tmp").abs()),
             process_id: Some("pid-1".to_string()),
             source: CommandExecutionSource::Agent,
@@ -2709,7 +2707,37 @@ fn core_turn_item_into_thread_item_converts_supported_variants() {
                 text: "ok".to_string(),
             }]),
             success: Some(true),
+            error: None,
             duration_ms: Some(5),
+        }
+    );
+
+    let cancellation_reason =
+        "dynamic tool call was cancelled before receiving a response".to_string();
+    let cancelled_dynamic_tool_call_item = TurnItem::DynamicToolCall(DynamicToolCallItem {
+        id: "dynamic-cancelled".to_string(),
+        namespace: None,
+        tool: "lookup".to_string(),
+        arguments: json!({"id": "456"}),
+        status: CoreDynamicToolCallStatus::Failed,
+        content_items: Some(Vec::new()),
+        success: Some(false),
+        error: Some(cancellation_reason.clone()),
+        duration: Some(Duration::from_millis(7)),
+    });
+
+    assert_eq!(
+        ThreadItem::from(cancelled_dynamic_tool_call_item),
+        ThreadItem::DynamicToolCall {
+            id: "dynamic-cancelled".to_string(),
+            namespace: None,
+            tool: "lookup".to_string(),
+            arguments: json!({"id": "456"}),
+            status: DynamicToolCallStatus::Failed,
+            content_items: Some(Vec::new()),
+            success: Some(false),
+            error: Some(cancellation_reason),
+            duration_ms: Some(7),
         }
     );
 
@@ -2940,7 +2968,6 @@ fn core_windows_command_execution_uses_windows_display_quoting() {
             "-Command".to_string(),
             "Write-Output \"hello world\"".to_string(),
         ],
-        display_label: None,
         cwd: PathUri::from_abs_path(&test_path_buf("/tmp").abs()),
         parsed_cmd: Vec::new(),
         source: CoreExecCommandSource::Agent,

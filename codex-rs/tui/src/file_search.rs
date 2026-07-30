@@ -129,5 +129,5 @@ impl file_search::SessionReporter for TuiSessionReporter {
         self.send_snapshot(snapshot);
     }
 
-    fn on_complete(&self) {}
+    fn on_complete(&self, _query: &str) {}
 }

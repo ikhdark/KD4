@@ -1221,7 +1221,6 @@ mod tests {
         let mut exec_cell = crate::exec_cell::new_active_exec_command(
             "exec-1".into(),
             vec!["bash".into(), "-lc".into(), "ls".into()],
-            /*display_label*/ None,
             vec![ParsedCommand::Unknown { cmd: "ls".into() }],
             ExecCommandSource::Agent,
             /*interaction_input*/ None,

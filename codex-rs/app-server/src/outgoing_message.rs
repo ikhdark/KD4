@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -107,6 +109,7 @@ pub(crate) enum OutgoingEnvelope {
 pub(crate) struct OutgoingMessageSender {
     next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
+    active_connections: Mutex<HashMap<ConnectionId, Arc<AtomicBool>>>,
     request_id_to_callback: Mutex<HashMap<RequestId, PendingCallbackEntry>>,
     /// Incoming requests that are still waiting on a final response or error.
     /// We keep them here because this is where responses, errors, and
@@ -129,6 +132,14 @@ struct PendingCallbackEntry {
     callback: oneshot::Sender<ClientRequestResult>,
     thread_id: Option<ThreadId>,
     request: ServerRequest,
+    /// Connections that received this request and may resolve its callback.
+    connection_ids: HashSet<ConnectionId>,
+}
+
+enum TakeCallbackResult {
+    Taken(RequestId, Box<PendingCallbackEntry>),
+    Unauthorized,
+    Missing,
 }
 
 struct PendingTurnDeliveryReceipt {
@@ -300,6 +311,7 @@ impl OutgoingMessageSender {
         Self {
             next_server_request_id: AtomicI64::new(0),
             sender,
+            active_connections: Mutex::new(HashMap::new()),
             request_id_to_callback: Mutex::new(HashMap::new()),
             request_contexts: Mutex::new(HashMap::new()),
             analytics_events_client,
@@ -319,9 +331,48 @@ impl OutgoingMessageSender {
         }
     }
 
+    pub(crate) async fn connection_opened(
+        &self,
+        connection_id: ConnectionId,
+        initialized: Arc<AtomicBool>,
+    ) {
+        self.active_connections
+            .lock()
+            .await
+            .insert(connection_id, initialized);
+    }
+
     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
-        let mut request_contexts = self.request_contexts.lock().await;
-        request_contexts.retain(|request_id, _| request_id.connection_id != connection_id);
+        self.active_connections.lock().await.remove(&connection_id);
+        {
+            let mut request_contexts = self.request_contexts.lock().await;
+            request_contexts.retain(|request_id, _| request_id.connection_id != connection_id);
+        }
+        let orphaned_entries = {
+            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            let orphaned_request_ids = request_id_to_callback
+                .iter_mut()
+                .filter_map(|(request_id, entry)| {
+                    let was_authorized = entry.connection_ids.remove(&connection_id);
+                    (was_authorized && entry.connection_ids.is_empty() && entry.thread_id.is_none())
+                        .then_some(request_id.clone())
+                })
+                .collect::<Vec<_>>();
+            orphaned_request_ids
+                .into_iter()
+                .filter_map(|request_id| request_id_to_callback.remove(&request_id))
+                .collect::<Vec<_>>()
+        };
+        for entry in orphaned_entries {
+            let request_id = entry.request.id().clone();
+            self.analytics_events_client
+                .track_server_request_aborted(now_unix_timestamp_ms(), request_id.clone());
+            if let Err(err) = entry.callback.send(Err(internal_error(
+                "client request canceled because all authorized connections disconnected",
+            ))) {
+                warn!("could not notify callback for {request_id:?} due to: {err:?}");
+            }
+        }
     }
 
     pub(crate) async fn request_trace_context(
@@ -381,8 +432,34 @@ impl OutgoingMessageSender {
         let id = self.next_request_id();
         let outgoing_message_id = id.clone();
         let request = request.request_with_id(outgoing_message_id.clone());
+        // Keep the active-connection snapshot locked through callback registration.
+        // Otherwise a disconnect can finish cleanup after the snapshot but before
+        // insertion, leaving a callback authorized only for a connection that is
+        // already gone.
+        let (active_connections, target_connection_ids) = match connection_ids {
+            Some(connection_ids) => (None, connection_ids.to_vec()),
+            None => {
+                let active_connections = self.active_connections.lock().await;
+                let target_connection_ids = active_connections
+                    .iter()
+                    .filter_map(|(connection_id, initialized)| {
+                        initialized
+                            .load(Ordering::Acquire)
+                            .then_some(*connection_id)
+                    })
+                    .collect();
+                (Some(active_connections), target_connection_ids)
+            }
+        };
+        let authorized_connection_ids = target_connection_ids.iter().copied().collect();
 
         let (tx_approve, rx_approve) = oneshot::channel();
+        if thread_id.is_none() && target_connection_ids.is_empty() {
+            let _ = tx_approve.send(Err(internal_error(
+                "client request canceled because no initialized connections are available",
+            )));
+            return (outgoing_message_id, rx_approve);
+        }
         {
             let mut request_id_to_callback = self.request_id_to_callback.lock().await;
             request_id_to_callback.insert(
@@ -391,43 +468,34 @@ impl OutgoingMessageSender {
                     callback: tx_approve,
                     thread_id,
                     request: request.clone(),
+                    connection_ids: authorized_connection_ids,
                 },
             );
         }
+        drop(active_connections);
 
         let outgoing_message = OutgoingMessage::Request(request.clone());
-        let send_result = match connection_ids {
-            None => {
-                self.sender
-                    .send(OutgoingEnvelope::Broadcast {
-                        message: outgoing_message,
-                    })
-                    .await
+        let mut send_error = None;
+        for connection_id in target_connection_ids {
+            if let Err(err) = self
+                .sender
+                .send(OutgoingEnvelope::ToConnection {
+                    connection_id,
+                    message: outgoing_message.clone(),
+                    write_complete_tx: None,
+                })
+                .await
+            {
+                send_error = Some(err);
+                break;
+            } else {
+                self.analytics_events_client
+                    .track_server_request(connection_id.0, request.clone());
             }
-            Some(connection_ids) => {
-                let mut send_error = None;
-                for connection_id in connection_ids {
-                    if let Err(err) = self
-                        .sender
-                        .send(OutgoingEnvelope::ToConnection {
-                            connection_id: *connection_id,
-                            message: outgoing_message.clone(),
-                            write_complete_tx: None,
-                        })
-                        .await
-                    {
-                        send_error = Some(err);
-                        break;
-                    } else {
-                        self.analytics_events_client
-                            .track_server_request(connection_id.0, request.clone());
-                    }
-                }
-                match send_error {
-                    Some(err) => Err(err),
-                    None => Ok(()),
-                }
-            }
+        }
+        let send_result = match send_error {
+            Some(err) => Err(err),
+            None => Ok(()),
         };
 
         if let Err(err) = send_result {
@@ -443,8 +511,21 @@ impl OutgoingMessageSender {
         connection_id: ConnectionId,
         thread_id: ThreadId,
     ) {
-        let requests = self.pending_requests_for_thread(thread_id).await;
-        for request in requests {
+        let requests = {
+            let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+            request_id_to_callback
+                .values_mut()
+                .filter_map(|entry| {
+                    if entry.thread_id != Some(thread_id) {
+                        return None;
+                    }
+                    let newly_authorized = entry.connection_ids.insert(connection_id);
+                    Some((entry.request.clone(), newly_authorized))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (request, newly_authorized) in requests {
+            let request_id = request.id().clone();
             if let Err(err) = self
                 .sender
                 .send(OutgoingEnvelope::ToConnection {
@@ -455,15 +536,28 @@ impl OutgoingMessageSender {
                 .await
             {
                 warn!("failed to resend request to client: {err:?}");
+                if newly_authorized {
+                    let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+                    if let Some(entry) = request_id_to_callback.get_mut(&request_id) {
+                        entry.connection_ids.remove(&connection_id);
+                    }
+                }
             }
         }
     }
 
-    pub(crate) async fn notify_client_response(&self, id: RequestId, result: Result) {
-        let entry = self.take_request_callback(&id).await;
+    pub(crate) async fn notify_client_response(
+        &self,
+        connection_id: ConnectionId,
+        id: RequestId,
+        result: Result,
+    ) {
+        let entry = self
+            .take_request_callback_from_connection(connection_id, &id)
+            .await;
 
         match entry {
-            Some((id, entry)) => {
+            TakeCallbackResult::Taken(id, entry) => {
                 let completed_at_ms = now_unix_timestamp_ms();
                 if let Ok(response) = entry.request.response_from_result(result.clone())
                     && !matches!(response, ServerResponse::PermissionsRequestApproval { .. })
@@ -475,17 +569,29 @@ impl OutgoingMessageSender {
                     warn!("could not notify callback for {id:?} due to: {err:?}");
                 }
             }
-            None => {
+            TakeCallbackResult::Unauthorized => {
+                warn!(
+                    "ignoring response for {id:?} from unauthorized connection {connection_id:?}"
+                );
+            }
+            TakeCallbackResult::Missing => {
                 warn!("could not find callback for {id:?}");
             }
         }
     }
 
-    pub(crate) async fn notify_client_error(&self, id: RequestId, error: JSONRPCErrorError) {
-        let entry = self.take_request_callback(&id).await;
+    pub(crate) async fn notify_client_error(
+        &self,
+        connection_id: ConnectionId,
+        id: RequestId,
+        error: JSONRPCErrorError,
+    ) {
+        let entry = self
+            .take_request_callback_from_connection(connection_id, &id)
+            .await;
 
         match entry {
-            Some((id, entry)) => {
+            TakeCallbackResult::Taken(id, entry) => {
                 warn!("client responded with error for {id:?}: {error:?}");
                 self.analytics_events_client
                     .track_server_request_aborted(now_unix_timestamp_ms(), id.clone());
@@ -493,14 +599,17 @@ impl OutgoingMessageSender {
                     warn!("could not notify callback for {id:?} due to: {err:?}");
                 }
             }
-            None => {
+            TakeCallbackResult::Unauthorized => {
+                warn!("ignoring error for {id:?} from unauthorized connection {connection_id:?}");
+            }
+            TakeCallbackResult::Missing => {
                 warn!("could not find callback for {id:?}");
             }
         }
     }
 
     pub(crate) async fn cancel_request(&self, id: &RequestId) -> bool {
-        let entry = self.take_request_callback(id).await;
+        let entry = self.remove_request_callback(id).await;
         if let Some((request_id, _entry)) = entry {
             self.analytics_events_client
                 .track_server_request_aborted(now_unix_timestamp_ms(), request_id);
@@ -531,14 +640,32 @@ impl OutgoingMessageSender {
         }
     }
 
-    async fn take_request_callback(
+    async fn take_request_callback_from_connection(
+        &self,
+        connection_id: ConnectionId,
+        id: &RequestId,
+    ) -> TakeCallbackResult {
+        let mut request_id_to_callback = self.request_id_to_callback.lock().await;
+        let Some(entry) = request_id_to_callback.get(id) else {
+            return TakeCallbackResult::Missing;
+        };
+        if !entry.connection_ids.contains(&connection_id) {
+            return TakeCallbackResult::Unauthorized;
+        }
+        match request_id_to_callback.remove_entry(id) {
+            Some((id, entry)) => TakeCallbackResult::Taken(id, Box::new(entry)),
+            None => TakeCallbackResult::Missing,
+        }
+    }
+
+    async fn remove_request_callback(
         &self,
         id: &RequestId,
     ) -> Option<(RequestId, PendingCallbackEntry)> {
-        let mut request_id_to_callback = self.request_id_to_callback.lock().await;
-        request_id_to_callback.remove_entry(id)
+        self.request_id_to_callback.lock().await.remove_entry(id)
     }
 
+    #[cfg(test)]
     pub(crate) async fn pending_requests_for_thread(
         &self,
         thread_id: ThreadId,
@@ -1751,6 +1878,9 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<OutgoingEnvelope>(4);
         let outgoing =
             OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
+        outgoing
+            .connection_opened(ConnectionId(1), Arc::new(AtomicBool::new(true)))
+            .await;
 
         let (request_id, wait_for_result) = outgoing
             .send_request(ServerRequestPayload::ApplyPatchApproval(
@@ -1767,7 +1897,7 @@ mod tests {
         let error = internal_error("refresh failed");
 
         outgoing
-            .notify_client_error(request_id, error.clone())
+            .notify_client_error(ConnectionId(1), request_id, error.clone())
             .await;
 
         let result = timeout(Duration::from_secs(1), wait_for_result)
@@ -1775,6 +1905,255 @@ mod tests {
             .expect("wait should not time out")
             .expect("waiter should receive a callback");
         assert_eq!(result, Err(error));
+    }
+
+    #[tokio::test]
+    async fn broadcast_request_without_initialized_connections_is_canceled_immediately() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
+        let outgoing =
+            OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
+
+        let (_request_id, wait_for_result) = outgoing
+            .send_request(ServerRequestPayload::ApplyPatchApproval(
+                ApplyPatchApprovalParams {
+                    conversation_id: ThreadId::new(),
+                    call_id: "call-id".to_string(),
+                    file_changes: HashMap::new(),
+                    reason: None,
+                    grant_root: None,
+                },
+            ))
+            .await;
+
+        let error = wait_for_result
+            .await
+            .expect("request should be canceled explicitly")
+            .expect_err("request without a recipient should fail");
+        assert_eq!(
+            error.message,
+            "client request canceled because no initialized connections are available"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "request without recipients must not be enqueued",
+        );
+    }
+
+    #[tokio::test]
+    async fn broadcast_request_freezes_delivery_and_authorization_to_initialized_connections() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
+        let outgoing =
+            OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
+        let original_connection = ConnectionId(21);
+        let later_initialized_connection = ConnectionId(22);
+        let later_initialized = Arc::new(AtomicBool::new(/*value*/ false));
+        outgoing
+            .connection_opened(
+                original_connection,
+                Arc::new(AtomicBool::new(/*value*/ true)),
+            )
+            .await;
+        outgoing
+            .connection_opened(later_initialized_connection, Arc::clone(&later_initialized))
+            .await;
+
+        let (request_id, wait_for_result) = outgoing
+            .send_request(ServerRequestPayload::ApplyPatchApproval(
+                ApplyPatchApprovalParams {
+                    conversation_id: ThreadId::new(),
+                    call_id: "call-id".to_string(),
+                    file_changes: HashMap::new(),
+                    reason: None,
+                    grant_root: None,
+                },
+            ))
+            .await;
+        later_initialized.store(true, Ordering::Release);
+
+        let envelope = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("initialized connection should receive the request before timeout")
+            .expect("outgoing channel should stay open");
+        let OutgoingEnvelope::ToConnection { connection_id, .. } = envelope else {
+            panic!("broadcast request should use its frozen targeted delivery set");
+        };
+        assert_eq!(connection_id, original_connection);
+        assert!(
+            rx.try_recv().is_err(),
+            "a connection initialized after the snapshot must not receive the request",
+        );
+        outgoing
+            .notify_client_error(
+                later_initialized_connection,
+                request_id.clone(),
+                internal_error("unauthorized"),
+            )
+            .await;
+
+        let expected_error = internal_error("authorized");
+        outgoing
+            .notify_client_error(original_connection, request_id, expected_error.clone())
+            .await;
+        let result = timeout(Duration::from_secs(1), wait_for_result)
+            .await
+            .expect("authorized response should resolve the callback")
+            .expect("callback sender should remain available");
+        assert_eq!(result, Err(expected_error));
+    }
+
+    #[tokio::test]
+    async fn connection_closed_cancels_non_thread_request_after_last_recipient_disconnects() {
+        let (tx, _rx) = mpsc::channel::<OutgoingEnvelope>(4);
+        let outgoing =
+            OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
+        let connection_id = ConnectionId(31);
+        outgoing
+            .connection_opened(connection_id, Arc::new(AtomicBool::new(/*value*/ true)))
+            .await;
+        let (_request_id, wait_for_result) = outgoing
+            .send_request(ServerRequestPayload::ApplyPatchApproval(
+                ApplyPatchApprovalParams {
+                    conversation_id: ThreadId::new(),
+                    call_id: "call-id".to_string(),
+                    file_changes: HashMap::new(),
+                    reason: None,
+                    grant_root: None,
+                },
+            ))
+            .await;
+
+        outgoing.connection_closed(connection_id).await;
+
+        let error = timeout(Duration::from_secs(1), wait_for_result)
+            .await
+            .expect("disconnect should resolve the callback")
+            .expect("callback sender should report a cancellation")
+            .expect_err("disconnect should cancel the request");
+        assert_eq!(
+            error.message,
+            "client request canceled because all authorized connections disconnected"
+        );
+    }
+
+    // This test deliberately holds the callback-map lock across scheduler yields
+    // to force the registration/disconnect interleaving it verifies.
+    #[allow(clippy::await_holding_invalid_type)]
+    #[tokio::test]
+    async fn broadcast_request_registration_is_atomic_with_disconnect_cleanup() {
+        let (tx, _rx) = mpsc::channel::<OutgoingEnvelope>(4);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let connection_id = ConnectionId(32);
+        outgoing
+            .connection_opened(connection_id, Arc::new(AtomicBool::new(/*value*/ true)))
+            .await;
+
+        let callback_guard = outgoing.request_id_to_callback.lock().await;
+        let send_outgoing = Arc::clone(&outgoing);
+        let send_task = tokio::spawn(async move {
+            send_outgoing
+                .send_request(ServerRequestPayload::ApplyPatchApproval(
+                    ApplyPatchApprovalParams {
+                        conversation_id: ThreadId::new(),
+                        call_id: "call-id".to_string(),
+                        file_changes: HashMap::new(),
+                        reason: None,
+                        grant_root: None,
+                    },
+                ))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            outgoing.active_connections.try_lock().is_err(),
+            "request registration must retain the active-connection snapshot lock",
+        );
+
+        let close_outgoing = Arc::clone(&outgoing);
+        let close_task =
+            tokio::spawn(async move { close_outgoing.connection_closed(connection_id).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !close_task.is_finished(),
+            "disconnect cleanup must wait until callback registration completes",
+        );
+
+        drop(callback_guard);
+        let (_request_id, wait_for_result) = timeout(Duration::from_secs(1), send_task)
+            .await
+            .expect("request registration should finish")
+            .expect("request registration task should not panic");
+        timeout(Duration::from_secs(1), close_task)
+            .await
+            .expect("disconnect cleanup should finish")
+            .expect("disconnect cleanup task should not panic");
+        let error = timeout(Duration::from_secs(1), wait_for_result)
+            .await
+            .expect("disconnect should resolve the callback")
+            .expect("callback sender should report a cancellation")
+            .expect_err("disconnect should cancel the request");
+        assert_eq!(
+            error.message,
+            "client request canceled because all authorized connections disconnected"
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_closed_preserves_thread_request_for_replay() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let thread_id = ThreadId::new();
+        let original_connection = ConnectionId(41);
+        let resumed_connection = ConnectionId(42);
+        let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
+            Arc::clone(&outgoing),
+            vec![original_connection],
+            thread_id,
+        );
+        let (request_id, wait_for_result) = thread_outgoing
+            .send_request(ServerRequestPayload::ToolRequestUserInput(
+                ToolRequestUserInputParams {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "item-1".to_string(),
+                    questions: vec![],
+                    auto_resolution_ms: None,
+                },
+            ))
+            .await;
+        let _original_delivery = rx.recv().await.expect("original request delivery");
+
+        outgoing.connection_closed(original_connection).await;
+        outgoing
+            .replay_requests_to_connection_for_thread(resumed_connection, thread_id)
+            .await;
+
+        let replay = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("replayed request should arrive before timeout")
+            .expect("outgoing channel should stay open");
+        let OutgoingEnvelope::ToConnection { connection_id, .. } = replay else {
+            panic!("replayed request should use targeted delivery");
+        };
+        assert_eq!(connection_id, resumed_connection);
+        outgoing
+            .notify_client_response(
+                resumed_connection,
+                request_id,
+                json!({
+                    "answers": {},
+                }),
+            )
+            .await;
+        let result = wait_for_result
+            .await
+            .expect("replayed callback sender should remain available");
+        assert_eq!(result, Ok(json!({"answers": {}})));
     }
 
     #[tokio::test]
@@ -1899,5 +2278,40 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn targeted_request_rejects_response_from_other_connection() {
+        let (tx, _rx) = mpsc::channel::<OutgoingEnvelope>(4);
+        let outgoing =
+            OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
+        let allowed_connection = ConnectionId(11);
+        let other_connection = ConnectionId(12);
+        let (request_id, wait_for_result) = outgoing
+            .send_request_to_connections(
+                Some(&[allowed_connection]),
+                ServerRequestPayload::ToolRequestUserInput(ToolRequestUserInputParams {
+                    thread_id: ThreadId::new().to_string(),
+                    turn_id: "turn-1".to_string(),
+                    item_id: "item-1".to_string(),
+                    questions: vec![],
+                    auto_resolution_ms: None,
+                }),
+                /*thread_id*/ None,
+            )
+            .await;
+
+        outgoing
+            .notify_client_response(other_connection, request_id.clone(), json!({"answers": {}}))
+            .await;
+
+        outgoing
+            .notify_client_response(allowed_connection, request_id, json!({"answers": {}}))
+            .await;
+        let result = timeout(Duration::from_secs(1), wait_for_result)
+            .await
+            .expect("authorized response should resolve the callback")
+            .expect("callback sender should remain available");
+        assert_eq!(result, Ok(json!({"answers": {}})));
     }
 }

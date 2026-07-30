@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
 
 use codex_features::Feature;
@@ -359,16 +358,6 @@ fn duplicate_primary_environment(turn: &mut TurnContext) {
     let mut second_environment = turn.environments.turn_environments[0].clone();
     second_environment.environment_id = "secondary".to_string();
     turn.environments.turn_environments.push(second_environment);
-}
-
-fn set_primary_environment_cwd(turn: &mut TurnContext, cwd: &Path) {
-    let primary = turn.environments.turn_environments[0].clone();
-    turn.environments.turn_environments[0] = crate::session::turn_context::TurnEnvironment::new(
-        primary.environment_id,
-        primary.environment,
-        codex_utils_path_uri::PathUri::from_host_native_path(cwd).expect("absolute test cwd"),
-        primary.shell,
-    );
 }
 
 #[tokio::test]

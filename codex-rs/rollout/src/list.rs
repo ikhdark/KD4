@@ -53,6 +53,8 @@ pub struct ThreadItem {
     pub thread_id: Option<ThreadId>,
     /// First user message captured for this thread, if any.
     pub first_user_message: Option<String>,
+    /// Persisted user-facing thread title, when supplied by the state DB.
+    pub title: Option<String>,
     /// Best available user-facing preview for discovery and list display.
     pub preview: Option<String>,
     /// Working directory from session metadata.
@@ -831,6 +833,7 @@ async fn build_thread_item(
             path,
             thread_id,
             first_user_message,
+            title: None,
             preview,
             cwd,
             git_branch,

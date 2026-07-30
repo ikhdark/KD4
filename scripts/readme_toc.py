@@ -70,9 +70,19 @@ def main() -> int:
         default=DEFAULT_DIFF_MAX_LINES,
         help="Maximum diff lines to print before truncating; use 0 for full diff.",
     )
+    parser.add_argument(
+        "--require-markers",
+        action="store_true",
+        help="Fail when the Markdown file has no ToC marker block.",
+    )
     args = parser.parse_args()
     path = Path(args.file)
-    return check_or_fix(path, args.fix, diff_max_lines=args.diff_max_lines)
+    return check_or_fix(
+        path,
+        args.fix,
+        diff_max_lines=args.diff_max_lines,
+        require_markers=args.require_markers,
+    )
 
 
 def generate_toc_lines(lines: Iterable[str]) -> list[str]:
@@ -212,7 +222,11 @@ def print_toc_diff(
 
 
 def check_or_fix(
-    readme_path: Path, fix: bool, diff_max_lines: int = DEFAULT_DIFF_MAX_LINES
+    readme_path: Path,
+    fix: bool,
+    diff_max_lines: int = DEFAULT_DIFF_MAX_LINES,
+    *,
+    require_markers: bool = False,
 ) -> int:
     if not readme_path.is_file():
         print(f"Error: file not found: {readme_path}", file=sys.stderr)
@@ -227,6 +241,12 @@ def check_or_fix(
         print(f"Error: {exc} in {readme_path}.", file=sys.stderr)
         return 1
     if parsed is None:
+        if require_markers:
+            print(
+                f"Error: required ToC markers not found in {readme_path}.",
+                file=sys.stderr,
+            )
+            return 1
         # No ToC markers found; treat as a no-op so repos without a ToC don't fail CI
         print(
             f"Note: Skipping ToC check; no markers found in {readme_path}.",

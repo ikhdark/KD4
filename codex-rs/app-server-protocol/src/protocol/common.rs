@@ -1604,6 +1604,7 @@ pub struct FuzzyFileSearchSessionUpdatedNotification {
 #[ts(rename_all = "camelCase")]
 pub struct FuzzyFileSearchSessionCompletedNotification {
     pub session_id: String,
+    pub query: String,
 }
 
 server_notification_definitions! {

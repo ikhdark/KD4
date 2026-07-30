@@ -8,9 +8,56 @@ use core_test_support::PathBufExt;
 use core_test_support::PathExt;
 use pretty_assertions::assert_eq;
 use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::pin::Pin;
+use std::task::Context as TaskContext;
+use std::task::Poll;
 use std::time::Duration;
+use tokio::io::AsyncRead;
 use tokio::io::AsyncWriteExt;
+use tokio::io::ReadBuf;
 use tokio::time::timeout;
+
+struct ChunkedReader {
+    chunks: VecDeque<Vec<u8>>,
+}
+
+impl ChunkedReader {
+    fn new(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self {
+            chunks: chunks.into_iter().collect(),
+        }
+    }
+}
+
+impl AsyncRead for ChunkedReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        _cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let Some(chunk) = self.chunks.pop_front() else {
+            return Poll::Ready(Ok(()));
+        };
+        assert!(chunk.len() <= buf.remaining());
+        buf.put_slice(&chunk);
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn streamed_output_chunks(receiver: &async_channel::Receiver<Event>) -> Vec<Vec<u8>> {
+    let mut chunks = Vec::new();
+    while let Ok(event) = receiver.try_recv() {
+        let EventMsg::ExecCommandOutputDelta(delta) = event.msg else {
+            panic!("expected exec command output delta");
+        };
+        assert_eq!(event.id, "sub");
+        assert_eq!(delta.call_id, "call");
+        assert_eq!(delta.stream, ExecOutputStream::Stdout);
+        chunks.push(delta.chunk);
+    }
+    chunks
+}
 
 fn make_exec_output(
     exit_code: i32,
@@ -115,6 +162,107 @@ async fn read_output_limits_retained_bytes_for_shell_capture() {
     .await
     .expect("read");
     assert_eq!(out.text.len(), EXEC_OUTPUT_MAX_BYTES);
+}
+
+#[tokio::test]
+async fn read_output_preserves_utf8_codepoints_split_across_reads() {
+    let expected = "A€𐍈Z";
+    let reader = ChunkedReader::new([
+        vec![b'A', 0xe2],
+        vec![0x82],
+        vec![0xac, 0xf0, 0x90],
+        vec![0x8d],
+        vec![0x88, b'Z'],
+    ]);
+    let (tx_event, rx_event) = async_channel::unbounded();
+
+    let output = read_output(
+        reader,
+        Some(StdoutStream {
+            sub_id: "sub".to_string(),
+            call_id: "call".to_string(),
+            tx_event,
+        }),
+        /*is_stderr*/ false,
+        /*max_bytes*/ None,
+    )
+    .await
+    .expect("read output");
+
+    assert_eq!(output.text, expected.as_bytes());
+    let chunks = streamed_output_chunks(&rx_event);
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| std::str::from_utf8(chunk).is_ok())
+    );
+    assert_eq!(chunks.concat(), expected.as_bytes());
+    let rendered = chunks
+        .iter()
+        .map(|chunk| String::from_utf8_lossy(chunk))
+        .collect::<String>();
+    assert_eq!(rendered, expected);
+}
+
+#[tokio::test]
+async fn read_output_makes_progress_when_pending_exceeds_read_chunk_size() {
+    let mut first = vec![b'a'; READ_CHUNK_SIZE];
+    first[READ_CHUNK_SIZE - 1] = 0xf0;
+    let mut second = vec![b'b'; READ_CHUNK_SIZE];
+    second[..3].copy_from_slice(&[0x90, 0x8d, 0x88]);
+    let expected = [first.as_slice(), second.as_slice()].concat();
+    let reader = ChunkedReader::new([first, second]);
+    let (tx_event, rx_event) = async_channel::unbounded();
+
+    let output = read_output(
+        reader,
+        Some(StdoutStream {
+            sub_id: "sub".to_string(),
+            call_id: "call".to_string(),
+            tx_event,
+        }),
+        /*is_stderr*/ false,
+        /*max_bytes*/ None,
+    )
+    .await
+    .expect("read output");
+
+    assert_eq!(output.text, expected);
+    let chunks = streamed_output_chunks(&rx_event);
+    assert!(
+        chunks
+            .iter()
+            .all(|chunk| std::str::from_utf8(chunk).is_ok())
+    );
+    assert_eq!(chunks.concat(), expected);
+}
+
+#[tokio::test]
+async fn read_output_flushes_terminal_incomplete_utf8_once() {
+    let reader = ChunkedReader::new([vec![b'x', 0xe2], vec![0x82]]);
+    let (tx_event, rx_event) = async_channel::unbounded();
+
+    let output = read_output(
+        reader,
+        Some(StdoutStream {
+            sub_id: "sub".to_string(),
+            call_id: "call".to_string(),
+            tx_event,
+        }),
+        /*is_stderr*/ false,
+        /*max_bytes*/ None,
+    )
+    .await
+    .expect("read output");
+
+    assert_eq!(output.text, vec![b'x', 0xe2, 0x82]);
+    let chunks = streamed_output_chunks(&rx_event);
+    assert_eq!(chunks, vec![b"x".to_vec(), vec![0xe2, 0x82]]);
+    let rendered = chunks
+        .iter()
+        .map(|chunk| String::from_utf8_lossy(chunk))
+        .collect::<String>();
+    assert_eq!(rendered, "x�");
 }
 
 #[test]

@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BYTES_PER_KIB = 1024
 BYTES_PER_MIB = BYTES_PER_KIB * 1024
 BYTES_PER_GIB = BYTES_PER_MIB * 1024
-DEFAULT_TARGET_WARN_BYTES = 50 * BYTES_PER_GIB
+DEFAULT_TARGET_WARN_BYTES = 250 * BYTES_PER_GIB
 DEFAULT_LANE_SIZE_WORKERS = 2
 MAX_LANE_SIZE_WORKERS = 4
 DEFAULT_PRUNE_KEEP_WARM_PER_BASE = 1
@@ -112,6 +112,49 @@ def directory_sizes_bytes(
         return dict(zip(paths, executor.map(size_func, paths)))
 
 
+def target_non_lane_size_bytes(
+    *,
+    repo_root: Path = REPO_ROOT,
+    lane_root: Path | None = None,
+    size_workers: int = DEFAULT_LANE_SIZE_WORKERS,
+) -> tuple[int, int]:
+    target_root = repo_root / "codex-rs" / "target"
+    if not target_root.exists():
+        return 0, 0
+
+    resolved_lane_root = (
+        (target_root / "lanes").resolve() if lane_root is None else lane_root.resolve()
+    )
+    total = 0
+    errors = 0
+    directories: list[Path] = []
+    try:
+        with os.scandir(target_root) as entries:
+            for entry in entries:
+                try:
+                    if _is_reparse_point(entry):
+                        continue
+                    path = Path(entry.path)
+                    if path.resolve() == resolved_lane_root:
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        directories.append(path)
+                    elif entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    errors += 1
+    except OSError:
+        return 0, 1
+
+    for size_bytes, child_errors in directory_sizes_bytes(
+        directories,
+        size_workers=size_workers,
+    ).values():
+        total += size_bytes
+        errors += child_errors
+    return total, errors
+
+
 def target_disk_report(
     *,
     repo_root: Path = REPO_ROOT,
@@ -144,8 +187,10 @@ def target_disk_report_lines(
     if size_bytes > warn_bytes:
         lines.append(
             "target disk warning: codex-rs/target is above the local budget; "
-            "run `just target-prune` for stale lanes, or remove `codex-rs/target` "
-            "only after `just rust-build-doctor` shows no active Rust jobs."
+            "automatic lane GC will recheck after active lane builds finish. "
+            "Use `just target-prune` only for an immediate idle cleanup, or remove "
+            "`codex-rs/target` only after `just rust-build-doctor` shows no active "
+            "Rust jobs."
         )
     strays = _runtime().stray_cargo_target_dirs(repo_root=repo_root)
     if strays:
@@ -312,6 +357,8 @@ def target_optimize_report(
     keep_warm_per_base: int = DEFAULT_PRUNE_KEEP_WARM_PER_BASE,
     max_age_days: float | None = DEFAULT_PRUNE_MAX_AGE_DAYS,
     max_lane_bytes: int | None = None,
+    max_total_lane_bytes: int | None = None,
+    max_total_target_bytes: int | None = None,
     include_prune_disk_report: bool = False,
     size_workers: int = DEFAULT_LANE_SIZE_WORKERS,
 ) -> str:
@@ -327,6 +374,8 @@ def target_optimize_report(
                 keep_warm_per_base=keep_warm_per_base,
                 max_age_days=max_age_days,
                 max_lane_bytes=max_lane_bytes,
+                max_total_lane_bytes=max_total_lane_bytes,
+                max_total_target_bytes=max_total_target_bytes,
                 include_disk_report=include_prune_disk_report,
                 size_workers=size_workers,
             ),
@@ -355,6 +404,18 @@ def max_lane_bytes_from_args(args: argparse.Namespace) -> int | None:
     return bytes_from_gib(args.max_lane_gib)
 
 
+def max_total_lane_bytes_from_args(args: argparse.Namespace) -> int | None:
+    if args.max_total_lane_bytes is not None:
+        return args.max_total_lane_bytes
+    return bytes_from_gib(args.max_total_lane_gib)
+
+
+def max_total_target_bytes_from_args(args: argparse.Namespace) -> int | None:
+    if args.max_total_target_bytes is not None:
+        return args.max_total_target_bytes
+    return bytes_from_gib(args.max_total_target_gib)
+
+
 def positive_float(value: str) -> float:
     parsed = float(value)
     if parsed <= 0:
@@ -378,7 +439,7 @@ def non_negative_int(value: str) -> int:
 
 def add_prune_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--warn-gib", type=positive_float, default=50.0)
+    parser.add_argument("--warn-gib", type=positive_float, default=250.0)
     parser.add_argument(
         "--keep-warm-per-base",
         type=non_negative_int,
@@ -389,6 +450,21 @@ def add_prune_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--max-lane-gib", type=positive_float)
     parser.add_argument("--max-lane-bytes", type=positive_int)
+    parser.add_argument(
+        "--max-total-lane-gib",
+        type=positive_float,
+        help="Evict least-recently-used inactive lanes until all lanes fit this aggregate GiB ceiling.",
+    )
+    parser.add_argument("--max-total-lane-bytes", type=positive_int)
+    parser.add_argument(
+        "--max-total-target-gib",
+        type=positive_float,
+        help=(
+            "Evict least-recently-used inactive lanes until the lane pool plus "
+            "other codex-rs/target content fits this aggregate GiB ceiling."
+        ),
+    )
+    parser.add_argument("--max-total-target-bytes", type=positive_int)
     parser.add_argument(
         "--size-workers", type=positive_int, default=DEFAULT_LANE_SIZE_WORKERS
     )

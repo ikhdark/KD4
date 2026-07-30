@@ -9,7 +9,7 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tracing::Span;
 
 use super::CommandShell;
@@ -62,6 +62,8 @@ pub(crate) async fn run_command(
 ) -> CommandRunResult {
     let started_at = chrono::Utc::now().timestamp();
     let started = Instant::now();
+    let timeout_duration = Duration::from_secs(handler.timeout_sec);
+    let timeout_deadline = tokio::time::Instant::now() + timeout_duration;
 
     let mut command = build_command(shell, handler);
     command
@@ -88,24 +90,7 @@ pub(crate) async fn run_command(
         }
     };
 
-    if let Some(mut stdin) = child.stdin.take()
-        && let Err(err) = stdin.write_all(input_json.as_bytes()).await
-        && err.kind() != io::ErrorKind::BrokenPipe
-    {
-        let _ = child.kill().await;
-        return finish_command_run(
-            started_at,
-            started,
-            CommandRunCompletion {
-                exit_code: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                error: Some(format!("failed to write hook stdin: {err}")),
-                outcome: "stdin_error",
-            },
-        );
-    }
-
+    let stdin = child.stdin.take();
     let Some(stdout) = child.stdout.take() else {
         let _ = child.kill().await;
         return finish_command_run(
@@ -135,10 +120,26 @@ pub(crate) async fn run_command(
         );
     };
 
-    let timeout_duration = Duration::from_secs(handler.timeout_sec);
-    let wait_for_output =
-        async { tokio::try_join!(child.wait(), capture_output(stdout), capture_output(stderr)) };
-    match timeout(timeout_duration, wait_for_output).await {
+    let write_stdin = async move {
+        let Some(mut stdin) = stdin else {
+            return Ok(());
+        };
+        match stdin.write_all(input_json.as_bytes()).await {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+            Err(err) => Err(err),
+        }
+    };
+    let wait_for_output = async {
+        let ((), status, stdout, stderr) = tokio::try_join!(
+            async { write_stdin.await.map_err(CommandRunError::Stdin) },
+            async { child.wait().await.map_err(CommandRunError::Wait) },
+            async { capture_output(stdout).await.map_err(CommandRunError::Wait) },
+            async { capture_output(stderr).await.map_err(CommandRunError::Wait) },
+        )?;
+        Ok::<_, CommandRunError>((status, stdout, stderr))
+    };
+    match timeout_at(timeout_deadline, wait_for_output).await {
         Ok(Ok((status, stdout, stderr))) => {
             let exit_code = status.code();
             // A successful hook's stdout can be structured JSON, so never parse a
@@ -168,6 +169,12 @@ pub(crate) async fn run_command(
         }
         Ok(Err(err)) => {
             let _ = child.kill().await;
+            let (error, outcome) = match err {
+                CommandRunError::Stdin(err) => {
+                    (format!("failed to write hook stdin: {err}"), "stdin_error")
+                }
+                CommandRunError::Wait(err) => (err.to_string(), "wait_error"),
+            };
             finish_command_run(
                 started_at,
                 started,
@@ -175,8 +182,8 @@ pub(crate) async fn run_command(
                     exit_code: None,
                     stdout: String::new(),
                     stderr: String::new(),
-                    error: Some(err.to_string()),
-                    outcome: "wait_error",
+                    error: Some(error),
+                    outcome,
                 },
             )
         }
@@ -195,6 +202,11 @@ pub(crate) async fn run_command(
             )
         }
     }
+}
+
+enum CommandRunError {
+    Stdin(io::Error),
+    Wait(io::Error),
 }
 
 #[derive(Default)]
@@ -348,20 +360,108 @@ mod tests {
 
     use super::*;
 
-    #[tokio::test]
-    async fn retains_output_when_hook_closes_stdin_early() {
-        let cwd = AbsolutePathBuf::current_dir().expect("current directory");
-        let handler = ConfiguredHandler {
+    fn test_handler(command: String, timeout_sec: u64, cwd: &AbsolutePathBuf) -> ConfiguredHandler {
+        ConfiguredHandler {
             event_name: HookEventName::PreToolUse,
             matcher: None,
-            command: "echo retained-hook-output".to_string(),
-            timeout_sec: 5,
+            command,
+            timeout_sec,
             status_message: None,
             source_path: cwd.join("hooks.json"),
             source: HookSource::User,
             display_order: 0,
             env: HashMap::new(),
-        };
+        }
+    }
+
+    #[cfg(windows)]
+    fn explicit_test_shell() -> CommandShell {
+        CommandShell {
+            program: "powershell.exe".to_string(),
+            args: vec!["-NoProfile".to_string(), "-Command".to_string()],
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn explicit_test_shell() -> CommandShell {
+        CommandShell {
+            program: "/bin/sh".to_string(),
+            args: vec!["-lc".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_covers_a_blocked_stdin_write() {
+        let cwd = AbsolutePathBuf::current_dir().expect("current directory");
+        #[cfg(windows)]
+        let command = "Start-Sleep -Seconds 60".to_string();
+        #[cfg(not(windows))]
+        let command = "sleep 60".to_string();
+        let handler = test_handler(command, 1, &cwd);
+        let input_json = "x".repeat(4 * 1024 * 1024);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_command(
+                &explicit_test_shell(),
+                &handler,
+                0,
+                &input_json,
+                cwd.as_path(),
+            ),
+        )
+        .await
+        .expect("run_command should enforce its timeout while writing stdin");
+
+        assert_eq!(result.exit_code, None);
+        assert_eq!(result.stdout, "");
+        assert_eq!(result.stderr, "");
+        assert_eq!(result.error, Some("hook timed out after 1s".to_string()));
+    }
+
+    #[tokio::test]
+    async fn drains_output_while_writing_stdin() {
+        let cwd = AbsolutePathBuf::current_dir().expect("current directory");
+        #[cfg(windows)]
+        let command = concat!(
+            "$stdout = [Console]::OpenStandardOutput(); ",
+            "$bytes = New-Object byte[] (2 * 1024 * 1024); ",
+            "$stdout.Write($bytes, 0, $bytes.Length); ",
+            "$stdout.Flush(); ",
+            "[Console]::In.ReadToEnd() | Out-Null"
+        )
+        .to_string();
+        #[cfg(not(windows))]
+        let command = "dd if=/dev/zero bs=65536 count=32 2>/dev/null; cat >/dev/null".to_string();
+        let handler = test_handler(command, 5, &cwd);
+        let input_json = "x".repeat(4 * 1024 * 1024);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            run_command(
+                &explicit_test_shell(),
+                &handler,
+                0,
+                &input_json,
+                cwd.as_path(),
+            ),
+        )
+        .await
+        .expect("hook stdin and output should make progress concurrently");
+
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result.error,
+            Some(format!(
+                "hook stdout exceeded the {HOOK_STREAM_CAPTURE_MAX_BYTES}-byte capture limit"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn retains_output_when_hook_closes_stdin_early() {
+        let cwd = AbsolutePathBuf::current_dir().expect("current directory");
+        let handler = test_handler("echo retained-hook-output".to_string(), 5, &cwd);
         let shell = CommandShell {
             program: String::new(),
             args: Vec::new(),

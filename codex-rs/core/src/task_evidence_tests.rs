@@ -148,14 +148,15 @@ async fn existing_evidence_reuses_canonical_repository_identity() {
     .expect("rewrite legacy repository root");
 
     let reloaded = TaskEvidenceLedger::load_or_new(codex_home.clone(), thread_id, &repo).await;
-    let guard = reloaded.document.lock().await;
-    let document = guard.as_ref().expect("document");
-    assert_eq!(document.revision, 2);
-    assert_eq!(
-        PathBuf::from(&document.start.repository_root),
-        canonical_repository_root(&repo)
-    );
-    drop(guard);
+    {
+        let guard = reloaded.document.lock().await;
+        let document = guard.as_ref().expect("document");
+        assert_eq!(document.revision, 2);
+        assert_eq!(
+            PathBuf::from(&document.start.repository_root),
+            canonical_repository_root(&repo)
+        );
+    }
 
     let mut entries = tokio::fs::read_dir(codex_home.join("task-evidence"))
         .await
@@ -365,6 +366,112 @@ async fn external_evidence_blank_producer_is_ignored_with_warning() {
             "{producer:?}"
         );
     }
+}
+
+async fn assert_external_evidence_rejected(
+    result: &CallToolResult,
+    expected_warning: &'static str,
+) {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    assert_eq!(
+        ledger
+            .record_external_mcp_evidence("server", "tool", "call", result)
+            .await,
+        ExternalEvidenceCapture::Warning(expected_warning)
+    );
+    assert!(
+        ledger
+            .document
+            .lock()
+            .await
+            .as_ref()
+            .expect("document")
+            .external_evidence
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn external_evidence_without_snapshot_remains_ingress_compatible() {
+    let mut result = evidence_result("test-provider", "diagnostic", serde_json::json!({}));
+    result.structured_content.as_mut().expect("structured")["evidenceMeta"]
+        .as_object_mut()
+        .expect("evidenceMeta object")
+        .remove("snapshot");
+
+    let (_temp, ledger) = record_fixture_evidence(&result).await;
+    let guard = ledger.document.lock().await;
+    let receipt = guard
+        .as_ref()
+        .and_then(|document| document.external_evidence.last())
+        .expect("receipt");
+    assert_eq!(receipt.provider_snapshot, None);
+}
+
+#[tokio::test]
+async fn external_evidence_rejects_complete_truncated_payload() {
+    let mut result = evidence_result("test-provider", "diagnostic", serde_json::json!({}));
+    result.structured_content.as_mut().expect("structured")["evidenceMeta"]["truncated"] =
+        serde_json::json!(true);
+
+    assert_external_evidence_rejected(
+        &result,
+        "MCP evidenceMeta complete payload cannot be truncated and was ignored",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn persisted_external_evidence_from_before_strict_ingress_still_loads() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    let home = ledger.codex_home.as_ref().expect("codex home").clone();
+    let thread_id = ledger.thread_id.as_ref().expect("thread id").clone();
+    let evidence_path = ledger
+        .evidence_path
+        .as_ref()
+        .expect("evidence path")
+        .clone();
+    let result = evidence_result("test-provider", "diagnostic", serde_json::json!({}));
+    assert_eq!(
+        ledger
+            .record_external_mcp_evidence("server", "tool", "call", &result)
+            .await,
+        ExternalEvidenceCapture::Stored
+    );
+    drop(ledger);
+
+    let mut persisted: Value = serde_json::from_slice(
+        &tokio::fs::read(&evidence_path)
+            .await
+            .expect("persisted evidence"),
+    )
+    .expect("valid evidence");
+    let receipt = persisted["external_evidence"][0]
+        .as_object_mut()
+        .expect("external evidence receipt");
+    receipt.insert("provider_snapshot".to_string(), Value::Null);
+    receipt.insert("truncated".to_string(), Value::Bool(true));
+    tokio::fs::write(
+        &evidence_path,
+        serde_json::to_vec_pretty(&persisted).expect("serialize legacy evidence"),
+    )
+    .await
+    .expect("write legacy evidence");
+
+    let reloaded = TaskEvidenceLedger::load_or_new(
+        home,
+        ThreadId::from_string(&thread_id).expect("thread id"),
+        &repo,
+    )
+    .await;
+    let guard = reloaded.document.lock().await;
+    let receipt = guard
+        .as_ref()
+        .and_then(|document| document.external_evidence.last())
+        .expect("reloaded external evidence receipt");
+    assert_eq!(receipt.provider_snapshot, None);
+    assert_eq!(receipt.payload_completeness, EvidenceCompleteness::Complete);
+    assert!(receipt.truncated);
 }
 
 #[tokio::test]
@@ -722,14 +829,15 @@ async fn trimming_and_persistence_failure_cleanup_external_evidence_artifacts() 
             .await,
         ExternalEvidenceCapture::Warning(_)
     ));
-    let guard = ledger.document.lock().await;
-    let document = guard.as_ref().expect("document");
-    assert_eq!(document.external_evidence.len(), 1);
-    assert_eq!(
-        document.external_evidence[0].payload_artifact_id.as_deref(),
-        Some(retained_id.as_str())
-    );
-    drop(guard);
+    {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("document");
+        assert_eq!(document.external_evidence.len(), 1);
+        assert_eq!(
+            document.external_evidence[0].payload_artifact_id.as_deref(),
+            Some(retained_id.as_str())
+        );
+    }
     let mut entries = tokio::fs::read_dir(&thread_directory)
         .await
         .expect("thread artifacts");
@@ -1099,7 +1207,7 @@ async fn failed_mutating_command_does_not_promote_the_active_step() {
 }
 
 #[tokio::test]
-async fn migration_repairs_duplicate_command_receipts_and_reopens_legacy_passed_steps() {
+async fn migration_repairs_duplicate_command_receipts_without_reopening_current_steps() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
     let mut document = ledger
         .document
@@ -1128,8 +1236,8 @@ async fn migration_repairs_duplicate_command_receipts_and_reopens_legacy_passed_
         document.command_receipts[0].id,
         document.command_receipts[1].id
     );
-    assert_eq!(document.plan[0].status, StepStatus::Implemented);
-    assert_eq!(document.schema_version, 4);
+    assert_eq!(document.plan[0].status, StepStatus::Passed);
+    assert_eq!(document.schema_version, TASK_EVIDENCE_SCHEMA_VERSION);
 }
 
 #[tokio::test]
@@ -1344,7 +1452,7 @@ async fn skipped_step_artifact_and_desktop_requirements_do_not_block_completion(
 }
 
 #[tokio::test]
-async fn schema_v4_reload_removes_stale_skipped_step_requirements() {
+async fn current_schema_reload_removes_stale_skipped_step_requirements() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     let codex_home = temp.path().join("home");
@@ -1480,16 +1588,17 @@ async fn genuine_v1_and_v2_documents_load_and_migrate_without_later_fields() {
         .expect("write legacy fixture");
 
         let ledger = TaskEvidenceLedger::load_or_new(codex_home, thread_id, &repo).await;
-        let guard = ledger.document.lock().await;
-        let migrated = guard.as_ref().expect("migrated document");
-        assert_eq!(migrated.schema_version, TASK_EVIDENCE_SCHEMA_VERSION);
-        assert_eq!(migrated.revision, expected_revision);
-        assert_eq!(migrated.plan[0].status, StepStatus::Implemented);
-        assert!(migrated.completion.is_none());
-        assert!(migrated.external_evidence.is_empty());
-        assert_eq!(migrated.next_external_evidence_receipt_sequence, 1);
-        assert_eq!(migrated.host_mutation_revision, 0);
-        drop(guard);
+        {
+            let guard = ledger.document.lock().await;
+            let migrated = guard.as_ref().expect("migrated document");
+            assert_eq!(migrated.schema_version, TASK_EVIDENCE_SCHEMA_VERSION);
+            assert_eq!(migrated.revision, expected_revision);
+            assert_eq!(migrated.plan[0].status, StepStatus::Implemented);
+            assert!(migrated.completion.is_none());
+            assert!(migrated.external_evidence.is_empty());
+            assert_eq!(migrated.next_external_evidence_receipt_sequence, 1);
+            assert_eq!(migrated.host_mutation_revision, 0);
+        }
 
         let persisted: TaskEvidenceDocument = serde_json::from_slice(
             &tokio::fs::read(&evidence_path)
@@ -1502,7 +1611,7 @@ async fn genuine_v1_and_v2_documents_load_and_migrate_without_later_fields() {
 }
 
 #[tokio::test]
-async fn v3_obsolete_validation_state_is_discarded_during_v4_migration() {
+async fn v3_obsolete_validation_state_is_discarded_during_shape_migration() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
     ledger
         .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
@@ -1559,11 +1668,12 @@ async fn v3_obsolete_validation_state_is_discarded_during_v4_migration() {
         "validation_receipt_ids": ["validation-1"]
     }]);
 
+    let retired_shape = uses_retired_v3_completion_shape(3, &legacy);
     let mut migrated: TaskEvidenceDocument =
         serde_json::from_value(legacy).expect("legacy document");
-    migrate_document(&mut migrated);
+    migrate_document_with_completion_model(&mut migrated, retired_shape);
 
-    assert_eq!(migrated.schema_version, 4);
+    assert_eq!(migrated.schema_version, TASK_EVIDENCE_SCHEMA_VERSION);
     assert_eq!(migrated.plan[0].status, StepStatus::Implemented);
     assert!(migrated.completion.is_none());
     assert!(migrated.risks.is_empty());
@@ -1577,6 +1687,71 @@ async fn v3_obsolete_validation_state_is_discarded_during_v4_migration() {
         assert!(persisted.get(obsolete).is_none(), "{obsolete}");
     }
     assert!(persisted["plan"][0].get("validation_receipt_ids").is_none());
+}
+
+#[tokio::test]
+async fn newer_schema_payload_disables_ledger_without_modifying_the_file() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .await;
+    let home = ledger.codex_home.as_ref().expect("codex home").clone();
+    let evidence_path = ledger
+        .evidence_path
+        .as_ref()
+        .expect("evidence path")
+        .clone();
+    let thread_id = ledger.thread_id.as_deref().expect("thread id").to_string();
+    let document = ledger
+        .document
+        .lock()
+        .await
+        .as_ref()
+        .expect("document")
+        .clone();
+    let mut legacy = serde_json::to_value(document).expect("serialize");
+    legacy["schema_version"] = serde_json::json!(4);
+    legacy["lifecycle"] = serde_json::json!({
+        "phase": "ready",
+        "outcome": "passed",
+        "mutation_revision": 1,
+        "accepted_evidence_revision": 1
+    });
+    let legacy_bytes = serde_json::to_vec_pretty(&legacy).expect("serialize v4 evidence");
+    tokio::fs::write(&evidence_path, &legacy_bytes)
+        .await
+        .expect("write v4 evidence");
+    drop(ledger);
+
+    assert!(matches!(
+        load_existing_document(&evidence_path, &thread_id, &repo).await,
+        ExistingDocument::NewerSchema { schema_version: 4 }
+    ));
+
+    let reloaded = TaskEvidenceLedger::load_or_new(
+        home,
+        ThreadId::from_string(&thread_id).expect("thread id"),
+        &repo,
+    )
+    .await;
+    assert_eq!(reloaded.mode(), TaskEvidenceMode::Disabled);
+    assert_eq!(
+        tokio::fs::read(&evidence_path)
+            .await
+            .expect("untouched v4 evidence"),
+        legacy_bytes
+    );
+
+    let mut entries = tokio::fs::read_dir(evidence_path.parent().expect("evidence parent"))
+        .await
+        .expect("evidence directory");
+    while let Some(entry) = entries.next_entry().await.expect("evidence entry") {
+        let name = entry.file_name();
+        assert!(
+            !name.to_string_lossy().ends_with(".preserved"),
+            "newer evidence must remain at its original path"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1705,7 +1880,7 @@ fn install_persistence_test_control(
     *ledger
         .persistence_test_control
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(PersistenceTestControl {
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PersistenceTestControl {
         before_next_write: Arc::new(std::sync::Mutex::new(Some((
             Arc::clone(&started),
             Arc::clone(&release),
@@ -1719,7 +1894,7 @@ fn set_persistence_test_failure(ledger: &TaskEvidenceLedger, fail_writes: bool) 
     let guard = ledger
         .persistence_test_control
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard
         .as_ref()
         .expect("persistence test control")
@@ -1757,38 +1932,40 @@ async fn completion_persistence_failure_blocks_then_recovers_when_storage_return
             .iter()
             .any(|reason| reason.contains("persistence failed"))
     );
-    let guard = ledger.document.lock().await;
-    let document = guard.as_ref().expect("document");
-    let storage_risk = document
-        .risks
-        .iter()
-        .find(|risk| risk.source == "task_evidence_storage")
-        .expect("storage risk");
-    assert!(storage_risk.blocking);
-    assert!(!storage_risk.resolved);
-    assert_eq!(
-        document
-            .completion
-            .as_ref()
-            .expect("cached completion")
-            .status,
-        TaskCompletionStatus::Blocked
-    );
-    drop(guard);
+    {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("document");
+        let storage_risk = document
+            .risks
+            .iter()
+            .find(|risk| risk.source == "task_evidence_storage")
+            .expect("storage risk");
+        assert!(storage_risk.blocking);
+        assert!(!storage_risk.resolved);
+        assert_eq!(
+            document
+                .completion
+                .as_ref()
+                .expect("cached completion")
+                .status,
+            TaskCompletionStatus::Blocked
+        );
+    }
 
     set_persistence_test_failure(&ledger, false);
     let recovered = ledger.completion_gate().await.expect("recovered gate");
     assert_eq!(recovered.status, TaskCompletionStatus::Passed);
-    let guard = ledger.document.lock().await;
-    let document = guard.as_ref().expect("document");
-    assert!(
-        document
-            .risks
-            .iter()
-            .find(|risk| risk.source == "task_evidence_storage")
-            .is_some_and(|risk| risk.resolved)
-    );
-    drop(guard);
+    {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("document");
+        assert!(
+            document
+                .risks
+                .iter()
+                .find(|risk| risk.source == "task_evidence_storage")
+                .is_some_and(|risk| risk.resolved)
+        );
+    }
     let persisted: TaskEvidenceDocument = serde_json::from_slice(
         &tokio::fs::read(ledger.evidence_path.as_ref().expect("evidence path"))
             .await
@@ -1827,23 +2004,24 @@ async fn cancelled_external_persistence_success_keeps_receipt_and_artifact() {
         .expect("coordinator completion");
     drop(completion_permit);
 
-    let guard = ledger.document.lock().await;
-    let document = guard.as_ref().expect("document");
-    assert_eq!(document.external_evidence.len(), 1);
-    let artifact_id = document.external_evidence[0]
-        .payload_artifact_id
-        .as_ref()
-        .expect("artifact id");
-    let artifact_path = ledger
-        .codex_home
-        .as_ref()
-        .expect("codex home")
-        .join("tool-output")
-        .join(ledger.thread_id.as_ref().expect("thread id"))
-        .join(format!("{artifact_id}.log"));
+    let artifact_path = {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("document");
+        assert_eq!(document.external_evidence.len(), 1);
+        let artifact_id = document.external_evidence[0]
+            .payload_artifact_id
+            .as_ref()
+            .expect("artifact id");
+        ledger
+            .codex_home
+            .as_ref()
+            .expect("codex home")
+            .join("tool-output")
+            .join(ledger.thread_id.as_ref().expect("thread id"))
+            .join(format!("{artifact_id}.log"))
+    };
     assert!(artifact_path.exists());
     assert!(artifact_path.with_extension("evidence-protected").exists());
-    drop(guard);
 
     let persisted: TaskEvidenceDocument = serde_json::from_slice(
         &tokio::fs::read(ledger.evidence_path.as_ref().expect("evidence path"))
@@ -1880,15 +2058,16 @@ async fn cancelled_external_persistence_failure_rolls_back_receipt_and_artifact(
         .expect("coordinator completion");
     drop(completion_permit);
 
-    let guard = ledger.document.lock().await;
-    assert!(
-        guard
-            .as_ref()
-            .expect("document")
-            .external_evidence
-            .is_empty()
-    );
-    drop(guard);
+    {
+        let guard = ledger.document.lock().await;
+        assert!(
+            guard
+                .as_ref()
+                .expect("document")
+                .external_evidence
+                .is_empty()
+        );
+    }
     let persisted: TaskEvidenceDocument = serde_json::from_slice(
         &tokio::fs::read(ledger.evidence_path.as_ref().expect("evidence path"))
             .await

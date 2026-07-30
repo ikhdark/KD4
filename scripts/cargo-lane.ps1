@@ -1,6 +1,8 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
+$CargoLanesRootMarkerName = ".codex-cargo-lanes-root"
+$CargoLanesRootMarkerContent = "codex-kd cargo lanes root v1"
 
 . (Join-Path $PSScriptRoot "common-rust-env.ps1")
 
@@ -118,6 +120,81 @@ function Get-RepoRoot {
     return [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 }
 
+function Get-NormalizedCargoLanePath {
+    param(
+        [string]$Path
+    )
+
+    $trimChars = [char[]]@(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+    return [System.IO.Path]::GetFullPath($Path).TrimEnd($trimChars)
+}
+
+function Test-CargoLanesRootMarker {
+    param(
+        [string]$LanesRoot
+    )
+
+    $markerPath = Join-Path $LanesRoot $CargoLanesRootMarkerName
+    if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $marker = Get-Item -LiteralPath $markerPath -Force
+        if (($marker.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $false
+        }
+        return [IO.File]::ReadAllText($markerPath).Trim() -ceq $CargoLanesRootMarkerContent
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-CargoLanesRootForPrune {
+    param(
+        [string]$RepoRoot,
+        [string]$LanesRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $LanesRoot -PathType Container)) {
+        return $false
+    }
+    $defaultLanesRoot = Join-Path $RepoRoot "codex-rs\target\lanes"
+    if ((Get-NormalizedCargoLanePath $LanesRoot) -ieq (Get-NormalizedCargoLanePath $defaultLanesRoot)) {
+        return $true
+    }
+    return Test-CargoLanesRootMarker -LanesRoot $LanesRoot
+}
+
+function Initialize-CargoLanesRoot {
+    param(
+        [string]$RepoRoot,
+        [string]$LanesRoot
+    )
+
+    if (Test-CargoLanesRootMarker -LanesRoot $LanesRoot) {
+        return
+    }
+
+    $defaultLanesRoot = Join-Path $RepoRoot "codex-rs\target\lanes"
+    $isDefaultRoot = (Get-NormalizedCargoLanePath $LanesRoot) -ieq (Get-NormalizedCargoLanePath $defaultLanesRoot)
+    if (-not (Test-Path -LiteralPath $LanesRoot -PathType Container)) {
+        New-Item -ItemType Directory -Force -Path $LanesRoot | Out-Null
+    }
+    elseif (-not $isDefaultRoot) {
+        $existingEntries = @(Get-ChildItem -LiteralPath $LanesRoot -Force -ErrorAction Stop)
+        if ($existingEntries.Count -gt 0) {
+            return
+        }
+    }
+
+    $markerPath = Join-Path $LanesRoot $CargoLanesRootMarkerName
+    [IO.File]::WriteAllText($markerPath, "$CargoLanesRootMarkerContent`n")
+}
+
 function Test-SccacheWrapper {
     param(
         [string]$Value
@@ -140,10 +217,16 @@ function Enable-SccacheEnvironment {
 
     if ([string]::IsNullOrWhiteSpace($env:RUSTC_WRAPPER)) {
         $env:RUSTC_WRAPPER = "sccache"
+        if ([string]::IsNullOrWhiteSpace($env:CARGO_INCREMENTAL)) {
+            $env:CARGO_INCREMENTAL = "0"
+        }
         Set-CodexRustSccacheEnvironment -RepoRoot $RepoRoot
         Ensure-CodexRustSccacheServer -RepoRoot $RepoRoot
     }
     elseif (Test-SccacheWrapper -Value $env:RUSTC_WRAPPER) {
+        if ([string]::IsNullOrWhiteSpace($env:CARGO_INCREMENTAL)) {
+            $env:CARGO_INCREMENTAL = "0"
+        }
         Set-CodexRustSccacheEnvironment -RepoRoot $RepoRoot
         Ensure-CodexRustSccacheServer -RepoRoot $RepoRoot
     }
@@ -466,10 +549,15 @@ function Invoke-CargoLanePrune {
         [string]$RepoRoot,
         [string]$LanesRoot,
         [string[]]$ActiveNames,
-        [string[]]$ExcludedNames = @()
+        [string[]]$ExcludedNames = @(),
+        [switch]$Force
     )
 
     if (-not (Test-Path -LiteralPath $LanesRoot -PathType Container)) {
+        return
+    }
+    if (-not (Test-CargoLanesRootForPrune -RepoRoot $RepoRoot -LanesRoot $LanesRoot)) {
+        Write-Warning "Skipping Cargo lane pruning for unrecognized lanes root '$LanesRoot'; custom roots must be new, empty, or contain $CargoLanesRootMarkerName."
         return
     }
 
@@ -477,7 +565,7 @@ function Invoke-CargoLanePrune {
 
     $intervalHours = Get-EnvIntValue -Name "CODEX_CARGO_LANE_GC_INTERVAL_HOURS" -DefaultValue 1 -MinimumValue 0
     $stampPath = Join-Path $LanesRoot ".gc-stamp"
-    if ($intervalHours -gt 0 -and (Test-Path -LiteralPath $stampPath -PathType Leaf)) {
+    if (-not $Force -and $intervalHours -gt 0 -and (Test-Path -LiteralPath $stampPath -PathType Leaf)) {
         $stampAge = (Get-Date) - (Get-Item -LiteralPath $stampPath).LastWriteTime
         if ($stampAge.TotalHours -lt $intervalHours) {
             return
@@ -486,9 +574,19 @@ function Invoke-CargoLanePrune {
 
     $maxAgeDays = Get-EnvIntValue -Name "CODEX_CARGO_LANE_MAX_AGE_DAYS" -DefaultValue 7 -MinimumValue 1
     $maxLaneBytes = Get-EnvInt64Value -Name "CODEX_CARGO_LANE_MAX_LANE_BYTES" -DefaultValue 0 -MinimumValue 0
+    $maxTotalLaneBytes = Get-EnvInt64Value -Name "CODEX_CARGO_LANE_MAX_TOTAL_BYTES" -DefaultValue 214748364800 -MinimumValue 0
+    $maxTotalTargetBytes = Get-EnvInt64Value -Name "CODEX_CARGO_TARGET_MAX_TOTAL_BYTES" -DefaultValue 268435456000 -MinimumValue 0
     $maxLaneArgs = @()
     if ($maxLaneBytes -gt 0) {
         $maxLaneArgs = @("--max-lane-bytes", ([string]$maxLaneBytes))
+    }
+    $maxTotalLaneArgs = @()
+    if ($maxTotalLaneBytes -gt 0) {
+        $maxTotalLaneArgs = @("--max-total-lane-bytes", ([string]$maxTotalLaneBytes))
+    }
+    $maxTotalTargetArgs = @()
+    if ($maxTotalTargetBytes -gt 0) {
+        $maxTotalTargetArgs = @("--max-total-target-bytes", ([string]$maxTotalTargetBytes))
     }
 
     $active = [System.Collections.Generic.List[string]]::new()
@@ -512,7 +610,7 @@ function Invoke-CargoLanePrune {
         }
         else {
             $global:LASTEXITCODE = $null
-            & $python.Source $scriptPath prune --skip-disk-report --keep-warm-per-base 1 --max-age-days $maxAgeDays @maxLaneArgs | Out-Null
+            & $python.Source $scriptPath prune --skip-disk-report --keep-warm-per-base 1 --max-age-days $maxAgeDays @maxLaneArgs @maxTotalLaneArgs @maxTotalTargetArgs | Out-Null
             $pruneSucceeded = $LASTEXITCODE -eq 0
             if (-not $pruneSucceeded) {
                 $pruneFailure = "prune command exited with code $LASTEXITCODE"
@@ -732,6 +830,17 @@ function Enable-SccacheForLane {
     Enable-SccacheEnvironment -RepoRoot $RepoRoot
 }
 
+function Update-CargoLaneLastUsed {
+    param(
+        [string]$TargetDir
+    )
+
+    [IO.File]::WriteAllText(
+        (Join-Path $TargetDir ".lane-last-used"),
+        [DateTime]::UtcNow.ToString("o", [Globalization.CultureInfo]::InvariantCulture)
+    )
+}
+
 $repoRoot = Get-RepoRoot
 $rustRoot = Join-Path $repoRoot "codex-rs"
 if (-not [string]::IsNullOrWhiteSpace($LanesRoot)) {
@@ -743,6 +852,7 @@ elseif (-not [string]::IsNullOrWhiteSpace($env:CODEX_CARGO_LANES_ROOT)) {
 else {
     $cargoLanesRoot = Join-Path $rustRoot "target\lanes"
 }
+Initialize-CargoLanesRoot -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot
 $commandArgs = @($Command)
 if ($commandArgs.Count -eq 1 -and [string]::IsNullOrWhiteSpace($commandArgs[0])) {
     $commandArgs = @()
@@ -757,10 +867,7 @@ $targetDir = $reservation.TargetDir
 if ($requestedLane -ne "auto" -and $resolvedLane -ne $requestedLane) {
     Write-Warning "Requested Cargo lane '$requestedLane' is busy; using '$resolvedLane'."
 }
-[IO.File]::WriteAllText(
-    (Join-Path $targetDir ".lane-last-used"),
-    (Get-Date).ToUniversalTime().ToString("o")
-)
+Update-CargoLaneLastUsed -TargetDir $targetDir
 try {
     Invoke-CargoLanePrune -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot -ActiveNames $activeLaneNames -ExcludedNames @($resolvedLane)
 }
@@ -806,6 +913,9 @@ try {
         if (-not [string]::IsNullOrWhiteSpace($env:RUSTC_WRAPPER)) {
             Write-Output "RUSTC_WRAPPER=$env:RUSTC_WRAPPER"
         }
+        if (-not [string]::IsNullOrWhiteSpace($env:CARGO_INCREMENTAL)) {
+            Write-Output "CARGO_INCREMENTAL=$env:CARGO_INCREMENTAL"
+        }
         if (-not [string]::IsNullOrWhiteSpace($env:CARGO_HOME)) {
             Write-Output "CARGO_HOME=$env:CARGO_HOME"
         }
@@ -833,8 +943,23 @@ try {
     exit $LASTEXITCODE
 }
 finally {
-    if ($null -ne $reservation -and $null -ne $reservation.Stream) {
-        $reservation.Stream.Dispose()
+    try {
+        Update-CargoLaneLastUsed -TargetDir $targetDir
     }
-    Pop-Location
+    finally {
+        if ($null -ne $reservation -and $null -ne $reservation.Stream) {
+            $reservation.Stream.Dispose()
+        }
+        try {
+            # The pre-build GC is hourly-throttled, but a single build burst can
+            # add hundreds of GiB. Re-check after the build and keep the lane
+            # that just completed while pruning older inactive lanes.
+            $postBuildActiveLaneNames = @(Get-ActiveCargoLaneNames -LanesRoot $cargoLanesRoot)
+            Invoke-CargoLanePrune -RepoRoot $repoRoot -LanesRoot $cargoLanesRoot -ActiveNames $postBuildActiveLaneNames -ExcludedNames @($resolvedLane) -Force
+        }
+        catch {
+            Write-Warning "Post-build Cargo lane pruning failed unexpectedly ($($_.Exception.Message)); continuing without pruning."
+        }
+        Pop-Location
+    }
 }

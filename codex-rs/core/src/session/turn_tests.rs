@@ -105,6 +105,64 @@ fn assistant_output_text(text: &str) -> ResponseItem {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn streamed_item_with_empty_id_gets_a_generated_id() -> Result<()> {
+    core_test_support::skip_if_no_network!(Ok(()));
+    let server = responses::start_mock_server().await;
+    let test = test_codex()
+        .with_config(|config| {
+            let _ = config.features.enable(Feature::ItemIds);
+        })
+        .build(&server)
+        .await?;
+    let response_mock = responses::mount_sse_once(
+        &server,
+        responses::sse(vec![
+            responses::ev_response_created("response-1"),
+            responses::ev_message_item_added("", ""),
+            responses::ev_output_text_delta("streamed"),
+            responses::ev_assistant_message("", "streamed"),
+            responses::ev_completed("response-1"),
+        ]),
+    )
+    .await;
+
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: "stream a response".to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    let started_id = core_test_support::wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::ItemStarted(event) => match &event.item {
+            TurnItem::AgentMessage(item) => Some(item.id.clone()),
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+    let completed_id = core_test_support::wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::ItemCompleted(event) => match &event.item {
+            TurnItem::AgentMessage(item) => Some(item.id.clone()),
+            _ => None,
+        },
+        _ => None,
+    })
+    .await;
+
+    assert!(started_id.starts_with("msg_"));
+    assert_eq!(started_id, completed_id);
+    response_mock.single_request();
+    Ok(())
+}
+
 fn non_openai_model_provider(server: &wiremock::MockServer) -> ModelProviderInfo {
     let mut provider = built_in_model_providers(/*openai_base_url*/ None)["openai"].clone();
     provider.name = "OpenAI (phase 68 test)".to_string();

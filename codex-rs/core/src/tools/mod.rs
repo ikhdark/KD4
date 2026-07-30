@@ -27,7 +27,6 @@ use codex_protocol::openai_models::ToolMode;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::OutputLimitResolution;
 use codex_utils_output_truncation::OutputOutcome;
-use codex_utils_output_truncation::TruncationMetadata;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
 use codex_utils_output_truncation::resolve_output_limits;
@@ -159,7 +158,7 @@ pub(crate) fn project_exec_output_for_model_with_budget(
         format!("Exit code: {}", exec_output.exit_code),
         format!("Wall time: {duration_seconds} seconds"),
     ];
-    if truncated.metadata.is_truncated() {
+    if truncated.was_truncated {
         sections.push(format!("Total output lines: {total_lines}"));
     }
     sections.push("Output:".to_string());
@@ -167,8 +166,7 @@ pub(crate) fn project_exec_output_for_model_with_budget(
 
     FormattedExecOutput {
         text: sections.join("\n"),
-        reduced: summarized.is_some() || truncated.metadata.is_truncated(),
-        truncation_metadata: truncated.metadata,
+        reduced: summarized.is_some() || truncated.was_truncated,
     }
 }
 
@@ -182,7 +180,6 @@ pub fn format_exec_output_str(
 pub(crate) struct FormattedExecOutput {
     pub(crate) text: String,
     pub(crate) reduced: bool,
-    pub(crate) truncation_metadata: TruncationMetadata,
 }
 
 pub(crate) fn project_exec_output_text(
@@ -224,9 +221,8 @@ pub(crate) fn project_exec_output_text_with_budget(
     );
     let truncated = formatted_truncate_text_with_output_limit(content, limits);
     FormattedExecOutput {
-        reduced: summarized.is_some() || truncated.metadata.is_truncated(),
+        reduced: summarized.is_some() || truncated.was_truncated,
         text: truncated.text,
-        truncation_metadata: truncated.metadata,
     }
 }
 

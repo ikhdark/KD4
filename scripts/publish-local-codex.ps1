@@ -1300,12 +1300,13 @@ function Set-EnvironmentVariableForTarget {
     param(
         [string]$Name,
         [AllowNull()]
-        [string]$Value,
+        [object]$Value,
         [ValidateSet("User", "Process")]
         [string]$Target
     )
 
-    [System.Environment]::SetEnvironmentVariable($Name, $Value, $Target)
+    $environmentValue = if ($null -eq $Value) { $null } else { [string]$Value }
+    [System.Environment]::SetEnvironmentVariable($Name, $environmentValue, $Target)
 }
 
 function Get-PathEnvironmentVariableForTarget {
@@ -1337,13 +1338,14 @@ function Get-PathEnvironmentVariableForTarget {
 function Set-PathEnvironmentVariableForTarget {
     param(
         [AllowNull()]
-        [string]$Value,
+        [object]$Value,
         [ValidateSet("User", "Process")]
         [string]$Target
     )
 
     if ($Target -eq "Process") {
-        [System.Environment]::SetEnvironmentVariable("Path", $Value, "Process")
+        $pathValue = if ($null -eq $Value) { $null } else { [string]$Value }
+        [System.Environment]::SetEnvironmentVariable("Path", $pathValue, "Process")
         return
     }
 
@@ -1352,14 +1354,142 @@ function Set-PathEnvironmentVariableForTarget {
         throw "Could not open HKCU:\Environment for writing."
     }
     try {
+        if ($null -eq $Value) {
+            $environmentKey.DeleteValue("Path", $false)
+            return
+        }
         $environmentKey.SetValue(
             "Path",
-            $Value,
+            [string]$Value,
             [Microsoft.Win32.RegistryValueKind]::ExpandString
         )
     }
     finally {
         $environmentKey.Dispose()
+    }
+}
+
+function Get-DesktopEnvironmentRoutingSnapshot {
+    param(
+        [ValidateSet("User", "Process")]
+        [string]$EnvironmentTarget
+    )
+
+    $snapshot = [ordered]@{
+        EnvironmentTarget = $EnvironmentTarget
+        CliPath = [System.Environment]::GetEnvironmentVariable(
+            "CODEX_CLI_PATH",
+            $EnvironmentTarget
+        )
+        CodexHome = [System.Environment]::GetEnvironmentVariable(
+            "CODEX_HOME",
+            $EnvironmentTarget
+        )
+        CodexSqliteHome = [System.Environment]::GetEnvironmentVariable(
+            "CODEX_SQLITE_HOME",
+            $EnvironmentTarget
+        )
+        Path = Get-PathEnvironmentVariableForTarget -Target $EnvironmentTarget
+        ProcessCliPath = $null
+        ProcessCodexHome = $null
+        ProcessCodexSqliteHome = $null
+    }
+    if ($EnvironmentTarget -eq "User") {
+        $snapshot.ProcessCliPath = [System.Environment]::GetEnvironmentVariable(
+            "CODEX_CLI_PATH",
+            "Process"
+        )
+        $snapshot.ProcessCodexHome = [System.Environment]::GetEnvironmentVariable(
+            "CODEX_HOME",
+            "Process"
+        )
+        $snapshot.ProcessCodexSqliteHome = [System.Environment]::GetEnvironmentVariable(
+            "CODEX_SQLITE_HOME",
+            "Process"
+        )
+    }
+
+    return [pscustomobject]$snapshot
+}
+
+function Restore-DesktopEnvironmentRouting {
+    param(
+        [object]$Snapshot
+    )
+
+    $failures = [System.Collections.Generic.List[string]]::new()
+    $targetValues = @(
+        [pscustomobject]@{ Name = "CODEX_CLI_PATH"; Value = $Snapshot.CliPath },
+        [pscustomobject]@{ Name = "CODEX_HOME"; Value = $Snapshot.CodexHome },
+        [pscustomobject]@{
+            Name = "CODEX_SQLITE_HOME"
+            Value = $Snapshot.CodexSqliteHome
+        }
+    )
+    foreach ($entry in $targetValues) {
+        try {
+            Set-EnvironmentVariableForTarget `
+                -Name $entry.Name `
+                -Value $entry.Value `
+                -Target $Snapshot.EnvironmentTarget
+        }
+        catch {
+            $failures.Add(
+                "$($Snapshot.EnvironmentTarget) $($entry.Name): $($_.Exception.Message)"
+            )
+        }
+    }
+    try {
+        Set-PathEnvironmentVariableForTarget `
+            -Value $Snapshot.Path `
+            -Target $Snapshot.EnvironmentTarget
+    }
+    catch {
+        $failures.Add(
+            "$($Snapshot.EnvironmentTarget) Path: $($_.Exception.Message)"
+        )
+    }
+
+    if ($Snapshot.EnvironmentTarget -eq "User") {
+        $processValues = @(
+            [pscustomobject]@{
+                Name = "CODEX_CLI_PATH"
+                Value = $Snapshot.ProcessCliPath
+            },
+            [pscustomobject]@{
+                Name = "CODEX_HOME"
+                Value = $Snapshot.ProcessCodexHome
+            },
+            [pscustomobject]@{
+                Name = "CODEX_SQLITE_HOME"
+                Value = $Snapshot.ProcessCodexSqliteHome
+            }
+        )
+        foreach ($entry in $processValues) {
+            try {
+                Set-EnvironmentVariableForTarget `
+                    -Name $entry.Name `
+                    -Value $entry.Value `
+                    -Target "Process"
+            }
+            catch {
+                $failures.Add("Process $($entry.Name): $($_.Exception.Message)")
+            }
+        }
+    }
+
+    if ($failures.Count -gt 0) {
+        throw "Desktop routing rollback failed: $($failures -join '; ')"
+    }
+
+    Write-ProofLine "desktopRoutingRollback" "restored"
+    if ($Snapshot.EnvironmentTarget -eq "User") {
+        try {
+            Write-ProofLine "desktopRoutingRollbackBroadcast" $(if (Send-EnvironmentChangedBroadcast) { "sent" } else { "failed" })
+        }
+        catch {
+            Write-ProofLine "desktopRoutingRollbackBroadcast" "failed: $($_.Exception.Message)"
+        }
     }
 }
 
@@ -1695,10 +1825,11 @@ function Set-ProcessEnvironmentVariable {
     param(
         [string]$Name,
         [AllowNull()]
-        [string]$Value
+        [object]$Value
     )
 
-    [System.Environment]::SetEnvironmentVariable($Name, $Value, "Process")
+    $environmentValue = if ($null -eq $Value) { $null } else { [string]$Value }
+    [System.Environment]::SetEnvironmentVariable($Name, $environmentValue, "Process")
 }
 
 function Enable-SccacheForPublish {
@@ -2606,6 +2737,7 @@ Write-ProofLine "targetPath" $targetPath
 Write-ProofLine "codeModeHostTargetPath" $codeModeHostTargetPath
 Write-ProofLine "targetKind" "local CLI/TUI payload used by Codex Desktop; launching it directly opens a terminal."
 $publishLock = $null
+$desktopRoutingSnapshot = $null
 if (-not $DryRun) {
     $publishLock = Enter-CodexLocalPublishMutex
     Write-ProofLine "publishLock" "acquired"
@@ -2781,6 +2913,10 @@ if ($ConfigureDesktopLocalCli) {
         Write-ProofLine "desktopLocalCliRouting" "skipped: source build stale"
     }
     else {
+        if (-not $DryRun) {
+            $desktopRoutingSnapshot = Get-DesktopEnvironmentRoutingSnapshot `
+                -EnvironmentTarget $DesktopCliEnvironmentTarget
+        }
         Sync-OfficialDesktopEnvironmentCleanup `
             -DryRun:$DryRun `
             -EnvironmentTarget $DesktopCliEnvironmentTarget
@@ -3031,6 +3167,18 @@ Remove-OldCodexBackups `
 Write-Output "Restart Codex Desktop from the Start menu or run: $(Get-CodexDesktopLaunchCommand)"
 Write-Output "Published codex.exe and codex-code-mode-host.exe as one local runtime bundle."
 Write-Output "Do not launch targetPath directly; it is the CLI/TUI payload and opens a terminal."
+}
+catch {
+    $publishError = $_.Exception
+    if ($null -ne $desktopRoutingSnapshot) {
+        try {
+            Restore-DesktopEnvironmentRouting -Snapshot $desktopRoutingSnapshot
+        }
+        catch {
+            throw "Publish failed: $($publishError.Message) Desktop routing rollback also failed: $($_.Exception.Message)"
+        }
+    }
+    throw $publishError
 }
 finally {
     Exit-CodexLocalPublishMutex -Lock $publishLock

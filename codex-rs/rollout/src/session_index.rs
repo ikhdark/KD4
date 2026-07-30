@@ -8,8 +8,6 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::LazyLock;
-use std::sync::Mutex;
 
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionMetaLine;
@@ -18,8 +16,8 @@ use serde::Serialize;
 use tokio::io::AsyncBufReadExt;
 
 const SESSION_INDEX_FILE: &str = "session_index.jsonl";
+const SESSION_INDEX_LOCK_FILE: &str = "session_index.jsonl.lock";
 const READ_CHUNK_SIZE: usize = 8192;
-static SESSION_INDEX_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionIndexEntry {
@@ -55,19 +53,79 @@ pub async fn append_session_index_entry(
     codex_home: &Path,
     entry: &SessionIndexEntry,
 ) -> std::io::Result<()> {
-    let _guard = SESSION_INDEX_LOCK
-        .lock()
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
-    let path = session_index_path(codex_home);
-    let mut file = std::fs::OpenOptions::new()
+    let codex_home = codex_home.to_path_buf();
+    let entry = entry.clone();
+    tokio::task::spawn_blocking(move || append_session_index_entry_blocking(&codex_home, &entry))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+fn append_session_index_entry_blocking(
+    codex_home: &Path,
+    entry: &SessionIndexEntry,
+) -> std::io::Result<()> {
+    with_session_index_lock(codex_home, || {
+        let path = session_index_path(codex_home);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let mut line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
+        line.push('\n');
+        file.write_all(line.as_bytes())?;
+        file.flush()
+    })
+}
+
+fn with_session_index_lock<T>(
+    codex_home: &Path,
+    operation: impl FnOnce() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let lock_path = session_index_lock_path(codex_home);
+    let lock_file = File::options()
         .create(true)
-        .append(true)
-        .open(&path)?;
-    let mut line = serde_json::to_string(entry).map_err(std::io::Error::other)?;
-    line.push('\n');
-    file.write_all(line.as_bytes())?;
-    file.flush()?;
-    Ok(())
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    lock_file.lock()?;
+    operation()
+}
+
+fn remove_thread_name_entries_blocking(
+    codex_home: &Path,
+    thread_id: ThreadId,
+) -> std::io::Result<()> {
+    with_session_index_lock(codex_home, || {
+        let path = session_index_path(codex_home);
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        let mut removed = false;
+        let mut remaining = String::with_capacity(contents.len());
+        for line in contents.lines() {
+            let should_remove = serde_json::from_str::<SessionIndexEntry>(line.trim())
+                .is_ok_and(|entry| entry.id == thread_id);
+            if should_remove {
+                removed = true;
+            } else {
+                remaining.push_str(line);
+                remaining.push('\n');
+            }
+        }
+        if !removed {
+            return Ok(());
+        }
+        let temp_path = path.with_extension("jsonl.tmp");
+        std::fs::write(&temp_path, remaining)?;
+        std::fs::rename(temp_path, path)
+    })
+}
+
+fn session_index_lock_path(codex_home: &Path) -> PathBuf {
+    codex_home.join(SESSION_INDEX_LOCK_FILE)
 }
 
 /// Remove all recorded names for a thread from the session index.
@@ -75,33 +133,10 @@ pub async fn remove_thread_name_entries(
     codex_home: &Path,
     thread_id: ThreadId,
 ) -> std::io::Result<()> {
-    let _guard = SESSION_INDEX_LOCK
-        .lock()
-        .map_err(|err| std::io::Error::other(err.to_string()))?;
-    let path = session_index_path(codex_home);
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err),
-    };
-    let mut removed = false;
-    let mut remaining = String::with_capacity(contents.len());
-    for line in contents.lines() {
-        let should_remove = serde_json::from_str::<SessionIndexEntry>(line.trim())
-            .is_ok_and(|entry| entry.id == thread_id);
-        if should_remove {
-            removed = true;
-        } else {
-            remaining.push_str(line);
-            remaining.push('\n');
-        }
-    }
-    if !removed {
-        return Ok(());
-    }
-    let temp_path = path.with_extension("jsonl.tmp");
-    std::fs::write(&temp_path, remaining)?;
-    std::fs::rename(temp_path, path)
+    let codex_home = codex_home.to_path_buf();
+    tokio::task::spawn_blocking(move || remove_thread_name_entries_blocking(&codex_home, thread_id))
+        .await
+        .map_err(std::io::Error::other)?
 }
 
 /// Find the latest thread name for a thread id, if any.

@@ -14,6 +14,7 @@ use codex_protocol::protocol::SessionSource;
 pub use codex_state::LogEntry;
 use codex_state::ThreadMetadataBuilder;
 use codex_utils_path::normalize_for_path_comparison;
+use futures::StreamExt;
 use serde_json::Value;
 use std::path::Path;
 use std::path::PathBuf;
@@ -34,6 +35,7 @@ const STARTUP_BACKFILL_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const STARTUP_BACKFILL_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 const STARTUP_BACKFILL_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_CONCURRENT_ROLLOUT_PATH_VALIDATIONS: usize = 8;
 
 /// Initialize the state runtime for thread state persistence.
 ///
@@ -439,12 +441,18 @@ pub async fn list_threads_db(
             if relation_filter.is_some() {
                 return Some(page);
             }
-            let mut valid_items = Vec::with_capacity(page.items.len());
-            for item in page.items {
-                if let Some(existing_path) =
-                    crate::compression::existing_rollout_path(item.rollout_path.as_path()).await
-                {
-                    let mut item = item;
+            let items = page.items;
+            let mut valid_items = Vec::with_capacity(items.len());
+            let mut path_validations = futures::stream::iter(items)
+                .map(|item| async move {
+                    let existing_path =
+                        crate::compression::existing_rollout_path(item.rollout_path.as_path())
+                            .await;
+                    (item, existing_path)
+                })
+                .buffered(MAX_CONCURRENT_ROLLOUT_PATH_VALIDATIONS);
+            while let Some((mut item, existing_path)) = path_validations.next().await {
+                if let Some(existing_path) = existing_path {
                     item.rollout_path = existing_path;
                     valid_items.push(item);
                 } else {

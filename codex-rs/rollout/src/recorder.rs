@@ -1136,6 +1136,7 @@ fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadIt
         path: _state_path,
         thread_id: _state_thread_id,
         first_user_message,
+        title,
         preview,
         cwd,
         git_branch,
@@ -1155,6 +1156,9 @@ fn fill_missing_thread_item_metadata(item: &mut ThreadItem, state_item: ThreadIt
 
     if item.first_user_message.is_none() {
         item.first_user_message = first_user_message;
+    }
+    if item.title.is_none() {
+        item.title = title;
     }
     if item.preview.is_none() {
         item.preview = preview;
@@ -2056,6 +2060,7 @@ fn thread_item_from_state_metadata(
         path: item.rollout_path,
         thread_id: Some(item.id),
         first_user_message: item.first_user_message,
+        title: Some(item.title),
         preview: item.preview,
         cwd: Some(item.cwd),
         git_branch: item.git_branch,

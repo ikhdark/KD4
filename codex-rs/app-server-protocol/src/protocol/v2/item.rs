@@ -270,10 +270,6 @@ pub enum ThreadItem {
         id: String,
         /// The command to be executed.
         command: String,
-        /// Optional short label for collapsed command activity.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        #[ts(optional)]
-        display_label: Option<String>,
         /// The command's working directory.
         cwd: LegacyAppPathString,
         /// Identifier for the underlying PTY process (when available).
@@ -330,6 +326,7 @@ pub enum ThreadItem {
         status: DynamicToolCallStatus,
         content_items: Option<Vec<DynamicToolCallOutputContentItem>>,
         success: Option<bool>,
+        error: Option<String>,
         /// The duration of the dynamic tool call in milliseconds.
         #[ts(type = "number | null")]
         duration_ms: Option<i64>,
@@ -847,7 +844,6 @@ impl From<CoreTurnItem> for ThreadItem {
             CoreTurnItem::CommandExecution(command) => ThreadItem::CommandExecution {
                 id: command.id,
                 command: command_display_string(&command.command),
-                display_label: command.display_label,
                 cwd: command.cwd.clone().into(),
                 process_id: command.process_id,
                 source: command.source.into(),
@@ -874,6 +870,7 @@ impl From<CoreTurnItem> for ThreadItem {
                         .collect()
                 }),
                 success: call.success,
+                error: call.error,
                 duration_ms: call
                     .duration
                     .and_then(|duration| i64::try_from(duration.as_millis()).ok()),

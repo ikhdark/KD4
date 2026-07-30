@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import argparse
+import hashlib
 import json
 import os
 import re
@@ -29,7 +31,6 @@ REQUIRED_FIELDS = {
     "id",
     "category",
     "repository",
-    "base_commit",
     "patch",
     "prompt",
     "expected_findings",
@@ -37,7 +38,6 @@ REQUIRED_FIELDS = {
     "notes",
 }
 CASE_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
-COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
 class ValidationError(ValueError):
@@ -77,6 +77,24 @@ def load_cases(path: Path = DEFAULT_CASES) -> list[dict[str, Any]]:
     return cases
 
 
+def case_fingerprint(case: dict[str, Any]) -> str:
+    """Bind a recorded result to the exact manifest, prompt, and patch content."""
+    digest = hashlib.sha256()
+    digest.update(
+        json.dumps(case, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    for field in ("prompt", "patch"):
+        digest.update(b"\0")
+        digest.update(field.encode("ascii"))
+        value = case[field]
+        if value is None:
+            digest.update(b"\0")
+            continue
+        path = _repo_relative_file(value, field=field, case_id=case["id"])
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def _validate_expected_findings(case: dict[str, Any]) -> None:
     case_id = case["id"]
     findings = case["expected_findings"]
@@ -97,21 +115,48 @@ def _validate_expected_findings(case: dict[str, Any]) -> None:
         )
 
 
-def _validate_git_object(commit: str, *, case_id: str) -> None:
-    result = subprocess.run(
-        ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    _require(result.returncode == 0, f"{case_id}: base_commit is not available in this checkout")
+def _scan_unified_diff(
+    patch_lines: list[str],
+) -> tuple[int, int, list[str], list[str]]:
+    raw_added = 0
+    raw_removed = 0
+    old_paths: list[str] = []
+    new_paths: list[str] = []
+    in_hunk = False
+    for line in patch_lines:
+        if line.startswith("diff --git "):
+            in_hunk = False
+        elif line.startswith("@@ "):
+            in_hunk = True
+        elif not in_hunk and line.startswith("--- "):
+            old_paths.append(line.removeprefix("--- "))
+        elif not in_hunk and line.startswith("+++ "):
+            new_paths.append(line.removeprefix("+++ "))
+        elif in_hunk and line.startswith("+"):
+            raw_added += 1
+        elif in_hunk and line.startswith("-"):
+            raw_removed += 1
+    return raw_added, raw_removed, old_paths, new_paths
 
 
-def _validate_patch(patch: Path, commit: str, *, case_id: str) -> None:
+def _validate_patch(patch: Path, *, case_id: str) -> None:
     patch_lines = patch.read_text(encoding="utf-8").splitlines()
-    raw_added = sum(line.startswith("+") and not line.startswith("+++") for line in patch_lines)
-    raw_removed = sum(line.startswith("-") and not line.startswith("---") for line in patch_lines)
+    raw_added, raw_removed, old_paths, new_paths = _scan_unified_diff(patch_lines)
+    _require(
+        old_paths and len(old_paths) == len(new_paths),
+        f"{case_id}: patch must contain paired file headers",
+    )
+    for old_path, new_path in zip(old_paths, new_paths, strict=True):
+        _require(old_path == "/dev/null", f"{case_id}: fixtures must add new files only")
+        _require(
+            new_path.startswith("b/investigation_cases/"),
+            f"{case_id}: fixture path must stay under investigation_cases/",
+        )
+        relative = Path(new_path.removeprefix("b/"))
+        _require(
+            not relative.is_absolute() and ".." not in relative.parts,
+            f"{case_id}: fixture path escapes investigation_cases/",
+        )
     numstat = subprocess.run(
         ["git", "apply", "--numstat", str(patch)],
         cwd=REPO_ROOT,
@@ -128,24 +173,29 @@ def _validate_patch(patch: Path, commit: str, *, case_id: str) -> None:
         _require(fields[0].isdigit() and fields[1].isdigit(), f"{case_id}: binary patches are unsupported")
         declared_added += int(fields[0])
         declared_removed += int(fields[1])
+        _require(
+            fields[2].replace("\\", "/").startswith("investigation_cases/"),
+            f"{case_id}: patch numstat path escapes investigation_cases/",
+        )
     _require(
         (declared_added, declared_removed) == (raw_added, raw_removed),
         f"{case_id}: patch hunk counts do not cover every added or removed line",
     )
+    _require(declared_removed == 0, f"{case_id}: fixtures must not remove existing lines")
 
     with tempfile.TemporaryDirectory(prefix="investigation-eval-index-") as temp_dir:
         index_path = Path(temp_dir) / "index"
         index_env = os.environ.copy()
         index_env["GIT_INDEX_FILE"] = str(index_path)
         read_tree = subprocess.run(
-            ["git", "read-tree", commit],
+            ["git", "read-tree", "--empty"],
             cwd=REPO_ROOT,
             env=index_env,
             capture_output=True,
             text=True,
             check=False,
         )
-        _require(read_tree.returncode == 0, f"{case_id}: could not load base_commit into a temporary index")
+        _require(read_tree.returncode == 0, f"{case_id}: could not initialize a temporary index")
         result = subprocess.run(
             ["git", "apply", "--check", "--cached", "--whitespace=error-all", str(patch)],
             cwd=REPO_ROOT,
@@ -176,21 +226,13 @@ def validate_cases(cases: list[dict[str, Any]]) -> None:
             isinstance(case["repository"], str) and case["repository"],
             f"{case_id}: repository must be a non-empty logical name",
         )
-        commit = case["base_commit"]
-        _require(
-            isinstance(commit, str) and COMMIT_RE.fullmatch(commit) is not None,
-            f"{case_id}: base_commit must be a lowercase full commit SHA",
-        )
-        if case["repository"] == "kd4":
-            _validate_git_object(commit, case_id=case_id)
-
         prompt = _repo_relative_file(case["prompt"], field="prompt", case_id=case_id)
         _require(prompt.suffix == ".md", f"{case_id}: prompt must be Markdown")
         patch_value = case["patch"]
         if patch_value is not None:
             patch = _repo_relative_file(patch_value, field="patch", case_id=case_id)
             _require(patch.suffix == ".patch", f"{case_id}: patch must use the .patch suffix")
-            _validate_patch(patch, commit, case_id=case_id)
+            _validate_patch(patch, case_id=case_id)
 
         _validate_expected_findings(case)
         forbidden = case["forbidden_findings"]
@@ -217,6 +259,13 @@ def validate_cases(cases: list[dict[str, Any]]) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--show-fingerprints",
+        action="store_true",
+        help="print each case fingerprint after validation",
+    )
+    args = parser.parse_args()
     try:
         cases = load_cases()
         validate_cases(cases)
@@ -227,6 +276,9 @@ def main() -> int:
     counts = Counter(case["category"] for case in cases)
     summary = ", ".join(f"{category}={counts[category]}" for category in sorted(counts))
     print(f"validated {len(cases)} investigation cases ({summary})")
+    if args.show_fingerprints:
+        for case in cases:
+            print(f"{case['id']} {case_fingerprint(case)}")
     return 0
 
 

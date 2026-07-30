@@ -239,6 +239,111 @@ class PublishLocalCodexApplyTest(PublishLocalCodexTestBase):
             )
             self.assert_no_publish_temps(install_dir)
 
+    def test_failed_publish_restores_process_desktop_routing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            install_dir = temp_path / "install"
+            install_dir.mkdir()
+            fake_codex = self.write_fake_codex(
+                temp_path / "fake-codex.cmd",
+                timestamp=FRESH_SOURCE_TIME,
+            )
+            target = install_dir / "codex.exe"
+            target.write_bytes(b"previous-codex")
+            code_mode_host_target = install_dir / "codex-code-mode-host.exe"
+            code_mode_host_target.write_bytes(b"previous-code-mode-host")
+            local_home = temp_path / "local-home"
+            sqlite_home = temp_path / "sqlite-home"
+
+            publish_args = [
+                "-RepoRoot",
+                str(self.repo_root),
+                "-SkipBuild",
+                "-SourceExe",
+                str(fake_codex),
+                "-SourceCodeModeHostExe",
+                str(self.source_code_mode_host),
+                "-InstallDir",
+                str(install_dir),
+                "-ConfigureDesktopLocalCli",
+                "-DesktopCliEnvironmentTarget",
+                "Process",
+                "-LocalCodexHome",
+                str(local_home),
+                "-LocalCodexSqliteHome",
+                str(sqlite_home),
+            ]
+            quoted_args = " ".join(
+                arg if arg.startswith("-") else ps_single_quote(arg)
+                for arg in publish_args
+            )
+            wrapper = (
+                "$failure = $null; "
+                f"try {{ & {ps_single_quote(SCRIPT)} {quoted_args} }} "
+                "catch { $failure = $_.Exception.Message; "
+                'Write-Output "publishFailure=$failure" }; '
+                'Write-Output "routingAfterCli=$([Environment]::GetEnvironmentVariable('
+                "'CODEX_CLI_PATH', 'Process'))\"; "
+                'Write-Output "routingAfterHome=$([Environment]::GetEnvironmentVariable('
+                "'CODEX_HOME', 'Process'))\"; "
+                'Write-Output "routingAfterHomeIsNull=$($null -eq '
+                "[Environment]::GetEnvironmentVariable('CODEX_HOME', 'Process'))\"; "
+                'Write-Output "routingAfterSqlite=$([Environment]::GetEnvironmentVariable('
+                "'CODEX_SQLITE_HOME', 'Process'))\"; "
+                'Write-Output "routingAfterPath=$([Environment]::GetEnvironmentVariable('
+                "'Path', 'Process'))\"; "
+                "if ($null -eq $failure) { exit 9 }"
+            )
+            env = clean_env()
+            original_cli = "C:\\prior\\codex.exe"
+            original_sqlite = "C:\\prior\\sqlite"
+            path_key = next(
+                (key for key in env if key.casefold() == "path"),
+                "Path",
+            )
+            original_path = f"{install_dir};{env[path_key]}"
+            env.update(
+                {
+                    "CODEX_CLI_PATH": original_cli,
+                    "CODEX_SQLITE_HOME": original_sqlite,
+                }
+            )
+            env[path_key] = original_path
+
+            result = subprocess.run(
+                [
+                    self.shell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    wrapper,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=env,
+                timeout=RUN_TIMEOUT_SECONDS,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertIn("publishFailure=", result.stdout)
+            self.assertIn("desktopRoutingRollback: restored", result.stdout)
+            self.assertIn(f"routingAfterCli={original_cli}", result.stdout)
+            self.assertIn("routingAfterHome=", result.stdout)
+            self.assertIn("routingAfterHomeIsNull=True", result.stdout)
+            self.assertIn(f"routingAfterSqlite={original_sqlite}", result.stdout)
+            self.assertIn(f"routingAfterPath={original_path}", result.stdout)
+            self.assertEqual(target.read_bytes(), b"previous-codex")
+            self.assertEqual(
+                code_mode_host_target.read_bytes(),
+                b"previous-code-mode-host",
+            )
+
     def test_failed_publish_can_rollback_when_backup_dir_is_over_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)

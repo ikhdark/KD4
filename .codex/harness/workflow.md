@@ -9,8 +9,6 @@ without redefining repository implementation policy.
 - Root `AGENTS.md` owns task lanes, repository inspection, implementation
   discipline, validation selection, completion status, and final reporting.
 - `.codex/harness` owns optional durable task artifacts and lifecycle guidance.
-- `kd4-harness` routes requests for those artifacts; ordinary code changes do
-  not need the skill.
 - Use subagents only when the user or active instructions explicitly request
   delegation or parallel agent work.
 

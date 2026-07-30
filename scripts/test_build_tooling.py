@@ -748,7 +748,7 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --no-fail-fast',
             justfile,
         )
-        self.assertEqual(nextest["profile"]["default"]["test-threads"], 6)
+        self.assertEqual(nextest["profile"]["default"]["test-threads"], 16)
         local_profile = nextest["profile"]["local"]
         self.assertEqual(local_profile["inherits"], "default")
         fast_profile = nextest["profile"]["fast"]
@@ -768,6 +768,10 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
             justfile,
         )
         self.assertIn('$env:NEXTEST_PROFILE = "fast"; cargo nextest run', justfile)
+        no_sccache_recipe = justfile.split("test-fast-nosccache *args:", 1)[1].split(
+            "\n\n", 1
+        )[0]
+        self.assertIn('$env:NEXTEST_PROFILE = "fast"', no_sccache_recipe)
         self.assertIn(
             "RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --no-fail-fast --timings=html,json",
             justfile,
@@ -801,12 +805,12 @@ class BuildToolingEnvironmentTest(unittest.TestCase):
         cargo_config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
-        self.assertEqual(cargo_config["build"]["jobs"], 6)
+        self.assertEqual(cargo_config["build"]["jobs"], 16)
         self.assertEqual(
             cargo_config["env"]["RUST_TEST_THREADS"],
-            {"value": "6", "force": False},
+            {"value": "16", "force": False},
         )
-        self.assertIn('rust_parallelism := "6"', justfile)
+        self.assertIn('rust_parallelism := "16"', justfile)
         self.assertIn(
             'env_var_or_default("CARGO_BUILD_JOBS", rust_parallelism)',
             justfile,

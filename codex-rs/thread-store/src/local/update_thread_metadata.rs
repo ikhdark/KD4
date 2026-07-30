@@ -721,6 +721,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::Value;
     use serde_json::json;
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::sqlite::SqlitePoolOptions;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -764,6 +766,110 @@ mod tests {
             .await
             .expect("find thread name");
         assert_eq!(latest_name.as_deref(), Some("A sharper name"));
+    }
+
+    #[tokio::test]
+    async fn update_thread_metadata_keeps_sqlite_name_when_index_write_fails() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = LocalThreadStore::new(config, Some(runtime.clone()));
+        let uuid = Uuid::from_u128(318);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        write_session_file(home.path(), "2025-01-03T14-15-00", uuid).expect("session file");
+
+        store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    title: Some("Original name".to_string()),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect("seed sqlite title");
+        std::fs::create_dir(home.path().join("session_index.jsonl"))
+            .expect("block session index file creation");
+
+        let err = store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    name: Some(Some("Committed name".to_string())),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect_err("index write should fail");
+
+        assert!(err.to_string().contains("failed to index thread name"));
+        let metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("sqlite metadata read")
+            .expect("sqlite metadata");
+        assert_eq!(metadata.title, "Committed name");
+    }
+
+    #[tokio::test]
+    async fn update_thread_metadata_does_not_index_name_when_sqlite_update_fails() {
+        let home = TempDir::new().expect("temp dir");
+        let config = test_config(home.path());
+        let runtime = codex_state::StateRuntime::init(
+            home.path().to_path_buf(),
+            config.default_model_provider_id.clone(),
+        )
+        .await
+        .expect("state db should initialize");
+        let store = LocalThreadStore::new(config, Some(runtime.clone()));
+        let uuid = Uuid::from_u128(319);
+        let thread_id = ThreadId::from_string(&uuid.to_string()).expect("valid thread id");
+        write_session_file(home.path(), "2025-01-03T14-20-00", uuid).expect("session file");
+
+        store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    title: Some("Original name".to_string()),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect("seed sqlite title");
+        install_thread_title_update_failure(&runtime).await;
+
+        let err = store
+            .update_thread_metadata(UpdateThreadMetadataParams {
+                thread_id,
+                patch: ThreadMetadataPatch {
+                    name: Some(Some("Uncommitted name".to_string())),
+                    ..Default::default()
+                },
+                include_archived: false,
+            })
+            .await
+            .expect_err("sqlite title update should fail");
+
+        assert!(err.to_string().contains("failed to set thread name"));
+        assert!(err.to_string().contains("forced title update failure"));
+        let metadata = runtime
+            .get_thread(thread_id)
+            .await
+            .expect("sqlite metadata read")
+            .expect("sqlite metadata");
+        assert_eq!(metadata.title, "Original name");
+        let latest_name = codex_rollout::find_thread_name_by_id(home.path(), &thread_id)
+            .await
+            .expect("read legacy name index");
+        assert_eq!(latest_name, None);
     }
 
     #[tokio::test]
@@ -1815,6 +1921,31 @@ mod tests {
                 .archived_at
                 .is_some()
         );
+    }
+
+    async fn install_thread_title_update_failure(runtime: &codex_state::StateRuntime) {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(runtime.codex_home().join(codex_state::STATE_DB_FILENAME))
+                    .create_if_missing(false),
+            )
+            .await
+            .expect("open state db");
+        sqlx::query(
+            r#"
+CREATE TRIGGER fail_thread_title_update
+BEFORE UPDATE OF title ON threads
+BEGIN
+    SELECT RAISE(FAIL, 'forced title update failure');
+END
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("install title update failure");
+        pool.close().await;
     }
 
     fn test_thread_metadata() -> ThreadPersistenceMetadata {

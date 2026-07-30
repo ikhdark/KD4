@@ -22,7 +22,6 @@ use codex_tools::LoadableToolSpec;
 use codex_tools::ToolName;
 use codex_utils_output_truncation::OutputLimitResolution;
 use codex_utils_output_truncation::OutputOutcome;
-use codex_utils_output_truncation::TruncationMetadata;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::formatted_truncate_text;
 use codex_utils_output_truncation::formatted_truncate_text_with_output_limit;
@@ -476,17 +475,14 @@ impl ExecCommandToolOutput {
             .and_then(RawOutputArtifact::retained_bytes)
             .is_some_and(|bytes| bytes > self.raw_output.len() as u64);
         ProjectedModelOutput {
-            reduced: summarized.is_some()
-                || truncated.metadata.is_truncated()
-                || artifact_has_more_bytes,
+            reduced: summarized.is_some() || truncated.was_truncated || artifact_has_more_bytes,
             text: truncated.text,
-            truncation_metadata: truncated.metadata,
         }
     }
 
     fn output_with_reduction_notice(&self, projected: ProjectedModelOutput) -> String {
         let mut output = projected.text;
-        if (projected.reduced || projected.truncation_metadata.is_truncated())
+        if projected.reduced
             && let Some(notice) = self
                 .raw_output_artifact
                 .as_ref()
@@ -540,7 +536,6 @@ impl ExecCommandToolOutput {
 struct ProjectedModelOutput {
     text: String,
     reduced: bool,
-    truncation_metadata: TruncationMetadata,
 }
 
 fn function_tool_response(

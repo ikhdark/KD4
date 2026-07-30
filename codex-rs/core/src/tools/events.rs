@@ -147,7 +147,6 @@ pub(crate) async fn emit_exec_command_begin(
     cwd: &PathUri,
     parsed_cmd: &[ParsedCommand],
     source: ExecCommandSource,
-    display_label: Option<String>,
     interaction_input: Option<String>,
     process_id: Option<&str>,
 ) {
@@ -158,7 +157,6 @@ pub(crate) async fn emit_exec_command_begin(
                 id: ctx.call_id.to_string(),
                 process_id: process_id.map(str::to_owned),
                 command: command.to_vec(),
-                display_label,
                 cwd: cwd.clone(),
                 parsed_cmd: parsed_cmd.to_vec(),
                 source,
@@ -181,7 +179,6 @@ pub(crate) enum ToolEmitter {
         cwd: PathUri,
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
-        display_label: Option<String>,
         environment_id: String,
     },
     ApplyPatch {
@@ -194,7 +191,6 @@ pub(crate) enum ToolEmitter {
         cwd: PathUri,
         source: ExecCommandSource,
         parsed_cmd: Vec<ParsedCommand>,
-        display_label: Option<String>,
         process_id: Option<String>,
         environment_id: String,
     },
@@ -213,7 +209,6 @@ impl ToolEmitter {
             cwd: PathUri::from_abs_path(&cwd),
             source,
             parsed_cmd,
-            display_label: None,
             environment_id,
         }
     }
@@ -243,7 +238,6 @@ impl ToolEmitter {
             cwd,
             source,
             parsed_cmd,
-            display_label: None,
             process_id,
             environment_id,
         }
@@ -257,7 +251,6 @@ impl ToolEmitter {
                     cwd,
                     source,
                     parsed_cmd,
-                    display_label,
                     environment_id,
                 },
                 stage,
@@ -270,7 +263,6 @@ impl ToolEmitter {
                         environment_id,
                         parsed_cmd,
                         *source,
-                        display_label.as_deref(),
                         /*interaction_input*/ None,
                         /*process_id*/ None,
                     ),
@@ -401,7 +393,6 @@ impl ToolEmitter {
                     cwd,
                     source,
                     parsed_cmd,
-                    display_label,
                     process_id,
                     environment_id,
                 },
@@ -415,7 +406,6 @@ impl ToolEmitter {
                         environment_id,
                         parsed_cmd,
                         *source,
-                        display_label.as_deref(),
                         /*interaction_input*/ None,
                         process_id.as_deref(),
                     ),
@@ -445,7 +435,6 @@ impl ToolEmitter {
                     /*requested_limit*/ None,
                     Some(&command_text),
                 );
-                debug_assert!(!projected.truncation_metadata.is_truncated() || projected.reduced);
                 projected.text
             }
             Self::ApplyPatch { .. } => {
@@ -543,7 +532,6 @@ struct ExecCommandInput<'a> {
     environment_id: &'a str,
     parsed_cmd: &'a [ParsedCommand],
     source: ExecCommandSource,
-    display_label: Option<&'a str>,
     interaction_input: Option<&'a str>,
     process_id: Option<&'a str>,
 }
@@ -555,7 +543,6 @@ impl<'a> ExecCommandInput<'a> {
         environment_id: &'a str,
         parsed_cmd: &'a [ParsedCommand],
         source: ExecCommandSource,
-        display_label: Option<&'a str>,
         interaction_input: Option<&'a str>,
         process_id: Option<&'a str>,
     ) -> Self {
@@ -565,7 +552,6 @@ impl<'a> ExecCommandInput<'a> {
             environment_id,
             parsed_cmd,
             source,
-            display_label,
             interaction_input,
             process_id,
         }
@@ -596,7 +582,6 @@ async fn emit_exec_stage(
                 exec_input.cwd,
                 exec_input.parsed_cmd,
                 exec_input.source,
-                exec_input.display_label.map(str::to_owned),
                 exec_input.interaction_input.map(str::to_owned),
                 exec_input.process_id,
             )
@@ -692,7 +677,6 @@ async fn emit_exec_end(
                 id: ctx.call_id.to_string(),
                 process_id: exec_input.process_id.map(str::to_owned),
                 command: exec_input.command.to_vec(),
-                display_label: exec_input.display_label.map(str::to_owned),
                 cwd: exec_input.cwd.clone(),
                 parsed_cmd: exec_input.parsed_cmd.to_vec(),
                 source: exec_input.source,
@@ -846,42 +830,6 @@ mod tests {
                 )
             })
             .collect();
-    }
-
-    #[test]
-    fn command_emitters_leave_provider_specific_display_labels_unset() {
-        let dir = tempdir().expect("tempdir");
-        let cwd = AbsolutePathBuf::from_absolute_path(dir.path()).expect("absolute cwd");
-        let command = vec![
-            "kds".to_string(),
-            "--agent".to_string(),
-            "--".to_string(),
-            "cargo".to_string(),
-            "test".to_string(),
-        ];
-
-        let shell = ToolEmitter::shell(
-            command.clone(),
-            cwd.clone(),
-            ExecCommandSource::Agent,
-            String::new(),
-        );
-        let ToolEmitter::Shell { display_label, .. } = shell else {
-            panic!("expected shell emitter");
-        };
-        assert_eq!(display_label, None);
-
-        let unified = ToolEmitter::unified_exec(
-            &command,
-            PathUri::from_abs_path(&cwd),
-            ExecCommandSource::Agent,
-            None,
-            String::new(),
-        );
-        let ToolEmitter::UnifiedExec { display_label, .. } = unified else {
-            panic!("expected unified exec emitter");
-        };
-        assert_eq!(display_label, None);
     }
 
     async fn assert_failed_apply_patch_tracks_committed_delta(

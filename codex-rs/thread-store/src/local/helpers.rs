@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs::FileTimes;
 use std::fs::OpenOptions;
@@ -186,6 +188,24 @@ pub(super) fn distinct_thread_metadata_title(metadata: &ThreadMetadata) -> Optio
     }
 }
 
+pub(super) fn thread_item_titles<'a>(
+    items: impl IntoIterator<Item = &'a ThreadItem>,
+) -> (HashMap<ThreadId, String>, HashSet<ThreadId>) {
+    let mut names = HashMap::new();
+    let mut resolved_thread_ids = HashSet::new();
+    for item in items {
+        let (Some(thread_id), Some(title)) = (item.thread_id, item.title.as_deref()) else {
+            continue;
+        };
+        let title = title.trim();
+        if !title.is_empty() && item.first_user_message.as_deref().map(str::trim) != Some(title) {
+            resolved_thread_ids.insert(thread_id);
+            names.insert(thread_id, title.to_string());
+        }
+    }
+    (names, resolved_thread_ids)
+}
+
 pub(super) fn set_thread_name_from_title(thread: &mut StoredThread, title: String) {
     if title.trim().is_empty() || thread.preview.trim() == title.trim() {
         return;
@@ -272,5 +292,41 @@ mod tests {
                 compressed_path.with_file_name(format!("rollout-2025-01-03T12-00-00-{uuid}.jsonl"))
             )
         );
+    }
+
+    #[test]
+    fn thread_item_titles_resolves_only_distinct_titles() {
+        let named_thread_id = ThreadId::new();
+        let default_title_thread_id = ThreadId::new();
+        let missing_title_thread_id = ThreadId::new();
+        let items = [
+            ThreadItem {
+                thread_id: Some(named_thread_id),
+                first_user_message: Some("original preview".to_string()),
+                title: Some("custom title".to_string()),
+                ..Default::default()
+            },
+            ThreadItem {
+                thread_id: Some(default_title_thread_id),
+                first_user_message: Some("default title".to_string()),
+                title: Some("default title".to_string()),
+                ..Default::default()
+            },
+            ThreadItem {
+                thread_id: Some(missing_title_thread_id),
+                title: None,
+                ..Default::default()
+            },
+        ];
+
+        let (names, resolved_thread_ids) = thread_item_titles(&items);
+
+        assert_eq!(
+            names,
+            [(named_thread_id, "custom title".to_string())].into()
+        );
+        assert_eq!(resolved_thread_ids, [named_thread_id].into());
+        assert!(!resolved_thread_ids.contains(&default_title_thread_id));
+        assert!(!resolved_thread_ids.contains(&missing_title_thread_id));
     }
 }

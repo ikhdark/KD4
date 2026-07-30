@@ -202,15 +202,23 @@ impl SessionReporterImpl {
         });
     }
 
-    fn send_complete(&self) {
+    fn send_complete(&self, query: &str) {
         if self.shared.canceled.load(Ordering::Relaxed) {
             return;
         }
+        {
+            #[expect(clippy::unwrap_used)]
+            let latest_query = self.shared.latest_query.lock().unwrap();
+            if query != latest_query.as_str() {
+                return;
+            }
+        }
         let session_id = self.shared.session_id.clone();
+        let query = query.to_string();
         let outgoing = self.shared.outgoing.clone();
         self.shared.runtime.spawn(async move {
             let notification = ServerNotification::FuzzyFileSearchSessionCompleted(
-                FuzzyFileSearchSessionCompletedNotification { session_id },
+                FuzzyFileSearchSessionCompletedNotification { session_id, query },
             );
             outgoing.send_server_notification(notification).await;
         });
@@ -222,8 +230,8 @@ impl file_search::SessionReporter for SessionReporterImpl {
         self.send_snapshot(snapshot);
     }
 
-    fn on_complete(&self) {
-        self.send_complete();
+    fn on_complete(&self, query: &str) {
+        self.send_complete(query);
     }
 }
 

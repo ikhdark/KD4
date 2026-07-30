@@ -187,9 +187,6 @@ pub struct CommandExecutionItem {
     #[ts(optional)]
     pub process_id: Option<String>,
     pub command: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub display_label: Option<String>,
     pub cwd: PathUri,
     pub parsed_cmd: Vec<ParsedCommand>,
     pub source: ExecCommandSource,

@@ -65,6 +65,7 @@ use codex_protocol::protocol::TurnAbortedEvent;
 use codex_protocol::protocol::TurnEnvironmentSelection;
 use codex_protocol::protocol::W3cTraceContext;
 use codex_rollout::state_db::StateDbHandle;
+use codex_thread_store::DeleteThreadParams;
 use codex_thread_store::InMemoryThreadStore;
 use codex_thread_store::LocalThreadStore;
 use codex_thread_store::LocalThreadStoreConfig;
@@ -290,6 +291,35 @@ pub fn thread_store_from_config(
             ))
         }
         ThreadStoreConfig::InMemory { id } => InMemoryThreadStore::for_id(id),
+    }
+}
+
+pub(crate) async fn rollback_created_thread_persistence(
+    thread_store: &Arc<dyn ThreadStore>,
+    thread_id: ThreadId,
+) {
+    let persistence_removed = match thread_store
+        .delete_thread(DeleteThreadParams { thread_id })
+        .await
+    {
+        Ok(()) | Err(ThreadStoreError::ThreadNotFound { .. }) => true,
+        Err(err) => {
+            warn!("failed to remove persistence for rolled-back thread {thread_id}: {err}");
+            false
+        }
+    };
+    if !persistence_removed {
+        return;
+    }
+
+    let Some(local_store) = thread_store.as_any().downcast_ref::<LocalThreadStore>() else {
+        return;
+    };
+    let Some(state_db) = local_store.state_db().await else {
+        return;
+    };
+    if let Err(err) = state_db.delete_thread(thread_id).await {
+        warn!("failed to remove state DB rows for rolled-back thread {thread_id}: {err}");
     }
 }
 
@@ -943,6 +973,28 @@ impl ThreadManager {
     /// Returns the thread if the thread was found and removed.
     pub async fn remove_thread(&self, thread_id: &ThreadId) -> Option<Arc<CodexThread>> {
         self.state.threads.write().await.remove(thread_id)
+    }
+
+    /// Roll back a newly spawned thread that failed before its creator could
+    /// publish a successful response.
+    #[doc(hidden)]
+    pub async fn rollback_thread_spawn(
+        &self,
+        thread_id: ThreadId,
+        expected_thread: &Arc<CodexThread>,
+    ) -> bool {
+        if !self
+            .state
+            .remove_thread_if_same(&thread_id, expected_thread)
+            .await
+        {
+            return false;
+        }
+        if let Err(err) = expected_thread.shutdown_and_wait().await {
+            warn!("failed to shut down rolled-back thread {thread_id}: {err}");
+        }
+        rollback_created_thread_persistence(&self.state.thread_store, thread_id).await;
+        true
     }
 
     /// Tries to shut down all tracked threads concurrently within the provided timeout.
@@ -1623,6 +1675,7 @@ impl ThreadManagerState {
         user_shell_override: Option<crate::shell::Shell>,
     ) -> CodexResult<NewThread> {
         let is_resumed_thread = matches!(&initial_history, InitialHistory::Resumed(_));
+        let rollback_persistence_on_finalize_error = !is_resumed_thread && !config.ephemeral;
         if let InitialHistory::Resumed(resumed) = &initial_history {
             let mut threads = self.threads.write().await;
             if let Some(thread) = threads.get(&resumed.conversation_id).cloned() {
@@ -1709,7 +1762,12 @@ impl ThreadManagerState {
         }))
         .await?;
         let new_thread = self
-            .finalize_thread_spawn(codex, thread_id, tracked_session_source)
+            .finalize_thread_spawn(
+                codex,
+                thread_id,
+                tracked_session_source,
+                rollback_persistence_on_finalize_error,
+            )
             .await?;
         if is_resumed_thread {
             new_thread.thread.emit_thread_resume_lifecycle().await;
@@ -1722,14 +1780,32 @@ impl ThreadManagerState {
         codex: Codex,
         thread_id: ThreadId,
         session_source: SessionSource,
+        rollback_persistence_on_error: bool,
     ) -> CodexResult<NewThread> {
-        let event = codex.next_event().await?;
+        let event = match codex.next_event().await {
+            Ok(event) => event,
+            Err(err) => {
+                if let Err(shutdown_err) = codex.shutdown_and_wait().await {
+                    warn!("failed to shut down unregistered thread {thread_id}: {shutdown_err}");
+                }
+                if rollback_persistence_on_error {
+                    rollback_created_thread_persistence(&self.thread_store, thread_id).await;
+                }
+                return Err(err);
+            }
+        };
         let session_configured = match event {
             Event {
                 id,
                 msg: EventMsg::SessionConfigured(session_configured),
             } if id == INITIAL_SUBMIT_ID => session_configured,
             _ => {
+                if let Err(err) = codex.shutdown_and_wait().await {
+                    warn!("failed to shut down unregistered thread {thread_id}: {err}");
+                }
+                if rollback_persistence_on_error {
+                    rollback_created_thread_persistence(&self.thread_store, thread_id).await;
+                }
                 return Err(CodexErr::SessionConfiguredNotFirstEvent);
             }
         };

@@ -65,6 +65,7 @@ pub(crate) enum RawOutputArtifact {
 }
 
 pub(crate) struct RawOutputArtifactWriter {
+    id: Option<ToolOutputArtifactId>,
     path: Option<PathBuf>,
     file: Option<tokio::fs::File>,
     bytes: u64,
@@ -74,8 +75,9 @@ impl RawOutputArtifactWriter {
     pub(crate) async fn open(state: Option<&Arc<Mutex<RawOutputArtifact>>>) -> Option<Self> {
         let state = state?;
         let artifact = state.lock().await.clone();
-        let RawOutputArtifact::Stored { path, bytes, .. } = artifact else {
+        let RawOutputArtifact::Stored { id, path, bytes } = artifact else {
             return Some(Self {
+                id: None,
                 path: None,
                 file: None,
                 bytes: 0,
@@ -89,6 +91,7 @@ impl RawOutputArtifactWriter {
         {
             Ok(file) => match lock_output_file(file).await {
                 Ok(file) => Some(Self {
+                    id: Some(id),
                     path: Some(path),
                     file: Some(file),
                     bytes,
@@ -105,6 +108,7 @@ impl RawOutputArtifactWriter {
                         bytes,
                     };
                     Some(Self {
+                        id: Some(id),
                         path: Some(path),
                         file: None,
                         bytes,
@@ -120,6 +124,7 @@ impl RawOutputArtifactWriter {
                     bytes,
                 };
                 Some(Self {
+                    id: Some(id),
                     path: Some(path),
                     file: None,
                     bytes,
@@ -133,7 +138,7 @@ impl RawOutputArtifactWriter {
         state: Option<&Arc<Mutex<RawOutputArtifact>>>,
         output: &[u8],
     ) {
-        let (Some(state), Some(path)) = (state, self.path.clone()) else {
+        let (Some(state), Some(id), Some(path)) = (state, self.id, self.path.clone()) else {
             return;
         };
         let Some(file) = self.file.as_mut() else {
@@ -151,7 +156,7 @@ impl RawOutputArtifactWriter {
         }
         self.bytes = self.bytes.saturating_add(output.len() as u64);
         *state.lock().await = RawOutputArtifact::Stored {
-            id: artifact_id_from_path(&path).expect("artifact path is UUID-backed"),
+            id,
             path,
             bytes: self.bytes,
         };

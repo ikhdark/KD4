@@ -864,7 +864,6 @@ fn sample_command_execution_item_with_id(
     ThreadItem::CommandExecution {
         id: id.to_string(),
         command: "echo hi".to_string(),
-        display_label: None,
         cwd: test_path_buf("/tmp").abs().into(),
         process_id: Some("pid-1".to_string()),
         source: CommandExecutionSource::Agent,
@@ -4451,6 +4450,7 @@ async fn turn_event_counts_completed_tool_items() {
             status: DynamicToolCallStatus::Completed,
             content_items: None,
             success: Some(true),
+            error: None,
             duration_ms: Some(3),
         },
         ThreadItem::CollabAgentToolCall {

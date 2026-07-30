@@ -728,6 +728,7 @@ impl ThreadHistoryBuilder {
             status: DynamicToolCallStatus::InProgress,
             content_items: None,
             success: None,
+            error: None,
             duration_ms: None,
         };
         if payload.turn_id.is_empty() {
@@ -752,6 +753,7 @@ impl ThreadHistoryBuilder {
             status,
             content_items: Some(convert_dynamic_tool_content_items(&payload.content_items)),
             success: Some(payload.success),
+            error: payload.error.clone(),
             duration_ms,
         };
         if payload.turn_id.is_empty() {
@@ -2090,7 +2092,6 @@ mod tests {
             id: "exec-1".to_string(),
             process_id: Some("pid-1".to_string()),
             command: vec!["echo".to_string(), "hello world".to_string()],
-            display_label: Some("Example -".to_string()),
             cwd: test_path_buf("/tmp").abs().into(),
             parsed_cmd: vec![ParsedCommand::Unknown {
                 cmd: "echo hello world".to_string(),
@@ -2143,7 +2144,6 @@ mod tests {
             vec![ThreadItem::CommandExecution {
                 id: "exec-1".to_string(),
                 command: "echo 'hello world'".to_string(),
-                display_label: Some("Example -".to_string()),
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-1".to_string()),
                 source: CommandExecutionSource::Agent,
@@ -2701,7 +2701,6 @@ mod tests {
                 turn_id: "turn-1".into(),
                 completed_at_ms: 0,
                 command: vec!["echo".into(), "hello world".into()],
-                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo hello world".into(),
@@ -2758,7 +2757,6 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "exec-1".into(),
                 command: "echo 'hello world'".into(),
-                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-1".into()),
                 source: CommandExecutionSource::Agent,
@@ -2871,7 +2869,7 @@ mod tests {
     }
 
     #[test]
-    fn reconstructs_dynamic_tool_items_from_request_and_response_events() {
+    fn reconstructs_dynamic_tool_items_and_error_from_request_and_response_events() {
         let events = vec![
             EventMsg::TurnStarted(TurnStartedEvent {
                 turn_id: "turn-1".into(),
@@ -2908,8 +2906,8 @@ mod tests {
                 content_items: vec![CoreDynamicToolCallOutputContentItem::InputText {
                     text: "Ticket is open".into(),
                 }],
-                success: true,
-                error: None,
+                success: false,
+                error: Some("dynamic tool call was cancelled".into()),
                 duration: Duration::from_millis(42),
             }),
         ];
@@ -2928,11 +2926,12 @@ mod tests {
                 namespace: Some("codex_app".into()),
                 tool: "lookup_ticket".into(),
                 arguments: serde_json::json!({"id":"ABC-123"}),
-                status: DynamicToolCallStatus::Completed,
+                status: DynamicToolCallStatus::Failed,
                 content_items: Some(vec![DynamicToolCallOutputContentItem::InputText {
                     text: "Ticket is open".into(),
                 }]),
-                success: Some(true),
+                success: Some(false),
+                error: Some("dynamic tool call was cancelled".into()),
                 duration_ms: Some(42),
             }
         );
@@ -2962,7 +2961,6 @@ mod tests {
                 turn_id: "turn-1".into(),
                 completed_at_ms: 0,
                 command: vec!["ls".into()],
-                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 parsed_cmd: vec![ParsedCommand::Unknown { cmd: "ls".into() }],
                 source: ExecCommandSource::Agent,
@@ -3005,7 +3003,6 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "exec-declined".into(),
                 command: "ls".into(),
-                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-2".into()),
                 source: CommandExecutionSource::Agent,
@@ -3104,7 +3101,6 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "guardian-exec".into(),
                 command: "rm -rf /tmp/guardian".into(),
-                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
                 source: CommandExecutionSource::Agent,
@@ -3171,7 +3167,6 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "guardian-execve".into(),
                 command: "/bin/rm -f /tmp/file.sqlite".into(),
-                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: None,
                 source: CommandExecutionSource::Agent,
@@ -3235,7 +3230,6 @@ mod tests {
                 turn_id: "turn-a".into(),
                 completed_at_ms: 0,
                 command: vec!["echo".into(), "done".into()],
-                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo done".into(),
@@ -3277,7 +3271,6 @@ mod tests {
             ThreadItem::CommandExecution {
                 id: "exec-late".into(),
                 command: "echo done".into(),
-                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 process_id: Some("pid-42".into()),
                 source: CommandExecutionSource::Agent,
@@ -3341,7 +3334,6 @@ mod tests {
                 turn_id: "turn-missing".into(),
                 completed_at_ms: 0,
                 command: vec!["echo".into(), "done".into()],
-                display_label: None,
                 cwd: test_path_buf("/tmp").abs().into(),
                 parsed_cmd: vec![ParsedCommand::Unknown {
                     cmd: "echo done".into(),

@@ -554,6 +554,7 @@ function Test-PackageContentsAreComplete {
     $expectedFiles = @(
         "codex-package.json",
         "bin\codex.exe",
+        "bin\codex-code-mode-host.exe",
         "codex-path\apply_patch.bat",
         "codex-path\applypatch.bat",
         "codex-path\rg.exe",

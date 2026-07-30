@@ -531,24 +531,6 @@ impl TurnRequestProcessor {
             );
             return Err(error);
         }
-        Self::set_app_server_client_info(
-            thread.as_ref(),
-            app_server_client_name,
-            app_server_client_version,
-        )
-        .await
-        .inspect_err(|error| {
-            self.track_error_response(&request_id, error, /*error_type*/ None);
-        })?;
-        thread
-            .set_openai_form_elicitation_support(supports_openai_form_elicitation)
-            .await
-            .map_err(|err| {
-                internal_error(format!(
-                    "failed to update OpenAI form elicitation support: {err}"
-                ))
-            })?;
-
         let environment_selections =
             resolve_turn_environment_selections(self.thread_manager.as_ref(), params.environments)?;
 
@@ -584,6 +566,26 @@ impl TurnRequestProcessor {
                 },
             )
             .await?;
+
+        // Finish fallible request preflight before applying connection capabilities to shared
+        // thread and MCP state. A rejected turn must leave the active thread unchanged.
+        Self::set_app_server_client_info(
+            thread.as_ref(),
+            app_server_client_name,
+            app_server_client_version,
+        )
+        .await
+        .inspect_err(|error| {
+            self.track_error_response(&request_id, error, /*error_type*/ None);
+        })?;
+        thread
+            .set_openai_form_elicitation_support(supports_openai_form_elicitation)
+            .await
+            .map_err(|err| {
+                internal_error(format!(
+                    "failed to update OpenAI form elicitation support: {err}"
+                ))
+            })?;
 
         // Start the turn by submitting the user input. Return its submission id as turn_id.
         let turn_op = Op::UserInput {

@@ -95,6 +95,95 @@ mod background_terminal_pagination_tests {
     }
 }
 
+mod failed_fork_cleanup_tests {
+    use super::super::should_finalize_failed_fork;
+
+    #[test]
+    fn finalizes_when_spawn_rollback_reports_already_removed() {
+        assert!(should_finalize_failed_fork(
+            /*rollback_succeeded*/ false, /*thread_id_still_loaded*/ false,
+        ));
+    }
+
+    #[test]
+    fn preserves_cleanup_state_for_a_replacement_thread() {
+        assert!(!should_finalize_failed_fork(
+            /*rollback_succeeded*/ false, /*thread_id_still_loaded*/ true,
+        ));
+    }
+}
+
+mod reconstructed_thread_item_pagination_tests {
+    use super::super::ReconstructedThreadItem;
+    use super::super::paginate_reconstructed_thread_items;
+    use codex_app_server_protocol::SortDirection;
+    use codex_app_server_protocol::ThreadItem;
+    use codex_app_server_protocol::UserInput;
+    use pretty_assertions::assert_eq;
+
+    fn item(turn_id: &str, item_id: &str) -> ReconstructedThreadItem {
+        ReconstructedThreadItem {
+            turn_id: turn_id.to_string(),
+            item: ThreadItem::UserMessage {
+                id: item_id.to_string(),
+                client_id: None,
+                content: vec![UserInput::Text {
+                    text: item_id.to_string(),
+                    text_elements: Vec::new(),
+                }],
+            },
+        }
+    }
+
+    fn items() -> Vec<ReconstructedThreadItem> {
+        vec![
+            item("turn-1", "item-1"),
+            item("turn-1", "item-2"),
+            item("turn-2", "item-3"),
+        ]
+    }
+
+    fn item_ids(items: &[ThreadItem]) -> Vec<&str> {
+        items.iter().map(ThreadItem::id).collect()
+    }
+
+    #[test]
+    fn paginates_forward_backward_and_rejects_removed_anchor() {
+        let first_page = paginate_reconstructed_thread_items(items(), None, 2, SortDirection::Asc)
+            .expect("first page");
+        assert_eq!(item_ids(&first_page.data), vec!["item-1", "item-2"]);
+        assert!(first_page.backwards_cursor.is_some());
+        let next_cursor = first_page.next_cursor.expect("next cursor");
+
+        let second_page =
+            paginate_reconstructed_thread_items(items(), Some(&next_cursor), 2, SortDirection::Asc)
+                .expect("second page");
+        assert_eq!(item_ids(&second_page.data), vec!["item-3"]);
+        assert!(second_page.next_cursor.is_none());
+        let backwards_cursor = second_page.backwards_cursor.expect("backwards cursor");
+
+        let backwards_page = paginate_reconstructed_thread_items(
+            items(),
+            Some(&backwards_cursor),
+            2,
+            SortDirection::Desc,
+        )
+        .expect("backwards page");
+        assert_eq!(item_ids(&backwards_page.data), vec!["item-3", "item-2"]);
+
+        let removed_anchor_items = vec![item("turn-1", "item-1"), item("turn-1", "item-2")];
+        assert!(
+            paginate_reconstructed_thread_items(
+                removed_anchor_items,
+                Some(&backwards_cursor),
+                2,
+                SortDirection::Desc,
+            )
+            .is_err()
+        );
+    }
+}
+
 mod thread_processor_behavior_tests {
     async fn forked_from_id_from_rollout(path: &Path) -> Option<String> {
         codex_core::read_session_meta_line(path)

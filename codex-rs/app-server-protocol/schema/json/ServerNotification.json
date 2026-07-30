@@ -1640,11 +1640,15 @@
     },
     "FuzzyFileSearchSessionCompletedNotification": {
       "properties": {
+        "query": {
+          "type": "string"
+        },
         "sessionId": {
           "type": "string"
         }
       },
       "required": [
+        "query",
         "sessionId"
       ],
       "type": "object"
@@ -4365,6 +4369,12 @@
               "format": "int64",
               "type": [
                 "integer",
+                "null"
+              ]
+            },
+            "error": {
+              "type": [
+                "string",
                 "null"
               ]
             },

@@ -20,8 +20,9 @@ use serde::de::DeserializeOwned;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::time::Instant;
-use tokio::time::sleep;
+use tokio::time::sleep_until;
 use tokio::time::timeout;
+use tokio::time::timeout_at;
 use tokio_tungstenite::WebSocketStream;
 
 use crate::RemoteControlReadyStatus;
@@ -30,6 +31,7 @@ use crate::client;
 const REMOTE_CONTROL_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const REMOTE_CONTROL_REQUEST_ID: RequestId = RequestId::Integer(2);
 const INVALID_PARAMS_ERROR_CODE: i64 = -32602;
+const MIN_CONNECT_RETRY_DELAY: Duration = Duration::from_millis(1);
 
 enum RemoteControlRpcResponse<T> {
     Success(T),
@@ -196,18 +198,37 @@ async fn connect_with_retry(
 ) -> Result<WebSocketStream<codex_uds::UnixStream>> {
     let deadline = Instant::now() + connect_timeout;
     loop {
-        match client::connect(socket_path).await {
-            Ok(websocket) => return Ok(websocket),
-            Err(_) if Instant::now() < deadline => {
-                sleep(connect_retry_delay).await;
+        match timeout_at(deadline, client::connect(socket_path)).await {
+            Ok(Ok(websocket)) => return Ok(websocket),
+            Ok(Err(error)) if Instant::now() < deadline => {
+                let retry_delay = connect_retry_delay.max(MIN_CONNECT_RETRY_DELAY);
+                let retry_at = Instant::now()
+                    .checked_add(retry_delay)
+                    .unwrap_or(deadline)
+                    .min(deadline);
+                sleep_until(retry_at).await;
+                if retry_at == deadline {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "app server did not become ready on {}",
+                            socket_path.display()
+                        )
+                    });
+                }
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 return Err(error).with_context(|| {
                     format!(
                         "app server did not become ready on {}",
                         socket_path.display()
                     )
                 });
+            }
+            Err(_) => {
+                return Err(anyhow!(
+                    "timed out connecting to app server on {}",
+                    socket_path.display()
+                ));
             }
         }
     }
@@ -365,6 +386,51 @@ mod tests {
     const TEST_INSTALLATION_ID: &str = "11111111-1111-4111-8111-111111111111";
     const TEST_SERVER_NAME: &str = "owen-mbp";
     const TEST_CODEX_HOME: &str = "/tmp/codex-home";
+
+    #[tokio::test]
+    async fn connect_with_retry_bounds_websocket_upgrade() -> Result<()> {
+        let dir = TempDir::new()?;
+        let socket_path = dir.path().join("app-server.sock");
+        let mut listener = UnixListener::bind(&socket_path).await?;
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let _stream = listener.accept().await?;
+            accepted_tx
+                .send(())
+                .map_err(|()| anyhow!("client dropped before the socket was accepted"))?;
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            Ok::<_, anyhow::Error>(())
+        });
+
+        let client_socket_path = socket_path.clone();
+        let client_task = tokio::spawn(async move {
+            connect_with_retry(
+                &client_socket_path,
+                Duration::from_millis(100),
+                Duration::from_millis(10),
+            )
+            .await
+        });
+        timeout(Duration::from_secs(1), accepted_rx)
+            .await
+            .context("client did not connect to the stale server")??;
+
+        let result = timeout(Duration::from_secs(1), client_task)
+            .await
+            .context("WebSocket upgrade outlived the connection deadline")??;
+        let error = match result {
+            Ok(_) => panic!("stale server unexpectedly completed the WebSocket upgrade"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("timed out connecting to app server"),
+            "unexpected error: {error:#}"
+        );
+
+        server_task.abort();
+        Ok(())
+    }
 
     #[tokio::test]
     async fn enable_remote_control_uses_connected_enable_response_without_later_notification()

@@ -110,6 +110,12 @@ fn evidence_meta_v1_rejects_invalid_contract_values() {
     let mut truncated_complete = provider_example();
     truncated_complete["evidenceMeta"]["truncated"] = json!(true);
 
+    let mut missing_snapshot = provider_example();
+    missing_snapshot["evidenceMeta"]
+        .as_object_mut()
+        .expect("evidenceMeta should be an object")
+        .remove("snapshot");
+
     let mut empty_limitation = provider_example();
     empty_limitation["evidenceMeta"]["limitations"] = json!([""]);
 
@@ -134,6 +140,7 @@ fn evidence_meta_v1_rejects_invalid_contract_values() {
         invalid_completeness,
         non_string_limitation,
         truncated_complete,
+        missing_snapshot,
         empty_limitation,
         empty_snapshot,
         blank_limitation,
