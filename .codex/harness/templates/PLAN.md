@@ -17,6 +17,19 @@ List what this task intentionally will not change.
 
 ## Scope
 
+Preflight receipt:
+
+- Root task ID:
+- Assignment ID:
+- Starting revision:
+- Named contract claims:
+- Path claims:
+- Dependencies:
+- Generated-output owner:
+- Validation owner:
+- Cargo target lane:
+- Workspace strategy:
+
 Owner files and directories to inspect:
 
 - <owner file or directory>

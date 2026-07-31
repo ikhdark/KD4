@@ -1,6 +1,8 @@
 use std::fmt;
 use std::fs::File;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
@@ -17,6 +19,9 @@ const ARTIFACT_EXPIRED_MESSAGE: &str = "artifact expired or does not belong to t
 const ARTIFACT_WRITING_MESSAGE: &str =
     "artifact is still being written; retry after the command yields or exits";
 const EVIDENCE_PROTECTION_EXTENSION: &str = "evidence-protected";
+const MAX_RAW_OUTPUT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
+const MAX_RETAINED_ARTIFACT_BYTES_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
 
 pub(crate) fn max_retained_artifacts_per_thread() -> usize {
     128
@@ -49,12 +54,14 @@ impl FromStr for ToolOutputArtifactId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) enum RawOutputArtifact {
     Stored {
         id: ToolOutputArtifactId,
         path: PathBuf,
         bytes: u64,
+        truncated: bool,
+        handle: Arc<File>,
     },
     Failed {
         id: Option<ToolOutputArtifactId>,
@@ -64,57 +71,121 @@ pub(crate) enum RawOutputArtifact {
     },
 }
 
+impl PartialEq for RawOutputArtifact {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Stored {
+                    id: left_id,
+                    path: left_path,
+                    bytes: left_bytes,
+                    truncated: left_truncated,
+                    ..
+                },
+                Self::Stored {
+                    id: right_id,
+                    path: right_path,
+                    bytes: right_bytes,
+                    truncated: right_truncated,
+                    ..
+                },
+            ) => {
+                left_id == right_id
+                    && left_path == right_path
+                    && left_bytes == right_bytes
+                    && left_truncated == right_truncated
+            }
+            (
+                Self::Failed {
+                    id: left_id,
+                    message: left_message,
+                    owned_path: left_path,
+                    bytes: left_bytes,
+                },
+                Self::Failed {
+                    id: right_id,
+                    message: right_message,
+                    owned_path: right_path,
+                    bytes: right_bytes,
+                },
+            ) => {
+                left_id == right_id
+                    && left_message == right_message
+                    && left_path == right_path
+                    && left_bytes == right_bytes
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for RawOutputArtifact {}
+
 pub(crate) struct RawOutputArtifactWriter {
     id: Option<ToolOutputArtifactId>,
     path: Option<PathBuf>,
     file: Option<tokio::fs::File>,
     bytes: u64,
+    truncated: bool,
+    handle: Option<Arc<File>>,
 }
 
 impl RawOutputArtifactWriter {
     pub(crate) async fn open(state: Option<&Arc<Mutex<RawOutputArtifact>>>) -> Option<Self> {
         let state = state?;
         let artifact = state.lock().await.clone();
-        let RawOutputArtifact::Stored { id, path, bytes } = artifact else {
+        let RawOutputArtifact::Stored {
+            id,
+            path,
+            bytes,
+            truncated,
+            handle,
+        } = artifact
+        else {
             return Some(Self {
                 id: None,
                 path: None,
                 file: None,
                 bytes: 0,
+                truncated: false,
+                handle: None,
             });
         };
-        match tokio::fs::OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&path)
-            .await
-        {
-            Ok(file) => match lock_output_file(file).await {
-                Ok(file) => Some(Self {
-                    id: Some(id),
-                    path: Some(path),
-                    file: Some(file),
-                    bytes,
-                }),
-                Err(err) => {
-                    enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path).await;
-                    *state.lock().await = RawOutputArtifact::Failed {
-                        id: artifact_id_from_path(&path),
-                        message: format!(
-                            "failed to lock `{}` for streaming: {err}",
-                            path.display()
-                        ),
-                        owned_path: Some(path.clone()),
-                        bytes,
-                    };
-                    Some(Self {
+        match lock_artifact_handle(&handle, SeekFrom::End(0)) {
+            Ok(file) => {
+                let file = tokio::fs::File::from_std(file);
+                match lock_output_file(file).await {
+                    Ok(file) => Some(Self {
                         id: Some(id),
                         path: Some(path),
-                        file: None,
+                        file: Some(file),
                         bytes,
-                    })
+                        truncated,
+                        handle: Some(handle),
+                    }),
+                    Err(err) => {
+                        enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path)
+                            .await;
+                        *state.lock().await = RawOutputArtifact::Failed {
+                            id: artifact_id_from_path(&path),
+                            message: format!(
+                                "failed to lock `{}` for streaming: {err}",
+                                path.display()
+                            ),
+                            owned_path: Some(path.clone()),
+                            bytes,
+                        };
+                        Some(Self {
+                            id: Some(id),
+                            path: Some(path),
+                            file: None,
+                            bytes,
+                            truncated,
+                            handle: Some(handle),
+                        })
+                    }
                 }
-            },
+            }
             Err(err) => {
                 enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), &path).await;
                 *state.lock().await = RawOutputArtifact::Failed {
@@ -128,6 +199,8 @@ impl RawOutputArtifactWriter {
                     path: Some(path),
                     file: None,
                     bytes,
+                    truncated,
+                    handle: Some(handle),
                 })
             }
         }
@@ -144,8 +217,13 @@ impl RawOutputArtifactWriter {
         let Some(file) = self.file.as_mut() else {
             return;
         };
-        if let Err(err) = file.write_all(output).await {
-            self.file = None;
+        let remaining = MAX_RAW_OUTPUT_ARTIFACT_BYTES.saturating_sub(self.bytes as usize);
+        let retained = &output[..output.len().min(remaining)];
+        self.truncated |= retained.len() != output.len();
+        if let Err(err) = file.write_all(retained).await {
+            if let Some(file) = self.file.take() {
+                let _ = unlock_output_file(file).await;
+            }
             *state.lock().await = failed_with_owned_path(
                 path.clone(),
                 self.bytes,
@@ -154,11 +232,16 @@ impl RawOutputArtifactWriter {
             .await;
             return;
         }
-        self.bytes = self.bytes.saturating_add(output.len() as u64);
+        self.bytes = self.bytes.saturating_add(retained.len() as u64);
+        let Some(handle) = self.handle.clone() else {
+            return;
+        };
         *state.lock().await = RawOutputArtifact::Stored {
             id,
             path,
             bytes: self.bytes,
+            truncated: self.truncated,
+            handle,
         };
     }
 
@@ -169,13 +252,33 @@ impl RawOutputArtifactWriter {
             return;
         };
         if let Err(err) = file.flush().await {
-            drop(file);
+            let _ = unlock_output_file(file).await;
             *state.lock().await = failed_with_owned_path(
                 path.clone(),
                 self.bytes,
                 format!("failed to flush `{}`: {err}", path.display()),
             )
             .await;
+            return;
+        }
+        if let Err(err) = unlock_output_file(file).await {
+            *state.lock().await = failed_with_owned_path(
+                path.clone(),
+                self.bytes,
+                format!("failed to unlock `{}`: {err}", path.display()),
+            )
+            .await;
+        }
+    }
+}
+
+impl Drop for RawOutputArtifactWriter {
+    fn drop(&mut self) {
+        let Some(file) = self.file.take() else {
+            return;
+        };
+        if let Ok(file) = file.try_into_std() {
+            let _ = file.unlock();
         }
     }
 }
@@ -184,6 +287,17 @@ async fn lock_output_file(file: tokio::fs::File) -> std::io::Result<tokio::fs::F
     let file = file.into_std().await;
     file.try_lock()?;
     Ok(tokio::fs::File::from_std(file))
+}
+
+async fn unlock_output_file(file: tokio::fs::File) -> std::io::Result<()> {
+    let file = file.into_std().await;
+    file.unlock()
+}
+
+fn lock_artifact_handle(handle: &Arc<File>, position: SeekFrom) -> std::io::Result<File> {
+    let mut file = handle.try_clone()?;
+    file.seek(position)?;
+    Ok(file)
 }
 
 impl RawOutputArtifact {
@@ -198,8 +312,18 @@ impl RawOutputArtifact {
 
     pub(crate) fn render_for_model(&self) -> String {
         match self {
-            Self::Stored { id, bytes, .. } => {
-                format!("Raw output artifact: {id} ({bytes} bytes retained)")
+            Self::Stored {
+                id,
+                bytes,
+                truncated,
+                ..
+            } => {
+                let suffix = if *truncated {
+                    ", truncated at safety limit"
+                } else {
+                    ""
+                };
+                format!("Raw output artifact: {id} ({bytes} bytes retained{suffix})")
             }
             Self::Failed {
                 id: Some(id),
@@ -224,14 +348,25 @@ impl RawOutputArtifact {
     }
 
     pub(crate) fn reduction_notice(&self) -> Option<String> {
-        let Self::Stored { id, path, .. } = self else {
+        let Self::Stored {
+            id,
+            path,
+            truncated,
+            ..
+        } = self
+        else {
             return None;
         };
         if open_regular_artifact(path).is_err() {
             return None;
         }
+        let scope = if *truncated {
+            "the retained output prefix (the artifact reached its safety limit)"
+        } else {
+            "full retained output"
+        };
         Some(format!(
-            "[command output reduced; full retained output is available as artifact {id}.\nUse read_tool_output with that id and a narrow line range.]"
+            "[command output reduced; {scope} is available as artifact {id}.\nUse read_tool_output with that id and a narrow line range.]"
         ))
     }
 
@@ -258,6 +393,8 @@ pub(crate) async fn create_raw_output_artifact(
 
     let id = ToolOutputArtifactId::new();
     let path = directory.join(format!("{id}.log"));
+    let retained = &output[..output.len().min(MAX_RAW_OUTPUT_ARTIFACT_BYTES)];
+    let truncated = retained.len() != output.len();
     match tokio::fs::OpenOptions::new()
         .create_new(true)
         .read(true)
@@ -277,8 +414,8 @@ pub(crate) async fn create_raw_output_artifact(
                     .await;
                 }
             };
-            if let Err(err) = file.write_all(output).await {
-                drop(file);
+            if let Err(err) = file.write_all(retained).await {
+                let _ = unlock_output_file(file).await;
                 return failed_with_owned_path(
                     path.clone(),
                     0,
@@ -287,20 +424,24 @@ pub(crate) async fn create_raw_output_artifact(
                 .await;
             }
             if let Err(err) = file.flush().await {
-                drop(file);
+                let _ = unlock_output_file(file).await;
                 return failed_with_owned_path(
                     path.clone(),
-                    output.len() as u64,
+                    retained.len() as u64,
                     format!("failed to flush `{}`: {err}", path.display()),
                 )
                 .await;
             }
-            drop(file);
+            let file = file.into_std().await;
+            let _ = file.unlock();
+            let handle = Arc::new(file);
             enforce_retention(&directory, &path).await;
             RawOutputArtifact::Stored {
                 id,
                 path,
-                bytes: output.len() as u64,
+                bytes: retained.len() as u64,
+                truncated,
+                handle,
             }
         }
         Err(err) => {
@@ -315,6 +456,12 @@ pub(crate) async fn create_evidence_output_artifact(
     thread_id: &str,
     output: &[u8],
 ) -> Result<PendingEvidenceArtifact, String> {
+    if output.len() > MAX_RAW_OUTPUT_ARTIFACT_BYTES {
+        return Err(format!(
+            "evidence output exceeds the {} byte artifact safety limit",
+            MAX_RAW_OUTPUT_ARTIFACT_BYTES
+        ));
+    }
     create_evidence_output_artifact_inner(codex_home, thread_id, output, None).await
 }
 
@@ -324,10 +471,24 @@ async fn create_evidence_output_artifact_inner(
     output: &[u8],
     pre_marker_barrier: Option<&tokio::sync::Barrier>,
 ) -> Result<PendingEvidenceArtifact, String> {
+    if output.len() > MAX_RAW_OUTPUT_ARTIFACT_BYTES {
+        return Err(format!(
+            "evidence output exceeds the {} byte artifact safety limit",
+            MAX_RAW_OUTPUT_ARTIFACT_BYTES
+        ));
+    }
     let directory = codex_home.join("tool-output").join(thread_id);
     let retention_permit = retention_sweep_permit().await;
     std::fs::create_dir_all(&directory)
         .map_err(|err| format!("failed to create `{}`: {err}", directory.display()))?;
+    let thread_bytes = log_bytes_in_directory(&directory).await;
+    let global_bytes =
+        log_bytes_in_tool_output_root(directory.parent().unwrap_or_else(|| Path::new("."))).await;
+    if thread_bytes.saturating_add(output.len() as u64) > MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD
+        || global_bytes.saturating_add(output.len() as u64) > MAX_RETAINED_ARTIFACT_BYTES_TOTAL
+    {
+        return Err("evidence artifact retention budget is exhausted".to_string());
+    }
 
     let id = ToolOutputArtifactId::new();
     let path = directory.join(format!("{id}.log"));
@@ -363,11 +524,14 @@ async fn create_evidence_output_artifact_inner(
     create_new_evidence_protection_marker(&marker)
         .map_err(|err| format!("failed to protect `{}` as evidence: {err}", path.display()))?;
 
-    drop(file);
+    let file = file.into_std().await;
+    let _ = file.unlock();
+    let handle = Arc::new(file);
     Ok(PendingEvidenceArtifact {
         id,
         path,
         bytes: output.len() as u64,
+        handle,
         cleanup,
         retention_permit: Some(retention_permit),
     })
@@ -377,6 +541,7 @@ pub(crate) struct PendingEvidenceArtifact {
     id: ToolOutputArtifactId,
     path: PathBuf,
     bytes: u64,
+    handle: Arc<File>,
     cleanup: PendingEvidenceArtifactCleanup,
     retention_permit: Option<SemaphorePermit<'static>>,
 }
@@ -393,6 +558,8 @@ impl PendingEvidenceArtifact {
             id: self.id,
             path: self.path.clone(),
             bytes: self.bytes,
+            truncated: false,
+            handle: self.handle.clone(),
         }
     }
 }
@@ -551,17 +718,20 @@ pub(crate) async fn append_raw_output_artifact(
     artifact: &RawOutputArtifact,
     output: &[u8],
 ) -> RawOutputArtifact {
-    let RawOutputArtifact::Stored { id, path, bytes } = artifact else {
+    let RawOutputArtifact::Stored {
+        id,
+        path,
+        bytes,
+        truncated,
+        handle,
+    } = artifact
+    else {
         return artifact.clone();
     };
 
-    match tokio::fs::OpenOptions::new()
-        .read(true)
-        .append(true)
-        .open(path)
-        .await
-    {
+    match lock_artifact_handle(handle, SeekFrom::End(0)) {
         Ok(file) => {
+            let file = tokio::fs::File::from_std(file);
             let mut file = match lock_output_file(file).await {
                 Ok(file) => file,
                 Err(err) => {
@@ -573,7 +743,10 @@ pub(crate) async fn append_raw_output_artifact(
                     .await;
                 }
             };
-            if let Err(err) = file.write_all(output).await {
+            let remaining = MAX_RAW_OUTPUT_ARTIFACT_BYTES.saturating_sub(*bytes as usize);
+            let retained = &output[..output.len().min(remaining)];
+            let truncated = *truncated || retained.len() != output.len();
+            if let Err(err) = file.write_all(retained).await {
                 drop(file);
                 return failed_with_owned_path(
                     path.clone(),
@@ -586,25 +759,35 @@ pub(crate) async fn append_raw_output_artifact(
                 drop(file);
                 return failed_with_owned_path(
                     path.clone(),
-                    (*bytes).saturating_add(output.len() as u64),
+                    (*bytes).saturating_add(retained.len() as u64),
                     format!("failed to flush `{}`: {err}", path.display()),
                 )
                 .await;
             }
-            match file.metadata().await {
+            let metadata = file.metadata().await;
+            if let Err(err) = unlock_output_file(file).await {
+                return failed_with_owned_path(
+                    path.clone(),
+                    (*bytes).saturating_add(retained.len() as u64),
+                    format!("failed to unlock `{}` after append: {err}", path.display()),
+                )
+                .await;
+            }
+            match metadata {
                 Ok(metadata) => {
                     enforce_retention(path.parent().unwrap_or_else(|| Path::new(".")), path).await;
                     RawOutputArtifact::Stored {
                         id: *id,
                         path: path.clone(),
                         bytes: metadata.len(),
+                        truncated,
+                        handle: handle.clone(),
                     }
                 }
                 Err(err) => {
-                    drop(file);
                     failed_with_owned_path(
                         path.clone(),
-                        (*bytes).saturating_add(output.len() as u64),
+                        (*bytes).saturating_add(retained.len() as u64),
                         format!("failed to stat `{}` after append: {err}", path.display()),
                     )
                     .await
@@ -626,17 +809,20 @@ pub(crate) async fn replace_raw_output_artifact(
     artifact: &RawOutputArtifact,
     output: &[u8],
 ) -> RawOutputArtifact {
-    let RawOutputArtifact::Stored { id, path, bytes } = artifact else {
+    let RawOutputArtifact::Stored {
+        id,
+        path,
+        bytes,
+        handle,
+        ..
+    } = artifact
+    else {
         return artifact.clone();
     };
 
-    match tokio::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .await
-    {
+    match lock_artifact_handle(handle, SeekFrom::Start(0)) {
         Ok(file) => {
+            let file = tokio::fs::File::from_std(file);
             let mut file = match lock_output_file(file).await {
                 Ok(file) => file,
                 Err(err) => {
@@ -648,8 +834,10 @@ pub(crate) async fn replace_raw_output_artifact(
                     .await;
                 }
             };
+            let retained = &output[..output.len().min(MAX_RAW_OUTPUT_ARTIFACT_BYTES)];
+            let truncated = retained.len() != output.len();
             if let Err(err) = file.set_len(0).await {
-                drop(file);
+                let _ = unlock_output_file(file).await;
                 return failed_with_owned_path(
                     path.clone(),
                     *bytes,
@@ -660,8 +848,8 @@ pub(crate) async fn replace_raw_output_artifact(
                 )
                 .await;
             }
-            if let Err(err) = file.write_all(output).await {
-                drop(file);
+            if let Err(err) = file.write_all(retained).await {
+                let _ = unlock_output_file(file).await;
                 return failed_with_owned_path(
                     path.clone(),
                     0,
@@ -670,11 +858,22 @@ pub(crate) async fn replace_raw_output_artifact(
                 .await;
             }
             if let Err(err) = file.flush().await {
-                drop(file);
+                let _ = unlock_output_file(file).await;
                 return failed_with_owned_path(
                     path.clone(),
-                    output.len() as u64,
+                    retained.len() as u64,
                     format!("failed to flush `{}`: {err}", path.display()),
+                )
+                .await;
+            }
+            if let Err(err) = unlock_output_file(file).await {
+                return failed_with_owned_path(
+                    path.clone(),
+                    retained.len() as u64,
+                    format!(
+                        "failed to unlock `{}` after replacement: {err}",
+                        path.display()
+                    ),
                 )
                 .await;
             }
@@ -682,7 +881,9 @@ pub(crate) async fn replace_raw_output_artifact(
             RawOutputArtifact::Stored {
                 id: *id,
                 path: path.clone(),
-                bytes: output.len() as u64,
+                bytes: retained.len() as u64,
+                truncated,
+                handle: handle.clone(),
             }
         }
         Err(err) => {
@@ -975,32 +1176,40 @@ async fn enforce_retention_locked(directory: &Path, keep_path: &Path) {
         return;
     };
     let mut paths = Vec::new();
+    let mut total_bytes = 0_u64;
     loop {
         let entry = match entries.next_entry().await {
             Ok(Some(entry)) => entry,
             Ok(None) | Err(_) => break,
         };
         let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) == Some("log")
-            && !evidence_artifact_is_protected(&path).await
-        {
-            paths.push(path);
+        if path.extension().and_then(|extension| extension.to_str()) == Some("log") {
+            let bytes = entry.metadata().await.map_or(0, |metadata| metadata.len());
+            total_bytes = total_bytes.saturating_add(bytes);
+            paths.push((
+                path.clone(),
+                bytes,
+                evidence_artifact_is_protected(&path).await,
+            ));
         }
     }
-    paths.sort_unstable();
+    paths.sort_unstable_by(|(left, ..), (right, ..)| left.cmp(right));
 
     let mut remove_count = paths
-        .len()
+        .iter()
+        .filter(|(_, _, protected)| !protected)
+        .count()
         .saturating_sub(max_retained_artifacts_per_thread());
-    for path in paths {
-        if remove_count == 0 {
+    for (path, bytes, protected) in paths {
+        if remove_count == 0 && total_bytes <= MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD {
             break;
         }
-        if path == keep_path {
+        if path == keep_path || protected {
             continue;
         }
         if remove_inactive_output_path(path).await {
-            remove_count -= 1;
+            remove_count = remove_count.saturating_sub(1);
+            total_bytes = total_bytes.saturating_sub(bytes);
         }
     }
 
@@ -1020,6 +1229,7 @@ async fn enforce_global_retention_locked(tool_output_root: &Path, keep_path: &Pa
         return;
     };
     let mut paths = Vec::new();
+    let mut total_bytes = 0_u64;
     loop {
         let thread_directory = match thread_directories.next_entry().await {
             Ok(Some(entry)) => entry.path(),
@@ -1034,33 +1244,71 @@ async fn enforce_global_retention_locked(tool_output_root: &Path, keep_path: &Pa
                 Ok(None) | Err(_) => break,
             };
             let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) == Some("log")
-                && !evidence_artifact_is_protected(&path).await
-            {
-                let modified = entry
-                    .metadata()
-                    .await
-                    .ok()
+            if path.extension().and_then(|extension| extension.to_str()) == Some("log") {
+                let metadata = entry.metadata().await.ok();
+                let bytes = metadata.as_ref().map_or(0, |metadata| metadata.len());
+                total_bytes = total_bytes.saturating_add(bytes);
+                let modified = metadata
                     .and_then(|metadata| metadata.modified().ok())
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                paths.push((modified, path));
+                paths.push((
+                    modified,
+                    path.clone(),
+                    bytes,
+                    evidence_artifact_is_protected(&path).await,
+                ));
             }
         }
     }
-    paths.sort_unstable_by(|(left_time, left_path), (right_time, right_path)| {
+    paths.sort_unstable_by(|(left_time, left_path, ..), (right_time, right_path, ..)| {
         left_time
             .cmp(right_time)
             .then_with(|| left_path.cmp(right_path))
     });
-    let mut remove_count = paths.len().saturating_sub(max_retained_artifacts_total());
-    for (_, path) in paths {
-        if remove_count == 0 {
+    let mut remove_count = paths
+        .iter()
+        .filter(|(_, _, _, protected)| !protected)
+        .count()
+        .saturating_sub(max_retained_artifacts_total());
+    for (_, path, bytes, protected) in paths {
+        if remove_count == 0 && total_bytes <= MAX_RETAINED_ARTIFACT_BYTES_TOTAL {
             break;
         }
-        if path != keep_path && remove_inactive_output_path(path).await {
-            remove_count -= 1;
+        if !protected && path != keep_path && remove_inactive_output_path(path).await {
+            remove_count = remove_count.saturating_sub(1);
+            total_bytes = total_bytes.saturating_sub(bytes);
         }
     }
+}
+
+async fn log_bytes_in_directory(directory: &Path) -> u64 {
+    let Ok(mut entries) = tokio::fs::read_dir(directory).await else {
+        return 0;
+    };
+    let mut bytes = 0_u64;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.path().extension().and_then(|value| value.to_str()) == Some("log") {
+            bytes = bytes.saturating_add(entry.metadata().await.map_or(0, |meta| meta.len()));
+        }
+    }
+    bytes
+}
+
+async fn log_bytes_in_tool_output_root(root: &Path) -> u64 {
+    let Ok(mut entries) = tokio::fs::read_dir(root).await else {
+        return 0;
+    };
+    let mut bytes = 0_u64;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry
+            .metadata()
+            .await
+            .is_ok_and(|metadata| metadata.is_dir())
+        {
+            bytes = bytes.saturating_add(log_bytes_in_directory(&entry.path()).await);
+        }
+    }
+    bytes
 }
 
 async fn retention_sweep_permit() -> SemaphorePermit<'static> {
@@ -1138,6 +1386,54 @@ mod tests {
         assert_eq!(
             tokio::fs::read(path).await.expect("read artifact"),
             final_output
+        );
+    }
+
+    #[tokio::test]
+    async fn artifact_creation_truncates_at_the_per_artifact_byte_limit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let oversized = vec![b'x'; MAX_RAW_OUTPUT_ARTIFACT_BYTES + 1];
+
+        let artifact = create_raw_output_artifact(temp.path(), "thread", &oversized).await;
+
+        let RawOutputArtifact::Stored {
+            path,
+            bytes,
+            truncated,
+            ..
+        } = artifact
+        else {
+            panic!("expected stored artifact");
+        };
+        assert_eq!(bytes, MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64);
+        assert!(truncated);
+        assert_eq!(
+            tokio::fs::metadata(path)
+                .await
+                .expect("artifact metadata")
+                .len(),
+            MAX_RAW_OUTPUT_ARTIFACT_BYTES as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn append_uses_the_original_handle_after_path_substitution() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let artifact = create_raw_output_artifact(temp.path(), "thread", b"original").await;
+        let RawOutputArtifact::Stored { path, .. } = &artifact else {
+            panic!("expected stored artifact");
+        };
+        let displaced = path.with_extension("displaced");
+        std::fs::rename(path, &displaced).expect("displace artifact path");
+        std::fs::write(path, b"substitute").expect("write substitute path");
+
+        let appended = append_raw_output_artifact(&artifact, b"-tail").await;
+
+        assert!(matches!(appended, RawOutputArtifact::Stored { .. }));
+        assert_eq!(std::fs::read(path).expect("read substitute"), b"substitute");
+        assert_eq!(
+            std::fs::read(displaced).expect("read original handle target"),
+            b"original-tail"
         );
     }
 

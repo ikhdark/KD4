@@ -25,6 +25,7 @@ pub(super) const CLOUD_CONFIG_BUNDLE_CACHE_FILENAME: &str = "cloud-config-bundle
 const CLOUD_CONFIG_BUNDLE_CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const CLOUD_CONFIG_BUNDLE_CACHE_WRITE_HMAC_KEY: &[u8] =
     b"codex-cloud-config-bundle-cache-v1-6160ae70-bcfd-4ca8-a99b-40f73b3b072e";
+#[cfg(test)]
 const CLOUD_CONFIG_BUNDLE_CACHE_READ_HMAC_KEYS: &[&[u8]] =
     &[CLOUD_CONFIG_BUNDLE_CACHE_WRITE_HMAC_KEY];
 
@@ -46,6 +47,7 @@ impl CloudConfigBundleCache {
         &self.path
     }
 
+    #[cfg(test)]
     pub(super) async fn load(
         &self,
         chatgpt_user_id: Option<&str>,
@@ -106,25 +108,6 @@ impl CloudConfigBundleCache {
         Ok(cache_file.signed_payload)
     }
 
-    pub(super) fn log_load_status(&self, status: &CacheLoadStatus) {
-        if matches!(status, CacheLoadStatus::CacheFileNotFound) {
-            return;
-        }
-
-        let warn = matches!(
-            status,
-            CacheLoadStatus::CacheReadFailed(_)
-                | CacheLoadStatus::CacheParseFailed(_)
-                | CacheLoadStatus::CacheSignatureInvalid
-        );
-
-        if warn {
-            tracing::warn!(path = %self.path.display(), "{status}");
-        } else {
-            tracing::info!(path = %self.path.display(), "{status}");
-        }
-    }
-
     pub(super) async fn save(
         &self,
         chatgpt_user_id: Option<String>,
@@ -167,6 +150,7 @@ impl CloudConfigBundleCache {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub(super) enum CacheLoadStatus {
     #[error("Skipping cloud config bundle cache read because auth identity is incomplete.")]
@@ -187,8 +171,6 @@ pub(super) enum CacheLoadStatus {
     CacheVersionUnsupported(u32),
     #[error("Cloud config bundle cache expired.")]
     CacheExpired,
-    #[error("Ignoring cloud config bundle cache because the cached bundle is invalid.")]
-    CacheInvalidBundle,
 }
 
 #[derive(Debug, Error)]
@@ -224,6 +206,7 @@ pub(super) fn sign_cache_payload(payload_bytes: &[u8]) -> Option<String> {
     Some(BASE64_STANDARD.encode(signature))
 }
 
+#[cfg(test)]
 pub(super) fn verify_cache_signature(payload_bytes: &[u8], signature: &str) -> bool {
     let signature_bytes = match BASE64_STANDARD.decode(signature) {
         Ok(signature_bytes) => signature_bytes,
@@ -235,6 +218,7 @@ pub(super) fn verify_cache_signature(payload_bytes: &[u8], signature: &str) -> b
         .any(|key| verify_cache_signature_with_key(payload_bytes, &signature_bytes, key))
 }
 
+#[cfg(test)]
 fn verify_cache_signature_with_key(
     payload_bytes: &[u8],
     signature_bytes: &[u8],

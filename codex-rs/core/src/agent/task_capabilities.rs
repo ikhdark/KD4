@@ -9,11 +9,11 @@ use codex_agent_task_store::RiskDomain;
 use codex_agent_task_store::RiskFacts;
 use codex_agent_task_store::RiskGateDecision;
 use codex_agent_task_store::evaluate_risk_gate;
+use codex_agent_task_store::repository_lineage_id;
+use codex_agent_task_store::repository_workspace_id;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
 use serde::Serialize;
-use sha2::Digest;
-use sha2::Sha256;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -103,6 +103,8 @@ pub(crate) enum CapabilityPolicyError {
     UnknownToolDenied,
     #[error("assignment repository {expected} does not match active repository {actual}")]
     RepositoryMismatch { expected: String, actual: String },
+    #[error("assignment workspace {expected} does not match active workspace {actual}")]
+    WorkspaceMismatch { expected: String, actual: String },
     #[error("assignment role {role:?} requires capability profile {expected:?}, got {actual:?}")]
     RoleProfileMismatch {
         role: codex_agent_task_store::AgentRole,
@@ -590,18 +592,26 @@ fn verify_assignment_authority(
             actual,
         });
     }
+    let actual_workspace = repository_workspace_id(repo_root).map_err(|error| {
+        CapabilityPolicyError::InvalidRepositoryRoot {
+            path: repo_root.to_string_lossy().into_owned(),
+            reason: error.to_string(),
+        }
+    })?;
+    if assignment.workspace_id != actual_workspace {
+        return Err(CapabilityPolicyError::WorkspaceMismatch {
+            expected: assignment.workspace_id.clone(),
+            actual: actual_workspace,
+        });
+    }
     Ok(())
 }
 
 fn repository_identity(repo_root: &Path) -> Result<String, CapabilityPolicyError> {
-    let canonical_root = canonical_repository_root(repo_root)?;
-    let canonical_path = canonical_root.to_string_lossy().into_owned();
-    let identity_input = if cfg!(windows) {
-        canonical_path.to_lowercase()
-    } else {
-        canonical_path
-    };
-    Ok(format!("{:x}", Sha256::digest(identity_input.as_bytes())))
+    repository_lineage_id(repo_root).map_err(|error| CapabilityPolicyError::InvalidRepositoryRoot {
+        path: repo_root.to_string_lossy().into_owned(),
+        reason: error.to_string(),
+    })
 }
 
 fn canonical_repository_root(repo_root: &Path) -> Result<PathBuf, CapabilityPolicyError> {

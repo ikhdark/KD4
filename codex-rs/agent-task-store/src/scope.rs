@@ -13,6 +13,7 @@ use crate::StoreResult;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RepositoryIdentity {
     pub id: String,
+    pub workspace_id: String,
     pub canonical_root: PathBuf,
     pub canonical_path: String,
 }
@@ -25,16 +26,71 @@ pub(crate) fn repository_identity(repo_root: &Path) -> StoreResult<RepositoryIde
         ))
     })?;
     let canonical_path = canonical_root.to_string_lossy().into_owned();
-    let identity_input = if cfg!(windows) {
+    let workspace_identity_input = if cfg!(windows) {
         canonical_path.to_lowercase()
     } else {
         canonical_path.clone()
     };
+    let repository_identity_input = git_common_directory(&canonical_root)
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .map(|path| path.to_string_lossy().into_owned())
+        .map(|path| {
+            if cfg!(windows) {
+                path.to_lowercase()
+            } else {
+                path
+            }
+        })
+        .unwrap_or_else(|| workspace_identity_input.clone());
     Ok(RepositoryIdentity {
-        id: format!("{:x}", Sha256::digest(identity_input.as_bytes())),
+        id: format!("{:x}", Sha256::digest(repository_identity_input.as_bytes())),
+        workspace_id: format!("{:x}", Sha256::digest(workspace_identity_input.as_bytes())),
         canonical_root,
         canonical_path,
     })
+}
+
+/// Stable repository-lineage identity shared by the coordination store and its callers.
+///
+/// Linked worktrees resolve to the same lineage through Git's common directory, while
+/// non-Git directories fall back to their canonical filesystem identity.
+pub fn repository_lineage_id(repo_root: &Path) -> StoreResult<String> {
+    Ok(repository_identity(repo_root)?.id)
+}
+
+/// Stable identity for one concrete checkout or linked worktree.
+pub fn repository_workspace_id(repo_root: &Path) -> StoreResult<String> {
+    Ok(repository_identity(repo_root)?.workspace_id)
+}
+
+fn git_common_directory(canonical_root: &Path) -> Option<PathBuf> {
+    let dot_git = canonical_root.join(".git");
+    if dot_git.is_dir() {
+        return Some(dot_git);
+    }
+    let marker = std::fs::read_to_string(&dot_git).ok()?;
+    let git_dir = marker
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gitdir:"))?
+        .trim();
+    let git_dir = Path::new(git_dir);
+    let git_dir = if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        canonical_root.join(git_dir)
+    };
+    let common = std::fs::read_to_string(git_dir.join("commondir")).ok();
+    match common {
+        Some(common) => {
+            let common = Path::new(common.trim());
+            Some(if common.is_absolute() {
+                common.to_path_buf()
+            } else {
+                git_dir.join(common)
+            })
+        }
+        None => Some(git_dir),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]

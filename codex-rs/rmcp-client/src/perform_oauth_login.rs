@@ -261,12 +261,15 @@ fn spawn_callback_server(
     server: Arc<Server>,
     tx: oneshot::Sender<CallbackResult>,
     expected_callback_path: String,
+    expected_csrf_state: String,
 ) {
     tokio::task::spawn_blocking(move || {
         while let Ok(request) = server.recv() {
             let path = request.url().to_string();
             match parse_oauth_callback(&path, &expected_callback_path) {
-                CallbackOutcome::Success(OauthCallbackResult { code, state }) => {
+                CallbackOutcome::Success(OauthCallbackResult { code, state })
+                    if state == expected_csrf_state =>
+                {
                     let response = Response::from_string(
                         "Authentication complete. You may close this window.",
                     );
@@ -280,7 +283,7 @@ fn spawn_callback_server(
                     }
                     break;
                 }
-                CallbackOutcome::Error(error) => {
+                CallbackOutcome::Error { error, state } if state == expected_csrf_state => {
                     let response = Response::from_string(error.to_string()).with_status_code(400);
                     if let Err(err) = request.respond(response) {
                         eprintln!("Failed to respond to OAuth callback: {err}");
@@ -290,7 +293,9 @@ fn spawn_callback_server(
                     }
                     break;
                 }
-                CallbackOutcome::Invalid => {
+                CallbackOutcome::Success(_)
+                | CallbackOutcome::Error { .. }
+                | CallbackOutcome::Invalid => {
                     let response =
                         Response::from_string("Invalid OAuth callback").with_status_code(400);
                     if let Err(err) = request.respond(response) {
@@ -317,7 +322,10 @@ enum CallbackResult {
 #[derive(Debug, PartialEq, Eq)]
 enum CallbackOutcome {
     Success(OauthCallbackResult),
-    Error(OAuthProviderError),
+    Error {
+        error: OAuthProviderError,
+        state: String,
+    },
     Invalid,
 }
 
@@ -351,12 +359,17 @@ fn parse_oauth_callback(path: &str, expected_callback_path: &str) -> CallbackOut
         }
     }
 
-    if let (Some(code), Some(state)) = (code, state) {
+    if let (Some(code), Some(state)) = (code, state.clone()) {
         return CallbackOutcome::Success(OauthCallbackResult { code, state });
     }
 
-    if error.is_some() || error_description.is_some() {
-        return CallbackOutcome::Error(OAuthProviderError::new(error, error_description));
+    if (error.is_some() || error_description.is_some())
+        && let Some(state) = state
+    {
+        return CallbackOutcome::Error {
+            error: OAuthProviderError::new(error, error_description),
+            state,
+        };
     }
 
     CallbackOutcome::Invalid
@@ -392,6 +405,7 @@ impl OauthLoginHandle {
 
 struct OauthLoginFlow {
     auth_url: String,
+    expected_csrf_state: String,
     oauth_state: OAuthState,
     rx: oneshot::Receiver<CallbackResult>,
     guard: CallbackServerGuard,
@@ -524,7 +538,6 @@ impl OauthLoginFlow {
         let callback_path = callback_path_from_redirect_uri(&redirect_uri)?;
 
         let (tx, rx) = oneshot::channel();
-        spawn_callback_server(server, tx, callback_path);
 
         let OAuthHttpContext {
             http_headers,
@@ -548,11 +561,23 @@ impl OauthLoginFlow {
             "resource",
             oauth_resource,
         );
+        let expected_csrf_state = Url::parse(&auth_url)
+            .context("OAuth authorization URL was invalid")?
+            .query_pairs()
+            .find_map(|(key, value)| (key == "state").then(|| value.into_owned()))
+            .ok_or_else(|| anyhow!("OAuth authorization URL did not include CSRF state"))?;
+        spawn_callback_server(
+            Arc::clone(&server),
+            tx,
+            callback_path,
+            expected_csrf_state.clone(),
+        );
         let timeout_secs = timeout_secs.unwrap_or(DEFAULT_OAUTH_TIMEOUT_SECS).max(1);
         let timeout = Duration::from_secs(timeout_secs as u64);
 
         Ok(Self {
             auth_url,
+            expected_csrf_state,
             oauth_state,
             rx,
             guard,
@@ -601,6 +626,10 @@ impl OauthLoginFlow {
                 CallbackResult::Success(callback) => callback,
                 CallbackResult::Error(error) => return Err(anyhow!(error)),
             };
+
+            if csrf_state != self.expected_csrf_state {
+                bail!("OAuth callback state did not match the authorization request");
+            }
 
             self.oauth_state
                 .handle_callback(&code, &csrf_state)
@@ -831,17 +860,26 @@ mod tests {
     #[test]
     fn parse_oauth_callback_returns_provider_error() {
         let parsed = parse_oauth_callback(
-            "/callback?error=invalid_scope&error_description=scope%20rejected",
+            "/callback?error=invalid_scope&error_description=scope%20rejected&state=xyz",
             "/callback",
         );
 
         assert_eq!(
             parsed,
-            CallbackOutcome::Error(OAuthProviderError::new(
-                Some("invalid_scope".to_string()),
-                Some("scope rejected".to_string()),
-            ))
+            CallbackOutcome::Error {
+                error: OAuthProviderError::new(
+                    Some("invalid_scope".to_string()),
+                    Some("scope rejected".to_string()),
+                ),
+                state: "xyz".to_string(),
+            }
         );
+    }
+
+    #[test]
+    fn parse_oauth_callback_rejects_provider_error_without_state() {
+        let parsed = parse_oauth_callback("/callback?error=access_denied", "/callback");
+        assert!(matches!(parsed, CallbackOutcome::Invalid));
     }
 
     #[test]

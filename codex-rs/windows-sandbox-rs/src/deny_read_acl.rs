@@ -65,8 +65,17 @@ pub unsafe fn apply_deny_read_acls(paths: &[PathBuf], psid: *mut c_void) -> Resu
         let added = match result {
             Ok(added) => added,
             Err(err) => {
+                let mut rollback_errors = Vec::new();
                 for added_path in &added_in_this_call {
-                    revoke_ace(added_path, psid);
+                    if let Err(rollback_error) = revoke_ace(added_path, psid) {
+                        rollback_errors.push(format!("{}: {rollback_error}", added_path.display()));
+                    }
+                }
+                if !rollback_errors.is_empty() {
+                    return Err(err.context(format!(
+                        "deny-read rollback also failed: {}",
+                        rollback_errors.join("; ")
+                    )));
                 }
                 return Err(err);
             }

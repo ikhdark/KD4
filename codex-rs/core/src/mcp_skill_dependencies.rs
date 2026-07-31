@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::hash_map::Entry;
@@ -242,12 +243,19 @@ async fn install_planned_mcp_dependencies(
     }
 
     if !added.is_empty() {
+        let additions = added.iter().cloned().collect::<BTreeMap<_, _>>();
         ConfigEditsBuilder::new(&codex_home)
-            .replace_mcp_servers(&servers)
+            .merge_mcp_servers(&additions)
             .apply()
             .await
             .map_err(|err| format!("failed to persist planned MCP dependencies: {err}"))?;
     }
+
+    // OAuth can be interactive. Re-read after the serialized merge so runtime
+    // refresh observes concurrent config edits instead of the stale snapshot.
+    servers = load_global_mcp_servers(&codex_home).await.map_err(|err| {
+        format!("failed to reload MCP servers after installing dependencies: {err}")
+    })?;
 
     let mut refresh_config = config.clone();
     let mut configured_servers = config.mcp_servers.get().clone();

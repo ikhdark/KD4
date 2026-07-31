@@ -358,11 +358,19 @@ async fn source_scan_preserves_partial_results_across_filesystem_failures() {
         let options = SourceSearchOptions::new(PathBuf::new(), "needle".to_string());
         let mut accumulator =
             SourceSearchAccumulator::new(&options).expect("create source accumulator");
+        let mut observed_entries = BTreeMap::new();
         let ignore_matcher = SourceIgnoreMatcher::new_preloaded(None);
 
-        scan_source_root(&context, &root, &options, &ignore_matcher, &mut accumulator)
-            .await
-            .expect("recoverable source scan");
+        scan_source_root(
+            &context,
+            &root,
+            &options,
+            &ignore_matcher,
+            &mut accumulator,
+            &mut observed_entries,
+        )
+        .await
+        .expect("recoverable source scan");
         let output = accumulator.finish(vec![".".to_string()]);
         let paths = output
             .matches
@@ -404,11 +412,19 @@ async fn source_scan_rejects_a_root_directory_read_failure() {
     };
     let options = SourceSearchOptions::new(PathBuf::new(), "needle".to_string());
     let mut accumulator = SourceSearchAccumulator::new(&options).expect("source accumulator");
+    let mut observed_entries = BTreeMap::new();
     let ignore_matcher = SourceIgnoreMatcher::new_preloaded(None);
 
-    let error = scan_source_root(&context, &root, &options, &ignore_matcher, &mut accumulator)
-        .await
-        .expect_err("root directory failure must be terminal");
+    let error = scan_source_root(
+        &context,
+        &root,
+        &options,
+        &ignore_matcher,
+        &mut accumulator,
+        &mut observed_entries,
+    )
+    .await
+    .expect_err("root directory failure must be terminal");
 
     assert!(error.to_string().contains("read directory"));
 }
@@ -453,6 +469,7 @@ async fn explicit_source_roots_preserve_partial_results_when_one_root_inspect_or
         };
         let options = SourceSearchOptions::new(PathBuf::new(), "needle".to_string());
         let mut accumulator = SourceSearchAccumulator::new(&options).expect("source accumulator");
+        let mut observed_entries = BTreeMap::new();
         let ignore_matcher = SourceIgnoreMatcher::new_preloaded(None);
 
         scan_source_roots(
@@ -461,6 +478,7 @@ async fn explicit_source_roots_preserve_partial_results_when_one_root_inspect_or
             &options,
             &ignore_matcher,
             &mut accumulator,
+            &mut observed_entries,
             /*recover_root_failures*/ true,
         )
         .await
@@ -527,6 +545,10 @@ async fn search_handler_passes_sandbox_context_to_filesystem_operations() {
 #[tokio::test]
 async fn search_handler_reads_through_selected_local_filesystem() {
     let (session, mut turn) = make_session_and_context().await;
+    assert!(
+        session.services.state_db.is_none(),
+        "this regression requires lazy durable-state initialization"
+    );
     let source_dir = tempfile::tempdir().expect("create source temp dir");
     let source_cwd = source_dir.abs();
     std::fs::create_dir(source_cwd.join(".git").as_path()).expect("create git marker");
@@ -542,10 +564,11 @@ async fn search_handler_reads_through_selected_local_filesystem() {
     let payload = ToolPayload::Function {
         arguments: json!({ "query": "needle", "paths": ["src"] }).to_string(),
     };
+    let session = Arc::new(session);
 
     let output = SearchSourceHandler::new(false)
         .handle(ToolInvocation {
-            session: Arc::new(session),
+            session: Arc::clone(&session),
             step_context: StepContext::for_test(Arc::clone(&turn)),
             turn,
             cancellation_token: tokio_util::sync::CancellationToken::new(),
@@ -566,6 +589,19 @@ async fn search_handler_reads_through_selected_local_filesystem() {
     let text = output.body.to_text().expect("text output");
     assert!(text.contains("citation: src/lib.rs:2-2 (match line 2)"));
     assert!(text.contains("     2 | needle"));
+    let coordinator = session.services.agent_control.task_coordinator();
+    let store = coordinator
+        .store()
+        .expect("source read lazily initializes durable coordination");
+    let actor_id = format!("root:{}", session.services.agent_control.session_id());
+    let manifest = store
+        .supporting_read_manifest(source_dir.path(), actor_id, vec!["src/lib.rs".to_string()])
+        .await
+        .expect("source read persists its supporting manifest");
+    assert_eq!(manifest.len(), 1);
+    assert_eq!(manifest[0].path, "src/lib.rs");
+    assert!(manifest[0].existed);
+    assert!(manifest[0].content_hash.is_some());
 }
 
 #[tokio::test]

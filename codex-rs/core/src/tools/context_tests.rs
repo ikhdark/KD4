@@ -570,6 +570,8 @@ fn exec_command_tool_output_summarizes_and_links_retained_raw_output() {
             id: artifact_id,
             path: artifact_path.clone(),
             bytes: raw_output.len() as u64,
+            truncated: false,
+            handle: std::sync::Arc::new(tempfile::tempfile().expect("artifact handle")),
         }),
         repair_notice: Some("Command preflight applied one repair".to_string()),
     };
@@ -625,6 +627,14 @@ fn artifact_backed_exec_output(
                 id: artifact_id,
                 path: artifact_path.clone(),
                 bytes: raw_output.len() as u64,
+                truncated: false,
+                handle: std::sync::Arc::new(
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&artifact_path)
+                        .expect("artifact handle"),
+                ),
             }),
             repair_notice: None,
         },

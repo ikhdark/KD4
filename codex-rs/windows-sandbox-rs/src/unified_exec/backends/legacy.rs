@@ -483,7 +483,7 @@ pub(crate) async fn spawn_windows_sandbox_session_legacy(
     let wait_logs_base_dir = common.logs_base_dir.clone();
     std::thread::spawn(move || {
         let _desktop = desktop;
-        let timeout = timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
+        let timeout = crate::windows_wait_timeout(timeout_ms);
         let wait_res = unsafe { WaitForSingleObject(pi.hProcess, timeout) };
         let termination_requested = match wait_res {
             WAIT_OBJECT_0 => {

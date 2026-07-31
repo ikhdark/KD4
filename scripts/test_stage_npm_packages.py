@@ -6,6 +6,8 @@ import os
 import sys
 import tarfile
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -115,10 +117,20 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         self.assertEqual(package_json["name"], "@openai/codex")
         self.assertEqual(package_json["version"], "1.2.3-linux-x64")
-        self.assertEqual(package_json["os"], ["linux"])
+        self.assertEqual(package_json["os"], ["linux", "android"])
         self.assertEqual(package_json["cpu"], ["x64"])
         self.assertEqual(package_json["files"], ["vendor"])
         self.assertNotIn("packageManager", package_json)
+
+        for package_name, expected_os in (
+            ("codex-darwin-x64", ["darwin"]),
+            ("codex-win32-x64", ["win32"]),
+        ):
+            manifest = build.build_platform_package_json(
+                f"1.2.3-{package_name.removeprefix('codex-')}",
+                build.CODEX_PLATFORM_PACKAGES[package_name],
+            )
+            self.assertEqual(manifest["os"], expected_os)
 
     def test_codex_staging_copies_user_facing_package_readme(self) -> None:
         build = stage.load_build_module()
@@ -665,28 +677,24 @@ class StageNpmPackagesTests(unittest.TestCase):
 
         self.assertEqual(dest.read_bytes(), b"existing")
 
-    def test_stale_lock_with_live_owner_is_not_removed(self) -> None:
+    def test_kernel_lock_serializes_concurrent_holders(self) -> None:
         lock_path = self.root / "cache" / ".artifact.lock"
-        lock_path.parent.mkdir()
-        lock_path.write_text("pid=123 thread=1\n", encoding="utf-8")
-        os.utime(lock_path, (0, 0))
+        second_acquired = threading.Event()
 
-        with (
-            mock.patch.object(
-                stage.time, "time", return_value=stage.LOCK_STALE_SECONDS + 100
-            ),
-            mock.patch.object(stage, "process_is_running", return_value=True),
-            mock.patch.object(
-                stage.time, "sleep", side_effect=RuntimeError("stop waiting")
-            ),
-            self.assertRaisesRegex(RuntimeError, "stop waiting"),
-        ):
+        def acquire_second() -> None:
             with stage.exclusive_file_lock(lock_path):
-                self.fail("lock should not have been acquired")
+                second_acquired.set()
 
+        with stage.exclusive_file_lock(lock_path):
+            worker = threading.Thread(target=acquire_second)
+            worker.start()
+            time.sleep(0.05)
+            self.assertFalse(second_acquired.is_set())
+        worker.join(timeout=2)
+        self.assertTrue(second_acquired.is_set())
         self.assertTrue(lock_path.exists())
 
-    def test_lock_initialization_failure_closes_and_removes_lock(self) -> None:
+    def test_lock_initialization_failure_closes_but_keeps_stable_lock_file(self) -> None:
         lock_path = self.root / "cache" / ".artifact.lock"
 
         with (
@@ -696,19 +704,33 @@ class StageNpmPackagesTests(unittest.TestCase):
             with stage.exclusive_file_lock(lock_path):
                 self.fail("lock should not have been acquired")
 
-        self.assertFalse(lock_path.exists())
+        self.assertTrue(lock_path.exists())
 
-    def test_head_mismatch_emits_real_warning(self) -> None:
+    def test_head_mismatch_fails_without_explicit_override(self) -> None:
         stderr = io.StringIO()
         with (
             mock.patch.object(
-                stage.subprocess, "check_output", return_value="current-head\n"
+                stage.subprocess,
+                "check_output",
+                side_effect=["current-head\n", ""],
+            ),
+            mock.patch.object(sys, "stderr", stderr),
+            self.assertRaisesRegex(RuntimeError, "source/native mismatch"),
+        ):
+            stage.ensure_source_matches_workflow("workflow-head", repo_root=self.root)
+
+        with (
+            mock.patch.object(
+                stage.subprocess,
+                "check_output",
+                side_effect=["current-head\n", "dirty\n"],
             ),
             mock.patch.object(sys, "stderr", stderr),
         ):
-            stage.warn_if_head_mismatch("workflow-head", repo_root=self.root)
-
-        self.assertIn("does not match workflow HEAD workflow-head", stderr.getvalue())
+            stage.ensure_source_matches_workflow(
+                "workflow-head", repo_root=self.root, allow_mismatch=True
+            )
+        self.assertIn("WARNING: allowing source/native mismatch", stderr.getvalue())
 
     def test_stage_packages_returns_results_in_package_order(self) -> None:
         calls: list[tuple[str, bool]] = []

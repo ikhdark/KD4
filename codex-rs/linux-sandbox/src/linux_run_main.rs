@@ -1090,6 +1090,13 @@ fn remove_protected_create_target(target: &crate::bwrap::ProtectedCreateTarget) 
             Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < 99 => {
                 thread::sleep(Duration::from_millis(1));
             }
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                eprintln!(
+                    "sandbox left non-empty protected path untouched because its contents cannot be attributed safely: {}",
+                    target.path().display()
+                );
+                return true;
+            }
             Err(err) => {
                 panic!(
                     "failed to remove protected create target {}: {err}",
@@ -1132,7 +1139,9 @@ fn try_remove_protected_create_target(
         ProtectedCreateRemoval::Other
     };
     let result = if removal == ProtectedCreateRemoval::Directory {
-        fs::remove_dir_all(path)
+        // Never recursively delete an unattributed host path. A concurrent host
+        // process may have populated it after the sandbox attempted creation.
+        fs::remove_dir(path)
     } else {
         fs::remove_file(path)
     };

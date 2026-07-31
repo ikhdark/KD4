@@ -21,6 +21,7 @@ use crate::MutationEvidence;
 use crate::MutationSnapshotChunk;
 use crate::MutationSnapshotVersion;
 use crate::ObservationKind;
+use crate::QuiescenceStatus;
 use crate::ReceiptDraft;
 use crate::RuntimeObservation;
 use crate::StoreError;
@@ -29,6 +30,14 @@ use crate::TaskActor;
 use crate::ValidationCall;
 use crate::WakeEventId;
 use crate::WakeRead;
+use crate::WorkspaceActorRegistration;
+use crate::WorkspaceManifestEntry;
+use crate::WorkspaceMutationLease;
+use crate::WorkspaceMutationRequest;
+use crate::WorkspaceMutationResult;
+use crate::WorkspaceRevision;
+use chrono::DateTime;
+use chrono::Utc;
 
 pub type TaskStoreFuture<'a, T> = Pin<Box<dyn Future<Output = StoreResult<T>> + Send + 'a>>;
 
@@ -87,6 +96,14 @@ pub trait AgentTaskStore: Send + Sync {
 
     fn record_validation_call(&self, call: ValidationCall) -> TaskStoreFuture<'_, ()>;
 
+    fn get_validation_call(&self, call_id: String) -> TaskStoreFuture<'_, Option<ValidationCall>>;
+
+    fn heartbeat_validation_call(
+        &self,
+        call_id: String,
+        lease_expires_at: DateTime<Utc>,
+    ) -> TaskStoreFuture<'_, bool>;
+
     fn submit_agent_receipt(
         &self,
         attempt_id: AttemptId,
@@ -140,6 +157,80 @@ pub trait AgentTaskStore: Send + Sync {
         root_session_id: String,
         after_event_id: Option<WakeEventId>,
     ) -> TaskStoreFuture<'_, WakeRead>;
+
+    fn reserve_stalled_nudge(
+        &self,
+        assignment_id: AssignmentId,
+        no_progress_before: DateTime<Utc>,
+    ) -> TaskStoreFuture<'_, bool>;
+
+    fn release_stalled_nudge(&self, assignment_id: AssignmentId) -> TaskStoreFuture<'_, bool>;
+
+    fn capture_workspace_revision<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        paths: Vec<String>,
+    ) -> TaskStoreFuture<'a, WorkspaceRevision>;
+
+    fn record_supporting_read<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        actor_id: String,
+        paths: Vec<String>,
+    ) -> TaskStoreFuture<'a, WorkspaceRevision>;
+
+    fn record_supporting_read_entries<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        actor_id: String,
+        entries: Vec<WorkspaceManifestEntry>,
+    ) -> TaskStoreFuture<'a, WorkspaceRevision>;
+
+    fn supporting_read_manifest<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        actor_id: String,
+        paths: Vec<String>,
+    ) -> TaskStoreFuture<'a, Vec<crate::WorkspaceManifestEntry>>;
+
+    fn read_workspace_events<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        after_epoch: u64,
+    ) -> TaskStoreFuture<'a, Vec<crate::WorkspaceEvent>>;
+
+    fn register_workspace_actor<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        registration: WorkspaceActorRegistration,
+    ) -> TaskStoreFuture<'a, ()>;
+
+    fn begin_workspace_mutation<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        request: WorkspaceMutationRequest,
+    ) -> TaskStoreFuture<'a, WorkspaceMutationLease>;
+
+    fn heartbeat_workspace_mutation<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        lease_id: String,
+        actor_id: String,
+    ) -> TaskStoreFuture<'a, bool>;
+
+    fn finish_workspace_mutation<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        lease: WorkspaceMutationLease,
+    ) -> TaskStoreFuture<'a, WorkspaceMutationResult>;
+
+    fn assert_workspace_unclaimed<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        actor_attempt_id: Option<AttemptId>,
+    ) -> TaskStoreFuture<'a, ()>;
+
+    fn check_quiescence(&self, root_session_id: String) -> TaskStoreFuture<'_, QuiescenceStatus>;
 
     fn begin_mutation<'a>(
         &'a self,

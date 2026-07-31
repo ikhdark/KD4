@@ -37,6 +37,7 @@ use rand::Rng;
 use rand::rng;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
@@ -134,6 +135,9 @@ pub(crate) struct ExecCommandRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
+    /// Cancels when the repository mutation lease can no longer be renewed.
+    /// A mutating process must not continue after losing coordination authority.
+    pub mutation_lease_lost: Option<CancellationToken>,
 }
 
 #[derive(Debug)]

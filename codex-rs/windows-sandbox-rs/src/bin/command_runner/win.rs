@@ -44,6 +44,7 @@ use codex_windows_sandbox::read_handle_loop;
 use codex_windows_sandbox::spawn_process_with_pipes;
 use codex_windows_sandbox::to_wide;
 use codex_windows_sandbox::token_mode_for_permission_profile;
+use codex_windows_sandbox::windows_wait_timeout;
 use codex_windows_sandbox::write_frame;
 use std::ffi::OsStr;
 use std::fs::File;
@@ -69,7 +70,6 @@ use windows_sys::Win32::System::Console::ResizePseudoConsole;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::GetProcessId;
-use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::System::Threading::MUTEX_ALL_ACCESS;
 use windows_sys::Win32::System::Threading::OpenMutexW;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
@@ -764,7 +764,7 @@ pub fn main() -> Result<()> {
         log_dir_owned,
     );
 
-    let timeout = req.timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
+    let timeout = windows_wait_timeout(req.timeout_ms);
     let wait_outcome = wait_for_process(pi.hProcess, timeout);
     let timed_out = matches!(wait_outcome, ProcessWaitOutcome::TimedOut);
     let root_exited = matches!(wait_outcome, ProcessWaitOutcome::Exited);

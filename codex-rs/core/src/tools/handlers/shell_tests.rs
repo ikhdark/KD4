@@ -955,7 +955,7 @@ async fn shell_command_pre_tool_use_payload_uses_raw_command() {
             payload,
         }),
         Some(crate::tools::registry::PreToolUsePayload {
-            tool_name: HookToolName::bash(),
+            tool_name: HookToolName::shell_command(),
             tool_input: json!({ "command": "printf shell command" }),
         })
     );
@@ -993,13 +993,23 @@ async fn shell_command_hook_rewrite_preserves_powershell_script_mode() {
     assert_eq!(
         handler.pre_tool_use_payload(&invocation),
         Some(crate::tools::registry::PreToolUsePayload {
-            tool_name: HookToolName::bash(),
-            tool_input: json!({ "command": "Write-Output before" }),
+            tool_name: HookToolName::shell_command(),
+            tool_input: json!({
+                "command": "Write-Output before",
+                "kind": "powershell_script",
+                "script_body": "Write-Output before",
+            }),
         })
     );
 
     let rewritten = handler
-        .with_updated_hook_input(invocation, json!({ "command": "Write-Output after" }))
+        .with_updated_hook_input(
+            invocation,
+            json!({
+                "kind": "powershell_script",
+                "script_body": "Write-Output after",
+            }),
+        )
         .expect("PowerShell hook rewrite should preserve structured mode");
     let ToolPayload::Function { arguments } = rewritten.payload else {
         panic!("rewritten shell_command payload should remain function-shaped");
@@ -1026,6 +1036,82 @@ async fn shell_command_hook_rewrite_preserves_powershell_script_mode() {
     );
     assert!(exec_args.iter().any(|arg| arg == "-EncodedCommand"));
     assert!(!exec_args.iter().any(|arg| arg == "Write-Output after"));
+}
+
+#[tokio::test]
+async fn shell_command_hook_rewrite_preserves_direct_argv_mode() {
+    let payload = ToolPayload::Function {
+        arguments: json!({
+            "kind": "argv",
+            "program": "rg",
+            "args": ["--files"],
+            "timeout_ms": 1234
+        })
+        .to_string(),
+    };
+    let (session, turn) = make_session_and_context().await;
+    let turn = Arc::new(turn);
+    let handler = ShellCommandHandler::from(codex_tools::ShellCommandBackendConfig::Classic);
+    let invocation = ToolInvocation {
+        session: session.into(),
+        step_context: StepContext::for_test(Arc::clone(&turn)),
+        turn,
+        cancellation_token: tokio_util::sync::CancellationToken::new(),
+        tracker: Arc::new(Mutex::new(TurnDiffTracker::new())),
+        call_id: "argv-hook-rewrite".to_string(),
+        tool_name: codex_tools::ToolName::plain("shell_command"),
+        source: ToolCallSource::Direct,
+        payload,
+    };
+
+    assert_eq!(
+        handler.pre_tool_use_payload(&invocation),
+        Some(crate::tools::registry::PreToolUsePayload {
+            tool_name: HookToolName::shell_command(),
+            tool_input: json!({
+                "command": "rg --files",
+                "kind": "argv",
+                "program": "rg",
+                "args": ["--files"],
+            }),
+        })
+    );
+
+    let rewritten = handler
+        .with_updated_hook_input(
+            invocation,
+            json!({
+                "kind": "argv",
+                "program": "kds",
+                "args": ["--agent", "--", "rg", "--files"],
+            }),
+        )
+        .expect("structured argv hook rewrite should retain argv mode");
+    let ToolPayload::Function { arguments } = rewritten.payload else {
+        panic!("rewritten shell_command payload should remain function-shaped");
+    };
+    let rewritten_arguments: serde_json::Value =
+        serde_json::from_str(&arguments).expect("rewritten arguments should remain valid JSON");
+    let command = parse_shell_command_hook_invocation(&arguments)
+        .expect("rewritten direct argv command should remain structured");
+
+    assert_eq!(rewritten_arguments["kind"], "argv");
+    assert_eq!(rewritten_arguments["program"], "kds");
+    assert_eq!(
+        rewritten_arguments["args"],
+        json!(["--agent", "--", "rg", "--files"])
+    );
+    assert_eq!(rewritten_arguments["timeout_ms"], 1234);
+    assert_eq!(
+        command.to_direct_argv(),
+        Some(vec![
+            "kds".to_string(),
+            "--agent".to_string(),
+            "--".to_string(),
+            "rg".to_string(),
+            "--files".to_string(),
+        ])
+    );
 }
 
 #[tokio::test]
@@ -1089,7 +1175,7 @@ async fn build_post_tool_use_payload_uses_tool_output_wire_value() {
     assert_eq!(
         handler.post_tool_use_payload(&invocation, &output),
         Some(crate::tools::registry::PostToolUsePayload {
-            tool_name: HookToolName::bash(),
+            tool_name: HookToolName::shell_command(),
             tool_use_id: "call-42".to_string(),
             tool_input: json!({ "command": "printf shell command" }),
             tool_response: json!("shell output"),

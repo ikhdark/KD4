@@ -729,6 +729,41 @@ def test_stage_runtime_release_rejects_incomplete_package_layout(tmp_path: Path)
         script.stage_python_runtime_package(tmp_path / "runtime-stage", "1.2.3", package_archive)
 
 
+@pytest.mark.parametrize(
+    ("member_name", "member_type", "link_name"),
+    [
+        ("../escaped.txt", tarfile.REGTYPE, None),
+        ("/absolute.txt", tarfile.REGTYPE, None),
+        ("linked", tarfile.SYMTYPE, "../escaped.txt"),
+        ("hard-linked", tarfile.LNKTYPE, "../escaped.txt"),
+        ("pipe", tarfile.FIFOTYPE, None),
+        ("device", tarfile.CHRTYPE, None),
+    ],
+)
+def test_runtime_archive_extraction_rejects_unsafe_members(
+    tmp_path: Path,
+    member_name: str,
+    member_type: bytes,
+    link_name: str | None,
+) -> None:
+    script = _load_update_script_module()
+    archive_path = tmp_path / "unsafe.tar.gz"
+    with tarfile.open(archive_path, "w:gz") as archive:
+        member = tarfile.TarInfo(member_name)
+        member.type = member_type
+        if link_name is not None:
+            member.linkname = link_name
+            archive.addfile(member)
+        else:
+            payload = b"unsafe"
+            member.size = len(payload)
+            archive.addfile(member, io.BytesIO(payload))
+
+    with pytest.raises(RuntimeError, match="Unsafe archive|escapes staging"):
+        script._extract_codex_package_archive(archive_path, tmp_path / "stage")
+    assert not (tmp_path / "escaped.txt").exists()
+
+
 def test_runtime_package_layout_is_included_by_wheel_config(
     tmp_path: Path,
 ) -> None:

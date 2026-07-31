@@ -172,7 +172,7 @@ impl MessageProcessor {
     }
 
     pub(crate) async fn process_response(&mut self, response: JsonRpcResponse<serde_json::Value>) {
-        tracing::info!("<- response: {:?}", response);
+        tracing::info!("<- response id={:?}", response.id);
         let JsonRpcResponse { id, result, .. } = response;
         self.outgoing.notify_client_response(id, result).await
     }
@@ -201,7 +201,7 @@ impl MessageProcessor {
     }
 
     pub(crate) fn process_error(&mut self, err: JsonRpcError) {
-        tracing::error!("<- error: {:?}", err);
+        tracing::error!("<- client error id={:?}", err.id);
     }
 
     async fn handle_initialize(
@@ -209,7 +209,7 @@ impl MessageProcessor {
         id: RequestId,
         params: rmcp::model::InitializeRequestParams,
     ) {
-        tracing::info!("initialize -> params: {:?}", params);
+        tracing::info!("initialize");
 
         if self.initialized {
             self.outgoing
@@ -288,40 +288,40 @@ impl MessageProcessor {
         self.outgoing.send_response(id, json!({})).await;
     }
 
-    fn handle_list_resources(&self, params: Option<rmcp::model::PaginatedRequestParams>) {
-        tracing::info!("resources/list -> params: {:?}", params);
+    fn handle_list_resources(&self, _params: Option<rmcp::model::PaginatedRequestParams>) {
+        tracing::info!("resources/list");
     }
 
-    fn handle_list_resource_templates(&self, params: Option<rmcp::model::PaginatedRequestParams>) {
-        tracing::info!("resources/templates/list -> params: {:?}", params);
+    fn handle_list_resource_templates(&self, _params: Option<rmcp::model::PaginatedRequestParams>) {
+        tracing::info!("resources/templates/list");
     }
 
-    fn handle_read_resource(&self, params: rmcp::model::ReadResourceRequestParams) {
-        tracing::info!("resources/read -> params: {:?}", params);
+    fn handle_read_resource(&self, _params: rmcp::model::ReadResourceRequestParams) {
+        tracing::info!("resources/read");
     }
 
-    fn handle_subscribe(&self, params: rmcp::model::SubscribeRequestParams) {
-        tracing::info!("resources/subscribe -> params: {:?}", params);
+    fn handle_subscribe(&self, _params: rmcp::model::SubscribeRequestParams) {
+        tracing::info!("resources/subscribe");
     }
 
-    fn handle_unsubscribe(&self, params: rmcp::model::UnsubscribeRequestParams) {
-        tracing::info!("resources/unsubscribe -> params: {:?}", params);
+    fn handle_unsubscribe(&self, _params: rmcp::model::UnsubscribeRequestParams) {
+        tracing::info!("resources/unsubscribe");
     }
 
-    fn handle_list_prompts(&self, params: Option<rmcp::model::PaginatedRequestParams>) {
-        tracing::info!("prompts/list -> params: {:?}", params);
+    fn handle_list_prompts(&self, _params: Option<rmcp::model::PaginatedRequestParams>) {
+        tracing::info!("prompts/list");
     }
 
-    fn handle_get_prompt(&self, params: rmcp::model::GetPromptRequestParams) {
-        tracing::info!("prompts/get -> params: {:?}", params);
+    fn handle_get_prompt(&self, _params: rmcp::model::GetPromptRequestParams) {
+        tracing::info!("prompts/get");
     }
 
     async fn handle_list_tools(
         &self,
         id: RequestId,
-        params: Option<rmcp::model::PaginatedRequestParams>,
+        _params: Option<rmcp::model::PaginatedRequestParams>,
     ) {
-        tracing::trace!("tools/list -> {params:?}");
+        tracing::trace!("tools/list");
         let result = rmcp::model::ListToolsResult {
             meta: None,
             tools: vec![
@@ -335,7 +335,7 @@ impl MessageProcessor {
     }
 
     async fn handle_call_tool(&self, id: RequestId, params: CallToolRequestParams) {
-        tracing::info!("tools/call -> params: {:?}", params);
+        tracing::info!("tools/call name={}", params.name);
         let CallToolRequestParams {
             name, arguments, ..
         } = params;
@@ -417,7 +417,7 @@ impl MessageProcessor {
         arguments: Option<rmcp::model::JsonObject>,
     ) {
         let arguments = arguments.map(serde_json::Value::Object);
-        tracing::info!("tools/call -> params: {:?}", arguments);
+        tracing::info!("tools/call codex-reply");
 
         // parse arguments
         let codex_tool_call_reply_param: CodexToolCallReplyParam = match arguments {
@@ -494,12 +494,12 @@ impl MessageProcessor {
         });
     }
 
-    fn handle_set_level(&self, params: rmcp::model::SetLevelRequestParams) {
-        tracing::info!("logging/setLevel -> params: {:?}", params);
+    fn handle_set_level(&self, _params: rmcp::model::SetLevelRequestParams) {
+        tracing::info!("logging/setLevel");
     }
 
-    fn handle_complete(&self, params: rmcp::model::CompleteRequestParams) {
-        tracing::info!("completion/complete -> params: {:?}", params);
+    fn handle_complete(&self, _params: rmcp::model::CompleteRequestParams) {
+        tracing::info!("completion/complete");
     }
 
     async fn handle_unsupported_request(&self, id: RequestId, method: &str) {
@@ -566,8 +566,8 @@ impl MessageProcessor {
             .remove(&request_id);
     }
 
-    fn handle_progress_notification(&self, params: rmcp::model::ProgressNotificationParam) {
-        tracing::info!("notifications/progress -> params: {:?}", params);
+    fn handle_progress_notification(&self, _params: rmcp::model::ProgressNotificationParam) {
+        tracing::info!("notifications/progress");
     }
 
     fn handle_roots_list_changed(&self) {

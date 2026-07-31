@@ -13,7 +13,7 @@ RELEASES_DIR="$STANDALONE_ROOT/releases"
 CURRENT_LINK="$STANDALONE_ROOT/current"
 LOCK_FILE="$STANDALONE_ROOT/install.lock"
 LOCK_DIR="$STANDALONE_ROOT/install.lock.d"
-LOCK_STALE_AFTER_SECS=600
+LOCK_WAIT_SECS=600
 INSTALL_METADATA_FILE="codex-install.env"
 
 path_action="already"
@@ -21,6 +21,7 @@ path_profile=""
 conflict_manager=""
 conflict_path=""
 lock_kind=""
+lock_token=""
 tmp_dir=""
 download_cmd=""
 sha256_cmd=""
@@ -65,6 +66,19 @@ validate_version() {
     echo "Invalid Codex release version: $version. Expected latest or x.y.z[-alpha[.N]|-beta[.N]]." >&2
     exit 1
   fi
+}
+
+validate_install_dir() {
+  if [ "$(printf '%s' "$BIN_DIR" | tr -d '\r\n')" != "$BIN_DIR" ]; then
+    echo "CODEX_INSTALL_DIR cannot contain a newline." >&2
+    exit 1
+  fi
+}
+
+shell_single_quote() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/'\\\\''/g"
+  printf "'"
 }
 
 parse_args() {
@@ -228,7 +242,8 @@ add_to_path() {
   path_profile="$profile"
   begin_marker="# >>> Codex installer >>>"
   end_marker="# <<< Codex installer <<<"
-  path_line="export PATH=\"$BIN_DIR:\$PATH\""
+  quoted_bin_dir="$(shell_single_quote "$BIN_DIR")"
+  path_line="export PATH=$quoted_bin_dir:\$PATH"
 
   if [ -f "$profile" ] && grep -F "$begin_marker" "$profile" >/dev/null 2>&1; then
     if grep -F "$path_line" "$profile" >/dev/null 2>&1; then
@@ -298,7 +313,19 @@ rewrite_path_block() {
   begin_marker="$2"
   end_marker="$3"
   path_line="$4"
-  tmp_profile="$tmp_dir/profile.$$.tmp"
+  profile_target="$profile"
+  while [ -L "$profile_target" ]; do
+    profile_link="$(readlink "$profile_target")"
+    case "$profile_link" in
+      /*) profile_target="$profile_link" ;;
+      *) profile_target="$(dirname "$profile_target")/$profile_link" ;;
+    esac
+  done
+  tmp_profile="$(mktemp "$profile_target.codex.XXXXXX")"
+  if ! cp -p "$profile_target" "$tmp_profile"; then
+    rm -f "$tmp_profile"
+    return 1
+  fi
 
   awk -v begin="$begin_marker" -v end="$end_marker" -v line="$path_line" '
     BEGIN {
@@ -329,44 +356,12 @@ rewrite_path_block() {
         exit 1
       }
     }
-  ' "$profile" >"$tmp_profile"
-  mv "$tmp_profile" "$profile"
-}
-
-mkdir_lock_is_stale() {
-  [ -d "$LOCK_DIR" ] || return 1
-
-  pid="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
-  started_at="$(cat "$LOCK_DIR/started_at" 2>/dev/null || true)"
-  now="$(date +%s 2>/dev/null || printf '0')"
-
-  case "$started_at" in
-    ''|*[!0-9]*)
-      started_at=0
-      ;;
-  esac
-
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    return 1
-  fi
-
-  if [ "$started_at" -eq 0 ] || [ "$now" -eq 0 ]; then
-    return 0
-  fi
-
-  [ $((now - started_at)) -ge "$LOCK_STALE_AFTER_SECS" ]
+  ' "$profile_target" >"$tmp_profile"
+  mv -f "$tmp_profile" "$profile_target"
 }
 
 acquire_install_lock() {
   mkdir -p "$STANDALONE_ROOT"
-
-  if [ "$os" = "darwin" ] && command -v lockf >/dev/null 2>&1; then
-    : >>"$LOCK_FILE"
-    exec 9<>"$LOCK_FILE"
-    lockf 9
-    lock_kind="lockf"
-    return
-  fi
 
   if command -v flock >/dev/null 2>&1; then
     exec 9>"$LOCK_FILE"
@@ -375,27 +370,34 @@ acquire_install_lock() {
     return
   fi
 
+  lock_waited=0
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
-    if mkdir_lock_is_stale; then
-      warn "Removing stale installer lock at $LOCK_DIR"
-      rm -rf "$LOCK_DIR"
-      continue
+    if [ "$lock_waited" -ge "$LOCK_WAIT_SECS" ]; then
+      echo "Timed out waiting for installer lock at $LOCK_DIR. Remove it only after confirming no installer is running." >&2
+      exit 1
     fi
     sleep 1
+    lock_waited=$((lock_waited + 1))
   done
 
+  lock_token="$$.$(date +%s 2>/dev/null || printf 'unknown')"
+  printf '%s\n' "$lock_token" >"$LOCK_DIR/owner"
   printf '%s\n' "$$" >"$LOCK_DIR/pid"
-  date +%s >"$LOCK_DIR/started_at" 2>/dev/null || true
   lock_kind="mkdir"
 }
 
 release_install_lock() {
   if [ "$lock_kind" = "mkdir" ]; then
-    rm -rf "$LOCK_DIR" 2>/dev/null || true
-  elif [ "$lock_kind" = "flock" ] || [ "$lock_kind" = "lockf" ]; then
+    current_lock_token="$(cat "$LOCK_DIR/owner" 2>/dev/null || true)"
+    if [ -n "$lock_token" ] && [ "$current_lock_token" = "$lock_token" ]; then
+      rm -f "$LOCK_DIR/owner" "$LOCK_DIR/pid" 2>/dev/null || true
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
+  elif [ "$lock_kind" = "flock" ]; then
     exec 9>&- 2>/dev/null || true
   fi
   lock_kind=""
+  lock_token=""
 }
 
 cleanup_stale_install_artifacts() {
@@ -405,7 +407,15 @@ cleanup_stale_install_artifacts() {
   remove_matching_children "$STANDALONE_ROOT" '.current.*' file
 
   if [ -d "$BIN_DIR" ]; then
-    remove_matching_children "$BIN_DIR" '.codex.*' file
+    for path in "$BIN_DIR"/.codex.*; do
+      name="${path##*/.codex.}"
+      case "$name" in
+        ''|*[!0-9]*) continue ;;
+      esac
+      if [ -f "$path" ] || [ -L "$path" ]; then
+        rm -f "$path"
+      fi
+    done
   fi
 }
 
@@ -647,6 +657,70 @@ handle_conflicting_install() {
   fi
 }
 
+package_metadata_string_equals() {
+  metadata_path="$1"
+  key="$2"
+  expected="$3"
+
+  awk -v key="$key" -v expected="$expected" '
+    {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      prefix = "\"" key "\""
+      if (index(line, prefix) == 1) {
+        sub("^\"" key "\"[[:space:]]*:[[:space:]]*\"", "", line)
+        sub(/\"[[:space:]]*,?[[:space:]]*$/, "", line)
+        if (line == expected) {
+          matches++
+        } else {
+          bad = 1
+        }
+      }
+    }
+    END { exit !(matches == 1 && bad != 1) }
+  ' "$metadata_path"
+}
+
+package_metadata_number_equals() {
+  metadata_path="$1"
+  key="$2"
+  expected="$3"
+
+  awk -v key="$key" -v expected="$expected" '
+    {
+      line = $0
+      sub(/^[[:space:]]*/, "", line)
+      prefix = "\"" key "\""
+      if (index(line, prefix) == 1) {
+        sub("^\"" key "\"[[:space:]]*:[[:space:]]*", "", line)
+        sub(/[[:space:]]*,?[[:space:]]*$/, "", line)
+        if (line == expected) {
+          matches++
+        } else {
+          bad = 1
+        }
+      }
+    }
+    END { exit !(matches == 1 && bad != 1) }
+  ' "$metadata_path"
+}
+
+validate_package_metadata() {
+  package_dir="$1"
+  expected_version="$2"
+  expected_target="$3"
+  metadata_path="$package_dir/codex-package.json"
+
+  [ -f "$metadata_path" ] &&
+    package_metadata_number_equals "$metadata_path" layoutVersion 1 &&
+    package_metadata_string_equals "$metadata_path" version "$expected_version" &&
+    package_metadata_string_equals "$metadata_path" target "$expected_target" &&
+    package_metadata_string_equals "$metadata_path" variant codex &&
+    package_metadata_string_equals "$metadata_path" entrypoint bin/codex &&
+    package_metadata_string_equals "$metadata_path" resourcesDir codex-resources &&
+    package_metadata_string_equals "$metadata_path" pathDir codex-path
+}
+
 install_package_release() {
   release_dir="$1"
   archive_path="$2"
@@ -659,6 +733,10 @@ install_package_release() {
   rm -rf "$stage_release"
   mkdir -p "$stage_release"
   tar -xzf "$archive_path" -C "$stage_release"
+  if ! validate_package_metadata "$stage_release" "$resolved_version" "$target"; then
+    echo "Downloaded Codex package metadata did not match the requested version and target." >&2
+    return 1
+  fi
   chmod 0755 \
     "$stage_release/bin/codex" \
     "$stage_release/bin/codex-code-mode-host" \
@@ -670,6 +748,11 @@ install_package_release() {
     chmod 0755 "$stage_release/codex-resources/zsh/bin/zsh"
   fi
   ln -sf "bin/codex" "$stage_release/codex"
+  staged_version="$(version_from_binary "$stage_release/bin/codex" || true)"
+  if [ "$staged_version" != "$resolved_version" ]; then
+    echo "Downloaded Codex binary version did not match release metadata. Expected $resolved_version but got ${staged_version:-unknown}." >&2
+    return 1
+  fi
   write_install_metadata "$stage_release" "$resolved_version" "$target" "$layout"
 
   if [ -e "$release_dir" ] || [ -L "$release_dir" ]; then
@@ -703,6 +786,11 @@ install_legacy_platform_npm_release() {
     chmod 0755 "$stage_release/codex-resources/bwrap"
   fi
   rm -rf "$stage_release/package"
+  staged_version="$(version_from_binary "$stage_release/codex" || true)"
+  if [ "$staged_version" != "$resolved_version" ]; then
+    echo "Downloaded Codex binary version did not match release metadata. Expected $resolved_version but got ${staged_version:-unknown}." >&2
+    return 1
+  fi
   write_install_metadata "$stage_release" "$resolved_version" "$target" "$layout"
 
   if [ -e "$release_dir" ] || [ -L "$release_dir" ]; then
@@ -746,6 +834,7 @@ release_dir_is_complete() {
   case "$layout" in
     package)
       [ -f "$release_dir/codex-package.json" ] &&
+        validate_package_metadata "$release_dir" "$expected_version" "$expected_target" &&
         [ -x "$release_dir/bin/codex" ] &&
         [ -x "$release_dir/bin/codex-code-mode-host" ] &&
         [ -x "$release_dir/codex" ] &&
@@ -771,6 +860,15 @@ release_dir_is_complete() {
     package:*linux* | package:*apple-darwin) [ -x "$release_dir/codex-resources/zsh/bin/zsh" ] || return 1 ;;
     *) true ;;
   esac
+
+  installed_version="$(version_from_binary "$(
+    if [ "$layout" = "package" ]; then
+      printf '%s\n' "$release_dir/bin/codex"
+    else
+      printf '%s\n' "$release_dir/codex"
+    fi
+  )" || true)"
+  [ "$installed_version" = "$expected_version" ]
 }
 
 update_current_link() {
@@ -804,6 +902,7 @@ verify_visible_command() {
 }
 
 parse_args "$@"
+validate_install_dir
 
 require_command mktemp
 require_command tar

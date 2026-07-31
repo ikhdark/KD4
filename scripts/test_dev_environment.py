@@ -12,6 +12,7 @@ from unittest import mock
 from scripts import app_server_schema_runtime_check
 from scripts import config_schema_check
 from scripts import dev_env_doctor
+from scripts import generated_output_lock
 from scripts import git_doctor
 from scripts import vscode_runtime_proof
 
@@ -275,7 +276,7 @@ class ConfigSchemaCheckTest(unittest.TestCase):
                 self.assertIn(f"Could not run {command}:", stderr.getvalue())
                 self.assertNotIn("Traceback", stderr.getvalue())
 
-    def test_missing_git_during_schema_status_forces_regeneration_cleanly(self) -> None:
+    def test_missing_git_during_schema_status_marks_inputs_changed_cleanly(self) -> None:
         stderr = io.StringIO()
         with (
             mock.patch.object(
@@ -288,12 +289,12 @@ class ConfigSchemaCheckTest(unittest.TestCase):
             self.assertTrue(config_schema_check.schema_inputs_changed(Path("/repo")))
 
         self.assertIn(
-            "Could not run git to inspect config schema input status:",
+            "Could not compare config schema inputs with HEAD:",
             stderr.getvalue(),
         )
         self.assertNotIn("Traceback", stderr.getvalue())
 
-    def test_config_schema_auto_regenerates_after_skipped_check_failure(self) -> None:
+    def test_config_schema_auto_is_check_only_after_failure(self) -> None:
         with (
             mock.patch.object(
                 config_schema_check, "repo_root", return_value=Path("/repo")
@@ -302,16 +303,70 @@ class ConfigSchemaCheckTest(unittest.TestCase):
                 config_schema_check, "schema_inputs_changed", return_value=False
             ),
             mock.patch.object(
-                config_schema_check, "run_protocol_check", side_effect=[1, 0]
+                config_schema_check, "run_protocol_check", return_value=1
             ) as run_check,
             mock.patch.object(
                 config_schema_check, "regenerate_schema", return_value=True
             ) as regenerate,
+            mock.patch.object(
+                config_schema_check,
+                "generated_output_lock",
+                return_value=contextlib.nullcontext(),
+            ),
         ):
             self.assertEqual(config_schema_check.main(["--mode", "auto"]), 1)
 
-        regenerate.assert_called_once_with(Path("/repo"))
-        self.assertEqual(run_check.call_count, 2)
+        regenerate.assert_not_called()
+        run_check.assert_called_once_with(Path("/repo"))
+
+    def test_config_schema_force_routes_the_generation_owner(self) -> None:
+        with (
+            mock.patch.object(
+                config_schema_check, "repo_root", return_value=Path("/repo")
+            ),
+            mock.patch.object(
+                config_schema_check, "regenerate_schema", return_value=True
+            ) as regenerate,
+            mock.patch.object(
+                config_schema_check, "run_protocol_check", return_value=0
+            ),
+            mock.patch.object(
+                config_schema_check,
+                "generated_output_lock",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            self.assertEqual(
+                config_schema_check.main(
+                    ["--mode", "force", "--owner", "assignment:config-owner"]
+                ),
+                0,
+            )
+
+        regenerate.assert_called_once_with(
+            Path("/repo"), "assignment:config-owner"
+        )
+
+
+class GeneratedOutputLockTest(unittest.TestCase):
+    def test_lock_is_process_scoped_and_recovers_after_release(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with generated_output_lock.generated_output_lock(
+                root, "assignment:owner-a"
+            ) as lock_path:
+                self.assertTrue(lock_path.is_file())
+                with self.assertRaises(generated_output_lock.GenerationLockError):
+                    with generated_output_lock.generated_output_lock(
+                        root, "assignment:owner-b"
+                    ):
+                        self.fail("a live generation owner cannot be stolen")
+            self.assertIn("assignment:owner-a", lock_path.read_text("utf-8"))
+
+            with generated_output_lock.generated_output_lock(
+                root, "assignment:owner-b"
+            ):
+                pass
 
 
 class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
@@ -350,7 +405,10 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
                 app_server_schema_runtime_check.schema_inputs_changed(Path("/repo"))
             )
 
-        self.assertIn("Could not run git", stderr.getvalue())
+        self.assertIn(
+            "Could not compare app-server schema inputs with HEAD:",
+            stderr.getvalue(),
+        )
 
     def test_missing_command_returns_clean_diagnostic(self) -> None:
         stderr = io.StringIO()
@@ -398,16 +456,65 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
                 app_server_schema_runtime_check,
                 "regenerate_schemas",
                 return_value=True,
-            ),
+            ) as regenerate,
             mock.patch.object(
                 app_server_schema_runtime_check, "run_protocol_check", return_value=0
             ),
+            mock.patch.object(
+                app_server_schema_runtime_check,
+                "generated_output_lock",
+                return_value=contextlib.nullcontext(),
+            ),
         ):
             self.assertEqual(
-                app_server_schema_runtime_check.main(["--mode", "force"]), 0
+                app_server_schema_runtime_check.main(
+                    ["--mode", "force", "--owner", "assignment:app-server-owner"]
+                ),
+                0,
             )
+        regenerate.assert_called_once_with(
+            Path("/repo"), "assignment:app-server-owner"
+        )
 
-    def test_auto_regenerates_after_skipped_check_failure(self) -> None:
+    def test_force_regeneration_forwards_generator_arguments(self) -> None:
+        with (
+            mock.patch.object(
+                app_server_schema_runtime_check, "repo_root", return_value=Path("/repo")
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check,
+                "regenerate_schemas",
+                return_value=False,
+            ) as regenerate,
+            mock.patch.object(
+                app_server_schema_runtime_check, "run_protocol_check", return_value=0
+            ),
+            mock.patch.object(
+                app_server_schema_runtime_check,
+                "generated_output_lock",
+                return_value=contextlib.nullcontext(),
+            ),
+        ):
+            self.assertEqual(
+                app_server_schema_runtime_check.main(
+                    [
+                        "--mode",
+                        "force",
+                        "--owner",
+                        "assignment:app-server-owner",
+                        "--",
+                        "--experimental",
+                    ]
+                ),
+                0,
+            )
+        regenerate.assert_called_once_with(
+            Path("/repo"),
+            "assignment:app-server-owner",
+            ["--experimental"],
+        )
+
+    def test_auto_is_check_only_after_failure(self) -> None:
         with (
             mock.patch.object(
                 app_server_schema_runtime_check, "repo_root", return_value=Path("/repo")
@@ -420,20 +527,25 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
             mock.patch.object(
                 app_server_schema_runtime_check,
                 "run_protocol_check",
-                side_effect=[1, 0],
+                return_value=1,
             ) as run_check,
             mock.patch.object(
                 app_server_schema_runtime_check,
                 "regenerate_schemas",
                 return_value=True,
             ) as regenerate,
+            mock.patch.object(
+                app_server_schema_runtime_check,
+                "generated_output_lock",
+                return_value=contextlib.nullcontext(),
+            ),
         ):
             self.assertEqual(
                 app_server_schema_runtime_check.main(["--mode", "auto"]), 1
             )
 
-        regenerate.assert_called_once_with(Path("/repo"))
-        self.assertEqual(run_check.call_count, 2)
+        regenerate.assert_not_called()
+        run_check.assert_called_once_with(Path("/repo"))
 
 
 if __name__ == "__main__":

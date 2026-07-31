@@ -70,6 +70,7 @@ coverage/
 personal/
 .codex/harness/runs/
 .codex/evals/investigation/
+.codex/locks/
 
 # os
 .DS_Store

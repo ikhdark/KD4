@@ -357,7 +357,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"- {blob.path}: {blob.size_bytes} bytes > {args.max_bytes} bytes")
         print(
             "\nIf one of these is a real checked-in asset we want to keep, add its "
-            "repo-relative path to .github/blob-size-allowlist.txt. Otherwise, "
+            f"repo-relative path to {args.allowlist}. Otherwise, "
             "shrink it or keep it out of git."
         )
         return 1

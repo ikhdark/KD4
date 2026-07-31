@@ -2011,10 +2011,14 @@ mod tests {
     use tempfile::TempDir;
 
     async fn build_config(temp_dir: &TempDir) -> std::io::Result<Config> {
-        ConfigBuilder::default()
+        let mut config = ConfigBuilder::default()
             .codex_home(temp_dir.path().to_path_buf())
             .build()
-            .await
+            .await?;
+        // ConfigBuilder intentionally honors a workspace-scoped SQLite override. Tests that
+        // construct an embedded app server must not inherit the checkout's live state database.
+        config.sqlite_home = temp_dir.path().to_path_buf();
+        Ok(config)
     }
 
     fn write_session_rollout(
@@ -2540,7 +2544,7 @@ mod tests {
         std::fs::create_dir_all(&project_cwd)?;
         std::fs::create_dir_all(&other_cwd)?;
 
-        let config = ConfigBuilder::default()
+        let mut config = ConfigBuilder::default()
             .codex_home(temp_dir.path().to_path_buf())
             .harness_overrides(ConfigOverrides {
                 cwd: Some(project_cwd.clone()),
@@ -2548,6 +2552,7 @@ mod tests {
             })
             .build()
             .await?;
+        config.sqlite_home = temp_dir.path().to_path_buf();
         let model_provider = config.model_provider_id.as_str();
         let project_thread_id = write_session_rollout(
             temp_dir.path(),
@@ -2804,7 +2809,7 @@ mod tests {
             std::fs::write(&rollout_path, "")?;
 
             let state_runtime = codex_state::StateRuntime::init(
-                config.codex_home.to_path_buf(),
+                config.sqlite_home.clone(),
                 config.model_provider_id.clone(),
             )
             .await

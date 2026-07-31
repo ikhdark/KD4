@@ -631,6 +631,9 @@ function Invoke-CargoLanePrune {
         $detail = if ([string]::IsNullOrWhiteSpace($pruneFailure)) { "" } else { " ($pruneFailure)" }
         Write-Warning "Cargo lane pruning failed$detail; leaving the GC stamp unchanged so the next run can retry."
     }
+    # Pruning may leave a uniquely renamed tree when Windows still has a file
+    # open. Start the deferred worker again after the rename phase.
+    Start-CargoLaneTrashCleanup -LanesRoot $LanesRoot
 }
 
 function Resolve-CargoLaneName {
@@ -685,43 +688,70 @@ function Acquire-CargoLaneReservation {
         [string[]]$ActiveNames = @()
     )
 
-    $active = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-    foreach ($name in @($ActiveNames)) {
-        if (-not [string]::IsNullOrWhiteSpace($name)) {
-            [void]$active.Add($name)
-        }
-    }
-
-    for ($i = 0; $i -le 64; $i++) {
-        $candidate = if ($i -eq 0) { $BaseLane } else { "$BaseLane-$($i + 1)" }
-        if ($active.Contains($candidate)) {
-            continue
-        }
-        $target = Join-Path $LaneRoot $candidate
-        New-Item -ItemType Directory -Force -Path $target | Out-Null
-        $lockPath = Join-Path $target ".lane-active.lock"
-        $stream = $null
+    $coordinationPath = Join-Path $LaneRoot ".lane-coordination.lock"
+    $coordinationStream = $null
+    $coordinationDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ($null -eq $coordinationStream) {
         try {
-            $stream = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-            $stream.SetLength(0)
-            $lockText = "pid=$PID`nlane=$candidate`nstarted=$([DateTime]::UtcNow.ToString("o", [Globalization.CultureInfo]::InvariantCulture))`n"
-            $bytes = [Text.Encoding]::UTF8.GetBytes($lockText)
-            $stream.Write($bytes, 0, $bytes.Length)
-            $stream.Flush()
-            return [pscustomobject]@{
-                Lane = $candidate
-                TargetDir = $target
-                Stream = $stream
-            }
+            $coordinationStream = [IO.File]::Open(
+                $coordinationPath,
+                [IO.FileMode]::OpenOrCreate,
+                [IO.FileAccess]::ReadWrite,
+                [IO.FileShare]::None
+            )
         }
-        catch {
-            if ($null -ne $stream) {
-                $stream.Dispose()
+        catch [IO.IOException] {
+            if ([DateTime]::UtcNow -ge $coordinationDeadline) {
+                throw "Timed out waiting for Cargo lane coordination lock."
             }
+            Start-Sleep -Milliseconds 50
         }
     }
 
-    throw "Unable to reserve an idle Cargo lane for '$BaseLane'."
+    try {
+        $active = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($name in @($ActiveNames)) {
+            if (-not [string]::IsNullOrWhiteSpace($name)) {
+                [void]$active.Add($name)
+            }
+        }
+
+        for ($i = 0; $i -le 64; $i++) {
+            $candidate = if ($i -eq 0) { $BaseLane } else { "$BaseLane-$($i + 1)" }
+            if ($active.Contains($candidate)) {
+                continue
+            }
+            $target = Join-Path $LaneRoot $candidate
+            New-Item -ItemType Directory -Force -Path $target | Out-Null
+            $lockPath = Join-Path $target ".lane-active.lock"
+            $stream = $null
+            try {
+                $stream = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                $stream.SetLength(0)
+                $lockText = "pid=$PID`nlane=$candidate`nstarted=$([DateTime]::UtcNow.ToString("o", [Globalization.CultureInfo]::InvariantCulture))`n"
+                $bytes = [Text.Encoding]::UTF8.GetBytes($lockText)
+                $stream.Write($bytes, 0, $bytes.Length)
+                $stream.Flush()
+                return [pscustomobject]@{
+                    Lane = $candidate
+                    TargetDir = $target
+                    Stream = $stream
+                }
+            }
+            catch {
+                if ($null -ne $stream) {
+                    $stream.Dispose()
+                }
+            }
+        }
+
+        throw "Unable to reserve an idle Cargo lane for '$BaseLane'."
+    }
+    finally {
+        if ($null -ne $coordinationStream) {
+            $coordinationStream.Dispose()
+        }
+    }
 }
 
 function Add-PathPrefix {

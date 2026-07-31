@@ -8,6 +8,10 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1546,12 +1550,16 @@ fn open_log_file_with_options(
         )));
     };
     fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
     let _write_lock = compression::lock_rollout_for_write_blocking(&path)?;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .append(true)
-        .create(create)
-        .open(&path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).append(true).create(create);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&path)?;
+    #[cfg(unix)]
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
     ensure_rollout_is_newline_terminated(&mut file)?;
     let locked_file = LockedRolloutFile {
         path: path.clone(),

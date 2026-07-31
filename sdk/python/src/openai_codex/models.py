@@ -5,39 +5,7 @@ from typing import TypeAlias
 
 from pydantic import BaseModel
 
-from .generated.v2_all import (
-    AccountLoginCompletedNotification,
-    AccountRateLimitsUpdatedNotification,
-    AccountUpdatedNotification,
-    AgentMessageDeltaNotification,
-    AppListUpdatedNotification,
-    CommandExecutionOutputDeltaNotification,
-    ConfigWarningNotification,
-    ContextCompactedNotification,
-    DeprecationNoticeNotification,
-    ErrorNotification,
-    FileChangeOutputDeltaNotification,
-    ItemCompletedNotification,
-    ItemStartedNotification,
-    McpServerOauthLoginCompletedNotification,
-    McpToolCallProgressNotification,
-    PlanDeltaNotification,
-    RawResponseItemCompletedNotification,
-    ReasoningSummaryPartAddedNotification,
-    ReasoningSummaryTextDeltaNotification,
-    ReasoningTextDeltaNotification,
-    TerminalInteractionNotification,
-    ThreadGoalClearedNotification,
-    ThreadGoalUpdatedNotification,
-    ThreadNameUpdatedNotification,
-    ThreadStartedNotification,
-    ThreadTokenUsageUpdatedNotification,
-    TurnCompletedNotification,
-    TurnDiffUpdatedNotification,
-    TurnPlanUpdatedNotification,
-    TurnStartedNotification,
-    WindowsWorldWritableWarningNotification,
-)
+from .generated.notification_registry import GeneratedNotificationPayload
 
 JsonScalar: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonScalar | dict[str, "JsonValue"] | list["JsonValue"]
@@ -49,40 +17,7 @@ class UnknownNotification:
     params: JsonObject
 
 
-NotificationPayload: TypeAlias = (
-    AccountLoginCompletedNotification
-    | AccountRateLimitsUpdatedNotification
-    | AccountUpdatedNotification
-    | AgentMessageDeltaNotification
-    | AppListUpdatedNotification
-    | CommandExecutionOutputDeltaNotification
-    | ConfigWarningNotification
-    | ContextCompactedNotification
-    | DeprecationNoticeNotification
-    | ErrorNotification
-    | FileChangeOutputDeltaNotification
-    | ItemCompletedNotification
-    | ItemStartedNotification
-    | McpServerOauthLoginCompletedNotification
-    | McpToolCallProgressNotification
-    | PlanDeltaNotification
-    | RawResponseItemCompletedNotification
-    | ReasoningSummaryPartAddedNotification
-    | ReasoningSummaryTextDeltaNotification
-    | ReasoningTextDeltaNotification
-    | TerminalInteractionNotification
-    | ThreadNameUpdatedNotification
-    | ThreadGoalClearedNotification
-    | ThreadGoalUpdatedNotification
-    | ThreadStartedNotification
-    | ThreadTokenUsageUpdatedNotification
-    | TurnCompletedNotification
-    | TurnDiffUpdatedNotification
-    | TurnPlanUpdatedNotification
-    | TurnStartedNotification
-    | WindowsWorldWritableWarningNotification
-    | UnknownNotification
-)
+NotificationPayload: TypeAlias = GeneratedNotificationPayload | UnknownNotification
 
 
 @dataclass(slots=True)

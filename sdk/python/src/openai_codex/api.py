@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import AsyncIterator, Iterator
 
 from ._approval_mode import (
@@ -10,6 +10,7 @@ from ._approval_mode import (
     _approval_mode_settings,
 )
 from ._initialize_metadata import validate_initialize_metadata
+from .errors import TransportClosedError
 from ._inputs import (
     ImageInput as ImageInput,
     Input as Input,
@@ -316,7 +317,7 @@ class AsyncCodex:
                 payload = await self._client.initialize()
                 self._init = validate_initialize_metadata(payload)
                 self._initialized = True
-            except Exception:
+            except BaseException:
                 await self._client.close()
                 self._init = None
                 self._initialized = False
@@ -721,9 +722,35 @@ class TurnHandle:
     _client: CodexClient
     thread_id: str
     id: str
+    _closed: bool = field(default=False, init=False, repr=False)
+    _epoch: int = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._epoch = self._client.process_epoch
+
+    def _ensure_current(self) -> None:
+        if self._client.process_epoch != self._epoch:
+            raise TransportClosedError("turn handle belongs to a closed Codex process")
+
+    def close(self) -> None:
+        """Release this handle's notification route without consuming the turn."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._client.process_epoch == self._epoch:
+            self._client.unregister_turn_notifications(self.id)
+
+    abandon = close
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def steer(self, input: RunInput) -> TurnSteerResponse:
         """Send additional input to this active turn."""
+        self._ensure_current()
         return self._client.turn_steer(
             self.thread_id,
             self.id,
@@ -732,10 +759,12 @@ class TurnHandle:
 
     def interrupt(self) -> TurnInterruptResponse:
         """Request interruption of this active turn."""
+        self._ensure_current()
         return self._client.turn_interrupt(self.thread_id, self.id)
 
     def stream(self) -> Iterator[Notification]:
         """Yield only notifications routed to this turn handle."""
+        self._ensure_current()
         self._client.register_turn_notifications(self.id)
         try:
             while True:
@@ -748,7 +777,7 @@ class TurnHandle:
                 ):
                     break
         finally:
-            self._client.unregister_turn_notifications(self.id)
+            self.close()
 
     def run(self) -> TurnResult:
         """Consume the turn stream and return its completed result."""
@@ -766,9 +795,37 @@ class AsyncTurnHandle:
     _codex: AsyncCodex
     thread_id: str
     id: str
+    _closed: bool = field(default=False, init=False, repr=False)
+    _epoch: int = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._epoch = self._codex._client.process_epoch
+
+    def _ensure_current(self) -> None:
+        if self._codex._client.process_epoch != self._epoch:
+            raise TransportClosedError("turn handle belongs to a closed Codex process")
+
+    async def close(self) -> None:
+        """Release this handle's notification route without consuming the turn."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._codex._client.process_epoch == self._epoch:
+            self._codex._client.unregister_turn_notifications(self.id)
+
+    abandon = close
+
+    def __del__(self) -> None:
+        try:
+            if not self._closed and self._codex._client.process_epoch == self._epoch:
+                self._closed = True
+                self._codex._client.unregister_turn_notifications(self.id)
+        except Exception:
+            pass
 
     async def steer(self, input: RunInput) -> TurnSteerResponse:
         """Send additional input to this active turn."""
+        self._ensure_current()
         await self._codex._ensure_initialized()
         return await self._codex._client.turn_steer(
             self.thread_id,
@@ -778,11 +835,13 @@ class AsyncTurnHandle:
 
     async def interrupt(self) -> TurnInterruptResponse:
         """Request interruption of this active turn."""
+        self._ensure_current()
         await self._codex._ensure_initialized()
         return await self._codex._client.turn_interrupt(self.thread_id, self.id)
 
     async def stream(self) -> AsyncIterator[Notification]:
         """Yield only notifications routed to this async turn handle."""
+        self._ensure_current()
         await self._codex._ensure_initialized()
         self._codex._client.register_turn_notifications(self.id)
         try:
@@ -796,7 +855,7 @@ class AsyncTurnHandle:
                 ):
                     break
         finally:
-            self._codex._client.unregister_turn_notifications(self.id)
+            await self.close()
 
     async def run(self) -> TurnResult:
         """Consume the turn stream and return its completed result."""

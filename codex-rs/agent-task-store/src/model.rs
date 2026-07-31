@@ -28,6 +28,7 @@ pub const MAX_VALIDATION_CALLS_PER_TASK: usize = 100;
 pub const DEFAULT_SNAPSHOT_CHUNK_BYTES: usize = 64 * 1024;
 pub const MAX_SNAPSHOT_CHUNK_BYTES: usize = 256 * 1024;
 pub const MAX_MUTATION_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_WORKSPACE_LEASE_SECONDS: i64 = 120;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +82,15 @@ pub struct AssignmentRelation {
     pub target_assignment_ids: Vec<AssignmentId>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceStrategy {
+    #[default]
+    Auto,
+    Shared,
+    Isolated,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AssignmentDraft {
     pub root_session_id: String,
@@ -101,6 +111,10 @@ pub struct AssignmentDraft {
     pub required_evidence: Vec<String>,
     #[serde(default)]
     pub prohibited_changes: Vec<String>,
+    #[serde(default)]
+    pub contract_claims: Vec<String>,
+    #[serde(default)]
+    pub workspace_strategy: WorkspaceStrategy,
     pub relation: Option<AssignmentRelation>,
 }
 
@@ -149,6 +163,15 @@ impl AssignmentDraft {
                 )));
             }
         }
+        let mut contract_claims = HashSet::new();
+        for contract in &self.contract_claims {
+            validate_nonempty("contract claim", contract)?;
+            if !contract_claims.insert(contract.as_str()) {
+                return Err(StoreError::InvalidAssignment(format!(
+                    "duplicate contract claim {contract}"
+                )));
+            }
+        }
 
         let read_scope = normalize_repo_scopes(repo_root, &self.read_scope)?;
         let write_scope = normalize_repo_scopes(repo_root, &self.write_scope)?;
@@ -174,6 +197,10 @@ impl AssignmentDraft {
             risk_hints: self.risk_hints,
             required_evidence: self.required_evidence,
             prohibited_changes: self.prohibited_changes,
+            contract_claims: self.contract_claims,
+            workspace_strategy: self.workspace_strategy,
+            workspace_id: String::new(),
+            start_epoch: 0,
             relation: self.relation,
             created_at: Utc::now(),
         })
@@ -184,10 +211,13 @@ impl AssignmentDraft {
 pub struct Assignment {
     pub assignment_id: AssignmentId,
     pub root_session_id: String,
-    /// Stable hash of the canonical repository root. The private absolute root is stored
-    /// separately and is never included in task-facing assignment JSON.
+    /// Stable hash of the Git repository lineage (or canonical root outside Git). The private
+    /// absolute worktree root is stored separately and never included in task-facing JSON.
     #[serde(default)]
     pub repository_id: String,
+    /// Stable identity of the concrete shared or isolated worktree.
+    #[serde(default)]
+    pub workspace_id: String,
     pub role: AgentRole,
     pub capability_profile: CapabilityProfile,
     pub objective: String,
@@ -199,6 +229,12 @@ pub struct Assignment {
     pub risk_hints: Vec<String>,
     pub required_evidence: Vec<String>,
     pub prohibited_changes: Vec<String>,
+    #[serde(default)]
+    pub contract_claims: Vec<String>,
+    #[serde(default)]
+    pub workspace_strategy: WorkspaceStrategy,
+    #[serde(default)]
+    pub start_epoch: u64,
     pub relation: Option<AssignmentRelation>,
     pub created_at: DateTime<Utc>,
 }
@@ -276,6 +312,148 @@ pub enum TaskActor {
     Attempt(AttemptId),
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceActorKind {
+    Root,
+    Typed,
+    Legacy,
+    External,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseState {
+    Active,
+    Expired,
+    Released,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct WorkspaceManifestEntry {
+    pub path: String,
+    pub content_hash: Option<String>,
+    pub existed: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceRevision {
+    pub repository_id: String,
+    pub workspace_id: String,
+    pub epoch: u64,
+    pub manifest_hash: String,
+    pub files: Vec<WorkspaceManifestEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceActorRegistration {
+    pub root_session_id: String,
+    pub actor_id: String,
+    pub kind: WorkspaceActorKind,
+    pub assignment_id: Option<AssignmentId>,
+    pub attempt_id: Option<AttemptId>,
+    #[serde(default)]
+    pub strategy: WorkspaceStrategy,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceMutationRequest {
+    pub root_session_id: String,
+    pub actor_id: String,
+    pub kind: WorkspaceActorKind,
+    pub attempt_id: Option<AttemptId>,
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub contracts: Vec<String>,
+    #[serde(default)]
+    pub expected_manifest: Vec<WorkspaceManifestEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceMutationLease {
+    pub lease_id: String,
+    pub repository_id: String,
+    pub workspace_id: String,
+    pub root_session_id: String,
+    pub actor_id: String,
+    pub kind: WorkspaceActorKind,
+    pub attempt_id: Option<AttemptId>,
+    pub start_epoch: u64,
+    pub paths: Vec<String>,
+    pub contracts: Vec<String>,
+    pub expected_manifest: Vec<WorkspaceManifestEntry>,
+    pub state: LeaseState,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceMutationResult {
+    pub lease_id: String,
+    pub start_epoch: u64,
+    pub end_epoch: u64,
+    pub changed_paths: Vec<String>,
+    pub drift_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceEvent {
+    pub workspace_id: String,
+    pub epoch: u64,
+    pub actor_id: Option<String>,
+    pub actor_kind: WorkspaceActorKind,
+    pub attribution_confidence: AttributionConfidence,
+    pub paths: Vec<String>,
+    pub contracts: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceTaskStatus {
+    pub epoch: u64,
+    pub last_progress_at: Option<DateTime<Utc>>,
+    pub lease_state: Option<LeaseState>,
+    pub pending_gates: Vec<GateKind>,
+    pub stale_reason: Option<String>,
+    pub next_required_action: Option<String>,
+    pub nudge_sent_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationHandoffState {
+    Ready,
+    Claimed,
+    Integrated,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IsolationHandoff {
+    pub assignment_id: AssignmentId,
+    pub source_workspace_id: String,
+    #[serde(default)]
+    pub source_repository_root: Option<String>,
+    pub source_epoch: u64,
+    pub source_manifest_hash: String,
+    pub covered_manifest: Vec<WorkspaceManifestEntry>,
+    pub state: IsolationHandoffState,
+    pub integrator_assignment_id: Option<AssignmentId>,
+    pub created_at: DateTime<Utc>,
+    pub integrated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct QuiescenceStatus {
+    pub quiescent: bool,
+    pub active_assignment_ids: Vec<AssignmentId>,
+    pub running_validation_call_ids: Vec<String>,
+    pub pending_gate_assignment_ids: Vec<AssignmentId>,
+    pub active_claim_assignment_ids: Vec<AssignmentId>,
+    #[serde(default)]
+    pub active_mutation_lease_ids: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
 impl TaskActor {
     pub(crate) fn require_root(self) -> StoreResult<()> {
         match self {
@@ -324,6 +502,7 @@ pub enum ValidationCallStatus {
     Succeeded,
     Failed,
     Cancelled,
+    Superseded,
 }
 
 impl ValidationCallStatus {
@@ -353,8 +532,39 @@ pub struct ValidationCall {
     pub resolved_executable: Option<String>,
     #[serde(default)]
     pub proof_kind: ValidationProofKind,
+    #[serde(default)]
+    pub evidence: ValidationEvidence,
     pub status: ValidationCallStatus,
     pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ValidationEvidence {
+    pub start_epoch: u64,
+    pub end_epoch: Option<u64>,
+    #[serde(default)]
+    pub covered_scopes: Vec<RepoScope>,
+    pub covered_manifest: Vec<WorkspaceManifestEntry>,
+    #[serde(default)]
+    pub execution_snapshot: Option<Box<ValidationExecutionSnapshot>>,
+    pub covered_contracts: Vec<String>,
+    pub manifest_hash: String,
+    pub repository_wide: bool,
+    pub cwd: Option<String>,
+    pub environment_hash: Option<String>,
+    pub toolchain: Option<String>,
+    pub retained_output_ref: Option<String>,
+    #[serde(default)]
+    pub output_summary: Option<String>,
+    pub lease_expires_at: Option<DateTime<Utc>>,
+    pub shared_from_call_id: Option<String>,
+    pub stale_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ValidationExecutionSnapshot {
+    pub manifest: Vec<WorkspaceManifestEntry>,
+    pub manifest_hash: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -428,6 +638,10 @@ pub struct AgentReceipt {
     pub blockers: Vec<String>,
     pub risks: Vec<String>,
     pub next_action: Option<String>,
+    #[serde(default)]
+    pub evidence_epoch: u64,
+    #[serde(default)]
+    pub evidence_manifest_hash: String,
     pub sealed_at: DateTime<Utc>,
 }
 
@@ -481,6 +695,8 @@ pub struct AgentGate {
     pub status: GateStatus,
     pub reason: String,
     pub waiver_reason: Option<String>,
+    #[serde(default)]
+    pub evidence_epoch: u64,
     pub updated_at: DateTime<Utc>,
     pub sealed_at: Option<DateTime<Utc>>,
 }
@@ -490,6 +706,10 @@ pub struct WriteClaim {
     pub assignment_id: AssignmentId,
     pub attempt_id: AttemptId,
     pub scopes: Vec<RepoScope>,
+    #[serde(default)]
+    pub contract_claims: Vec<String>,
+    #[serde(default)]
+    pub workspace_id: String,
     pub supersedes: Vec<AssignmentId>,
     pub active: bool,
     pub created_at: DateTime<Utc>,
@@ -525,6 +745,10 @@ pub struct MutationEvidence {
     pub snapshot_retained: bool,
     pub first_observed_at: DateTime<Utc>,
     pub finalized_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub start_epoch: u64,
+    #[serde(default)]
+    pub end_epoch: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -671,6 +895,12 @@ pub struct AgentTask {
     pub receipt: Option<AgentReceipt>,
     #[serde(default)]
     pub validation_calls: Vec<ValidationCall>,
+    #[serde(default)]
+    pub workspace_status: WorkspaceTaskStatus,
+    #[serde(default)]
+    pub isolation_handoff: Option<IsolationHandoff>,
+    #[serde(default)]
+    pub integration_handoffs: Vec<IsolationHandoff>,
     pub observations: Vec<RuntimeObservation>,
 }
 

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
+import tempfile
 
 
 INSTALL_DIR = Path(__file__).resolve().parent
@@ -41,10 +43,19 @@ def standalone_installer_text(
 
 def build_standalone_installer(output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = output_path.with_name(f".{output_path.name}.tmp")
-    temp_path.write_text(standalone_installer_text(), encoding="utf-8", newline="\n")
-    temp_path.chmod(SOURCE_PATH.stat().st_mode)
-    temp_path.replace(output_path)
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=output_path.parent,
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+    )
+    os.close(descriptor)
+    temp_path = Path(temp_name)
+    try:
+        temp_path.write_text(standalone_installer_text(), encoding="utf-8", newline="\n")
+        temp_path.chmod(SOURCE_PATH.stat().st_mode)
+        temp_path.replace(output_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def parse_args() -> argparse.Namespace:

@@ -1,5 +1,6 @@
 use super::*;
 use crate::ThreadManager;
+use crate::agent::control::AgentControlTestBarrier;
 use crate::config::AgentRoleConfig;
 use crate::config::Constrained;
 use crate::config::DEFAULT_AGENT_MAX_DEPTH;
@@ -800,43 +801,44 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         .unwrap_or_else(|| child_config.cwd.to_path_buf());
     let risk_file = repo_root.join(&risk_path);
 
-    let output = SpawnAgentHandlerV2::default()
-        .handle(invocation(
-            Arc::new(session),
-            Arc::new(turn),
-            "spawn_agent",
-            function_payload(json!({
-                "task_name": task_name.clone(),
-                "agent_type": "worker",
-                "assignment": {
-                    "objective": "inspect the bounded path",
-                    "acceptance_criteria": [{
-                        "id": "criterion-1",
-                        "text": "report evidence"
-                    }],
-                    "write_scope": [{"path": risk_path.clone(), "recursive": false}],
-                    "risk_hints": [format!("path:{risk_path}")],
-                    "required_evidence": ["focused validation"],
-                    "stop_condition": "stop after reporting evidence"
-                }
-            })),
-        ))
-        .await
-        .expect("typed spawn should create and bind durable task state");
-    let (content, _) = expect_text_output(output);
-    let result: serde_json::Value =
-        serde_json::from_str(&content).expect("spawn_agent result should be json");
-    assert_eq!(result["task_name"], format!("/root/{task_name}"));
-    let assignment_id = codex_agent_task_store::AssignmentId::parse(
-        result["assignment_id"]
-            .as_str()
-            .expect("typed spawn should return assignment id"),
-    )
-    .expect("assignment id should be UUIDv7");
+    let before_initial_submission = Arc::new(AgentControlTestBarrier::default());
+    agent_control
+        .set_before_initial_submission_barrier(Some(Arc::clone(&before_initial_submission)));
+    let spawn_invocation = invocation(
+        Arc::new(session),
+        Arc::new(turn),
+        "spawn_agent",
+        function_payload(json!({
+            "task_name": task_name.clone(),
+            "agent_type": "worker",
+            "assignment": {
+                "objective": "inspect the bounded path",
+                "acceptance_criteria": [{
+                    "id": "criterion-1",
+                    "text": "report evidence"
+                }],
+                "write_scope": [{"path": risk_path.clone(), "recursive": false}],
+                "risk_hints": [format!("path:{risk_path}")],
+                "required_evidence": ["focused validation"],
+                "stop_condition": "stop after reporting evidence"
+            }
+        })),
+    );
+    let spawn_task = tokio::spawn(async move {
+        SpawnAgentHandlerV2::default()
+            .handle(spawn_invocation)
+            .await
+    });
+    before_initial_submission.wait_until_reached().await;
+    agent_control.set_before_initial_submission_barrier(None);
+    let agent_path = AgentPath::root()
+        .join(&task_name)
+        .expect("typed worker path should be valid");
     let binding = agent_control
         .task_coordinator()
-        .binding_for_assignment(assignment_id)
+        .binding_for_agent_path(&agent_path)
         .expect("typed assignment should be bound before spawn returns");
+    let assignment_id = binding.assignment_id;
     assert_eq!(binding.agent_path, format!("/root/{task_name}"));
     assert!(binding.thread_id.is_some());
     let task = agent_control
@@ -955,6 +957,24 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         ))
         .await
         .expect("bound attempt should seal a validation-backed risk-gated receipt");
+    before_initial_submission.release_one();
+    let output = spawn_task
+        .await
+        .expect("typed spawn task should join")
+        .expect("typed spawn should create and bind durable task state");
+    let (content, _) = expect_text_output(output);
+    let result: serde_json::Value =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    assert_eq!(result["task_name"], format!("/root/{task_name}"));
+    let assignment_id_text = assignment_id.to_string();
+    assert_eq!(
+        result["assignment_id"].as_str(),
+        Some(assignment_id_text.as_str())
+    );
+    let _ = agent_control
+        .shutdown_live_agent(child_thread_id)
+        .await
+        .expect("typed child should stop after its durable receipt is sealed");
 
     let reloaded = crate::agent::task_coordinator::AgentTaskCoordinator::default();
     reloaded
@@ -991,10 +1011,6 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
             && gate.status == codex_agent_task_store::GateStatus::Pending
     }));
 
-    let _ = agent_control
-        .shutdown_live_agent(child_thread_id)
-        .await
-        .expect("typed child shutdown should submit");
     std::fs::remove_file(risk_file).expect("high-risk test file should be removed");
 }
 
@@ -4196,6 +4212,7 @@ async fn multi_agent_v2_wait_agent_accepts_timeout_only_argument() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait completed.".to_string(),
             timed_out: false,
+            ..Default::default()
         }
     );
     assert_eq!(success, None);
@@ -4261,6 +4278,7 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_min() 
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait timed out.".to_string(),
             timed_out: true,
+            ..Default::default()
         }
     );
     assert_eq!(success, None);
@@ -4316,6 +4334,7 @@ async fn multi_agent_v2_wait_agent_uses_configured_default_timeout() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait timed out.".to_string(),
             timed_out: true,
+            ..Default::default()
         }
     );
     assert_eq!(success, None);
@@ -4356,6 +4375,7 @@ async fn multi_agent_v2_wait_agent_allows_zero_configured_timeout() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait timed out.".to_string(),
             timed_out: true,
+            ..Default::default()
         }
     );
     assert_eq!(success, None);
@@ -4421,6 +4441,7 @@ async fn multi_agent_v2_wait_agent_accepts_explicit_timeout_at_configured_max() 
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait timed out.".to_string(),
             timed_out: true,
+            ..Default::default()
         }
     );
     assert_eq!(success, None);
@@ -4680,6 +4701,7 @@ async fn multi_agent_v2_wait_agent_returns_summary_for_mailbox_activity() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait completed.".to_string(),
             timed_out: false,
+            ..Default::default()
         }
     );
     assert_eq!(success, None);
@@ -4761,6 +4783,7 @@ async fn multi_agent_v2_wait_agent_returns_for_already_queued_mail() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait completed.".to_string(),
             timed_out: false,
+            ..Default::default()
         }
     );
     assert_eq!(success, None);
@@ -4852,6 +4875,7 @@ async fn multi_agent_v2_wait_agent_wakes_on_any_mailbox_notification() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait completed.".to_string(),
             timed_out: false,
+            ..Default::default()
         }
     );
     assert_eq!(success, None);
@@ -4940,6 +4964,7 @@ async fn multi_agent_v2_wait_agent_does_not_return_completed_content() {
         crate::tools::handlers::multi_agents_v2::wait::WaitAgentResult {
             message: "Wait completed.".to_string(),
             timed_out: false,
+            ..Default::default()
         }
     );
     assert!(!content.contains("sensitive child output"));

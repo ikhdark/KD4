@@ -12,14 +12,24 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from validate_cases import (
-    DEFAULT_CASES,
-    REPO_ROOT,
-    ValidationError,
-    case_fingerprint,
-    load_cases,
-    validate_cases,
-)
+if __package__:
+    from .validate_cases import (
+        DEFAULT_CASES,
+        REPO_ROOT,
+        ValidationError,
+        case_fingerprint,
+        load_cases,
+        validate_cases,
+    )
+else:  # Direct execution from this directory.
+    from validate_cases import (
+        DEFAULT_CASES,
+        REPO_ROOT,
+        ValidationError,
+        case_fingerprint,
+        load_cases,
+        validate_cases,
+    )
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RFC3339_RE = re.compile(

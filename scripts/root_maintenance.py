@@ -142,6 +142,7 @@ SCRIPT_TEST_MODULES: dict[str, tuple[str, ...]] = {
         "scripts.codex_package.test_ripgrep",
     ),
     "scripts/config_schema_check.py": ("scripts.test_dev_environment",),
+    "scripts/generated_output_lock.py": ("scripts.test_dev_environment",),
     "scripts/debug-codex.sh": ("scripts.test_shell_helpers",),
     "scripts/dev_env_doctor.py": ("scripts.test_dev_environment",),
     "scripts/format.py": ("scripts.test_build_tooling",),

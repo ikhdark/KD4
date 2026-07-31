@@ -49,20 +49,40 @@ pub unsafe fn sync_persistent_deny_read_acls(
         .map(|path| lexical_path_key(path))
         .collect::<HashSet<_>>();
 
+    let mut failed_stale_paths = Vec::new();
+    let mut revoke_errors = Vec::new();
     for path in previous_paths {
         if !desired_keys.contains(&lexical_path_key(&path)) {
-            revoke_ace(&path, psid);
+            if let Err(error) = revoke_ace(&path, psid) {
+                revoke_errors.push(format!("{}: {error}", path.display()));
+                failed_stale_paths.push(path);
+            }
         }
     }
 
-    if applied_paths.is_empty() {
+    let mut persisted_paths = applied_paths.clone();
+    let mut persisted_keys = desired_keys;
+    for path in failed_stale_paths {
+        if persisted_keys.insert(lexical_path_key(&path)) {
+            persisted_paths.push(path);
+        }
+    }
+
+    if persisted_paths.is_empty() {
         state.principals.remove(principal_sid);
     } else {
         state
             .principals
-            .insert(principal_sid.to_string(), applied_paths.clone());
+            .insert(principal_sid.to_string(), persisted_paths);
     }
     store_state(&state_path, &state)?;
+
+    if !revoke_errors.is_empty() {
+        anyhow::bail!(
+            "failed to revoke stale deny-read ACLs; retained for retry: {}",
+            revoke_errors.join("; ")
+        );
+    }
 
     Ok(applied_paths)
 }

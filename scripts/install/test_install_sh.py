@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,8 +14,24 @@ import unittest
 INSTALL_SCRIPT = Path(__file__).with_name("install.sh")
 BUNDLE_SCRIPT = Path(__file__).with_name("build_install_sh.py")
 VERSION = "0.142.5"
+SH_PATH = shutil.which("sh")
+SH_PLATFORM = (
+    subprocess.run(
+        [SH_PATH, "-c", "uname -s"],
+        check=False,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if SH_PATH
+    else ""
+)
+SH_SUPPORTED = SH_PLATFORM in {"Darwin", "Linux"}
 
 
+@unittest.skipUnless(
+    SH_SUPPORTED,
+    "install.sh tests require a macOS or Linux POSIX shell",
+)
 class InstallShTest(unittest.TestCase):
     def test_release_bundle_is_a_standalone_installer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -33,7 +50,7 @@ class InstallShTest(unittest.TestCase):
             bundled_text = bundled_installer.read_text(encoding="utf-8")
             self.assertNotIn("install_release.sh", bundled_text)
             self.assertIn("release_asset_digest_or_empty()", bundled_text)
-            subprocess.run(["/bin/sh", "-n", str(bundled_installer)], check=True)
+            subprocess.run([SH_PATH, "-n", str(bundled_installer)], check=True)
 
             result, requests = run_installer(
                 VERSION,
@@ -131,26 +148,56 @@ def run_installer(
                 """
             ),
             encoding="utf-8",
+            newline="\n",
         )
         fake_curl.chmod(0o755)
 
+        fake_uname = bin_dir / "uname"
+        fake_uname.write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/sh
+                case "${1:-}" in
+                  -s) printf 'Linux\n' ;;
+                  -m) printf 'x86_64\n' ;;
+                  *) printf 'Linux\n' ;;
+                esac
+                """
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        fake_uname.chmod(0o755)
+
+        shell_root = subprocess.run(
+            [SH_PATH, "-c", 'cd "$1" && pwd', "sh", str(root)],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
         env = os.environ.copy()
         env.update(
             {
-                "CODEX_HOME": str(root / "codex-home"),
-                "CODEX_INSTALL_DIR": str(root / "install-bin"),
+                "CODEX_HOME": f"{shell_root}/codex-home",
+                "CODEX_INSTALL_DIR": f"{shell_root}/install-bin",
                 "CODEX_NON_INTERACTIVE": "1",
                 "CODEX_RELEASE": release,
                 "CODEX_TEST_METADATA_FAILURE": "1" if metadata_failure else "0",
                 "CODEX_TEST_METADATA_JSON": release_metadata(),
-                "CODEX_TEST_REQUEST_LOG": str(request_log),
-                "HOME": str(root / "home"),
-                "PATH": f"{bin_dir}:/usr/bin:/bin",
-                "SHELL": "/bin/sh",
+                "CODEX_TEST_REQUEST_LOG": f"{shell_root}/requests.log",
+                "HOME": f"{shell_root}/home",
+                "SHELL": SH_PATH,
             }
         )
         result = subprocess.run(
-            ["/bin/sh", str(install_script)],
+            [
+                SH_PATH,
+                "-c",
+                'PATH="$1:$PATH"; export PATH; exec sh "$2"',
+                "sh",
+                f"{shell_root}/bin",
+                str(install_script),
+            ],
             capture_output=True,
             check=False,
             env=env,

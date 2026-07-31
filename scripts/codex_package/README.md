@@ -16,9 +16,10 @@ python scripts/build_codex_package.py \
   --archive-output dist/codex-package-x86_64-pc-windows-msvc.zip
 ```
 
-The wrapper routes to `codex_package.cli.main`. Release packaging should keep
-using `.github/scripts/build-codex-package-archive.sh`, which supplies signed or
-prebuilt artifacts and creates both gzip and zstd archives.
+The wrapper routes to `codex_package.cli.main` and is the canonical packaging
+entrypoint in this fork. Upstream release automation may wrap it to supply signed
+or prebuilt artifacts and create additional archive formats, but those `.github`
+workflow scripts are not present in this checkout.
 
 ## Package Layout
 

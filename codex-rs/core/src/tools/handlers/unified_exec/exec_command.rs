@@ -7,6 +7,7 @@ use crate::maybe_emit_implicit_skill_invocation;
 use crate::shell::Shell;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
+use crate::tools::command_execution::RunningWorkspaceMutation;
 use crate::tools::command_output_artifact::create_raw_output_artifact;
 use crate::tools::command_output_artifact::replace_raw_output_artifact;
 use crate::tools::context::ExecCommandToolOutput;
@@ -23,8 +24,7 @@ use crate::tools::handlers::normalize_and_validate_additional_permissions;
 use crate::tools::handlers::parse_arguments;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_tool_environment;
-use crate::tools::handlers::rewrite_function_command_argument;
-use crate::tools::handlers::updated_hook_command;
+use crate::tools::handlers::rewrite_function_command_invocation;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
@@ -36,7 +36,11 @@ use crate::unified_exec::UnifiedExecContext;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcessManager;
 use crate::unified_exec::generate_chunk_id;
+use codex_agent_task_store::REPOSITORY_WIDE_PATH;
+use codex_agent_task_store::WorkspaceActorKind;
+use codex_agent_task_store::WorkspaceMutationRequest;
 use codex_features::Feature;
+use codex_git_utils::get_git_repo_root;
 use codex_otel::SessionTelemetry;
 use codex_otel::TOOL_CALL_UNIFIED_EXEC_METRIC;
 use codex_sandboxing::SandboxManager;
@@ -84,6 +88,14 @@ impl ExecCommandHookArgs {
             self.script_body.as_deref(),
         )
     }
+}
+
+pub(super) fn exec_command_hook_input(arguments: &str) -> Option<serde_json::Value> {
+    parse_arguments::<ExecCommandHookArgs>(arguments)
+        .ok()?
+        .command_invocation()
+        .ok()
+        .map(|invocation| invocation.hook_input())
 }
 
 #[derive(Clone, Copy)]
@@ -163,6 +175,78 @@ pub(super) fn attach_powershell_failure_advisory(
             None => advisory.to_string(),
         });
     }
+}
+
+async fn begin_unified_exec_workspace_mutation(
+    session: &crate::session::session::Session,
+    turn: &crate::session::turn_context::TurnContext,
+    environment_id: &str,
+    command_cwd: &std::path::Path,
+) -> Result<RunningWorkspaceMutation, FunctionCallError> {
+    let coordinator = session.services.agent_control.task_coordinator().clone();
+    if coordinator.store().is_none() {
+        coordinator
+            .initialize_for_workspace_coordination(
+                session.services.state_db.clone(),
+                turn.config.sqlite_home.clone(),
+                turn.config.model_provider_id.clone(),
+                session.services.agent_control.session_id().to_string(),
+            )
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "exec_command workspace coordination could not initialize: {error}"
+                ))
+            })?;
+    }
+    let store = coordinator.store().ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "exec_command workspace coordination store is unavailable".to_string(),
+        )
+    })?;
+    let root_session_id = coordinator.root_session_id().ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "exec_command root task identity is unavailable".to_string(),
+        )
+    })?;
+    let agent_path = turn
+        .session_source
+        .get_agent_path()
+        .map(|path| path.to_string())
+        .unwrap_or_else(|| "/root".to_string());
+    let kind = if turn.session_source.is_non_root_agent() {
+        WorkspaceActorKind::Legacy
+    } else {
+        WorkspaceActorKind::Root
+    };
+    let actor_id = match kind {
+        WorkspaceActorKind::Root => format!("root:{root_session_id}"),
+        WorkspaceActorKind::Legacy => {
+            format!("legacy:{root_session_id}:{agent_path}:{environment_id}")
+        }
+        WorkspaceActorKind::Typed | WorkspaceActorKind::External => unreachable!(),
+    };
+    let repo_root = get_git_repo_root(command_cwd).unwrap_or_else(|| command_cwd.to_path_buf());
+    let lease = store
+        .begin_workspace_mutation(
+            &repo_root,
+            WorkspaceMutationRequest {
+                root_session_id,
+                actor_id,
+                kind,
+                attempt_id: None,
+                paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "exec_command could not acquire the repository-wide mutation lease: {error}"
+            ))
+        })?;
+    Ok(RunningWorkspaceMutation::new(store, repo_root, lease))
 }
 
 impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
@@ -355,6 +439,20 @@ impl ExecCommandHandler {
             args.additional_permissions.is_some(),
         )
         .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
+        let inspection_command = is_known_safe_command(&resolved_command.safety_command);
+        if !inspection_command
+            && session
+                .services
+                .agent_control
+                .task_coordinator()
+                .binding_for_source(&turn.session_source)
+                .is_some()
+        {
+            return Err(FunctionCallError::RespondToModel(
+                "typed agents must use shell_command for focused validation; exec_command cannot admit a potentially mutating typed command"
+                    .to_string(),
+            ));
+        }
         let hook_command = command_invocation.display_command();
         // Implicit skill detection requires a native path, so foreign PathUri
         // workdirs are intentionally skipped here.
@@ -369,6 +467,10 @@ impl ExecCommandHandler {
         }
         let command = resolved_command.command;
         let safety_command = resolved_command.safety_command;
+        let intercepted_apply_patch = !matches!(
+            codex_apply_patch::maybe_parse_apply_patch(&command, &cwd),
+            codex_apply_patch::MaybeApplyPatch::NotApplyPatch
+        );
         let shell_type = resolved_command.shell_type;
         let is_powershell_script = command_invocation.is_powershell_script();
         let command_for_display = hook_command.clone();
@@ -540,12 +642,44 @@ impl ExecCommandHandler {
             }
         }
 
+        let mut workspace_mutation =
+            if !inspection_command && !intercepted_apply_patch && !environment_is_remote {
+                let mutation_cwd = native_cwd.as_ref().ok_or_else(|| {
+                FunctionCallError::RespondToModel(format!(
+                    "cannot coordinate a mutating command in non-native working directory `{cwd}`"
+                ))
+            })?;
+                match begin_unified_exec_workspace_mutation(
+                    session.as_ref(),
+                    turn.as_ref(),
+                    &turn_environment.environment_id,
+                    mutation_cwd.as_path(),
+                )
+                .await
+                {
+                    Ok(workspace_mutation) => Some(workspace_mutation),
+                    Err(error) => {
+                        session
+                            .services
+                            .command_execution
+                            .record_exit(&attempt_key, -1)
+                            .await;
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+
         let raw_output_artifact = create_raw_output_artifact(
             turn.config.codex_home.as_path(),
             &session.thread_id.to_string(),
             b"",
         )
         .await;
+        let mutation_lease_lost = workspace_mutation
+            .as_ref()
+            .map(RunningWorkspaceMutation::lease_lost_token);
 
         emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
         // Reserve only for a real process launch. The manager-owned reservation
@@ -576,6 +710,7 @@ impl ExecCommandHandler {
                         .permissions_preapproved,
                     justification,
                     prefix_rule,
+                    mutation_lease_lost,
                 },
                 process_id_reservation,
                 &context,
@@ -600,6 +735,25 @@ impl ExecCommandHandler {
                         .command_execution
                         .update_running_artifact(process_id, finalized_artifact)
                         .await;
+                    if let Some(mutation) = workspace_mutation.take() {
+                        let attached = session
+                            .services
+                            .command_execution
+                            .attach_running_workspace_mutation(process_id, mutation.clone())
+                            .await
+                            .map_err(|error| {
+                                FunctionCallError::RespondToModel(format!(
+                                    "exec_command workspace mutation tracking failed: {error}"
+                                ))
+                            })?;
+                        if !attached {
+                            mutation.finish().await.map_err(|error| {
+                                FunctionCallError::RespondToModel(format!(
+                                    "exec_command workspace mutation finalization failed: {error}"
+                                ))
+                            })?;
+                        }
+                    }
                 } else if let Some(exit_code) = response.exit_code {
                     let tracked = session
                         .services
@@ -612,6 +766,13 @@ impl ExecCommandHandler {
                             .command_execution
                             .record_exit(&attempt_key, exit_code)
                             .await;
+                    }
+                    if let Some(mutation) = workspace_mutation.take() {
+                        mutation.finish().await.map_err(|error| {
+                            FunctionCallError::RespondToModel(format!(
+                                "exec_command workspace mutation finalization failed: {error}"
+                            ))
+                        })?;
                     }
                 }
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
@@ -632,6 +793,13 @@ impl ExecCommandHandler {
                         .command_execution
                         .record_exit(&attempt_key, output.exit_code)
                         .await;
+                }
+                if let Some(mutation) = workspace_mutation.take() {
+                    mutation.finish().await.map_err(|error| {
+                        FunctionCallError::RespondToModel(format!(
+                            "exec_command workspace mutation finalization failed: {error}"
+                        ))
+                    })?;
                 }
                 let original_token_count = approx_token_count(&output_text);
                 let mut response = ExecCommandToolOutput {
@@ -654,6 +822,11 @@ impl ExecCommandHandler {
                 Ok(boxed_tool_output(response))
             }
             Err(err) => {
+                if let Some(mutation) = workspace_mutation.take()
+                    && let Err(error) = mutation.finish().await
+                {
+                    tracing::warn!(%error, "exec_command workspace mutation finalization failed");
+                }
                 let retry_failure = matches!(
                     &err,
                     UnifiedExecError::CreateProcess { .. } | UnifiedExecError::ProcessFailed { .. }
@@ -702,13 +875,10 @@ impl CoreToolRuntime for ExecCommandHandler {
             return None;
         };
 
-        parse_arguments::<ExecCommandHookArgs>(arguments)
-            .ok()
-            .and_then(|args| args.command_invocation().ok())
-            .map(|args| PreToolUsePayload {
-                tool_name: HookToolName::bash(),
-                tool_input: serde_json::json!({ "command": args.display_command() }),
-            })
+        exec_command_hook_input(arguments).map(|tool_input| PreToolUsePayload {
+            tool_name: HookToolName::exec_command(),
+            tool_input,
+        })
     }
 
     fn with_updated_hook_input(
@@ -724,12 +894,12 @@ impl CoreToolRuntime for ExecCommandHandler {
         let args: ExecCommandHookArgs = parse_arguments(&arguments)?;
         let command_invocation = args.command_invocation()?;
         invocation.payload = ToolPayload::Function {
-            arguments: rewrite_function_command_argument(
+            arguments: rewrite_function_command_invocation(
                 &arguments,
                 "exec_command",
                 "cmd",
                 &command_invocation,
-                updated_hook_command(&updated_input)?,
+                &updated_input,
             )?,
         };
         Ok(invocation)

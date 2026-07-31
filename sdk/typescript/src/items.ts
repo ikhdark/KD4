@@ -3,7 +3,7 @@
 import type { ContentBlock as McpContentBlock } from "@modelcontextprotocol/sdk/types.js";
 
 /** The status of a command execution. */
-export type CommandExecutionStatus = "in_progress" | "completed" | "failed";
+export type CommandExecutionStatus = "in_progress" | "completed" | "failed" | "declined";
 
 /** A command executed by the agent. */
 export type CommandExecutionItem = {
@@ -13,8 +13,8 @@ export type CommandExecutionItem = {
   command: string;
   /** Aggregated stdout and stderr captured while the command was running. */
   aggregated_output: string;
-  /** Set when the command exits; omitted while still running. */
-  exit_code?: number;
+  /** Set when the command exits; null while still running. */
+  exit_code: number | null;
   /** Current status of the command execution. */
   status: CommandExecutionStatus;
 };
@@ -29,9 +29,9 @@ export type FileUpdateChange = {
 };
 
 /** The status of a file change. */
-export type PatchApplyStatus = "completed" | "failed";
+export type PatchApplyStatus = "in_progress" | "completed" | "failed";
 
-/** A set of file changes by the agent. Emitted once the patch succeeds or fails. */
+/** A set of file changes by the agent, from application start through completion. */
 export type FileChangeItem = {
   id: string;
   type: "file_change";
@@ -58,15 +58,15 @@ export type McpToolCallItem = {
   /** Arguments forwarded to the tool invocation. */
   arguments: unknown;
   /** Result payload returned by the MCP server for successful calls. */
-  result?: {
+  result: {
     content: McpContentBlock[];
     _meta?: unknown;
-    structured_content: unknown;
-  };
+    structured_content: unknown | null;
+  } | null;
   /** Error message reported for failed calls. */
-  error?: {
+  error: {
     message: string;
-  };
+  } | null;
   /** Current status of the tool invocation. */
   status: McpToolCallStatus;
 };
@@ -120,11 +120,19 @@ export type ReasoningItem = {
   text: string;
 };
 
+/** Action performed by a web search item. */
+export type WebSearchAction =
+  | { type: "search"; query?: string; queries?: string[] }
+  | { type: "open_page"; url?: string }
+  | { type: "find_in_page"; url?: string; pattern?: string }
+  | { type: "other" };
+
 /** Captures a web search request. Completes when results are returned to the agent. */
 export type WebSearchItem = {
   id: string;
   type: "web_search";
   query: string;
+  action: WebSearchAction;
 };
 
 /** Describes a non-fatal error surfaced as an item. */

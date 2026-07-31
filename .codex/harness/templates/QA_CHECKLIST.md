@@ -28,8 +28,10 @@
 
 ## Implementation Completion Gate
 
-Use the authoritative status definitions in
-[`../workflow.md`](../workflow.md#incomplete-implementation-finish-gate).
+Use the authoritative completion discipline in repository root
+[`AGENTS.md`](../../../AGENTS.md), the status definitions in
+[`../workflow.md`](../workflow.md#completion-gate-status), and the finish phase
+in [`../workflow.md`](../workflow.md#phase-5-finish).
 
 - [ ] Intended runtime path identified:
 - [ ] Changed code is reached from that path:

@@ -118,6 +118,7 @@ export class Thread {
     let finalResponse: string = "";
     let usage: Usage | null = null;
     let turnFailure: ThreadError | null = null;
+    let streamFailure: string | null = null;
     for await (const event of generator) {
       if (event.type === "item.completed") {
         if (event.item.type === "agent_message") {
@@ -129,7 +130,13 @@ export class Thread {
       } else if (event.type === "turn.failed") {
         turnFailure = event.error;
         break;
+      } else if (event.type === "error") {
+        streamFailure = event.message;
+        break;
       }
+    }
+    if (streamFailure !== null) {
+      throw new Error(streamFailure);
     }
     if (turnFailure) {
       throw new Error(turnFailure.message);

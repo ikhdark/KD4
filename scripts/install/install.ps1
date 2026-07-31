@@ -30,6 +30,30 @@ function Write-WarningStep {
     Write-Warning $Message
 }
 
+function Test-PathIsEqualOrDescendant {
+    param(
+        [string]$CandidatePath,
+        [string]$RootPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($CandidatePath) -or [string]::IsNullOrWhiteSpace($RootPath)) {
+        return $false
+    }
+
+    try {
+        $candidate = [IO.Path]::GetFullPath($CandidatePath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        $root = [IO.Path]::GetFullPath($RootPath).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    } catch {
+        return $false
+    }
+
+    if ($candidate.Equals($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+
+    return $candidate.StartsWith($root + [IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Prompt-YesNo {
     param(
         [string]$Prompt
@@ -509,8 +533,7 @@ function Ensure-Junction {
     if (Test-IsJunction -Path $LinkPath) {
         $existingTarget = [string]$item.Target
         if (-not [string]::IsNullOrWhiteSpace($InstallerOwnedTargetPrefix)) {
-            $ownedTargetPrefix = $InstallerOwnedTargetPrefix.TrimEnd("\\")
-            if (-not $existingTarget.StartsWith($ownedTargetPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            if (-not (Test-PathIsEqualOrDescendant -CandidatePath $existingTarget -RootPath $InstallerOwnedTargetPrefix)) {
                 throw "Refusing to retarget junction at $LinkPath because it is not managed by this installer."
             }
         }
@@ -544,7 +567,9 @@ function Ensure-Junction {
 
 function Test-PackageContentsAreComplete {
     param(
-        [string]$PackageDir
+        [string]$PackageDir,
+        [string]$ExpectedVersion,
+        [string]$ExpectedTarget
     )
 
     if (-not (Test-Path -LiteralPath $PackageDir -PathType Container)) {
@@ -563,6 +588,27 @@ function Test-PackageContentsAreComplete {
     )
     foreach ($name in $expectedFiles) {
         if (-not (Test-Path -LiteralPath (Join-Path $PackageDir $name) -PathType Leaf)) {
+            return $false
+        }
+    }
+
+    try {
+        $metadata = Get-Content -LiteralPath (Join-Path $PackageDir "codex-package.json") -Raw | ConvertFrom-Json
+    } catch {
+        return $false
+    }
+    $expectedMetadata = @{
+        layoutVersion = 1
+        version = $ExpectedVersion
+        target = $ExpectedTarget
+        variant = "codex"
+        entrypoint = "bin/codex.exe"
+        resourcesDir = "codex-resources"
+        pathDir = "codex-path"
+    }
+    foreach ($key in $expectedMetadata.Keys) {
+        $property = $metadata.PSObject.Properties[$key]
+        if ($null -eq $property -or $property.Value -cne $expectedMetadata[$key]) {
             return $false
         }
     }
@@ -642,7 +688,7 @@ function Test-ReleaseIsComplete {
 
     switch ($Layout) {
         "Package" {
-            if (-not (Test-PackageContentsAreComplete -PackageDir $ReleaseDir)) {
+            if (-not (Test-PackageContentsAreComplete -PackageDir $ReleaseDir -ExpectedVersion $ExpectedVersion -ExpectedTarget $ExpectedTarget)) {
                 return $false
             }
         }
@@ -660,9 +706,19 @@ function Test-ReleaseIsComplete {
         return $false
     }
 
-    return (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "version") -eq $ExpectedVersion -and
+    $metadataMatches = (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "version") -eq $ExpectedVersion -and
         (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "target") -eq $ExpectedTarget -and
         (Get-InstallMetadataField -ReleaseDir $ReleaseDir -Name "layout") -eq $Layout
+    if (-not $metadataMatches) {
+        return $false
+    }
+
+    $codexPath = if ($Layout -eq "Package") {
+        Join-Path $ReleaseDir "bin\codex.exe"
+    } else {
+        Join-Path $ReleaseDir "codex.exe"
+    }
+    return (Get-VersionFromBinary -CodexPath $codexPath) -ceq $ExpectedVersion
 }
 
 function Get-ExistingCodexCommand {
@@ -684,7 +740,7 @@ function Get-ExistingCodexManager {
         return $null
     }
 
-    if ($ExistingPath.StartsWith($VisibleBinDir, [System.StringComparison]::OrdinalIgnoreCase)) {
+    if (Test-PathIsEqualOrDescendant -CandidatePath $ExistingPath -RootPath $VisibleBinDir) {
         return $null
     }
 
@@ -876,7 +932,7 @@ try {
             New-Item -ItemType Directory -Force -Path $stagingDir | Out-Null
             if ($installLayout -eq "Package") {
                 tar -xzf $archivePath -C $stagingDir
-                if (-not (Test-PackageContentsAreComplete -PackageDir $stagingDir)) {
+                if (-not (Test-PackageContentsAreComplete -PackageDir $stagingDir -ExpectedVersion $resolvedVersion -ExpectedTarget $target)) {
                     throw "Downloaded Codex package archive did not contain the expected package layout."
                 }
             } else {
@@ -901,6 +957,16 @@ try {
                 if (-not (Test-LegacyPlatformNpmContentsAreComplete -PackageDir $stagingDir)) {
                     throw "Downloaded Codex npm archive did not contain the expected legacy platform package layout."
                 }
+            }
+
+            $stagedCodexPath = if ($installLayout -eq "Package") {
+                Join-Path $stagingDir "bin\codex.exe"
+            } else {
+                Join-Path $stagingDir "codex.exe"
+            }
+            $stagedVersion = Get-VersionFromBinary -CodexPath $stagedCodexPath
+            if ($stagedVersion -cne $resolvedVersion) {
+                throw "Downloaded Codex binary version did not match release metadata. Expected $resolvedVersion but got $stagedVersion."
             }
 
             Write-InstallMetadata -ReleaseDir $stagingDir -ResolvedVersion $resolvedVersion -Target $target -Layout $installLayout

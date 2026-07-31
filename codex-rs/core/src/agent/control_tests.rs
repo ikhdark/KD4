@@ -2828,6 +2828,8 @@ async fn completion_watcher_emits_terminal_metrics_for_missing_typed_receipt() {
                 risk_hints: Vec::new(),
                 required_evidence: Vec::new(),
                 prohibited_changes: Vec::new(),
+                contract_claims: Vec::new(),
+                workspace_strategy: codex_agent_task_store::WorkspaceStrategy::Auto,
                 relation: None,
             },
         )

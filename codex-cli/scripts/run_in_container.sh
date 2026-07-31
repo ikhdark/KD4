@@ -25,15 +25,35 @@ fi
 
 WORK_DIR=$(realpath "$WORK_DIR")
 
-# Generate a unique container name based on the normalized work directory
-CONTAINER_NAME="codex_$(echo "$WORK_DIR" | sed 's/\//_/g' | sed 's/[^a-zA-Z0-9_-]//g')"
+# Generate a bounded readable name plus a collision-resistant identity derived
+# from the canonical workspace path.
+if command -v sha256sum >/dev/null 2>&1; then
+  WORKSPACE_HASH=$(printf '%s' "$WORK_DIR" | sha256sum | awk '{print $1}')
+elif command -v shasum >/dev/null 2>&1; then
+  WORKSPACE_HASH=$(printf '%s' "$WORK_DIR" | shasum -a 256 | awk '{print $1}')
+else
+  echo "Error: sha256sum or shasum is required."
+  exit 1
+fi
+READABLE_NAME=$(basename "$WORK_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_.-]/-/g' | cut -c1-40)
+READABLE_NAME=${READABLE_NAME:-workspace}
+CONTAINER_NAME="codex-${READABLE_NAME}-${WORKSPACE_HASH:0:16}"
+WORKSPACE_LABEL="com.openai.codex.workspace"
 
 # Define cleanup to remove the container on script exit, ensuring no leftover containers
 cleanup() {
+  if ! docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+    return 0
+  fi
+  existing_workspace=$(docker inspect --format "{{ index .Config.Labels \"$WORKSPACE_LABEL\" }}" "$CONTAINER_NAME" 2>/dev/null || true)
+  if [ "$existing_workspace" != "$WORK_DIR" ]; then
+    echo "Refusing to remove container $CONTAINER_NAME because its workspace ownership label does not match." >&2
+    return 1
+  fi
   docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
 }
 # Trap EXIT to invoke cleanup regardless of how the script terminates
-trap cleanup EXIT
+trap 'cleanup || true' EXIT
 
 # Ensure a command is provided.
 if [ "$#" -eq 0 ]; then
@@ -58,6 +78,7 @@ cleanup
 
 # Run the container with the specified directory mounted at the same path inside the container.
 docker run --name "$CONTAINER_NAME" -d \
+  --label "$WORKSPACE_LABEL=$WORK_DIR" \
   -e OPENAI_API_KEY \
   --cap-add=NET_ADMIN \
   --cap-add=NET_RAW \

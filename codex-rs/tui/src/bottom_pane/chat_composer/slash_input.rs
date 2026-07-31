@@ -223,6 +223,23 @@ impl ChatComposer {
         } else {
             self.footer.mode = reset_mode_after_activity(self.footer.mode);
         }
+
+        // An exact typed command must win over a fuzzy popup match. Hidden-but-dispatchable
+        // commands such as `/usage` can otherwise select an unrelated row whose description
+        // happens to contain the same word (for example the `/fast` service tier).
+        if matches!(
+            key_event,
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            }
+        ) && let Some(result) = self.try_dispatch_bare_slash_command()
+        {
+            self.popups.active = ActivePopup::None;
+            return (result, true);
+        }
+
         let ActivePopup::Command(popup) = &mut self.popups.active else {
             unreachable!();
         };

@@ -1,7 +1,5 @@
 use rand::Rng;
-use std::cmp::Reverse;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -482,6 +480,22 @@ impl UnifiedExecProcessManager {
                 return Err(err);
             }
         };
+        if let Some(lease_lost) = request.mutation_lease_lost.clone() {
+            let leased_process = Arc::clone(&process);
+            let process_exited = process.cancellation_token();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = process_exited.cancelled() => {}
+                    _ = lease_lost.cancelled() => {
+                        if !leased_process.has_exited()
+                            && let Err(error) = leased_process.terminate_confirmed().await
+                        {
+                            tracing::error!(%error, "failed to terminate process after mutation lease loss");
+                        }
+                    }
+                }
+            });
+        }
         let executor_was_ready =
             self.deferred_executor_enabled && self.executor_ready.swap(true, Ordering::AcqRel);
         let tool_execution_timing_guard = context.turn.turn_timing_state.begin_tool_execution();
@@ -533,7 +547,7 @@ impl UnifiedExecProcessManager {
                 Arc::clone(&transcript),
                 Arc::clone(&initial_exec_command_active),
             )
-            .await;
+            .await?;
             Some(InitialExecCommandGuard {
                 active: initial_exec_command_active,
             })
@@ -886,7 +900,7 @@ impl UnifiedExecProcessManager {
         let exit_code = entry.process.exit_code();
         let process_id = entry.process_id;
 
-        if entry.process.has_exited() {
+        if entry.process.has_exited() && entry.process.output_is_closed() {
             let Some(entry) = store.remove(process_id) else {
                 return ProcessStatus::Unknown;
             };
@@ -965,7 +979,7 @@ impl UnifiedExecProcessManager {
         network_approval: Option<DeferredNetworkApproval>,
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
         initial_exec_command_active: Arc<AtomicBool>,
-    ) {
+    ) -> Result<(), UnifiedExecError> {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
             call_id: context.call_id.clone(),
@@ -978,12 +992,15 @@ impl UnifiedExecProcessManager {
             session: Arc::downgrade(&context.session),
             last_used: started_at,
         };
-        let pruned_entry = {
+        let (pruned_entry, stored) = {
             let mut store = self.process_store.lock().await;
             let pruned_entry = Self::prune_processes_if_needed(&mut store);
-            store.processes.insert(process_id, entry);
-            process_id_reservation.transfer_to_store();
-            pruned_entry
+            let stored = store.processes.len() < MAX_UNIFIED_EXEC_PROCESSES;
+            if stored {
+                store.processes.insert(process_id, entry);
+                process_id_reservation.transfer_to_store();
+            }
+            (pruned_entry, stored)
         };
         // prune_processes_if_needed runs while holding process_store; do async
         // network-approval cleanup only after dropping that lock.
@@ -996,7 +1013,14 @@ impl UnifiedExecProcessManager {
                 .command_execution
                 .finish_running_process(pruned_entry.process_id, Some(exit_code))
                 .await;
-            pruned_entry.process.terminate();
+            debug_assert!(pruned_entry.process.has_exited());
+        }
+
+        if !stored {
+            let _ = process.terminate_confirmed().await;
+            return Err(UnifiedExecError::process_failed(format!(
+                "unified exec process limit ({MAX_UNIFIED_EXEC_PROCESSES}) reached; all slots are still active"
+            )));
         }
 
         context
@@ -1019,6 +1043,7 @@ impl UnifiedExecProcessManager {
             started_at,
             context.tracker.clone(),
         );
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1325,8 +1350,6 @@ impl UnifiedExecProcessManager {
         mut pause_state: Option<watch::Receiver<bool>>,
         mut deadline: Instant,
     ) -> Vec<u8> {
-        const POST_EXIT_CLOSE_WAIT_CAP: Duration = Duration::from_millis(50);
-
         let mut collected: Vec<u8> = Vec::with_capacity(4096);
         let mut lagged_chunks = 0_u64;
         let mut exit_signal_received = cancellation_token.is_cancelled();
@@ -1372,8 +1395,8 @@ impl UnifiedExecProcessManager {
 
                 if exit_signal_received {
                     let now = Instant::now();
-                    let close_wait_deadline = *post_exit_deadline
-                        .get_or_insert_with(|| now + remaining.min(POST_EXIT_CLOSE_WAIT_CAP));
+                    let close_wait_deadline =
+                        *post_exit_deadline.get_or_insert_with(|| now + remaining);
                     let close_wait_remaining = close_wait_deadline.saturating_duration_since(now);
                     if close_wait_remaining == Duration::ZERO {
                         break;
@@ -1489,26 +1512,10 @@ impl UnifiedExecProcessManager {
             return None;
         }
 
-        let mut by_recency = meta.to_vec();
-        by_recency.sort_by_key(|(_, last_used, _)| Reverse(*last_used));
-        let protected: HashSet<i32> = by_recency
-            .iter()
-            .take(8)
-            .map(|(process_id, _, _)| *process_id)
-            .collect();
-
         let mut lru = meta.to_vec();
         lru.sort_by_key(|(_, last_used, _)| *last_used);
-
-        if let Some((process_id, _, _)) = lru
-            .iter()
-            .find(|(process_id, _, exited)| !protected.contains(process_id) && *exited)
-        {
-            return Some(*process_id);
-        }
-
         lru.into_iter()
-            .find(|(process_id, _, _)| !protected.contains(process_id))
+            .find(|(_, _, exited)| *exited)
             .map(|(process_id, _, _)| process_id)
     }
 

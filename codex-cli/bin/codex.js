@@ -211,9 +211,6 @@ child.on("error", (err) => {
 // exiting immediately; once the child has been signaled we simply wait for
 // its exit event which will in turn terminate the parent (see below).
 const forwardSignal = (signal) => {
-  if (child.killed) {
-    return;
-  }
   try {
     child.kill(signal);
   } catch {
@@ -221,9 +218,19 @@ const forwardSignal = (signal) => {
   }
 };
 
-["SIGINT", "SIGTERM", "SIGHUP"].forEach((sig) => {
-  process.on(sig, () => forwardSignal(sig));
-});
+const forwardedSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
+const signalHandlers = new Map(
+  forwardedSignals.map((signal) => [signal, () => forwardSignal(signal)]),
+);
+for (const [signal, handler] of signalHandlers) {
+  process.on(signal, handler);
+}
+
+const removeSignalHandlers = () => {
+  for (const [signal, handler] of signalHandlers) {
+    process.off(signal, handler);
+  }
+};
 
 // When the child exits, mirror its termination reason in the parent so that
 // shell scripts and other tooling observe the correct exit status.
@@ -243,6 +250,7 @@ const childResult = await new Promise((resolve) => {
 if (childResult.type === "signal") {
   // Re-emit the same signal so that the parent terminates with the expected
   // semantics (this also sets the correct exit code of 128 + n).
+  removeSignalHandlers();
   process.kill(process.pid, childResult.signal);
 } else {
   process.exit(childResult.exitCode);

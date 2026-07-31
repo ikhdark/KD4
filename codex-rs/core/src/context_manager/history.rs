@@ -23,12 +23,14 @@ use codex_protocol::protocol::TurnContextItem;
 use codex_protocol::protocol::WorldStateItem;
 use codex_utils_cache::BlockingLruCache;
 use codex_utils_cache::sha1_digest;
+use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_bytes_for_tokens;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::approx_tokens_from_byte_count_i64;
 use codex_utils_output_truncation::truncate_function_output_items_with_policy;
 use codex_utils_output_truncation::truncate_text;
+use std::io::Cursor;
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -643,6 +645,17 @@ fn estimate_original_image_bytes(image_url: &str) -> Option<i64> {
                 return None;
             }
         };
+        let max_encoded_len = MAX_PROMPT_IMAGE_SOURCE_BYTES
+            .saturating_add(2)
+            .saturating_div(3)
+            .saturating_mul(4);
+        if payload.len() > max_encoded_len {
+            tracing::trace!(
+                payload_bytes = payload.len(),
+                "skipping oversized original-detail image estimate"
+            );
+            return None;
+        }
         let bytes = match BASE64_STANDARD.decode(payload) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -650,15 +663,25 @@ fn estimate_original_image_bytes(image_url: &str) -> Option<i64> {
                 return None;
             }
         };
-        let dynamic = match image::load_from_memory(&bytes) {
-            Ok(dynamic) => dynamic,
+        if bytes.len() > MAX_PROMPT_IMAGE_SOURCE_BYTES {
+            return None;
+        }
+        let reader = match image::ImageReader::new(Cursor::new(&bytes)).with_guessed_format() {
+            Ok(reader) => reader,
             Err(error) => {
-                tracing::trace!("failed to decode original-detail image bytes: {error}");
+                tracing::trace!("failed to identify original-detail image bytes: {error}");
                 return None;
             }
         };
-        let width = i64::from(dynamic.width());
-        let height = i64::from(dynamic.height());
+        let dimensions = match reader.into_dimensions() {
+            Ok(dimensions) => dimensions,
+            Err(error) => {
+                tracing::trace!("failed to inspect original-detail image bytes: {error}");
+                return None;
+            }
+        };
+        let width = i64::from(dimensions.0);
+        let height = i64::from(dimensions.1);
         let patch_size = i64::from(ORIGINAL_IMAGE_PATCH_SIZE);
         let patches_wide = width.saturating_add(patch_size.saturating_sub(1)) / patch_size;
         let patches_high = height.saturating_add(patch_size.saturating_sub(1)) / patch_size;

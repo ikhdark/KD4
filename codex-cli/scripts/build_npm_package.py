@@ -319,11 +319,15 @@ def build_platform_package_json(version: str, platform_package: dict[str, str]) 
     with open(CODEX_CLI_ROOT / "package.json", "r", encoding="utf-8") as fh:
         codex_package_json = json.load(fh)
 
+    supported_os = [platform_package["os"]]
+    if platform_package["os"] == "linux":
+        supported_os.append("android")
+
     package_json = {
         "name": CODEX_NPM_NAME,
         "version": version,
         "license": codex_package_json.get("license", "Apache-2.0"),
-        "os": [platform_package["os"]],
+        "os": supported_os,
         "cpu": [platform_package["cpu"]],
         "files": ["vendor"],
         "repository": codex_package_json.get("repository"),

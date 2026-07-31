@@ -5,14 +5,24 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from score_results import FROZEN_EXECUTION
-from score_results import FROZEN_MODEL_SETTINGS
-from score_results import score
-from validate_cases import ValidationError
-from validate_cases import _validate_patch
-from validate_cases import case_fingerprint
-from validate_cases import load_cases
-from validate_cases import validate_cases
+if __package__:
+    from .score_results import FROZEN_EXECUTION
+    from .score_results import FROZEN_MODEL_SETTINGS
+    from .score_results import score
+    from .validate_cases import ValidationError
+    from .validate_cases import _validate_patch
+    from .validate_cases import case_fingerprint
+    from .validate_cases import load_cases
+    from .validate_cases import validate_cases
+else:  # Direct execution from this directory.
+    from score_results import FROZEN_EXECUTION
+    from score_results import FROZEN_MODEL_SETTINGS
+    from score_results import score
+    from validate_cases import ValidationError
+    from validate_cases import _validate_patch
+    from validate_cases import case_fingerprint
+    from validate_cases import load_cases
+    from validate_cases import validate_cases
 
 
 class InvestigationEvalTests(unittest.TestCase):

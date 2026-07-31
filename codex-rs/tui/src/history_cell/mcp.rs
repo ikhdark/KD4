@@ -4,7 +4,7 @@ use super::*;
 
 #[derive(Debug)]
 struct CompletedMcpToolCallWithImageOutput {
-    _image: DynamicImage,
+    _dimensions: (u32, u32),
 }
 impl HistoryCell for CompletedMcpToolCallWithImageOutput {
     fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
@@ -268,30 +268,50 @@ pub(crate) fn new_active_mcp_tool_call(
 fn try_new_completed_mcp_tool_call_with_image_output(
     result: &Result<codex_protocol::mcp::CallToolResult, String>,
 ) -> Option<CompletedMcpToolCallWithImageOutput> {
-    let image = result
+    let dimensions = result
         .as_ref()
         .ok()?
         .content
         .iter()
         .find_map(decode_mcp_image)?;
 
-    Some(CompletedMcpToolCallWithImageOutput { _image: image })
+    Some(CompletedMcpToolCallWithImageOutput {
+        _dimensions: dimensions,
+    })
 }
 
-/// Decodes an MCP `ImageContent` block into an in-memory image.
+/// Validates a bounded MCP `ImageContent` block and returns its dimensions.
 ///
 /// Returns `None` when the block is not an image, when base64 decoding fails, when the format
 /// cannot be inferred, or when the image decoder rejects the bytes.
-fn decode_mcp_image(block: &serde_json::Value) -> Option<DynamicImage> {
-    let content = serde_json::from_value::<rmcp::model::Content>(block.clone()).ok()?;
-    let rmcp::model::RawContent::Image(image) = content.raw else {
+fn decode_mcp_image(block: &serde_json::Value) -> Option<(u32, u32)> {
+    let object = block.as_object()?;
+    if object.get("type")?.as_str()? != "image" {
         return None;
-    };
-    let base64_data = if let Some(data_url) = image.data.strip_prefix("data:") {
-        data_url.split_once(',')?.1
+    }
+    let data = object.get("data")?.as_str()?;
+    let base64_data = if let Some(data_url) = data.strip_prefix("data:") {
+        let (metadata, payload) = data_url.split_once(',')?;
+        if !metadata
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.starts_with("image/"))
+        {
+            return None;
+        }
+        payload
     } else {
-        image.data.as_str()
+        data
     };
+    let max_source_bytes = codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
+    let max_encoded_len = max_source_bytes
+        .saturating_add(2)
+        .saturating_div(3)
+        .saturating_mul(4);
+    if base64_data.len() > max_encoded_len {
+        error!("MCP image exceeds the encoded size limit");
+        return None;
+    }
     let raw_data = base64::engine::general_purpose::STANDARD
         .decode(base64_data)
         .map_err(|e| {
@@ -299,6 +319,10 @@ fn decode_mcp_image(block: &serde_json::Value) -> Option<DynamicImage> {
             e
         })
         .ok()?;
+    if raw_data.len() > max_source_bytes {
+        error!("MCP image exceeds the decoded size limit");
+        return None;
+    }
     let reader = ImageReader::new(Cursor::new(raw_data))
         .with_guessed_format()
         .map_err(|e| {
@@ -308,9 +332,9 @@ fn decode_mcp_image(block: &serde_json::Value) -> Option<DynamicImage> {
         .ok()?;
 
     reader
-        .decode()
+        .into_dimensions()
         .map_err(|e| {
-            error!("Image decoding failed: {e}");
+            error!("Image dimension inspection failed: {e}");
             e
         })
         .ok()

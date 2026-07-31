@@ -82,7 +82,6 @@ use codex_protocol::user_input::TextElement;
 use codex_utils_absolute_path::AbsolutePathBuf;
 #[cfg(test)]
 use codex_utils_cli::format_env_display;
-use image::DynamicImage;
 use image::ImageReader;
 use ratatui::prelude::*;
 use ratatui::style::Color;

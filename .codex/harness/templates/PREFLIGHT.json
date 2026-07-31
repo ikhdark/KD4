@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "assignment_id": "root:<task-id-or-uuidv7-assignment-id>",
+  "root_task_id": "<durable-root-task-id>",
+  "repository_root": "../../..",
+  "starting_revision": "auto",
+  "path_claims": [
+    {
+      "path": "<repository-relative-path>",
+      "recursive": true
+    }
+  ],
+  "contract_claims": [
+    "<named-contract>"
+  ],
+  "dependencies": [],
+  "generated_outputs": [],
+  "generated_output_owner": "none",
+  "validation_owner": "<assignment-id>",
+  "validation_commands": [
+    "<exact-check-only-command>"
+  ],
+  "cargo_lane": {
+    "target_dir": "<absolute-or-task-unique-target-dir>",
+    "cargo_home": "<absolute-or-shared-read-mostly-cargo-home>"
+  },
+  "workspace_strategy": "auto"
+}

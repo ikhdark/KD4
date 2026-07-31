@@ -1,9 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::ErrorKind;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 
+use fs2::FileExt;
+use tempfile::NamedTempFile;
 use tokio::task;
 use toml::Value as TomlValue;
 use toml_edit::DocumentMut;
@@ -63,6 +67,7 @@ fn ensure_no_inline_bearer_tokens(value: &TomlValue) -> std::io::Result<()> {
 pub struct ConfigEditsBuilder {
     codex_home: PathBuf,
     mcp_servers: Option<BTreeMap<String, McpServerConfig>>,
+    mcp_servers_to_merge: Option<BTreeMap<String, McpServerConfig>>,
 }
 
 impl ConfigEditsBuilder {
@@ -70,7 +75,16 @@ impl ConfigEditsBuilder {
         Self {
             codex_home: codex_home.to_path_buf(),
             mcp_servers: None,
+            mcp_servers_to_merge: None,
         }
+    }
+
+    /// Merge these entries into the latest on-disk configuration while holding
+    /// the config lock. Existing names win so an interactive dependency install
+    /// cannot overwrite a concurrent user edit.
+    pub fn merge_mcp_servers(mut self, servers: &BTreeMap<String, McpServerConfig>) -> Self {
+        self.mcp_servers_to_merge = Some(servers.clone());
+        self
     }
 
     pub fn replace_mcp_servers(mut self, servers: &BTreeMap<String, McpServerConfig>) -> Self {
@@ -87,14 +101,53 @@ impl ConfigEditsBuilder {
     }
 
     fn apply_blocking(self) -> std::io::Result<()> {
+        fs::create_dir_all(&self.codex_home)?;
         let config_path = self.codex_home.join(CONFIG_TOML_FILE);
+        let lock_path = self.codex_home.join(".config.toml.lock");
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        lock_file.lock_exclusive()?;
         let mut doc = read_or_create_document(&config_path)?;
         if let Some(servers) = self.mcp_servers.as_ref() {
             replace_mcp_servers(&mut doc, servers);
         }
-        fs::create_dir_all(&self.codex_home)?;
-        fs::write(config_path, doc.to_string())
+        if let Some(servers) = self.mcp_servers_to_merge.as_ref() {
+            let mut current = mcp_servers_from_document(&doc)?;
+            for (name, config) in servers {
+                current
+                    .entry(name.clone())
+                    .or_insert_with(|| config.clone());
+            }
+            replace_mcp_servers(&mut doc, &current);
+        }
+        let mut temporary = NamedTempFile::new_in(&self.codex_home)?;
+        temporary.write_all(doc.to_string().as_bytes())?;
+        temporary.flush()?;
+        temporary.as_file().sync_all()?;
+        temporary
+            .persist(&config_path)
+            .map_err(|error| error.error)?;
+        lock_file.unlock()?;
+        Ok(())
     }
+}
+
+fn mcp_servers_from_document(
+    doc: &DocumentMut,
+) -> std::io::Result<BTreeMap<String, McpServerConfig>> {
+    let parsed = toml::from_str::<TomlValue>(&doc.to_string())
+        .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err))?;
+    let Some(servers_value) = parsed.get("mcp_servers") else {
+        return Ok(BTreeMap::new());
+    };
+    ensure_no_inline_bearer_tokens(servers_value)?;
+    servers_value
+        .clone()
+        .try_into()
+        .map_err(|err| std::io::Error::new(ErrorKind::InvalidData, err))
 }
 
 fn read_or_create_document(config_path: &Path) -> std::io::Result<DocumentMut> {

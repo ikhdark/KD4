@@ -11,6 +11,7 @@ and resuming substantial work without changing product behavior by default.
 | --- | --- |
 | Focused task that fits in one turn | No durable artifact; follow the workflow in conversation |
 | Multi-step, risky, or resumable task | [`templates/PLAN.md`](templates/PLAN.md) |
+| Concurrent writers or validation lanes | [`templates/PREFLIGHT.json`](templates/PREFLIGHT.json) |
 | Decisions or evidence must survive later turns | [`templates/IMPLEMENT.md`](templates/IMPLEMENT.md) |
 | Behavior needs explicit capability or regression criteria | [`templates/EVAL.md`](templates/EVAL.md) |
 | Broad or risky verification | [`templates/QA_CHECKLIST.md`](templates/QA_CHECKLIST.md) |
@@ -22,6 +23,17 @@ and resuming substantial work without changing product behavior by default.
 end-to-end checklist when a single task spans several of these concerns. Delete
 unused placeholder sections instead of filling artifacts for completeness.
 
+Resolve a preflight manifest with
+`just workflow-preflight <manifest> <receipt>`. The command atomically
+checks and publishes against the repository's active-receipt registry so path,
+named-contract, and Cargo target-lane overlap is rejected before work begins.
+Release it with `just workflow-preflight-release <assignment-id>` when the
+assignment becomes terminal. The resolved receipt captures the
+assignment and root-task identities, repository-lineage and concrete-workspace
+identities, exact starting commit, a content-addressed tracked/untracked
+workspace fingerprint, dependencies, owners, claims, validation commands,
+canonical Cargo lane, and workspace strategy.
+
 ## Execution Rules
 
 Choose the task lane and apply the implementation, validation, and completion
@@ -30,6 +42,12 @@ decisions and evidence; it does not define a second implementation discipline.
 For implementation inside a harnessed task, follow any independently active
 specialist skill. Another skill alone does not require a run directory or
 activate the harness skill.
+
+Ordinary validation commands are check-only. Generated schemas and mirrors may
+be changed only by their declared generated-output owner through the explicit
+serialized regeneration recipe; for example,
+`just config-schema-regenerate <owner>` or
+`just app-server-schema-regenerate <owner>`.
 
 ## Generated Task State
 

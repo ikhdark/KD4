@@ -19,7 +19,11 @@ use codex_agent_task_store::StoreResult;
 use codex_agent_task_store::TaskActor;
 use codex_agent_task_store::ValidationCall;
 use codex_agent_task_store::ValidationCallStatus;
+use codex_agent_task_store::ValidationEvidence;
 use codex_agent_task_store::ValidationProofKind;
+use codex_agent_task_store::WorkspaceActorKind;
+use codex_agent_task_store::WorkspaceActorRegistration;
+use codex_agent_task_store::WorkspaceStrategy;
 use codex_otel::SessionTelemetry;
 use codex_protocol::AgentPath;
 use codex_protocol::protocol::SessionSource;
@@ -27,6 +31,7 @@ use codex_state::StateRuntime;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::RwLock;
@@ -45,6 +50,21 @@ pub(crate) struct FocusedValidationToken {
     call_id: String,
     command_summary: String,
     resolved_executable: String,
+    evidence: ValidationEvidence,
+}
+
+impl FocusedValidationToken {
+    pub(crate) fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    pub(crate) fn shared_from_call_id(&self) -> Option<&str> {
+        self.evidence.shared_from_call_id.as_deref()
+    }
+
+    pub(crate) fn lease_expires_at(&self) -> Option<chrono::DateTime<Utc>> {
+        self.evidence.lease_expires_at
+    }
 }
 
 #[derive(Default)]
@@ -67,6 +87,7 @@ struct TaskMetricIndex {
 #[derive(Clone, Default)]
 pub(crate) struct AgentTaskCoordinator {
     store: Arc<OnceCell<Arc<dyn AgentTaskStore>>>,
+    fallback_state_runtime: Arc<OnceCell<Arc<StateRuntime>>>,
     root_session_id: Arc<OnceCell<String>>,
     bindings: Arc<RwLock<BindingIndex>>,
     metrics: Arc<Mutex<TaskMetricIndex>>,
@@ -116,6 +137,30 @@ impl AgentTaskCoordinator {
         Ok(())
     }
 
+    pub(crate) async fn initialize_for_workspace_coordination(
+        &self,
+        state_runtime: Option<Arc<StateRuntime>>,
+        sqlite_home: PathBuf,
+        default_provider: String,
+        root_session_id: String,
+    ) -> StoreResult<()> {
+        let state_runtime = match state_runtime {
+            Some(state_runtime) => state_runtime,
+            None => self
+                .fallback_state_runtime
+                .get_or_try_init(|| async move {
+                    StateRuntime::init(sqlite_home, default_provider)
+                        .await
+                        .map_err(|error| {
+                            StoreError::WorkspaceStateInitialization(error.to_string())
+                        })
+                })
+                .await?
+                .clone(),
+        };
+        self.initialize(state_runtime, root_session_id).await
+    }
+
     pub(crate) fn store(&self) -> Option<Arc<dyn AgentTaskStore>> {
         self.store.get().cloned()
     }
@@ -138,10 +183,21 @@ impl AgentTaskCoordinator {
         repo_root: &Path,
         draft: AssignmentDraft,
     ) -> StoreResult<(Assignment, Attempt)> {
-        let (assignment, attempt) = self
-            .required_store()?
-            .create_assignment(repo_root, draft)
+        let store = self.required_store()?;
+        store
+            .register_workspace_actor(
+                repo_root,
+                WorkspaceActorRegistration {
+                    root_session_id: draft.root_session_id.clone(),
+                    actor_id: format!("root:{}", draft.root_session_id),
+                    kind: WorkspaceActorKind::Root,
+                    assignment_id: None,
+                    attempt_id: None,
+                    strategy: WorkspaceStrategy::Shared,
+                },
+            )
             .await?;
+        let (assignment, attempt) = store.create_assignment(repo_root, draft).await?;
         self.start_task_metrics(&assignment);
         Ok((assignment, attempt))
     }
@@ -237,6 +293,7 @@ impl AgentTaskCoordinator {
         Ok(binding)
     }
 
+    #[cfg(test)]
     pub(crate) async fn begin_focused_validation_for_source(
         &self,
         session_source: &SessionSource,
@@ -244,34 +301,94 @@ impl AgentTaskCoordinator {
         command_summary: String,
         resolved_executable: String,
     ) -> StoreResult<Option<FocusedValidationToken>> {
+        self.begin_focused_validation_for_source_with_evidence(
+            session_source,
+            call_id,
+            command_summary,
+            resolved_executable,
+            ValidationEvidence::default(),
+        )
+        .await
+    }
+
+    pub(crate) async fn begin_focused_validation_for_source_with_evidence(
+        &self,
+        session_source: &SessionSource,
+        call_id: String,
+        command_summary: String,
+        resolved_executable: String,
+        evidence: ValidationEvidence,
+    ) -> StoreResult<Option<FocusedValidationToken>> {
         let Some(binding) = self.binding_for_source(session_source) else {
             return Ok(None);
         };
-        let token = FocusedValidationToken {
+        let mut token = FocusedValidationToken {
             assignment_id: binding.assignment_id,
             attempt_id: binding.attempt_id,
             call_id,
             command_summary,
             resolved_executable,
+            evidence,
         };
-        self.required_store()?
+        let store = self.required_store()?;
+        store
             .record_validation_call(ValidationCall {
                 call_id: token.call_id.clone(),
                 attempt_id: token.attempt_id,
                 command_summary: token.command_summary.clone(),
                 resolved_executable: Some(token.resolved_executable.clone()),
                 proof_kind: ValidationProofKind::Focused,
+                evidence: token.evidence.clone(),
                 status: ValidationCallStatus::Running,
                 recorded_at: Utc::now(),
             })
             .await?;
+        let persisted = store
+            .get_validation_call(token.call_id.clone())
+            .await?
+            .ok_or_else(|| {
+                StoreError::CorruptData(format!(
+                    "focused validation {} disappeared after persistence",
+                    token.call_id
+                ))
+            })?;
+        token.evidence = persisted.evidence;
         Ok(Some(token))
     }
 
+    pub(crate) async fn get_validation_call(
+        &self,
+        call_id: String,
+    ) -> StoreResult<Option<ValidationCall>> {
+        self.required_store()?.get_validation_call(call_id).await
+    }
+
+    pub(crate) async fn heartbeat_validation_call(
+        &self,
+        call_id: String,
+        lease_expires_at: chrono::DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        self.required_store()?
+            .heartbeat_validation_call(call_id, lease_expires_at)
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn finish_focused_validation(
         &self,
         token: FocusedValidationToken,
         status: ValidationCallStatus,
+    ) -> StoreResult<()> {
+        self.finish_focused_validation_with_output(token, status, None, None)
+            .await
+    }
+
+    pub(crate) async fn finish_focused_validation_with_output(
+        &self,
+        token: FocusedValidationToken,
+        status: ValidationCallStatus,
+        retained_output_ref: Option<String>,
+        output_summary: Option<String>,
     ) -> StoreResult<()> {
         if !status.is_terminal() {
             return Err(StoreError::InvalidAssignment(
@@ -290,6 +407,11 @@ impl AgentTaskCoordinator {
                 command_summary: token.command_summary,
                 resolved_executable: Some(token.resolved_executable),
                 proof_kind: ValidationProofKind::Focused,
+                evidence: ValidationEvidence {
+                    retained_output_ref,
+                    output_summary,
+                    ..ValidationEvidence::default()
+                },
                 status,
                 recorded_at: Utc::now(),
             })

@@ -369,11 +369,12 @@ cargo-lane-isolated-home lane *args:
 cargo-lane-home lane *args:
     @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\cargo-lane.ps1" -Lane "{{ lane }}" -IsolateCargoHome @($args | Select-Object -Skip 2)
 
-# Run from the repository root so scripts that resolve paths from `cwd` see
-# the same layout they use in GitHub Actions.
 [no-cd]
-test-github-scripts:
-    @{{ python }} -c "from pathlib import Path; import subprocess, sys; scripts = Path(r'{{ justfile_directory() }}') / '.github' / 'scripts'; print('No .github/scripts directory present; skipping.') if not scripts.is_dir() else None; sys.exit(0 if not scripts.is_dir() else subprocess.call([sys.executable, '-m', 'unittest', 'discover', '-s', str(scripts), '-p', 'test_*.py']))"
+test-release-tooling:
+    {{ python }} -m unittest scripts.test_build_tooling_policy scripts.test_check_blob_size scripts.test_stage_npm_packages
+
+# Compatibility alias for older local commands; this fork has no .github scripts.
+test-github-scripts: test-release-tooling
 
 [no-cd]
 rust-build-doctor:
@@ -517,27 +518,32 @@ generate-config-proto-check:
 generate-config-proto-check:
     @powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\codex-rs\config\scripts\generate-proto.ps1" -Check
 
-# Regenerate the json schema for config.toml from the current config types.
+# Regenerate config.schema.json through the serialized generated-output lane.
 write-config-schema:
-    cargo run -p codex-core --bin codex-write-config-schema
+    {{ python }} {{ justfile_directory() }}/scripts/config_schema_check.py --mode force --owner "manual:write-config-schema"
 
 # Run focused config schema fixture validation without regenerating schemas.
 config-schema-protocol-check:
     cargo nextest run -p codex-core -E 'test(config_schema_matches_fixture) | test(config_schema_hides_unsupported_inline_mcp_bearer_token)'
 
-# Regenerate config schema only when config inputs changed, then check freshness.
+# Check config schema freshness without modifying generated output.
 [no-cd]
 config-schema-check:
-    {{ python }} {{ justfile_directory() }}/scripts/config_schema_check.py --mode auto
+    {{ python }} {{ justfile_directory() }}/scripts/config_schema_check.py --mode check
 
-# Force config schema regeneration, then check freshness.
+# Explicitly regenerate config schema under the repository generation lock.
 [no-cd]
-config-schema-check-force:
-    {{ python }} {{ justfile_directory() }}/scripts/config_schema_check.py --mode force
+config-schema-regenerate owner:
+    {{ python }} {{ justfile_directory() }}/scripts/config_schema_check.py --mode force --owner "{{ owner }}"
 
-# Regenerate vendored app-server protocol schema artifacts.
-write-app-server-schema *args:
-    cargo run -p codex-app-server-protocol --bin write_schema_fixtures -- {args}
+# Compatibility name for explicit, owner-attributed regeneration.
+[no-cd]
+config-schema-check-force owner:
+    just config-schema-regenerate "{{ owner }}"
+
+# Regenerate vendored app-server schemas through the serialized generation lane.
+write-app-server-schema experimental="":
+    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode force --owner "manual:write-app-server-schema" -- {{ if experimental == "--experimental" { "--experimental" } else if experimental == "" { "" } else { error("write-app-server-schema only accepts --experimental") } }}
 
 # Run focused app-server runtime validation without regenerating schemas.
 app-server-runtime-check:
@@ -587,12 +593,13 @@ sdk-ts-check:
 # Run the Python SDK test suite (default marker exclusions apply).
 [no-cd]
 sdk-python-check:
-    uv run --directory "{{ justfile_directory() }}/sdk/python" --extra dev pytest
+    uv run --directory "{{ justfile_directory() }}/sdk/python" --group dev pytest
 
 # Lint the codex-cli npm wrapper entrypoint.
 [no-cd]
 codex-cli-wrapper-check:
-    pnpm --dir "{{ justfile_directory() }}" run lint:js
+    node --check "{{ justfile_directory() }}/codex-cli/bin/codex.js"
+    node --check "{{ justfile_directory() }}/codex-rs/responses-api-proxy/npm/bin/codex-responses-api-proxy.js"
 
 app-server-command-exec-check:
     cargo nextest run -p codex-app-server-protocol -E 'test(command_exec_response_round_trips_runtime_status)'
@@ -612,29 +619,44 @@ app-server-thread-status-check:
 app-server-schema-protocol-check:
     cargo nextest run -p codex-app-server-protocol -E 'test(typescript_schema_fixtures_match_generated) | test(json_schema_fixtures_match_generated)'
 
-# Regenerate app-server schemas only when protocol inputs changed, then check schema fixtures.
+# Check app-server schema fixtures without modifying generated output.
 [no-cd]
 app-server-schema-check:
-    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode auto
+    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode check
 
-# Force app-server schema regeneration, then check schema fixtures.
+# Explicitly regenerate app-server schemas under the repository generation lock.
 [no-cd]
-app-server-schema-check-force:
-    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode force
+app-server-schema-regenerate owner:
+    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode force --owner "{{ owner }}"
+
+# Compatibility name for explicit, owner-attributed regeneration.
+[no-cd]
+app-server-schema-check-force owner:
+    just app-server-schema-regenerate "{{ owner }}"
 
 # Compatibility wrapper for callers that still want schema and runtime proof together.
 [no-cd]
 app-server-schema-runtime-check:
-    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode auto --runtime
+    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode check --runtime
 
 [no-cd]
 app-server-schema-runtime-check-with-runtime:
-    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode auto --runtime
+    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode check --runtime
 
 # Compatibility wrapper for forced schema regeneration plus runtime proof.
 [no-cd]
-app-server-schema-runtime-check-force:
-    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode force --runtime
+app-server-schema-runtime-check-force owner:
+    {{ python }} {{ justfile_directory() }}/scripts/app_server_schema_runtime_check.py --mode force --owner "{{ owner }}" --runtime
+
+# Validate and resolve a shared-worktree preflight manifest.
+[no-cd]
+workflow-preflight manifest output:
+    {{ python }} {{ justfile_directory() }}/scripts/workflow_preflight.py "{{ manifest }}" --output "{{ output }}"
+
+# Release a terminal assignment from the active workflow-preflight registry.
+[no-cd]
+workflow-preflight-release assignment_id:
+    {{ python }} {{ justfile_directory() }}/scripts/workflow_preflight.py --release "{{ assignment_id }}" --repository-root "{{ justfile_directory() }}"
 
 # Regenerate hook schema artifacts through the Rust workspace from any cwd.
 [no-cd]

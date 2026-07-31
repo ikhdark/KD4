@@ -220,7 +220,9 @@ class CodexClient:
         self.config = config or CodexConfig()
         self._approval_handler = approval_handler or self._default_approval_handler
         self._proc: subprocess.Popen[str] | None = None
+        self._process_epoch = 0
         self._lock = threading.Lock()
+        self._lifecycle_lock = threading.Lock()
         self._thread_start_locks_guard = threading.Lock()
         self._thread_start_locks: dict[str, _ThreadStartLock] = {}
         self._router = MessageRouter()
@@ -236,59 +238,70 @@ class CodexClient:
         self.close()
 
     def start(self) -> None:
-        if self._proc is not None:
-            return
+        with self._lifecycle_lock:
+            if self._proc is not None:
+                return
 
-        path_dirs: tuple[Path, ...] = ()
-        if self.config.launch_args_override is not None:
-            args = list(self.config.launch_args_override)
-        else:
-            codex_bin = _resolve_codex_bin(self.config)
-            if self.config.codex_bin is None:
-                path_dirs = _installed_codex_path_dirs()
-            args = [str(codex_bin)]
-            for kv in self.config.config_overrides:
-                args.extend(["--config", kv])
-            args.extend(["app-server", "--listen", "stdio://"])
+            path_dirs: tuple[Path, ...] = ()
+            if self.config.launch_args_override is not None:
+                args = list(self.config.launch_args_override)
+            else:
+                codex_bin = _resolve_codex_bin(self.config)
+                if self.config.codex_bin is None:
+                    path_dirs = _installed_codex_path_dirs()
+                args = [str(codex_bin)]
+                for kv in self.config.config_overrides:
+                    args.extend(["--config", kv])
+                args.extend(["app-server", "--listen", "stdio://"])
 
-        env = os.environ.copy()
-        if self.config.env:
-            env.update(self.config.env)
-        _prepend_path_dirs(env, path_dirs)
+            env = os.environ.copy()
+            if self.config.env:
+                env.update(self.config.env)
+            _prepend_path_dirs(env, path_dirs)
 
-        self._proc = subprocess.Popen(
-            args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            cwd=self.config.cwd,
-            env=env,
-            bufsize=1,
-        )
-
-        self._start_stderr_drain_thread()
-        self._start_reader_thread()
+            proc = subprocess.Popen(
+                args,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                cwd=self.config.cwd,
+                env=env,
+                bufsize=1,
+            )
+            router = MessageRouter()
+            self._router = router
+            self._stderr_lines.clear()
+            self._proc = proc
+            self._process_epoch += 1
+            self._start_stderr_drain_thread(proc)
+            self._start_reader_thread(proc, router)
 
     def close(self) -> None:
-        if self._proc is None:
-            return
-        proc = self._proc
-        self._proc = None
+        with self._lifecycle_lock:
+            if self._proc is None:
+                return
+            proc = self._proc
+            router = self._router
+            self._proc = None
 
-        if proc.stdin:
-            proc.stdin.close()
-        try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except Exception:
-            proc.kill()
+            if proc.stdin:
+                proc.stdin.close()
+            try:
+                proc.terminate()
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
+                proc.wait()
 
-        if self._stderr_thread and self._stderr_thread.is_alive():
-            self._stderr_thread.join(timeout=0.5)
-        if self._reader_thread and self._reader_thread.is_alive():
-            self._reader_thread.join(timeout=0.5)
+            router.fail_all(TransportClosedError("Codex process was closed"))
+            if self._stderr_thread and self._stderr_thread.is_alive():
+                self._stderr_thread.join(timeout=2)
+            if self._reader_thread and self._reader_thread.is_alive():
+                self._reader_thread.join(timeout=2)
+            self._stderr_thread = None
+            self._reader_thread = None
 
     def initialize(self) -> InitializeResponse:
         result = self.request(
@@ -308,6 +321,11 @@ class CodexClient:
         self.notify("initialized", None)
         return result
 
+    @property
+    def process_epoch(self) -> int:
+        """Return the transport generation used to reject stale handles."""
+        return self._process_epoch
+
     def request(
         self,
         method: str,
@@ -322,17 +340,22 @@ class CodexClient:
 
     def _request_raw(self, method: str, params: JsonObject | None = None) -> JsonValue:
         """Send a JSON-RPC request and wait for the reader thread to route its response."""
-        request_id = str(uuid.uuid4())
-        waiter = self._router.create_response_waiter(request_id)
+        with self._lifecycle_lock:
+            proc = self._proc
+            router = self._router
+            if proc is None:
+                raise TransportClosedError("Codex process is not running")
+            request_id = str(uuid.uuid4())
+            waiter = router.create_response_waiter(request_id)
 
-        try:
-            message: JsonObject = {"id": request_id, "method": method}
-            if params is not None:
-                message["params"] = params
-            self._write_message(message)
-        except BaseException:
-            self._router.discard_response_waiter(request_id)
-            raise
+            try:
+                message: JsonObject = {"id": request_id, "method": method}
+                if params is not None:
+                    message["params"] = params
+                self._write_message(message, proc=proc)
+            except BaseException:
+                router.discard_response_waiter(request_id)
+                raise
 
         item = waiter.get()
         if isinstance(item, BaseException):
@@ -344,11 +367,15 @@ class CodexClient:
         message: JsonObject = {"method": method}
         if params is not None:
             message["params"] = params
-        self._write_message(message)
+        with self._lifecycle_lock:
+            proc = self._proc
+            if proc is None:
+                raise TransportClosedError("Codex process is not running")
+            self._write_message(message, proc=proc)
 
-    def next_notification(self) -> Notification:
+    def next_notification(self, timeout_s: float | None = None) -> Notification:
         """Return the next notification that is not scoped to an active turn."""
-        return self._router.next_global_notification()
+        return self._router.next_global_notification(timeout_s)
 
     def register_login_notifications(self, login_id: str) -> None:
         """Start routing notifications for one interactive login attempt."""
@@ -358,9 +385,11 @@ class CodexClient:
         """Stop routing notifications for one interactive login attempt."""
         self._router.unregister_login(login_id)
 
-    def next_login_notification(self, login_id: str) -> Notification:
+    def next_login_notification(
+        self, login_id: str, timeout_s: float | None = None
+    ) -> Notification:
         """Return the next routed notification for the requested login id."""
-        return self._router.next_login_notification(login_id)
+        return self._router.next_login_notification(login_id, timeout_s)
 
     def register_turn_notifications(self, turn_id: str) -> None:
         """Start routing notifications for one turn into its dedicated queue."""
@@ -370,9 +399,11 @@ class CodexClient:
         """Stop routing notifications for one turn into its dedicated queue."""
         self._router.unregister_turn(turn_id)
 
-    def next_turn_notification(self, turn_id: str) -> Notification:
+    def next_turn_notification(
+        self, turn_id: str, timeout_s: float | None = None
+    ) -> Notification:
         """Return the next routed notification for the requested turn id."""
-        return self._router.next_turn_notification(turn_id)
+        return self._router.next_turn_notification(turn_id, timeout_s)
 
     def register_goal_operation(self, thread_id: str) -> _GoalOperationState:
         """Register a private thread-scoped route for a logical goal turn."""
@@ -386,9 +417,11 @@ class CodexClient:
         """Release routing state for one logical goal turn."""
         self._router.unregister_goal(state)
 
-    def next_goal_notification(self, state: _GoalOperationState) -> Notification:
+    def next_goal_notification(
+        self, state: _GoalOperationState, timeout_s: float | None = None
+    ) -> Notification:
         """Wait for the next notification in a logical goal turn."""
-        return state.next_notification()
+        return state.next_notification(timeout_s)
 
     def account_login_start(
         self,
@@ -756,8 +789,8 @@ class CodexClient:
 
         try:
             payload = model.model_validate(params_dict)
-        except Exception:  # noqa: BLE001
-            return Notification(method=method, payload=UnknownNotification(params=params_dict))
+        except Exception as exc:  # noqa: BLE001
+            raise CodexError(f"Invalid payload for known notification {method!r}") from exc
         return Notification(method=method, payload=payload)
 
     def _normalize_input_items(
@@ -778,47 +811,54 @@ class CodexClient:
             return {"decision": "accept"}
         return {}
 
-    def _start_stderr_drain_thread(self) -> None:
-        if self._proc is None or self._proc.stderr is None:
+    def _start_stderr_drain_thread(self, proc: subprocess.Popen[str]) -> None:
+        if proc.stderr is None:
             return
+        stderr = proc.stderr
 
         def _drain() -> None:
-            stderr = self._proc.stderr
-            if stderr is None:
-                return
             for line in stderr:
                 self._stderr_lines.append(line.rstrip("\n"))
 
         self._stderr_thread = threading.Thread(target=_drain, daemon=True)
         self._stderr_thread.start()
 
-    def _start_reader_thread(self) -> None:
+    def _start_reader_thread(
+        self, proc: subprocess.Popen[str], router: MessageRouter
+    ) -> None:
         """Start the sole stdout reader that fans messages into router queues."""
-        if self._proc is None or self._proc.stdout is None:
+        if proc.stdout is None:
             return
 
-        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop, args=(proc, router), daemon=True
+        )
         self._reader_thread.start()
 
-    def _reader_loop(self) -> None:
+    def _reader_loop(
+        self,
+        proc: subprocess.Popen[str] | None = None,
+        router: MessageRouter | None = None,
+    ) -> None:
         """Continuously classify transport messages into requests, responses, and events."""
+        active_router = router or self._router
         try:
             while True:
-                msg = self._read_message()
+                msg = self._read_message(proc)
                 if "method" in msg and "id" in msg:
                     response = self._handle_server_request(msg)
-                    self._write_message({"id": msg["id"], "result": response})
+                    self._write_message({"id": msg["id"], "result": response}, proc=proc)
                     continue
                 if "method" in msg and "id" not in msg:
                     method = msg["method"]
                     if isinstance(method, str):
-                        self._router.route_notification(
+                        active_router.route_notification(
                             self._coerce_notification(method, msg.get("params"))
                         )
                     continue
-                self._router.route_response(msg)
+                active_router.route_response(msg)
         except BaseException as exc:
-            self._router.fail_all(exc)
+            active_router.fail_all(exc)
 
     def _stderr_tail(self, limit: int = 40) -> str:
         return "\n".join(list(self._stderr_lines)[-limit:])
@@ -833,18 +873,24 @@ class CodexClient:
             params if isinstance(params, dict) else None,
         )
 
-    def _write_message(self, payload: JsonObject) -> None:
-        if self._proc is None or self._proc.stdin is None:
-            raise TransportClosedError("Codex process is not running")
+    def _write_message(
+        self, payload: JsonObject, *, proc: subprocess.Popen[str] | None = None
+    ) -> None:
         with self._lock:
-            self._proc.stdin.write(json.dumps(payload) + "\n")
-            self._proc.stdin.flush()
+            target = proc or self._proc
+            if target is None or target.stdin is None:
+                raise TransportClosedError("Codex process is not running")
+            target.stdin.write(json.dumps(payload) + "\n")
+            target.stdin.flush()
 
-    def _read_message(self) -> dict[str, JsonValue]:
-        if self._proc is None or self._proc.stdout is None:
+    def _read_message(
+        self, proc: subprocess.Popen[str] | None = None
+    ) -> dict[str, JsonValue]:
+        target = proc or self._proc
+        if target is None or target.stdout is None:
             raise TransportClosedError("Codex process is not running")
 
-        line = self._proc.stdout.readline()
+        line = target.stdout.readline()
         if not line:
             raise TransportClosedError(
                 f"Codex process closed stdout. stderr_tail={self._stderr_tail()[:2000]}"

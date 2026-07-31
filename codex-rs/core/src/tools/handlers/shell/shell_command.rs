@@ -22,8 +22,7 @@ use crate::tools::handlers::command_preflight::preflight_invocation_with_equival
 use crate::tools::handlers::command_shape::CommandInvocation;
 use crate::tools::handlers::parse_arguments_with_base_path;
 use crate::tools::handlers::resolve_workdir_base_path;
-use crate::tools::handlers::rewrite_function_command_argument;
-use crate::tools::handlers::updated_hook_command;
+use crate::tools::handlers::rewrite_function_command_invocation;
 use crate::tools::hook_names::HookToolName;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::PostToolUsePayload;
@@ -363,10 +362,15 @@ impl CoreToolRuntime for ShellCommandHandler {
     }
 
     fn pre_tool_use_payload(&self, invocation: &ToolInvocation) -> Option<PreToolUsePayload> {
-        shell_command_payload_command(&invocation.payload).map(|command| PreToolUsePayload {
-            tool_name: HookToolName::bash(),
-            tool_input: serde_json::json!({ "command": command }),
-        })
+        let ToolPayload::Function { arguments } = &invocation.payload else {
+            return None;
+        };
+        parse_shell_command_hook_invocation(arguments)
+            .ok()
+            .map(|command| PreToolUsePayload {
+                tool_name: HookToolName::shell_command(),
+                tool_input: command.hook_input(),
+            })
     }
 
     fn with_updated_hook_input(
@@ -381,12 +385,12 @@ impl CoreToolRuntime for ShellCommandHandler {
         };
         let command_invocation = parse_shell_command_hook_invocation(&arguments)?;
         invocation.payload = ToolPayload::Function {
-            arguments: rewrite_function_command_argument(
+            arguments: rewrite_function_command_invocation(
                 &arguments,
                 "shell_command",
                 "command",
                 &command_invocation,
-                updated_hook_command(&updated_input)?,
+                &updated_input,
             )?,
         };
         Ok(invocation)
@@ -401,7 +405,7 @@ impl CoreToolRuntime for ShellCommandHandler {
             result.post_tool_use_response(&invocation.call_id, &invocation.payload)?;
         let command = shell_command_payload_command(&invocation.payload)?;
         Some(PostToolUsePayload {
-            tool_name: HookToolName::bash(),
+            tool_name: HookToolName::shell_command(),
             tool_use_id: invocation.call_id.clone(),
             tool_input: serde_json::json!({ "command": command }),
             tool_response,

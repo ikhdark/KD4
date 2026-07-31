@@ -1,0 +1,544 @@
+KD4 FULL REPOSITORY AUDIT
+=========================
+
+Audit date: 2026-07-31
+Repository: C:\Users\kuh\Desktop\kd4
+Scope: the complete current repository, including tracked and untracked source,
+       unchanged and modified files, Rust crates, SDKs, launchers, scripts,
+       installers, packaging, configuration, generated-contract routes, tests,
+       documentation, and build/release automation.
+Method: Repo Atlas ownership/dependency routing, four read-only audit agents,
+        root source reconciliation, static checks, generated-contract checks,
+        dependency-policy checks, and focused/full test-entrypoint probes.
+
+This ledger was created after the read-only survey and before any fixes for this
+second audit. WORKING_TREE_AUDIT.txt is the separate ledger for the first task.
+
+STATUS KEY
+----------
+FIXED / VALIDATED       - confirmed defect corrected; available owner gates pass.
+REJECTED                 - source reconciliation disproved the candidate.
+DEFERRED                 - not established as an active defect in this checkout.
+
+CONFIRMED FINDINGS
+------------------
+
+R001 [P1] FIXED / VALIDATED
+Linux sandbox bwrap discovery can execute a writable/PATH-controlled candidate
+before sandboxing. Evidence: codex-rs/linux-sandbox/src/launcher.rs:51-151 and
+codex-rs/sandboxing/src/bwrap.rs:168-190. Fix: use the verified bundled binary or
+strict trusted-system locations and preserve file identity between probe/exec.
+
+R002 [P1] FIXED / VALIDATED
+Windows sandbox ACL enforcement ignores protection failures and can report setup
+success. Evidence: codex-rs/windows-sandbox-rs/src/spawn_prep.rs:267-345 and
+src/bin/setup_main/win.rs:916-1044. Fix: fail closed on every enforcement-relevant
+ACL error, except verified idempotent results.
+
+R003 [P1] FIXED / VALIDATED
+Workspace-mutating processes continue after lease heartbeat rejection/error.
+Evidence: codex-rs/core/src/tools/command_execution.rs:166-205 and
+core/src/tools/handlers/shell.rs:489-534. Fix: cancel/reap the process when lease
+ownership is lost and report failure.
+
+R004 [P1] FIXED / VALIDATED
+The 64-entry running-process ledger evicts a still-live process and finalizes its
+mutation lease without terminating it. Evidence:
+codex-rs/core/src/tools/command_execution.rs:18-20,305-344. Fix: reject at
+capacity or terminate/reap before releasing a lease.
+
+R005 [P2] FIXED / VALIDATED
+Mutation finalization marks itself final before the durable store call succeeds,
+preventing retry after transient failure. Evidence:
+codex-rs/core/src/tools/command_execution.rs:218-229. Fix: commit finalized state
+only after successful storage, with serialized retry state.
+
+R006 [P1] FIXED / VALIDATED
+Shell and unified-exec mutation leases resolve from turn cwd instead of effective
+command/environment cwd. Evidence: core/src/tools/handlers/shell.rs:192-261 and
+core/src/tools/handlers/unified_exec/exec_command.rs:180-249. Fix: resolve and
+lease the repository containing the actual effective cwd.
+
+R007 [P1] FIXED / VALIDATED
+Managed network-policy refresh commits tighter settings before proxy refresh, and
+refresh failures leave a stale broader policy active. Evidence:
+core/src/session/mod.rs:1088-1157,1512-1550 and
+core/src/session/turn_context.rs:610-667. Fix: atomic/fail-closed refresh before
+settings commit; disable stale proxy policy on error.
+
+R008 [P1] FIXED / VALIDATED
+Retained command-output artifacts have count limits but no byte quotas. Evidence:
+core/src/tools/command_output_artifact.rs:21-27,136-162 and unified-exec streaming
+callers. Fix: per-artifact/thread/global byte caps with explicit truncation.
+
+R009 [P1] FIXED / VALIDATED
+Artifact streaming drops the creation handle and reopens a command-visible path
+without no-follow/identity checks, allowing link replacement when CODEX_HOME is
+writable by the command. Evidence: command_output_artifact.rs:74-99,246-304 and
+unified_exec/process.rs:458-476. Fix: retain the original handle or verify a
+no-follow reopen against the original file identity.
+
+R010 [P1] FIXED / VALIDATED
+Linux protected-create cleanup recursively deletes a directory that appears at a
+missing protected path without proving the sandbox created it, risking deletion
+of concurrent host/IDE data. Evidence: linux_run_main.rs:542-567,1050-1148.
+Fix: fail/terminate without recursive deletion unless creator/inode attribution
+is established.
+
+R011 [P2] FIXED / VALIDATED
+Core token estimation fully decodes unbounded inline images. Evidence:
+core/src/context_manager/history.rs:636-668. Fix: encoded-byte, dimension, pixel,
+and decoder-memory limits using header inspection rather than full decode.
+
+R012 [P1] FIXED / VALIDATED
+TUI fully decodes untrusted MCP images without resource limits. Evidence:
+tui/src/history_cell/mcp.rs:268-317. Fix: encoded-size/dimension/pixel/decoder
+limits and avoid cloning the full block.
+
+R013 [P2] FIXED / VALIDATED
+Shell snapshot capture uses unbounded read_to_end before timeout. Evidence:
+core/src/shell_snapshot.rs:344-426. Fix: bounded readers and process-group
+termination with an oversized/truncated error.
+
+R014 [P2] FIXED / VALIDATED
+Windows timeout milliseconds are truncated from u64 to u32, so large values wrap
+or become INFINITE. Evidence: windows-sandbox-rs/src/lib.rs:463,
+src/unified_exec/backends/legacy.rs:486, and command_runner/win.rs:767. Fix:
+checked conversion with an explicit finite upper bound.
+
+R015 [P2] FIXED / VALIDATED
+codex exec installs a one-shot Ctrl-C listener, so later signals are not handled.
+Evidence: codex-rs/exec/src/lib.rs:867-873,950-975. Fix: persistent signal loop,
+graceful first interrupt, forced orderly shutdown on a subsequent signal.
+
+R016 [P2] FIXED / VALIDATED
+git status is treated as non-mutating even though it can refresh the index or run
+configured helpers, bypassing mutation coordination. Evidence:
+shell-command/src/command_safety/is_safe_command.rs:175-194 and shell/unified
+lease bypasses. Fix: classify as mutating or force lock/helper-free inspection.
+
+R017 [P2] FIXED / VALIDATED
+Windows sandbox group-add failures are always reported as success. Evidence:
+windows-sandbox-rs/src/bin/setup_main/win/sandbox_users.rs:197-214. Fix: accept
+only success/already-member and propagate all other NetAPI statuses.
+
+R018 [P2] FIXED / VALIDATED
+Deny-read ACL revoke failures are swallowed and removed from durable retry state.
+Evidence: windows-sandbox-rs/src/acl.rs:676-726 and deny_read_state.rs:52-65.
+Fix: return errors and retain failed paths until verified removal; write state
+atomically.
+
+R019 [P1] FIXED / VALIDATED
+Nested wait_agent callers can automatically nudge tasks outside their authorized
+subtree. Evidence: core/src/tools/handlers/multi_agents_v2/wait.rs:272-345. Fix:
+apply target authorization or restrict global nudging to root callers.
+
+R020 [P2] FIXED / VALIDATED
+Typed binding reconciliation is hard-truncated at 256, omitting older active
+tasks from list/wait nudging. Evidence: agent-task-store/src/model.rs:24 and
+multi_agents_v2/list_agents.rs:79-88, wait.rs:281-303. Fix: cursor pagination for
+coordination; retain caps only for rendered output.
+
+R021 [P1] FIXED / VALIDATED
+App-server INFO logging records peer refresh responses containing ChatGPT access
+tokens. Evidence: app-server/src/message_processor.rs:730-740,
+external_auth.rs:42-73, protocol/v2/account.rs:277-284. Fix: log response ID and
+status only; sentinel tracing test.
+
+R022 [P1] FIXED / VALIDATED
+CLI auth.json is truncated in place and existing permissive Unix modes are not
+repaired. Evidence: login/src/auth/storage.rs:191-219. Fix: same-directory 0600
+temporary, flush/fsync, atomic replacement, final permission repair.
+
+R023 [P2] FIXED / VALIDATED
+Successful CLI/MCP secure-store migration can return success while plaintext
+fallback credentials remain after deletion failure. Evidence:
+login/src/auth/storage.rs:291-305,372-390 and rmcp-client/src/oauth.rs:301-350.
+Fix: surface cleanup failure as non-success/partial-security state.
+
+R024 [P1] FIXED / VALIDATED
+Cloud-config cache authenticity relies on a public hard-coded HMAC key and the
+cache can be accepted without backend validation. Evidence:
+cloud-config/src/cache.rs:1-4,26-29,74-106 and service.rs:171-192. Fix: remove
+client-held symmetric authenticity; require backend-verifiable signatures or
+fail-closed online validation.
+
+R025 [P2] FIXED / VALIDATED
+Login /success and /cancel loopback terminal routes do not validate per-login
+state/nonce. Evidence: login/src/server.rs:150-175,226-276,329-355,476-504.
+Fix: authenticate every terminal route and separate old-instance cancellation.
+
+R026 [P2] FIXED / VALIDATED
+MCP server INFO logs persist initial/follow-up prompts, tool arguments, and
+arbitrary peer responses. Evidence: mcp-server/src/message_processor.rs:174-177,
+337-341,363-391,414-425. Fix: request ID/tool name/status only.
+
+R027 [P1/P2] FIXED / VALIDATED
+Unix CODEX_HOME, rollout JSONL, and SQLite state files use umask-default modes,
+which can expose conversations, logs, memories, and goals to other local users.
+Evidence: rollout/src/recorder.rs:1487-1555 and state/src/runtime.rs:192-205,
+367-375. Fix/repair directories to 0700 and sensitive files to 0600.
+
+R028 [P2] FIXED / VALIDATED
+Skill-driven MCP dependency install holds a stale full server-map snapshot over
+interactive OAuth, overwrites concurrent edits, and truncates config.toml in
+place. Evidence: core/src/mcp_skill_dependencies.rs:176-249 and
+config/src/mcp_edit.rs:89-97. Fix: serialized reread/merge of intended entries
+through the canonical symlink-aware atomic editor.
+
+R029 [P1/P2] FIXED / VALIDATED
+File-mode MCP OAuth persistence truncates the aggregate plaintext token store and
+chmods only after writing. Evidence: rmcp-client/src/oauth.rs:620-715,827-849.
+Fix: 0600 same-directory temporary, flush/fsync, atomic rename, final mode check.
+
+R030 [P2/P3] FIXED / VALIDATED
+MCP OAuth callback server terminates on syntactically valid callback/error before
+CSRF state validation; error callbacks need no state. Evidence:
+rmcp-client/src/perform_oauth_login.rs:260-360,593-608. Fix: validate expected
+state before terminal response/break and require state for provider errors.
+
+R031 [P1] FIXED / VALIDATED
+Python SDK can discard a back-to-back turn/completed notification before the
+turn route is registered and wait forever. Evidence: client.py:602-622,
+_message_router.py:207-214, api.py:737-751. Fix: atomic reservation or bounded
+terminal-orphan retention.
+
+R032 [P1] FIXED / VALIDATED
+Async Python cancellation can leave to_thread RPC/wait work, process startup,
+routes, or completed mutations without an owner; initialization misses
+CancelledError cleanup. Evidence: async_client.py:68-76,236-291,336-378 and
+api.py:308-323. Fix: shield/reconcile in-flight work and explicit cancellation
+cleanup.
+
+R033 [P1] FIXED / VALIDATED
+Malformed known terminal notifications are converted to non-terminal unknown
+notifications, hanging streams. Evidence: client.py:750-760 and api.py:744-749,
+792-797. Fix: surface known-method validation failures as typed protocol errors.
+
+R034 [P2] FIXED / VALIDATED
+Discarded Python TurnHandles leak registered routing queues. Evidence:
+client.py:620-622, api.py:737-751, _message_router.py:207-215. Fix: explicit
+abandon/close semantics or terminal auto-detach while preserving queued data.
+
+R035 [P1] FIXED / VALIDATED
+Reusing a closed Python client can cross process epochs because reader threads
+dereference mutable self._proc, shutdown does not always reap, and router failure
+state is reused. Evidence: client.py:274-291,781-793,843-850,
+_message_router.py:217-240, api.py:334-337. Fix: immutable per-process streams,
+kill-and-wait, and a fresh router per process epoch.
+
+R036 [P1] FIXED / VALIDATED
+Python artifact staging falls back to unrestricted tar extractall on supported
+Python 3.10. Evidence: sdk/python/scripts/update_sdk_artifacts.py:259-268 and
+pyproject.toml:10. Fix: validate resolved members and reject links/special paths;
+never unfiltered extraction.
+
+R037 [P1] FIXED / VALIDATED
+Both npm launchers re-signal the parent without removing forwarding listeners and
+misuse child.killed, breaking signal-derived exit semantics. Evidence:
+codex-cli/bin/codex.js:213-246 and responses-api-proxy npm launcher:69-95. Fix:
+remove listeners before re-signal and track actual child exit.
+
+R038 [P2] FIXED / VALIDATED
+Launchers advertise Android via Linux targets, but generated native package
+metadata declares only linux, so npm may omit the dependency. Evidence:
+codex-cli/bin/codex.js:29-37, sdk/typescript/src/exec.ts:339-347, and
+codex-cli/scripts/build_npm_package.py:24-36,318-328. Fix: add android metadata
+or explicitly reject Android.
+
+R039 [P1] FIXED / VALIDATED
+TypeScript Thread.run ignores fatal protocol error events and can report success
+after an error plus exit code zero. Evidence: sdk/typescript/src/events.ts:62-82
+and thread.ts:121-137. Fix: capture and reject on error.
+
+R040 [P1] FIXED / VALIDATED
+TypeScript handwritten exec item types disagree with Rust output: missing
+declined/in_progress statuses, wrong nullable/optional fields, and missing web
+search action. Evidence: sdk/typescript/src/items.ts and
+codex-rs/exec/src/exec_events.rs:145-300. Fix: correct types and add contract
+fixtures/parity checks.
+
+R041 [P2] FIXED / VALIDATED
+Python public NotificationPayload omits many types the generated registry routes.
+Evidence: sdk/python/src/openai_codex/models.py:52-85 and generated/
+notification_registry.py:8-71. Fix: generate/derive the union from the registry
+or expose an accurate common base.
+
+R042 [P1] FIXED / VALIDATED
+All three documented local non-Rust validation recipes are broken: missing TS
+typecheck script, uv --extra used for a dependency group, and missing root
+lint:js. Evidence: justfile:588-600, sdk/typescript/package.json:34-46,
+sdk/python/pyproject.toml:27-37, package.json:5-16. Fix recipes/scripts and run
+them from locked dependency state.
+
+R043 [P1] FIXED / VALIDATED
+Python app-server harness overrides CODEX_HOME but inherits CODEX_SQLITE_HOME,
+allowing tests to open/mutate installed state. Evidence:
+sdk/python/tests/app_server_harness.py:228-237, client.py:254-267, and
+core/src/config/mod.rs:356-367,3755-3760. Fix: set every independent storage
+override to harness-owned temporary paths.
+
+R044 [P1] FIXED / VALIDATED
+Both firewall initializers flush active rules before fallible resolution/network
+steps and install DROP late, causing first-run fail-open and rerun failure.
+Evidence: .devcontainer/init-firewall.sh:56-146 and
+codex-cli/scripts/init_firewall.sh:25-100. Fix: assemble/swap atomically with a
+fail-closed trap and idempotent ordering.
+
+R045 [P1] FIXED / VALIDATED
+Both advertised domain firewalls permit DNS to arbitrary destinations and the
+whole Docker /24; the legacy codex-cli variant also lacks IPv6 enforcement.
+Evidence: .devcontainer/init-firewall.sh:77-81,123-146 and
+codex-cli/scripts/init_firewall.sh:34-89. Fix: exact resolver/gateway endpoints
+and IPv6 default deny.
+
+R046 [P2] FIXED / VALIDATED
+Container names use lossy path replacement, so distinct/long workspace paths can
+collide and cleanup another container. Evidence:
+codex-cli/scripts/run_in_container.sh:28-36. Fix: bounded readable prefix plus
+hash of canonical path.
+
+R047 [P2] FIXED / VALIDATED
+Python API reference constructor signatures omit current public options. Evidence:
+sdk/python/docs/api-reference.md:68-71,108-111 and api.py:132-197. Fix: update
+docs and add signature parity coverage.
+
+R048 [P3] FIXED / VALIDATED
+Retry jitter is added after the exponential cap and invalid negative settings are
+accepted. Evidence: sdk/python/src/openai_codex/retry.py:37-40. Fix: validate
+nonnegative configuration and clamp final jittered delay.
+
+R049 [P1] FIXED / VALIDATED
+macOS installer invokes BSD lockf with fd-style flock syntax. Evidence:
+scripts/install/install.sh:363-367. Fix: proper whole-critical-section lockf or
+robust directory lock; concurrent macOS test.
+
+R050 [P1] FIXED / VALIDATED
+Shell profile rewrite loses modes/ownership, replaces symlinks, and may cross
+filesystems. Evidence: install.sh:296-334. Fix: resolve symlink intent and perform
+same-directory metadata-preserving atomic replacement.
+
+R051 [P1] FIXED / VALIDATED
+Shell and PowerShell installers do not validate extracted package metadata or
+exact target/version before self-labeling/promoting it. Evidence:
+install.sh:650-804, install.ps1:545-761,852-927, and codex_package/layout.py.
+Fix: validate authoritative layout/version/target/variant/entrypoint and binary
+version before promotion.
+
+R052 [P1] FIXED / VALIDATED
+Nix cargoLock.outputHashes omits five Git crates present in Cargo.lock: libwebrtc,
+livekit-protocol, livekit-runtime, webrtc-sys, and webrtc-sys-build. Evidence:
+codex-rs/default.nix:40-47 and Cargo.lock entries. Fix: regenerate hashes and
+validate nix build.
+
+R053 [P1] FIXED / VALIDATED
+Native-Windows full Python discovery collects shell installer tests that hardcode
+/bin/sh and Unix PATH even when sh.exe is available. Evidence:
+scripts/install/test_install_sh.py:36,137-153 and root_maintenance.py:342-348.
+Fix: resolve shell portably or skip only when truly unavailable.
+
+R054 [P1] FIXED / VALIDATED
+Investigation-eval tests use bare sibling imports and fail under package-style
+unittest discovery. Evidence: test_investigation_eval.py:8-15 and
+score_results.py:15-22. Fix: package-relative imports with direct-script fallback.
+
+R055 [P1] FIXED / VALIDATED
+kd4_features.toml contains a stale exact evidence marker for shell output summary,
+making its owning manifest test fail. Evidence: kd4_features.toml:210-213,
+core/src/tools/context.rs:452-458, test_check_kd4_features.py:80-87. Fix: stable
+current marker.
+
+R056 [P1] FIXED / VALIDATED
+Cargo lane pruning releases the final activity probe before recursive deletion,
+so a newly reserved active lane can be deleted. Evidence:
+scripts/cargo-lane.ps1:681-715,864-872,953-958 and
+scripts/rust_build_status.py:853-867. Fix: shared coordination plus atomic rename
+to trash before deletion.
+
+R057 [P2] FIXED / VALIDATED
+Fallback installer lock takeover treats missing initialization metadata as stale
+and removes locks by pathname, racing live/replacement locks. Evidence:
+install.sh:336-389. Fix: generation-aware atomic ownership or OS lock.
+
+R058 [P2] FIXED / VALIDATED
+CODEX_INSTALL_DIR is interpolated unescaped into executable profile text.
+Evidence: install.sh:8,227-251. Fix: robust POSIX quoting or reject unsupported
+control/metacharacter paths; literal/no-side-effect tests.
+
+R059 [P2] FIXED / VALIDATED
+Installer cleanup deletes every .codex.* entry in a user-supplied BIN_DIR, wider
+than its owned .codex.<pid> temporaries. Evidence: install.sh:401-435,793-800.
+Fix: delete only exact owned temporary schema.
+
+R060 [P2] FIXED / VALIDATED
+PowerShell installer ownership checks use raw string prefixes and accept sibling
+paths such as standalone-evil. Evidence: install.ps1:496-515,677-710. Fix:
+canonical equality-or-descendant-with-separator checks.
+
+R061 [P2] FIXED / VALIDATED
+Shell installer bundler uses a fixed .<output>.tmp and races concurrent builds.
+Evidence: scripts/install/build_install_sh.py:42-47. Fix: unique same-directory
+temporary and finally cleanup.
+
+R062 [P2] FIXED / VALIDATED
+Persistent native-artifact cache records/trusts only name and size, not content
+integrity. Evidence: scripts/stage_npm_packages.py:430-450,580-651,887-905.
+Fix: persist and verify digest/tree hash before reuse.
+
+R063 [P2] FIXED / VALIDATED
+stage_npm_archives stale-lock recovery stats an old lock then unlinks the current
+pathname without identity verification. Evidence: stage_npm_archives.py:42-66.
+Fix: OS lock or generation/identity-checked stale takeover.
+
+R064 [P2] FIXED / VALIDATED
+Native staging only warns on source/native commit mismatch, ignores dirty-tree
+divergence, and cannot verify explicit workflow URL head SHA. Evidence:
+stage_npm_packages.py:358-426,877-945. Fix: fail by default after authoritative
+head lookup, with explicit escape hatch.
+
+R065 [P2] FIXED / VALIDATED
+Workflow preflight registry treats every receipt as active forever unless manually
+released; crashes permanently poison claims. Evidence: workflow_preflight.py:
+238-247,470-495 and harness workflow docs. Fix: leases/status/liveness
+reconciliation and stale cleanup.
+
+R066 [P2] FIXED / VALIDATED
+Persistent repository identity creates the final file before writing; a crash can
+leave an empty permanent poison. Evidence: workflow_preflight.py:175-206. Fix:
+atomic same-directory publish and safe empty-file repair under registry lock.
+
+R067 [P2] FIXED / VALIDATED
+Fork-local docs/checks point to absent .github paths and one recipe silently skips
+the missing checks. Evidence: scripts/codex_package/README.md:19-21,
+shell-escalation/README.md:31-33, check_blob_size.py:354-361, justfile:372-376.
+Fix: point to actual fork-local validation or make absence explicit/non-silent.
+
+R068 [P1] FIXED / VALIDATED
+TypeScript Jest setup constructs file://C:\... by string concatenation, which is
+not a valid Windows file URL and causes every suite to fail. Evidence:
+sdk/typescript/jest.config.cjs and reproduced createRequire failures. Fix: use
+pathToFileURL(path.resolve(...)).href; run all TypeScript tests on Windows.
+
+R069 [P2] FIXED / VALIDATED
+The Windows goal-operation integration assertion compared protocol text with
+platform CRLF endings against a hard-coded LF string, breaking the full SDK gate
+despite valid runtime output. Evidence:
+sdk/python/tests/test_app_server_goal_operations.py:76-79. Fix: normalize the
+assembled protocol text before the assertion.
+
+R070 [P2] FIXED / VALIDATED
+A login test mutated process-global authentication environment variables while
+the Rust harness ran unrelated tests in parallel, leaking a PAT into other auth
+cases and producing duplicate live whoami requests. Evidence:
+codex-rs/login/src/auth/auth_tests.rs:1509-1557 and reproduced full-suite
+failure. Fix: run the environment-dependent case in an ignored subprocess child
+with child-only environment overrides.
+
+R071 [P2] FIXED / VALIDATED
+The TUI instruction-source summary rendered native paths outside the workspace as
+full Windows paths instead of using the existing home-relative formatter.
+Evidence: codex-rs/tui/src/status/helpers.rs:56-82 and three failing Windows
+tests. Fix: route native fallback paths through format_directory_display.
+
+R072 [P1] FIXED / VALIDATED
+TUI embedded-app-server tests overrode CODEX_HOME but inherited the checkout's
+independent SQLite home; they queried and could mutate live task/session state.
+One setup path also initialized StateRuntime from codex_home instead of the
+configured sqlite_home. Evidence: codex-rs/tui/src/lib.rs:2013-2022,
+2536-2603,2793-2848 and reproduced selection of the active desktop task ID.
+Fix: isolate sqlite_home per test and consistently initialize StateRuntime from it.
+
+R073 [P2] FIXED / VALIDATED
+An exact bare slash command could lose to a fuzzy popup row whose description
+matched the same word: typed /usage selected the /fast service tier while signed
+out. Evidence: chat_composer/slash_input.rs:208-377 and the signed-out /usage
+snapshot test. Fix: dispatch an exact bare command before accepting fuzzy popup
+selection and close the popup after dispatch.
+
+REJECTED / DUPLICATE / DEFERRED CANDIDATES
+------------------------------------------
+
+- REJECTED as stale after source reconciliation: covered-path change/revert,
+  supporting-read byte mismatch, expired-lease renewal, amendment actor rollover,
+  caller-supplied lease finalization, and swallowed epoch-query errors. Current
+  code contains the first audit's event scan, observed-byte manifest, expiry,
+  actor rekey, authoritative lease reload, and propagated epoch-error fixes.
+- REJECTED: migration 0009 one-way lineage upgrade is intentional.
+- REJECTED: active plugin archive extraction already rejects traversal/links and
+  applies size limits.
+- REJECTED: apply-patch partial application is an explicit tested contract.
+- DEFERRED: dormant remote-skills path handling and unused feedback temp-file API;
+  neither has an active production call path.
+- DEFERRED: default Python approval behavior lacks a clear contrary contract.
+- DEFERRED: flake stable.latest vs pinned Rust is a reproducibility risk without a
+  demonstrated incompatibility.
+- DEFERRED: cargo-audit reports allowed unsound advisories and one yanked transitive
+  spin release, while the repository's owning cargo-deny gate passes; no concrete
+  affected call path was established in this audit.
+
+PRE-FIX CLOSURE CHECKS
+----------------------
+
+PASS: cargo check --workspace --all-targets (zero warnings)
+PASS: cargo deny check (owning advisories/bans/licenses/sources policy)
+PASS: just source-map-check
+PASS: just config-schema-check
+PASS: just app-server-schema-check
+PASS: just generate-config-proto-check
+PASS: just fmt-check-fast
+PASS: Python SDK ruff check
+PASS: TypeScript SDK lint
+PASS: TypeScript SDK build during frozen pnpm install
+BLOCKED: all-features Rust check at external rusty_v8 archive build; default
+         all-target workspace check passed afterward.
+FAIL (findings): just sdk-ts-check, just sdk-python-check,
+                 just codex-cli-wrapper-check.
+FAIL (findings): TypeScript Jest on invalid Windows file URL.
+FAIL (findings): Python SDK harness inherited installed CODEX_SQLITE_HOME.
+FAIL (findings): full Python tooling discovery on installer shell path,
+                 investigation-eval imports, and stale KD4 feature evidence.
+
+POST-FIX CLOSURE CHECKS
+-----------------------
+
+PASS: cargo check --workspace --all-targets
+PASS: cargo deny check (advisories, bans, licenses, sources)
+PASS: cargo fmt --all -- --check
+PASS: git diff --check
+PASS: codex-core nextest: 2,398 passed; 4 skipped
+PASS: codex-tui nextest: 2,978 passed; 6 skipped
+PASS: codex-login: 117 passed; 1 subprocess-only child intentionally ignored
+PASS: codex-agent-task-store: 35 passed
+PASS: codex-rmcp-client: 80 passed; 1 subprocess-only child intentionally ignored
+PASS: codex-windows-sandbox: 127 passed; 2 platform-intentional skips
+PASS: codex-sandboxing: 37 passed
+PASS: codex-cloud-config: 29 passed
+PASS: codex-shell-command: 209 passed
+PASS: command-execution and artifact hardening focused suites
+PASS: just test-release-tooling: 92 passed; 2 skipped
+PASS: just codex-cli-wrapper-check
+PASS: just sdk-python-check: 140 passed; 38 skipped
+PASS: just sdk-ts-check: 6 suites / 40 tests passed
+PASS: combined repository Python unit modules and touched-script syntax checks
+PASS: source-map, config schema, app-server schema, and config-proto checks
+
+ENVIRONMENT-ONLY LIMITS
+-----------------------
+
+- Nix is unavailable on this Windows host (and neither WSL nor Docker is
+  available), so a native nix build could not run. R052's five output hashes were
+  computed from the exact locked parent/submodule commits using canonical NAR
+  serialization; the algorithm was cross-checked by reproducing an existing
+  known Git dependency hash exactly.
+- The optional all-features check remains blocked in the external rusty_v8
+  archive build. The repository's owning default all-target workspace check is
+  clean.
+- Repository source changes were not published into or used to restart the
+  installed Codex Desktop binary.
+
+FINAL DISPOSITION
+-----------------
+
+All 73 confirmed findings are fixed in this working tree. Rejected/deferred
+candidates above remain intentionally unchanged for the stated reasons. No
+confirmed finding is left fix-pending.

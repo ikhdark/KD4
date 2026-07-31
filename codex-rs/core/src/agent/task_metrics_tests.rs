@@ -16,7 +16,10 @@ use codex_agent_task_store::CriterionResult;
 use codex_agent_task_store::CriterionStatus;
 use codex_agent_task_store::ValidationCall;
 use codex_agent_task_store::ValidationCallStatus;
+use codex_agent_task_store::ValidationEvidence;
 use codex_agent_task_store::ValidationProofKind;
+use codex_agent_task_store::WorkspaceStrategy;
+use codex_agent_task_store::WorkspaceTaskStatus;
 
 fn metric_input() -> TaskMetricInput {
     TaskMetricInput {
@@ -98,6 +101,7 @@ fn completed_task_with_validation(
             assignment_id,
             root_session_id: "root-session".to_string(),
             repository_id: "repository".to_string(),
+            workspace_id: "workspace".to_string(),
             role: AgentRole::Worker,
             capability_profile: CapabilityProfile::ScopedSourceWrite,
             objective: "complete the task".to_string(),
@@ -112,6 +116,9 @@ fn completed_task_with_validation(
             risk_hints: Vec::new(),
             required_evidence: Vec::new(),
             prohibited_changes: Vec::new(),
+            contract_claims: Vec::new(),
+            workspace_strategy: WorkspaceStrategy::Shared,
+            start_epoch: 0,
             relation: None,
             created_at: now,
         },
@@ -143,6 +150,8 @@ fn completed_task_with_validation(
             blockers: Vec::new(),
             risks: Vec::new(),
             next_action: None,
+            evidence_epoch: 0,
+            evidence_manifest_hash: String::new(),
             sealed_at: now,
         }),
         validation_calls: validation_calls
@@ -160,10 +169,17 @@ fn completed_task_with_validation(
                     .into_owned(),
                 ),
                 proof_kind: ValidationProofKind::Focused,
+                evidence: ValidationEvidence {
+                    end_epoch: Some(0),
+                    ..ValidationEvidence::default()
+                },
                 status: *status,
                 recorded_at: now,
             })
             .collect(),
+        workspace_status: WorkspaceTaskStatus::default(),
+        isolation_handoff: None,
+        integration_handoffs: Vec::new(),
         observations: Vec::new(),
     }
 }
@@ -245,6 +261,7 @@ fn add_gate(task: &mut AgentTask, kind: GateKind, reason: &str) {
         status: GateStatus::Passed,
         reason: reason.to_string(),
         waiver_reason: None,
+        evidence_epoch: 0,
         updated_at: now,
         sealed_at: Some(now),
     });

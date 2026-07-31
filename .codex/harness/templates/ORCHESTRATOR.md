@@ -1,7 +1,6 @@
 # Orchestrator Template
 
-Use this template only when the user or active instructions explicitly ask for
-subagents, delegation, or parallel agent work.
+Use this template when multi-agent work is active.
 
 ## Objective
 
@@ -19,22 +18,35 @@ Choose one:
 - Producer/reviewer: one agent proposes or implements, another checks.
 - Supervisor: one owner tracks work, constraints, and validation evidence.
 
+## Durable Preflight
+
+- Root task ID:
+- Starting revision and workspace fingerprint:
+- Active preflight receipts checked:
+- Generated-output owner:
+- Validation owner:
+- Cargo lanes:
+- Shared/isolated strategy:
+
 ## Agent Assignments
 
-| Agent | Scope | Expected Output | Stop Condition |
-| --- | --- | --- | --- |
-|  |  |  |  |
+| Agent | Assignment ID | Path/contract claims | Expected Output | Stop Condition |
+| --- | --- | --- | --- | --- |
+|  |  |  |  |  |
 
 ## Shared Constraints
 
 - Follow the root and nearest scoped `AGENTS.md`.
 - Do not recurse into more agents unless explicitly approved.
-- Do not edit the same file from multiple agents without a single integrator.
+- Reject accidental path, named-contract, and Cargo target-lane overlap.
+- Route deliberate competing implementations to separate isolated worktrees.
 - Each agent reports inspected scope, findings, and validation evidence.
 
 ## Integration
 
 - Final owner:
 - Integration files:
+- Versioned isolated-worktree handoffs:
 - Required validation:
+- Quiescence check for linked assignments, validations, gates, and claims:
 - Remaining risk:

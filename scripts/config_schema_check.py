@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
-"""Regenerate config schema only when needed, then run schema freshness tests."""
+"""Check config schema freshness, or explicitly regenerate under a shared lock."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Sequence
+
+try:
+    from scripts.generated_output_lock import GenerationLockError
+    from scripts.generated_output_lock import generated_output_lock
+except ModuleNotFoundError:
+    from generated_output_lock import GenerationLockError
+    from generated_output_lock import generated_output_lock
 
 
 SCHEMA_INPUTS = (
@@ -39,10 +47,10 @@ def run(args: Sequence[str], *, cwd: Path) -> int:
         return 127 if isinstance(error, FileNotFoundError) else 1
 
 
-def schema_inputs_changed(root: Path) -> bool:
+def schema_inputs_changed(root: Path, baseline: str = "HEAD") -> bool:
     try:
         completed = subprocess.run(
-            ["git", "status", "--porcelain", "--", *SCHEMA_INPUTS],
+            ["git", "diff", "--name-only", baseline, "--", *SCHEMA_INPUTS],
             cwd=root,
             text=True,
             encoding="utf-8",
@@ -53,13 +61,13 @@ def schema_inputs_changed(root: Path) -> bool:
         )
     except OSError as error:
         print(
-            f"Could not run git to inspect config schema input status: {error}",
+            f"Could not compare config schema inputs with {baseline}: {error}",
             file=sys.stderr,
         )
         return True
     if completed.returncode != 0:
         print(
-            "Could not inspect config schema input status; regenerating.",
+            "Could not inspect config schema input status.",
             file=sys.stderr,
         )
         if completed.stderr:
@@ -90,7 +98,8 @@ def changed_outputs(before: dict[str, str], after: dict[str, str]) -> list[str]:
     return [path for path in paths if before.get(path) != after.get(path)]
 
 
-def regenerate_schema(root: Path) -> bool:
+def regenerate_schema(root: Path, owner: str) -> bool:
+    del owner
     before = snapshot_outputs(root)
     code = run(
         ["cargo", "run", "-p", "codex-core", "--bin", "codex-write-config-schema"],
@@ -115,50 +124,55 @@ def run_protocol_check(root: Path) -> int:
     )
 
 
-def run_config_protocol_check_with_auto_regen(root: Path) -> tuple[int, bool]:
-    check_code = run_protocol_check(root)
-    if check_code == 0:
-        return 0, False
-
-    print(
-        "Config schema freshness check failed after skipping regeneration; "
-        "regenerating schema and retrying."
-    )
-    generated_changed = regenerate_schema(root)
-    retry_code = run_protocol_check(root)
-    return retry_code, generated_changed
-
-
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("auto", "force"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "check", "force"),
+        required=True,
+        help="auto is a backwards-compatible alias for the check-only mode",
+    )
+    parser.add_argument("--baseline", default="HEAD")
+    parser.add_argument(
+        "--owner",
+        help="Required identity for the serialized force-regeneration lane.",
+    )
     args = parser.parse_args(argv)
 
     root = repo_root()
+    if args.mode == "force" and (not args.owner or not args.owner.strip()):
+        parser.error("--owner is required with --mode force")
+    lock_owner = args.owner if args.mode == "force" else f"check:{os.getpid()}"
     generated_changed = False
-    skipped_regen = False
-    if args.mode == "force":
-        print("Forcing config schema regeneration.")
-        generated_changed = regenerate_schema(root)
-    elif schema_inputs_changed(root):
-        print("Config schema inputs changed; regenerating schema.")
-        generated_changed = regenerate_schema(root)
-    else:
-        print("Config schema inputs unchanged; skipping schema regeneration.")
-        skipped_regen = True
-
-    if skipped_regen:
-        check_code, retry_changed = run_config_protocol_check_with_auto_regen(root)
-        generated_changed = generated_changed or retry_changed
-    else:
-        check_code = run_protocol_check(root)
+    try:
+        with generated_output_lock(root, lock_owner):
+            if args.mode == "force":
+                print("Forcing config schema regeneration.")
+                generated_changed = regenerate_schema(root, args.owner)
+            else:
+                changed = schema_inputs_changed(root, args.baseline)
+                state = "changed" if changed else "unchanged"
+                print(
+                    f"Config schema inputs are {state} relative to {args.baseline}; "
+                    "running a check-only freshness proof."
+                )
+            check_code = run_protocol_check(root)
+    except GenerationLockError as error:
+        print(str(error), file=sys.stderr)
+        return 2
     if check_code != 0:
+        if args.mode != "force":
+            print(
+                "Freshness failed without modifying generated output. "
+                "Use `just config-schema-regenerate <owner>` in the serialized "
+                "generation lane.",
+                file=sys.stderr,
+            )
         return check_code
     if generated_changed:
         print(
             "Config schema regeneration changed generated output; review and include it."
         )
-        return 1
     return 0
 
 

@@ -7,15 +7,13 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::fs::File;
-use std::fs::OpenOptions;
 use std::io::Read;
 use std::io::Write;
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use tempfile::NamedTempFile;
 use tracing::warn;
 
 use super::BedrockApiKeyAuth;
@@ -206,15 +204,29 @@ impl AuthStorageBackend for FileAuthStorage {
             std::fs::create_dir_all(parent)?;
         }
         let json_data = serde_json::to_string_pretty(auth_dot_json)?;
-        let mut options = OpenOptions::new();
-        options.truncate(true).write(true).create(true);
+        let parent = auth_file.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("auth path {} has no parent", auth_file.display()),
+            )
+        })?;
+        let mut temporary = NamedTempFile::new_in(parent)?;
         #[cfg(unix)]
         {
-            options.mode(0o600);
+            use std::os::unix::fs::PermissionsExt;
+            temporary
+                .as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        let mut file = options.open(auth_file)?;
-        file.write_all(json_data.as_bytes())?;
-        file.flush()?;
+        temporary.write_all(json_data.as_bytes())?;
+        temporary.flush()?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(&auth_file).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&auth_file, std::fs::Permissions::from_mode(0o600))?;
+        }
         Ok(())
     }
 
@@ -299,9 +311,12 @@ impl AuthStorageBackend for DirectKeyringAuthStorage {
         // Simpler error mapping per style: prefer method reference over closure
         let serialized = serde_json::to_string(auth).map_err(std::io::Error::other)?;
         self.save_to_keyring(&key, &serialized)?;
-        if let Err(err) = delete_file_if_exists(&self.codex_home) {
-            warn!("failed to remove CLI auth fallback file: {err}");
-        }
+        delete_file_if_exists(&self.codex_home).map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!("secure auth was saved but plaintext fallback cleanup failed: {err}"),
+            )
+        })?;
         Ok(())
     }
 
@@ -380,9 +395,12 @@ impl AuthStorageBackend for SecretsKeyringAuthStorage {
                 warn!("{message}");
                 std::io::Error::other(message)
             })?;
-        if let Err(err) = delete_file_if_exists(&self.codex_home) {
-            warn!("failed to remove CLI auth fallback file: {err}");
-        }
+        delete_file_if_exists(&self.codex_home).map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!("secure auth was saved but plaintext fallback cleanup failed: {err}"),
+            )
+        })?;
         Ok(())
     }
 

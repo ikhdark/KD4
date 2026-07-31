@@ -11,6 +11,7 @@ use sqlx::sqlite::SqliteJournalMode;
 use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::sqlite::SqliteSynchronous;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::io::Read;
 use std::io::Write;
@@ -35,13 +36,14 @@ use crate::AttemptState;
 use crate::AttributionConfidence;
 use crate::CONCURRENT_DRIFT_REASON;
 use crate::CriterionStatus;
-use crate::DEFAULT_BINDING_LIMIT;
 use crate::DEFAULT_MUTATION_EVIDENCE_LIMIT;
 use crate::DEFAULT_SNAPSHOT_CHUNK_BYTES;
 use crate::DependencyBlocker;
 use crate::DependencyState;
 use crate::GateKind;
 use crate::GateStatus;
+use crate::IsolationHandoff;
+use crate::IsolationHandoffState;
 use crate::MAX_BINDING_LIMIT;
 use crate::MAX_MUTATION_EVIDENCE_LIMIT;
 use crate::MAX_MUTATION_SNAPSHOT_BYTES;
@@ -64,9 +66,17 @@ use crate::StoreResult;
 use crate::TaskActor;
 use crate::TaskStoreFuture;
 use crate::ValidationCall;
+use crate::ValidationEvidence;
 use crate::WakeEvent;
 use crate::WakeEventId;
 use crate::WakeRead;
+use crate::WorkspaceActorRegistration;
+use crate::WorkspaceMutationLease;
+use crate::WorkspaceMutationRequest;
+use crate::WorkspaceMutationResult;
+use crate::WorkspaceRevision;
+use crate::WorkspaceStrategy;
+use crate::WorkspaceTaskStatus;
 use crate::WriteClaimConflict;
 use crate::scope::RepositoryIdentity;
 use crate::scope::absolute_repo_path;
@@ -80,6 +90,11 @@ const DATABASE_FILENAME: &str = "agent_tasks.sqlite";
 const NONEXISTENT_SENTINEL: &[u8] = b"CODEX_AGENT_TASK_STORE_NONEXISTENT\n";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+enum ReceiptHandoffAction {
+    Publish(IsolationHandoff),
+    Integrate(Vec<AssignmentId>),
+}
 
 #[derive(Clone)]
 pub struct LocalAgentTaskStore {
@@ -112,6 +127,7 @@ impl LocalAgentTaskStore {
             .connect_with(options)
             .await?;
         MIGRATOR.run(&pool).await?;
+        upgrade_legacy_repository_bindings(&pool).await?;
         let store = Self {
             pool,
             coordination_root: Arc::new(coordination_root),
@@ -161,11 +177,15 @@ impl LocalAgentTaskStore {
         draft: AssignmentDraft,
     ) -> StoreResult<(Assignment, Attempt)> {
         let repository = repository_identity(repo_root)?;
-        let assignment = draft.normalize(repo_root)?;
+        let mut assignment = draft.normalize(repo_root)?;
         if assignment.repository_id != repository.id {
             return Err(StoreError::InvalidScope(
                 "repository root changed while the assignment was normalized".to_string(),
             ));
+        }
+        assignment.workspace_id = repository.workspace_id.clone();
+        if assignment.workspace_strategy == WorkspaceStrategy::Auto {
+            assignment.workspace_strategy = WorkspaceStrategy::Shared;
         }
         let attempt = Attempt {
             attempt_id: AttemptId::new(),
@@ -177,6 +197,9 @@ impl LocalAgentTaskStore {
             sealed_at: None,
         };
         let mut transaction = self.pool.begin().await?;
+        crate::workspace::ensure_workspace_tx(&mut transaction, &repository).await?;
+        assignment.start_epoch =
+            crate::workspace::current_epoch_tx(&mut transaction, &repository.workspace_id).await?;
         // The assignment insert acquires SQLite's writer lock before dependency and claim
         // validation. Any validation failure rolls the row back, so no dormant task is exposed.
         sqlx::query(
@@ -188,11 +211,12 @@ impl LocalAgentTaskStore {
         .bind(encode(&assignment.created_at)?)
         .execute(&mut *transaction)
         .await?;
-        sqlx::query("INSERT INTO assignment_repositories (assignment_id, repository_id, canonical_root, bound_at) VALUES (?, ?, ?, ?)")
+        sqlx::query("INSERT INTO assignment_repositories (assignment_id, repository_id, canonical_root, bound_at, workspace_id) VALUES (?, ?, ?, ?, ?)")
             .bind(assignment.assignment_id.to_string())
             .bind(&repository.id)
             .bind(&repository.canonical_path)
             .bind(encode(&assignment.created_at)?)
+            .bind(&repository.workspace_id)
             .execute(&mut *transaction)
             .await?;
         let allowed_pending_gate = assignment.relation.as_ref().and_then(|relation| {
@@ -215,12 +239,46 @@ impl LocalAgentTaskStore {
             allowed_pending_gate,
         )
         .await?;
+        let mutation_conflicts =
+            workspace_mutation_claim_conflicts_tx(&mut transaction, &assignment).await?;
+        if !mutation_conflicts.is_empty() {
+            return Err(StoreError::WorkspaceClaimConflict {
+                details: mutation_conflicts,
+            });
+        }
         let (supersedes, conflicts) =
             plan_write_claim_tx(&mut transaction, &assignment, None).await?;
         if !conflicts.is_empty() {
             return Err(StoreError::WriteClaimConflict { conflicts });
         }
+        let contract_conflicts = sqlx::query(
+            "SELECT contract_name, assignment_id FROM contract_claims
+             WHERE workspace_id = ? AND active = 1",
+        )
+        .bind(&repository.workspace_id)
+        .fetch_all(&mut *transaction)
+        .await?
+        .into_iter()
+        .filter_map(|row| {
+            let contract = row.get::<String, _>("contract_name");
+            let owner = row.get::<String, _>("assignment_id");
+            if supersedes.iter().any(|id| id.to_string() == owner) {
+                return None;
+            }
+            assignment
+                .contract_claims
+                .iter()
+                .any(|requested| requested == &contract)
+                .then(|| format!("contract {contract} is already claimed by assignment {owner}"))
+        })
+        .collect::<Vec<_>>();
+        if !contract_conflicts.is_empty() {
+            return Err(StoreError::WorkspaceClaimConflict {
+                details: contract_conflicts,
+            });
+        }
         insert_attempt(&mut transaction, &attempt).await?;
+        claim_isolated_handoffs_tx(&mut transaction, &assignment).await?;
         for superseded in &supersedes {
             sqlx::query("UPDATE write_claims SET active = 0, released_at = ?, superseded_by = ? WHERE assignment_id = ? AND active = 1")
                 .bind(encode(&Utc::now())?)
@@ -228,6 +286,14 @@ impl LocalAgentTaskStore {
                 .bind(superseded.to_string())
                 .execute(&mut *transaction)
                 .await?;
+            sqlx::query(
+                "UPDATE contract_claims SET active = 0, released_at = ?
+                 WHERE assignment_id = ? AND active = 1",
+            )
+            .bind(encode(&Utc::now())?)
+            .bind(superseded.to_string())
+            .execute(&mut *transaction)
+            .await?;
         }
         if !assignment.write_scope.is_empty() {
             sqlx::query("INSERT INTO write_claims (assignment_id, attempt_id, scopes_json, supersedes_json, active, created_at) VALUES (?, ?, ?, ?, 1, ?)")
@@ -239,6 +305,41 @@ impl LocalAgentTaskStore {
                 .execute(&mut *transaction)
                 .await?;
         }
+        for contract in &assignment.contract_claims {
+            sqlx::query(
+                "INSERT INTO contract_claims (
+                    workspace_id, contract_name, assignment_id, attempt_id, active,
+                    created_at
+                 ) VALUES (?, ?, ?, ?, 1, ?)",
+            )
+            .bind(&repository.workspace_id)
+            .bind(contract)
+            .bind(assignment.assignment_id.to_string())
+            .bind(attempt.attempt_id.to_string())
+            .bind(encode(&attempt.created_at)?)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO workspace_actors (
+                workspace_id, actor_id, root_session_id, kind, assignment_id, attempt_id,
+                strategy, state, last_progress_at, lease_expires_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)",
+        )
+        .bind(&repository.workspace_id)
+        .bind(format!("attempt:{}", attempt.attempt_id))
+        .bind(&assignment.root_session_id)
+        .bind(encode(&crate::WorkspaceActorKind::Typed)?)
+        .bind(assignment.assignment_id.to_string())
+        .bind(attempt.attempt_id.to_string())
+        .bind(encode(&assignment.workspace_strategy)?)
+        .bind(encode(&attempt.created_at)?)
+        .bind(encode(
+            &(attempt.created_at
+                + chrono::Duration::seconds(crate::DEFAULT_WORKSPACE_LEASE_SECONDS)),
+        )?)
+        .execute(&mut *transaction)
+        .await?;
         append_observation_tx(
             &mut transaction,
             &assignment,
@@ -276,7 +377,7 @@ impl LocalAgentTaskStore {
                 .bind(assignment_id.to_string())
                 .fetch_all(&mut *transaction)
                 .await?;
-        let gates = gate_rows
+        let gates: Vec<AgentGate> = gate_rows
             .into_iter()
             .map(|row| decode(row.get::<String, _>("body_json").as_str()))
             .collect::<StoreResult<Vec<_>>>()?;
@@ -304,6 +405,100 @@ impl LocalAgentTaskStore {
                 .collect::<StoreResult<Vec<_>>>()?
         };
         observations.reverse();
+        let epoch =
+            crate::workspace::current_epoch_tx(&mut transaction, &assignment.workspace_id).await?;
+        let actor_row = sqlx::query(
+            "SELECT state, last_progress_at, lease_expires_at, nudge_sent_at FROM workspace_actors
+             WHERE workspace_id = ? AND attempt_id = ?",
+        )
+        .bind(&assignment.workspace_id)
+        .bind(current_attempt.attempt_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let last_progress_at = actor_row
+            .as_ref()
+            .map(|row| decode(row.get::<String, _>("last_progress_at").as_str()))
+            .transpose()?;
+        let lease_state = actor_row
+            .as_ref()
+            .and_then(|row| row.get::<Option<String>, _>("lease_expires_at"))
+            .map(|value| decode::<chrono::DateTime<Utc>>(&value))
+            .transpose()?
+            .map(|expires_at| {
+                if expires_at < Utc::now() {
+                    crate::LeaseState::Expired
+                } else {
+                    crate::LeaseState::Active
+                }
+            });
+        let nudge_sent_at = actor_row
+            .as_ref()
+            .and_then(|row| row.get::<Option<String>, _>("nudge_sent_at"))
+            .map(|value| decode::<chrono::DateTime<Utc>>(&value))
+            .transpose()?;
+        let isolation_handoff = sqlx::query(
+            "SELECT assignment_id, source_workspace_id, source_epoch, source_manifest_hash,
+                    covered_manifest_json, state, integrator_assignment_id, created_at,
+                    integrated_at,
+                    assignment_repositories.canonical_root AS source_repository_root
+             FROM isolated_handoffs
+             JOIN assignment_repositories USING (assignment_id)
+             WHERE assignment_id = ?",
+        )
+        .bind(assignment_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|row| isolation_handoff_from_row(&row))
+        .transpose()?;
+        let integration_handoffs = sqlx::query(
+            "SELECT isolated_handoffs.assignment_id, source_workspace_id, source_epoch,
+                    source_manifest_hash, covered_manifest_json, state,
+                    integrator_assignment_id, isolated_handoffs.created_at,
+                    integrated_at,
+                    assignment_repositories.canonical_root AS source_repository_root
+             FROM isolated_handoffs
+             JOIN assignment_repositories USING (assignment_id)
+             WHERE integrator_assignment_id = ?
+             ORDER BY isolated_handoffs.assignment_id",
+        )
+        .bind(assignment_id.to_string())
+        .fetch_all(&mut *transaction)
+        .await?
+        .into_iter()
+        .map(|row| isolation_handoff_from_row(&row))
+        .collect::<StoreResult<Vec<_>>>()?;
+        let stale_recovery = sqlx::query(
+            "SELECT stale_events, last_reason FROM stale_recovery WHERE attempt_id = ?",
+        )
+        .bind(current_attempt.attempt_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let stale_events = stale_recovery
+            .as_ref()
+            .map(|row| row.get::<i64, _>("stale_events"))
+            .unwrap_or(0);
+        let stale_reason = stale_recovery
+            .as_ref()
+            .and_then(|row| row.get::<Option<String>, _>("last_reason"));
+        let pending_gates = gates
+            .iter()
+            .filter(|gate| gate.status == GateStatus::Pending)
+            .map(|gate| gate.kind)
+            .collect::<Vec<_>>();
+        let next_required_action = stale_reason
+            .as_ref()
+            .map(|_| {
+                if stale_events >= 2 || current_attempt.state == AttemptState::NeedsMain {
+                    "root must reconcile the repeated stale state or restart the work in an isolated workspace"
+                        .to_string()
+                } else {
+                    "reconcile stale inputs and run one targeted validation".to_string()
+                }
+            })
+            .or_else(|| {
+                (!pending_gates.is_empty())
+                    .then(|| "resolve pending gates before completion".to_string())
+            });
         transaction.commit().await?;
         Ok(AgentTask {
             assignment,
@@ -311,6 +506,17 @@ impl LocalAgentTaskStore {
             gates,
             receipt,
             validation_calls,
+            workspace_status: WorkspaceTaskStatus {
+                epoch,
+                last_progress_at,
+                lease_state,
+                pending_gates,
+                stale_reason,
+                next_required_action,
+                nudge_sent_at,
+            },
+            isolation_handoff,
+            integration_handoffs,
             observations,
         })
     }
@@ -476,15 +682,31 @@ impl LocalAgentTaskStore {
                 "root session id cannot be empty".to_string(),
             ));
         }
-        let limit = limit.unwrap_or(DEFAULT_BINDING_LIMIT);
-        if limit > MAX_BINDING_LIMIT {
-            return Err(StoreError::InvalidBindingLimit(limit));
-        }
-        let rows = sqlx::query("SELECT assignment_id, attempt_id, root_session_id, agent_path, task_name, thread_id, bound_at, updated_at FROM agent_task_bindings WHERE root_session_id = ? ORDER BY updated_at DESC, agent_path LIMIT ?")
-            .bind(root_session_id)
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await?;
+        let limit = match limit {
+            Some(limit) if limit > MAX_BINDING_LIMIT => {
+                return Err(StoreError::InvalidBindingLimit(limit));
+            }
+            Some(limit) => limit as i64,
+            // None is the explicit exhaustive form used by coordination paths.
+            // SQLite's LIMIT -1 means no limit without duplicating the query.
+            None => -1,
+        };
+        let rows = sqlx::query(
+            "SELECT agent_task_bindings.assignment_id, agent_task_bindings.attempt_id,
+                    agent_task_bindings.root_session_id, agent_path, task_name, thread_id,
+                    bound_at, agent_task_bindings.updated_at
+             FROM agent_task_bindings
+             JOIN attempts ON attempts.attempt_id = agent_task_bindings.attempt_id
+             WHERE agent_task_bindings.root_session_id = ?
+             ORDER BY CASE WHEN attempts.state = '\"active\"' THEN 0 ELSE 1 END,
+                      agent_task_bindings.updated_at DESC, agent_path,
+                      agent_task_bindings.assignment_id
+             LIMIT ?",
+        )
+        .bind(root_session_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
         rows.into_iter().map(|row| binding_from_row(&row)).collect()
     }
 
@@ -513,6 +735,23 @@ impl LocalAgentTaskStore {
             call_id,
         )
         .await?;
+        let workspace_id =
+            assignment_workspace_id_tx(&mut transaction, assignment.assignment_id).await?;
+        sqlx::query(
+            "UPDATE workspace_actors
+             SET last_progress_at = ?, state = 'active', nudge_sent_at = NULL,
+                 lease_expires_at = ?
+             WHERE workspace_id = ? AND attempt_id = ?",
+        )
+        .bind(encode(&observation.created_at)?)
+        .bind(encode(
+            &(observation.created_at
+                + chrono::Duration::seconds(crate::DEFAULT_WORKSPACE_LEASE_SECONDS)),
+        )?)
+        .bind(workspace_id)
+        .bind(attempt_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(observation)
     }
@@ -528,9 +767,17 @@ impl LocalAgentTaskStore {
                 "validation command summary cannot be empty".to_string(),
             ));
         }
+        let mut call = prepare_validation_call(&self.pool, call).await?;
         let mut transaction = self.pool.begin().await?;
         lock_attempt_tx(&mut transaction, call.attempt_id).await?;
-        let attempt = require_active_current_attempt_tx(&mut transaction, call.attempt_id).await?;
+        let attempt = load_attempt_tx(&mut transaction, call.attempt_id).await?;
+        let current = load_current_attempt_tx(&mut transaction, attempt.assignment_id).await?;
+        if current.attempt_id != call.attempt_id {
+            return Err(StoreError::AttemptNotActive(call.attempt_id));
+        }
+        let attempt_is_active =
+            attempt.state == AttemptState::Active && attempt.sealed_at.is_none();
+        let mut reconciliation_exhausted = false;
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, body_json, status FROM validation_calls WHERE call_id = ?",
         )
@@ -556,28 +803,44 @@ impl LocalAgentTaskStore {
                 transaction.commit().await?;
                 return Ok(());
             }
-            if existing.status.is_terminal()
+            let late_supersession = existing.status == crate::ValidationCallStatus::Succeeded
+                && call.status == crate::ValidationCallStatus::Superseded;
+            if !attempt_is_active && !late_supersession {
+                return Err(StoreError::AttemptNotActive(call.attempt_id));
+            }
+            if existing.status.is_terminal() && !late_supersession
                 || !call.status.is_terminal()
                 || existing.command_summary != call.command_summary
                 || existing.resolved_executable != call.resolved_executable
                 || existing.proof_kind != call.proof_kind
+                || existing.evidence.start_epoch != call.evidence.start_epoch
+                || existing.evidence.covered_manifest != call.evidence.covered_manifest
+                || existing.evidence.manifest_hash != call.evidence.manifest_hash
                 || call.recorded_at < existing.recorded_at
             {
                 return Err(StoreError::ValidationCallImmutable(call.call_id));
             }
+            let expected_status = if late_supersession {
+                crate::ValidationCallStatus::Succeeded
+            } else {
+                crate::ValidationCallStatus::Running
+            };
             let result = sqlx::query("UPDATE validation_calls SET body_json = ?, status = ?, recorded_at = ? WHERE call_id = ? AND attempt_id = ? AND status = ?")
                 .bind(encode(&call)?)
                 .bind(encode(&call.status)?)
                 .bind(encode(&call.recorded_at)?)
                 .bind(&call.call_id)
                 .bind(call.attempt_id.to_string())
-                .bind(encode(&crate::ValidationCallStatus::Running)?)
+                .bind(encode(&expected_status)?)
                 .execute(&mut *transaction)
                 .await?;
             if result.rows_affected() != 1 {
                 return Err(StoreError::ValidationCallImmutable(call.call_id));
             }
         } else {
+            if !attempt_is_active {
+                return Err(StoreError::AttemptNotActive(call.attempt_id));
+            }
             if call.status != crate::ValidationCallStatus::Running {
                 return Err(StoreError::ValidationCallImmutable(call.call_id));
             }
@@ -614,6 +877,27 @@ impl LocalAgentTaskStore {
                     )));
                 }
             }
+            let mut is_singleflight_leader = false;
+            if call.proof_kind == crate::ValidationProofKind::Focused {
+                let fingerprint = validation_fingerprint(&call)?;
+                let now = encode(&Utc::now())?;
+                if let Some(leader) = sqlx::query_scalar::<_, String>(
+                    "SELECT leader_call_id FROM validation_singleflight
+                     WHERE workspace_id = ? AND start_epoch = ? AND fingerprint = ?
+                       AND state = 'running' AND lease_expires_at >= ?",
+                )
+                .bind(&assignment_workspace_id_tx(&mut transaction, attempt.assignment_id).await?)
+                .bind(call.evidence.start_epoch as i64)
+                .bind(&fingerprint)
+                .bind(&now)
+                .fetch_optional(&mut *transaction)
+                .await?
+                {
+                    call.evidence.shared_from_call_id = Some(leader);
+                } else {
+                    is_singleflight_leader = true;
+                }
+            }
             sqlx::query("INSERT INTO validation_calls (call_id, attempt_id, body_json, status, recorded_at) VALUES (?, ?, ?, ?, ?)")
                 .bind(&call.call_id)
                 .bind(call.attempt_id.to_string())
@@ -622,9 +906,226 @@ impl LocalAgentTaskStore {
                 .bind(encode(&call.recorded_at)?)
                 .execute(&mut *transaction)
                 .await?;
+            if is_singleflight_leader {
+                let workspace_id =
+                    assignment_workspace_id_tx(&mut transaction, attempt.assignment_id).await?;
+                sqlx::query(
+                    "INSERT INTO validation_singleflight (
+                        workspace_id, start_epoch, fingerprint, leader_call_id, state,
+                        lease_expires_at, updated_at
+                     ) VALUES (?, ?, ?, ?, 'running', ?, ?)
+                     ON CONFLICT(workspace_id, start_epoch, fingerprint) DO UPDATE SET
+                        leader_call_id = excluded.leader_call_id,
+                        state = 'running',
+                        lease_expires_at = excluded.lease_expires_at,
+                        updated_at = excluded.updated_at",
+                )
+                .bind(workspace_id)
+                .bind(call.evidence.start_epoch as i64)
+                .bind(validation_fingerprint(&call)?)
+                .bind(&call.call_id)
+                .bind(
+                    call.evidence
+                        .lease_expires_at
+                        .map(|value| encode(&value))
+                        .transpose()?
+                        .unwrap_or_else(|| encode(&Utc::now()).unwrap_or_default()),
+                )
+                .bind(encode(&Utc::now())?)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            reconciliation_exhausted =
+                reserve_reconciliation_validation_tx(&mut transaction, &attempt, &call.call_id)
+                    .await?;
+        }
+        if call.status.is_terminal() {
+            sqlx::query(
+                "UPDATE validation_singleflight SET state = ?, updated_at = ?
+                 WHERE leader_call_id = ? AND state = 'running'",
+            )
+            .bind(if call.status == crate::ValidationCallStatus::Superseded {
+                "superseded"
+            } else {
+                "terminal"
+            })
+            .bind(encode(&Utc::now())?)
+            .bind(&call.call_id)
+            .execute(&mut *transaction)
+            .await?;
+            if call.status == crate::ValidationCallStatus::Superseded {
+                record_stale_event_tx(
+                    &mut transaction,
+                    &attempt,
+                    call.evidence.end_epoch.unwrap_or(call.evidence.start_epoch),
+                    call.evidence
+                        .stale_reason
+                        .as_deref()
+                        .unwrap_or("validation inputs changed"),
+                )
+                .await?;
+            }
         }
         transaction.commit().await?;
+        if reconciliation_exhausted {
+            return Err(StoreError::StaleRecoveryExhausted(call.attempt_id));
+        }
         Ok(())
+    }
+
+    async fn get_validation_call_impl(
+        &self,
+        call_id: String,
+    ) -> StoreResult<Option<ValidationCall>> {
+        if call_id.trim().is_empty() {
+            return Err(StoreError::InvalidAssignment(
+                "validation call id cannot be empty".to_string(),
+            ));
+        }
+        sqlx::query_scalar::<_, String>("SELECT body_json FROM validation_calls WHERE call_id = ?")
+            .bind(call_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|body| decode(&body))
+            .transpose()
+    }
+
+    async fn heartbeat_validation_call_impl(
+        &self,
+        call_id: String,
+        lease_expires_at: chrono::DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        let mut transaction = self.pool.begin().await?;
+        let body = sqlx::query_scalar::<_, String>(
+            "SELECT body_json FROM validation_calls
+             WHERE call_id = ? AND status = ?",
+        )
+        .bind(&call_id)
+        .bind(encode(&crate::ValidationCallStatus::Running)?)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(body) = body else {
+            transaction.commit().await?;
+            return Ok(false);
+        };
+        let mut call: ValidationCall = decode(&body)?;
+        call.evidence.lease_expires_at = Some(lease_expires_at);
+        let updated = sqlx::query(
+            "UPDATE validation_calls SET body_json = ?
+             WHERE call_id = ? AND status = ?",
+        )
+        .bind(encode(&call)?)
+        .bind(&call_id)
+        .bind(encode(&crate::ValidationCallStatus::Running)?)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() == 1 {
+            sqlx::query(
+                "UPDATE validation_singleflight
+                 SET lease_expires_at = ?, updated_at = ?
+                 WHERE leader_call_id = ? AND state = 'running'",
+            )
+            .bind(encode(&lease_expires_at)?)
+            .bind(encode(&Utc::now())?)
+            .bind(&call_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn refresh_validation_calls_impl(
+        &self,
+        attempt_id: AttemptId,
+        validation_call_ids: &[String],
+    ) -> StoreResult<Vec<String>> {
+        let mut stale_call_ids = Vec::new();
+        for call_id in validation_call_ids {
+            let Some(body) = sqlx::query_scalar::<_, String>(
+                "SELECT body_json FROM validation_calls WHERE call_id = ?",
+            )
+            .bind(call_id)
+            .fetch_optional(&self.pool)
+            .await?
+            else {
+                continue;
+            };
+            let mut refreshed: ValidationCall = decode(&body)?;
+            if refreshed.attempt_id != attempt_id
+                || refreshed.status != crate::ValidationCallStatus::Succeeded
+            {
+                continue;
+            }
+            refreshed.recorded_at = Utc::now();
+            refreshed = prepare_validation_call(&self.pool, refreshed).await?;
+            if refreshed.status == crate::ValidationCallStatus::Superseded {
+                stale_call_ids.push(call_id.clone());
+                self.record_validation_call_impl(refreshed).await?;
+            }
+        }
+        Ok(stale_call_ids)
+    }
+
+    async fn require_root_receipt_evidence_current_impl(
+        &self,
+        root_session_id: &str,
+    ) -> StoreResult<()> {
+        let rows = sqlx::query(
+            "SELECT receipts.body_json
+             FROM receipts
+             JOIN assignments USING (assignment_id)
+             JOIN attempts USING (attempt_id)
+             WHERE assignments.root_session_id = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM attempts AS newer
+                   WHERE newer.assignment_id = attempts.assignment_id
+                     AND newer.ordinal > attempts.ordinal
+               )",
+        )
+        .bind(root_session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut stale_call_ids = BTreeSet::new();
+        for row in rows {
+            let receipt: AgentReceipt = decode(&row.get::<String, _>("body_json"))?;
+            if !receipt.status.is_success() {
+                continue;
+            }
+            stale_call_ids.extend(
+                self.refresh_validation_calls_impl(
+                    receipt.attempt_id,
+                    &receipt.validation_call_ids,
+                )
+                .await?,
+            );
+            for call_id in &receipt.validation_call_ids {
+                let call = self
+                    .get_validation_call_impl(call_id.clone())
+                    .await?
+                    .ok_or_else(|| {
+                        StoreError::CorruptData(format!(
+                            "sealed receipt references missing validation call {call_id}"
+                        ))
+                    })?;
+                if call.status == crate::ValidationCallStatus::Superseded
+                    || call.evidence.stale_reason.is_some()
+                {
+                    stale_call_ids.insert(call_id.clone());
+                } else if !call.status.is_success() {
+                    return Err(StoreError::ValidationCallStatusInvalid {
+                        call_ids: vec![call_id.clone()],
+                    });
+                }
+            }
+        }
+        if stale_call_ids.is_empty() {
+            Ok(())
+        } else {
+            Err(StoreError::EvidenceSuperseded {
+                call_ids: stale_call_ids.into_iter().collect(),
+            })
+        }
     }
 
     async fn submit_agent_receipt_impl(
@@ -638,6 +1139,21 @@ impl LocalAgentTaskStore {
                 "receipt summary cannot be empty".to_string(),
             ));
         }
+        if draft.status == AgentStatusClaim::Completed {
+            let stale_call_ids = self
+                .refresh_validation_calls_impl(attempt_id, &draft.validation_call_ids)
+                .await?;
+            if !stale_call_ids.is_empty() {
+                return Err(StoreError::EvidenceSuperseded {
+                    call_ids: stale_call_ids,
+                });
+            }
+        }
+        let handoff_action = if draft.status == AgentStatusClaim::Completed {
+            self.prepare_receipt_handoff_action(attempt_id).await?
+        } else {
+            None
+        };
         let mut transaction = self.pool.begin().await?;
         lock_attempt_tx(&mut transaction, attempt_id).await?;
         let attempt = load_attempt_tx(&mut transaction, attempt_id).await?;
@@ -662,6 +1178,8 @@ impl LocalAgentTaskStore {
         let mut invalid_statuses = Vec::new();
         let mut seen_calls = HashSet::new();
         let mut validation_summaries = HashSet::new();
+        let mut validation_manifest_hashes = BTreeSet::new();
+        let mut transaction_stale_call_ids = Vec::new();
         for call_id in &draft.validation_call_ids {
             if !seen_calls.insert(call_id.as_str()) {
                 invalid_calls.push(call_id.clone());
@@ -689,8 +1207,40 @@ impl LocalAgentTaskStore {
                     "validation call {call_id} has inconsistent persisted identity or status"
                 )));
             }
+            if draft.status == AgentStatusClaim::Completed
+                && call.status == crate::ValidationCallStatus::Succeeded
+                && let Some((reason, current_epoch)) =
+                    validation_stale_event_reason_tx(&mut transaction, &assignment, &call).await?
+            {
+                let mut superseded = call.clone();
+                superseded.status = crate::ValidationCallStatus::Superseded;
+                superseded.evidence.end_epoch = Some(current_epoch);
+                superseded.evidence.stale_reason = Some(reason.clone());
+                superseded.recorded_at = Utc::now();
+                let updated = sqlx::query(
+                    "UPDATE validation_calls
+                     SET body_json = ?, status = ?, recorded_at = ?
+                     WHERE call_id = ? AND attempt_id = ? AND status = ?",
+                )
+                .bind(encode(&superseded)?)
+                .bind(encode(&superseded.status)?)
+                .bind(encode(&superseded.recorded_at)?)
+                .bind(call_id)
+                .bind(attempt_id.to_string())
+                .bind(encode(&crate::ValidationCallStatus::Succeeded)?)
+                .execute(&mut *transaction)
+                .await?;
+                if updated.rows_affected() != 1 {
+                    return Err(StoreError::ValidationCallImmutable(call_id.clone()));
+                }
+                record_stale_event_tx(&mut transaction, &attempt, current_epoch, &reason).await?;
+                transaction_stale_call_ids.push(call_id.clone());
+                continue;
+            }
             let completion_proof = call.status.is_success()
                 && call.proof_kind == crate::ValidationProofKind::Focused
+                && call.evidence.end_epoch.is_some()
+                && call.evidence.stale_reason.is_none()
                 && call
                     .resolved_executable
                     .as_deref()
@@ -702,7 +1252,14 @@ impl LocalAgentTaskStore {
             }
             if completion_proof {
                 validation_summaries.insert(call.command_summary);
+                validation_manifest_hashes.insert(call.evidence.manifest_hash);
             }
+        }
+        if !transaction_stale_call_ids.is_empty() {
+            transaction.commit().await?;
+            return Err(StoreError::EvidenceSuperseded {
+                call_ids: transaction_stale_call_ids,
+            });
         }
         if !invalid_calls.is_empty() {
             return Err(StoreError::ValidationCallOwnership {
@@ -748,6 +1305,11 @@ impl LocalAgentTaskStore {
             )
             .await?;
         }
+        let evidence_epoch = assignment_epoch_tx(&mut transaction, attempt.assignment_id).await?;
+        let evidence_manifest_hash = format!(
+            "{:x}",
+            Sha256::digest(encode(&validation_manifest_hashes)?.as_bytes())
+        );
         let receipt = AgentReceipt {
             assignment_id: attempt.assignment_id,
             attempt_id,
@@ -759,6 +1321,8 @@ impl LocalAgentTaskStore {
             blockers: draft.blockers,
             risks: draft.risks,
             next_action: draft.next_action,
+            evidence_epoch,
+            evidence_manifest_hash,
             sealed_at: Utc::now(),
         };
         let state = receipt.status.attempt_state();
@@ -770,6 +1334,9 @@ impl LocalAgentTaskStore {
             .bind(encode(&receipt.sealed_at)?)
             .execute(&mut *transaction)
             .await?;
+        if let Some(action) = handoff_action {
+            persist_receipt_handoff_action_tx(&mut transaction, action).await?;
+        }
         let updated = sqlx::query(
             "UPDATE attempts SET state = ?, sealed_at = ? WHERE attempt_id = ? AND state = ?",
         )
@@ -798,6 +1365,99 @@ impl LocalAgentTaskStore {
         .await?;
         transaction.commit().await?;
         Ok(receipt)
+    }
+
+    async fn prepare_receipt_handoff_action(
+        &self,
+        attempt_id: AttemptId,
+    ) -> StoreResult<Option<ReceiptHandoffAction>> {
+        let context = validation_context(&self.pool, attempt_id).await?;
+        if context.assignment.workspace_strategy == WorkspaceStrategy::Isolated {
+            let paths = context
+                .assignment
+                .write_scope
+                .iter()
+                .map(|scope| scope.path.clone())
+                .collect::<Vec<_>>();
+            let revision =
+                crate::workspace::capture_revision(&self.pool, &context.repo_root, paths).await?;
+            return Ok(Some(ReceiptHandoffAction::Publish(IsolationHandoff {
+                assignment_id: context.assignment.assignment_id,
+                source_workspace_id: revision.workspace_id,
+                source_repository_root: Some(context.repo_root.to_string_lossy().into_owned()),
+                source_epoch: revision.epoch,
+                source_manifest_hash: revision.manifest_hash,
+                covered_manifest: revision.files,
+                state: IsolationHandoffState::Ready,
+                integrator_assignment_id: None,
+                created_at: Utc::now(),
+                integrated_at: None,
+            })));
+        }
+        let Some(relation) = context.assignment.relation.as_ref() else {
+            return Ok(None);
+        };
+        if context.assignment.role != AgentRole::Integrator
+            || relation.kind != RelationKind::Integration
+        {
+            return Ok(None);
+        }
+        let mut integrated_targets = Vec::new();
+        for target in &relation.target_assignment_ids {
+            let row = sqlx::query(
+                "SELECT assignments.body_json, assignment_repositories.canonical_root
+                 FROM assignments
+                 JOIN assignment_repositories USING (assignment_id)
+                 WHERE assignments.assignment_id = ?",
+            )
+            .bind(target.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::AssignmentNotFound(*target))?;
+            let target_assignment: Assignment = decode(row.get::<String, _>("body_json").as_str())?;
+            if target_assignment.workspace_strategy != WorkspaceStrategy::Isolated {
+                continue;
+            }
+            let handoff_row = sqlx::query(
+                "SELECT assignment_id, source_workspace_id, source_epoch, source_manifest_hash,
+                        covered_manifest_json, state, integrator_assignment_id, created_at,
+                        integrated_at
+                 FROM isolated_handoffs WHERE assignment_id = ?",
+            )
+            .bind(target.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| {
+                StoreError::InvalidAssignment(format!(
+                    "isolated dependency {target} has no versioned handoff"
+                ))
+            })?;
+            let mut handoff = isolation_handoff_from_row(&handoff_row)?;
+            handoff.source_repository_root = Some(row.get::<String, _>("canonical_root"));
+            if handoff.state != IsolationHandoffState::Claimed
+                || handoff.integrator_assignment_id != Some(context.assignment.assignment_id)
+            {
+                return Err(StoreError::InvalidAssignment(format!(
+                    "isolated handoff {target} is not claimed by integrator {}",
+                    context.assignment.assignment_id
+                )));
+            }
+            let paths = handoff
+                .covered_manifest
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>();
+            let canonical_root = row.get::<String, _>("canonical_root");
+            let current =
+                crate::workspace::capture_revision(&self.pool, Path::new(&canonical_root), paths)
+                    .await?;
+            if current.manifest_hash != handoff.source_manifest_hash {
+                return Err(StoreError::IsolationHandoffSuperseded(*target));
+            }
+            integrated_targets.push(*target);
+        }
+        Ok((!integrated_targets.is_empty())
+            .then_some(ReceiptHandoffAction::Integrate(integrated_targets)))
     }
 
     async fn amend_agent_task_impl(
@@ -846,6 +1506,13 @@ impl LocalAgentTaskStore {
             created_at: Utc::now(),
             sealed_at: None,
         };
+        let mutation_conflicts =
+            workspace_mutation_claim_conflicts_tx(&mut transaction, &assignment).await?;
+        if !mutation_conflicts.is_empty() {
+            return Err(StoreError::WorkspaceClaimConflict {
+                details: mutation_conflicts,
+            });
+        }
         if !assignment.write_scope.is_empty() {
             let claim = sqlx::query("SELECT attempt_id FROM write_claims WHERE assignment_id = ?")
                 .bind(assignment_id.to_string())
@@ -902,13 +1569,38 @@ impl LocalAgentTaskStore {
                 return Err(StoreError::WriteClaimInactive(assignment_id));
             }
         }
+        sqlx::query(
+            "UPDATE contract_claims SET attempt_id = ?, active = 1, released_at = NULL
+             WHERE assignment_id = ?",
+        )
+        .bind(next.attempt_id.to_string())
+        .bind(assignment_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "UPDATE workspace_actors SET actor_id = ?, attempt_id = ?, state = 'active',
+             last_progress_at = ?, lease_expires_at = ?, nudge_sent_at = NULL
+             WHERE assignment_id = ? AND attempt_id = ?",
+        )
+        .bind(format!("attempt:{}", next.attempt_id))
+        .bind(next.attempt_id.to_string())
+        .bind(encode(&next.created_at)?)
+        .bind(encode(
+            &(next.created_at + chrono::Duration::seconds(crate::DEFAULT_WORKSPACE_LEASE_SECONDS)),
+        )?)
+        .bind(assignment_id.to_string())
+        .bind(current.attempt_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
         let gate_now = Utc::now();
+        let gate_epoch = assignment_epoch_tx(&mut transaction, assignment_id).await?;
         let correction_gate = AgentGate {
             assignment_id,
             kind: GateKind::Review,
             status: GateStatus::Pending,
             reason: "correction attempt requires a new review verdict".to_string(),
             waiver_reason: None,
+            evidence_epoch: gate_epoch,
             updated_at: gate_now,
             sealed_at: None,
         };
@@ -977,6 +1669,8 @@ impl LocalAgentTaskStore {
             blockers: Vec::new(),
             risks: Vec::new(),
             next_action: None,
+            evidence_epoch: assignment_epoch_tx(&mut transaction, assignment_id).await?,
+            evidence_manifest_hash: String::new(),
             sealed_at: Utc::now(),
         };
         sqlx::query("INSERT INTO receipts (attempt_id, assignment_id, status, body_json, sealed_at) VALUES (?, ?, ?, ?, ?)")
@@ -1031,11 +1725,35 @@ impl LocalAgentTaskStore {
                 gate: kind.to_string(),
             });
         }
+        if status.is_sealed()
+            && let Some((target_attempt_id, validation_call_ids)) =
+                assignment_receipt_validation_ids(&self.pool, assignment_id).await?
+        {
+            let stale_call_ids = self
+                .refresh_validation_calls_impl(target_attempt_id, &validation_call_ids)
+                .await?;
+            if !stale_call_ids.is_empty() {
+                return Err(StoreError::EvidenceSuperseded {
+                    call_ids: stale_call_ids,
+                });
+            }
+        }
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
         require_gate_actor_tx(&mut transaction, actor, &assignment, kind).await?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
+        if status.is_sealed() {
+            let stale_call_ids =
+                supersede_stale_receipt_validations_tx(&mut transaction, &assignment, &attempt)
+                    .await?;
+            if !stale_call_ids.is_empty() {
+                transaction.commit().await?;
+                return Err(StoreError::EvidenceSuperseded {
+                    call_ids: stale_call_ids,
+                });
+            }
+        }
         if let Some(existing_json) = sqlx::query_scalar::<_, String>(
             "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
         )
@@ -1052,12 +1770,14 @@ impl LocalAgentTaskStore {
             }
         }
         let now = Utc::now();
+        let evidence_epoch = assignment_epoch_tx(&mut transaction, assignment_id).await?;
         let gate = AgentGate {
             assignment_id,
             kind,
             status,
             reason,
             waiver_reason: None,
+            evidence_epoch,
             updated_at: now,
             sealed_at: status.is_sealed().then_some(now),
         };
@@ -1124,10 +1844,30 @@ impl LocalAgentTaskStore {
                 "waiver reason cannot be empty".to_string(),
             ));
         }
+        if let Some((target_attempt_id, validation_call_ids)) =
+            assignment_receipt_validation_ids(&self.pool, assignment_id).await?
+        {
+            let stale_call_ids = self
+                .refresh_validation_calls_impl(target_attempt_id, &validation_call_ids)
+                .await?;
+            if !stale_call_ids.is_empty() {
+                return Err(StoreError::EvidenceSuperseded {
+                    call_ids: stale_call_ids,
+                });
+            }
+        }
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
         let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
+        let stale_call_ids =
+            supersede_stale_receipt_validations_tx(&mut transaction, &assignment, &attempt).await?;
+        if !stale_call_ids.is_empty() {
+            transaction.commit().await?;
+            return Err(StoreError::EvidenceSuperseded {
+                call_ids: stale_call_ids,
+            });
+        }
         if let Some(existing_json) = sqlx::query_scalar::<_, String>(
             "SELECT body_json FROM gates WHERE assignment_id = ? AND kind = ?",
         )
@@ -1144,12 +1884,14 @@ impl LocalAgentTaskStore {
             }
         }
         let now = Utc::now();
+        let evidence_epoch = assignment_epoch_tx(&mut transaction, assignment_id).await?;
         let gate = AgentGate {
             assignment_id,
             kind,
             status: GateStatus::Waived,
             reason: "root waived soft gate".to_string(),
             waiver_reason: Some(reason),
+            evidence_epoch,
             updated_at: now,
             sealed_at: Some(now),
         };
@@ -1250,6 +1992,54 @@ impl LocalAgentTaskStore {
             latest_event_id,
             truncated_count: lost_to_retention + not_returned,
         })
+    }
+
+    async fn reserve_stalled_nudge_impl(
+        &self,
+        assignment_id: AssignmentId,
+        no_progress_before: chrono::DateTime<Utc>,
+    ) -> StoreResult<bool> {
+        let mut transaction = self.pool.begin().await?;
+        lock_assignment_tx(&mut transaction, assignment_id).await?;
+        let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
+        if attempt.state != AttemptState::Active {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let workspace_id = assignment_workspace_id_tx(&mut transaction, assignment_id).await?;
+        let now = Utc::now();
+        let updated = sqlx::query(
+            "UPDATE workspace_actors
+             SET nudge_sent_at = ?
+             WHERE workspace_id = ? AND attempt_id = ? AND state <> 'terminal'
+               AND last_progress_at <= ? AND nudge_sent_at IS NULL",
+        )
+        .bind(encode(&now)?)
+        .bind(workspace_id)
+        .bind(attempt.attempt_id.to_string())
+        .bind(encode(&no_progress_before)?)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn release_stalled_nudge_impl(&self, assignment_id: AssignmentId) -> StoreResult<bool> {
+        let mut transaction = self.pool.begin().await?;
+        lock_assignment_tx(&mut transaction, assignment_id).await?;
+        let attempt = load_current_attempt_tx(&mut transaction, assignment_id).await?;
+        let workspace_id = assignment_workspace_id_tx(&mut transaction, assignment_id).await?;
+        let updated = sqlx::query(
+            "UPDATE workspace_actors
+             SET nudge_sent_at = NULL
+             WHERE workspace_id = ? AND attempt_id = ? AND nudge_sent_at IS NOT NULL",
+        )
+        .bind(workspace_id)
+        .bind(attempt.attempt_id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        Ok(updated.rows_affected() == 1)
     }
 
     async fn begin_mutation_impl(
@@ -1870,6 +2660,21 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         Box::pin(async move { self.record_validation_call_impl(call).await })
     }
 
+    fn get_validation_call(&self, call_id: String) -> TaskStoreFuture<'_, Option<ValidationCall>> {
+        Box::pin(async move { self.get_validation_call_impl(call_id).await })
+    }
+
+    fn heartbeat_validation_call(
+        &self,
+        call_id: String,
+        lease_expires_at: chrono::DateTime<Utc>,
+    ) -> TaskStoreFuture<'_, bool> {
+        Box::pin(async move {
+            self.heartbeat_validation_call_impl(call_id, lease_expires_at)
+                .await
+        })
+    }
+
     fn submit_agent_receipt(
         &self,
         attempt_id: AttemptId,
@@ -1955,6 +2760,140 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         })
     }
 
+    fn reserve_stalled_nudge(
+        &self,
+        assignment_id: AssignmentId,
+        no_progress_before: chrono::DateTime<Utc>,
+    ) -> TaskStoreFuture<'_, bool> {
+        Box::pin(async move {
+            self.reserve_stalled_nudge_impl(assignment_id, no_progress_before)
+                .await
+        })
+    }
+
+    fn release_stalled_nudge(&self, assignment_id: AssignmentId) -> TaskStoreFuture<'_, bool> {
+        Box::pin(async move { self.release_stalled_nudge_impl(assignment_id).await })
+    }
+
+    fn capture_workspace_revision<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        paths: Vec<String>,
+    ) -> TaskStoreFuture<'a, WorkspaceRevision> {
+        Box::pin(
+            async move { crate::workspace::capture_revision(&self.pool, repo_root, paths).await },
+        )
+    }
+
+    fn record_supporting_read<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        actor_id: String,
+        paths: Vec<String>,
+    ) -> TaskStoreFuture<'a, WorkspaceRevision> {
+        Box::pin(async move {
+            crate::workspace::record_supporting_read(&self.pool, repo_root, &actor_id, paths).await
+        })
+    }
+
+    fn record_supporting_read_entries<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        actor_id: String,
+        entries: Vec<crate::WorkspaceManifestEntry>,
+    ) -> TaskStoreFuture<'a, WorkspaceRevision> {
+        Box::pin(async move {
+            crate::workspace::record_supporting_read_entries(
+                &self.pool, repo_root, &actor_id, entries,
+            )
+            .await
+        })
+    }
+
+    fn supporting_read_manifest<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        actor_id: String,
+        paths: Vec<String>,
+    ) -> TaskStoreFuture<'a, Vec<crate::WorkspaceManifestEntry>> {
+        Box::pin(async move {
+            crate::workspace::supporting_read_manifest(&self.pool, repo_root, &actor_id, paths)
+                .await
+        })
+    }
+
+    fn read_workspace_events<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        after_epoch: u64,
+    ) -> TaskStoreFuture<'a, Vec<crate::WorkspaceEvent>> {
+        Box::pin(
+            async move { crate::workspace::read_events(&self.pool, repo_root, after_epoch).await },
+        )
+    }
+
+    fn register_workspace_actor<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        registration: WorkspaceActorRegistration,
+    ) -> TaskStoreFuture<'a, ()> {
+        Box::pin(async move {
+            crate::workspace::register_actor(&self.pool, repo_root, registration).await
+        })
+    }
+
+    fn begin_workspace_mutation<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        request: WorkspaceMutationRequest,
+    ) -> TaskStoreFuture<'a, WorkspaceMutationLease> {
+        Box::pin(
+            async move { crate::workspace::begin_mutation(&self.pool, repo_root, request).await },
+        )
+    }
+
+    fn heartbeat_workspace_mutation<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        lease_id: String,
+        actor_id: String,
+    ) -> TaskStoreFuture<'a, bool> {
+        Box::pin(async move {
+            crate::workspace::heartbeat_mutation(&self.pool, repo_root, &lease_id, &actor_id).await
+        })
+    }
+
+    fn finish_workspace_mutation<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        lease: WorkspaceMutationLease,
+    ) -> TaskStoreFuture<'a, WorkspaceMutationResult> {
+        Box::pin(
+            async move { crate::workspace::finish_mutation(&self.pool, repo_root, lease).await },
+        )
+    }
+
+    fn assert_workspace_unclaimed<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        actor_attempt_id: Option<AttemptId>,
+    ) -> TaskStoreFuture<'a, ()> {
+        Box::pin(async move {
+            crate::workspace::assert_unclaimed(&self.pool, repo_root, actor_attempt_id).await
+        })
+    }
+
+    fn check_quiescence(
+        &self,
+        root_session_id: String,
+    ) -> TaskStoreFuture<'_, crate::QuiescenceStatus> {
+        Box::pin(async move {
+            self.require_root_receipt_evidence_current_impl(&root_session_id)
+                .await?;
+            crate::workspace::quiescence(&self.pool, &root_session_id).await
+        })
+    }
+
     fn begin_mutation<'a>(
         &'a self,
         attempt_id: AttemptId,
@@ -2010,6 +2949,941 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
     }
 }
 
+async fn prepare_validation_call(
+    pool: &SqlitePool,
+    mut call: ValidationCall,
+) -> StoreResult<ValidationCall> {
+    let existing =
+        sqlx::query_scalar::<_, String>("SELECT body_json FROM validation_calls WHERE call_id = ?")
+            .bind(&call.call_id)
+            .fetch_optional(pool)
+            .await?
+            .map(|value| decode::<ValidationCall>(&value))
+            .transpose()?;
+    if let Some(existing) = existing {
+        if existing.attempt_id != call.attempt_id {
+            return Err(StoreError::ValidationCallOwnership {
+                call_ids: vec![call.call_id],
+            });
+        }
+        let retained_output_ref = call.evidence.retained_output_ref.clone();
+        let output_summary = call.evidence.output_summary.clone();
+        call.evidence = existing.evidence.clone();
+        if call.status.is_terminal() {
+            let context = validation_context(pool, call.attempt_id).await?;
+            let paths = if existing.evidence.covered_scopes.is_empty() {
+                existing
+                    .evidence
+                    .covered_manifest
+                    .iter()
+                    .map(|entry| entry.path.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                existing
+                    .evidence
+                    .covered_scopes
+                    .iter()
+                    .map(|scope| scope.path.clone())
+                    .collect::<Vec<_>>()
+            };
+            let current =
+                crate::workspace::capture_revision(pool, &context.repo_root, paths).await?;
+            let mut current = current;
+            let execution_current = if existing.status == crate::ValidationCallStatus::Running {
+                Some(
+                    crate::workspace::capture_revision(
+                        pool,
+                        &context.repo_root,
+                        vec![crate::workspace::REPOSITORY_WIDE_PATH.to_string()],
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            if let Some(execution_current) = &execution_current {
+                current.epoch = execution_current.epoch;
+            }
+            let execution_changes = execution_current
+                .as_ref()
+                .zip(existing.evidence.execution_snapshot.as_deref())
+                .filter(|(_, snapshot)| !snapshot.manifest_hash.is_empty())
+                .map(|(execution_current, snapshot)| {
+                    crate::workspace::changed_manifest_paths(
+                        &snapshot.manifest,
+                        &execution_current.files,
+                    )
+                })
+                .unwrap_or_default();
+            let stale_reason = if execution_changes.is_empty() {
+                validation_stale_reason(
+                    pool,
+                    &context.repo_root,
+                    &context.assignment,
+                    &existing,
+                    &current,
+                )
+                .await?
+            } else {
+                Some(format!(
+                    "repository contents changed while validation was running: {}",
+                    execution_changes.join(", ")
+                ))
+            };
+            call.evidence.end_epoch = Some(
+                execution_current
+                    .as_ref()
+                    .map_or(current.epoch, |revision| revision.epoch),
+            );
+            call.evidence.retained_output_ref =
+                retained_output_ref.or(existing.evidence.retained_output_ref);
+            call.evidence.output_summary = output_summary.or(existing.evidence.output_summary);
+            if let Some(reason) = stale_reason {
+                call.status = crate::ValidationCallStatus::Superseded;
+                call.evidence.stale_reason = Some(reason);
+            }
+        }
+        return Ok(call);
+    }
+
+    if call.proof_kind != crate::ValidationProofKind::Focused {
+        return Ok(call);
+    }
+    let context = validation_context(pool, call.attempt_id).await?;
+    let mut covered_scopes = context.assignment.write_scope.clone();
+    let mut covered_contracts = context.assignment.contract_claims.clone();
+    if covered_scopes.is_empty()
+        && let Some(relation) = &context.assignment.relation
+    {
+        for target in &relation.target_assignment_ids {
+            if let Some(body) = sqlx::query_scalar::<_, String>(
+                "SELECT body_json FROM assignments WHERE assignment_id = ?",
+            )
+            .bind(target.to_string())
+            .fetch_optional(pool)
+            .await?
+            {
+                let target: Assignment = decode(&body)?;
+                covered_scopes.extend(target.write_scope);
+                covered_contracts.extend(target.contract_claims);
+            }
+        }
+    }
+    covered_scopes.extend(repository_global_validation_scopes(&context.repo_root)?);
+    covered_scopes = merge_validation_scopes(covered_scopes);
+    let paths = covered_scopes
+        .iter()
+        .map(|scope| scope.path.clone())
+        .collect::<Vec<_>>();
+    covered_contracts.sort();
+    covered_contracts.dedup();
+    let revision = crate::workspace::capture_revision(pool, &context.repo_root, paths).await?;
+    let execution_revision = crate::workspace::capture_revision(
+        pool,
+        &context.repo_root,
+        vec![crate::workspace::REPOSITORY_WIDE_PATH.to_string()],
+    )
+    .await?;
+    let repository_wide = validation_is_repository_wide(&call.command_summary);
+    call.evidence = ValidationEvidence {
+        start_epoch: execution_revision.epoch,
+        end_epoch: None,
+        covered_scopes,
+        covered_manifest: revision.files,
+        execution_snapshot: Some(Box::new(crate::ValidationExecutionSnapshot {
+            manifest: execution_revision.files,
+            manifest_hash: execution_revision.manifest_hash,
+        })),
+        covered_contracts,
+        manifest_hash: revision.manifest_hash,
+        repository_wide,
+        cwd: call
+            .evidence
+            .cwd
+            .or_else(|| Some(context.repo_root.to_string_lossy().into_owned())),
+        environment_hash: call.evidence.environment_hash,
+        toolchain: call.evidence.toolchain,
+        retained_output_ref: call.evidence.retained_output_ref,
+        output_summary: call.evidence.output_summary,
+        lease_expires_at: call
+            .evidence
+            .lease_expires_at
+            .or_else(|| Some(Utc::now() + chrono::Duration::minutes(15))),
+        shared_from_call_id: None,
+        stale_reason: None,
+    };
+    Ok(call)
+}
+
+async fn claim_isolated_handoffs_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment: &Assignment,
+) -> StoreResult<()> {
+    let Some(relation) = assignment.relation.as_ref() else {
+        return Ok(());
+    };
+    if assignment.role != AgentRole::Integrator || relation.kind != RelationKind::Integration {
+        return Ok(());
+    }
+    for target in &relation.target_assignment_ids {
+        let target_body = sqlx::query_scalar::<_, String>(
+            "SELECT body_json FROM assignments WHERE assignment_id = ?",
+        )
+        .bind(target.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or(StoreError::AssignmentNotFound(*target))?;
+        let target_assignment: Assignment = decode(&target_body)?;
+        if target_assignment.workspace_strategy != WorkspaceStrategy::Isolated {
+            continue;
+        }
+        let handoff = sqlx::query(
+            "SELECT state, integrator_assignment_id
+             FROM isolated_handoffs WHERE assignment_id = ?",
+        )
+        .bind(target.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| {
+            StoreError::InvalidAssignment(format!(
+                "isolated dependency {target} has no versioned handoff"
+            ))
+        })?;
+        let state: IsolationHandoffState = decode(handoff.get::<String, _>("state").as_str())?;
+        let claimed_by = handoff.get::<Option<String>, _>("integrator_assignment_id");
+        if state != IsolationHandoffState::Ready || claimed_by.is_some() {
+            return Err(StoreError::InvalidAssignment(format!(
+                "isolated handoff {target} is already claimed or integrated"
+            )));
+        }
+        let updated = sqlx::query(
+            "UPDATE isolated_handoffs
+             SET state = ?, integrator_assignment_id = ?
+             WHERE assignment_id = ? AND state = ? AND integrator_assignment_id IS NULL",
+        )
+        .bind(encode(&IsolationHandoffState::Claimed)?)
+        .bind(assignment.assignment_id.to_string())
+        .bind(target.to_string())
+        .bind(encode(&IsolationHandoffState::Ready)?)
+        .execute(&mut **transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::InvalidAssignment(format!(
+                "isolated handoff {target} changed while the integrator was being created"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn persist_receipt_handoff_action_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    action: ReceiptHandoffAction,
+) -> StoreResult<()> {
+    match action {
+        ReceiptHandoffAction::Publish(handoff) => {
+            sqlx::query(
+                "INSERT INTO isolated_handoffs (
+                    assignment_id, source_workspace_id, source_epoch,
+                    source_manifest_hash, covered_manifest_json, state,
+                    integrator_assignment_id, created_at, integrated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL)
+                 ON CONFLICT(assignment_id) DO UPDATE SET
+                    source_workspace_id = excluded.source_workspace_id,
+                    source_epoch = excluded.source_epoch,
+                    source_manifest_hash = excluded.source_manifest_hash,
+                    covered_manifest_json = excluded.covered_manifest_json,
+                    state = excluded.state,
+                    integrator_assignment_id = NULL,
+                    created_at = excluded.created_at,
+                    integrated_at = NULL",
+            )
+            .bind(handoff.assignment_id.to_string())
+            .bind(&handoff.source_workspace_id)
+            .bind(handoff.source_epoch as i64)
+            .bind(&handoff.source_manifest_hash)
+            .bind(encode(&handoff.covered_manifest)?)
+            .bind(encode(&IsolationHandoffState::Ready)?)
+            .bind(encode(&handoff.created_at)?)
+            .execute(&mut **transaction)
+            .await?;
+        }
+        ReceiptHandoffAction::Integrate(targets) => {
+            let integrated_at = Utc::now();
+            for target in targets {
+                let updated = sqlx::query(
+                    "UPDATE isolated_handoffs
+                     SET state = ?, integrated_at = ?
+                     WHERE assignment_id = ? AND state = ?",
+                )
+                .bind(encode(&IsolationHandoffState::Integrated)?)
+                .bind(encode(&integrated_at)?)
+                .bind(target.to_string())
+                .bind(encode(&IsolationHandoffState::Claimed)?)
+                .execute(&mut **transaction)
+                .await?;
+                if updated.rows_affected() != 1 {
+                    return Err(StoreError::InvalidAssignment(format!(
+                        "isolated handoff {target} changed before integration sealed"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+struct ValidationContext {
+    assignment: Assignment,
+    repo_root: PathBuf,
+}
+
+async fn assignment_receipt_validation_ids(
+    pool: &SqlitePool,
+    assignment_id: AssignmentId,
+) -> StoreResult<Option<(AttemptId, Vec<String>)>> {
+    let row = sqlx::query(
+        "SELECT receipts.attempt_id, receipts.body_json
+         FROM receipts
+         JOIN attempts USING (attempt_id)
+         WHERE receipts.assignment_id = ?
+         ORDER BY attempts.ordinal DESC
+         LIMIT 1",
+    )
+    .bind(assignment_id.to_string())
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let receipt: AgentReceipt = decode(&row.get::<String, _>("body_json"))?;
+    Ok(Some((
+        AttemptId::parse(&row.get::<String, _>("attempt_id"))?,
+        receipt.validation_call_ids,
+    )))
+}
+
+async fn validation_context(
+    pool: &SqlitePool,
+    attempt_id: AttemptId,
+) -> StoreResult<ValidationContext> {
+    let row = sqlx::query(
+        "SELECT assignments.body_json, assignment_repositories.canonical_root,
+                assignment_repositories.repository_id, assignment_repositories.workspace_id
+         FROM attempts
+         JOIN assignments USING (assignment_id)
+         JOIN assignment_repositories USING (assignment_id)
+         WHERE attempts.attempt_id = ?",
+    )
+    .bind(attempt_id.to_string())
+    .fetch_optional(pool)
+    .await?
+    .ok_or(StoreError::AttemptNotFound(attempt_id))?;
+    let mut assignment: Assignment = decode(&row.get::<String, _>("body_json"))?;
+    assignment.repository_id = row.get("repository_id");
+    assignment.workspace_id = row.get("workspace_id");
+    Ok(ValidationContext {
+        assignment,
+        repo_root: PathBuf::from(row.get::<String, _>("canonical_root")),
+    })
+}
+
+async fn supersede_stale_receipt_validations_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment: &Assignment,
+    attempt: &Attempt,
+) -> StoreResult<Vec<String>> {
+    let receipt = sqlx::query_scalar::<_, String>(
+        "SELECT body_json FROM receipts WHERE assignment_id = ? AND attempt_id = ?",
+    )
+    .bind(assignment.assignment_id.to_string())
+    .bind(attempt.attempt_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .map(|body| decode::<AgentReceipt>(&body))
+    .transpose()?;
+    let Some(receipt) = receipt.filter(|receipt| receipt.status.is_success()) else {
+        return Ok(Vec::new());
+    };
+
+    let mut stale_call_ids = Vec::new();
+    for call_id in &receipt.validation_call_ids {
+        let row = sqlx::query(
+            "SELECT body_json, status FROM validation_calls
+             WHERE call_id = ? AND attempt_id = ?",
+        )
+        .bind(call_id)
+        .bind(attempt.attempt_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?
+        .ok_or_else(|| {
+            StoreError::CorruptData(format!(
+                "sealed receipt references missing validation call {call_id}"
+            ))
+        })?;
+        let call: ValidationCall = decode(&row.get::<String, _>("body_json"))?;
+        let stored_status: crate::ValidationCallStatus = decode(&row.get::<String, _>("status"))?;
+        if call.status != stored_status || call.attempt_id != attempt.attempt_id {
+            return Err(StoreError::CorruptData(format!(
+                "validation call {call_id} has inconsistent persisted identity or status"
+            )));
+        }
+        if call.status == crate::ValidationCallStatus::Superseded {
+            stale_call_ids.push(call_id.clone());
+            continue;
+        }
+        if call.status != crate::ValidationCallStatus::Succeeded {
+            return Err(StoreError::ValidationCallStatusInvalid {
+                call_ids: vec![call_id.clone()],
+            });
+        }
+        let Some((reason, current_epoch)) =
+            validation_stale_event_reason_tx(transaction, assignment, &call).await?
+        else {
+            continue;
+        };
+        let mut superseded = call;
+        superseded.status = crate::ValidationCallStatus::Superseded;
+        superseded.evidence.end_epoch = Some(current_epoch);
+        superseded.evidence.stale_reason = Some(reason.clone());
+        superseded.recorded_at = Utc::now();
+        let updated = sqlx::query(
+            "UPDATE validation_calls
+             SET body_json = ?, status = ?, recorded_at = ?
+             WHERE call_id = ? AND attempt_id = ? AND status = ?",
+        )
+        .bind(encode(&superseded)?)
+        .bind(encode(&superseded.status)?)
+        .bind(encode(&superseded.recorded_at)?)
+        .bind(call_id)
+        .bind(attempt.attempt_id.to_string())
+        .bind(encode(&crate::ValidationCallStatus::Succeeded)?)
+        .execute(&mut **transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(StoreError::ValidationCallImmutable(call_id.clone()));
+        }
+        record_stale_event_tx(transaction, attempt, current_epoch, &reason).await?;
+        stale_call_ids.push(call_id.clone());
+    }
+    Ok(stale_call_ids)
+}
+
+async fn validation_stale_reason(
+    pool: &SqlitePool,
+    repo_root: &Path,
+    assignment: &Assignment,
+    call: &ValidationCall,
+    current: &WorkspaceRevision,
+) -> StoreResult<Option<String>> {
+    if call.evidence.repository_wide && current.epoch != call.evidence.start_epoch {
+        return Ok(Some(format!(
+            "repository-wide validation started at epoch {} but workspace is at epoch {}",
+            call.evidence.start_epoch, current.epoch
+        )));
+    }
+    if !call.evidence.covered_scopes.is_empty() {
+        let newly_global = repository_global_validation_scopes(repo_root)?
+            .into_iter()
+            .filter(|current_scope| {
+                !call
+                    .evidence
+                    .covered_scopes
+                    .iter()
+                    .any(|covered| covered.covers_scope(current_scope))
+            })
+            .map(|scope| scope.path)
+            .collect::<Vec<_>>();
+        if !newly_global.is_empty() {
+            return Ok(Some(format!(
+                "repository-wide schema, lockfile, or build configuration appeared: {}",
+                newly_global.join(", ")
+            )));
+        }
+    }
+    let changed =
+        crate::workspace::changed_manifest_paths(&call.evidence.covered_manifest, &current.files);
+    if !changed.is_empty() {
+        return Ok(Some(format!(
+            "covered validation inputs changed: {}",
+            changed.join(", ")
+        )));
+    }
+    if current.epoch > call.evidence.start_epoch {
+        let rows = sqlx::query(
+            "SELECT epoch, paths_json, contracts_json FROM workspace_events
+             WHERE workspace_id = ? AND epoch > ? AND epoch <= ? ORDER BY epoch",
+        )
+        .bind(&assignment.workspace_id)
+        .bind(call.evidence.start_epoch as i64)
+        .bind(current.epoch as i64)
+        .fetch_all(pool)
+        .await?;
+        let mut expected_epoch = call.evidence.start_epoch + 1;
+        for row in rows {
+            let event_epoch = u64::try_from(row.get::<i64, _>("epoch")).map_err(|_| {
+                StoreError::CorruptData("workspace event epoch is negative".to_string())
+            })?;
+            if event_epoch != expected_epoch {
+                return Ok(Some(format!(
+                    "workspace event coverage is incomplete after validation epoch {}",
+                    call.evidence.start_epoch
+                )));
+            }
+            expected_epoch += 1;
+            let paths: Vec<String> = decode(&row.get::<String, _>("paths_json"))?;
+            let path_overlap = paths
+                .into_iter()
+                .filter(|path| validation_event_affects_path(&call.evidence, path))
+                .collect::<Vec<_>>();
+            let contracts: Vec<String> = decode(&row.get::<String, _>("contracts_json"))?;
+            let contract_overlap = contracts
+                .into_iter()
+                .filter(|contract| call.evidence.covered_contracts.contains(contract))
+                .collect::<Vec<_>>();
+            if !path_overlap.is_empty() || !contract_overlap.is_empty() {
+                let mut changes = Vec::new();
+                if !path_overlap.is_empty() {
+                    changes.push(format!("paths {}", path_overlap.join(", ")));
+                }
+                if !contract_overlap.is_empty() {
+                    changes.push(format!("contracts {}", contract_overlap.join(", ")));
+                }
+                return Ok(Some(format!(
+                    "workspace event at epoch {event_epoch} changed covered {}",
+                    changes.join(" and ")
+                )));
+            }
+        }
+        if expected_epoch <= current.epoch {
+            return Ok(Some(format!(
+                "workspace event coverage ends at epoch {} but workspace is at epoch {}",
+                expected_epoch - 1,
+                current.epoch
+            )));
+        }
+    }
+    Ok(None)
+}
+
+async fn validation_stale_event_reason_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment: &Assignment,
+    call: &ValidationCall,
+) -> StoreResult<Option<(String, u64)>> {
+    let current_epoch = assignment_epoch_tx(transaction, assignment.assignment_id).await?;
+    let evidence_epoch = call.evidence.end_epoch.unwrap_or(call.evidence.start_epoch);
+    if current_epoch < evidence_epoch {
+        return Ok(Some((
+            format!(
+                "workspace epoch regressed from evidence epoch {evidence_epoch} to {current_epoch}"
+            ),
+            current_epoch,
+        )));
+    }
+    if current_epoch == evidence_epoch {
+        return Ok(None);
+    }
+    if call.evidence.repository_wide {
+        return Ok(Some((
+            format!(
+                "repository-wide validation ended at epoch {evidence_epoch} but workspace is at epoch {current_epoch}"
+            ),
+            current_epoch,
+        )));
+    }
+
+    let rows = sqlx::query(
+        "SELECT epoch, paths_json, contracts_json FROM workspace_events
+         WHERE workspace_id = ? AND epoch > ? ORDER BY epoch",
+    )
+    .bind(&assignment.workspace_id)
+    .bind(evidence_epoch as i64)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut expected_epoch = evidence_epoch + 1;
+    for row in rows {
+        let event_epoch = u64::try_from(row.get::<i64, _>("epoch")).map_err(|_| {
+            StoreError::CorruptData("workspace event epoch is negative".to_string())
+        })?;
+        if event_epoch != expected_epoch {
+            return Ok(Some((
+                format!(
+                    "workspace event coverage is incomplete after evidence epoch {evidence_epoch}"
+                ),
+                current_epoch,
+            )));
+        }
+        expected_epoch += 1;
+
+        let event_paths: Vec<String> = decode(&row.get::<String, _>("paths_json"))?;
+        let changed_paths = event_paths
+            .into_iter()
+            .filter(|path| validation_event_affects_path(&call.evidence, path))
+            .collect::<Vec<_>>();
+        let event_contracts: Vec<String> = decode(&row.get::<String, _>("contracts_json"))?;
+        let changed_contracts = event_contracts
+            .into_iter()
+            .filter(|contract| call.evidence.covered_contracts.contains(contract))
+            .collect::<Vec<_>>();
+        if !changed_paths.is_empty() || !changed_contracts.is_empty() {
+            let mut changes = Vec::new();
+            if !changed_paths.is_empty() {
+                changes.push(format!("paths {}", changed_paths.join(", ")));
+            }
+            if !changed_contracts.is_empty() {
+                changes.push(format!("contracts {}", changed_contracts.join(", ")));
+            }
+            return Ok(Some((
+                format!(
+                    "workspace event at epoch {event_epoch} changed covered {}",
+                    changes.join(" and ")
+                ),
+                current_epoch,
+            )));
+        }
+    }
+    if expected_epoch <= current_epoch {
+        return Ok(Some((
+            format!(
+                "workspace event coverage ends at epoch {} but workspace is at epoch {current_epoch}",
+                expected_epoch - 1
+            ),
+            current_epoch,
+        )));
+    }
+    Ok(None)
+}
+
+fn validation_event_affects_path(evidence: &ValidationEvidence, path: &str) -> bool {
+    if path == crate::REPOSITORY_WIDE_PATH || validation_event_is_repository_global(path) {
+        return true;
+    }
+    let event_scope = RepoScope {
+        path: path.to_string(),
+        recursive: true,
+    };
+    if !evidence.covered_scopes.is_empty() {
+        return evidence
+            .covered_scopes
+            .iter()
+            .any(|scope| event_scope.overlaps(scope));
+    }
+    evidence.covered_manifest.iter().any(|entry| {
+        event_scope.overlaps(&RepoScope {
+            path: entry.path.clone(),
+            recursive: false,
+        })
+    })
+}
+
+fn validation_event_is_repository_global(path: &str) -> bool {
+    if is_repository_global_validation_file(Path::new(path)) {
+        return true;
+    }
+    let path = if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    };
+    [
+        "codex-rs/app-server-protocol/schema",
+        "codex-rs/hooks/schema/generated",
+    ]
+    .iter()
+    .any(|directory| path == *directory || path.starts_with(&format!("{directory}/")))
+}
+
+fn validation_is_repository_wide(command: &str) -> bool {
+    let command = command.to_ascii_lowercase();
+    [
+        "--workspace",
+        "--all-targets",
+        "schema-protocol-check",
+        "cargo test --all",
+        "cargo check --all",
+        "cargo nextest run --all",
+    ]
+    .iter()
+    .any(|needle| command.contains(needle))
+}
+
+fn merge_validation_scopes(scopes: Vec<RepoScope>) -> Vec<RepoScope> {
+    let mut merged = HashMap::<String, RepoScope>::new();
+    for scope in scopes {
+        let key = if cfg!(windows) {
+            scope.path.to_lowercase()
+        } else {
+            scope.path.clone()
+        };
+        merged
+            .entry(key)
+            .and_modify(|existing| existing.recursive |= scope.recursive)
+            .or_insert(scope);
+    }
+    let mut scopes = merged.into_values().collect::<Vec<_>>();
+    scopes.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.recursive.cmp(&right.recursive))
+    });
+    scopes
+}
+
+fn repository_global_validation_scopes(repo_root: &Path) -> StoreResult<Vec<RepoScope>> {
+    let mut scopes = Vec::new();
+    collect_repository_global_validation_files(repo_root, repo_root, &mut scopes)?;
+    for schema_dir in [
+        "codex-rs/app-server-protocol/schema",
+        "codex-rs/hooks/schema/generated",
+    ] {
+        if repo_root.join(schema_dir).is_dir() {
+            scopes.push(RepoScope {
+                path: schema_dir.to_string(),
+                recursive: true,
+            });
+        }
+    }
+    Ok(merge_validation_scopes(scopes))
+}
+
+fn collect_repository_global_validation_files(
+    repo_root: &Path,
+    directory: &Path,
+    scopes: &mut Vec<RepoScope>,
+) -> StoreResult<()> {
+    let mut directories = vec![directory.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let mut entries = std::fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+                if name == ".git"
+                    || name == "node_modules"
+                    || name == ".venv"
+                    || name == "venv"
+                    || name == "dist"
+                    || name == "build"
+                    || name.starts_with("target")
+                {
+                    continue;
+                }
+                directories.push(path);
+            } else if file_type.is_file() && is_repository_global_validation_file(&path) {
+                let relative = path.strip_prefix(repo_root).map_err(|_| {
+                    StoreError::InvalidScope(format!(
+                        "global validation input escaped repository root: {}",
+                        path.display()
+                    ))
+                })?;
+                scopes.push(RepoScope {
+                    path: relative
+                        .components()
+                        .map(|component| component.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                    recursive: false,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_repository_global_validation_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "cargo.toml"
+            | "cargo.lock"
+            | "package.json"
+            | "package-lock.json"
+            | "pnpm-lock.yaml"
+            | "pnpm-workspace.yaml"
+            | "yarn.lock"
+            | "pyproject.toml"
+            | "uv.lock"
+            | "rust-toolchain"
+            | "rust-toolchain.toml"
+            | "justfile"
+            | "makefile"
+            | "build.rs"
+            | "build.bazel"
+            | "module.bazel"
+            | ".bazelrc"
+            | "deno.json"
+            | "tsconfig.json"
+    ) || name.ends_with(".schema.json")
+        || name.ends_with("-lock.json")
+        || name.ends_with("-lock.yaml")
+        || name.ends_with("-lock.yml")
+        || name == "config.toml"
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|parent| parent.eq_ignore_ascii_case(".cargo"))
+}
+
+fn validation_fingerprint(call: &ValidationCall) -> StoreResult<String> {
+    #[derive(Serialize)]
+    struct Fingerprint<'a> {
+        start_epoch: u64,
+        command: &'a str,
+        executable: &'a Option<String>,
+        cwd: &'a Option<String>,
+        environment_hash: &'a Option<String>,
+        toolchain: &'a Option<String>,
+        manifest_hash: &'a str,
+    }
+    let payload = encode(&Fingerprint {
+        start_epoch: call.evidence.start_epoch,
+        command: &call.command_summary,
+        executable: &call.resolved_executable,
+        cwd: &call.evidence.cwd,
+        environment_hash: &call.evidence.environment_hash,
+        toolchain: &call.evidence.toolchain,
+        manifest_hash: &call.evidence.manifest_hash,
+    })?;
+    Ok(format!("{:x}", Sha256::digest(payload.as_bytes())))
+}
+
+async fn assignment_workspace_id_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment_id: AssignmentId,
+) -> StoreResult<String> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT workspace_id FROM assignment_repositories WHERE assignment_id = ?",
+    )
+    .bind(assignment_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(StoreError::RepositoryBindingMissing(assignment_id))
+}
+
+async fn reserve_reconciliation_validation_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attempt: &Attempt,
+    call_id: &str,
+) -> StoreResult<bool> {
+    let row = sqlx::query(
+        "SELECT stale_events, reconciliation_call_id FROM stale_recovery WHERE attempt_id = ?",
+    )
+    .bind(attempt.attempt_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    if row.get::<i64, _>("stale_events") == 0 {
+        return Ok(false);
+    }
+    if let Some(existing) = row.get::<Option<String>, _>("reconciliation_call_id") {
+        if existing != call_id {
+            pause_active_attempt_for_stale_recovery_tx(transaction, attempt).await?;
+            release_claim(transaction, attempt.assignment_id, None).await?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    sqlx::query(
+        "UPDATE stale_recovery SET reconciliation_call_id = ?, updated_at = ?
+         WHERE attempt_id = ? AND reconciliation_call_id IS NULL",
+    )
+    .bind(call_id)
+    .bind(encode(&Utc::now())?)
+    .bind(attempt.attempt_id.to_string())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(false)
+}
+
+async fn record_stale_event_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attempt: &Attempt,
+    stale_epoch: u64,
+    reason: &str,
+) -> StoreResult<()> {
+    let existing = sqlx::query(
+        "SELECT stale_events, last_stale_epoch FROM stale_recovery WHERE attempt_id = ?",
+    )
+    .bind(attempt.attempt_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    if existing.as_ref().and_then(|row| {
+        row.get::<Option<i64>, _>("last_stale_epoch")
+            .and_then(|value| u64::try_from(value).ok())
+    }) == Some(stale_epoch)
+    {
+        sqlx::query(
+            "UPDATE stale_recovery SET last_reason = ?, updated_at = ? WHERE attempt_id = ?",
+        )
+        .bind(reason)
+        .bind(encode(&Utc::now())?)
+        .bind(attempt.attempt_id.to_string())
+        .execute(&mut **transaction)
+        .await?;
+        return Ok(());
+    }
+    let existing_count = existing
+        .as_ref()
+        .map(|row| row.get::<i64, _>("stale_events"))
+        .unwrap_or(0);
+    let stale_events = (existing_count + 1).min(2);
+    sqlx::query(
+        "INSERT INTO stale_recovery (
+            attempt_id, stale_events, reconciliation_call_id, last_stale_epoch,
+            last_reason, updated_at
+         ) VALUES (?, ?, NULL, ?, ?, ?)
+         ON CONFLICT(attempt_id) DO UPDATE SET
+            stale_events = excluded.stale_events,
+            reconciliation_call_id = NULL,
+            last_stale_epoch = excluded.last_stale_epoch,
+            last_reason = excluded.last_reason,
+            updated_at = excluded.updated_at",
+    )
+    .bind(attempt.attempt_id.to_string())
+    .bind(stale_events)
+    .bind(stale_epoch as i64)
+    .bind(reason)
+    .bind(encode(&Utc::now())?)
+    .execute(&mut **transaction)
+    .await?;
+    if stale_events >= 2 && attempt.state == AttemptState::Active && attempt.sealed_at.is_none() {
+        pause_active_attempt_for_stale_recovery_tx(transaction, attempt).await?;
+        release_claim(transaction, attempt.assignment_id, None).await?;
+    }
+    Ok(())
+}
+
+async fn pause_active_attempt_for_stale_recovery_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    attempt: &Attempt,
+) -> StoreResult<()> {
+    let now = Utc::now();
+    let updated = sqlx::query(
+        "UPDATE attempts SET state = ?, sealed_at = ?
+         WHERE attempt_id = ? AND state = ? AND sealed_at IS NULL",
+    )
+    .bind(encode(&AttemptState::NeedsMain)?)
+    .bind(encode(&now)?)
+    .bind(attempt.attempt_id.to_string())
+    .bind(encode(&AttemptState::Active)?)
+    .execute(&mut **transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(StoreError::InvalidAssignment(
+            "stale-evidence escalation requires an active unsealed attempt".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 async fn lock_attempt_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     attempt_id: AttemptId,
@@ -2042,7 +3916,7 @@ async fn load_assignment_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment_id: AssignmentId,
 ) -> StoreResult<Assignment> {
-    let row = sqlx::query("SELECT a.root_session_id, a.body_json, ar.repository_id FROM assignments a LEFT JOIN assignment_repositories ar ON ar.assignment_id = a.assignment_id WHERE a.assignment_id = ?")
+    let row = sqlx::query("SELECT a.root_session_id, a.body_json, ar.repository_id, ar.workspace_id FROM assignments a LEFT JOIN assignment_repositories ar ON ar.assignment_id = a.assignment_id WHERE a.assignment_id = ?")
         .bind(assignment_id.to_string())
         .fetch_optional(&mut **transaction)
         .await?
@@ -2058,8 +3932,13 @@ async fn load_assignment_tx(
             "assignment root session does not match {assignment_id}"
         )));
     }
-    if let Some(bound_repository_id) = row.get::<Option<String>, _>("repository_id") {
-        if assignment.repository_id.is_empty() {
+    let bound_repository_id = row.get::<Option<String>, _>("repository_id");
+    let bound_workspace_id = row.get::<Option<String>, _>("workspace_id");
+    if let Some(bound_repository_id) = bound_repository_id {
+        let legacy_body_identity = bound_workspace_id
+            .as_deref()
+            .is_some_and(|workspace_id| assignment.repository_id == workspace_id);
+        if assignment.repository_id.is_empty() || legacy_body_identity {
             assignment.repository_id = bound_repository_id;
         } else if assignment.repository_id != bound_repository_id {
             return Err(StoreError::CorruptData(format!(
@@ -2067,7 +3946,93 @@ async fn load_assignment_tx(
             )));
         }
     }
+    if let Some(bound_workspace_id) = bound_workspace_id {
+        if assignment.workspace_id.is_empty() {
+            assignment.workspace_id = bound_workspace_id;
+        } else if assignment.workspace_id != bound_workspace_id {
+            return Err(StoreError::CorruptData(format!(
+                "assignment workspace identity does not match {assignment_id}"
+            )));
+        }
+    }
     Ok(assignment)
+}
+
+async fn upgrade_legacy_repository_bindings(pool: &SqlitePool) -> StoreResult<()> {
+    let rows = sqlx::query(
+        "SELECT assignment_id, repository_id, workspace_id, canonical_root
+         FROM assignment_repositories
+         WHERE repository_id = workspace_id
+         ORDER BY assignment_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    for row in rows {
+        let assignment_id = row.get::<String, _>("assignment_id");
+        let legacy_repository_id = row.get::<String, _>("repository_id");
+        let workspace_id = row.get::<String, _>("workspace_id");
+        let canonical_root = row.get::<String, _>("canonical_root");
+        let repository = match repository_identity(Path::new(&canonical_root)) {
+            Ok(repository) => repository,
+            Err(StoreError::InvalidScope(_)) => continue,
+            Err(error) => return Err(error),
+        };
+        if repository.workspace_id != workspace_id {
+            return Err(StoreError::CorruptData(format!(
+                "legacy workspace identity does not match assignment {assignment_id}"
+            )));
+        }
+        if repository.id == legacy_repository_id {
+            continue;
+        }
+        let now = Utc::now();
+        let mut transaction = pool.begin().await?;
+        let binding_update = sqlx::query(
+            "UPDATE assignment_repositories
+             SET repository_id = ?
+             WHERE assignment_id = ? AND repository_id = ? AND workspace_id = ?",
+        )
+        .bind(&repository.id)
+        .bind(&assignment_id)
+        .bind(&legacy_repository_id)
+        .bind(&workspace_id)
+        .execute(&mut *transaction)
+        .await?;
+        if binding_update.rows_affected() != 1 {
+            return Err(StoreError::CorruptData(format!(
+                "legacy repository binding changed during upgrade for assignment {assignment_id}"
+            )));
+        }
+        sqlx::query(
+            "UPDATE workspace_repositories
+             SET repository_id = ?, updated_at = ?
+             WHERE workspace_id = ? AND repository_id = ?",
+        )
+        .bind(&repository.id)
+        .bind(encode(&now)?)
+        .bind(&workspace_id)
+        .bind(&legacy_repository_id)
+        .execute(&mut *transaction)
+        .await?;
+        let workspace_repository_id = sqlx::query_scalar::<_, String>(
+            "SELECT repository_id FROM workspace_repositories WHERE workspace_id = ?",
+        )
+        .bind(&workspace_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| {
+            StoreError::CorruptData(format!(
+                "legacy workspace binding is missing for assignment {assignment_id}"
+            ))
+        })?;
+        if workspace_repository_id != repository.id {
+            return Err(StoreError::CorruptData(format!(
+                "legacy workspace lineage does not match assignment {assignment_id}"
+            )));
+        }
+        transaction.commit().await?;
+    }
+    Ok(())
 }
 
 async fn load_attempt_tx(
@@ -2352,12 +4317,14 @@ async fn insert_risk_review_gates_tx(
     }
 
     let now = Utc::now();
+    let evidence_epoch = assignment_epoch_tx(transaction, assignment_id).await?;
     let risk_gate = AgentGate {
         assignment_id,
         kind: GateKind::Risk,
         status: GateStatus::Passed,
         reason: review_reason.to_string(),
         waiver_reason: None,
+        evidence_epoch,
         updated_at: now,
         sealed_at: Some(now),
     };
@@ -2420,6 +4387,7 @@ async fn insert_risk_review_gates_tx(
         status: GateStatus::Pending,
         reason: review_reason.to_string(),
         waiver_reason: None,
+        evidence_epoch,
         updated_at: now,
         sealed_at: None,
     };
@@ -2510,12 +4478,14 @@ async fn ensure_pending_verification_for_risk_review_tx(
     }
 
     let now = Utc::now();
+    let evidence_epoch = assignment_epoch_tx(transaction, assignment_id).await?;
     let gate = AgentGate {
         assignment_id,
         kind: GateKind::Verification,
         status: GateStatus::Pending,
         reason: "independent verification required after risk-gated cold review".to_string(),
         waiver_reason: None,
+        evidence_epoch,
         updated_at: now,
         sealed_at: None,
     };
@@ -2585,6 +4555,76 @@ async fn validate_completed_mutation_evidence_tx(
     Ok(())
 }
 
+async fn workspace_mutation_claim_conflicts_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment: &Assignment,
+) -> StoreResult<Vec<String>> {
+    let rows = sqlx::query(
+        "SELECT actor_id, paths_json, contracts_json
+         FROM workspace_mutation_leases
+         WHERE workspace_id = ? AND state = 'active' AND expires_at >= ?",
+    )
+    .bind(&assignment.workspace_id)
+    .bind(encode(&Utc::now())?)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut conflicts = BTreeSet::new();
+    for row in rows {
+        let actor_id = row.get::<String, _>("actor_id");
+        let paths: Vec<String> = decode(&row.get::<String, _>("paths_json"))?;
+        let contracts: Vec<String> = decode(&row.get::<String, _>("contracts_json"))?;
+        for path in &paths {
+            if assignment
+                .write_scope
+                .iter()
+                .any(|scope| mutation_path_overlaps_scope(path, scope))
+            {
+                conflicts.insert(format!(
+                    "active mutation path {path} held by {actor_id} overlaps the requested write scope"
+                ));
+            }
+        }
+        let contract_overlap = assignment
+            .contract_claims
+            .iter()
+            .filter(|contract| contracts.contains(contract))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !contract_overlap.is_empty() {
+            conflicts.insert(format!(
+                "active mutation held by {actor_id} overlaps contracts {}",
+                contract_overlap.join(", ")
+            ));
+        } else if paths.iter().any(|path| path == crate::REPOSITORY_WIDE_PATH)
+            && !assignment.contract_claims.is_empty()
+        {
+            conflicts.insert(format!(
+                "repository-wide mutation held by {actor_id} overlaps requested contract claims"
+            ));
+        }
+    }
+    Ok(conflicts.into_iter().collect())
+}
+
+fn mutation_path_overlaps_scope(path: &str, scope: &RepoScope) -> bool {
+    if path == crate::REPOSITORY_WIDE_PATH {
+        return true;
+    }
+    let path = if cfg!(windows) {
+        path.to_lowercase()
+    } else {
+        path.to_string()
+    };
+    let scope_path = if cfg!(windows) {
+        scope.path.to_lowercase()
+    } else {
+        scope.path.clone()
+    };
+    path == scope_path
+        || scope.recursive && path.starts_with(&format!("{scope_path}/"))
+        || scope_path.starts_with(&format!("{path}/"))
+}
+
 async fn plan_write_claim_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment: &Assignment,
@@ -2593,8 +4633,8 @@ async fn plan_write_claim_tx(
     if assignment.write_scope.is_empty() {
         return Ok((Vec::new(), Vec::new()));
     }
-    let bound_repository_id = sqlx::query_scalar::<_, String>(
-        "SELECT repository_id FROM assignment_repositories WHERE assignment_id = ?",
+    let binding = sqlx::query(
+        "SELECT repository_id, workspace_id FROM assignment_repositories WHERE assignment_id = ?",
     )
     .bind(assignment.assignment_id.to_string())
     .fetch_optional(&mut **transaction)
@@ -2602,7 +4642,12 @@ async fn plan_write_claim_tx(
     .ok_or(StoreError::RepositoryBindingMissing(
         assignment.assignment_id,
     ))?;
-    if assignment.repository_id.is_empty() || assignment.repository_id != bound_repository_id {
+    let bound_repository_id = binding.get::<String, _>("repository_id");
+    let bound_workspace_id = binding.get::<String, _>("workspace_id");
+    if assignment.repository_id.is_empty()
+        || assignment.repository_id != bound_repository_id
+        || assignment.workspace_id != bound_workspace_id
+    {
         return Err(StoreError::CorruptData(format!(
             "assignment repository identity does not match {}",
             assignment.assignment_id
@@ -2618,14 +4663,14 @@ async fn plan_write_claim_tx(
         HashSet::new()
     };
     let rows = if let Some(excluded) = exclude_assignment_id {
-        sqlx::query("SELECT wc.assignment_id, wc.scopes_json, ar.repository_id, ar.canonical_root FROM write_claims wc LEFT JOIN assignment_repositories ar ON ar.assignment_id = wc.assignment_id WHERE wc.active = 1 AND (ar.repository_id = ? OR ar.repository_id IS NULL) AND wc.assignment_id <> ?")
-            .bind(&bound_repository_id)
+        sqlx::query("SELECT wc.assignment_id, wc.scopes_json, ar.repository_id, ar.canonical_root FROM write_claims wc LEFT JOIN assignment_repositories ar ON ar.assignment_id = wc.assignment_id WHERE wc.active = 1 AND (ar.workspace_id = ? OR ar.workspace_id IS NULL) AND wc.assignment_id <> ?")
+            .bind(&bound_workspace_id)
             .bind(excluded.to_string())
             .fetch_all(&mut **transaction)
             .await?
     } else {
-        sqlx::query("SELECT wc.assignment_id, wc.scopes_json, ar.repository_id, ar.canonical_root FROM write_claims wc LEFT JOIN assignment_repositories ar ON ar.assignment_id = wc.assignment_id WHERE wc.active = 1 AND (ar.repository_id = ? OR ar.repository_id IS NULL)")
-            .bind(&bound_repository_id)
+        sqlx::query("SELECT wc.assignment_id, wc.scopes_json, ar.repository_id, ar.canonical_root FROM write_claims wc LEFT JOIN assignment_repositories ar ON ar.assignment_id = wc.assignment_id WHERE wc.active = 1 AND (ar.workspace_id = ? OR ar.workspace_id IS NULL)")
+            .bind(&bound_workspace_id)
             .fetch_all(&mut **transaction)
             .await?
     };
@@ -2695,7 +4740,7 @@ async fn require_repository_identity_tx(
     repository: &RepositoryIdentity,
 ) -> StoreResult<()> {
     let row = sqlx::query(
-        "SELECT repository_id, canonical_root FROM assignment_repositories WHERE assignment_id = ?",
+        "SELECT repository_id, workspace_id, canonical_root FROM assignment_repositories WHERE assignment_id = ?",
     )
     .bind(assignment.assignment_id.to_string())
     .fetch_optional(&mut **transaction)
@@ -2704,6 +4749,7 @@ async fn require_repository_identity_tx(
         assignment.assignment_id,
     ))?;
     let bound_id = row.get::<String, _>("repository_id");
+    let bound_workspace_id = row.get::<String, _>("workspace_id");
     let bound_root = row.get::<String, _>("canonical_root");
     let root_matches = if cfg!(windows) {
         bound_root.to_lowercase() == repository.canonical_path.to_lowercase()
@@ -2713,6 +4759,8 @@ async fn require_repository_identity_tx(
     if assignment.repository_id.is_empty()
         || assignment.repository_id != bound_id
         || repository.id != bound_id
+        || assignment.workspace_id != bound_workspace_id
+        || repository.workspace_id != bound_workspace_id
         || !root_matches
     {
         return Err(StoreError::RepositoryMismatch(assignment.assignment_id));
@@ -2798,6 +4846,8 @@ async fn load_mutation_evidence_tx(
         snapshot_retained: row.get::<i64, _>("snapshot_retained") != 0,
         first_observed_at: decode(row.get::<String, _>("first_observed_at").as_str())?,
         finalized_at,
+        start_epoch: 0,
+        end_epoch: None,
     })
 }
 
@@ -2862,6 +4912,31 @@ fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> StoreResult<AgentTaskBindi
         thread_id: row.get("thread_id"),
         bound_at: decode(row.get::<String, _>("bound_at").as_str())?,
         updated_at: decode(row.get::<String, _>("updated_at").as_str())?,
+    })
+}
+
+fn isolation_handoff_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+) -> StoreResult<crate::IsolationHandoff> {
+    Ok(crate::IsolationHandoff {
+        assignment_id: AssignmentId::parse(row.get::<String, _>("assignment_id").as_str())?,
+        source_workspace_id: row.get("source_workspace_id"),
+        source_repository_root: row.try_get("source_repository_root").ok(),
+        source_epoch: u64::try_from(row.get::<i64, _>("source_epoch")).map_err(|_| {
+            StoreError::CorruptData("isolated handoff source epoch is negative".to_string())
+        })?,
+        source_manifest_hash: row.get("source_manifest_hash"),
+        covered_manifest: decode(row.get::<String, _>("covered_manifest_json").as_str())?,
+        state: decode(row.get::<String, _>("state").as_str())?,
+        integrator_assignment_id: row
+            .get::<Option<String>, _>("integrator_assignment_id")
+            .map(|value| AssignmentId::parse(&value))
+            .transpose()?,
+        created_at: decode(row.get::<String, _>("created_at").as_str())?,
+        integrated_at: row
+            .get::<Option<String>, _>("integrated_at")
+            .map(|value| decode(&value))
+            .transpose()?,
     })
 }
 
@@ -3232,6 +5307,24 @@ async fn pending_gate_count(
     .await?)
 }
 
+async fn assignment_epoch_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    assignment_id: AssignmentId,
+) -> StoreResult<u64> {
+    let epoch = sqlx::query_scalar::<_, i64>(
+        "SELECT workspace_repositories.epoch
+         FROM assignment_repositories
+         JOIN workspace_repositories USING (workspace_id)
+         WHERE assignment_repositories.assignment_id = ?",
+    )
+    .bind(assignment_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?
+    .ok_or(StoreError::RepositoryBindingMissing(assignment_id))?;
+    u64::try_from(epoch)
+        .map_err(|_| StoreError::CorruptData("workspace epoch is negative".to_string()))
+}
+
 async fn release_claim(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment_id: AssignmentId,
@@ -3243,6 +5336,22 @@ async fn release_claim(
         .bind(assignment_id.to_string())
         .execute(&mut **transaction)
         .await?;
+    sqlx::query(
+        "UPDATE contract_claims SET active = 0, released_at = ?
+         WHERE assignment_id = ? AND active = 1",
+    )
+    .bind(encode(&Utc::now())?)
+    .bind(assignment_id.to_string())
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query(
+        "UPDATE workspace_actors SET state = 'terminal', last_progress_at = ?,
+         lease_expires_at = NULL WHERE assignment_id = ?",
+    )
+    .bind(encode(&Utc::now())?)
+    .bind(assignment_id.to_string())
+    .execute(&mut **transaction)
+    .await?;
     Ok(())
 }
 

@@ -1,5 +1,8 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use serde_json::Map;
+use serde_json::Value;
+use serde_json::json;
 
 use crate::function_tool::FunctionCallError;
 use crate::shell::Shell;
@@ -151,18 +154,110 @@ impl CommandInvocation {
         }
     }
 
-    pub(crate) fn with_updated_hook_command(
+    pub(crate) fn hook_input(&self) -> Value {
+        match self {
+            Self::Script(script) => json!({ "command": script }),
+            Self::Argv { program, args } => json!({
+                "command": self.display_command(),
+                "kind": "argv",
+                "program": program,
+                "args": args,
+            }),
+            Self::PowerShellScript(script_body) => json!({
+                "command": script_body,
+                "kind": "powershell_script",
+                "script_body": script_body,
+            }),
+        }
+    }
+
+    pub(crate) fn with_updated_hook_input(
         &self,
         tool_name: &str,
-        updated_command: &str,
+        updated_input: &Value,
     ) -> Result<Self, FunctionCallError> {
+        let Value::Object(updated_input) = updated_input else {
+            return Err(FunctionCallError::RespondToModel(
+                "hook returned updatedInput that is not an object".to_string(),
+            ));
+        };
+        let command = optional_string(updated_input, "command")?;
+        let kind = optional_string(updated_input, "kind")?;
+        let program = optional_string(updated_input, "program")?;
+        let args = optional_string_array(updated_input, "args")?;
+        let script_body = optional_string(updated_input, "script_body")?;
+
         match self {
-            Self::Script(_) => Ok(Self::Script(updated_command.to_string())),
-            Self::PowerShellScript(_) => Ok(Self::PowerShellScript(updated_command.to_string())),
-            Self::Argv { .. } if updated_command == self.display_command() => Ok(self.clone()),
-            Self::Argv { .. } => Err(FunctionCallError::RespondToModel(format!(
-                "{tool_name} hook cannot rewrite a direct argv command as text because that would lose structured `program`/`args`; return the original `command` value or block the tool call instead."
-            ))),
+            Self::Script(_) => {
+                if !matches!(kind, None | Some("legacy" | "script"))
+                    || program.is_some()
+                    || args.is_some()
+                    || script_body.is_some()
+                {
+                    return Err(shape_change_error(tool_name, "script"));
+                }
+                let command = command.ok_or_else(missing_updated_command)?;
+                Ok(Self::Script(command.to_string()))
+            }
+            Self::PowerShellScript(_) => {
+                if !matches!(kind, None | Some("powershell_script"))
+                    || program.is_some()
+                    || args.is_some()
+                    || (script_body.is_some() && kind.is_none())
+                {
+                    return Err(shape_change_error(tool_name, "powershell_script"));
+                }
+                let updated_script = match (command, script_body) {
+                    (Some(command), Some(script_body)) if command != script_body => {
+                        return Err(FunctionCallError::RespondToModel(format!(
+                            "{tool_name} hook returned conflicting `command` and `script_body` values for a PowerShell script."
+                        )));
+                    }
+                    (Some(command), _) => command,
+                    (None, Some(script_body)) => script_body,
+                    (None, None) => {
+                        return Err(FunctionCallError::RespondToModel(
+                            "hook returned updatedInput without string field `command` or structured PowerShell field `script_body`".to_string(),
+                        ));
+                    }
+                };
+                Ok(Self::PowerShellScript(updated_script.to_string()))
+            }
+            Self::Argv { .. } => {
+                if script_body.is_some() {
+                    return Err(shape_change_error(tool_name, "argv"));
+                }
+                match kind {
+                    None if program.is_none() && args.is_none() => {
+                        let command = command.ok_or_else(missing_updated_command)?;
+                        if command == self.display_command() {
+                            Ok(self.clone())
+                        } else {
+                            Err(FunctionCallError::RespondToModel(format!(
+                                "{tool_name} hook cannot rewrite a direct argv command as text because that would lose structured `program`/`args`; return structured `kind`, `program`, and `args`, return the original `command` value, or block the tool call instead."
+                            )))
+                        }
+                    }
+                    Some("argv") => {
+                        let updated = Self::from_parts(
+                            tool_name,
+                            "command",
+                            None,
+                            Some("argv"),
+                            program,
+                            args.as_deref(),
+                            None,
+                        )?;
+                        if command.is_some_and(|command| command != updated.display_command()) {
+                            return Err(FunctionCallError::RespondToModel(format!(
+                                "{tool_name} hook returned a `command` value that does not match its structured `program`/`args` rewrite."
+                            )));
+                        }
+                        Ok(updated)
+                    }
+                    _ => Err(shape_change_error(tool_name, "argv")),
+                }
+            }
         }
     }
 
@@ -237,6 +332,54 @@ fn non_empty(value: &str) -> Option<&str> {
 
 fn non_blank(value: &str) -> Option<&str> {
     (!value.trim().is_empty()).then_some(value)
+}
+
+fn optional_string<'a>(
+    input: &'a Map<String, Value>,
+    field: &str,
+) -> Result<Option<&'a str>, FunctionCallError> {
+    match input.get(field) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(FunctionCallError::RespondToModel(format!(
+            "hook returned updatedInput with non-string field `{field}`"
+        ))),
+    }
+}
+
+fn optional_string_array(
+    input: &Map<String, Value>,
+    field: &str,
+) -> Result<Option<Vec<String>>, FunctionCallError> {
+    match input.get(field) {
+        None => Ok(None),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    FunctionCallError::RespondToModel(format!(
+                        "hook returned updatedInput with non-string item in `{field}`"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some),
+        Some(_) => Err(FunctionCallError::RespondToModel(format!(
+            "hook returned updatedInput with non-array field `{field}`"
+        ))),
+    }
+}
+
+fn missing_updated_command() -> FunctionCallError {
+    FunctionCallError::RespondToModel(
+        "hook returned updatedInput without string field `command`".to_string(),
+    )
+}
+
+fn shape_change_error(tool_name: &str, original_kind: &str) -> FunctionCallError {
+    FunctionCallError::RespondToModel(format!(
+        "{tool_name} hook cannot change command shape from `{original_kind}`; return updatedInput with the same command kind or block the tool call instead."
+    ))
 }
 
 pub(crate) fn powershell_script_failure_advisory(

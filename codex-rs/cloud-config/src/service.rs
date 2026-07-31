@@ -1,13 +1,13 @@
 //! Cloud config bundle lifecycle orchestration.
 //!
-//! Startup loads a single shared bundle from cache or backend, and a background
-//! refresher keeps the cache warm for future app starts without changing the
-//! already-snapshotted runtime config.
+//! Startup loads a single shared bundle from the authenticated backend, and a
+//! background refresher keeps the local diagnostic cache warm without changing
+//! the already-snapshotted runtime config. The client-written cache is never an
+//! authority for managed configuration.
 
 use crate::backend::BundleClient;
 use crate::backend::BundleRequestError;
 use crate::backend::RetryableFailureKind;
-use crate::cache::CacheLoadStatus;
 use crate::cache::CloudConfigBundleCache;
 use crate::metrics::emit_fetch_attempt_metric;
 use crate::metrics::emit_fetch_final_metric;
@@ -59,11 +59,6 @@ fn optional_bundle(bundle: CloudConfigBundle) -> Option<CloudConfigBundle> {
     } else {
         Some(bundle)
     }
-}
-
-enum CachedBundleLookup {
-    Hit(Option<CloudConfigBundle>),
-    Miss,
 }
 
 enum UnauthorizedRecoveryAction {
@@ -178,50 +173,8 @@ where
             return Ok(None);
         }
 
-        // Startup prefers a valid, identity-matched cache entry. The backend is
-        // only consulted on cache miss or invalid cache contents.
-        let (chatgpt_user_id, account_id) = auth_identity(&auth);
-        match self
-            .load_valid_cached_bundle(chatgpt_user_id.as_deref(), account_id.as_deref())
-            .await
-        {
-            CachedBundleLookup::Hit(bundle) => return Ok(bundle),
-            CachedBundleLookup::Miss => {}
-        }
-
         self.fetch_remote_bundle_and_update_cache_with_retries(auth, "startup")
             .await
-    }
-
-    async fn load_valid_cached_bundle(
-        &self,
-        chatgpt_user_id: Option<&str>,
-        account_id: Option<&str>,
-    ) -> CachedBundleLookup {
-        match self.cache.load(chatgpt_user_id, account_id).await {
-            Ok(signed_payload) => {
-                if let Err(err) = validate_bundle(&signed_payload.bundle, &self.codex_home) {
-                    tracing::warn!(
-                        path = %self.cache.path().display(),
-                        error = %err,
-                        "Ignoring invalid cached cloud config bundle"
-                    );
-                    self.cache
-                        .log_load_status(&CacheLoadStatus::CacheInvalidBundle);
-                    CachedBundleLookup::Miss
-                } else {
-                    tracing::info!(
-                        path = %self.cache.path().display(),
-                        "Using cached cloud config bundle"
-                    );
-                    CachedBundleLookup::Hit(optional_bundle(signed_payload.bundle))
-                }
-            }
-            Err(cache_load_status) => {
-                self.cache.log_load_status(&cache_load_status);
-                CachedBundleLookup::Miss
-            }
-        }
     }
 
     async fn fetch_remote_bundle_and_update_cache_with_retries(

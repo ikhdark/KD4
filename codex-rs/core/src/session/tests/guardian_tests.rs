@@ -49,6 +49,8 @@ use tempfile::tempdir;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
+const ECHO_COMMAND_TIMEOUT_MS: u64 = if cfg!(windows) { 10_000 } else { 1_000 };
+
 fn expect_text_output<T>(output: &T) -> String
 where
     T: ToolOutput + ?Sized,
@@ -323,8 +325,6 @@ async fn guardian_allows_shell_command_additional_permissions_requests_past_poli
     );
     let session = Arc::new(session);
     let turn_context = Arc::new(turn_context_raw);
-    let expiration_ms: u64 = if cfg!(windows) { 2_500 } else { 1_000 };
-
     let handler = crate::tools::handlers::ShellCommandHandler::from(
         codex_tools::ShellCommandBackendConfig::Classic,
     );
@@ -346,7 +346,7 @@ async fn guardian_allows_shell_command_additional_permissions_requests_past_poli
                     "command": "echo hi",
                     "login": false,
                     "workdir": workdir,
-                    "timeout_ms": expiration_ms,
+                    "timeout_ms": ECHO_COMMAND_TIMEOUT_MS,
                     "sandbox_permissions": SandboxPermissions::WithAdditionalPermissions,
                     "additional_permissions": PermissionProfile {
                         network: Some(NetworkPermissions {
@@ -452,7 +452,7 @@ async fn strict_auto_review_turn_grant_forces_guardian_for_shell_command_policy_
                     "command": "echo hi",
                     "login": false,
                     "workdir": workdir,
-                    "timeout_ms": 1_000_u64,
+                    "timeout_ms": ECHO_COMMAND_TIMEOUT_MS,
                 })
                 .to_string(),
             },

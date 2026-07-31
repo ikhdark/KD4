@@ -67,18 +67,26 @@ child.on("error", (err) => {
 });
 
 const forwardSignal = (signal) => {
-  if (!child.killed) {
-    try {
-      child.kill(signal);
-    } catch {
-      /* ignore */
-    }
+  try {
+    child.kill(signal);
+  } catch {
+    /* ignore */
   }
 };
 
-["SIGINT", "SIGTERM", "SIGHUP"].forEach((sig) => {
-  process.on(sig, () => forwardSignal(sig));
-});
+const forwardedSignals = ["SIGINT", "SIGTERM", "SIGHUP"];
+const signalHandlers = new Map(
+  forwardedSignals.map((signal) => [signal, () => forwardSignal(signal)]),
+);
+for (const [signal, handler] of signalHandlers) {
+  process.on(signal, handler);
+}
+
+const removeSignalHandlers = () => {
+  for (const [signal, handler] of signalHandlers) {
+    process.off(signal, handler);
+  }
+};
 
 const childResult = await new Promise((resolve) => {
   child.on("exit", (code, signal) => {
@@ -91,6 +99,7 @@ const childResult = await new Promise((resolve) => {
 });
 
 if (childResult.type === "signal") {
+  removeSignalHandlers();
   process.kill(process.pid, childResult.signal);
 } else {
   process.exit(childResult.exitCode);

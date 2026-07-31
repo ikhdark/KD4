@@ -1,0 +1,184 @@
+KD4 WORKING TREE AUDIT
+======================
+
+Scope
+-----
+Audited every tracked modification and untracked source file reported by
+`git status --short` on 2026-07-31. Four independent read-only agents reviewed:
+
+1. agent-task-store persistence, migrations, workspace coordination, and CAS;
+2. core multi-agent lifecycle, authorization, listing, waiting, and isolation;
+3. shell/source/unified-exec/apply-patch and hook execution;
+4. harness, schema, justfile, and workflow-preflight tooling.
+
+The root agent owns all fixes. No audit agent edited repository files.
+
+Findings
+--------
+
+A01 FIXED [P1] Narrow validation can accept an overlapping file change followed
+    by a revert because only endpoint manifests are compared.
+
+A02 FIXED [P1] Supporting-read CAS can record bytes captured after the bytes
+    returned to the model, allowing a stale read to authorize a later write.
+
+A03 FIXED [P2] An expired workspace mutation lease can be renewed because the
+    heartbeat update does not require an unexpired persisted deadline.
+
+A04 FIXED [P2] Amendment updates an actor's attempt_id without rekeying its
+    attempt-derived actor_id, creating duplicate actors and suppressing nudges.
+
+A05 FIXED [P2] Mutation finalization trusts caller-supplied lease scope and actor
+    fields instead of the authoritative persisted lease.
+
+A06 FIXED [P2] Task inspection suppresses all workspace-epoch storage errors and
+    returns a plausible stale epoch.
+
+A07 FIXED [P1] Typed authorization checks repository lineage but not the concrete
+    workspace, so an isolated agent can operate in a sibling worktree.
+
+A08 FIXED [P1] A changed typed-task integration test terminates its child before
+    receipt submission, racing the fallback NeedsMain receipt.
+
+A09 FIXED [P1] Non-root wait_agent can indirectly nudge/control sibling agents
+    even though direct follow-up control is root-only.
+
+A10 FIXED [P2] A failed nudge delivery permanently consumes the durable nudge
+    reservation.
+
+A11 FIXED [P2] Typed and live list_agents results use incompatible path-prefix
+    resolution and segment-boundary semantics.
+
+A12 FIXED [P1] Completion, list, and wait skip supported fallback-store
+    initialization when state_db is absent.
+
+A13 FIXED [P1] Isolated snapshot creation follows untracked symlinks and reads
+    untracked files into memory without per-file or aggregate bounds.
+
+A14 FIXED [P1] An integrator cannot discover the claimed isolated handoff
+    descriptors for the assignments it must integrate.
+
+A15 FIXED [P2] Typed binding enumeration silently treats the newest 100 records
+    as exhaustive, dropping older active assignments and stall nudges.
+
+A16 FIXED [P2] A retained durable wake can be returned before already-pending
+    user steering, contrary to interruption priority.
+
+A17 FIXED [P2] Shared-validation lease recovery can race a leader's terminal
+    success and return an error instead of reusing the completed result.
+
+A18 FIXED [P0] Typed/untyped workspace mutation admission is enforced for
+    shell_command but bypassed by unified exec and write_stdin.
+
+A19 FIXED [P1] apply_patch unconditionally converts remote cwd values to a local
+    host path, breaking untyped remote filesystem execution.
+
+A20 FIXED [P2] Canonical shell/exec hook names no longer use command-specific
+    blocked-output rendering.
+
+A21 FIXED [P1] Shell-intercepted apply_patch acquires a repository-wide lease and
+    then self-conflicts while acquiring its path-scoped apply-patch lease.
+
+A22 FIXED [P1] Detached shell/apply-patch heartbeat tasks can outlive cancelled
+    tool futures and keep leases alive indefinitely.
+
+A23 FIXED [P1] Workflow preflight compare-and-publish is not transactional, so
+    simultaneous conflicting preflights can both succeed.
+
+A24 FIXED [P1] Schema recipe rewrites break raw generator compatibility and drop
+    app-server generator arguments such as --experimental.
+
+A25 FIXED [P1] An untouched PREFLIGHT.json template is accepted as a meaningful,
+    safe receipt because unresolved placeholders are merely nonempty strings.
+
+A26 FIXED [P2] Successful config-schema regeneration returns failure when it
+    intentionally changes the generated output.
+
+A27 FIXED [P2] workflow-preflight variadic arguments are interpolated into shell
+    source instead of forwarded as argv, breaking spaces and metacharacters.
+
+A28 FIXED [P2] Generated-output checks do not share the generation lock, and
+    force mode releases the lock before freshness validation.
+
+A29 FIXED [P2] Repository identity hashes host-formatted paths, so Windows and
+    WSL aliases of the same Git common directory receive different identities.
+
+A30 FIXED [P2] The new generated-output lock helper is omitted from changed-script
+    test routing.
+
+A31 FIXED [P2] The QA template cites completion-status definitions that do not
+    exist at the referenced authoritative locations.
+
+A32 FIXED [P1] Root shell mutation admission can run before policy rejection and
+    consult unrelated durable claims, changing established command errors and
+    contaminating otherwise isolated tests.
+
+A33 FIXED [P1] A partially committed apply_patch failure finalizes its lease
+    before sandbox retry classification, so an escalated retry can fail CAS
+    against mutations made by the first attempt.
+
+A34 FIXED [P1] Shell mutation leases are selected from command cwd rather than
+    the task's authoritative workspace, so absolute-path mutations can protect
+    the wrong repository.
+
+A35 FIXED [P1] Focused validation executes repository-controlled build/test code
+    with workspace-write access, permitting transitive out-of-scope mutation.
+
+A36 FIXED [P2] Singleflight validation followers receive a leader-only artifact
+    reference and cannot retrieve failed validation diagnostics.
+
+A37 FIXED [P2] Hook alias matching preserves legacy selection but canonicalized
+    payload tool_name values can break existing hooks that branch on Bash.
+
+A38 FIXED [P1] Windows nextest workers use libtest's 2 MiB default stack even
+    though repository binaries are linked for 8 MiB, aborting nested-agent tests
+    with STATUS_STACK_OVERFLOW. A Windows-only nextest setup rule now exports the
+    matching RUST_MIN_STACK value before test processes start.
+
+A39 FIXED [P1] Unified exec can report a foreground process as exited before its
+    output readers and artifact writer close, returning a stale artifact byte
+    count and making the process disappear while output is still draining.
+
+A40 FIXED [P2] Windows core tests oversubscribe real PowerShell/child-process
+    work, while guardian shell tests use deadlines shorter than normal Windows
+    process startup under load. The core group is now bounded to eight workers
+    and those Windows-only command deadlines allow ten seconds.
+
+A41 FIXED [P1] CLI-stream subprocess tests override CODEX_HOME but inherit the
+    developer's CODEX_SQLITE_HOME, allowing tests to read or migrate shared user
+    state and making fresh-home resume tests migration-incompatible. Every such
+    subprocess now removes the SQLite override and failures print both streams.
+
+A42 FIXED [P2] Shell-decision telemetry tests destructure TestCodex and drop its
+    TempDir guards before executing commands, so repository-wide mutation
+    admission cannot canonicalize the deleted workspace. The tests now retain
+    their full harness for the command lifetime.
+
+A43 FIXED [P2] The wait-agent steering integration test asserts the obsolete
+    minimal response and rejects the current cursor, typed delta, nudge, and
+    truncation fields even though the runtime response is correct.
+
+Initial validation
+------------------
+
+PASS: python -m unittest scripts.test_workflow_preflight scripts.test_dev_environment
+PASS: just test-fast -p codex-agent-task-store (33 tests)
+FAIL: codex-core fast suite, 1 of 1,566 executed tests failed before fail-fast:
+      session::tests::rejects_escalated_permissions_when_policy_not_on_request
+      observed A32 instead of the expected approval-policy rejection.
+
+Final validation
+----------------
+
+PASS: cargo check -p codex-agent-task-store -p codex-core
+PASS: cargo nextest run -p codex-agent-task-store (35 tests)
+PASS: cargo nextest run -p codex-core --lib --retries 0 --no-fail-fast
+       (2,396 passed; 4 configured skips)
+PASS: cargo nextest run -p codex-core --test all --test responses_headers
+      --retries 0 --no-fail-fast (694 passed; 41 configured skips)
+PASS: python -m unittest scripts.test_workflow_preflight scripts.test_dev_environment
+PASS: Python syntax compilation for all changed workflow/schema helpers and the
+      Windows nextest setup helper.
+PASS: just --list
+
+All 43 confirmed findings are fixed. No audit candidate remains open or deferred.

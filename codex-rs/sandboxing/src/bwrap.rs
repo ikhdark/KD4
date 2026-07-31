@@ -3,6 +3,7 @@ use codex_protocol::models::PermissionProfile;
 use std::io::ErrorKind;
 use std::io::Read;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -175,6 +176,14 @@ fn find_system_bwrap_in_search_paths(
     search_paths: impl IntoIterator<Item = PathBuf>,
     cwd: &Path,
 ) -> Option<PathBuf> {
+    find_system_bwrap_in_search_paths_with_trust(search_paths, cwd, trusted_system_executable)
+}
+
+fn find_system_bwrap_in_search_paths_with_trust(
+    search_paths: impl IntoIterator<Item = PathBuf>,
+    cwd: &Path,
+    is_trusted: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
     let search_path = std::env::join_paths(search_paths).ok()?;
     let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let cwd_is_root = cwd.parent().is_none();
@@ -182,12 +191,30 @@ fn find_system_bwrap_in_search_paths(
         .ok()?
         .find_map(|path| {
             let path = std::fs::canonicalize(path).ok()?;
-            if !cwd_is_root && path.starts_with(&cwd) {
+            if (!cwd_is_root && path.starts_with(&cwd)) || !is_trusted(&path) {
                 None
             } else {
                 Some(path)
             }
         })
+}
+
+/// System bubblewrap is a sandbox security boundary. Only accept a canonical
+/// root-owned executable whose file and ancestor directories cannot be replaced
+/// by an unprivileged user or group. This also removes the probe/exec pathname
+/// race for the supported system installation locations.
+fn trusted_system_executable(path: &Path) -> bool {
+    let mut current = Some(path);
+    while let Some(component) = current {
+        let Ok(metadata) = std::fs::metadata(component) else {
+            return false;
+        };
+        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+            return false;
+        }
+        current = component.parent();
+    }
+    true
 }
 
 #[cfg(test)]

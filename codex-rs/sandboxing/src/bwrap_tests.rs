@@ -127,7 +127,11 @@ fn finds_first_executable_bwrap_in_joined_search_path() {
     let search_path = std::env::join_paths([first_dir, second_dir]).expect("join search path");
 
     assert_eq!(
-        find_system_bwrap_in_search_paths(std::env::split_paths(&search_path), &cwd),
+        find_system_bwrap_in_search_paths_with_trust(
+            std::env::split_paths(&search_path),
+            &cwd,
+            |_| true,
+        ),
         Some(expected_bwrap)
     );
 }
@@ -144,7 +148,11 @@ fn skips_workspace_local_bwrap_in_joined_search_path() {
     let search_path = std::env::join_paths([cwd.clone(), trusted_dir]).expect("join search path");
 
     assert_eq!(
-        find_system_bwrap_in_search_paths(std::env::split_paths(&search_path), &cwd),
+        find_system_bwrap_in_search_paths_with_trust(
+            std::env::split_paths(&search_path),
+            &cwd,
+            |_| true,
+        ),
         Some(expected_bwrap)
     );
 }
@@ -158,8 +166,35 @@ fn root_cwd_does_not_hide_system_bwrap_candidates() {
     let search_path = std::env::join_paths([bin_dir]).expect("join search path");
 
     assert_eq!(
-        find_system_bwrap_in_search_paths(std::env::split_paths(&search_path), Path::new("/")),
+        find_system_bwrap_in_search_paths_with_trust(
+            std::env::split_paths(&search_path),
+            Path::new("/"),
+            |_| true,
+        ),
         Some(expected_bwrap)
+    );
+}
+
+#[test]
+fn skips_candidates_rejected_by_trust_policy() {
+    let temp_dir = tempdir().expect("temp dir");
+    let cwd = temp_dir.path().join("cwd");
+    let untrusted_dir = temp_dir.path().join("untrusted");
+    let trusted_dir = temp_dir.path().join("trusted");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    std::fs::create_dir_all(&untrusted_dir).expect("create untrusted dir");
+    std::fs::create_dir_all(&trusted_dir).expect("create trusted dir");
+    let rejected = write_named_fake_bwrap_in(&untrusted_dir);
+    let expected = write_named_fake_bwrap_in(&trusted_dir);
+    let search_path = std::env::join_paths([untrusted_dir, trusted_dir]).expect("join search path");
+
+    assert_eq!(
+        find_system_bwrap_in_search_paths_with_trust(
+            std::env::split_paths(&search_path),
+            &cwd,
+            |path| path != rejected,
+        ),
+        Some(expected)
     );
 }
 

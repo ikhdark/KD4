@@ -52,6 +52,8 @@ use codex_protocol::protocol::CodexErrorInfo;
 use codex_protocol::protocol::ErrorEvent;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::MultiAgentVersion;
+use codex_protocol::protocol::TaskCompletionGate;
+use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnAbortedEvent;
@@ -945,11 +947,81 @@ impl Session {
             turn_context.config.memories.use_memories,
             turn_had_memory_citation,
         );
-        let completion = if abort_reason.is_none() {
+        let mut completion = if abort_reason.is_none() {
             self.services.task_evidence.completion_gate().await
         } else {
             None
         };
+        if abort_reason.is_none() && !turn_context.session_source.is_non_root_agent() {
+            let coordinator = self.services.agent_control.task_coordinator();
+            let (quiescence_reason, quiescence_warnings) = if let (
+                Some(store),
+                Some(root_session_id),
+            ) =
+                (coordinator.store(), coordinator.root_session_id())
+            {
+                match store.check_quiescence(root_session_id).await {
+                    Ok(status) => {
+                        let reason = (!status.quiescent).then(|| {
+                                format!(
+                                    "linked typed work is not quiescent: active assignments [{}]; running validations [{}]; pending gates [{}]; active claims [{}]; active mutation leases [{}]",
+                                    status
+                                        .active_assignment_ids
+                                        .iter()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                    status.running_validation_call_ids.join(", "),
+                                    status
+                                        .pending_gate_assignment_ids
+                                        .iter()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                    status
+                                        .active_claim_assignment_ids
+                                        .iter()
+                                        .map(ToString::to_string)
+                                        .collect::<Vec<_>>()
+                                        .join(", "),
+                                    status.active_mutation_lease_ids.join(", "),
+                                )
+                            });
+                        (reason, status.warnings)
+                    }
+                    Err(error) => (
+                        Some(format!(
+                            "linked typed-work quiescence could not be established: {error}"
+                        )),
+                        Vec::new(),
+                    ),
+                }
+            } else {
+                (None, Vec::new())
+            };
+            for warning in quiescence_warnings {
+                self.send_event(
+                    turn_context.as_ref(),
+                    EventMsg::Warning(WarningEvent { message: warning }),
+                )
+                .await;
+            }
+            if let Some(reason) = quiescence_reason {
+                match completion.as_mut() {
+                    Some(gate) => {
+                        gate.status = TaskCompletionStatus::Blocked;
+                        gate.reasons.push(reason);
+                    }
+                    None => {
+                        completion = Some(TaskCompletionGate {
+                            status: TaskCompletionStatus::Blocked,
+                            reasons: vec![reason],
+                            evidence_path: None,
+                        });
+                    }
+                }
+            }
+        }
         if let Some(reason) = abort_reason.as_ref() {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
                 .await;

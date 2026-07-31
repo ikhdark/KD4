@@ -75,7 +75,7 @@ impl RepoFixture {
                 }),
             ),
         };
-        AssignmentDraft {
+        let mut assignment = AssignmentDraft {
             root_session_id: "root".to_string(),
             role,
             capability_profile: profile,
@@ -91,10 +91,15 @@ impl RepoFixture {
             risk_hints: Vec::new(),
             required_evidence: Vec::new(),
             prohibited_changes: Vec::new(),
+            contract_claims: Vec::new(),
+            workspace_strategy: codex_agent_task_store::WorkspaceStrategy::Auto,
             relation,
         }
         .normalize(self.path())
-        .expect("valid assignment fixture")
+        .expect("valid assignment fixture");
+        assignment.workspace_id =
+            repository_workspace_id(self.path()).expect("valid workspace fixture");
+        assignment
     }
 }
 
@@ -605,6 +610,8 @@ fn cold_review_context_is_attempt_bound_and_structurally_excludes_worker_history
         mutation_event_ids: Vec::new(),
         attribution_confidence: AttributionConfidence::Definitive,
         snapshot_retained: true,
+        start_epoch: 0,
+        end_epoch: Some(1),
         first_observed_at: chrono::Utc::now(),
         finalized_at: Some(chrono::Utc::now()),
     };

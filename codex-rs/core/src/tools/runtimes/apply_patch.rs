@@ -22,8 +22,12 @@ use crate::tools::sandboxing::ToolCtx;
 use crate::tools::sandboxing::ToolError;
 use crate::tools::sandboxing::ToolRuntime;
 use crate::tools::sandboxing::with_cached_approval;
+use codex_agent_task_store::AgentTaskStore;
 use codex_agent_task_store::AttemptState;
 use codex_agent_task_store::AttributionConfidence;
+use codex_agent_task_store::WorkspaceActorKind;
+use codex_agent_task_store::WorkspaceMutationLease;
+use codex_agent_task_store::WorkspaceMutationRequest;
 use codex_apply_patch::AppliedPatchDelta;
 use codex_apply_patch::ApplyPatchAction;
 use codex_exec_server::FileSystemSandboxContext;
@@ -43,6 +47,8 @@ use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use std::path::PathBuf;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize)]
 pub(crate) struct ApplyPatchApprovalKey {
@@ -65,6 +71,11 @@ pub struct ApplyPatchRequest {
 pub struct ApplyPatchRuntime {
     committed_delta: AppliedPatchDelta,
     typed_mutations_started: bool,
+    workspace_mutation: Option<(
+        std::sync::Arc<dyn AgentTaskStore>,
+        PathBuf,
+        WorkspaceMutationLease,
+    )>,
 }
 
 #[derive(Debug)]
@@ -82,7 +93,7 @@ impl ApplyPatchRuntime {
         &self.committed_delta
     }
 
-    async fn begin_typed_mutations(
+    async fn begin_workspace_mutations(
         &mut self,
         req: &ApplyPatchRequest,
         ctx: &ToolCtx,
@@ -91,36 +102,61 @@ impl ApplyPatchRuntime {
             return Ok(());
         }
         let coordinator = ctx.session.services.agent_control.task_coordinator();
-        let Some(binding) = coordinator.binding_for_source(&ctx.turn.session_source) else {
-            self.typed_mutations_started = true;
-            return Ok(());
-        };
-        let task = coordinator
-            .get_agent_task(binding.assignment_id, Some(0))
-            .await
-            .map_err(|error| {
-                ToolError::Rejected(format!(
-                    "apply_patch: typed assignment state is unavailable: {error}"
-                ))
-            })?;
-        if task.current_attempt.attempt_id != binding.attempt_id
-            || task.current_attempt.state != AttemptState::Active
-        {
-            return Err(ToolError::Rejected(
-                "apply_patch: the bound typed assignment attempt is no longer active".to_string(),
-            ));
+        if coordinator.store().is_none() {
+            coordinator
+                .initialize_for_workspace_coordination(
+                    ctx.session.services.state_db.clone(),
+                    ctx.turn.config.sqlite_home.clone(),
+                    ctx.turn.config.model_provider_id.clone(),
+                    ctx.session.services.agent_control.session_id().to_string(),
+                )
+                .await
+                .map_err(|error| {
+                    ToolError::Rejected(format!(
+                        "apply_patch: workspace coordination could not initialize: {error}"
+                    ))
+                })?;
         }
+        let binding = coordinator.binding_for_source(&ctx.turn.session_source);
+        let task = match &binding {
+            Some(binding) => {
+                let task = coordinator
+                    .get_agent_task(binding.assignment_id, Some(0))
+                    .await
+                    .map_err(|error| {
+                        ToolError::Rejected(format!(
+                            "apply_patch: typed assignment state is unavailable: {error}"
+                        ))
+                    })?;
+                if task.current_attempt.attempt_id != binding.attempt_id
+                    || task.current_attempt.state != AttemptState::Active
+                {
+                    return Err(ToolError::Rejected(
+                        "apply_patch: the bound typed assignment attempt is no longer active"
+                            .to_string(),
+                    ));
+                }
+                Some(task)
+            }
+            None => None,
+        };
 
-        let cwd = req
-            .turn_environment
-            .cwd()
-            .to_abs_path()
-            .map_err(|error| {
-                ToolError::Rejected(format!(
+        let cwd = match req.turn_environment.cwd().to_abs_path() {
+            Ok(cwd) => cwd.to_path_buf(),
+            Err(_) if binding.is_none() => {
+                // Workspace leases are host-local. Untyped patches against a
+                // remote environment are still protected by that environment's
+                // filesystem sandbox and cannot be represented in the local
+                // workspace task store.
+                self.typed_mutations_started = true;
+                return Ok(());
+            }
+            Err(error) => {
+                return Err(ToolError::Rejected(format!(
                     "apply_patch: typed assignments require a local filesystem environment: {error}"
-                ))
-            })?
-            .to_path_buf();
+                )));
+            }
+        };
         let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
         let repo_paths = req
             .file_paths
@@ -141,40 +177,123 @@ impl ApplyPatchRuntime {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let authorization = authorize_typed_tool(
-            &task.assignment,
-            &repo_root,
-            TypedToolRequest {
-                class: TypedToolClass::StructuredEdit,
-                external_mutation_intent: ExternalMutationIntent::MayMutate,
-                repo_paths: &repo_paths,
-            },
-        )
-        .map_err(|error| {
-            ToolError::Rejected(format!(
-                "apply_patch: typed assignment capability denied: {error}"
-            ))
-        })?;
+        let normalized_repo_paths = if let Some(task) = &task {
+            authorize_typed_tool(
+                &task.assignment,
+                &repo_root,
+                TypedToolRequest {
+                    class: TypedToolClass::StructuredEdit,
+                    external_mutation_intent: ExternalMutationIntent::MayMutate,
+                    repo_paths: &repo_paths,
+                },
+            )
+            .map_err(|error| {
+                ToolError::Rejected(format!(
+                    "apply_patch: typed assignment capability denied: {error}"
+                ))
+            })?
+            .normalized_repo_paths
+        } else {
+            repo_paths
+        };
         let store = coordinator.store().ok_or_else(|| {
-            ToolError::Rejected("apply_patch: the typed task store is unavailable".to_string())
+            ToolError::Rejected("apply_patch: the workspace task store is unavailable".to_string())
         })?;
-        for path in authorization.normalized_repo_paths {
-            store
-                .begin_mutation(
-                    binding.attempt_id,
-                    &repo_root,
-                    path,
-                    AttributionConfidence::Definitive,
-                )
-                .await
-                .map_err(|error| {
-                    ToolError::Rejected(format!(
+        let root_session_id = coordinator.root_session_id().ok_or_else(|| {
+            ToolError::Rejected("apply_patch: root task identity is unavailable".to_string())
+        })?;
+        let agent_path = ctx
+            .turn
+            .session_source
+            .get_agent_path()
+            .map(|path| path.to_string())
+            .unwrap_or_else(|| "/root".to_string());
+        let (kind, actor_id) = if let Some(binding) = &binding {
+            (
+                WorkspaceActorKind::Typed,
+                format!("attempt:{}", binding.attempt_id),
+            )
+        } else if ctx.turn.session_source.is_non_root_agent() {
+            (
+                WorkspaceActorKind::Legacy,
+                format!("legacy:{root_session_id}:{agent_path}"),
+            )
+        } else {
+            (WorkspaceActorKind::Root, format!("root:{root_session_id}"))
+        };
+        let expected_manifest = store
+            .supporting_read_manifest(&repo_root, actor_id.clone(), normalized_repo_paths.clone())
+            .await
+            .map_err(|error| {
+                ToolError::Rejected(format!(
+                    "apply_patch: supporting-read manifest could not be loaded: {error}"
+                ))
+            })?;
+        let lease = store
+            .begin_workspace_mutation(
+                &repo_root,
+                WorkspaceMutationRequest {
+                    root_session_id,
+                    actor_id,
+                    kind,
+                    attempt_id: binding.as_ref().map(|binding| binding.attempt_id),
+                    paths: normalized_repo_paths,
+                    contracts: task
+                        .as_ref()
+                        .map(|task| task.assignment.contract_claims.clone())
+                        .unwrap_or_default(),
+                    expected_manifest,
+                },
+            )
+            .await
+            .map_err(|error| {
+                ToolError::Rejected(format!(
+                    "apply_patch: workspace mutation was rejected: {error}"
+                ))
+            })?;
+        if let Some(binding) = &binding {
+            for path in &lease.paths {
+                if let Err(error) = store
+                    .begin_mutation(
+                        binding.attempt_id,
+                        &repo_root,
+                        path.clone(),
+                        AttributionConfidence::Definitive,
+                    )
+                    .await
+                {
+                    if let Err(cleanup_error) = store
+                        .finish_workspace_mutation(&repo_root, lease.clone())
+                        .await
+                    {
+                        tracing::warn!(
+                            %cleanup_error,
+                            "apply_patch failed to release workspace lease after mutation-evidence failure"
+                        );
+                    }
+                    return Err(ToolError::Rejected(format!(
                         "apply_patch: failed to capture typed mutation evidence: {error}"
-                    ))
-                })?;
+                    )));
+                }
+            }
         }
+        self.workspace_mutation = Some((store, repo_root, lease));
         self.typed_mutations_started = true;
         Ok(())
+    }
+
+    async fn finish_workspace_mutation(&mut self) -> Result<(), ToolError> {
+        let Some((store, repo_root, lease)) = self.workspace_mutation.take() else {
+            self.typed_mutations_started = false;
+            return Ok(());
+        };
+        let result = store.finish_workspace_mutation(&repo_root, lease).await;
+        self.typed_mutations_started = false;
+        result.map(|_| ()).map_err(|error| {
+            ToolError::Rejected(format!(
+                "apply_patch: workspace mutation finalization failed: {error}"
+            ))
+        })
     }
 
     fn build_guardian_review_request(
@@ -337,7 +456,52 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
     ) -> Result<ApplyPatchRuntimeOutput, ToolError> {
-        self.begin_typed_mutations(req, ctx).await?;
+        self.begin_workspace_mutations(req, ctx).await?;
+        let heartbeat_stop = CancellationToken::new();
+        let heartbeat_task = self
+            .workspace_mutation
+            .as_ref()
+            .map(|(store, repo_root, lease)| {
+                let store = store.clone();
+                let repo_root = repo_root.clone();
+                let lease_id = lease.lease_id.clone();
+                let actor_id = lease.actor_id.clone();
+                let heartbeat_stop = heartbeat_stop.clone();
+                AbortOnDropHandle::new(tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = heartbeat_stop.cancelled() => break,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                                match store
+                                    .heartbeat_workspace_mutation(
+                                        &repo_root,
+                                        lease_id.clone(),
+                                        actor_id.clone(),
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        tracing::warn!(
+                                            %lease_id,
+                                            "apply_patch workspace mutation lease expired before heartbeat"
+                                        );
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            %error,
+                                            %lease_id,
+                                            "apply_patch workspace mutation heartbeat failed"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }))
+            });
         let started_at = Instant::now();
         let fs = req.turn_environment.environment.get_filesystem();
         let sandbox = Self::file_system_sandbox_context_for_attempt(req, attempt);
@@ -361,6 +525,12 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
             Err(failure) => failure.into_parts().1,
         };
         self.committed_delta.append(delta);
+        heartbeat_stop.cancel();
+        if let Some(heartbeat_task) = heartbeat_task
+            && let Err(error) = heartbeat_task.await
+        {
+            tracing::warn!(%error, "apply_patch workspace mutation heartbeat task failed");
+        }
         let output = ExecToolCallOutput {
             exit_code,
             stdout: StreamOutput::new(stdout.clone()),
@@ -375,6 +545,7 @@ impl ToolRuntime<ApplyPatchRequest, ApplyPatchRuntimeOutput> for ApplyPatchRunti
                 network_policy_decision: None,
             })));
         }
+        self.finish_workspace_mutation().await?;
         Ok(ApplyPatchRuntimeOutput {
             exec_output: output,
             delta: self.committed_delta.clone(),

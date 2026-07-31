@@ -176,6 +176,7 @@ impl NetworkProxySpec {
         Ok(spec)
     }
 
+    #[cfg(test)]
     pub(crate) async fn apply_to_started_proxy(
         &self,
         started_proxy: &StartedNetworkProxy,

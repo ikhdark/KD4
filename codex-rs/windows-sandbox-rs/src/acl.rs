@@ -673,7 +673,7 @@ pub unsafe fn add_deny_read_ace(path: &Path, psid: *mut c_void) -> Result<bool> 
     add_deny_ace(path, psid, DenyAceKind::Read)
 }
 
-pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) {
+pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) -> Result<bool> {
     let mut p_sd: *mut c_void = std::ptr::null_mut();
     let mut p_dacl: *mut ACL = std::ptr::null_mut();
     let code = GetNamedSecurityInfoW(
@@ -690,7 +690,10 @@ pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) {
         if !p_sd.is_null() {
             LocalFree(p_sd as HLOCAL);
         }
-        return;
+        return Err(anyhow!(
+            "GetNamedSecurityInfoW failed for {} with code {code}",
+            path.display()
+        ));
     }
     let trustee = TRUSTEE_W {
         pMultipleTrustee: std::ptr::null_mut(),
@@ -706,23 +709,37 @@ pub unsafe fn revoke_ace(path: &Path, psid: *mut c_void) {
     explicit.Trustee = trustee;
     let mut p_new_dacl: *mut ACL = std::ptr::null_mut();
     let code2 = SetEntriesInAclW(1, &explicit, p_dacl, &mut p_new_dacl);
-    if code2 == ERROR_SUCCESS {
-        let _ = SetNamedSecurityInfoW(
-            to_wide(path).as_ptr() as *mut u16,
-            1,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            p_new_dacl,
-            std::ptr::null_mut(),
-        );
-        if !p_new_dacl.is_null() {
-            LocalFree(p_new_dacl as HLOCAL);
+    if code2 != ERROR_SUCCESS {
+        if !p_sd.is_null() {
+            LocalFree(p_sd as HLOCAL);
         }
+        return Err(anyhow!(
+            "SetEntriesInAclW failed while revoking {} with code {code2}",
+            path.display()
+        ));
+    }
+    let code3 = SetNamedSecurityInfoW(
+        to_wide(path).as_ptr() as *mut u16,
+        1,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        p_new_dacl,
+        std::ptr::null_mut(),
+    );
+    if !p_new_dacl.is_null() {
+        LocalFree(p_new_dacl as HLOCAL);
     }
     if !p_sd.is_null() {
         LocalFree(p_sd as HLOCAL);
     }
+    if code3 != ERROR_SUCCESS {
+        return Err(anyhow!(
+            "SetNamedSecurityInfoW failed while revoking {} with code {code3}",
+            path.display()
+        ));
+    }
+    Ok(true)
 }
 
 /// Grants RX to the null device for the given SID to support stdout/stderr redirection.

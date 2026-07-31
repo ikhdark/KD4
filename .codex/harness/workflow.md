@@ -9,8 +9,8 @@ without redefining repository implementation policy.
 - Root `AGENTS.md` owns task lanes, repository inspection, implementation
   discipline, validation selection, completion status, and final reporting.
 - `.codex/harness` owns optional durable task artifacts and lifecycle guidance.
-- Use subagents only when the user or active instructions explicitly request
-  delegation or parallel agent work.
+- Give every mutating root task and subagent a durable identity. One owner holds
+  each path and named-contract claim at a time in a shared worktree.
 
 ## Phase 1: Intake
 
@@ -23,12 +23,29 @@ Use durable artifacts for broad, risky, interrupted, resumable, explicitly
 auditable, or multi-agent work. For a focused one-turn task, keep the workflow
 in conversation and create no run directory.
 
-## Phase 2: Plan
+## Phase 2: Preflight and Plan
 
 Create `PLAN.md` only when durable planning is useful. Capture the objective,
 non-goals, owner scope, validation intent, risks, and a short milestone list.
 Add `EVAL.md` before implementation when capability or regression criteria need
 to survive later turns.
+
+For concurrent writers or validation lanes, copy `templates/PREFLIGHT.json` and
+resolve it with `just workflow-preflight <manifest> <receipt>`. The
+preflight publishes the receipt into the repository's locked active-receipt
+registry and checks every registered receipt atomically. Use
+`just workflow-preflight-release <assignment-id>` when the assignment becomes
+terminal. Receipts are leases (one hour by default); long-running assignments
+must rerun the same preflight before expiry to renew them, or pass a bounded
+`--lease-seconds` value to the script. Expired and legacy non-lease receipts are
+removed under the registry lock so a crashed process cannot block the repository
+forever. The preflight must name the assignment and root task, starting
+revision, path and contract claims, dependencies, generated-output owner,
+validation owner, exact validation commands, Cargo lane, and shared/isolated
+workspace strategy.
+
+Accidental overlap is a preflight failure. Deliberate competing implementations
+use separate isolated worktrees and a versioned integrator handoff.
 
 ## Phase 3: Implement
 
@@ -40,25 +57,52 @@ Keep unrelated dirty changes intact. Keep generated output under its owning
 workflow. Do not add logs, screenshots, binaries, or large transcripts to
 reviewable changes unless requested.
 
+Before a claimed write, compare the file with the hash from the supporting read.
+If it changed, reconcile once instead of applying a stale patch.
+
 ## Phase 4: Check
 
 Run the nearest sufficient proof required by root `AGENTS.md`, then record only
 the evidence that matters for resumption or audit. Name skipped checks and their
 reasons.
 
-Use the completion-gate definitions and final-answer fields from root
-`AGENTS.md`; do not maintain a second copy here. Use `QA_CHECKLIST.md` for broad
-verification and `HARNESS_AUDIT.md` for harness-policy or skill changes.
+Validation is check-only and bound to the revision and covered path/contract
+manifest. A relevant mutation supersedes the result. Generated-output
+regeneration is a separate, explicitly owner-attributed command serialized by
+the repository generation lock.
+
+One workspace epoch that supersedes several proofs counts as one stale event.
+After the first event, reconcile once and run one targeted validation. Repeated
+staleness pauses the task for root and offers an isolated-worktree restart
+instead of beginning another validation loop.
+
+Use the completion-gate status definitions below and the completion discipline
+from root `AGENTS.md`. Use `QA_CHECKLIST.md` for broad verification and
+`HARNESS_AUDIT.md` for harness-policy or skill changes.
+
+### Completion Gate Status
+
+- `passed`: the objective is implemented, the intended runtime path is wired,
+  and the nearest sufficient validation passed with no known task-relevant
+  defect remaining.
+- `partial`: a useful subset is complete, but an explicitly identified part of
+  the accepted scope or its required proof remains unfinished.
+- `blocked`: completion cannot proceed without a named external state change,
+  authority, dependency, or user decision; the blocker and completed evidence
+  are recorded.
 
 ## Phase 5: Finish
 
 Summarize the material changes, focused validation, and remaining risk. Write
 `HANDOFF.md` before stopping only when unresolved work or important context must
-survive.
+survive. Release any active preflight receipt after its assignment is terminal.
 
 ## Optional Multi-Agent Mode
 
-Use `ORCHESTRATOR.md` only when multi-agent work is explicitly requested or
-required by active instructions. Give each agent a bounded task and evidence
-target, prevent recursive delegation unless requested, and keep one owner
-responsible for final validation.
+Use `ORCHESTRATOR.md` when multi-agent work is active. Give each agent a bounded
+task, durable identity, claim set, and evidence target. Keep exactly one owner
+for each complete behavioral contract and one owner for final validation.
+Before root completion, linked assignments, validations, gates, and claims must
+be terminal, and no linked workspace mutation lease may remain active. Root
+completion rechecks sealed receipt evidence so later relevant drift remains a
+blocker; unrelated task roots only warn and do not join this barrier.

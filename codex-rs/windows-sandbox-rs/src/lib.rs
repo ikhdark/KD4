@@ -8,6 +8,35 @@ mod ssh_config_dependencies;
 use std::fmt;
 use std::sync::Arc;
 
+/// Converts an optional millisecond timeout to the Win32 wait representation.
+/// `INFINITE` is reserved for the absence of a deadline, so finite values are
+/// clamped to the largest representable non-infinite timeout.
+pub fn windows_wait_timeout(timeout_ms: Option<u64>) -> u32 {
+    timeout_ms
+        .map(|value| value.min(u64::from(u32::MAX - 1)) as u32)
+        .unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod wait_timeout_tests {
+    use super::windows_wait_timeout;
+
+    #[test]
+    fn finite_wait_timeouts_never_alias_infinite() {
+        assert_eq!(windows_wait_timeout(None), u32::MAX);
+        assert_eq!(windows_wait_timeout(Some(0)), 0);
+        assert_eq!(
+            windows_wait_timeout(Some(u64::from(u32::MAX - 1))),
+            u32::MAX - 1
+        );
+        assert_eq!(
+            windows_wait_timeout(Some(u64::from(u32::MAX))),
+            u32::MAX - 1
+        );
+        assert_eq!(windows_wait_timeout(Some(u64::MAX)), u32::MAX - 1);
+    }
+}
+
 /// Cancellation hook used by Windows sandbox capture backends.
 #[derive(Clone)]
 pub struct WindowsSandboxCancellationToken {
@@ -422,7 +451,6 @@ mod windows_impl {
     use windows_sys::Win32::System::Pipes::PIPE_NOWAIT;
     use windows_sys::Win32::System::Pipes::SetNamedPipeHandleState;
     use windows_sys::Win32::System::Threading::GetExitCodeProcess;
-    use windows_sys::Win32::System::Threading::INFINITE;
     use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
     type PipeHandles = ((HANDLE, HANDLE), (HANDLE, HANDLE), (HANDLE, HANDLE));
@@ -460,7 +488,7 @@ mod windows_impl {
         cancellation: Option<&WindowsSandboxCancellationToken>,
     ) -> WaitOutcome {
         let Some(cancellation) = cancellation else {
-            let timeout = timeout_ms.map(|ms| ms as u32).unwrap_or(INFINITE);
+            let timeout = crate::windows_wait_timeout(timeout_ms);
             return wait_outcome(process, timeout);
         };
 

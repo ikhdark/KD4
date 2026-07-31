@@ -106,7 +106,7 @@ pub(crate) struct ListedAgent {
 }
 
 #[cfg(test)]
-struct AgentControlTestBarrier {
+pub(crate) struct AgentControlTestBarrier {
     visits: std::sync::atomic::AtomicUsize,
     reached: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
@@ -136,7 +136,7 @@ impl AgentControlTestBarrier {
             .forget();
     }
 
-    async fn wait_until_reached(&self) {
+    pub(crate) async fn wait_until_reached(&self) {
         self.reached
             .acquire()
             .await
@@ -144,7 +144,7 @@ impl AgentControlTestBarrier {
             .forget();
     }
 
-    fn release_one(&self) {
+    pub(crate) fn release_one(&self) {
         self.release.add_permits(1);
     }
 
@@ -231,6 +231,18 @@ impl AgentControl {
 
     pub(crate) fn task_coordinator(&self) -> &AgentTaskCoordinator {
         &self.task_coordinator
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_initial_submission_barrier(
+        &self,
+        barrier: Option<Arc<AgentControlTestBarrier>>,
+    ) {
+        *self
+            .test_hooks
+            .before_initial_submission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = barrier;
     }
 
     /// Send rich user input items to an existing agent thread.

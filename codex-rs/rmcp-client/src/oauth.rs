@@ -48,11 +48,13 @@ use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
+use tempfile::NamedTempFile;
 use tracing::warn;
 
 use self::store_lock::OAuthStore;
@@ -308,9 +310,9 @@ fn save_oauth_tokens_to_direct_keyring<K: KeyringStore>(
     let key = compute_store_key(server_name, &tokens.url)?;
     match keyring_store.save(KEYRING_SERVICE, &key, &serialized) {
         Ok(()) => {
-            if let Err(error) = delete_oauth_tokens_from_file(&key) {
-                warn!("failed to remove OAuth tokens from fallback storage: {error:?}");
-            }
+            delete_oauth_tokens_from_file(&key).context(
+                "secure OAuth credentials were saved but plaintext fallback cleanup failed",
+            )?;
             Ok(())
         }
         Err(error) => {
@@ -344,9 +346,8 @@ fn save_oauth_tokens_to_secrets_keyring<K: KeyringStore + Clone + 'static>(
     }
 
     let key = compute_store_key(server_name, &tokens.url)?;
-    if let Err(error) = delete_oauth_tokens_from_file(&key) {
-        warn!("failed to remove OAuth tokens from fallback storage: {error:?}");
-    }
+    delete_oauth_tokens_from_file(&key)
+        .context("secure OAuth credentials were saved but plaintext fallback cleanup failed")?;
     Ok(())
 }
 
@@ -839,13 +840,25 @@ fn write_fallback_file(store: &FallbackFile) -> Result<()> {
     }
 
     let serialized = serde_json::to_string(store)?;
-    fs::write(&path, serialized)?;
-
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("credentials path has no parent: {}", path.display()))?;
+    let mut temporary = NamedTempFile::new_in(parent)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&path, perms)?;
+        temporary.as_file().set_permissions(perms)?;
+    }
+    temporary.write_all(serialized.as_bytes())?;
+    temporary.flush()?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path).map_err(|error| error.error)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     }
 
     Ok(())

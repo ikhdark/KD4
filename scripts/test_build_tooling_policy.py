@@ -273,7 +273,28 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("#!/bin/sh\n", encoding="utf-8", newline="\n")
                 path.chmod(0o755)
-            (release_dir / "codex-package.json").touch()
+            (release_dir / "bin" / "codex").write_text(
+                f"#!/bin/sh\nprintf 'codex-cli {version}\\n'\n",
+                encoding="utf-8",
+                newline="\n",
+            )
+            (release_dir / "codex-package.json").write_text(
+                json.dumps(
+                    {
+                        "layoutVersion": 1,
+                        "version": version,
+                        "target": target,
+                        "variant": "codex",
+                        "entrypoint": "bin/codex",
+                        "resourcesDir": "codex-resources",
+                        "pathDir": "codex-path",
+                    },
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+                newline="\n",
+            )
             with (release_dir / "codex-install.env").open(
                 "w", encoding="utf-8", newline="\n"
             ) as metadata:
@@ -285,6 +306,10 @@ class BuildToolingPolicyTest(unittest.TestCase):
                         "#!/bin/sh",
                         'INSTALL_METADATA_FILE="codex-install.env"',
                         shell_function("install_metadata_field"),
+                        shell_function("package_metadata_string_equals"),
+                        shell_function("package_metadata_number_equals"),
+                        shell_function("validate_package_metadata"),
+                        shell_function("version_from_binary"),
                         shell_function("release_dir_is_complete"),
                         'chmod 0755 "$1/bin/codex" "$1/codex" "$1/codex-path/rg"',
                         'if [ -e "$1/bin/codex-code-mode-host" ]; then',
@@ -344,7 +369,6 @@ class BuildToolingPolicyTest(unittest.TestCase):
             root = Path(temp_dir)
             windows_package = root / "windows-package"
             for relative in (
-                "codex-package.json",
                 "bin/codex.exe",
                 "codex-path/apply_patch.bat",
                 "codex-path/applypatch.bat",
@@ -355,6 +379,20 @@ class BuildToolingPolicyTest(unittest.TestCase):
                 path = windows_package / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.touch()
+            (windows_package / "codex-package.json").write_text(
+                json.dumps(
+                    {
+                        "layoutVersion": 1,
+                        "version": "1.2.3",
+                        "target": "x86_64-pc-windows-msvc",
+                        "variant": "codex",
+                        "entrypoint": "bin/codex.exe",
+                        "resourcesDir": "codex-resources",
+                        "pathDir": "codex-path",
+                    }
+                ),
+                encoding="utf-8",
+            )
 
             powershell_installer = REPO_ROOT / "scripts" / "install" / "install.ps1"
 
@@ -371,7 +409,8 @@ class BuildToolingPolicyTest(unittest.TestCase):
                     "-and $node.Name -eq 'Test-PackageContentsAreComplete' }, $true); "
                     "Invoke-Expression $function[0].Extent.Text; "
                     f"$actual = Test-PackageContentsAreComplete -PackageDir "
-                    f"{ps_single_quote(windows_package)}; "
+                    f"{ps_single_quote(windows_package)} -ExpectedVersion '1.2.3' "
+                    "-ExpectedTarget 'x86_64-pc-windows-msvc'; "
                     f"if ($actual -ne ${str(expected).lower()}) {{ exit 9 }}"
                 )
                 return subprocess.run(

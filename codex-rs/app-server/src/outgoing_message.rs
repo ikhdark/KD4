@@ -560,7 +560,11 @@ impl OutgoingMessageSender {
             TakeCallbackResult::Taken(id, entry) => {
                 let completed_at_ms = now_unix_timestamp_ms();
                 if let Ok(response) = entry.request.response_from_result(result.clone())
-                    && !matches!(response, ServerResponse::PermissionsRequestApproval { .. })
+                    && !matches!(
+                        response,
+                        ServerResponse::PermissionsRequestApproval { .. }
+                            | ServerResponse::ChatgptAuthTokensRefresh { .. }
+                    )
                 {
                     self.analytics_events_client
                         .track_server_response(completed_at_ms, response);

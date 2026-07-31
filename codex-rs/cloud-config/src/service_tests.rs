@@ -574,7 +574,7 @@ async fn get_bundle_empty_response_is_success_and_cached() {
 }
 
 #[tokio::test]
-async fn get_bundle_uses_cache_when_valid() {
+async fn get_bundle_does_not_trust_valid_local_cache() {
     let bundle = test_bundle();
     let codex_home = tempdir().expect("tempdir");
     let prime_service = CloudConfigBundleService::new(
@@ -585,7 +585,7 @@ async fn get_bundle_uses_cache_when_valid() {
     );
     let _ = prime_service.load_startup_bundle().await;
 
-    let fetcher = Arc::new(SequenceBundleClient::new(vec![Err(request_error())]));
+    let fetcher = Arc::new(StaticBundleClient::new(CloudConfigBundle::default()));
     let service = CloudConfigBundleService::new(
         auth_manager_with_plan("business").await,
         fetcher.clone(),
@@ -593,8 +593,8 @@ async fn get_bundle_uses_cache_when_valid() {
         CLOUD_CONFIG_BUNDLE_TIMEOUT,
     );
 
-    assert_eq!(service.load_startup_bundle().await, Ok(Some(bundle)));
-    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 0);
+    assert_eq!(service.load_startup_bundle().await, Ok(None));
+    assert_eq!(fetcher.request_count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

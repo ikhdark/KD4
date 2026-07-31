@@ -581,7 +581,7 @@ async fn intercepted_apply_patch_success_reports_terminal_completion_and_post_ho
     let post_hook = handler
         .post_tool_use_payload(&invocation, output.as_ref())
         .expect("successful interception should expose Bash PostToolUse");
-    assert_eq!(post_hook.tool_name, HookToolName::bash());
+    assert_eq!(post_hook.tool_name, HookToolName::exec_command());
     assert_eq!(post_hook.tool_input, pre_hook.tool_input);
     assert_eq!(post_hook.tool_use_id, "intercept-success");
     let patch_result = post_hook
@@ -986,7 +986,7 @@ async fn exec_command_pre_tool_use_payload_ignores_base_sensitive_permission_fie
     assert_eq!(
         handler.pre_tool_use_payload(&invocation),
         Some(crate::tools::registry::PreToolUsePayload {
-            tool_name: HookToolName::bash(),
+            tool_name: HookToolName::exec_command(),
             tool_input: serde_json::json!({ "command": "printf exec command" }),
         })
     );
@@ -1015,7 +1015,7 @@ async fn exec_command_pre_tool_use_payload_ignores_base_sensitive_permission_fie
 }
 
 #[tokio::test]
-async fn exec_command_hook_noop_preserves_direct_argv_and_rejects_text_rewrite() {
+async fn exec_command_hook_preserves_and_rewrites_direct_argv_structurally() {
     let arguments = serde_json::json!({
         "kind": "argv",
         "program": "rg",
@@ -1034,11 +1034,20 @@ async fn exec_command_hook_noop_preserves_direct_argv_and_rejects_text_rewrite()
     let handler = ExecCommandHandler::default();
     let updated_input = handler
         .pre_tool_use_payload(&invocation)
-        .expect("argv invocation should expose hook input")
-        .tool_input;
+        .expect("argv invocation should expose hook input");
+    assert_eq!(updated_input.tool_name, HookToolName::exec_command());
+    assert_eq!(
+        updated_input.tool_input,
+        serde_json::json!({
+            "command": "rg --files",
+            "kind": "argv",
+            "program": "rg",
+            "args": ["--files"],
+        })
+    );
 
     let rewritten = handler
-        .with_updated_hook_input(invocation.clone(), updated_input)
+        .with_updated_hook_input(invocation.clone(), updated_input.tool_input)
         .expect("unchanged argv display should preserve structured invocation");
     let ToolPayload::Function {
         arguments: rewritten_arguments,
@@ -1059,6 +1068,35 @@ async fn exec_command_hook_noop_preserves_direct_argv_and_rejects_text_rewrite()
     )
     .expect("preserved argv should resolve directly");
     assert_eq!(resolved.command, vec!["rg", "--files"]);
+    assert_eq!(resolved.preflight_shell_type, None);
+
+    let rewritten = handler
+        .with_updated_hook_input(
+            invocation.clone(),
+            serde_json::json!({
+                "kind": "argv",
+                "program": "kds",
+                "args": ["--agent", "--", "rg", "--files"],
+            }),
+        )
+        .expect("structured argv rewrite should remain direct");
+    let ToolPayload::Function { arguments } = rewritten.payload else {
+        panic!("rewritten exec_command payload should remain function-shaped");
+    };
+    let args: ExecCommandArgs =
+        parse_arguments(&arguments).expect("rewritten argv should still parse");
+    let resolved = get_command(
+        &args,
+        Arc::new(default_user_shell()),
+        &UnifiedExecShellMode::Direct,
+        /*allow_login_shell*/ false,
+        /*environment_is_remote*/ false,
+    )
+    .expect("rewritten argv should resolve directly");
+    assert_eq!(
+        resolved.command,
+        vec!["kds", "--agent", "--", "rg", "--files"]
+    );
     assert_eq!(resolved.preflight_shell_type, None);
 
     let err = handler
@@ -1124,7 +1162,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_noninteractive_one_s
     assert_eq!(
         handler.post_tool_use_payload(&invocation, &output),
         Some(crate::tools::registry::PostToolUsePayload {
-            tool_name: HookToolName::bash(),
+            tool_name: HookToolName::exec_command(),
             tool_use_id: "call-43".to_string(),
             tool_input: serde_json::json!({ "command": "echo three" }),
             tool_response: serde_json::json!("three"),
@@ -1157,7 +1195,7 @@ async fn exec_command_post_tool_use_payload_uses_output_for_interactive_completi
     assert_eq!(
         handler.post_tool_use_payload(&invocation, &output),
         Some(crate::tools::registry::PostToolUsePayload {
-            tool_name: HookToolName::bash(),
+            tool_name: HookToolName::exec_command(),
             tool_use_id: "call-44".to_string(),
             tool_input: serde_json::json!({ "command": "echo three" }),
             tool_response: serde_json::json!("three"),
@@ -1218,7 +1256,7 @@ async fn write_stdin_post_tool_use_payload_uses_original_exec_call_id_and_comman
     assert_eq!(
         handler.post_tool_use_payload(&invocation, &output),
         Some(crate::tools::registry::PostToolUsePayload {
-            tool_name: HookToolName::bash(),
+            tool_name: HookToolName::exec_command(),
             tool_use_id: "exec-call-45".to_string(),
             tool_input: serde_json::json!({ "command": "sleep 1; echo finished" }),
             tool_response: serde_json::json!("finished\n"),
@@ -1272,13 +1310,13 @@ async fn write_stdin_post_tool_use_payload_keeps_parallel_session_metadata_separ
         payloads,
         [
             Some(crate::tools::registry::PostToolUsePayload {
-                tool_name: HookToolName::bash(),
+                tool_name: HookToolName::exec_command(),
                 tool_use_id: "exec-call-b".to_string(),
                 tool_input: serde_json::json!({ "command": "sleep 1; echo beta" }),
                 tool_response: serde_json::json!("beta\n"),
             }),
             Some(crate::tools::registry::PostToolUsePayload {
-                tool_name: HookToolName::bash(),
+                tool_name: HookToolName::exec_command(),
                 tool_use_id: "exec-call-a".to_string(),
                 tool_input: serde_json::json!({ "command": "sleep 2; echo alpha" }),
                 tool_response: serde_json::json!("alpha\n"),

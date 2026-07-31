@@ -21,9 +21,23 @@ use codex_agent_task_store::Attempt;
 use codex_agent_task_store::RepoScope;
 use codex_agent_task_store::StoreError;
 use codex_agent_task_store::TaskActor;
+use codex_agent_task_store::WorkspaceStrategy;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::AgentPath;
 use codex_tools::ToolSpec;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use sha2::Digest;
+use sha2::Sha256;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Stdio;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+use uuid::Uuid;
+
+const MAX_UNTRACKED_SNAPSHOT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_UNTRACKED_SNAPSHOT_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Default)]
 pub(crate) struct Handler {
@@ -110,6 +124,8 @@ async fn handle_spawn_agent(
     let child_depth = next_thread_spawn_depth(&session_source);
     let mut config =
         build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())?;
+    let mut spawn_environments = Some(turn.environments.to_selections());
+    let mut isolated_workspace: Option<IsolatedWorkspace> = None;
     if let Some(service_tier) = args.service_tier.as_ref() {
         config.service_tier = Some(service_tier.clone());
     }
@@ -166,15 +182,11 @@ async fn handle_spawn_agent(
         })?;
         let coordinator = session.services.agent_control.task_coordinator();
         if coordinator.store().is_none() {
-            let state_runtime = session.services.state_db.as_ref().ok_or_else(|| {
-                FunctionCallError::RespondToModel(
-                    "spawn_agent: durable typed assignments require persistent local session state"
-                        .to_string(),
-                )
-            })?;
             coordinator
-                .initialize(
-                    state_runtime.clone(),
+                .initialize_for_workspace_coordination(
+                    session.services.state_db.clone(),
+                    config.sqlite_home.clone(),
+                    config.model_provider_id.clone(),
                     session.services.agent_control.session_id().to_string(),
                 )
                 .await
@@ -194,12 +206,52 @@ async fn handle_spawn_agent(
             })?.to_path_buf(),
             None => turn.config.cwd.to_path_buf(),
         };
-        let repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
+        let main_repo_root = get_git_repo_root(&cwd).unwrap_or(cwd);
+        let repo_root = if assignment_args.workspace_strategy == WorkspaceStrategy::Isolated {
+            let workspace = Box::pin(create_isolated_worktree(
+                &main_repo_root,
+                config.codex_home.as_path(),
+                &args.task_name,
+            ))
+            .await?;
+            config.cwd = match AbsolutePathBuf::from_absolute_path(&workspace.path) {
+                Ok(path) => path,
+                Err(error) => {
+                    if let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await {
+                        tracing::warn!(
+                            path = %workspace.path.display(),
+                            %cleanup_error,
+                            "failed to clean isolated worktree after path conversion failure"
+                        );
+                    }
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "spawn_agent: isolated worktree path is invalid: {error}"
+                    )));
+                }
+            };
+            spawn_environments = None;
+            let repo_root = workspace.path.clone();
+            isolated_workspace = Some(workspace);
+            repo_root
+        } else {
+            main_repo_root
+        };
         let draft = assignment_args.into_draft(root_session_id, role);
-        let (assignment, attempt) = coordinator
-            .create_assignment(&repo_root, draft)
-            .await
-            .map_err(typed_task_store_error)?;
+        let (assignment, attempt) = match coordinator.create_assignment(&repo_root, draft).await {
+            Ok(task) => task,
+            Err(error) => {
+                if let Some(workspace) = isolated_workspace.take()
+                    && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
+                {
+                    tracing::warn!(
+                        path = %workspace.path.display(),
+                        %cleanup_error,
+                        "failed to clean isolated worktree after assignment creation failure"
+                    );
+                }
+                return Err(typed_task_store_error(error));
+            }
+        };
         Some((assignment, attempt))
     } else {
         None
@@ -231,7 +283,7 @@ async fn handle_spawn_agent(
                     fork_parent_spawn_call_id: fork_mode.as_ref().map(|_| call_id.clone()),
                     fork_mode,
                     parent_thread_id: Some(session.thread_id),
-                    environments: Some(turn.environments.to_selections()),
+                    environments: spawn_environments,
                     typed_task_binding: typed_task.as_ref().map(|(assignment, attempt)| {
                         AgentTaskBindingDraft {
                             assignment_id: assignment.assignment_id,
@@ -287,6 +339,15 @@ async fn handle_spawn_agent(
                         .await;
                 }
             }
+            if let Some(workspace) = isolated_workspace.take()
+                && let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await
+            {
+                tracing::warn!(
+                    path = %workspace.path.display(),
+                    %cleanup_error,
+                    "failed to clean isolated worktree after spawn failure"
+                );
+            }
             return Err(collab_spawn_error(error));
         }
     };
@@ -334,6 +395,285 @@ async fn handle_spawn_agent(
             nickname,
             assignment_id,
         })
+    }
+}
+
+#[derive(Debug)]
+struct IsolatedWorkspace {
+    main_repo_root: PathBuf,
+    path: PathBuf,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct WorkspaceOverlay {
+    tracked_diff: Vec<u8>,
+    untracked_files: Vec<(PathBuf, Vec<u8>)>,
+}
+
+async fn create_isolated_worktree(
+    repo_root: &Path,
+    codex_home: &Path,
+    task_name: &str,
+) -> Result<IsolatedWorkspace, FunctionCallError> {
+    let initial_overlay = capture_workspace_overlay(repo_root).await?;
+    let repository_key = format!(
+        "{:x}",
+        Sha256::digest(repo_root.to_string_lossy().as_bytes())
+    );
+    let safe_task_name = task_name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(24)
+        .collect::<String>();
+    let leaf = format!(
+        "{}-{}",
+        if safe_task_name.is_empty() {
+            "task"
+        } else {
+            &safe_task_name
+        },
+        Uuid::now_v7()
+    );
+    let parent = codex_home
+        .join("isolated-worktrees")
+        .join(&repository_key[..16]);
+    tokio::fs::create_dir_all(&parent).await.map_err(|error| {
+        FunctionCallError::RespondToModel(format!(
+            "spawn_agent: could not create isolated-worktree directory: {error}"
+        ))
+    })?;
+    let path = parent.join(leaf);
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "add", "--detach"])
+        .arg(&path)
+        .arg("HEAD")
+        .output()
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "spawn_agent: could not launch git worktree add: {error}"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "spawn_agent: git worktree add failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let workspace = IsolatedWorkspace {
+        main_repo_root: repo_root.to_path_buf(),
+        path,
+    };
+    let populate_result = Box::pin(async {
+        let current_overlay = capture_workspace_overlay(repo_root).await?;
+        if current_overlay != initial_overlay {
+            return Err(FunctionCallError::RespondToModel(
+                "spawn_agent: the shared worktree changed while its isolated snapshot was being created; retry after the current writer finishes"
+                    .to_string(),
+            ));
+        }
+        if !initial_overlay.tracked_diff.is_empty() {
+            let mut child = Command::new("git")
+                .arg("-C")
+                .arg(&workspace.path)
+                .args(["apply", "--binary", "--whitespace=nowarn", "-"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "spawn_agent: could not apply the shared-worktree snapshot: {error}"
+                    ))
+                })?;
+            let mut stdin = child.stdin.take().ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "spawn_agent: git apply stdin was unavailable".to_string(),
+                )
+            })?;
+            stdin
+                .write_all(&initial_overlay.tracked_diff)
+                .await
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "spawn_agent: could not stream the shared-worktree snapshot: {error}"
+                    ))
+                })?;
+            drop(stdin);
+            let output = child.wait_with_output().await.map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "spawn_agent: could not finish applying the shared-worktree snapshot: {error}"
+                ))
+            })?;
+            if !output.status.success() {
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "spawn_agent: isolated snapshot apply failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+        }
+        for (relative_path, bytes) in initial_overlay.untracked_files {
+            let target = workspace.path.join(relative_path);
+            if let Some(parent) = target.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "spawn_agent: could not create an isolated snapshot directory: {error}"
+                    ))
+                })?;
+            }
+            tokio::fs::write(&target, bytes).await.map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "spawn_agent: could not copy an untracked file into the isolated snapshot: {error}"
+                ))
+            })?;
+        }
+        Ok(())
+    })
+    .await;
+    if let Err(error) = populate_result {
+        if let Err(cleanup_error) = cleanup_isolated_worktree(&workspace).await {
+            tracing::warn!(
+                path = %workspace.path.display(),
+                %cleanup_error,
+                "failed to clean isolated worktree after snapshot failure"
+            );
+        }
+        return Err(error);
+    }
+    Ok(workspace)
+}
+
+async fn capture_workspace_overlay(
+    repo_root: &Path,
+) -> Result<WorkspaceOverlay, FunctionCallError> {
+    let diff = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["diff", "--binary", "--no-ext-diff", "HEAD", "--"])
+        .output()
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "spawn_agent: could not capture tracked workspace changes: {error}"
+            ))
+        })?;
+    if !diff.status.success() {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "spawn_agent: git diff failed while creating an isolated snapshot: {}",
+            String::from_utf8_lossy(&diff.stderr).trim()
+        )));
+    }
+    let untracked = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["ls-files", "--others", "--exclude-standard", "-z"])
+        .output()
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "spawn_agent: could not enumerate untracked workspace files: {error}"
+            ))
+        })?;
+    if !untracked.status.success() {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "spawn_agent: git ls-files failed while creating an isolated snapshot: {}",
+            String::from_utf8_lossy(&untracked.stderr).trim()
+        )));
+    }
+    let mut untracked_files = Vec::new();
+    let mut total_untracked_bytes = 0u64;
+    for raw_path in untracked.stdout.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(String::from_utf8(raw_path.to_vec()).map_err(|_| {
+            FunctionCallError::RespondToModel(
+                "spawn_agent: an untracked path is not valid UTF-8".to_string(),
+            )
+        })?);
+        let source = repo_root.join(&path);
+        let metadata = tokio::fs::symlink_metadata(&source)
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "spawn_agent: could not inspect untracked file {}: {error}",
+                    path.display()
+                ))
+            })?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "spawn_agent: isolated snapshots reject untracked symlinks and special files: {}",
+                path.display()
+            )));
+        }
+        if metadata.len() > MAX_UNTRACKED_SNAPSHOT_FILE_BYTES {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "spawn_agent: untracked file {} is too large for an isolated snapshot ({} bytes, max {})",
+                path.display(),
+                metadata.len(),
+                MAX_UNTRACKED_SNAPSHOT_FILE_BYTES
+            )));
+        }
+        total_untracked_bytes = total_untracked_bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "spawn_agent: untracked snapshot size overflowed".to_string(),
+                )
+            })?;
+        if total_untracked_bytes > MAX_UNTRACKED_SNAPSHOT_TOTAL_BYTES {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "spawn_agent: untracked files exceed the isolated snapshot limit of {MAX_UNTRACKED_SNAPSHOT_TOTAL_BYTES} bytes"
+            )));
+        }
+        let file = tokio::fs::File::open(&source).await.map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "spawn_agent: could not snapshot untracked file {}: {error}",
+                path.display()
+            ))
+        })?;
+        let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+        file.take(MAX_UNTRACKED_SNAPSHOT_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "spawn_agent: could not snapshot untracked file {}: {error}",
+                    path.display()
+                ))
+            })?;
+        if bytes.len() as u64 != metadata.len() {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "spawn_agent: untracked file {} changed while the isolated snapshot was captured",
+                path.display()
+            )));
+        }
+        untracked_files.push((path, bytes));
+    }
+    untracked_files.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(WorkspaceOverlay {
+        tracked_diff: diff.stdout,
+        untracked_files,
+    })
+}
+
+async fn cleanup_isolated_worktree(workspace: &IsolatedWorkspace) -> Result<(), std::io::Error> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(&workspace.main_repo_root)
+        .args(["worktree", "remove", "--force"])
+        .arg(&workspace.path)
+        .output()
+        .await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "git worktree remove failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )))
     }
 }
 
@@ -429,6 +769,10 @@ struct TypedAssignmentArgs {
     required_evidence: Vec<String>,
     #[serde(default)]
     prohibited_changes: Vec<String>,
+    #[serde(default)]
+    contract_claims: Vec<String>,
+    #[serde(default)]
+    workspace_strategy: WorkspaceStrategy,
     relation: Option<AssignmentRelation>,
 }
 
@@ -447,6 +791,8 @@ impl TypedAssignmentArgs {
             risk_hints: self.risk_hints,
             required_evidence: self.required_evidence,
             prohibited_changes: self.prohibited_changes,
+            contract_claims: self.contract_claims,
+            workspace_strategy: self.workspace_strategy,
             relation: self.relation,
         }
     }
@@ -543,6 +889,8 @@ mod tests {
             risk_hints: Vec::new(),
             required_evidence: Vec::new(),
             prohibited_changes: Vec::new(),
+            contract_claims: Vec::new(),
+            workspace_strategy: WorkspaceStrategy::Auto,
             relation: None,
         }
     }

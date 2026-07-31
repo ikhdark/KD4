@@ -131,15 +131,16 @@ fn post_unified_exec_tool_use_payload(
     invocation: &ToolInvocation,
     result: &dyn ToolOutput,
 ) -> Option<PostToolUsePayload> {
-    let ToolPayload::Function { .. } = &invocation.payload else {
+    let ToolPayload::Function { arguments } = &invocation.payload else {
         return None;
     };
 
-    let tool_input = result.post_tool_use_input(&invocation.payload)?;
+    let tool_input = exec_command::exec_command_hook_input(arguments)
+        .or_else(|| result.post_tool_use_input(&invocation.payload))?;
     let tool_use_id = result.post_tool_use_id(&invocation.call_id);
     let tool_response = result.post_tool_use_response(&tool_use_id, &invocation.payload)?;
     Some(PostToolUsePayload {
-        tool_name: HookToolName::bash(),
+        tool_name: HookToolName::exec_command(),
         tool_use_id,
         tool_input,
         tool_response,

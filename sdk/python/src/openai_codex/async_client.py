@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import queue
 import threading
-from collections.abc import Iterator
 from concurrent.futures import Future
 from typing import AsyncIterator, Callable, ParamSpec, TypeVar
 
@@ -56,6 +56,11 @@ class AsyncCodexClient:
         """Create the wrapped sync client that owns the transport process."""
         self._sync = CodexClient(config=config)
 
+    @property
+    def process_epoch(self) -> int:
+        """Return the wrapped transport generation."""
+        return self._sync.process_epoch
+
     async def __aenter__(self) -> "AsyncCodexClient":
         """Start the Codex process when entering an async context."""
         await self.start()
@@ -73,17 +78,18 @@ class AsyncCodexClient:
         **kwargs: ParamsT.kwargs,
     ) -> ReturnT:
         """Run a blocking sync-client operation without blocking the event loop."""
-        return await asyncio.to_thread(fn, *args, **kwargs)
-
-    @staticmethod
-    def _next_from_iterator(
-        iterator: Iterator[AgentMessageDeltaNotification],
-    ) -> tuple[bool, AgentMessageDeltaNotification | None]:
-        """Convert StopIteration into a value that can cross asyncio.to_thread."""
+        operation = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
         try:
-            return True, next(iterator)
-        except StopIteration:
-            return False, None
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # asyncio cannot stop a to_thread worker. Reconcile the finite sync
+            # operation before propagating cancellation so it cannot outlive its
+            # async owner.
+            try:
+                await asyncio.shield(operation)
+            except BaseException:
+                pass
+            raise
 
     async def start(self) -> None:
         """Start the wrapped sync client in a worker thread."""
@@ -256,7 +262,6 @@ class AsyncCodexClient:
         try:
             return await asyncio.shield(asyncio.wrap_future(operation))
         except asyncio.CancelledError:
-
             def cleanup_cancelled_start(
                 completed: Future[tuple[_GoalOperationState, str]],
             ) -> None:
@@ -288,7 +293,23 @@ class AsyncCodexClient:
         params: V2TurnStartParams | JsonObject | None = None,
     ) -> TurnStartResponse:
         """Start a turn using the wrapped sync client."""
-        return await self._call_sync(self._sync.turn_start, thread_id, input_items, params)
+        operation = asyncio.create_task(
+            asyncio.to_thread(self._sync.turn_start, thread_id, input_items, params)
+        )
+        try:
+            return await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            try:
+                started = await asyncio.shield(operation)
+            except BaseException:
+                raise
+            try:
+                await asyncio.shield(
+                    asyncio.to_thread(self._sync.turn_interrupt, thread_id, started.turn.id)
+                )
+            finally:
+                self._sync.unregister_turn_notifications(started.turn.id)
+            raise
 
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> TurnInterruptResponse:
         """Interrupt a turn using the wrapped sync client."""
@@ -335,30 +356,68 @@ class AsyncCodexClient:
 
     async def next_notification(self) -> Notification:
         """Wait for the next global notification without blocking the event loop."""
-        return await self._call_sync(self._sync.next_notification)
+        while True:
+            try:
+                return await self._call_sync(self._sync.next_notification, 0.1)
+            except queue.Empty:
+                await asyncio.sleep(0)
 
     async def next_login_notification(self, login_id: str) -> Notification:
         """Wait for the next notification routed to one login attempt."""
-        return await self._call_sync(self._sync.next_login_notification, login_id)
+        while True:
+            try:
+                return await self._call_sync(self._sync.next_login_notification, login_id, 0.1)
+            except queue.Empty:
+                await asyncio.sleep(0)
 
     async def next_turn_notification(self, turn_id: str) -> Notification:
         """Wait for the next notification routed to one turn."""
-        return await self._call_sync(self._sync.next_turn_notification, turn_id)
+        while True:
+            try:
+                return await self._call_sync(self._sync.next_turn_notification, turn_id, 0.1)
+            except queue.Empty:
+                await asyncio.sleep(0)
 
     async def next_goal_notification(self, state: _GoalOperationState) -> Notification:
         """Wait for the next notification in a logical goal turn."""
-        return await self._call_sync(self._sync.next_goal_notification, state)
+        while True:
+            try:
+                return await self._call_sync(self._sync.next_goal_notification, state, 0.1)
+            except queue.Empty:
+                await asyncio.sleep(0)
 
     async def wait_for_login_completed(
         self,
         login_id: str,
     ) -> AccountLoginCompletedNotification:
         """Wait for the completion notification routed to one login attempt."""
-        return await self._call_sync(self._sync.wait_for_login_completed, login_id)
+        self.register_login_notifications(login_id)
+        try:
+            while True:
+                notification = await self.next_login_notification(login_id)
+                if (
+                    notification.method == "account/login/completed"
+                    and isinstance(notification.payload, AccountLoginCompletedNotification)
+                    and notification.payload.login_id == login_id
+                ):
+                    return notification.payload
+        finally:
+            self.unregister_login_notifications(login_id)
 
     async def wait_for_turn_completed(self, turn_id: str) -> TurnCompletedNotification:
         """Wait for the completion notification routed to one turn."""
-        return await self._call_sync(self._sync.wait_for_turn_completed, turn_id)
+        self.register_turn_notifications(turn_id)
+        try:
+            while True:
+                notification = await self.next_turn_notification(turn_id)
+                if (
+                    notification.method == "turn/completed"
+                    and isinstance(notification.payload, TurnCompletedNotification)
+                    and notification.payload.turn.id == turn_id
+                ):
+                    return notification.payload
+        finally:
+            self.unregister_turn_notifications(turn_id)
 
     async def stream_text(
         self,
@@ -367,12 +426,23 @@ class AsyncCodexClient:
         params: V2TurnStartParams | JsonObject | None = None,
     ) -> AsyncIterator[AgentMessageDeltaNotification]:
         """Stream text deltas from one turn without monopolizing the event loop."""
-        iterator = self._sync.stream_text(thread_id, text, params)
-        while True:
-            has_value, chunk = await asyncio.to_thread(
-                self._next_from_iterator,
-                iterator,
-            )
-            if not has_value:
-                break
-            yield chunk
+        started = await self.turn_start(thread_id, text, params)
+        turn_id = started.turn.id
+        try:
+            while True:
+                notification = await self.next_turn_notification(turn_id)
+                if (
+                    notification.method == "item/agentMessage/delta"
+                    and isinstance(notification.payload, AgentMessageDeltaNotification)
+                    and notification.payload.turn_id == turn_id
+                ):
+                    yield notification.payload
+                    continue
+                if (
+                    notification.method == "turn/completed"
+                    and isinstance(notification.payload, TurnCompletedNotification)
+                    and notification.payload.turn.id == turn_id
+                ):
+                    break
+        finally:
+            self.unregister_turn_notifications(turn_id)

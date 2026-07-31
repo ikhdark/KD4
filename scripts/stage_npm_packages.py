@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
+import hashlib
 import importlib.util
 import json
 import os
@@ -222,6 +223,11 @@ def parse_args() -> argparse.Namespace:
             "copy fallback (default), copy always copies, hardlink requires links."
         ),
     )
+    parser.add_argument(
+        "--allow-source-native-mismatch",
+        action="store_true",
+        help="Allow dirty or commit-mismatched sources with a prominent warning.",
+    )
     return parser.parse_args()
 
 
@@ -368,7 +374,7 @@ def resolve_release_workflow(
             "--branch",
             f"rust-v{version}",
             "--json",
-            "workflowName,url,headSha",
+            "workflowName,url,headSha,status,conclusion",
             "--workflow",
             workflow_name,
             "--jq",
@@ -389,9 +395,31 @@ def resolve_workflow_url(
     version: str, override: str | None, github_repo: str, workflow_name: str
 ) -> tuple[str, str | None]:
     if override:
-        return override, None
+        reference = parse_workflow_run_url(override)
+        stdout = subprocess.check_output(
+            [
+                "gh",
+                "run",
+                "view",
+                reference.run_id,
+                "--repo",
+                reference.github_repo,
+                "--json",
+                "url,headSha,status,conclusion",
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+        )
+        workflow = json.loads(stdout)
+        workflow["url"] = override
+    else:
+        workflow = resolve_release_workflow(version, github_repo, workflow_name)
 
-    workflow = resolve_release_workflow(version, github_repo, workflow_name)
+    if workflow.get("status") != "completed" or workflow.get("conclusion") != "success":
+        raise RuntimeError(
+            "native artifact workflow must be completed successfully; "
+            f"status={workflow.get('status')!r}, conclusion={workflow.get('conclusion')!r}"
+        )
     return workflow["url"], workflow.get("headSha")
 
 
@@ -399,31 +427,32 @@ def workflow_id_from_url(workflow_url: str) -> str:
     return parse_workflow_run_url(workflow_url).run_id
 
 
-def warn_if_head_mismatch(
+def ensure_source_matches_workflow(
     expected_head_sha: str,
     *,
     repo_root: Path = REPO_ROOT,
+    allow_mismatch: bool = False,
 ) -> None:
-    try:
-        current_head_sha = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repo_root,
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-    except (OSError, subprocess.CalledProcessError) as exc:
-        print(
-            f"warning: unable to compare checkout HEAD with workflow {expected_head_sha}: {exc}",
-            file=sys.stderr,
-        )
-        return
+    current_head_sha = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
+    ).strip()
+    dirty = subprocess.check_output(
+        ["git", "status", "--porcelain", "--untracked-files=normal"],
+        cwd=repo_root,
+        text=True,
+    ).strip()
+    problems = []
     if current_head_sha.casefold() != expected_head_sha.casefold():
-        print(
-            "warning: current checkout HEAD "
-            f"{current_head_sha or '(unknown)'} does not match workflow HEAD "
-            f"{expected_head_sha}; staged sources may not match the native artifacts",
-            file=sys.stderr,
-        )
+        problems.append(f"checkout HEAD {current_head_sha} != workflow HEAD {expected_head_sha}")
+    if dirty:
+        problems.append("checkout has uncommitted changes")
+    if not problems:
+        return
+    message = "; ".join(problems)
+    if allow_mismatch:
+        print(f"WARNING: allowing source/native mismatch: {message}", file=sys.stderr)
+        return
+    raise RuntimeError(f"refusing source/native mismatch: {message}")
 
 
 @cache
@@ -639,17 +668,63 @@ def artifact_is_complete(artifact_dir: Path, artifact: WorkflowArtifact) -> bool
         marker = marker_path.read_text(encoding="utf-8")
     except OSError:
         return False
+    expected_digest = next(
+        (line.removeprefix("tree_sha256=") for line in marker.splitlines() if line.startswith("tree_sha256=")),
+        None,
+    )
+    if expected_digest is None:
+        return False
+    try:
+        actual_digest = artifact_tree_digest(artifact_dir)
+    except (OSError, RuntimeError):
+        return False
     return (
         f"name={artifact.name}\n" in marker
         and f"size_in_bytes={artifact.size_in_bytes}\n" in marker
+        and actual_digest == expected_digest
     )
+
+
+def artifact_tree_digest(artifact_dir: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(artifact_dir.rglob("*"), key=lambda item: item.relative_to(artifact_dir).as_posix()):
+        if path.name == COMPLETE_MARKER:
+            continue
+        relative = path.relative_to(artifact_dir).as_posix().encode("utf-8")
+        if path.is_symlink():
+            raise RuntimeError(f"artifact cache contains a symlink: {path}")
+        kind = b"d" if path.is_dir() else b"f" if path.is_file() else None
+        if kind is None:
+            raise RuntimeError(f"artifact cache contains a special entry: {path}")
+        digest.update(kind)
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        if kind == b"f":
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+    return digest.hexdigest()
 
 
 def write_complete_marker(artifact_dir: Path, artifact: WorkflowArtifact) -> None:
-    (artifact_dir / COMPLETE_MARKER).write_text(
-        f"name={artifact.name}\nsize_in_bytes={artifact.size_in_bytes}\n",
-        encoding="utf-8",
+    marker_path = artifact_dir / COMPLETE_MARKER
+    payload = (
+        f"name={artifact.name}\n"
+        f"size_in_bytes={artifact.size_in_bytes}\n"
+        f"tree_sha256={artifact_tree_digest(artifact_dir)}\n"
     )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{COMPLETE_MARKER}.", suffix=".tmp", dir=artifact_dir, text=True
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(marker_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def format_bytes(size_in_bytes: int) -> str:
@@ -831,7 +906,6 @@ def main() -> int:
     args = parse_args()
 
     output_dir = args.output_dir or (REPO_ROOT / "dist" / "npm")
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     runner_temp = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()))
     workflow_repo = (
@@ -932,7 +1006,12 @@ def main() -> int:
                 )
 
         if resolved_head_sha:
-            warn_if_head_mismatch(resolved_head_sha)
+            ensure_source_matches_workflow(
+                resolved_head_sha,
+                allow_mismatch=args.allow_source_native_mismatch,
+            )
+
+        output_dir.mkdir(parents=True, exist_ok=True)
 
         for result in stage_packages(
             packages,

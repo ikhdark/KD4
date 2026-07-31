@@ -5,6 +5,10 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import get_args
+
+from openai_codex.generated.notification_registry import NOTIFICATION_MODELS
+from openai_codex.models import NotificationPayload, ServerInfo, UnknownNotification
 
 ROOT = Path(__file__).resolve().parents[1]
 GENERATED_TARGETS = [
@@ -55,3 +59,10 @@ def test_generated_files_are_up_to_date():
 
     after = _snapshot_targets(ROOT)
     assert before == after, "Generated files drifted after regeneration"
+
+
+def test_public_notification_payload_matches_generated_registry() -> None:
+    payload_types = set(get_args(NotificationPayload))
+
+    assert payload_types == set(NOTIFICATION_MODELS.values()) | {UnknownNotification}
+    assert ServerInfo not in payload_types

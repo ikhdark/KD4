@@ -12,11 +12,8 @@
 //! Returned `io::Error` values still carry the detail needed by CLI/browser callers, while
 //! structured logs only emit explicitly reviewed fields plus redacted URL/error values.
 use std::io::Cursor;
-use std::io::Read;
 use std::io::Write;
 use std::io::{self};
-use std::net::SocketAddr;
-use std::net::TcpStream;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -441,6 +438,23 @@ async fn process_request(
                         opts.codex_streamlined_login,
                         &opts.login_success_page,
                     );
+                    let redirect = match redirect {
+                        LoginSuccessRedirect::Local(url) => match url::Url::parse(&url) {
+                            Ok(mut parsed) => {
+                                parsed.query_pairs_mut().append_pair("state", state);
+                                LoginSuccessRedirect::Local(parsed.to_string())
+                            }
+                            Err(_) => {
+                                return login_error_response(
+                                    "Sign-in completed but the local success URL was invalid.",
+                                    io::ErrorKind::InvalidData,
+                                    Some("redirect_failed"),
+                                    /*error_description*/ None,
+                                );
+                            }
+                        },
+                        hosted @ LoginSuccessRedirect::Hosted(_) => hosted,
+                    };
                     let url = match &redirect {
                         LoginSuccessRedirect::Local(url) | LoginSuccessRedirect::Hosted(url) => url,
                     };
@@ -474,6 +488,15 @@ async fn process_request(
             }
         }
         "/success" => {
+            if parsed_url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .is_none_or(|(_, value)| value != state)
+            {
+                return HandledRequest::Response(
+                    Response::from_string("State mismatch").with_status_code(400),
+                );
+            }
             let use_streamlined_success = parsed_url
                 .query_pairs()
                 .any(|(key, value)| key == "codex_streamlined_login" && value == "true");
@@ -494,14 +517,26 @@ async fn process_request(
                 result: Ok(()),
             }
         }
-        "/cancel" => HandledRequest::ResponseAndExit {
-            headers: Vec::new(),
-            body: b"Login cancelled".to_vec(),
-            result: Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "Login cancelled",
-            )),
-        },
+        "/cancel" => {
+            if parsed_url
+                .query_pairs()
+                .find(|(key, _)| key == "state")
+                .is_none_or(|(_, value)| value != state)
+            {
+                HandledRequest::Response(
+                    Response::from_string("State mismatch").with_status_code(400),
+                )
+            } else {
+                HandledRequest::ResponseAndExit {
+                    headers: Vec::new(),
+                    body: b"Login cancelled".to_vec(),
+                    result: Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "Login cancelled",
+                    )),
+                }
+            }
+        }
         _ => HandledRequest::Response(Response::from_string("Not Found").with_status_code(404)),
     }
 }
@@ -594,28 +629,10 @@ fn generate_state() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-fn send_cancel_request(port: u16) -> io::Result<()> {
-    let addr: SocketAddr = format!("127.0.0.1:{port}")
-        .parse()
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-
-    stream.write_all(b"GET /cancel HTTP/1.1\r\n")?;
-    stream.write_all(format!("Host: 127.0.0.1:{port}\r\n").as_bytes())?;
-    stream.write_all(b"Connection: close\r\n\r\n")?;
-
-    let mut buf = [0u8; 64];
-    let _ = stream.read(&mut buf);
-    Ok(())
-}
-
 fn bind_server(port: u16) -> io::Result<Server> {
     let preferred_bind_address = format!("127.0.0.1:{port}");
     let fallback_bind_address = format!("127.0.0.1:{FALLBACK_PORT}");
     let mut bind_address = preferred_bind_address.clone();
-    let mut cancel_attempted = false;
     let mut attempts = 0;
     let mut using_fallback_port = false;
     const MAX_ATTEMPTS: u32 = 10;
@@ -631,16 +648,7 @@ fn bind_server(port: u16) -> io::Result<Server> {
                     .map(|io_err| io_err.kind() == io::ErrorKind::AddrInUse)
                     .unwrap_or(false);
 
-                // If the address is in use, there may be another instance of the login server
-                // running. Attempt to cancel it and retry before falling back.
                 if is_addr_in_use {
-                    if !cancel_attempted && !using_fallback_port {
-                        cancel_attempted = true;
-                        if let Err(cancel_err) = send_cancel_request(port) {
-                            eprintln!("Failed to cancel previous login server: {cancel_err}");
-                        }
-                    }
-
                     thread::sleep(RETRY_DELAY);
 
                     if attempts >= MAX_ATTEMPTS {

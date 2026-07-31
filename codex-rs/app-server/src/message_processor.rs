@@ -733,8 +733,8 @@ impl MessageProcessor {
         connection_id: ConnectionId,
         response: JSONRPCResponse,
     ) {
-        tracing::info!("<- response: {:?}", response);
         let JSONRPCResponse { id, result, .. } = response;
+        tracing::info!(?connection_id, ?id, "<- response");
         self.outgoing
             .notify_client_response(connection_id, id, result)
             .await
@@ -742,7 +742,12 @@ impl MessageProcessor {
 
     /// Handle an error object received from the peer.
     pub(crate) async fn process_error(&self, connection_id: ConnectionId, err: JSONRPCError) {
-        tracing::error!("<- error: {:?}", err);
+        tracing::error!(
+            ?connection_id,
+            request_id = ?err.id,
+            code = ?err.error.code,
+            "<- error"
+        );
         self.outgoing
             .notify_client_error(connection_id, err.id, err.error)
             .await;

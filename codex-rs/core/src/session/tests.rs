@@ -4202,7 +4202,7 @@ fn text_block(s: &str) -> serde_json::Value {
 }
 
 async fn build_test_config(codex_home: &Path) -> Config {
-    ConfigBuilder::without_managed_config_for_tests()
+    let mut config = ConfigBuilder::without_managed_config_for_tests()
         .codex_home(codex_home.to_path_buf())
         .harness_overrides(ConfigOverrides {
             model: Some("gpt-5.5".to_string()),
@@ -4210,7 +4210,9 @@ async fn build_test_config(codex_home: &Path) -> Config {
         })
         .build()
         .await
-        .expect("load default test config")
+        .expect("load default test config");
+    config.sqlite_home = config.codex_home.to_path_buf();
+    config
 }
 
 fn session_telemetry(

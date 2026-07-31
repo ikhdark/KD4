@@ -37,6 +37,7 @@
     "build:watch": "tsup --watch",
     "lint": "pnpm eslint \"src/**/*.ts\" \"tests/**/*.ts\"",
     "lint:fix": "pnpm eslint --fix \"src/**/*.ts\" \"tests/**/*.ts\"",
+    "typecheck": "tsc --noEmit --rootDir . --allowImportingTsExtensions",
     "test": "jest",
     "test:watch": "jest --watch",
     "coverage": "jest --coverage",

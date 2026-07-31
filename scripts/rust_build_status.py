@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field
 import json
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import time
 from typing import Callable
+from typing import Iterator
 from typing import Mapping
 from typing import Sequence
 from typing import TextIO
@@ -502,6 +504,59 @@ def lane_active_lock_is_held(lane_dir: Path) -> bool:
             handle.close()
 
 
+@contextmanager
+def cargo_lane_coordination_lock(lane_root: Path) -> Iterator[None]:
+    """Serialize lane creation with the final prune check and rename."""
+
+    lock_path = lane_root / ".lane-coordination.lock"
+    deadline = time.monotonic() + 30.0
+    handle = None
+    while handle is None:
+        try:
+            handle = lock_path.open("a+b")
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for lane coordination lock {lock_path}")
+            time.sleep(0.05)
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            while True:
+                try:
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"timed out waiting for lane coordination lock {lock_path}"
+                        )
+                    time.sleep(0.05)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 def is_protected_target_dir_name(name: str) -> bool:
     return name in PROTECTED_TARGET_DIR_NAMES or any(
         name.startswith(prefix) for prefix in PROTECTED_TARGET_DIR_PREFIXES
@@ -853,27 +908,45 @@ def prune_stale_lanes(
         if cargo_lock_is_busy(path) or lane_active_lock_is_held(path):
             continue
         if not dry_run:
+            trash_path: Path | None = None
             try:
-                if is_indirect_directory(path):
-                    print(
-                        f"warning: lane became an indirect path before prune: {path}",
-                        file=sys.stderr,
+                with cargo_lane_coordination_lock(lane_root):
+                    if not path.exists():
+                        continue
+                    if is_indirect_directory(path):
+                        print(
+                            f"warning: lane became an indirect path before prune: {path}",
+                            file=sys.stderr,
+                        )
+                        continue
+                    if cargo_lock_is_busy(path) or lane_active_lock_is_held(path):
+                        continue
+                    timestamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
+                    centiseconds = int((time.time() % 1) * 100)
+                    trash_path = path.with_name(
+                        f"{path.name}.trash-{timestamp}{centiseconds:02d}0"
                     )
-                    continue
-                if cargo_lock_is_busy(path) or lane_active_lock_is_held(path):
-                    continue
-                # Lanes routinely contain read-only files (registry-cache
-                # copies in build OUT_DIRs); bare rmtree would abort partway.
-                remove_tree_allow_readonly(path)
+                    if trash_path.exists():
+                        raise FileExistsError(trash_path)
+                    path.replace(trash_path)
+                # A new reservation may now recreate `path`; delete only the
+                # uniquely renamed tree after releasing the coordination lock.
+                remove_tree_allow_readonly(trash_path)
             except FileNotFoundError:
                 continue
             except OSError as exc:
-                if not cargo_lock_is_busy(path) and not lane_active_lock_is_held(path):
+                if trash_path is None:
+                    if cargo_lock_is_busy(path) or lane_active_lock_is_held(path):
+                        continue
                     print(
                         f"warning: failed to prune lane {path}: {exc}",
                         file=sys.stderr,
                     )
-                continue
+                    continue
+                print(
+                    f"warning: lane moved to deferred cleanup path {trash_path}: {exc}",
+                    file=sys.stderr,
+                )
         removed.append(path)
     return removed
 

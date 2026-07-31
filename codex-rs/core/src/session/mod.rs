@@ -1085,11 +1085,9 @@ impl Session {
         Ok((network_proxy, session_network_proxy))
     }
 
-    async fn refresh_managed_network_proxy_for_current_permission_profile(&self) {
-        let Ok(_refresh_guard) = self.managed_network_proxy_refresh_lock.acquire().await else {
-            error!("managed network proxy refresh semaphore closed");
-            return;
-        };
+    async fn refresh_managed_network_proxy_for_current_permission_profile(
+        &self,
+    ) -> anyhow::Result<()> {
         let session_configuration = {
             let state = self.state.lock().await;
             state.session_configuration.clone()
@@ -1102,7 +1100,7 @@ impl Session {
             .cloned()
         else {
             self.services.network_proxy.store(None);
-            return;
+            return Ok(());
         };
 
         let spec = match spec
@@ -1110,28 +1108,13 @@ impl Session {
         {
             Ok(spec) => spec,
             Err(err) => {
-                warn!("failed to rebuild managed network proxy policy for sandbox change: {err}");
-                return;
+                return Err(anyhow::anyhow!(
+                    "failed to rebuild managed network proxy policy for sandbox change: {err}"
+                ));
             }
         };
         let current_exec_policy = self.services.exec_policy.current();
-        let spec = match spec.with_exec_policy_network_rules(current_exec_policy.as_ref()) {
-            Ok(spec) => spec,
-            Err(err) => {
-                warn!(
-                    "failed to apply execpolicy network rules while refreshing managed network proxy: {err}"
-                );
-                spec
-            }
-        };
-        if let Some(started_proxy) = self.services.network_proxy.load_full() {
-            if let Err(err) = spec.apply_to_started_proxy(started_proxy.as_ref()).await {
-                warn!("failed to refresh managed network proxy for sandbox change: {err}");
-            }
-            return;
-        }
-
-        match Self::start_managed_network_proxy(
+        let (started_proxy, _session_network_proxy) = Self::start_managed_network_proxy(
             &spec,
             current_exec_policy.as_ref(),
             &session_configuration.permission_profile(),
@@ -1144,17 +1127,14 @@ impl Session {
             self.services.managed_network_requirements_configured,
             self.services.network_proxy_audit_metadata.clone(),
         )
-        .await
-        {
-            Ok((started_proxy, _session_network_proxy)) => {
-                self.services
-                    .network_proxy
-                    .store(Some(Arc::new(started_proxy)));
-            }
-            Err(err) => {
-                warn!("failed to start managed network proxy for sandbox change: {err}");
-            }
-        }
+        .await?;
+        // Publish only a fully started candidate. Existing turns retain their
+        // Arc to the previous proxy; new turns cannot enter while the caller
+        // holds the refresh semaphore.
+        self.services
+            .network_proxy
+            .store(Some(Arc::new(started_proxy)));
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1513,8 +1493,20 @@ impl Session {
         &self,
         updates: SessionSettingsUpdate,
     ) -> ConstraintResult<()> {
+        let _refresh_guard = self
+            .managed_network_proxy_refresh_lock
+            .acquire()
+            .await
+            .expect("managed network proxy refresh semaphore is never closed");
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
-        let (previous_config, new_config, permission_profile_changed) = {
+        let (
+            previous_config,
+            new_config,
+            permission_profile_changed,
+            previous_session_configuration,
+            updated_session_configuration,
+            environments_changed,
+        ) = {
             let mut state = self.state.lock().await;
             let updated = match state.session_configuration.apply(&updates) {
                 Ok(updated) => updated,
@@ -1532,20 +1524,36 @@ impl Session {
             let updated_permission_profile = updated.permission_profile();
             let permission_profile_changed =
                 previous_permission_profile != updated_permission_profile;
-            if updates.environments.is_some() {
-                self.services
-                    .turn_environments
-                    .update_selections(updated.environment_selections());
-                self.services.bump_planning_generation();
-            }
+            let previous_session_configuration = state.session_configuration.clone();
+            let updated_session_configuration = updated.clone();
             state.session_configuration = updated;
-            (previous_config, new_config, permission_profile_changed)
+            (
+                previous_config,
+                new_config,
+                permission_profile_changed,
+                previous_session_configuration,
+                updated_session_configuration,
+                updates.environments.is_some(),
+            )
         };
-        self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
         if permission_profile_changed {
-            self.refresh_managed_network_proxy_for_current_permission_profile()
-                .await;
+            if let Err(error) = self
+                .refresh_managed_network_proxy_for_current_permission_profile()
+                .await
+            {
+                self.state.lock().await.session_configuration = previous_session_configuration;
+                return Err(codex_config::ConstraintError::UpdateRejected {
+                    reason: error.to_string(),
+                });
+            }
         }
+        if environments_changed {
+            self.services
+                .turn_environments
+                .update_selections(updated_session_configuration.environment_selections());
+            self.services.bump_planning_generation();
+        }
+        self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
 
         Ok(())
     }

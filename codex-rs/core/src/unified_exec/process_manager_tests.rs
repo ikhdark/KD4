@@ -541,6 +541,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         additional_permissions_preapproved: false,
         justification: None,
         prefix_rule: None,
+        mutation_lease_lost: None,
     };
 
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));
@@ -607,7 +608,7 @@ fn pruning_prefers_exited_processes_outside_recently_used() {
 }
 
 #[test]
-fn pruning_falls_back_to_lru_when_no_exited() {
+fn pruning_refuses_to_evict_when_no_process_has_exited() {
     let now = Instant::now();
     let meta = vec![
         (1, now - Duration::from_secs(40), false),
@@ -624,11 +625,11 @@ fn pruning_falls_back_to_lru_when_no_exited() {
 
     let candidate = UnifiedExecProcessManager::process_id_to_prune_from_meta(&meta);
 
-    assert_eq!(candidate, Some(1));
+    assert_eq!(candidate, None);
 }
 
 #[test]
-fn pruning_protects_recent_processes_even_if_exited() {
+fn pruning_selects_the_oldest_exited_process_without_evicting_live_processes() {
     let now = Instant::now();
     let meta = vec![
         (1, now - Duration::from_secs(40), false),
@@ -645,6 +646,5 @@ fn pruning_protects_recent_processes_even_if_exited() {
 
     let candidate = UnifiedExecProcessManager::process_id_to_prune_from_meta(&meta);
 
-    // (10) is exited but among the last 8; we should drop the LRU outside that set.
-    assert_eq!(candidate, Some(1));
+    assert_eq!(candidate, Some(3));
 }

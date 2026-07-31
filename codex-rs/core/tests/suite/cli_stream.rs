@@ -80,6 +80,7 @@ fn personal_access_token_exec_command(server: &MockServer, home: &TempDir) -> Co
         .arg(repo_root())
         .arg("hello?");
     cmd.env("CODEX_HOME", home.path())
+        .env_remove(codex_state::SQLITE_HOME_ENV)
         .env(CODEX_ACCESS_TOKEN_ENV_VAR, PERSONAL_ACCESS_TOKEN)
         .env("CODEX_AUTHAPI_BASE_URL", server.uri())
         .env_remove(CODEX_API_KEY_ENV_VAR)
@@ -239,6 +240,7 @@ async fn responses_mode_stream_cli() {
         .arg(&repo_root)
         .arg("hello?");
     cmd.env("CODEX_HOME", home.path())
+        .env_remove(codex_state::SQLITE_HOME_ENV)
         .env("OPENAI_API_KEY", "dummy");
 
     let output = run_cli_command(&mut cmd).unwrap();
@@ -279,6 +281,7 @@ async fn responses_mode_stream_cli_supports_openai_base_url_config_override() {
         .arg(&repo_root)
         .arg("hello?");
     cmd.env("CODEX_HOME", home.path())
+        .env_remove(codex_state::SQLITE_HOME_ENV)
         .env("OPENAI_API_KEY", "dummy");
 
     let output = run_cli_command(&mut cmd).unwrap();
@@ -337,6 +340,7 @@ async fn exec_cli_applies_model_instructions_file() {
         .arg(&repo_root)
         .arg("hello?\n");
     cmd.env("CODEX_HOME", home.path())
+        .env_remove(codex_state::SQLITE_HOME_ENV)
         .env("OPENAI_API_KEY", "dummy");
 
     let output = run_cli_command(&mut cmd).unwrap();
@@ -409,6 +413,7 @@ async fn exec_cli_profile_applies_model_instructions_file() {
         .arg(&repo_root)
         .arg("hello?\n");
     cmd.env("CODEX_HOME", home.path())
+        .env_remove(codex_state::SQLITE_HOME_ENV)
         .env("OPENAI_API_KEY", "dummy");
 
     let output = run_cli_command(&mut cmd).unwrap();
@@ -450,6 +455,7 @@ async fn responses_api_stream_cli() {
         .arg(&repo_root)
         .arg("hello?");
     cmd.env("CODEX_HOME", home.path())
+        .env_remove(codex_state::SQLITE_HOME_ENV)
         .env("OPENAI_API_KEY", "dummy");
 
     let output = run_cli_command(&mut cmd).unwrap();
@@ -491,6 +497,7 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
         .arg(&repo_root)
         .arg(&prompt);
     cmd.env("CODEX_HOME", home.path())
+        .env_remove(codex_state::SQLITE_HOME_ENV)
         .env(CODEX_API_KEY_ENV_VAR, "dummy");
 
     let output = run_cli_command(&mut cmd).unwrap();
@@ -609,10 +616,17 @@ async fn integration_creates_and_checks_session_file() -> anyhow::Result<()> {
         .arg("resume")
         .arg("--last");
     cmd2.env("CODEX_HOME", home.path())
+        .env_remove(codex_state::SQLITE_HOME_ENV)
         .env("OPENAI_API_KEY", "dummy");
 
     let output2 = run_cli_command(&mut cmd2).unwrap();
-    assert!(output2.status.success(), "resume codex-cli run failed");
+    assert!(
+        output2.status.success(),
+        "resume codex-cli run failed with status {}\nstdout:\n{}\nstderr:\n{}",
+        output2.status,
+        String::from_utf8_lossy(&output2.stdout),
+        String::from_utf8_lossy(&output2.stderr),
+    );
     assert_eq!(resp_mock.requests().len(), 2);
 
     // Find the new session file containing the resumed marker.

@@ -1507,9 +1507,7 @@ async fn load_auth_reads_personal_access_token_from_env() {
 }
 
 #[tokio::test]
-#[serial(codex_auth_env)]
 async fn auth_manager_rejects_env_personal_access_token_workspace_mismatch() {
-    let codex_home = tempdir().unwrap();
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path("/v1/user-auth-credential/whoami"))
@@ -1521,9 +1519,28 @@ async fn auth_manager_rejects_env_personal_access_token_workspace_mismatch() {
         .expect(1)
         .mount(&server)
         .await;
-    let _authapi_guard = EnvVarGuard::set("CODEX_AUTHAPI_BASE_URL", &server.uri());
-    let _access_token_guard =
-        EnvVarGuard::set(CODEX_ACCESS_TOKEN_ENV_VAR, "at-env-workspace-mismatch");
+
+    let status = tokio::process::Command::new(std::env::current_exe().expect("test executable"))
+        .arg("--exact")
+        .arg(
+            "auth::manager::tests::auth_manager_rejects_env_personal_access_token_workspace_mismatch_child",
+        )
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("CODEX_AUTHAPI_BASE_URL", server.uri())
+        .env(CODEX_ACCESS_TOKEN_ENV_VAR, "at-env-workspace-mismatch")
+        .status()
+        .await
+        .expect("run isolated auth environment test");
+
+    assert!(status.success(), "isolated auth environment test failed");
+    server.verify().await;
+}
+
+#[tokio::test]
+#[ignore = "subprocess-only test for isolated process environment"]
+async fn auth_manager_rejects_env_personal_access_token_workspace_mismatch_child() {
+    let codex_home = tempdir().unwrap();
 
     let manager = AuthManager::new(
         codex_home.path().to_path_buf(),
@@ -1537,7 +1554,6 @@ async fn auth_manager_rejects_env_personal_access_token_workspace_mismatch() {
     .await;
 
     assert_eq!(manager.auth().await, None);
-    server.verify().await;
 }
 
 #[tokio::test]

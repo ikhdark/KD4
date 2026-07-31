@@ -866,9 +866,11 @@ async fn run_exec_session(args: ExecRunArgs) -> anyhow::Result<()> {
 
     let (interrupt_tx, mut interrupt_rx) = mpsc::unbounded_channel::<()>();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
+        while tokio::signal::ctrl_c().await.is_ok() {
             tracing::debug!("Keyboard interrupt");
-            let _ = interrupt_tx.send(());
+            if interrupt_tx.send(()).is_err() {
+                break;
+            }
         }
     });
 

@@ -55,6 +55,30 @@ impl HookToolName {
         Self::new("Bash")
     }
 
+    /// Returns the stable hook identity for `shell_command`.
+    ///
+    /// Shell hooks historically receive `Bash` in hook stdin. Keep that
+    /// serialized contract while accepting the concrete Codex tool name as an
+    /// additional matcher input.
+    pub(crate) fn shell_command() -> Self {
+        Self {
+            name: "Bash".to_string(),
+            matcher_aliases: vec!["shell_command".to_string()],
+        }
+    }
+
+    /// Returns the stable hook identity for `exec_command`.
+    ///
+    /// Unified exec is another shell transport, so preserve the same `Bash`
+    /// payload contract and expose the concrete tool name only as a matcher
+    /// alias.
+    pub(crate) fn exec_command() -> Self {
+        Self {
+            name: "Bash".to_string(),
+            matcher_aliases: vec!["exec_command".to_string()],
+        }
+    }
+
     /// Returns the canonical hook name serialized into hook stdin.
     pub(crate) fn name(&self) -> &str {
         &self.name

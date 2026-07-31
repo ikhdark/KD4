@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use serde_json::json;
+
 use crate::function_tool::FunctionCallError;
 use crate::shell::Shell;
 use crate::shell::ShellType;
@@ -41,6 +43,14 @@ fn powershell_script_mode_accepts_script_body_only() {
     );
     assert!(invocation.is_powershell_script());
     assert_eq!(invocation.display_command(), "Get-ChildItem -Force");
+    assert_eq!(
+        invocation.hook_input(),
+        json!({
+            "command": "Get-ChildItem -Force",
+            "kind": "powershell_script",
+            "script_body": "Get-ChildItem -Force",
+        })
+    );
 }
 
 #[test]
@@ -58,6 +68,80 @@ fn argv_mode_accepts_program_and_args_without_script() {
     );
     assert!(invocation.is_argv());
     assert_eq!(invocation.display_command(), "rg --files codex-rs");
+    assert_eq!(
+        invocation.hook_input(),
+        json!({
+            "command": "rg --files codex-rs",
+            "kind": "argv",
+            "program": "rg",
+            "args": ["--files", "codex-rs"],
+        })
+    );
+}
+
+#[test]
+fn argv_hook_rewrite_preserves_structured_shape() {
+    let invocation = parse(
+        None,
+        Some("argv"),
+        Some("rg"),
+        Some(&["--files".to_string()]),
+        None,
+    )
+    .expect("argv should parse");
+
+    assert_eq!(
+        invocation
+            .with_updated_hook_input(
+                "exec_command",
+                &json!({
+                    "kind": "argv",
+                    "program": "kds",
+                    "args": ["--agent", "--", "rg", "--files"],
+                }),
+            )
+            .expect("structured argv rewrite should be accepted"),
+        CommandInvocation::Argv {
+            program: "kds".to_string(),
+            args: vec![
+                "--agent".to_string(),
+                "--".to_string(),
+                "rg".to_string(),
+                "--files".to_string(),
+            ],
+        }
+    );
+}
+
+#[test]
+fn argv_hook_rewrite_rejects_mixed_or_misleading_shapes() {
+    let invocation = parse(None, Some("argv"), Some("rg"), None, None).expect("argv should parse");
+
+    let changed_text = invocation
+        .with_updated_hook_input("exec_command", &json!({ "command": "rg --hidden" }))
+        .expect_err("changed text must not replace argv");
+    assert!(
+        changed_text
+            .to_string()
+            .contains("cannot rewrite a direct argv command as text")
+    );
+
+    let conflicting_display = invocation
+        .with_updated_hook_input(
+            "exec_command",
+            &json!({
+                "command": "not-the-command",
+                "kind": "argv",
+                "program": "rg",
+                "args": ["--files"],
+            }),
+        )
+        .expect_err("structured argv display must be consistent");
+    assert!(
+        conflicting_display
+            .to_string()
+            .contains("does not match its structured `program`/`args`")
+    );
 }
 
 #[test]

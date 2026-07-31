@@ -25,6 +25,22 @@ pub enum StoreError {
     DependencyBlocked { blockers: Vec<DependencyBlocker> },
     #[error("active write claims overlap: {conflicts:?}")]
     WriteClaimConflict { conflicts: Vec<WriteClaimConflict> },
+    #[error("workspace mutation overlaps an active claim: {details:?}")]
+    WorkspaceClaimConflict { details: Vec<String> },
+    #[error("workspace file changed after the supporting read: {paths:?}")]
+    WorkspaceCasMismatch { paths: Vec<String> },
+    #[error("workspace mutation lease {0} is unavailable, expired, or already released")]
+    WorkspaceLeaseUnavailable(String),
+    #[error("workspace state initialization failed: {0}")]
+    WorkspaceStateInitialization(String),
+    #[error("validation evidence was superseded by workspace changes: {call_ids:?}")]
+    EvidenceSuperseded { call_ids: Vec<String> },
+    #[error(
+        "stale-evidence recovery is exhausted for attempt {0}; root reconciliation is required"
+    )]
+    StaleRecoveryExhausted(AttemptId),
+    #[error("isolated handoff from assignment {0} changed after it was versioned")]
+    IsolationHandoffSuperseded(AssignmentId),
     #[error("only one immutable correction amendment is allowed for assignment {0}")]
     AmendmentLimitReached(AssignmentId),
     #[error("only worker assignments may create a correction attempt: {0}")]

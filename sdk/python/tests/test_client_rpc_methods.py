@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from openai_codex.client import CodexClient, _params_dict
+from openai_codex.errors import CodexError
+from openai_codex.api import TurnHandle
 from openai_codex.generated.notification_registry import notification_turn_id
 from openai_codex.generated.v2_all import (
     AgentMessageDeltaNotification,
@@ -11,6 +15,7 @@ from openai_codex.generated.v2_all import (
     ThreadResumeResponse,
     ThreadTokenUsageUpdatedNotification,
     TurnCompletedNotification,
+    TurnStartResponse,
     WarningNotification,
 )
 from openai_codex.models import Notification, UnknownNotification
@@ -109,12 +114,11 @@ def test_unknown_notifications_fall_back_to_unknown_payloads() -> None:
     assert event.payload.params["msg"] == {"type": "turn_aborted"}
 
 
-def test_invalid_notification_payload_falls_back_to_unknown() -> None:
+def test_invalid_known_notification_payload_fails_fast() -> None:
     client = CodexClient()
-    event = client._coerce_notification("thread/tokenUsage/updated", {"threadId": "missing"})
 
-    assert event.method == "thread/tokenUsage/updated"
-    assert isinstance(event.payload, UnknownNotification)
+    with pytest.raises(CodexError, match="Invalid payload for known notification"):
+        client._coerce_notification("thread/tokenUsage/updated", {"threadId": "missing"})
 
 
 def test_generated_notification_turn_id_handles_known_payload_shapes() -> None:
@@ -256,13 +260,14 @@ def test_client_reader_routes_interleaved_turn_notifications_by_turn_id() -> Non
         },
     ]
 
-    def fake_read_message() -> dict[str, object]:
+    def fake_read_message(_proc=None) -> dict[str, object]:
         """Feed the reader loop a realistic interleaved stdout sequence."""
         if messages:
             return messages.pop(0)
         raise EOFError
 
     client._read_message = fake_read_message  # type: ignore[method-assign]
+    client._router.fail_all = lambda _exc: None  # type: ignore[method-assign]
     client._reader_loop()
 
     first_turn_events = [
@@ -315,8 +320,8 @@ def test_turn_notification_router_buffers_events_before_registration() -> None:
     )
 
 
-def test_turn_notification_router_clears_unregistered_turn_when_completed() -> None:
-    """A completed unregistered turn should not leave a pending queue behind."""
+def test_turn_notification_router_replays_completion_after_late_registration() -> None:
+    """A completion racing turn/start response registration must remain observable."""
     client = CodexClient()
     client._router.route_notification(
         client._coerce_notification(
@@ -339,7 +344,59 @@ def test_turn_notification_router_clears_unregistered_turn_when_completed() -> N
         )
     )
 
-    assert client._router._pending_turn_notifications == {}
+    client.register_turn_notifications("turn-1")
+    events = [
+        client.next_turn_notification("turn-1"),
+        client.next_turn_notification("turn-1"),
+    ]
+
+    assert [event.method for event in events] == [
+        "item/agentMessage/delta",
+        "turn/completed",
+    ]
+
+
+def test_turn_start_replays_completion_that_arrives_before_response() -> None:
+    client = CodexClient()
+    completion = client._coerce_notification(
+        "turn/completed",
+        {
+            "threadId": "thread-1",
+            "turn": {"id": "turn-1", "items": [], "status": "completed"},
+        },
+    )
+    response = TurnStartResponse.model_validate(
+        {"turn": {"id": "turn-1", "items": [], "status": "completed"}}
+    )
+
+    def request_before_completion(*_args, **_kwargs) -> TurnStartResponse:
+        client._router.route_notification(completion)
+        return response
+
+    client.request = request_before_completion  # type: ignore[method-assign]
+
+    started = client.turn_start("thread-1", "hello")
+
+    assert started.turn.id == "turn-1"
+    assert client.next_turn_notification("turn-1").method == "turn/completed"
+
+
+def test_reader_failure_is_persistent_for_late_turn_registration() -> None:
+    client = CodexClient()
+    messages: list[dict[str, object]] = [
+        {"method": "turn/completed", "params": {"threadId": "thread-1"}}
+    ]
+
+    def fake_read_message(_proc=None) -> dict[str, object]:
+        if messages:
+            return messages.pop(0)
+        raise EOFError
+
+    client._read_message = fake_read_message  # type: ignore[method-assign]
+    client._reader_loop()
+
+    with pytest.raises(CodexError, match="Invalid payload for known notification"):
+        client.register_turn_notifications("turn-1")
 
 
 def test_turn_notification_router_routes_unknown_turn_notifications() -> None:
@@ -365,3 +422,36 @@ def test_turn_notification_router_routes_unknown_turn_notifications() -> None:
     second = client.next_turn_notification("turn-2")
 
     assert [first.method, second.method] == ["unknown/direct", "unknown/nested"]
+
+
+def test_turn_handle_close_releases_registered_route() -> None:
+    client = CodexClient()
+    client.register_turn_notifications("turn-1")
+    handle = TurnHandle(client, "thread-1", "turn-1")
+
+    handle.close()
+
+    client._router.route_notification(
+        client._coerce_notification(
+            "item/agentMessage/delta",
+            {
+                "delta": "ignored",
+                "itemId": "item-1",
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+            },
+        )
+    )
+    client._router.route_notification(
+        client._coerce_notification(
+            "turn/completed",
+            {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "items": [], "status": "completed"},
+            },
+        )
+    )
+
+    assert "turn-1" not in client._router._turn_notifications
+    assert "turn-1" not in client._router._pending_turn_notifications
+    assert "turn-1" not in client._router._abandoned_turns

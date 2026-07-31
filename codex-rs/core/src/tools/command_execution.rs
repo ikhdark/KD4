@@ -2,13 +2,18 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::hash::Hash;
 use std::hash::Hasher;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use codex_agent_task_store::AgentTaskStore;
+use codex_agent_task_store::WorkspaceMutationLease;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::tools::command_output_artifact::RawOutputArtifact;
 
 const MAX_TRACKED_COMMANDS: usize = 128;
-const MAX_TRACKED_PROCESSES: usize = 64;
 const MAX_CONSECUTIVE_FAILURES: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -128,6 +133,115 @@ pub(crate) struct RunningCommand {
     pub(crate) key: CommandAttemptKey,
     pub(crate) artifact: RawOutputArtifact,
     completed_exit_code: Option<i32>,
+    workspace_mutation: Option<RunningWorkspaceMutation>,
+}
+
+#[derive(Clone)]
+pub(crate) struct RunningWorkspaceMutation {
+    inner: Arc<RunningWorkspaceMutationInner>,
+}
+
+struct RunningWorkspaceMutationInner {
+    store: Arc<dyn AgentTaskStore>,
+    repo_root: PathBuf,
+    lease: WorkspaceMutationLease,
+    stop: CancellationToken,
+    lease_lost: CancellationToken,
+    finalized: Mutex<bool>,
+    _heartbeat_task: AbortOnDropHandle<()>,
+}
+
+impl std::fmt::Debug for RunningWorkspaceMutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunningWorkspaceMutation")
+            .field("repo_root", &self.inner.repo_root)
+            .field("lease_id", &self.inner.lease.lease_id)
+            .finish()
+    }
+}
+
+impl RunningWorkspaceMutation {
+    pub(crate) fn new(
+        store: Arc<dyn AgentTaskStore>,
+        repo_root: PathBuf,
+        lease: WorkspaceMutationLease,
+    ) -> Self {
+        let stop = CancellationToken::new();
+        let heartbeat_stop = stop.clone();
+        let lease_lost = CancellationToken::new();
+        let heartbeat_lease_lost = lease_lost.clone();
+        let heartbeat_store = store.clone();
+        let heartbeat_root = repo_root.clone();
+        let lease_id = lease.lease_id.clone();
+        let actor_id = lease.actor_id.clone();
+        let heartbeat_task = AbortOnDropHandle::new(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = heartbeat_stop.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        match heartbeat_store
+                            .heartbeat_workspace_mutation(
+                                &heartbeat_root,
+                                lease_id.clone(),
+                                actor_id.clone(),
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                tracing::warn!(
+                                    %lease_id,
+                                    "workspace mutation lease was lost"
+                                );
+                                heartbeat_lease_lost.cancel();
+                                break;
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    %error,
+                                    %lease_id,
+                                    "unified exec workspace mutation heartbeat failed"
+                                );
+                                heartbeat_lease_lost.cancel();
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+        Self {
+            inner: Arc::new(RunningWorkspaceMutationInner {
+                store,
+                repo_root,
+                lease,
+                stop,
+                lease_lost,
+                finalized: Mutex::new(false),
+                _heartbeat_task: heartbeat_task,
+            }),
+        }
+    }
+
+    pub(crate) fn lease_lost_token(&self) -> CancellationToken {
+        self.inner.lease_lost.clone()
+    }
+
+    pub(crate) async fn finish(&self) -> Result<(), String> {
+        let mut finalized = self.inner.finalized.lock().await;
+        if *finalized {
+            return Ok(());
+        }
+        self.inner
+            .store
+            .finish_workspace_mutation(&self.inner.repo_root, self.inner.lease.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        *finalized = true;
+        self.inner.stop.cancel();
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -210,17 +324,9 @@ impl CommandExecutionLedger {
         artifact: RawOutputArtifact,
     ) {
         let mut state = self.state.lock().await;
-        if let Some(replaced) = state.running.remove(&process_id) {
-            state.running_order.retain(|tracked| *tracked != process_id);
-            record_evicted_running_failure_locked(&mut state, replaced);
-        }
-        while state.running.len() >= MAX_TRACKED_PROCESSES {
-            let Some(oldest) = state.running_order.pop_front() else {
-                break;
-            };
-            if let Some(evicted) = state.running.remove(&oldest) {
-                record_evicted_running_failure_locked(&mut state, evicted);
-            }
+        if state.running.contains_key(&process_id) {
+            tracing::error!(process_id, "refusing to replace live command bookkeeping");
+            return;
         }
         state.running_order.push_back(process_id);
         state.running.insert(
@@ -229,8 +335,25 @@ impl CommandExecutionLedger {
                 key,
                 artifact,
                 completed_exit_code: None,
+                workspace_mutation: None,
             },
         );
+    }
+
+    pub(crate) async fn attach_running_workspace_mutation(
+        &self,
+        process_id: i32,
+        workspace_mutation: RunningWorkspaceMutation,
+    ) -> Result<bool, String> {
+        let attached = {
+            let mut state = self.state.lock().await;
+            let Some(running) = state.running.get_mut(&process_id) else {
+                return Ok(false);
+            };
+            running.workspace_mutation = Some(workspace_mutation);
+            true
+        };
+        Ok(attached)
     }
 
     pub(crate) async fn running_process(&self, process_id: i32) -> Option<RunningCommand> {
@@ -270,17 +393,47 @@ impl CommandExecutionLedger {
         process_id: i32,
         exit_code: Option<i32>,
     ) -> bool {
-        let mut state = self.state.lock().await;
-        let Some(running) = state.running.remove(&process_id) else {
-            return false;
-        };
-        state.running_order.retain(|tracked| *tracked != process_id);
-        if running.completed_exit_code.is_none()
-            && let Some(exit_code) = exit_code
+        match self
+            .finish_running_process_checked(process_id, exit_code)
+            .await
         {
-            record_exit_locked(&mut state, &running.key, exit_code);
+            Ok(finished) => finished,
+            Err(error) => {
+                tracing::warn!(%error, process_id, "workspace mutation finalization failed");
+                true
+            }
         }
-        true
+    }
+
+    pub(crate) async fn finish_running_process_checked(
+        &self,
+        process_id: i32,
+        exit_code: Option<i32>,
+    ) -> Result<bool, String> {
+        let running = {
+            let mut state = self.state.lock().await;
+            let Some(running) = state.running.remove(&process_id) else {
+                return Ok(false);
+            };
+            state.running_order.retain(|tracked| *tracked != process_id);
+            if running.completed_exit_code.is_none()
+                && let Some(exit_code) = exit_code
+            {
+                record_exit_locked(&mut state, &running.key, exit_code);
+            }
+            running
+        };
+        if let Some(workspace_mutation) = running.workspace_mutation.as_ref()
+            && let Err(error) = workspace_mutation.finish().await
+        {
+            let mut state = self.state.lock().await;
+            if !state.running.contains_key(&process_id) {
+                state.running_order.push_back(process_id);
+                state.running.insert(process_id, running);
+            }
+            return Err(error);
+        }
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -303,15 +456,6 @@ fn record_exit_locked(state: &mut CommandExecutionState, key: &CommandAttemptKey
         entry.consecutive_failures = 0;
     } else {
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-    }
-}
-
-fn record_evicted_running_failure_locked(
-    state: &mut CommandExecutionState,
-    running: RunningCommand,
-) {
-    if running.completed_exit_code.is_none() {
-        record_exit_locked(state, &running.key, -1);
     }
 }
 
@@ -497,13 +641,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn running_metadata_eviction_records_failure_before_late_exit() {
+    async fn running_metadata_is_not_evicted_while_processes_are_live() {
         let ledger = CommandExecutionLedger::default();
-        let keys = (0..=MAX_TRACKED_PROCESSES)
+        let keys = (0..=64)
             .map(|index| key(&format!("background-{index}.exe")))
             .collect::<Vec<_>>();
 
-        for (process_id, key) in keys.iter().take(MAX_TRACKED_PROCESSES).enumerate() {
+        for (process_id, key) in keys.iter().take(64).enumerate() {
             ledger.begin_attempt(key, false).await.expect("attempt");
             ledger
                 .track_running_process(
@@ -520,16 +664,17 @@ mod tests {
             .expect("replacement attempt");
         ledger
             .track_running_process(
-                MAX_TRACKED_PROCESSES as i32,
+                64,
                 replacement_key.clone(),
                 RawOutputArtifact::unavailable("replacement fixture"),
             )
             .await;
 
-        assert!(ledger.running_process(0).await.is_none());
-        assert_eq!(ledger.consecutive_failures(&keys[0]).await, 1);
-        assert!(!ledger.mark_running_process_completed(0, -1).await);
-        assert_eq!(ledger.consecutive_failures(&keys[0]).await, 1);
+        assert!(ledger.running_process(0).await.is_some());
+        assert_eq!(ledger.consecutive_failures(&keys[0]).await, 0);
+        assert!(ledger.mark_running_process_completed(0, 0).await);
+        assert_eq!(ledger.consecutive_failures(&keys[0]).await, 0);
+        assert!(ledger.running_process(64).await.is_some());
     }
 
     #[tokio::test]

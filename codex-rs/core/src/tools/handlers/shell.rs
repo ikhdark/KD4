@@ -1,4 +1,9 @@
+use chrono::Utc;
+use codex_agent_task_store::REPOSITORY_WIDE_PATH;
 use codex_agent_task_store::ValidationCallStatus;
+use codex_agent_task_store::ValidationEvidence;
+use codex_agent_task_store::WorkspaceActorKind;
+use codex_agent_task_store::WorkspaceMutationRequest;
 use codex_features::Feature;
 use codex_git_utils::get_git_repo_root;
 use codex_protocol::error::CodexErr;
@@ -6,10 +11,13 @@ use codex_protocol::error::SandboxErr;
 use codex_protocol::exec_output::ExecToolCallOutput;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use sha2::Digest;
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 
 use crate::agent::task_capabilities::is_independent_review_source;
 use crate::agent::task_capabilities::validate_independent_review_shell;
@@ -157,9 +165,102 @@ pub(super) async fn run_exec_like_with_exit_code(
         args.additional_permissions.is_some(),
     )
     .map_err(|message| FunctionCallError::RespondToModel(message.to_string()))?;
+    if args
+        .exec_params
+        .sandbox_permissions
+        .requests_sandbox_override()
+        && !matches!(
+            args.turn.approval_policy.value(),
+            codex_protocol::protocol::AskForApproval::OnRequest
+        )
+    {
+        let effective_permissions = apply_granted_turn_permissions(
+            args.session.as_ref(),
+            &args.turn_environment.environment_id,
+            args.exec_params.cwd.as_path(),
+            args.exec_params.sandbox_permissions,
+            args.additional_permissions.clone(),
+        )
+        .await;
+        if !effective_permissions.permissions_preapproved {
+            let approval_policy = args.turn.approval_policy.value();
+            return Err(FunctionCallError::RespondToModel(format!(
+                "approval policy is {approval_policy:?}; reject command — you should not ask for escalated permissions if the approval policy is {approval_policy:?}"
+            )));
+        }
+    }
+    let repo_root = get_git_repo_root(args.exec_params.cwd.as_path())
+        .unwrap_or_else(|| args.exec_params.cwd.to_path_buf());
+    let apply_patch_cwd = PathUri::from_abs_path(&args.exec_params.cwd);
+    let intercepted_apply_patch = !matches!(
+        codex_apply_patch::maybe_parse_apply_patch(&args.exec_params.command, &apply_patch_cwd),
+        codex_apply_patch::MaybeApplyPatch::NotApplyPatch
+    );
+    let mut workspace_mutation = None;
+    if typed_binding.is_none()
+        && !independent_review
+        && !inspection_command
+        && !intercepted_apply_patch
+    {
+        if coordinator.store().is_none() {
+            coordinator
+                .initialize_for_workspace_coordination(
+                    args.session.services.state_db.clone(),
+                    args.turn.config.sqlite_home.clone(),
+                    args.turn.config.model_provider_id.clone(),
+                    args.session.services.agent_control.session_id().to_string(),
+                )
+                .await
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "shell workspace coordination could not initialize: {error}"
+                    ))
+                })?;
+        }
+        let store = coordinator.store().ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "shell workspace coordination store is unavailable".to_string(),
+            )
+        })?;
+        let root_session_id = coordinator.root_session_id().ok_or_else(|| {
+            FunctionCallError::RespondToModel("shell root task identity is unavailable".to_string())
+        })?;
+        let agent_path = session_source
+            .get_agent_path()
+            .map(|path| path.to_string())
+            .unwrap_or_else(|| "/root".to_string());
+        let kind = if session_source.is_non_root_agent() {
+            WorkspaceActorKind::Legacy
+        } else {
+            WorkspaceActorKind::Root
+        };
+        let actor_id = match kind {
+            WorkspaceActorKind::Root => format!("root:{root_session_id}"),
+            WorkspaceActorKind::Legacy => format!("legacy:{root_session_id}:{agent_path}"),
+            WorkspaceActorKind::Typed | WorkspaceActorKind::External => unreachable!(),
+        };
+        let lease = store
+            .begin_workspace_mutation(
+                &repo_root,
+                WorkspaceMutationRequest {
+                    root_session_id,
+                    actor_id,
+                    kind,
+                    attempt_id: None,
+                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                    contracts: Vec::new(),
+                    expected_manifest: Vec::new(),
+                },
+            )
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "shell command could not acquire the repository-wide mutation lease: {error}"
+                ))
+            })?;
+        workspace_mutation = Some((store, repo_root.clone(), lease));
+    }
     let focused_validation_command = if typed_binding.is_some() && !inspection_command {
-        let repo_root = get_git_repo_root(args.turn.config.cwd.as_path())
-            .unwrap_or_else(|| args.turn.config.cwd.to_path_buf());
         let command_summary = focused_validation_command_summary(
             &args.safety_command,
             &args.hook_command,
@@ -195,15 +296,29 @@ pub(super) async fn run_exec_like_with_exit_code(
         None
     };
     let call_id = args.call_id.clone();
+    let retained_output_ref = format!("tool-call:{}:{call_id}", args.session.thread_id);
     let focused_validation = if let Some((command_summary, resolved_executable)) =
         focused_validation_command
     {
+        let lease_expires_at = Utc::now()
+            + chrono::Duration::seconds(codex_agent_task_store::DEFAULT_WORKSPACE_LEASE_SECONDS);
+        let toolchain = child_env_value(&args.exec_params.env, "RUSTUP_TOOLCHAIN")
+            .map(|value| value.to_string_lossy().into_owned())
+            .or_else(|| args.safety_command.first().cloned());
         let token = coordinator
-            .begin_focused_validation_for_source(
+            .begin_focused_validation_for_source_with_evidence(
                 &session_source,
                 call_id.clone(),
                 command_summary,
                 resolved_executable,
+                ValidationEvidence {
+                    cwd: Some(args.exec_params.cwd.to_string_lossy().into_owned()),
+                    environment_hash: Some(validation_environment_hash(&args.exec_params.env)),
+                    toolchain,
+                    retained_output_ref: Some(retained_output_ref.clone()),
+                    lease_expires_at: Some(lease_expires_at),
+                    ..ValidationEvidence::default()
+                },
             )
             .await
             .map_err(|error| {
@@ -216,15 +331,249 @@ pub(super) async fn run_exec_like_with_exit_code(
                 "focused validation lost its typed assignment binding before execution".to_string(),
             ));
         };
+        if let Some(leader_call_id) = token.shared_from_call_id().map(str::to_string) {
+            let leader = loop {
+                if args.cancellation_token.is_cancelled() {
+                    coordinator
+                        .finish_focused_validation_with_output(
+                            token,
+                            ValidationCallStatus::Cancelled,
+                            Some(retained_output_ref),
+                            None,
+                        )
+                        .await
+                        .map_err(|error| {
+                            FunctionCallError::RespondToModel(format!(
+                                "shared validation cancellation could not be persisted: {error}"
+                            ))
+                        })?;
+                    return Err(FunctionCallError::RespondToModel(
+                        "shared validation wait was cancelled".to_string(),
+                    ));
+                }
+                let leader = coordinator
+                    .get_validation_call(leader_call_id.clone())
+                    .await
+                    .map_err(|error| {
+                        FunctionCallError::RespondToModel(format!(
+                            "shared validation leader could not be read: {error}"
+                        ))
+                    })?
+                    .ok_or_else(|| {
+                        FunctionCallError::RespondToModel(format!(
+                            "shared validation leader {leader_call_id} disappeared"
+                        ))
+                    })?;
+                if leader.status.is_terminal() {
+                    break leader;
+                }
+                if leader
+                    .evidence
+                    .lease_expires_at
+                    .or_else(|| token.lease_expires_at())
+                    .is_some_and(|deadline| deadline <= Utc::now())
+                {
+                    let mut expired = leader;
+                    expired.status = ValidationCallStatus::Cancelled;
+                    expired.recorded_at = Utc::now();
+                    let recovery = coordinator
+                        .store()
+                        .ok_or_else(|| {
+                            FunctionCallError::RespondToModel(
+                                "shared validation store became unavailable".to_string(),
+                            )
+                        })?
+                        .record_validation_call(expired)
+                        .await;
+                    match recovery {
+                        Ok(()) => {}
+                        Err(codex_agent_task_store::StoreError::ValidationCallImmutable(_)) => {
+                            let refreshed = coordinator
+                                .get_validation_call(leader_call_id.clone())
+                                .await
+                                .map_err(|error| {
+                                    FunctionCallError::RespondToModel(format!(
+                                        "shared validation leader could not be reread after a recovery race: {error}"
+                                    ))
+                                })?
+                                .ok_or_else(|| {
+                                    FunctionCallError::RespondToModel(format!(
+                                        "shared validation leader {leader_call_id} disappeared during recovery"
+                                    ))
+                                })?;
+                            if refreshed.status.is_terminal() {
+                                break refreshed;
+                            }
+                        }
+                        Err(error) => {
+                            return Err(FunctionCallError::RespondToModel(format!(
+                                "expired shared validation lease could not be recovered: {error}"
+                            )));
+                        }
+                    }
+                    continue;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            };
+            let status = leader.status;
+            let leader_output_ref = leader.evidence.retained_output_ref.clone();
+            let leader_output_summary = leader.evidence.output_summary.clone();
+            coordinator
+                .finish_focused_validation_with_output(
+                    token,
+                    status,
+                    leader_output_ref.clone(),
+                    leader_output_summary.clone(),
+                )
+                .await
+                .map_err(|error| {
+                    FunctionCallError::RespondToModel(format!(
+                        "shared validation result could not be persisted: {error}"
+                    ))
+                })?;
+            let output_reference = leader_output_ref
+                .as_deref()
+                .unwrap_or("no retained output reference");
+            let output_summary = leader_output_summary
+                .as_deref()
+                .unwrap_or("no retained output summary");
+            return Ok(RunExecLikeResult {
+                output: FunctionToolOutput {
+                    body: vec![
+                        codex_protocol::models::FunctionCallOutputContentItem::InputText {
+                            text: format!(
+                                "Validation singleflight reused leader {leader_call_id}; status: {status:?}; output: {output_reference}\n\n{output_summary}"
+                            ),
+                        },
+                    ],
+                    success: Some(status.is_success()),
+                    post_tool_use_response: None,
+                },
+                exit_code: Some(if status.is_success() { 0 } else { 1 }),
+            });
+        }
         Some(token)
     } else {
         None
     };
+    let heartbeat_stop = CancellationToken::new();
+    let heartbeat_task = focused_validation.as_ref().map(|token| {
+        let coordinator = coordinator.clone();
+        let call_id = token.call_id().to_string();
+        let heartbeat_stop = heartbeat_stop.clone();
+        AbortOnDropHandle::new(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = heartbeat_stop.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                        let lease_expires_at = Utc::now()
+                            + chrono::Duration::seconds(
+                                codex_agent_task_store::DEFAULT_WORKSPACE_LEASE_SECONDS,
+                            );
+                        match coordinator
+                            .heartbeat_validation_call(call_id.clone(), lease_expires_at)
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(error) => {
+                                tracing::warn!(%error, %call_id, "validation heartbeat failed");
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+    });
+    let workspace_heartbeat_stop = CancellationToken::new();
+    let workspace_heartbeat_task = workspace_mutation
+        .as_ref()
+        .map(|(store, repo_root, lease)| {
+            let store = store.clone();
+            let repo_root = repo_root.clone();
+            let lease_id = lease.lease_id.clone();
+            let actor_id = lease.actor_id.clone();
+            let workspace_heartbeat_stop = workspace_heartbeat_stop.clone();
+            let command_cancellation = args.cancellation_token.clone();
+            AbortOnDropHandle::new(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = workspace_heartbeat_stop.cancelled() => break,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                            match store
+                                .heartbeat_workspace_mutation(
+                                    &repo_root,
+                                    lease_id.clone(),
+                                    actor_id.clone(),
+                                )
+                                .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => {
+                                    tracing::warn!(
+                                        %lease_id,
+                                        "workspace mutation lease expired before heartbeat"
+                                    );
+                                    command_cancellation.cancel();
+                                    break;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        %lease_id,
+                                        "workspace mutation heartbeat failed"
+                                    );
+                                    command_cancellation.cancel();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }))
+        });
     let cancellation_token = args.cancellation_token.clone();
     let result = run_exec_like_with_exit_code_inner(args, focused_validation.is_some()).await;
-    let Some(token) = focused_validation else {
-        return result;
+    heartbeat_stop.cancel();
+    if let Some(heartbeat_task) = heartbeat_task
+        && let Err(error) = heartbeat_task.await
+    {
+        tracing::warn!(%error, "validation heartbeat task failed");
+    }
+    workspace_heartbeat_stop.cancel();
+    if let Some(workspace_heartbeat_task) = workspace_heartbeat_task
+        && let Err(error) = workspace_heartbeat_task.await
+    {
+        tracing::warn!(%error, "workspace mutation heartbeat task failed");
+    }
+    let workspace_record_result = match workspace_mutation {
+        Some((store, repo_root, lease)) => store
+            .finish_workspace_mutation(&repo_root, lease)
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "shell workspace mutation could not be finalized: {error}"
+                ))
+            }),
+        None => Ok(()),
     };
+    let Some(token) = focused_validation else {
+        return match (result, workspace_record_result) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(record_error)) => {
+                tracing::warn!(
+                    %record_error,
+                    "failed to finalize shell workspace mutation after command failure"
+                );
+                Err(error)
+            }
+        };
+    };
+    workspace_record_result?;
     let status = match (&result, cancellation_token.is_cancelled()) {
         (_, true) => ValidationCallStatus::Cancelled,
         (Ok(result), false) if result.exit_code == Some(0) => ValidationCallStatus::Succeeded,
@@ -236,7 +585,15 @@ pub(super) async fn run_exec_like_with_exit_code(
         }
         (Err(_), false) => ValidationCallStatus::Failed,
     };
-    let record_result = coordinator.finish_focused_validation(token, status).await;
+    let output_summary = validation_output_summary(&result);
+    let record_result = coordinator
+        .finish_focused_validation_with_output(
+            token,
+            status,
+            Some(retained_output_ref),
+            output_summary,
+        )
+        .await;
     match (result, record_result) {
         (Ok(result), Ok(())) => Ok(result),
         (Ok(_), Err(error)) => Err(FunctionCallError::RespondToModel(format!(
@@ -248,6 +605,51 @@ pub(super) async fn run_exec_like_with_exit_code(
             Err(error)
         }
     }
+}
+
+fn validation_environment_hash(env: &HashMap<String, String>) -> String {
+    let mut entries = env.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(name, _)| *name);
+    let mut digest = Sha256::new();
+    for (name, value) in entries {
+        digest.update(name.as_bytes());
+        digest.update([0]);
+        digest.update(value.as_bytes());
+        digest.update([0xff]);
+    }
+    format!("{:x}", digest.finalize())
+}
+
+fn validation_output_summary(
+    result: &Result<RunExecLikeResult, FunctionCallError>,
+) -> Option<String> {
+    const MAX_SUMMARY_CHARS: usize = 4_096;
+    let text = match result {
+        Ok(result) => result
+            .output
+            .body
+            .iter()
+            .filter_map(|item| match item {
+                codex_protocol::models::FunctionCallOutputContentItem::InputText { text } => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Err(FunctionCallError::RespondToModel(message)) => message.clone(),
+        Err(_) => return None,
+    };
+    if text.is_empty() {
+        return None;
+    }
+    let mut chars = text.chars();
+    let summary = chars.by_ref().take(MAX_SUMMARY_CHARS).collect::<String>();
+    Some(if chars.next().is_some() {
+        format!("{summary}\n[validation output truncated]")
+    } else {
+        summary
+    })
 }
 
 fn pin_focused_validation_executable(

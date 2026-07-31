@@ -177,6 +177,10 @@ impl UnifiedExecProcess {
         }
     }
 
+    pub(super) fn output_is_closed(&self) -> bool {
+        self.output_closed.load(Ordering::Acquire)
+    }
+
     pub(super) fn take_output_receiver(&self) -> Option<broadcast::Receiver<Vec<u8>>> {
         self.initial_output_rx
             .lock()

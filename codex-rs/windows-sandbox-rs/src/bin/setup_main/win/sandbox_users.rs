@@ -58,6 +58,17 @@ const SID_USERS: &str = "S-1-5-32-545";
 const SID_AUTHENTICATED_USERS: &str = "S-1-5-11";
 const SID_EVERYONE: &str = "S-1-1-0";
 const SID_SYSTEM: &str = "S-1-5-18";
+const ERROR_MEMBER_IN_ALIAS: u32 = 1378;
+
+fn ensure_group_add_status(status: u32, group_name: &str, member_name: &str) -> Result<()> {
+    if status == NERR_Success || status == ERROR_MEMBER_IN_ALIAS {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(SetupFailure::new(
+        SetupErrorCode::HelperUserCreateOrUpdateFailed,
+        format!("failed to add {member_name} to local group {group_name}, code {status}"),
+    )))
+}
 
 pub fn ensure_sandbox_users_group(log: &mut dyn Write) -> Result<()> {
     ensure_local_group(SANDBOX_USERS_GROUP, SANDBOX_USERS_GROUP_COMMENT, log)
@@ -145,13 +156,14 @@ pub fn ensure_local_user(name: &str, password: &str, log: &mut dyn Write) -> Res
             let member = LOCALGROUP_MEMBERS_INFO_3 {
                 lgrmi3_domainandname: name_w.as_ptr() as *mut u16,
             };
-            let _ = NetLocalGroupAddMembers(
+            let status = NetLocalGroupAddMembers(
                 std::ptr::null(),
                 group.as_ptr(),
                 3,
                 &member as *const _ as *mut u8,
                 1,
             );
+            ensure_group_add_status(status, &group_name, name)?;
         } else {
             super::log_line(
                 log,
@@ -195,21 +207,20 @@ pub fn ensure_local_group(name: &str, comment: &str, log: &mut dyn Write) -> Res
 }
 
 pub fn ensure_local_group_member(group_name: &str, member_name: &str) -> Result<()> {
-    // If the member is already in the group, NetLocalGroupAddMembers may
-    // return an error code. We don't care.
     let group_w = to_wide(OsStr::new(group_name));
     let member_w = to_wide(OsStr::new(member_name));
     unsafe {
         let member = LOCALGROUP_MEMBERS_INFO_3 {
             lgrmi3_domainandname: member_w.as_ptr() as *mut u16,
         };
-        let _ = NetLocalGroupAddMembers(
+        let status = NetLocalGroupAddMembers(
             std::ptr::null(),
             group_w.as_ptr(),
             3,
             &member as *const _ as *mut u8,
             1,
         );
+        ensure_group_add_status(status, group_name, member_name)?;
     }
     Ok(())
 }

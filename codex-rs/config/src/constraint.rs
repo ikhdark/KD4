@@ -33,6 +33,9 @@ pub enum ConstraintError {
         requirement_source: RequirementSource,
         reason: String,
     },
+
+    #[error("configuration update rejected: {reason}")]
+    UpdateRejected { reason: String },
 }
 
 impl ConstraintError {

@@ -4,6 +4,7 @@ import argparse
 import importlib
 import importlib.metadata
 import json
+import os
 import platform
 import re
 import shutil
@@ -261,11 +262,32 @@ def _extract_codex_package_archive(package_archive: Path, runtime_package_root: 
         raise RuntimeError(f"Expected a .tar.gz Codex package archive: {package_archive}")
 
     runtime_package_root.mkdir(parents=True, exist_ok=True)
+    extraction_root = runtime_package_root.resolve()
     with tarfile.open(package_archive, "r:gz") as archive:
-        try:
-            archive.extractall(runtime_package_root, filter="data")
-        except TypeError:
-            archive.extractall(runtime_package_root)
+        members = archive.getmembers()
+        destinations: dict[str, Path] = {}
+        for member in members:
+            if member.issym() or member.islnk() or not (member.isfile() or member.isdir()):
+                raise RuntimeError(f"Unsafe archive member type: {member.name}")
+            destination = (runtime_package_root / member.name).resolve()
+            if destination != extraction_root and extraction_root not in destination.parents:
+                raise RuntimeError(f"Archive member escapes staging directory: {member.name}")
+            destinations[member.name] = destination
+
+        # Extract only the two validated member kinds ourselves. This keeps the
+        # Python 3.10 path safe without ever invoking unrestricted extractall.
+        for member in members:
+            destination = destinations[member.name]
+            if member.isdir():
+                destination.mkdir(parents=True, exist_ok=True)
+            else:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise RuntimeError(f"Could not read archive member: {member.name}")
+                with source, destination.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+            os.chmod(destination, member.mode & 0o777)
 
     _validate_codex_package_layout(runtime_package_root, package_archive)
 
@@ -733,12 +755,22 @@ def generate_notification_registry(schema_dir: Path) -> None:
         "",
         "from __future__ import annotations",
         "",
+        "from typing import TypeAlias",
+        "",
         "from pydantic import BaseModel",
         "",
     ]
 
     for class_name in class_names:
         lines.append(f"from .v2_all import {class_name}")
+    lines.extend(
+        [
+            "",
+            "GeneratedNotificationPayload: TypeAlias = (",
+            *(f"    {class_name}" if index == 0 else f"    | {class_name}" for index, class_name in enumerate(class_names)),
+            ")",
+        ]
+    )
     lines.extend(
         [
             "",

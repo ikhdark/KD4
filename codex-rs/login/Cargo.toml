@@ -28,6 +28,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+tempfile = { workspace = true }
 tiny_http = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
@@ -49,7 +50,6 @@ keyring = { workspace = true }
 pretty_assertions = { workspace = true }
 regex-lite = { workspace = true }
 serial_test = { workspace = true }
-tempfile = { workspace = true }
 wiremock = { workspace = true }
 
 [lib]

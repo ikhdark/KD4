@@ -6,6 +6,7 @@ from __future__ import annotations
 from concurrent.futures import as_completed
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -25,7 +26,6 @@ if TYPE_CHECKING:
 
 COMPLETE_MARKER = ".complete"
 LOCK_POLL_SECONDS = 0.1
-LOCK_STALE_SECONDS = 60 * 60
 DEFAULT_GHA_DOWNLOAD_WORKERS = 8
 
 
@@ -42,74 +42,49 @@ def _gha_enabled() -> bool:
 @contextmanager
 def exclusive_file_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fd: int | None = None
-    lock_identity: tuple[int, int] | None = None
-    while fd is None:
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
-            try:
-                lock_stat = lock_path.stat()
-                owner_pid = lock_owner_pid(lock_path)
-                owner_is_live = owner_pid is not None and _runtime().process_is_running(
-                    owner_pid
-                )
-                if (
-                    time.time() - lock_stat.st_mtime > LOCK_STALE_SECONDS
-                    and not owner_is_live
-                ):
-                    lock_path.unlink()
-            except (FileNotFoundError, PermissionError):
-                # On Windows, unlinking a lock whose holder still has the fd
-                # open raises PermissionError — keep waiting, don't crash.
-                pass
-            time.sleep(LOCK_POLL_SECONDS)
-            continue
-
-        try:
-            stat_result = os.fstat(fd)
-            lock_identity = (stat_result.st_dev, stat_result.st_ino)
-            payload = f"pid={os.getpid()} thread={threading.get_ident()}\n".encode(
-                "utf-8"
-            )
-            if os.write(fd, payload) != len(payload):
-                raise OSError(f"short write while initializing lock {lock_path}")
-        except BaseException as exc:
-            cleanup_error: OSError | None = None
-            try:
-                os.close(fd)
-            except OSError as close_error:
-                cleanup_error = close_error
-            finally:
-                fd = None
-            try:
-                lock_stat = lock_path.stat()
-                if lock_identity is None or lock_identity == (
-                    lock_stat.st_dev,
-                    lock_stat.st_ino,
-                ):
-                    lock_path.unlink()
-            except FileNotFoundError:
-                pass
-            except OSError as unlink_error:
-                cleanup_error = cleanup_error or unlink_error
-            if cleanup_error is not None:
-                raise RuntimeError(
-                    f"failed to clean up uninitialized lock {lock_path}: {cleanup_error}"
-                ) from exc
-            raise
-
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    acquired = False
     try:
+        if os.name == "nt" and os.fstat(fd).st_size == 0:
+            os.write(fd, b"\0")
+            os.fsync(fd)
+        while not acquired:
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except OSError:
+                time.sleep(LOCK_POLL_SECONDS)
+
+        payload = f"pid={os.getpid()} thread={threading.get_ident()}\n".encode("utf-8")
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        if os.write(fd, payload) != len(payload):
+            raise OSError(f"short write while initializing lock {lock_path}")
+        os.fsync(fd)
         yield
     finally:
-        if fd is not None:
-            os.close(fd)
-        try:
-            lock_stat = lock_path.stat()
-            if lock_identity == (lock_stat.st_dev, lock_stat.st_ino):
-                lock_path.unlink()
-        except FileNotFoundError:
-            pass
+        if acquired:
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(fd)
 
 
 def lock_owner_pid(lock_path: Path) -> int | None:
@@ -295,12 +270,12 @@ def cached_codex_package_archive(
     stat = archive_path.stat()
     cache_dir = cache_root / f"{target}-{stat.st_size}-{stat.st_mtime_ns}"
     marker_path = cache_dir / COMPLETE_MARKER
-    if marker_path.is_file():
+    if extracted_cache_is_complete(cache_dir, marker_path):
         return cache_dir
 
     lock_path = cache_root / f".{cache_dir.name}.lock"
     with exclusive_file_lock(lock_path):
-        if marker_path.is_file():
+        if extracted_cache_is_complete(cache_dir, marker_path):
             return cache_dir
 
         temp_dir = (
@@ -310,10 +285,12 @@ def cached_codex_package_archive(
         temp_dir.mkdir(parents=True, exist_ok=True)
         try:
             extract_tar_data(archive_path, temp_dir)
+            tree_sha256 = cache_tree_digest(temp_dir)
             (temp_dir / COMPLETE_MARKER).write_text(
                 f"source={archive_path}\n"
                 f"size={stat.st_size}\n"
-                f"mtime_ns={stat.st_mtime_ns}\n",
+                f"mtime_ns={stat.st_mtime_ns}\n"
+                f"tree_sha256={tree_sha256}\n",
                 encoding="utf-8",
             )
             if cache_dir.exists():
@@ -324,6 +301,48 @@ def cached_codex_package_archive(
             raise
 
     return cache_dir
+
+
+def extracted_cache_is_complete(cache_dir: Path, marker_path: Path) -> bool:
+    try:
+        marker = marker_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    expected = next(
+        (
+            line.removeprefix("tree_sha256=")
+            for line in marker.splitlines()
+            if line.startswith("tree_sha256=")
+        ),
+        None,
+    )
+    if expected is None:
+        return False
+    try:
+        return cache_tree_digest(cache_dir) == expected
+    except (OSError, RuntimeError):
+        return False
+
+
+def cache_tree_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        if path.name == COMPLETE_MARKER:
+            continue
+        relative = path.relative_to(root).as_posix().encode("utf-8")
+        if path.is_symlink():
+            raise RuntimeError(f"cache contains a symlink: {path}")
+        kind = b"d" if path.is_dir() else b"f" if path.is_file() else None
+        if kind is None:
+            raise RuntimeError(f"cache contains a special entry: {path}")
+        digest.update(kind)
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        if kind == b"f":
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+    return digest.hexdigest()
 
 
 def extract_tar_data(archive_path: Path, dest_dir: Path) -> None:

@@ -1255,7 +1255,7 @@ async fn handle_shell_command_autoapprove_from_config_records_tool_decision() {
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex()
+    let test = test_codex()
         .with_config(|config| {
             config.permissions.approval_policy = Constrained::allow_any(AskForApproval::OnRequest);
             config
@@ -1266,6 +1266,7 @@ async fn handle_shell_command_autoapprove_from_config_records_tool_decision() {
         .build(&server)
         .await
         .unwrap();
+    let codex = test.codex.clone();
 
     codex
         .submit(Op::UserInput {
@@ -1313,7 +1314,7 @@ async fn handle_shell_command_user_approved_records_tool_decision() {
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex()
+    let test = test_codex()
         .with_config(|config| {
             config.permissions.approval_policy =
                 Constrained::allow_any(AskForApproval::UnlessTrusted);
@@ -1321,6 +1322,7 @@ async fn handle_shell_command_user_approved_records_tool_decision() {
         .build(&server)
         .await
         .unwrap();
+    let codex = test.codex.clone();
 
     codex
         .submit(Op::UserInput {
@@ -1383,7 +1385,7 @@ async fn handle_shell_command_user_approved_for_session_records_tool_decision() 
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex()
+    let test = test_codex()
         .with_config(|config| {
             config.permissions.approval_policy =
                 Constrained::allow_any(AskForApproval::UnlessTrusted);
@@ -1391,6 +1393,7 @@ async fn handle_shell_command_user_approved_for_session_records_tool_decision() 
         .build(&server)
         .await
         .unwrap();
+    let codex = test.codex.clone();
 
     codex
         .submit(Op::UserInput {
@@ -1453,7 +1456,7 @@ async fn handle_sandbox_error_user_approves_retry_records_tool_decision() {
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex()
+    let test = test_codex()
         .with_config(|config| {
             config.permissions.approval_policy =
                 Constrained::allow_any(AskForApproval::UnlessTrusted);
@@ -1461,6 +1464,7 @@ async fn handle_sandbox_error_user_approves_retry_records_tool_decision() {
         .build(&server)
         .await
         .unwrap();
+    let codex = test.codex.clone();
 
     codex
         .submit(Op::UserInput {
@@ -1523,7 +1527,7 @@ async fn handle_shell_command_user_denies_records_tool_decision() {
         ]),
     )
     .await;
-    let TestCodex { codex, .. } = test_codex()
+    let test = test_codex()
         .with_config(|config| {
             config.permissions.approval_policy =
                 Constrained::allow_any(AskForApproval::UnlessTrusted);
@@ -1531,6 +1535,7 @@ async fn handle_shell_command_user_denies_records_tool_decision() {
         .build(&server)
         .await
         .unwrap();
+    let codex = test.codex.clone();
 
     codex
         .submit(Op::UserInput {
@@ -1593,7 +1598,7 @@ async fn handle_sandbox_error_user_approves_for_session_records_tool_decision() 
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex()
+    let test = test_codex()
         .with_config(|config| {
             config.permissions.approval_policy =
                 Constrained::allow_any(AskForApproval::UnlessTrusted);
@@ -1601,6 +1606,7 @@ async fn handle_sandbox_error_user_approves_for_session_records_tool_decision() 
         .build(&server)
         .await
         .unwrap();
+    let codex = test.codex.clone();
 
     codex
         .submit(Op::UserInput {
@@ -1664,7 +1670,7 @@ async fn handle_sandbox_error_user_denies_records_tool_decision() {
     )
     .await;
 
-    let TestCodex { codex, .. } = test_codex()
+    let test = test_codex()
         .with_config(|config| {
             config.permissions.approval_policy =
                 Constrained::allow_any(AskForApproval::UnlessTrusted);
@@ -1672,6 +1678,7 @@ async fn handle_sandbox_error_user_denies_records_tool_decision() {
         .build(&server)
         .await
         .unwrap();
+    let codex = test.codex.clone();
 
     codex
         .submit(Op::UserInput {

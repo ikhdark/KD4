@@ -20,6 +20,7 @@ use codex_otel::SessionTelemetry;
 use codex_protocol::ThreadId;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use tokio::fs;
+use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -391,12 +392,18 @@ async fn run_script_with_timeout_with_args(
         let mut stderr_bytes = Vec::new();
         let (status, stdout_read, stderr_read) = tokio::join!(
             child.wait(),
-            stdout.read_to_end(&mut stdout_bytes),
-            stderr.read_to_end(&mut stderr_bytes),
+            read_snapshot_output_bounded(&mut stdout, &mut stdout_bytes),
+            read_snapshot_output_bounded(&mut stderr, &mut stderr_bytes),
         );
         let status = status.with_context(|| format!("Failed to execute {shell_name}"))?;
-        stdout_read.context("Failed to read snapshot command stdout")?;
-        stderr_read.context("Failed to read snapshot command stderr")?;
+        let stdout_overflow = stdout_read.context("Failed to read snapshot command stdout")?;
+        let stderr_overflow = stderr_read.context("Failed to read snapshot command stderr")?;
+        if stdout_overflow || stderr_overflow {
+            bail!(
+                "Snapshot command output exceeded the {} byte per-stream limit",
+                SNAPSHOT_OUTPUT_LIMIT_BYTES
+            );
+        }
         Ok::<_, anyhow::Error>((status, stdout_bytes, stderr_bytes))
     })
     .await;
@@ -433,6 +440,28 @@ async fn run_script_with_timeout_with_args(
     }
 
     Ok(String::from_utf8_lossy(&stdout).into_owned())
+}
+
+const SNAPSHOT_OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Retains at most the configured limit while continuing to drain the pipe so
+/// a verbose child cannot deadlock waiting for its reader.
+async fn read_snapshot_output_bounded<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    retained: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    let mut overflow = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(overflow);
+        }
+        let remaining = SNAPSHOT_OUTPUT_LIMIT_BYTES.saturating_sub(retained.len());
+        let keep = remaining.min(read);
+        retained.extend_from_slice(&buffer[..keep]);
+        overflow |= keep < read;
+    }
 }
 
 fn excluded_exports_regex() -> String {

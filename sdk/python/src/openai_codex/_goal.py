@@ -110,8 +110,8 @@ class _GoalOperationState:
             self._condition.notify_all()
         self._notifications.put(exc)
 
-    def next_notification(self) -> Notification:
-        item = self._notifications.get()
+    def next_notification(self, timeout_s: float | None = None) -> Notification:
+        item = self._notifications.get(timeout=timeout_s)
         if isinstance(item, BaseException):
             raise item
         return item

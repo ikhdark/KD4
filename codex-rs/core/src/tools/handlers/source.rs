@@ -11,6 +11,10 @@ use crate::tools::handlers::source_spec::create_read_file_span_tool;
 use crate::tools::handlers::source_spec::create_search_source_tool;
 use crate::tools::registry::CoreToolRuntime;
 use crate::tools::registry::ToolExecutor;
+use codex_agent_task_store::WorkspaceActorKind;
+use codex_agent_task_store::WorkspaceActorRegistration;
+use codex_agent_task_store::WorkspaceManifestEntry;
+use codex_agent_task_store::WorkspaceStrategy;
 use codex_file_search::source_search::ReadFileSpanOutput;
 use codex_file_search::source_search::SOURCE_READ_DEFAULT_LINES;
 use codex_file_search::source_search::SOURCE_SEARCH_DEFAULT_MAX_MATCHES;
@@ -35,6 +39,9 @@ use codex_tools::ToolSpec;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
+use sha2::Digest;
+use sha2::Sha256;
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -185,12 +192,14 @@ async fn handle_search_source(
     );
     load_repository_exclude_rules(&source_context, &ignore_matcher).await?;
     load_global_ignore_rules(&source_context, &ignore_matcher).await;
+    let mut observed_entries = BTreeMap::new();
     scan_source_roots(
         &source_context,
         &roots,
         &options,
         &ignore_matcher,
         &mut accumulator,
+        &mut observed_entries,
         recover_explicit_root_failures,
     )
     .await?;
@@ -200,6 +209,24 @@ async fn handle_search_source(
             .map(|root| relative_source_path(&source_context, root))
             .collect::<Result<Vec<_>, _>>()?,
     );
+    let mut supporting_paths = output
+        .matches
+        .iter()
+        .map(|matched| matched.path.clone())
+        .collect::<Vec<_>>();
+    supporting_paths.sort();
+    supporting_paths.dedup();
+    let supporting_entries = supporting_paths
+        .into_iter()
+        .map(|path| {
+            observed_entries.remove(&path).ok_or_else(|| {
+                FunctionCallError::RespondToModel(format!(
+                    "search_source: no read-time manifest was retained for matched path {path}"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    record_supporting_source_reads(&invocation, &source_context, supporting_entries).await?;
 
     Ok(boxed_tool_output(FunctionToolOutput::from_text(
         render_search_output(&output),
@@ -257,13 +284,116 @@ async fn handle_read_file_span(
         )));
     };
     let relative_path = relative_source_path(&source_context, &path)?;
+    let supporting_entry = manifest_entry_from_bytes(relative_path.clone(), &bytes);
     let output = read_file_span_from_bytes(relative_path, bytes, start_line, line_count)
         .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+    record_supporting_source_reads(&invocation, &source_context, vec![supporting_entry]).await?;
 
     Ok(boxed_tool_output(FunctionToolOutput::from_text(
         render_read_output(&output),
         Some(true),
     )))
+}
+
+async fn record_supporting_source_reads(
+    invocation: &ToolInvocation,
+    source_context: &LocalSourceContext,
+    entries: Vec<WorkspaceManifestEntry>,
+) -> Result<(), FunctionCallError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let coordinator = invocation.session.services.agent_control.task_coordinator();
+    if coordinator.store().is_none() {
+        coordinator
+            .initialize_for_workspace_coordination(
+                invocation.session.services.state_db.clone(),
+                invocation.step_context.turn.config.sqlite_home.clone(),
+                invocation
+                    .step_context
+                    .turn
+                    .config
+                    .model_provider_id
+                    .clone(),
+                invocation
+                    .session
+                    .services
+                    .agent_control
+                    .session_id()
+                    .to_string(),
+            )
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "read_file_span: supporting-read coordination could not initialize: {error}"
+                ))
+            })?;
+    }
+    let binding = coordinator.binding_for_source(&invocation.step_context.turn.session_source);
+    let store = coordinator.store().ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "read_file_span: supporting-read task store is unavailable".to_string(),
+        )
+    })?;
+    let root_session_id = coordinator.root_session_id().ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "read_file_span: durable root task identity is unavailable".to_string(),
+        )
+    })?;
+    let agent_path = invocation
+        .step_context
+        .turn
+        .session_source
+        .get_agent_path()
+        .map(|path| path.to_string())
+        .unwrap_or_else(|| "/root".to_string());
+    let (actor_id, kind) = if let Some(binding) = binding {
+        (
+            format!("attempt:{}", binding.attempt_id),
+            WorkspaceActorKind::Typed,
+        )
+    } else if invocation
+        .step_context
+        .turn
+        .session_source
+        .is_non_root_agent()
+    {
+        (
+            format!("legacy:{root_session_id}:{agent_path}"),
+            WorkspaceActorKind::Legacy,
+        )
+    } else {
+        (format!("root:{root_session_id}"), WorkspaceActorKind::Root)
+    };
+    if kind != WorkspaceActorKind::Typed {
+        store
+            .register_workspace_actor(
+                source_context.repo_root_abs.as_path(),
+                WorkspaceActorRegistration {
+                    root_session_id,
+                    actor_id: actor_id.clone(),
+                    kind,
+                    assignment_id: None,
+                    attempt_id: None,
+                    strategy: WorkspaceStrategy::Shared,
+                },
+            )
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "read_file_span: durable reader identity could not be registered: {error}"
+                ))
+            })?;
+    }
+    store
+        .record_supporting_read_entries(source_context.repo_root_abs.as_path(), actor_id, entries)
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "read_file_span: supporting-read manifest could not be persisted: {error}"
+            ))
+        })?;
+    Ok(())
 }
 
 fn reject_unadvertised_environment_id(
@@ -648,6 +778,7 @@ async fn scan_source_root(
     options: &SourceSearchOptions,
     ignore_matcher: &SourceIgnoreMatcher,
     accumulator: &mut SourceSearchAccumulator,
+    observed_entries: &mut BTreeMap<String, WorkspaceManifestEntry>,
 ) -> Result<(), FunctionCallError> {
     let metadata = context
         .fs
@@ -655,7 +786,7 @@ async fn scan_source_root(
         .await
         .map_err(|err| source_fs_error("inspect", root, err))?;
     if metadata.is_file {
-        return add_source_file(context, root, accumulator).await;
+        return add_source_file(context, root, accumulator, observed_entries).await;
     }
     if !metadata.is_directory {
         return Err(FunctionCallError::RespondToModel(format!(
@@ -778,7 +909,7 @@ async fn scan_source_root(
                 continue;
             }
             let _ = recover_scan_result(
-                add_source_file(context, &canonical, accumulator).await,
+                add_source_file(context, &canonical, accumulator, observed_entries).await,
                 accumulator,
             );
         }
@@ -796,13 +927,22 @@ async fn scan_source_roots(
     options: &SourceSearchOptions,
     ignore_matcher: &SourceIgnoreMatcher,
     accumulator: &mut SourceSearchAccumulator,
+    observed_entries: &mut BTreeMap<String, WorkspaceManifestEntry>,
     recover_root_failures: bool,
 ) -> Result<(), FunctionCallError> {
     for root in roots {
         if accumulator.should_stop() {
             break;
         }
-        let result = scan_source_root(context, root, options, ignore_matcher, accumulator).await;
+        let result = scan_source_root(
+            context,
+            root,
+            options,
+            ignore_matcher,
+            accumulator,
+            observed_entries,
+        )
+        .await;
         if recover_root_failures {
             let _ = recover_scan_result(result, accumulator);
         } else {
@@ -816,6 +956,7 @@ async fn add_source_file(
     context: &LocalSourceContext,
     path: &PathUri,
     accumulator: &mut SourceSearchAccumulator,
+    observed_entries: &mut BTreeMap<String, WorkspaceManifestEntry>,
 ) -> Result<(), FunctionCallError> {
     let metadata = context
         .fs
@@ -834,10 +975,24 @@ async fn add_source_file(
         return Ok(());
     }
     match read_source_file_stably(context, path, &metadata).await? {
-        Some(bytes) => accumulator.add_file_bytes(Path::new(&relative), bytes),
+        Some(bytes) => {
+            observed_entries.insert(
+                relative.clone(),
+                manifest_entry_from_bytes(relative.clone(), &bytes),
+            );
+            accumulator.add_file_bytes(Path::new(&relative), bytes);
+        }
         None => accumulator.mark_file_changed_during_read(),
     }
     Ok(())
+}
+
+fn manifest_entry_from_bytes(path: String, bytes: &[u8]) -> WorkspaceManifestEntry {
+    WorkspaceManifestEntry {
+        path,
+        content_hash: Some(format!("{:x}", Sha256::digest(bytes))),
+        existed: true,
+    }
 }
 
 async fn read_source_file_stably(

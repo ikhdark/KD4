@@ -132,14 +132,20 @@ fn rewrite_function_arguments(
     })
 }
 
-fn rewrite_function_command_argument(
+fn rewrite_function_command_invocation(
     arguments: &str,
     tool_name: &str,
     field_name: &str,
     command_invocation: &CommandInvocation,
-    value: &str,
+    updated_input: &Value,
 ) -> Result<String, FunctionCallError> {
-    match command_invocation.with_updated_hook_command(tool_name, value)? {
+    let updated_invocation =
+        command_invocation.with_updated_hook_input(tool_name, updated_input)?;
+    if &updated_invocation == command_invocation {
+        return Ok(arguments.to_string());
+    }
+
+    match updated_invocation {
         CommandInvocation::Script(script) => {
             rewrite_function_arguments(arguments, tool_name, |arguments| {
                 arguments.insert(field_name.to_string(), Value::String(script));
@@ -150,7 +156,18 @@ fn rewrite_function_command_argument(
                 arguments.insert("script_body".to_string(), Value::String(script_body));
             })
         }
-        CommandInvocation::Argv { .. } => Ok(arguments.to_string()),
+        CommandInvocation::Argv { program, args } => {
+            rewrite_function_arguments(arguments, tool_name, |arguments| {
+                arguments.remove(field_name);
+                arguments.remove("script_body");
+                arguments.insert("kind".to_string(), Value::String("argv".to_string()));
+                arguments.insert("program".to_string(), Value::String(program));
+                arguments.insert(
+                    "args".to_string(),
+                    Value::Array(args.into_iter().map(Value::String).collect()),
+                );
+            })
+        }
     }
 }
 

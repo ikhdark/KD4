@@ -343,8 +343,12 @@ async fn steer_interrupts_wait_agent_and_is_sent_in_follow_up_request() {
     assert_eq!(
         serde_json::from_str::<Value>(wait_output).expect("parse wait_agent output"),
         json!({
+            "cursor": null,
             "message": "Wait interrupted by new input.",
+            "nudged_assignment_ids": [],
             "timed_out": false,
+            "truncated_count": 0,
+            "typed_deltas": [],
         })
     );
 

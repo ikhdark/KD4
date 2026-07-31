@@ -30,6 +30,8 @@ fn assignment_draft() -> AssignmentDraft {
         risk_hints: Vec::new(),
         required_evidence: vec!["cargo test -p codex-core".to_string()],
         prohibited_changes: Vec::new(),
+        contract_claims: Vec::new(),
+        workspace_strategy: codex_agent_task_store::WorkspaceStrategy::Auto,
         relation: None,
     }
 }
@@ -79,6 +81,31 @@ async fn initialized_coordinator() -> (AgentTaskCoordinator, TempDir, TempDir) {
         .await
         .expect("task coordinator initializes");
     (coordinator, codex_home, repository)
+}
+
+#[tokio::test]
+async fn workspace_coordination_lazy_state_initialization_is_singleflight() {
+    let codex_home = TempDir::new().expect("codex home tempdir");
+    let coordinator = AgentTaskCoordinator::default();
+    let first = coordinator.initialize_for_workspace_coordination(
+        None,
+        codex_home.path().to_path_buf(),
+        "test-provider".to_string(),
+        "lazy-root".to_string(),
+    );
+    let second = coordinator.initialize_for_workspace_coordination(
+        None,
+        codex_home.path().to_path_buf(),
+        "test-provider".to_string(),
+        "lazy-root".to_string(),
+    );
+
+    let (first_result, second_result) = tokio::join!(first, second);
+
+    first_result.expect("first lazy initialization");
+    second_result.expect("parallel lazy initialization shares the same runtime");
+    assert!(coordinator.store().is_some());
+    assert_eq!(coordinator.root_session_id().as_deref(), Some("lazy-root"));
 }
 
 #[tokio::test]

@@ -290,7 +290,7 @@ pub fn create_wait_agent_tool_v1(options: WaitAgentTimeoutOptions) -> ToolSpec {
 pub fn create_wait_agent_tool_v2(options: WaitAgentTimeoutOptions) -> ToolSpec {
     ToolSpec::Function(ResponsesApiTool {
         name: "wait_agent".to_string(),
-        description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. The wait also ends early when new user input is steered into the active turn. Does not return the content; returns either a summary of which agents have updates (if any), an interruption summary for steered input, or a timeout summary if no activity arrives before the deadline."
+        description: "Wait for a mailbox update or durable typed-task progress. Pass the returned cursor to receive only later assignment, workspace-epoch, gate, receipt, lease, and progress deltas. Does not return the content; returns either a summary of which agents have updates (if any), typed-task deltas, an interruption summary, or a timeout summary. The wait also ends early when new user input is steered into the active turn."
             .to_string(),
         strict: false,
         defer_loading: None,
@@ -491,9 +491,17 @@ fn list_agents_output_schema() -> Value {
                     "additionalProperties": false
                 },
                 "description": "Live agents visible in the current root thread tree."
+            },
+            "typed_tasks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                },
+                "description": "Durable typed-task status including workspace epoch, progress, lease, pending gates, stale reason, and next action."
             }
         },
-        "required": ["agents"],
+        "required": ["agents", "typed_tasks"],
         "additionalProperties": false
     })
 }
@@ -539,9 +547,30 @@ fn wait_output_schema_v2() -> Value {
             "timed_out": {
                 "type": "boolean",
                 "description": "Whether the wait call returned because no mailbox update arrived before the timeout."
+            },
+            "cursor": {
+                "type": ["string", "null"],
+                "description": "Durable typed-task wake cursor to pass to the next wait."
+            },
+            "typed_deltas": {
+                "type": "array",
+                "description": "Durable typed-task deltas after the supplied cursor.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                }
+            },
+            "truncated_count": {
+                "type": "integer",
+                "description": "Number of durable deltas omitted because of retention or page limits."
+            },
+            "nudged_assignment_ids": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Stalled live assignments that received their one durable no-progress nudge."
             }
         },
-        "required": ["message", "timed_out"],
+        "required": ["message", "timed_out", "cursor", "typed_deltas", "truncated_count", "nudged_assignment_ids"],
         "additionalProperties": false
     })
 }
@@ -790,6 +819,22 @@ fn typed_assignment_schema() -> JsonSchema {
                 "prohibited_changes".to_string(),
                 string_array("Changes explicitly outside this assignment."),
             ),
+            (
+                "contract_claims".to_string(),
+                string_array(
+                    "Exclusive named behavioral contracts owned by this assignment.",
+                ),
+            ),
+            (
+                "workspace_strategy".to_string(),
+                JsonSchema::string_enum(
+                    vec![json!("auto"), json!("shared"), json!("isolated")],
+                    Some(
+                        "Use shared for disjoint claims and isolated for deliberate competing implementations."
+                            .to_string(),
+                    ),
+                ),
+            ),
             ("relation".to_string(), relation),
         ]),
         Some(vec![
@@ -1009,13 +1054,22 @@ fn wait_agent_tool_parameters_v1(options: WaitAgentTimeoutOptions) -> JsonSchema
 }
 
 fn wait_agent_tool_parameters_v2(options: WaitAgentTimeoutOptions) -> JsonSchema {
-    let properties = BTreeMap::from([(
-        "timeout_ms".to_string(),
-        JsonSchema::number(Some(format!(
-            "Timeout in milliseconds. Defaults to {}, min {}, max {}.",
-            options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
-        ))),
-    )]);
+    let properties = BTreeMap::from([
+        (
+            "timeout_ms".to_string(),
+            JsonSchema::number(Some(format!(
+                "Timeout in milliseconds. Defaults to {}, min {}, max {}.",
+                options.default_timeout_ms, options.min_timeout_ms, options.max_timeout_ms,
+            ))),
+        ),
+        (
+            "cursor".to_string(),
+            JsonSchema::string(Some(
+                "Opaque durable typed-task cursor returned by a previous wait_agent call."
+                    .to_string(),
+            )),
+        ),
+    ]);
 
     JsonSchema::object(properties, /*required*/ None, Some(false.into()))
 }

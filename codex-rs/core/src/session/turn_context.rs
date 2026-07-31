@@ -608,11 +608,17 @@ impl Session {
         sub_id: &str,
         updates: &SessionSettingsUpdate,
     ) -> CodexResult<SessionConfiguration> {
+        let _refresh_guard = self
+            .managed_network_proxy_refresh_lock
+            .acquire()
+            .await
+            .expect("managed network proxy refresh semaphore is never closed");
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
         let update_result: CodexResult<_> = {
             let mut state = self.state.lock().await;
             match state.session_configuration.clone().apply(updates) {
                 Ok(next) => {
+                    let previous_session_configuration = state.session_configuration.clone();
                     let previous_permission_profile =
                         state.session_configuration.permission_profile();
                     let next_permission_profile = next.permission_profile();
@@ -623,46 +629,68 @@ impl Session {
                     });
                     let new_config = notify_config_contributors
                         .then(|| Self::build_effective_session_config(&next));
-                    if updates.environments.is_some() {
-                        self.services
-                            .turn_environments
-                            .update_selections(next.environment_selections());
-                        self.services.bump_planning_generation();
-                    }
                     state.session_configuration = next.clone();
                     Ok((
                         next,
                         permission_profile_changed,
                         previous_config,
                         new_config,
+                        previous_session_configuration,
+                        updates.environments.is_some(),
                     ))
                 }
                 Err(err) => Err(CodexErr::InvalidRequest(err.to_string())),
             }
         };
 
-        let (session_configuration, permission_profile_changed, previous_config, new_config) =
-            match update_result {
-                Ok(update) => update,
-                Err(err) => {
-                    let message = err.to_string();
-                    self.send_event_raw(Event {
-                        id: sub_id.to_string(),
-                        msg: EventMsg::Error(ErrorEvent {
-                            message: message.clone(),
-                            codex_error_info: Some(CodexErrorInfo::BadRequest),
-                        }),
-                    })
-                    .await;
-                    return Err(CodexErr::InvalidRequest(message));
-                }
-            };
-        self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
+        let (
+            session_configuration,
+            permission_profile_changed,
+            previous_config,
+            new_config,
+            previous_session_configuration,
+            environments_changed,
+        ) = match update_result {
+            Ok(update) => update,
+            Err(err) => {
+                let message = err.to_string();
+                self.send_event_raw(Event {
+                    id: sub_id.to_string(),
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: message.clone(),
+                        codex_error_info: Some(CodexErrorInfo::BadRequest),
+                    }),
+                })
+                .await;
+                return Err(CodexErr::InvalidRequest(message));
+            }
+        };
 
         if permission_profile_changed {
-            self.refresh_managed_network_proxy_for_current_permission_profile()
+            if let Err(error) = self
+                .refresh_managed_network_proxy_for_current_permission_profile()
+                .await
+            {
+                self.state.lock().await.session_configuration = previous_session_configuration;
+                let message = format!("managed network policy update failed: {error}");
+                self.send_event_raw(Event {
+                    id: sub_id.to_string(),
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: message.clone(),
+                        codex_error_info: Some(CodexErrorInfo::BadRequest),
+                    }),
+                })
                 .await;
+                return Err(CodexErr::InvalidRequest(message));
+            }
         }
+        if environments_changed {
+            self.services
+                .turn_environments
+                .update_selections(session_configuration.environment_selections());
+            self.services.bump_planning_generation();
+        }
+        self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
 
         Ok(session_configuration)
     }

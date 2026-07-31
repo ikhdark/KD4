@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import TypeAlias
+
 from pydantic import BaseModel
 
 from .v2_all import AccountLoginCompletedNotification
@@ -69,6 +71,73 @@ from .v2_all import TurnStartedNotification
 from .v2_all import WarningNotification
 from .v2_all import WindowsSandboxSetupCompletedNotification
 from .v2_all import WindowsWorldWritableWarningNotification
+
+GeneratedNotificationPayload: TypeAlias = (
+    AccountLoginCompletedNotification
+    | AccountRateLimitsUpdatedNotification
+    | AccountUpdatedNotification
+    | AgentMessageDeltaNotification
+    | AppListUpdatedNotification
+    | CommandExecOutputDeltaNotification
+    | CommandExecutionOutputDeltaNotification
+    | ConfigWarningNotification
+    | ContextCompactedNotification
+    | DeprecationNoticeNotification
+    | ErrorNotification
+    | ExternalAgentConfigImportCompletedNotification
+    | FileChangeOutputDeltaNotification
+    | FileChangePatchUpdatedNotification
+    | FsChangedNotification
+    | FuzzyFileSearchSessionCompletedNotification
+    | FuzzyFileSearchSessionUpdatedNotification
+    | GuardianWarningNotification
+    | HookCompletedNotification
+    | HookStartedNotification
+    | ItemCompletedNotification
+    | ItemGuardianApprovalReviewCompletedNotification
+    | ItemGuardianApprovalReviewStartedNotification
+    | ItemStartedNotification
+    | McpServerOauthLoginCompletedNotification
+    | McpServerStatusUpdatedNotification
+    | McpToolCallProgressNotification
+    | ModelReroutedNotification
+    | ModelVerificationNotification
+    | PlanDeltaNotification
+    | ProcessExitedNotification
+    | ProcessOutputDeltaNotification
+    | ReasoningSummaryPartAddedNotification
+    | ReasoningSummaryTextDeltaNotification
+    | ReasoningTextDeltaNotification
+    | RemoteControlStatusChangedNotification
+    | ServerRequestResolvedNotification
+    | SkillsChangedNotification
+    | TerminalInteractionNotification
+    | ThreadArchivedNotification
+    | ThreadClosedNotification
+    | ThreadGoalClearedNotification
+    | ThreadGoalUpdatedNotification
+    | ThreadNameUpdatedNotification
+    | ThreadRealtimeClosedNotification
+    | ThreadRealtimeErrorNotification
+    | ThreadRealtimeItemAddedNotification
+    | ThreadRealtimeOutputAudioDeltaNotification
+    | ThreadRealtimeSdpNotification
+    | ThreadRealtimeStartedNotification
+    | ThreadRealtimeTranscriptDeltaNotification
+    | ThreadRealtimeTranscriptDoneNotification
+    | ThreadSettingsUpdatedNotification
+    | ThreadStartedNotification
+    | ThreadStatusChangedNotification
+    | ThreadTokenUsageUpdatedNotification
+    | ThreadUnarchivedNotification
+    | TurnCompletedNotification
+    | TurnDiffUpdatedNotification
+    | TurnPlanUpdatedNotification
+    | TurnStartedNotification
+    | WarningNotification
+    | WindowsSandboxSetupCompletedNotification
+    | WindowsWorldWritableWarningNotification
+)
 
 NOTIFICATION_MODELS: dict[str, type[BaseModel]] = {
     "account/login/completed": AccountLoginCompletedNotification,

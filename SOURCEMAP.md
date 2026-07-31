@@ -218,6 +218,7 @@ below.
 | Command selection and top-level dispatch | `codex-rs/cli/src/main.rs` | command-specific CLI modules, then TUI, exec, app-server, MCP, auth, plugins, or sandbox setup |
 | Session and turn lifecycle | `codex-rs/core/src/session`, `codex-rs/core/src/tasks` | core state, rollout, protocol events, tools, model client, extension lifecycle |
 | Multi-agent execution | `codex-rs/core/src/agent`, `codex-rs/core/src/agent_communication.rs` | agent identity/task/graph stores, protocol events, app-server and TUI consumers |
+| Shared-worktree coordination | `codex-rs/agent-task-store`, `codex-rs/core/src/agent/task_coordinator.rs` | root/legacy/typed mutation entrypoints, source-read CAS, shell validation, durable waits, completion quiescence, migrations, and isolated-worktree integration |
 | Model-visible context | `codex-rs/core/src/context`, `codex-rs/core/src/context_manager`, `codex-rs/prompts` | context fragments, skills/plugins/apps instructions, compaction, prompt snapshots |
 | Model requests and retries | `codex-rs/core/src/client.rs` | model-provider, backend/client crates, auth, telemetry, response debug context |
 | Tool planning and dispatch | `codex-rs/core/src/tools`, `codex-rs/tools` | built-in handlers, extension tools, MCP calls, approvals, shell and sandbox owners |
@@ -266,7 +267,7 @@ hook engine and policy surface, not a substitute for the typed extension API.
 | Rollout tracing | `codex-rs/rollout-trace` | diagnostics and execution tracing |
 | Prompt/message history | `codex-rs/message-history` | core context reconstruction and client history |
 | Memories | `codex-rs/memories/read`, `codex-rs/memories/write`, `codex-rs/ext/memories` | state DB, prompt context, tools, lifecycle callbacks |
-| Agent graph and tasks | `codex-rs/agent-graph-store`, `codex-rs/agent-task-store` | core multi-agent coordinator, protocol/app-server status |
+| Agent graph and tasks | `codex-rs/agent-graph-store`, `codex-rs/agent-task-store` | core multi-agent coordinator, repository/workspace identities, epochs, claims, validation evidence, leases, wake cursors, isolated handoffs, protocol/app-server status |
 
 Treat migrations, rollout records, serialized protocol items, stored thread
 metadata, and resume behavior as one compatibility surface. A change to one
@@ -276,9 +277,9 @@ owner must trace every reader and writer before completion.
 
 | Contract or output | Source owner | Update and validation path |
 | --- | --- | --- |
-| App-server request/notification schema | `codex-rs/app-server`, `codex-rs/app-server-protocol`, `codex-rs/protocol` | Focused protocol/app-server tests plus `just app-server-schema-check`; intentional regeneration uses the force/generator recipe |
+| App-server request/notification schema | `codex-rs/app-server`, `codex-rs/app-server-protocol`, `codex-rs/protocol` | Focused protocol/app-server tests plus check-only `just app-server-schema-check`; intentional regeneration uses serialized `just app-server-schema-regenerate <owner>` |
 | App-server schema tree | `codex-rs/app-server-protocol/schema` | Generated output; never hand-edit; inspect the generator-produced diff |
-| Config schema | `codex-rs/config`, `codex-rs/features`, `codex-rs/core` | Focused config/core tests plus `just config-schema-check`; output is `codex-rs/core/config.schema.json` |
+| Config schema | `codex-rs/config`, `codex-rs/features`, `codex-rs/core` | Focused config/core tests plus check-only `just config-schema-check`; intentional regeneration uses serialized `just config-schema-regenerate <owner>` and outputs `codex-rs/core/config.schema.json` |
 | Thread-config protobuf binding | `codex-rs/config/src/thread_config/proto/codex.thread_config.v1.proto` | `just generate-config-proto-check`; intentional regeneration uses `just generate-config-proto` |
 | Hook schemas | `codex-rs/hooks/src` | Focused hook tests; intentional regeneration uses `just write-hooks-schema` and produces `codex-rs/hooks/schema/generated` |
 | npm package layout | `codex-cli`, `scripts/stage_npm_packages.py`, `scripts/codex_package` | Staging/package tests, archive inspection, and the owning dry-run |
