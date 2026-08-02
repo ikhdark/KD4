@@ -45,6 +45,7 @@ pub(crate) struct SessionState {
     pub(crate) active_connector_selection: HashSet<String>,
     pub(crate) pending_session_start_sources: VecDeque<codex_hooks::SessionStartSource>,
     granted_permissions_by_environment_id: HashMap<String, AdditionalPermissionProfile>,
+    last_passed_root_completion_turn_id: Option<String>,
     next_turn_is_first: bool,
 }
 
@@ -78,6 +79,7 @@ impl SessionState {
             active_connector_selection: HashSet::new(),
             pending_session_start_sources: VecDeque::new(),
             granted_permissions_by_environment_id: HashMap::new(),
+            last_passed_root_completion_turn_id: None,
             next_turn_is_first: true,
         }
     }
@@ -113,6 +115,14 @@ impl SessionState {
 
     pub(crate) fn clone_history(&self) -> ContextManager {
         self.history.clone()
+    }
+
+    pub(crate) fn last_passed_root_completion_turn_id(&self) -> Option<String> {
+        self.last_passed_root_completion_turn_id.clone()
+    }
+
+    pub(crate) fn set_last_passed_root_completion_turn_id(&mut self, turn_id: Option<String>) {
+        self.last_passed_root_completion_turn_id = turn_id;
     }
 
     pub(crate) fn replace_history(

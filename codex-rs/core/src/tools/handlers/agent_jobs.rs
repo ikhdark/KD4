@@ -1,6 +1,6 @@
 use crate::agent::control::AgentJobBinding;
 use crate::agent::control::SpawnAgentOptions;
-use crate::agent::role::AgentRoleModelLocks;
+use crate::agent::role::AgentRoleLocks;
 use crate::agent::status::is_final;
 use crate::config::Config;
 use crate::function_tool::FunctionCallError;
@@ -151,7 +151,7 @@ async fn build_runner_options(
         &mut spawn_config,
         /*requested_model*/ None,
         /*requested_reasoning_effort*/ None,
-        AgentRoleModelLocks::default(),
+        AgentRoleLocks::default(),
     )
     .await?;
     apply_spawn_agent_service_tier(

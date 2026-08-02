@@ -3,6 +3,7 @@ use super::NOTES_SECTION_TOKEN_BUDGET;
 use super::RECENT_WORK_SECTION_TOKEN_BUDGET;
 use super::STARTUP_CONTEXT_HEADER;
 use super::WORKSPACE_SECTION_TOKEN_BUDGET;
+use super::approx_realtime_token_count;
 use super::build_current_thread_section;
 use super::build_recent_work_section;
 use super::build_workspace_section_with_user_root;
@@ -188,9 +189,9 @@ fn current_thread_section_keeps_latest_turns_when_history_exceeds_budget() {
 }
 
 #[test]
-fn startup_context_blob_is_wrapped_in_tags_without_final_truncation() {
+fn startup_context_blob_is_wrapped_when_it_fits_the_budget() {
     let body = "Startup context from Codex.\n## Current Thread\nhello";
-    let wrapped = format_startup_context_blob(body);
+    let wrapped = format_startup_context_blob(body, 100).expect("wrapped startup context");
 
     assert_eq!(
         wrapped,
@@ -199,7 +200,7 @@ fn startup_context_blob_is_wrapped_in_tags_without_final_truncation() {
 }
 
 #[test]
-fn fixed_section_budgets_apply_per_section_without_total_blob_truncation() {
+fn fixed_section_budgets_fit_within_a_total_blob_budget() {
     let body = [
         STARTUP_CONTEXT_HEADER.to_string(),
         format_section(
@@ -229,15 +230,34 @@ fn fixed_section_budgets_apply_per_section_without_total_blob_truncation() {
     ]
     .join("\n\n");
 
-    let wrapped = format_startup_context_blob(&body);
+    let budget_tokens = 6_000;
+    let wrapped =
+        format_startup_context_blob(&body, budget_tokens).expect("wrapped startup context");
 
     assert!(wrapped.starts_with("<startup_context>\n"));
     assert!(wrapped.ends_with("\n</startup_context>"));
+    assert!(approx_realtime_token_count(&wrapped) <= budget_tokens);
     assert!(wrapped.contains("tokens truncated"));
     assert!(wrapped.contains("## Current Thread"));
     assert!(wrapped.contains("## Recent Work"));
     assert!(wrapped.contains("## Machine / Workspace Map"));
     assert!(wrapped.contains("## Notes"));
+}
+
+#[test]
+fn startup_context_blob_truncates_to_the_total_budget_and_preserves_tags() {
+    let budget_tokens = 120;
+    let body = format!(
+        "Startup context from Codex.\n## Current Thread\n{}",
+        "long context ".repeat(500)
+    );
+    let wrapped =
+        format_startup_context_blob(&body, budget_tokens).expect("wrapped startup context");
+
+    assert!(wrapped.starts_with("<startup_context>\n"));
+    assert!(wrapped.ends_with("\n</startup_context>"));
+    assert!(wrapped.contains("tokens truncated"));
+    assert!(approx_realtime_token_count(&wrapped) <= budget_tokens);
 }
 
 #[tokio::test]

@@ -80,6 +80,21 @@ new file mode 100644
 
             _validate_patch(patch, case_id="double-plus-content")
 
+    def test_patch_validation_normalizes_crlf_before_git_apply(self) -> None:
+        patch_text = """\
+diff --git a/investigation_cases/crlf.txt b/investigation_cases/crlf.txt
+new file mode 100644
+--- /dev/null
++++ b/investigation_cases/crlf.txt
+@@ -0,0 +1 @@
++value
+"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            patch = Path(temp_dir) / "crlf.patch"
+            patch.write_bytes(patch_text.replace("\n", "\r\n").encode("utf-8"))
+
+            _validate_patch(patch, case_id="crlf-content")
+
     def test_scorer_derives_binary_hash_from_results(self) -> None:
         case = load_cases()[0]
         binary_sha256 = "a" * 64

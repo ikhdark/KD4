@@ -2,7 +2,7 @@
 
 import contextlib
 import io
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import os
 import subprocess
 import tempfile
@@ -130,7 +130,7 @@ class GitDoctorTest(unittest.TestCase):
             ),
         ):
             self.assertEqual(
-                git_doctor.path_kind(Path("/mnt/c/Users/kuh/repo")),
+                git_doctor.path_kind(PurePosixPath("/mnt/c/Users/kuh/repo")),
                 "wsl-windows-mount",
             )
 
@@ -145,7 +145,9 @@ class GitDoctorTest(unittest.TestCase):
             ),
             mock.patch.object(git_doctor.platform, "system", return_value="Linux"),
         ):
-            self.assertEqual(git_doctor.path_kind(Path("/mnt/data/repo")), "linux")
+            self.assertEqual(
+                git_doctor.path_kind(PurePosixPath("/mnt/data/repo")), "linux"
+            )
 
     def test_recommendations_include_git_tuning_when_unset(self) -> None:
         recs = "\n".join(git_doctor.recommendations("windows", None, None))
@@ -276,7 +278,9 @@ class ConfigSchemaCheckTest(unittest.TestCase):
                 self.assertIn(f"Could not run {command}:", stderr.getvalue())
                 self.assertNotIn("Traceback", stderr.getvalue())
 
-    def test_missing_git_during_schema_status_marks_inputs_changed_cleanly(self) -> None:
+    def test_missing_git_during_schema_status_marks_inputs_changed_cleanly(
+        self,
+    ) -> None:
         stderr = io.StringIO()
         with (
             mock.patch.object(
@@ -343,9 +347,7 @@ class ConfigSchemaCheckTest(unittest.TestCase):
                 0,
             )
 
-        regenerate.assert_called_once_with(
-            Path("/repo"), "assignment:config-owner"
-        )
+        regenerate.assert_called_once_with(Path("/repo"), "assignment:config-owner")
 
 
 class GeneratedOutputLockTest(unittest.TestCase):
@@ -472,9 +474,7 @@ class AppServerSchemaRuntimeCheckTest(unittest.TestCase):
                 ),
                 0,
             )
-        regenerate.assert_called_once_with(
-            Path("/repo"), "assignment:app-server-owner"
-        )
+        regenerate.assert_called_once_with(Path("/repo"), "assignment:app-server-owner")
 
     def test_force_regeneration_forwards_generator_arguments(self) -> None:
         with (

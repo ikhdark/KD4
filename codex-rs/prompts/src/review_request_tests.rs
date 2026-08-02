@@ -49,3 +49,26 @@ fn review_prompt_template_renders_commit_variant_with_title() {
         "Review the code changes introduced by commit deadbeef (\"Fix bug\"). Provide prioritized, actionable findings."
     );
 }
+
+#[test]
+fn review_rubric_stays_compact_without_losing_output_contracts() {
+    assert!(
+        REVIEW_PROMPT.len() <= 5_000,
+        "review rubric grew to {} bytes",
+        REVIEW_PROMPT.len()
+    );
+    for required in [
+        "Return every qualifying issue",
+        "[P0]",
+        "\"priority\"",
+        "\"code_location\"",
+        "\"overall_correctness\"",
+        "location must overlap the diff",
+        "Do not generate a PR fix",
+    ] {
+        assert!(
+            REVIEW_PROMPT.contains(required),
+            "review rubric lost required contract: {required}"
+        );
+    }
+}

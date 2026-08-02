@@ -43,23 +43,6 @@ function Restore-ProcessEnvironmentVariable {
     }
 }
 
-function Test-StringArrayEqual {
-    param(
-        [string[]]$Left,
-        [string[]]$Right
-    )
-
-    if ($Left.Count -ne $Right.Count) {
-        return $false
-    }
-    for ($i = 0; $i -lt $Left.Count; $i++) {
-        if (-not [string]::Equals($Left[$i], $Right[$i], [StringComparison]::Ordinal)) {
-            return $false
-        }
-    }
-    return $true
-}
-
 function Format-EnvProofValue {
     param(
         [string]$Name
@@ -163,22 +146,26 @@ try {
         $laneName = ConvertTo-SafeCargoLaneName -Value $CargoTargetLane
         $laneTargetDir = Join-Path $repoRoot "codex-rs\target\lanes\$laneName"
         $hasExplicitCargoTargetDir = Test-ProgramArgsHaveCargoTargetDir -CommandArgs $ProgramArgs
-        $programArgsWithTargetDir = @(Add-CargoTargetDirArgument -CommandArgs $ProgramArgs -TargetDir $laneTargetDir)
         if ($hasExplicitCargoTargetDir) {
-            Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
             $cargoTargetDirProof = "<explicit command argument>"
         }
-        elseif (Test-StringArrayEqual -Left $programArgsWithTargetDir -Right $ProgramArgs) {
-            $env:CARGO_TARGET_DIR = $laneTargetDir
-            $cargoTargetDirProof = $laneTargetDir
-        }
         else {
-            # An exported CARGO_TARGET_DIR lands in sccache's cache key even
-            # when cargo itself uses --target-dir, so drop any inherited value.
-            Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
-            $ProgramArgs = $programArgsWithTargetDir
             $cargoTargetDirProof = $laneTargetDir
         }
+        # The Python reservation owner holds .lane-active.lock for the entire
+        # child lifetime and injects --target-dir for Cargo build commands.
+        # Never export CARGO_TARGET_DIR because it fragments sccache keys.
+        Remove-Item Env:CARGO_TARGET_DIR -ErrorAction SilentlyContinue
+        $python = Get-Command python -ErrorAction Stop
+        $laneRunner = Join-Path $repoRoot "scripts\rust_build_status.py"
+        $ProgramArgs = @(
+            $python.Source,
+            $laneRunner,
+            "run-lane",
+            "--lane",
+            $laneName,
+            "--"
+        ) + @($ProgramArgs)
     }
 
     if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory)) {

@@ -740,7 +740,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn("app-server-thread-status-check:", justfile)
         self.assertIn("app-server-schema-protocol-check:", justfile)
         self.assertIn("app-server-schema-check:", justfile)
-        self.assertIn("app-server-schema-check-force:", justfile)
+        self.assertIn("app-server-schema-check-force owner:", justfile)
         self.assertIn("cargo nextest run -p codex-app-server-protocol -E", justfile)
 
     def test_agents_current_nested_instruction_layout_is_explicit(

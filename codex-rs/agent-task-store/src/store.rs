@@ -86,6 +86,13 @@ pub trait AgentTaskStore: Send + Sync {
         limit: Option<usize>,
     ) -> TaskStoreFuture<'_, Vec<AgentTaskBinding>>;
 
+    /// Renews only the exact, currently bound, active typed actor. Missing, sealed,
+    /// superseded, terminal, or mismatched bindings return `false` without revival.
+    fn heartbeat_typed_workspace_actor(
+        &self,
+        binding: AgentTaskBinding,
+    ) -> TaskStoreFuture<'_, bool>;
+
     fn append_observation(
         &self,
         attempt_id: AttemptId,

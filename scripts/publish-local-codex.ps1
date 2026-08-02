@@ -836,6 +836,7 @@ function Get-VersionProofLines {
             $process = [System.Diagnostics.Process]::new()
             $process.StartInfo.FileName = $Path
             $process.StartInfo.Arguments = "--version"
+            $process.StartInfo.RedirectStandardInput = $true
             $process.StartInfo.RedirectStandardOutput = $true
             $process.StartInfo.RedirectStandardError = $true
             $process.StartInfo.UseShellExecute = $false
@@ -844,6 +845,7 @@ function Get-VersionProofLines {
             if (-not $process.Start()) {
                 return @("<unavailable: failed to start>")
             }
+            $process.StandardInput.Close()
 
             $standardOutputTask = $process.StandardOutput.ReadToEndAsync()
             $standardErrorTask = $process.StandardError.ReadToEndAsync()
@@ -2035,13 +2037,42 @@ function Get-CargoLockPackageVersion {
 }
 
 function Get-WindowsRustyV8Target {
-    $architecture = [System.Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITEW6432")
+    try {
+        $rustcCommand = Get-Command rustc -CommandType Application -ErrorAction Stop |
+            Select-Object -First 1
+        $rustcVersion = @(& $rustcCommand.Path -vV 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+            foreach ($line in $rustcVersion) {
+                if ($line -match '^host:\s*(\S+)\s*$') {
+                    $rustHost = $matches[1]
+                    if ($rustHost -in @("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc")) {
+                        return $rustHost
+                    }
+                    break
+                }
+            }
+        }
+    }
+    catch {
+        # Fall through to the architecture of the process that will launch Cargo.
+    }
+
+    $architecture = $null
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        try {
+            $architecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+        }
+        catch {
+            $architecture = $null
+        }
+    }
     if ([string]::IsNullOrWhiteSpace($architecture)) {
         $architecture = [System.Environment]::GetEnvironmentVariable("PROCESSOR_ARCHITECTURE")
     }
 
     switch ($architecture) {
         "AMD64" { return "x86_64-pc-windows-msvc" }
+        "X64" { return "x86_64-pc-windows-msvc" }
         "ARM64" { return "aarch64-pc-windows-msvc" }
         default { return $null }
     }

@@ -666,6 +666,11 @@ impl AgentControl {
                     .await);
             }
         }
+        if options.typed_task_binding.is_some()
+            && let Some(agent_path) = agent_metadata.agent_path.clone()
+        {
+            self.start_typed_actor_heartbeat_watcher(agent_path, new_thread.thread_id);
+        }
 
         if let Some(binding) = options.agent_job_binding.as_ref() {
             let spawned_thread_id = new_thread.thread_id.to_string();
@@ -1196,6 +1201,14 @@ impl AgentControl {
                     resumed_thread.thread_id
                 ))),
             };
+        }
+        if let Some(agent_path) = agent_metadata.agent_path.clone()
+            && self
+                .task_coordinator()
+                .binding_for_agent_path(&agent_path)
+                .is_some()
+        {
+            self.start_typed_actor_heartbeat_watcher(agent_path, resumed_thread.thread_id);
         }
         // Resumed threads are re-registered in-memory and need the same listener
         // attachment path as freshly spawned threads.

@@ -106,3 +106,24 @@ Before root completion, linked assignments, validations, gates, and claims must
 be terminal, and no linked workspace mutation lease may remain active. Root
 completion rechecks sealed receipt evidence so later relevant drift remains a
 blocker; unrelated task roots only warn and do not join this barrier.
+
+### Architect-Driven Implementation Lane
+
+For risky work selected under root `AGENTS.md`, use `kd4_explorer` as the
+read-only contract architect, then copy its completed
+`KD4_ARCHITECT_CONTRACT_V1` JSON assignment block into a dependent `kd4_worker`
+assignment. Preserve every stable obligation ID and copied typed field exactly.
+If the receipt is ambiguous or cannot be copied without interpretation, the
+coordinator treats the architect assignment as incomplete and does not spawn the
+coder. Bind the reviewer and verifier to the coder as their sole evaluation
+target, with both architect and coder assignments as dependencies.
+
+The store and runtime hard-enforce the architect and verifier capability
+boundaries, successful sealed dependencies and cleared gates, and exclusive path
+and named-contract claims. The receipt format, transcription fidelity, exact
+obligation-ID comparison, and refusal to complete with unresolved copied
+obligations are coordinator-policy checks. They are not store validation. The
+coder's copied typed assignment is authoritative for review and verification;
+tests and other validation remain supporting evidence rather than proof of
+completeness. Drift-proof receipt-to-assignment binding would require a future
+Rust change and is outside this workflow.

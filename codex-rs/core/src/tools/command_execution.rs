@@ -132,6 +132,7 @@ struct AttemptEntry {
 pub(crate) struct RunningCommand {
     pub(crate) key: CommandAttemptKey,
     pub(crate) artifact: RawOutputArtifact,
+    owner_turn_id: String,
     completed_exit_code: Option<i32>,
     workspace_mutation: Option<RunningWorkspaceMutation>,
 }
@@ -166,6 +167,7 @@ impl RunningWorkspaceMutation {
         store: Arc<dyn AgentTaskStore>,
         repo_root: PathBuf,
         lease: WorkspaceMutationLease,
+        owner_cancelled: CancellationToken,
     ) -> Self {
         let stop = CancellationToken::new();
         let heartbeat_stop = stop.clone();
@@ -179,6 +181,14 @@ impl RunningWorkspaceMutation {
             loop {
                 tokio::select! {
                     _ = heartbeat_stop.cancelled() => break,
+                    _ = owner_cancelled.cancelled() => {
+                        // A mutating process must not outlive the turn that owns its
+                        // repository authority. The process manager observes lease_lost,
+                        // terminates the process tree, and the exit watcher finalizes the
+                        // lease only after termination is confirmed.
+                        heartbeat_lease_lost.cancel();
+                        break;
+                    }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                         match heartbeat_store
                             .heartbeat_workspace_mutation(
@@ -226,6 +236,11 @@ impl RunningWorkspaceMutation {
 
     pub(crate) fn lease_lost_token(&self) -> CancellationToken {
         self.inner.lease_lost.clone()
+    }
+
+    pub(crate) fn cancel_owner(&self) {
+        self.inner.stop.cancel();
+        self.inner.lease_lost.cancel();
     }
 
     pub(crate) async fn finish(&self) -> Result<(), String> {
@@ -322,6 +337,8 @@ impl CommandExecutionLedger {
         process_id: i32,
         key: CommandAttemptKey,
         artifact: RawOutputArtifact,
+        owner_turn_id: String,
+        workspace_mutation: Option<RunningWorkspaceMutation>,
     ) {
         let mut state = self.state.lock().await;
         if state.running.contains_key(&process_id) {
@@ -334,30 +351,32 @@ impl CommandExecutionLedger {
             RunningCommand {
                 key,
                 artifact,
+                owner_turn_id,
                 completed_exit_code: None,
-                workspace_mutation: None,
+                workspace_mutation,
             },
         );
     }
 
-    pub(crate) async fn attach_running_workspace_mutation(
-        &self,
-        process_id: i32,
-        workspace_mutation: RunningWorkspaceMutation,
-    ) -> Result<bool, String> {
-        let attached = {
-            let mut state = self.state.lock().await;
-            let Some(running) = state.running.get_mut(&process_id) else {
-                return Ok(false);
-            };
-            running.workspace_mutation = Some(workspace_mutation);
-            true
-        };
-        Ok(attached)
-    }
-
     pub(crate) async fn running_process(&self, process_id: i32) -> Option<RunningCommand> {
         self.state.lock().await.running.get(&process_id).cloned()
+    }
+
+    pub(crate) async fn cancel_mutations_for_turn(&self, turn_id: &str) {
+        let mutations = {
+            let state = self.state.lock().await;
+            state
+                .running
+                .values()
+                .filter(|running| {
+                    running.owner_turn_id == turn_id && running.completed_exit_code.is_none()
+                })
+                .filter_map(|running| running.workspace_mutation.clone())
+                .collect::<Vec<_>>()
+        };
+        for mutation in mutations {
+            mutation.cancel_owner();
+        }
     }
 
     pub(crate) async fn update_running_artifact(
@@ -375,16 +394,33 @@ impl CommandExecutionLedger {
         process_id: i32,
         exit_code: i32,
     ) -> bool {
-        let mut state = self.state.lock().await;
-        let Some(running) = state.running.get_mut(&process_id) else {
-            return false;
+        let workspace_mutation = {
+            let mut state = self.state.lock().await;
+            let Some(running) = state.running.get_mut(&process_id) else {
+                return false;
+            };
+            if running.completed_exit_code.is_some() {
+                return true;
+            }
+            running.completed_exit_code = Some(exit_code);
+            let key = running.key.clone();
+            let workspace_mutation = running.workspace_mutation.clone();
+            record_exit_locked(&mut state, &key, exit_code);
+            workspace_mutation
         };
-        if running.completed_exit_code.is_some() {
-            return true;
+        if let Some(workspace_mutation) = workspace_mutation
+            && let Err(error) = workspace_mutation.finish().await
+        {
+            // Keep the shared mutation handle on the running entry so a later poll can
+            // retry finalization, but stop renewing authority for a process that has
+            // already exited so an unpolled cleanup error cannot strand the repository.
+            workspace_mutation.cancel_owner();
+            tracing::warn!(
+                %error,
+                process_id,
+                "workspace mutation finalization after process exit failed"
+            );
         }
-        running.completed_exit_code = Some(exit_code);
-        let key = running.key.clone();
-        record_exit_locked(&mut state, &key, exit_code);
         true
     }
 
@@ -483,6 +519,56 @@ fn attempt_entry_locked<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codex_agent_task_store::LocalAgentTaskStore;
+    use codex_agent_task_store::REPOSITORY_WIDE_PATH;
+    use codex_agent_task_store::WorkspaceActorKind;
+    use codex_agent_task_store::WorkspaceMutationRequest;
+    use codex_state::StateRuntime;
+    use tempfile::TempDir;
+
+    async fn running_workspace_mutation(
+        owner_cancelled: CancellationToken,
+    ) -> (
+        TempDir,
+        TempDir,
+        Arc<LocalAgentTaskStore>,
+        RunningWorkspaceMutation,
+    ) {
+        let codex_home = TempDir::new().expect("codex home tempdir");
+        let repo = TempDir::new().expect("repository tempdir");
+        let state =
+            StateRuntime::init(codex_home.path().to_path_buf(), "test-provider".to_string())
+                .await
+                .expect("state runtime initializes");
+        let store = Arc::new(
+            LocalAgentTaskStore::initialize(&state)
+                .await
+                .expect("task store initializes"),
+        );
+        let lease = store
+            .begin_workspace_mutation(
+                repo.path(),
+                WorkspaceMutationRequest {
+                    root_session_id: "owner-root".to_string(),
+                    actor_id: "root:owner-root".to_string(),
+                    kind: WorkspaceActorKind::Root,
+                    attempt_id: None,
+                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                    contracts: Vec::new(),
+                    expected_manifest: Vec::new(),
+                },
+            )
+            .await
+            .expect("workspace mutation starts");
+        let trait_store: Arc<dyn AgentTaskStore> = store.clone();
+        let running = RunningWorkspaceMutation::new(
+            trait_store,
+            repo.path().to_path_buf(),
+            lease,
+            owner_cancelled,
+        );
+        (codex_home, repo, store, running)
+    }
 
     fn key(command: &str) -> CommandAttemptKey {
         CommandAttemptKey::new("exec_command", "local", "C:/repo", &[command.to_string()])
@@ -554,6 +640,8 @@ mod tests {
                     owned_path: None,
                     bytes: 0,
                 },
+                "turn-1".to_string(),
+                None,
             )
             .await;
 
@@ -567,6 +655,92 @@ mod tests {
             .begin_attempt(&key, false)
             .await
             .expect("one failure must not block the next attempt");
+    }
+
+    #[tokio::test]
+    async fn background_completion_releases_mutation_before_poll() {
+        let (_codex_home, repo, store, mutation) =
+            running_workspace_mutation(CancellationToken::new()).await;
+        let ledger = CommandExecutionLedger::default();
+        let command_key = key("background-success.exe");
+        ledger
+            .track_running_process(
+                42,
+                command_key,
+                RawOutputArtifact::unavailable("fixture"),
+                "turn-1".to_string(),
+                Some(mutation),
+            )
+            .await;
+
+        assert!(ledger.mark_running_process_completed(42, 0).await);
+        assert!(
+            ledger.running_process(42).await.is_some(),
+            "completed metadata remains available for a later poll"
+        );
+
+        let replacement = store
+            .begin_workspace_mutation(
+                repo.path(),
+                WorkspaceMutationRequest {
+                    root_session_id: "replacement-root".to_string(),
+                    actor_id: "root:replacement-root".to_string(),
+                    kind: WorkspaceActorKind::Root,
+                    attempt_id: None,
+                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                    contracts: Vec::new(),
+                    expected_manifest: Vec::new(),
+                },
+            )
+            .await
+            .expect("confirmed background exit releases the repository lease");
+        store
+            .finish_workspace_mutation(repo.path(), replacement)
+            .await
+            .expect("replacement mutation finishes");
+        assert!(ledger.finish_running_process(42, Some(0)).await);
+    }
+
+    #[tokio::test]
+    async fn owner_cancellation_stops_heartbeat_and_signals_process_termination() {
+        let owner_cancelled = CancellationToken::new();
+        let (_codex_home, _repo, _store, mutation) =
+            running_workspace_mutation(owner_cancelled.clone()).await;
+        let lease_lost = mutation.lease_lost_token();
+
+        owner_cancelled.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), lease_lost.cancelled())
+            .await
+            .expect("owner cancellation signals mutation lease loss");
+        mutation
+            .finish()
+            .await
+            .expect("test mutation finalizes after cancellation");
+    }
+
+    #[tokio::test]
+    async fn terminal_turn_revokes_only_its_mutating_background_process() {
+        let (_codex_home, _repo, _store, mutation) =
+            running_workspace_mutation(CancellationToken::new()).await;
+        let lease_lost = mutation.lease_lost_token();
+        let ledger = CommandExecutionLedger::default();
+        ledger
+            .track_running_process(
+                42,
+                key("turn-owned-background.exe"),
+                RawOutputArtifact::unavailable("fixture"),
+                "owner-turn".to_string(),
+                Some(mutation),
+            )
+            .await;
+
+        ledger.cancel_mutations_for_turn("other-turn").await;
+        assert!(!lease_lost.is_cancelled());
+        ledger.cancel_mutations_for_turn("owner-turn").await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), lease_lost.cancelled())
+            .await
+            .expect("terminal owner turn signals process termination");
+        assert!(ledger.mark_running_process_completed(42, -1).await);
     }
 
     #[test]
@@ -632,7 +806,13 @@ mod tests {
         let key = key("stored-process-failure.exe");
         ledger.begin_attempt(&key, false).await.expect("attempt");
         ledger
-            .track_running_process(42, key.clone(), RawOutputArtifact::unavailable("fixture"))
+            .track_running_process(
+                42,
+                key.clone(),
+                RawOutputArtifact::unavailable("fixture"),
+                "turn-1".to_string(),
+                None,
+            )
             .await;
 
         assert!(ledger.finish_running_process(42, Some(-1)).await);
@@ -654,6 +834,8 @@ mod tests {
                     process_id as i32,
                     key.clone(),
                     RawOutputArtifact::unavailable("fixture"),
+                    "turn-1".to_string(),
+                    None,
                 )
                 .await;
         }
@@ -667,6 +849,8 @@ mod tests {
                 64,
                 replacement_key.clone(),
                 RawOutputArtifact::unavailable("replacement fixture"),
+                "turn-1".to_string(),
+                None,
             )
             .await;
 

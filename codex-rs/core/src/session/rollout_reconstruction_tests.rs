@@ -13,6 +13,8 @@ use codex_protocol::protocol::ResumedHistory;
 use codex_protocol::protocol::SessionContextWindow;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
+use codex_protocol::protocol::TaskCompletionGate;
+use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::WorldStateItem;
 use pretty_assertions::assert_eq;
 use serde_json::json;
@@ -106,6 +108,156 @@ fn completed_user_turn_rollout(
         },
     )));
     rollout_items
+}
+
+fn completed_turn_with_status(
+    turn_id: &str,
+    status: Option<TaskCompletionStatus>,
+) -> Vec<RolloutItem> {
+    vec![
+        RolloutItem::EventMsg(EventMsg::TurnStarted(
+            codex_protocol::protocol::TurnStartedEvent {
+                turn_id: turn_id.to_string(),
+                trace_id: None,
+                started_at: None,
+                model_context_window: Some(128_000),
+                collaboration_mode_kind: ModeKind::Default,
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::UserMessage(
+            codex_protocol::protocol::UserMessageEvent {
+                client_id: None,
+                message: turn_id.to_string(),
+                images: None,
+                local_images: Vec::new(),
+                text_elements: Vec::new(),
+                ..Default::default()
+            },
+        )),
+        RolloutItem::EventMsg(EventMsg::TurnComplete(
+            codex_protocol::protocol::TurnCompleteEvent {
+                turn_id: turn_id.to_string(),
+                last_agent_message: None,
+                error: None,
+                completed_at: None,
+                duration_ms: None,
+                time_to_first_token_ms: None,
+                completion: status.map(|status| TaskCompletionGate {
+                    status,
+                    reasons: Vec::new(),
+                    evidence_path: None,
+                }),
+                timing: None,
+            },
+        )),
+    ]
+}
+
+async fn resume_rollout(session: &Session, rollout_items: Vec<RolloutItem>) {
+    session
+        .record_initial_history(InitialHistory::Resumed(ResumedHistory {
+            conversation_id: ThreadId::default(),
+            history: Arc::new(rollout_items),
+            rollout_path: Some(PathBuf::from("/tmp/resume.jsonl")),
+        }))
+        .await;
+}
+
+#[tokio::test]
+async fn record_initial_history_restores_newest_passed_completion_boundary() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let mut rollout_items = completed_turn_with_status("older", Some(TaskCompletionStatus::Passed));
+    rollout_items.extend(completed_turn_with_status(
+        "newer",
+        Some(TaskCompletionStatus::Passed),
+    ));
+
+    resume_rollout(&session, rollout_items).await;
+
+    assert_eq!(
+        session.last_passed_root_completion_turn_id().await,
+        Some("newer".to_string())
+    );
+}
+
+#[tokio::test]
+async fn record_initial_history_rollback_reveals_prior_passed_completion_boundary() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let mut rollout_items = completed_turn_with_status("older", Some(TaskCompletionStatus::Passed));
+    rollout_items.extend(completed_turn_with_status(
+        "rolled-back",
+        Some(TaskCompletionStatus::Passed),
+    ));
+    rollout_items.push(RolloutItem::EventMsg(EventMsg::ThreadRolledBack(
+        codex_protocol::protocol::ThreadRolledBackEvent { num_turns: 1 },
+    )));
+
+    resume_rollout(&session, rollout_items).await;
+
+    assert_eq!(
+        session.last_passed_root_completion_turn_id().await,
+        Some("older".to_string())
+    );
+}
+
+#[tokio::test]
+async fn record_initial_history_without_passed_completion_clears_boundary() {
+    let (session, _turn_context) = make_session_and_context().await;
+    session
+        .set_last_passed_root_completion_turn_id(Some("stale".to_string()))
+        .await;
+
+    resume_rollout(
+        &session,
+        completed_turn_with_status("partial", Some(TaskCompletionStatus::Partial)),
+    )
+    .await;
+
+    assert_eq!(session.last_passed_root_completion_turn_id().await, None);
+}
+
+#[tokio::test]
+async fn record_initial_history_ignores_partial_and_blocked_completion_boundaries() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let mut rollout_items =
+        completed_turn_with_status("partial", Some(TaskCompletionStatus::Partial));
+    rollout_items.extend(completed_turn_with_status(
+        "blocked",
+        Some(TaskCompletionStatus::Blocked),
+    ));
+
+    resume_rollout(&session, rollout_items).await;
+
+    assert_eq!(session.last_passed_root_completion_turn_id().await, None);
+}
+
+#[tokio::test]
+async fn replacement_checkpoint_does_not_hide_older_passed_completion_boundary() {
+    let (session, turn_context) = make_session_and_context().await;
+    let mut rollout_items = completed_turn_with_status(
+        "passed-before-compaction",
+        Some(TaskCompletionStatus::Passed),
+    );
+    let mut compacting_context = turn_context.to_turn_context_item();
+    compacting_context.turn_id = Some("compacting-turn".to_string());
+    rollout_items.extend(completed_user_turn_rollout(
+        compacting_context,
+        vec![RolloutItem::Compacted(CompactedItem {
+            message: "summary".to_string(),
+            replacement_history: Some(vec![user_message("replacement")]),
+            window_number: Some(2),
+            first_window_id: Some(Uuid::now_v7().to_string()),
+            previous_window_id: Some(Uuid::now_v7().to_string()),
+            window_id: Some(Uuid::now_v7().to_string()),
+        })],
+    ));
+
+    resume_rollout(&session, rollout_items).await;
+
+    assert_eq!(
+        session.last_passed_root_completion_turn_id().await,
+        Some("passed-before-compaction".to_string())
+    );
 }
 
 #[tokio::test]

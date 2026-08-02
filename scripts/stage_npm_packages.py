@@ -10,16 +10,20 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
 import threading
 import time
-from pathlib import Path
+import uuid
+from pathlib import Path, PurePosixPath
 from typing import Sequence
 from urllib.parse import urlparse
+import zipfile
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -97,6 +101,8 @@ class BinaryComponent:
 class WorkflowArtifact:
     name: str
     size_in_bytes: int
+    artifact_id: int
+    archive_sha256: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,22 +259,17 @@ def github_repo_cache_key(github_repo: str) -> str:
 def parse_workflow_run_url(workflow_url: str) -> WorkflowRunReference:
     parsed = urlparse(workflow_url)
     parts = [part for part in parsed.path.split("/") if part]
-    has_valid_attempt_suffix = (
-        len(parts) == 7 and parts[5] == "attempts" and parts[6].isdigit()
-    )
     if (
         parsed.scheme.casefold() != "https"
         or parsed.netloc.casefold() != "github.com"
-        or len(parts) not in (5, 7)
+        or len(parts) != 5
         or parts[2] != "actions"
         or parts[3] != "runs"
         or not parts[4].isdigit()
-        or (len(parts) == 7 and not has_valid_attempt_suffix)
     ):
         raise ValueError(
             "workflow URL must match "
             "https://github.com/<owner>/<repo>/actions/runs/<run-id>"
-            "[/attempts/<attempt-id>]"
         )
     return WorkflowRunReference(
         github_repo=f"{parts[0]}/{parts[1]}",
@@ -432,19 +433,38 @@ def ensure_source_matches_workflow(
     *,
     repo_root: Path = REPO_ROOT,
     allow_mismatch: bool = False,
+    owned_paths: Sequence[Path] = (),
 ) -> None:
     current_head_sha = subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=repo_root, text=True
     ).strip()
-    dirty = subprocess.check_output(
-        ["git", "status", "--porcelain", "--untracked-files=normal"],
+    dirty_output = subprocess.check_output(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
         cwd=repo_root,
-        text=True,
-    ).strip()
+    )
+    dirty_records = parse_porcelain_v1_z(dirty_output)
+    owned_roots = [path.resolve() for path in owned_paths]
+    repo_root = repo_root.resolve()
+    if any(path == repo_root for path in owned_roots):
+        raise ValueError("script-owned source-validation path cannot be the repository root")
+    dirty_records = [
+        paths
+        for paths in dirty_records
+        if not paths
+        or not all(
+            any(
+                is_relative_to((repo_root / path).resolve(strict=False), owned_root)
+                for owned_root in owned_roots
+            )
+            for path in paths
+        )
+    ]
     problems = []
     if current_head_sha.casefold() != expected_head_sha.casefold():
-        problems.append(f"checkout HEAD {current_head_sha} != workflow HEAD {expected_head_sha}")
-    if dirty:
+        problems.append(
+            f"checkout HEAD {current_head_sha} != workflow HEAD {expected_head_sha}"
+        )
+    if dirty_records:
         problems.append("checkout has uncommitted changes")
     if not problems:
         return
@@ -453,6 +473,28 @@ def ensure_source_matches_workflow(
         print(f"WARNING: allowing source/native mismatch: {message}", file=sys.stderr)
         return
     raise RuntimeError(f"refusing source/native mismatch: {message}")
+
+
+def parse_porcelain_v1_z(output: bytes) -> list[tuple[Path, ...]]:
+    fields = output.split(b"\0")
+    records: list[tuple[Path, ...]] = []
+    index = 0
+    while index < len(fields):
+        entry = fields[index]
+        index += 1
+        if not entry:
+            continue
+        if len(entry) < 4 or entry[2:3] != b" ":
+            raise RuntimeError("unexpected git status --porcelain=v1 -z record")
+        status = entry[:2]
+        paths = [Path(os.fsdecode(entry[3:]))]
+        if b"R" in status or b"C" in status:
+            if index >= len(fields) or not fields[index]:
+                raise RuntimeError("incomplete rename/copy record from git status")
+            paths.append(Path(os.fsdecode(fields[index])))
+            index += 1
+        records.append(tuple(paths))
+    return records
 
 
 @cache
@@ -466,7 +508,7 @@ def list_workflow_artifacts(
             f"repos/{github_repo}/actions/runs/{workflow_id}/artifacts",
             "--paginate",
             "--jq",
-            ".artifacts[] | [.name, .size_in_bytes] | @tsv",
+            ".artifacts[] | [.id, .name, .size_in_bytes, (.digest // \"\")] | @tsv",
         ],
         cwd=REPO_ROOT,
         text=True,
@@ -475,8 +517,18 @@ def list_workflow_artifacts(
     for line in stdout.splitlines():
         if not line.strip():
             continue
-        name, size_in_bytes = line.split("\t", 1)
-        artifacts.append(WorkflowArtifact(name, int(size_in_bytes)))
+        artifact_id, name, size_in_bytes, digest = line.split("\t", 3)
+        archive_sha256 = None
+        if digest:
+            match = re.fullmatch(r"sha256:([0-9a-fA-F]{64})", digest)
+            if match is None:
+                raise RuntimeError(
+                    f"workflow artifact {name!r} has unsupported digest {digest!r}"
+                )
+            archive_sha256 = match.group(1).lower()
+        artifacts.append(
+            WorkflowArtifact(name, int(size_in_bytes), int(artifact_id), archive_sha256)
+        )
     return tuple(artifacts)
 
 
@@ -560,15 +612,20 @@ def select_target_artifacts(
     if not needs_target_artifacts:
         return []
 
-    artifacts_by_name = {
-        artifact.name: artifact
-        for artifact in list_workflow_artifacts(workflow_id, github_repo)
-    }
+    artifacts_by_name: dict[str, WorkflowArtifact] = {}
+    for artifact in list_workflow_artifacts(workflow_id, github_repo):
+        if artifact.name in artifacts_by_name:
+            raise RuntimeError(f"duplicate workflow artifact name: {artifact.name}")
+        artifacts_by_name[artifact.name] = artifact
     selected_artifacts: list[WorkflowArtifact] = []
     for target in targets:
         for artifact_name in [target, f"{target}-unsigned"]:
             artifact = artifacts_by_name.get(artifact_name)
             if artifact is not None:
+                if artifact.archive_sha256 is None:
+                    raise RuntimeError(
+                        f"workflow artifact {artifact.name!r} has no authoritative sha256 digest"
+                    )
                 selected_artifacts.append(artifact)
                 break
         else:
@@ -607,8 +664,12 @@ def download_artifacts(
 
 
 def download_single_artifact(
-    workflow_id: str, github_repo: str, dest_dir: Path, artifact: WorkflowArtifact
+    _workflow_id: str, github_repo: str, dest_dir: Path, artifact: WorkflowArtifact
 ) -> None:
+    if artifact.archive_sha256 is None:
+        raise RuntimeError(
+            f"workflow artifact {artifact.name!r} has no authoritative sha256 digest"
+        )
     dest_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir = dest_dir / artifact.name
     if artifact_is_complete(artifact_dir, artifact):
@@ -637,24 +698,41 @@ def download_single_artifact(
                 f"  downloading {artifact.name} ({format_bytes(artifact.size_in_bytes)})",
                 flush=True,
             )
-            subprocess.check_call(
-                [
-                    "gh",
-                    "run",
-                    "download",
-                    "--name",
-                    artifact.name,
-                    "--dir",
-                    str(temp_dir),
-                    "--repo",
-                    github_repo,
-                    workflow_id,
-                ]
+            archive_path = dest_dir / (
+                f".{artifact.name}.{artifact.artifact_id}."
+                f"{os.getpid()}-{threading.get_ident()}.zip"
             )
-            if artifact_dir.exists():
-                shutil.rmtree(artifact_dir)
-            temp_dir.rename(artifact_dir)
-            write_complete_marker(artifact_dir, artifact)
+            try:
+                with archive_path.open("wb") as archive_handle:
+                    subprocess.run(
+                        [
+                            "gh",
+                            "api",
+                            f"repos/{github_repo}/actions/artifacts/"
+                            f"{artifact.artifact_id}/zip",
+                        ],
+                        cwd=REPO_ROOT,
+                        stdout=archive_handle,
+                        check=True,
+                    )
+                    archive_handle.flush()
+                    os.fsync(archive_handle.fileno())
+                if archive_path.stat().st_size != artifact.size_in_bytes:
+                    raise RuntimeError(
+                        f"workflow artifact {artifact.name!r} size mismatch: "
+                        f"expected {artifact.size_in_bytes}, got {archive_path.stat().st_size}"
+                    )
+                actual_archive_sha256 = file_sha256(archive_path)
+                if actual_archive_sha256 != artifact.archive_sha256:
+                    raise RuntimeError(
+                        f"workflow artifact {artifact.name!r} sha256 mismatch: "
+                        f"expected {artifact.archive_sha256}, got {actual_archive_sha256}"
+                    )
+                extract_artifact_zip(archive_path, temp_dir)
+            finally:
+                archive_path.unlink(missing_ok=True)
+            write_complete_marker(temp_dir, artifact)
+            replace_directory(temp_dir, artifact_dir)
         except Exception:
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
@@ -669,7 +747,11 @@ def artifact_is_complete(artifact_dir: Path, artifact: WorkflowArtifact) -> bool
     except OSError:
         return False
     expected_digest = next(
-        (line.removeprefix("tree_sha256=") for line in marker.splitlines() if line.startswith("tree_sha256=")),
+        (
+            line.removeprefix("tree_sha256=")
+            for line in marker.splitlines()
+            if line.startswith("tree_sha256=")
+        ),
         None,
     )
     if expected_digest is None:
@@ -679,15 +761,21 @@ def artifact_is_complete(artifact_dir: Path, artifact: WorkflowArtifact) -> bool
     except (OSError, RuntimeError):
         return False
     return (
-        f"name={artifact.name}\n" in marker
+        "version=2\n" in marker
+        and f"name={artifact.name}\n" in marker
         and f"size_in_bytes={artifact.size_in_bytes}\n" in marker
+        and f"artifact_id={artifact.artifact_id}\n" in marker
+        and f"archive_sha256={artifact.archive_sha256}\n" in marker
         and actual_digest == expected_digest
     )
 
 
 def artifact_tree_digest(artifact_dir: Path) -> str:
     digest = hashlib.sha256()
-    for path in sorted(artifact_dir.rglob("*"), key=lambda item: item.relative_to(artifact_dir).as_posix()):
+    for path in sorted(
+        artifact_dir.rglob("*"),
+        key=lambda item: item.relative_to(artifact_dir).as_posix(),
+    ):
         if path.name == COMPLETE_MARKER:
             continue
         relative = path.relative_to(artifact_dir).as_posix().encode("utf-8")
@@ -709,8 +797,11 @@ def artifact_tree_digest(artifact_dir: Path) -> str:
 def write_complete_marker(artifact_dir: Path, artifact: WorkflowArtifact) -> None:
     marker_path = artifact_dir / COMPLETE_MARKER
     payload = (
+        "version=2\n"
         f"name={artifact.name}\n"
         f"size_in_bytes={artifact.size_in_bytes}\n"
+        f"artifact_id={artifact.artifact_id}\n"
+        f"archive_sha256={artifact.archive_sha256}\n"
         f"tree_sha256={artifact_tree_digest(artifact_dir)}\n"
     )
     descriptor, temporary_name = tempfile.mkstemp(
@@ -725,6 +816,59 @@ def write_complete_marker(artifact_dir: Path, artifact: WorkflowArtifact) -> Non
         temporary.replace(marker_path)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def extract_artifact_zip(archive_path: Path, dest_dir: Path) -> None:
+    seen: set[str] = set()
+    with zipfile.ZipFile(archive_path) as archive:
+        for member in archive.infolist():
+            normalized_name = member.filename.replace("\\", "/")
+            candidate = PurePosixPath(normalized_name)
+            if (
+                not normalized_name
+                or candidate.is_absolute()
+                or any(part in {"", ".", ".."} for part in candidate.parts)
+                or normalized_name in seen
+            ):
+                raise RuntimeError(f"unsafe workflow artifact path: {member.filename}")
+            seen.add(normalized_name)
+            mode = member.external_attr >> 16
+            file_type = stat.S_IFMT(mode)
+            if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                raise RuntimeError(f"workflow artifact contains a link or special file: {member.filename}")
+            destination = dest_dir.joinpath(*candidate.parts)
+            if member.is_dir():
+                destination.mkdir(parents=True, exist_ok=True)
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member) as source, destination.open("wb") as output:
+                shutil.copyfileobj(source, output)
+
+
+def replace_directory(source: Path, destination: Path) -> None:
+    backup = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.old")
+    had_destination = destination.exists()
+    if had_destination:
+        destination.rename(backup)
+    activated = False
+    try:
+        source.rename(destination)
+        activated = True
+    except BaseException:
+        if had_destination and backup.exists() and not destination.exists():
+            backup.rename(destination)
+        raise
+    finally:
+        if activated and backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
 
 
 def format_bytes(size_in_bytes: int) -> str:
@@ -907,7 +1051,9 @@ def main() -> int:
 
     output_dir = args.output_dir or (REPO_ROOT / "dist" / "npm")
 
-    runner_temp = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir()))
+    runner_temp = Path(os.environ.get("RUNNER_TEMP", tempfile.gettempdir())).resolve()
+    if is_relative_to(runner_temp, REPO_ROOT.resolve()):
+        raise ValueError("RUNNER_TEMP must be outside the repository")
     workflow_repo = (
         github_repo_from_workflow_url(args.workflow_url) if args.workflow_url else None
     )
@@ -956,7 +1102,13 @@ def main() -> int:
                 github_repo,
                 args.workflow_name,
             )
+            if not resolved_head_sha:
+                raise RuntimeError("native artifact workflow did not report a head SHA")
             workflow_id = workflow_id_from_url(workflow_url)
+            ensure_source_matches_workflow(
+                resolved_head_sha,
+                allow_mismatch=args.allow_source_native_mismatch,
+            )
             print(f"Using native artifacts from {workflow_url}", flush=True)
             if args.cache_dir is None:
                 artifacts_temp_root = Path(
@@ -1005,12 +1157,6 @@ def main() -> int:
                     vendor_temp_root / "vendor"
                 )
 
-        if resolved_head_sha:
-            ensure_source_matches_workflow(
-                resolved_head_sha,
-                allow_mismatch=args.allow_source_native_mismatch,
-            )
-
         output_dir.mkdir(parents=True, exist_ok=True)
 
         for result in stage_packages(
@@ -1023,6 +1169,16 @@ def main() -> int:
             args.max_stage_workers,
         ):
             final_messages.append(f"Staged {result.package} at {result.pack_output}")
+
+        if resolved_head_sha:
+            owned_paths = [output_dir]
+            if artifacts_temp_root is not None:
+                owned_paths.append(artifacts_temp_root)
+            ensure_source_matches_workflow(
+                resolved_head_sha,
+                allow_mismatch=args.allow_source_native_mismatch,
+                owned_paths=owned_paths,
+            )
     finally:
         if not args.keep_staging_dirs:
             for vendor_temp_root in vendor_temp_roots:

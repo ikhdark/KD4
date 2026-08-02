@@ -4,9 +4,9 @@ from pathlib import Path
 
 import pytest
 
+from openai_codex.api import TurnHandle
 from openai_codex.client import CodexClient, _params_dict
 from openai_codex.errors import CodexError
-from openai_codex.api import TurnHandle
 from openai_codex.generated.notification_registry import notification_turn_id
 from openai_codex.generated.v2_all import (
     AgentMessageDeltaNotification,

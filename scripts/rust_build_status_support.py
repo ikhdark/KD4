@@ -344,8 +344,7 @@ def lane_report_lines(
         for path in sorted(prunable):
             lines.append(f"  {path.name}")
         lines.append("safe prune suggestions:")
-        for path in sorted(prunable):
-            lines.append(f"  {powershell_remove_item_command(path)}")
+        lines.append("  just target-prune")
     return lines
 
 
@@ -381,11 +380,6 @@ def target_optimize_report(
             ),
         ]
     )
-
-
-def powershell_remove_item_command(path: Path) -> str:
-    escaped = str(path).replace("'", "''")
-    return f"Remove-Item -Recurse -Force -LiteralPath '{escaped}'"
 
 
 def warn_bytes_from_gib(warn_gib: float) -> int:

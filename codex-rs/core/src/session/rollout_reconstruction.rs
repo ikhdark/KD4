@@ -2,6 +2,7 @@ use super::*;
 use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::is_user_turn_boundary;
 use codex_protocol::protocol::SessionContextWindow;
+use codex_protocol::protocol::TaskCompletionStatus;
 use std::collections::HashSet;
 use uuid::Uuid;
 
@@ -17,6 +18,7 @@ pub(super) struct RolloutReconstruction {
     pub(super) first_window_id: Option<Uuid>,
     pub(super) previous_window_id: Option<Uuid>,
     pub(super) window_id: Option<Uuid>,
+    pub(super) last_passed_root_completion_turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +57,7 @@ struct ActiveReplaySegment<'a> {
     compaction_count: u64,
     has_legacy_compaction_without_window_number: bool,
     window: Option<ReconstructedWindow>,
+    last_passed_root_completion_turn_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -73,6 +76,7 @@ struct FinalizedReplayState<'items, 'state> {
     surviving_compaction_count: &'state mut u64,
     has_surviving_legacy_compaction_without_window_number: &'state mut bool,
     window: &'state mut Option<ReconstructedWindow>,
+    last_passed_root_completion_turn_id: &'state mut Option<String>,
     pending_rollback_turns: &'state mut usize,
 }
 
@@ -95,6 +99,7 @@ fn finalize_active_segment<'a>(
         surviving_compaction_count,
         has_surviving_legacy_compaction_without_window_number,
         window,
+        last_passed_root_completion_turn_id,
         pending_rollback_turns,
     } = state;
     // Thread rollback drops the newest surviving real user-message boundaries. In replay, that
@@ -125,6 +130,9 @@ fn finalize_active_segment<'a>(
 
     if window.is_none() {
         *window = active_segment.window;
+    }
+    if last_passed_root_completion_turn_id.is_none() {
+        *last_passed_root_completion_turn_id = active_segment.last_passed_root_completion_turn_id;
     }
 
     // `previous_turn_settings` come from the newest surviving user turn that established them.
@@ -171,6 +179,7 @@ impl Session {
         let mut surviving_compaction_count = 0u64;
         let mut has_surviving_legacy_compaction_without_window_number = false;
         let mut window = None;
+        let mut last_passed_root_completion_turn_id = None;
         let has_segmented_turn_boundaries = rollout_items.iter().any(|item| {
             matches!(
                 item,
@@ -250,6 +259,15 @@ impl Session {
                     if active_segment.turn_id.is_none() {
                         active_segment.turn_id = Some(event.turn_id.clone());
                     }
+                    if active_segment.last_passed_root_completion_turn_id.is_none()
+                        && event
+                            .completion
+                            .as_ref()
+                            .is_some_and(|gate| gate.status == TaskCompletionStatus::Passed)
+                    {
+                        active_segment.last_passed_root_completion_turn_id =
+                            Some(event.turn_id.clone());
+                    }
                 }
                 RolloutItem::EventMsg(EventMsg::TurnAborted(event)) => {
                     if let Some(active_segment) = active_segment.as_mut() {
@@ -324,6 +342,8 @@ impl Session {
                                 has_surviving_legacy_compaction_without_window_number:
                                     &mut has_surviving_legacy_compaction_without_window_number,
                                 window: &mut window,
+                                last_passed_root_completion_turn_id:
+                                    &mut last_passed_root_completion_turn_id,
                                 pending_rollback_turns: &mut pending_rollback_turns,
                             },
                         );
@@ -350,6 +370,7 @@ impl Session {
                 && previous_turn_settings.is_some()
                 && !matches!(reference_context_item, TurnReferenceContextItem::NeverSet)
                 && window.is_some()
+                && last_passed_root_completion_turn_id.is_some()
             {
                 // At this point we have the eager resume metadata, the replacement-history base,
                 // and an explicit surviving window identity, so older rollout items cannot affect
@@ -372,6 +393,7 @@ impl Session {
                     has_surviving_legacy_compaction_without_window_number:
                         &mut has_surviving_legacy_compaction_without_window_number,
                     window: &mut window,
+                    last_passed_root_completion_turn_id: &mut last_passed_root_completion_turn_id,
                     pending_rollback_turns: &mut pending_rollback_turns,
                 },
             );
@@ -510,6 +532,7 @@ impl Session {
             first_window_id: window.first_id,
             previous_window_id: window.previous_id,
             window_id: window.id,
+            last_passed_root_completion_turn_id,
         }
     }
 }

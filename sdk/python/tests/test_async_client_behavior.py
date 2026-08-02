@@ -7,6 +7,8 @@ import time
 from openai_codex.async_client import AsyncCodexClient
 from openai_codex.generated.v2_all import (
     TurnCompletedNotification,
+    TurnInterruptResponse,
+    TurnStartResponse,
 )
 from openai_codex.models import Notification, UnknownNotification
 
@@ -105,50 +107,140 @@ def test_async_client_turn_notification_methods_delegate_to_sync_client() -> Non
     )
 
 
-def test_async_cancellation_reconciles_finite_worker() -> None:
-    """Cancelling a finite to_thread call must not leave its worker alive."""
+def test_async_cancellation_does_not_wait_for_blocked_rpc() -> None:
+    """Cancelling an unbounded sync RPC must not delay asyncio.run shutdown."""
 
-    async def scenario() -> bool:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    runner_done = threading.Event()
+    outcome: list[tuple[bool, bool] | BaseException] = []
+
+    async def scenario() -> tuple[bool, bool]:
         client = AsyncCodexClient()
-        started = threading.Event()
-        finished = threading.Event()
 
         def blocking_model_list(include_hidden: bool = False) -> bool:
             started.set()
-            time.sleep(0.05)
-            finished.set()
-            return include_hidden
+            try:
+                release.wait()
+            finally:
+                finished.set()
+            raise RuntimeError(f"late worker failure: {include_hidden}")
 
         client._sync.model_list = blocking_model_list  # type: ignore[method-assign]
         operation = asyncio.create_task(client.model_list())
-        await asyncio.to_thread(started.wait, 1)
+        while not started.is_set():
+            await asyncio.sleep(0.001)
         operation.cancel()
+        done, _ = await asyncio.wait({operation}, timeout=0.5)
         try:
             await operation
         except asyncio.CancelledError:
             pass
-        return finished.is_set()
+        return operation in done, operation.cancelled()
 
-    assert asyncio.run(scenario()) is True
+    def run_scenario() -> None:
+        try:
+            outcome.append(asyncio.run(scenario()))
+        except BaseException as exc:
+            outcome.append(exc)
+        finally:
+            runner_done.set()
+
+    runner = threading.Thread(target=run_scenario, daemon=True)
+    runner.start()
+    try:
+        assert runner_done.wait(0.5), "asyncio.run waited for the detached RPC worker"
+        assert outcome == [(True, True)]
+        assert not finished.is_set()
+    finally:
+        release.set()
+        runner.join(timeout=1)
+    assert finished.wait(1)
 
 
-def test_cancelled_notification_wait_leaves_no_background_consumer() -> None:
-    async def scenario() -> Notification:
+def test_cancelled_turn_start_cleans_up_after_late_response() -> None:
+    async def scenario() -> tuple[bool, list[tuple[str, str]], bool]:
+        client = AsyncCodexClient()
+        started = threading.Event()
+        release = threading.Event()
+        cleanup_done = threading.Event()
+        calls: list[tuple[str, str]] = []
+        response = TurnStartResponse.model_validate(
+            {"turn": {"id": "turn-1", "items": [], "status": "completed"}}
+        )
+
+        def blocking_turn_start(*_args: object) -> TurnStartResponse:
+            started.set()
+            release.wait()
+            return response
+
+        def interrupt(thread_id: str, turn_id: str) -> TurnInterruptResponse:
+            calls.append(("interrupt", f"{thread_id}/{turn_id}"))
+            return TurnInterruptResponse()
+
+        def unregister(turn_id: str) -> None:
+            calls.append(("unregister", turn_id))
+            cleanup_done.set()
+
+        client._sync.turn_start = blocking_turn_start  # type: ignore[method-assign]
+        client._sync.turn_interrupt = interrupt  # type: ignore[method-assign]
+        client._sync.unregister_turn_notifications = unregister  # type: ignore[method-assign]
+        operation = asyncio.create_task(client.turn_start("thread-1", "hello"))
+        assert await asyncio.to_thread(started.wait, 1)
+        operation.cancel()
+        done, _ = await asyncio.wait({operation}, timeout=0.5)
+        completed_before_release = operation in done
+        release.set()
+        try:
+            await operation
+        except asyncio.CancelledError:
+            pass
+        cleanup_completed = await asyncio.to_thread(cleanup_done.wait, 1)
+        return completed_before_release, calls, cleanup_completed
+
+    assert asyncio.run(scenario()) == (
+        True,
+        [("interrupt", "thread-1/turn-1"), ("unregister", "turn-1")],
+        True,
+    )
+
+
+def test_cancelled_notification_wait_preserves_notification_order() -> None:
+    async def scenario() -> tuple[Notification, Notification]:
         client = AsyncCodexClient()
         client.register_turn_notifications("turn-1")
+        poll_started = threading.Event()
+        original_next = client._sync.next_turn_notification
+
+        def observed_next(turn_id: str, timeout_s: float | None = None) -> Notification:
+            poll_started.set()
+            return original_next(turn_id, timeout_s)
+
+        client._sync.next_turn_notification = observed_next  # type: ignore[method-assign]
         wait = asyncio.create_task(client.next_turn_notification("turn-1"))
-        await asyncio.sleep(0.01)
+        while not poll_started.is_set():
+            await asyncio.sleep(0.001)
         wait.cancel()
+        first = Notification(
+            method="unknown/first",
+            payload=UnknownNotification(params={"turnId": "turn-1"}),
+        )
+        second = Notification(
+            method="unknown/second",
+            payload=UnknownNotification(params={"turnId": "turn-1"}),
+        )
+        client._sync._router.route_notification(first)
+        client._sync._router.route_notification(second)
         try:
             await wait
         except asyncio.CancelledError:
             pass
 
-        expected = Notification(
-            method="unknown/direct",
-            payload=UnknownNotification(params={"turnId": "turn-1"}),
+        return (
+            await asyncio.wait_for(client.next_turn_notification("turn-1"), 0.5),
+            await asyncio.wait_for(client.next_turn_notification("turn-1"), 0.5),
         )
-        client._sync._router.route_notification(expected)
-        return await client.next_turn_notification("turn-1")
 
-    assert asyncio.run(scenario()).method == "unknown/direct"
+    first, second = asyncio.run(scenario())
+    assert (first.method, second.method) == ("unknown/first", "unknown/second")

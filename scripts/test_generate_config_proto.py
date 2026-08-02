@@ -159,6 +159,14 @@ class GenerateConfigProtoTest(unittest.TestCase):
         )
         self.assertTrue(lane_args[-1].endswith("proto"), lane_args[-1])
 
+    def test_checked_binding_is_pinned_to_lf_in_worktrees(self) -> None:
+        attributes = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
+        self.assertIn(
+            "codex-rs/config/src/thread_config/proto/"
+            "codex.thread_config.v1.rs text eol=lf",
+            attributes.splitlines(),
+        )
+
     def test_check_uses_default_cargo_home_and_locked_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             fixture = create_fixture(Path(temp_dir))
@@ -226,7 +234,9 @@ class GenerateConfigProtoTest(unittest.TestCase):
             self.assertEqual(fixture.cargo_lock.read_bytes(), lock_before)
             self.assert_locked_lane_args(fixture)
 
-    def test_write_replaces_stale_binding_atomically_without_touching_lock(self) -> None:
+    def test_write_replaces_stale_binding_atomically_without_touching_lock(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             changed = EXPECTED_GENERATED.replace(
                 "pub struct Generated;",

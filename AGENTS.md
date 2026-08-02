@@ -37,6 +37,52 @@ Use ownership maps and source-of-truth documents to identify the relevant local
 owner. Do not expand into unrelated ownership documents after the required owner
 and affected routes are clear.
 
+## Shared subagent baselines
+
+These baselines apply to non-root subagents in addition to their role-specific
+instructions.
+
+* Investigation agents must read the root and closest applicable `AGENTS.md`,
+  prefer `rg` or `rg --files`, and inspect only the smallest relevant owner,
+  caller, test, and contract surface. They must distinguish direct evidence from
+  inference; report inspected paths, dependencies, validation implications, and a
+  clear stop condition; remain non-mutating; and not update shared harness state.
+* Implementation agents must read the root and closest applicable `AGENTS.md`,
+  reinspect the focused worktree diff before editing, use `apply_patch` for manual
+  edits, preserve unrelated changes, and stop on a competing owner or unfinished
+  dependency. They must not update shared harness state, stage, commit, push, or
+  publish, and must report changed paths, validation evidence, runtime-wiring
+  implications, and remaining risk to the coordinator.
+
+## Architect-driven KD4 implementation lane
+
+Ordinary investigation and implementation use the built-in `explorer` and
+`worker`; this lane uses the repo-local typed aliases.
+
+1. The coordinator decides case by case whether a risky task needs this lane.
+2. Spawn `kd4_explorer` with criteria that require the complete runtime and
+   contract surface plus a single valid-JSON `KD4_ARCHITECT_CONTRACT_V1`
+   assignment block.
+3. Wait for the architect's successful sealed receipt and cleared gates.
+4. Copy the architect's `objective`, stable-ID `acceptance_criteria`, `read_scope`,
+   `write_scope`, `risk_hints`, `required_evidence`, `prohibited_changes`,
+   `contract_claims`, and `stop_condition` into a `kd4_worker` assignment. Record
+   the architect assignment and receipt version in the coder objective, and make
+   the architect assignment a dependency.
+5. Before spawning the coder, compare the copied fields and obligation IDs with
+   the architect receipt using exact string and set equality. If the receipt is
+   ambiguous or cannot be copied without interpretation, treat the architect work
+   as incomplete.
+6. Bind the reviewer and verifier to the coder as their sole evaluation target and
+   make both the architect and coder assignments dependencies.
+
+The store hard-enforces successful sealed dependencies, cleared gates, capability
+boundaries, and path and named-contract ownership. Receipt shape, transcription
+fidelity, obligation-ID equality, and refusal to complete with an unresolved
+copied obligation are coordinator-policy checks, not store validation. Do not
+claim otherwise. A future Rust change would be required to bind receipt content to
+coder spawn arguments cryptographically or structurally.
+
 ## Operating defaults
 
 Use the fastest safe investigation, implementation, communication, and validation

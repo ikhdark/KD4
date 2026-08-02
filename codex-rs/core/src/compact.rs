@@ -41,6 +41,7 @@ use codex_protocol::protocol::TurnStartedEvent;
 use codex_protocol::protocol::WarningEvent;
 use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::InferenceTraceContext;
+use codex_utils_image::MAX_PROMPT_IMAGE_SOURCE_BYTES;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_output_truncation::truncate_text;
@@ -52,6 +53,11 @@ use codex_model_provider_info::ModelProviderInfo;
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+pub(crate) const MAX_RETAINED_USER_IMAGES: usize = 8;
+pub(crate) const MAX_RETAINED_USER_IMAGE_BYTES: usize =
+    MAX_PROMPT_IMAGE_SOURCE_BYTES / 3 * 4 + 4096;
+pub(crate) const COMPACT_IMAGE_OMISSION_MARKER: &str =
+    "[codex-local-compaction omitted user images: limits exceeded]";
 
 /// Controls whether compaction replacement history must include initial context.
 ///
@@ -521,7 +527,7 @@ pub fn content_items_to_text(content: &[ContentItem]) -> Option<String> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CompactedUserMessage {
-    message: String,
+    content: Vec<UserInput>,
     internal_chat_message_metadata_passthrough: Option<InternalChatMessageMetadataPassthrough>,
 }
 
@@ -534,7 +540,7 @@ pub(crate) fn collect_user_messages(items: &[ResponseItem]) -> Vec<CompactedUser
                     None
                 } else {
                     Some(CompactedUserMessage {
-                        message: user.message(),
+                        content: user.content,
                         internal_chat_message_metadata_passthrough: match item {
                             ResponseItem::Message {
                                 internal_chat_message_metadata_passthrough,
@@ -625,44 +631,101 @@ pub(crate) fn build_compacted_history(
 }
 
 fn build_compacted_history_with_limit(
-    mut history: Vec<ResponseItem>,
+    history: Vec<ResponseItem>,
     user_messages: &[CompactedUserMessage],
     summary_text: &str,
     max_tokens: usize,
 ) -> Vec<ResponseItem> {
+    build_compacted_history_with_limits(
+        history,
+        user_messages,
+        summary_text,
+        max_tokens,
+        MAX_RETAINED_USER_IMAGES,
+        MAX_RETAINED_USER_IMAGE_BYTES,
+    )
+}
+
+fn build_compacted_history_with_limits(
+    mut history: Vec<ResponseItem>,
+    user_messages: &[CompactedUserMessage],
+    summary_text: &str,
+    max_tokens: usize,
+    max_images: usize,
+    max_image_bytes: usize,
+) -> Vec<ResponseItem> {
     let mut selected_messages: Vec<CompactedUserMessage> = Vec::new();
-    if max_tokens > 0 {
-        let mut remaining = max_tokens;
-        for message in user_messages.iter().rev() {
-            if remaining == 0 {
-                break;
-            }
-            let tokens = approx_token_count(&message.message);
-            if tokens <= remaining {
-                selected_messages.push(message.clone());
-                remaining = remaining.saturating_sub(tokens);
-            } else {
-                let truncated =
-                    truncate_text(&message.message, TruncationPolicy::Tokens(remaining));
-                selected_messages.push(CompactedUserMessage {
-                    message: truncated,
-                    internal_chat_message_metadata_passthrough: message
-                        .internal_chat_message_metadata_passthrough
-                        .clone(),
-                });
-                break;
+    let mut remaining = max_tokens;
+    let mut retained_image_count = 0usize;
+    let mut retained_image_bytes = 0usize;
+    let mut omitted_images = false;
+    for message in user_messages.iter().rev() {
+        let mut content = Vec::new();
+        for item in &message.content {
+            match item {
+                UserInput::Text { text, .. } if remaining > 0 && !text.is_empty() => {
+                    let tokens = approx_token_count(text);
+                    if tokens <= remaining {
+                        content.push(UserInput::Text {
+                            text: text.clone(),
+                            text_elements: Vec::new(),
+                        });
+                        remaining = remaining.saturating_sub(tokens);
+                    } else {
+                        let truncated = truncate_text(text, TruncationPolicy::Tokens(remaining));
+                        if !truncated.is_empty() {
+                            content.push(UserInput::Text {
+                                text: truncated,
+                                text_elements: Vec::new(),
+                            });
+                        }
+                        remaining = 0;
+                    }
+                }
+                UserInput::Image { image_url, detail } => {
+                    let next_bytes = retained_image_bytes.saturating_add(image_url.len());
+                    if retained_image_count < max_images && next_bytes <= max_image_bytes {
+                        content.push(UserInput::Image {
+                            image_url: image_url.clone(),
+                            detail: *detail,
+                        });
+                        retained_image_count = retained_image_count.saturating_add(1);
+                        retained_image_bytes = next_bytes;
+                    } else {
+                        omitted_images = true;
+                    }
+                }
+                _ => {}
             }
         }
-        selected_messages.reverse();
+        if !content.is_empty() {
+            selected_messages.push(CompactedUserMessage {
+                content,
+                internal_chat_message_metadata_passthrough: message
+                    .internal_chat_message_metadata_passthrough
+                    .clone(),
+            });
+        }
     }
+    selected_messages.reverse();
 
     for message in &selected_messages {
+        let content = message
+            .content
+            .iter()
+            .filter_map(|item| match item {
+                UserInput::Text { text, .. } => Some(ContentItem::InputText { text: text.clone() }),
+                UserInput::Image { image_url, detail } => Some(ContentItem::InputImage {
+                    image_url: image_url.clone(),
+                    detail: *detail,
+                }),
+                _ => None,
+            })
+            .collect();
         history.push(ResponseItem::Message {
             id: None,
             role: "user".to_string(),
-            content: vec![ContentItem::InputText {
-                text: message.message.clone(),
-            }],
+            content,
             phase: None,
             internal_chat_message_metadata_passthrough: message
                 .internal_chat_message_metadata_passthrough
@@ -670,11 +733,15 @@ fn build_compacted_history_with_limit(
         });
     }
 
-    let summary_text = if summary_text.is_empty() {
+    let mut summary_text = if summary_text.is_empty() {
         "(no summary available)".to_string()
     } else {
         summary_text.to_string()
     };
+    if omitted_images {
+        summary_text.push_str("\n\n");
+        summary_text.push_str(COMPACT_IMAGE_OMISSION_MARKER);
+    }
 
     history.push(ResponseItem::Message {
         id: None,

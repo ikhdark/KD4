@@ -51,6 +51,46 @@ def clean_env() -> dict[str, str]:
 
 
 class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
+    def test_rusty_v8_target_prefers_rust_toolchain_host(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_bin = Path(temp_dir)
+            (fake_bin / "rustc.cmd").write_text(
+                "@echo off\r\necho rustc 1.0.0\r\necho host: x86_64-pc-windows-msvc\r\n",
+                encoding="utf-8",
+            )
+            command = "\n".join(
+                [
+                    "$tokens = $null",
+                    "$errors = $null",
+                    f"$ast = [System.Management.Automation.Language.Parser]::ParseFile({ps_single_quote(SCRIPT)}, [ref]$tokens, [ref]$errors)",
+                    "$definition = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-WindowsRustyV8Target' }, $true)",
+                    "Invoke-Expression $definition.Extent.Text",
+                    "Get-WindowsRustyV8Target",
+                ]
+            )
+            env = clean_env()
+            env["PATH"] = f"{fake_bin}{os.pathsep}{env['PATH']}"
+            env["PROCESSOR_ARCHITEW6432"] = "ARM64"
+            env["PROCESSOR_ARCHITECTURE"] = "ARM64"
+            result = subprocess.run(
+                [self.shell, "-NoProfile", "-Command", command],
+                cwd=SCRIPT.parent.parent,
+                env=env,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+                timeout=RUN_TIMEOUT_SECONDS,
+                creationflags=CREATE_NO_WINDOW,
+            )
+            self.assertEqual(
+                result.returncode,
+                0,
+                f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+            )
+            self.assertEqual(result.stdout.strip(), "x86_64-pc-windows-msvc")
+            self.assertNotIn("OSArchitecture", SCRIPT.read_text(encoding="utf-8"))
+
     def test_actual_release_build_runs_preflight_and_uses_target_dir_argument(
         self,
     ) -> None:
@@ -147,7 +187,7 @@ class PublishLocalCodexBuildTest(PublishLocalCodexTestBase):
                         (
                             'python -c "import os; '
                             f"os.utime(r'{built_code_mode_host}', "
-                            f"({sidecar_timestamp}, {sidecar_timestamp}))\""
+                            f'({sidecar_timestamp}, {sidecar_timestamp}))"'
                         ),
                         "exit /b 0",
                     ]

@@ -53,6 +53,7 @@ use codex_tools::ToolSpec;
 use codex_utils_output_truncation::approx_token_count;
 use codex_utils_path_uri::PathConvention;
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 
 use super::super::shell_spec::CommandToolOptions;
 use super::super::shell_spec::create_exec_command_tool_with_environment_id;
@@ -182,6 +183,7 @@ async fn begin_unified_exec_workspace_mutation(
     turn: &crate::session::turn_context::TurnContext,
     environment_id: &str,
     command_cwd: &std::path::Path,
+    owner_cancelled: CancellationToken,
 ) -> Result<RunningWorkspaceMutation, FunctionCallError> {
     let coordinator = session.services.agent_control.task_coordinator().clone();
     if coordinator.store().is_none() {
@@ -227,6 +229,16 @@ async fn begin_unified_exec_workspace_mutation(
         WorkspaceActorKind::Typed | WorkspaceActorKind::External => unreachable!(),
     };
     let repo_root = get_git_repo_root(command_cwd).unwrap_or_else(|| command_cwd.to_path_buf());
+    session
+        .services
+        .agent_control
+        .reconcile_live_typed_actor_heartbeats()
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "exec_command typed-agent liveness could not be reconciled: {error}"
+            ))
+        })?;
     let lease = store
         .begin_workspace_mutation(
             &repo_root,
@@ -246,7 +258,12 @@ async fn begin_unified_exec_workspace_mutation(
                 "exec_command could not acquire the repository-wide mutation lease: {error}"
             ))
         })?;
-    Ok(RunningWorkspaceMutation::new(store, repo_root, lease))
+    Ok(RunningWorkspaceMutation::new(
+        store,
+        repo_root,
+        lease,
+        owner_cancelled,
+    ))
 }
 
 impl ToolExecutor<ToolInvocation> for ExecCommandHandler {
@@ -285,6 +302,7 @@ impl ExecCommandHandler {
             step_context,
             tracker,
             call_id,
+            cancellation_token,
             payload,
             ..
         } = invocation;
@@ -642,7 +660,19 @@ impl ExecCommandHandler {
             }
         }
 
-        let mut workspace_mutation =
+        let raw_output_artifact = create_raw_output_artifact(
+            turn.config.codex_home.as_path(),
+            &session.thread_id.to_string(),
+            b"",
+        )
+        .await;
+        emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
+        // Reserve the process identity before acquiring mutation authority so
+        // cancellation can always identify and clean up the startup attempt.
+        let process_id_reservation = manager.reserve_process_id().await;
+        let process_id = process_id_reservation.process_id();
+
+        let workspace_mutation =
             if !inspection_command && !intercepted_apply_patch && !environment_is_remote {
                 let mutation_cwd = native_cwd.as_ref().ok_or_else(|| {
                 FunctionCallError::RespondToModel(format!(
@@ -654,6 +684,7 @@ impl ExecCommandHandler {
                     turn.as_ref(),
                     &turn_environment.environment_id,
                     mutation_cwd.as_path(),
+                    cancellation_token.clone(),
                 )
                 .await
                 {
@@ -670,22 +701,6 @@ impl ExecCommandHandler {
             } else {
                 None
             };
-
-        let raw_output_artifact = create_raw_output_artifact(
-            turn.config.codex_home.as_path(),
-            &session.thread_id.to_string(),
-            b"",
-        )
-        .await;
-        let mutation_lease_lost = workspace_mutation
-            .as_ref()
-            .map(RunningWorkspaceMutation::lease_lost_token);
-
-        emit_unified_exec_tty_metric(&turn.session_telemetry, tty);
-        // Reserve only for a real process launch. The manager-owned reservation
-        // releases itself if cancellation wins before process-store transfer.
-        let process_id_reservation = manager.reserve_process_id().await;
-        let process_id = process_id_reservation.process_id();
         let exec_result = manager
             .exec_command(
                 ExecCommandRequest {
@@ -710,7 +725,7 @@ impl ExecCommandHandler {
                         .permissions_preapproved,
                     justification,
                     prefix_rule,
-                    mutation_lease_lost,
+                    workspace_mutation,
                 },
                 process_id_reservation,
                 &context,
@@ -735,25 +750,6 @@ impl ExecCommandHandler {
                         .command_execution
                         .update_running_artifact(process_id, finalized_artifact)
                         .await;
-                    if let Some(mutation) = workspace_mutation.take() {
-                        let attached = session
-                            .services
-                            .command_execution
-                            .attach_running_workspace_mutation(process_id, mutation.clone())
-                            .await
-                            .map_err(|error| {
-                                FunctionCallError::RespondToModel(format!(
-                                    "exec_command workspace mutation tracking failed: {error}"
-                                ))
-                            })?;
-                        if !attached {
-                            mutation.finish().await.map_err(|error| {
-                                FunctionCallError::RespondToModel(format!(
-                                    "exec_command workspace mutation finalization failed: {error}"
-                                ))
-                            })?;
-                        }
-                    }
                 } else if let Some(exit_code) = response.exit_code {
                     let tracked = session
                         .services
@@ -766,13 +762,6 @@ impl ExecCommandHandler {
                             .command_execution
                             .record_exit(&attempt_key, exit_code)
                             .await;
-                    }
-                    if let Some(mutation) = workspace_mutation.take() {
-                        mutation.finish().await.map_err(|error| {
-                            FunctionCallError::RespondToModel(format!(
-                                "exec_command workspace mutation finalization failed: {error}"
-                            ))
-                        })?;
                     }
                 }
                 attach_powershell_failure_advisory(&mut response, shell_type, is_powershell_script);
@@ -793,13 +782,6 @@ impl ExecCommandHandler {
                         .command_execution
                         .record_exit(&attempt_key, output.exit_code)
                         .await;
-                }
-                if let Some(mutation) = workspace_mutation.take() {
-                    mutation.finish().await.map_err(|error| {
-                        FunctionCallError::RespondToModel(format!(
-                            "exec_command workspace mutation finalization failed: {error}"
-                        ))
-                    })?;
                 }
                 let original_token_count = approx_token_count(&output_text);
                 let mut response = ExecCommandToolOutput {
@@ -822,11 +804,6 @@ impl ExecCommandHandler {
                 Ok(boxed_tool_output(response))
             }
             Err(err) => {
-                if let Some(mutation) = workspace_mutation.take()
-                    && let Err(error) = mutation.finish().await
-                {
-                    tracing::warn!(%error, "exec_command workspace mutation finalization failed");
-                }
                 let retry_failure = matches!(
                     &err,
                     UnifiedExecError::CreateProcess { .. } | UnifiedExecError::ProcessFailed { .. }

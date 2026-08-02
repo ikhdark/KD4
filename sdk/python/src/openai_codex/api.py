@@ -10,7 +10,6 @@ from ._approval_mode import (
     _approval_mode_settings,
 )
 from ._initialize_metadata import validate_initialize_metadata
-from .errors import TransportClosedError
 from ._inputs import (
     ImageInput as ImageInput,
     Input as Input,
@@ -41,6 +40,7 @@ from ._run import (
 from ._sandbox import Sandbox as Sandbox, _sandbox_mode, _sandbox_policy
 from .async_client import AsyncCodexClient
 from .client import CodexClient, CodexConfig
+from .errors import TransportClosedError
 from .generated.v2_all import (
     ApiKeyLoginAccountParams,
     GetAccountParams,

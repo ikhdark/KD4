@@ -6,16 +6,20 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import field
+import errno
+import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import time
 from typing import Callable
+from typing import BinaryIO
 from typing import Iterator
 from typing import Mapping
 from typing import Sequence
@@ -48,7 +52,6 @@ from scripts.rust_build_status_support import (  # noqa: E402
     non_negative_int,
     positive_float,
     positive_int,
-    powershell_remove_item_command,
     target_disk_report,
     target_disk_report_lines,
     target_non_lane_size_bytes,
@@ -73,7 +76,6 @@ __all__ = [
     "non_negative_int",
     "positive_float",
     "positive_int",
-    "powershell_remove_item_command",
     "target_disk_report",
     "target_disk_report_lines",
     "target_non_lane_size_bytes",
@@ -504,20 +506,38 @@ def lane_active_lock_is_held(lane_dir: Path) -> bool:
             handle.close()
 
 
+def _is_file_lock_contention(exc: OSError) -> bool:
+    if os.name == "nt":
+        return getattr(exc, "winerror", None) in {32, 33, 36} or exc.errno in {
+            errno.EACCES,
+            errno.EAGAIN,
+        }
+    return exc.errno in {errno.EACCES, errno.EAGAIN}
+
+
 @contextmanager
-def cargo_lane_coordination_lock(lane_root: Path) -> Iterator[None]:
+def cargo_lane_coordination_lock(
+    lane_root: Path,
+    *,
+    timeout_seconds: float = 30.0,
+) -> Iterator[None]:
     """Serialize lane creation with the final prune check and rename."""
 
     lock_path = lane_root / ".lane-coordination.lock"
-    deadline = time.monotonic() + 30.0
+    deadline = time.monotonic() + timeout_seconds
     handle = None
     while handle is None:
         try:
             handle = lock_path.open("a+b")
-        except OSError:
+        except OSError as exc:
+            if not _is_file_lock_contention(exc):
+                raise
             if time.monotonic() >= deadline:
-                raise TimeoutError(f"timed out waiting for lane coordination lock {lock_path}")
+                raise TimeoutError(
+                    f"timed out waiting for lane coordination lock {lock_path}"
+                )
             time.sleep(0.05)
+    acquired = False
     try:
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
@@ -530,8 +550,11 @@ def cargo_lane_coordination_lock(lane_root: Path) -> Iterator[None]:
             while True:
                 try:
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
                     break
-                except OSError:
+                except OSError as exc:
+                    if not _is_file_lock_contention(exc):
+                        raise
                     if time.monotonic() >= deadline:
                         raise TimeoutError(
                             f"timed out waiting for lane coordination lock {lock_path}"
@@ -540,21 +563,374 @@ def cargo_lane_coordination_lock(lane_root: Path) -> Iterator[None]:
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            while True:
+                try:
+                    fcntl.flock(
+                        handle.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if not _is_file_lock_contention(exc):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"timed out waiting for lane coordination lock {lock_path}"
+                        ) from exc
+                    time.sleep(0.05)
         yield
     finally:
         try:
-            handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
+            if acquired:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
 
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
+
+
+def _release_binary_file_lock(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _try_acquire_binary_file_lock(path: Path) -> BinaryIO | None:
+    try:
+        handle = path.open("a+b")
+    except OSError as exc:
+        if _is_file_lock_contention(exc):
+            return None
+        raise
+    acquired = False
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                if _is_file_lock_contention(exc):
+                    return None
+                raise
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(
+                    handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except OSError as exc:
+                if _is_file_lock_contention(exc):
+                    return None
+                raise
+        acquired = True
+        return handle
+    finally:
+        if not acquired:
+            handle.close()
+
+
+def _safe_lane_name(value: str) -> str:
+    if (
+        not value
+        or re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None
+        or re.fullmatch(r"\.+", value) is not None
+    ):
+        raise ValueError(f"invalid Cargo lane name {value!r}")
+    return value
+
+
+def _auto_lane_base(command: Sequence[str]) -> str:
+    signature = " ".join(command).strip()
+    release = re.search(
+        r"(?:^|\s)(?:--release|-r|--profile(?:=|\s+)release)(?:\s|$)",
+        signature,
+    )
+    package = re.search(
+        r"(?:^|\s)--package(?:=|\s+)([A-Za-z0-9_.-]+)(?:\s|$)",
+        signature,
+    ) or re.search(r"(?:^|\s)-p\s+([A-Za-z0-9_.-]+)(?:\s|$)", signature)
+    if package is not None:
+        base = package.group(1)
+    elif command:
+        program = Path(command[0]).stem
+        digest = hashlib.sha1(signature.encode("utf-8")).hexdigest()[:8]
+        base = f"{program}-{digest}"
+    else:
+        base = "auto"
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "-", base).strip("-") or "auto"
+    return f"{safe}-release" if release is not None else safe
+
+
+def initialize_cargo_lanes_root(repo_root: Path, lane_root: Path) -> Path:
+    lane_root = lane_root.expanduser()
+    if lane_root.exists() and is_indirect_directory(lane_root):
+        raise CargoLanesRootValidationError(
+            f"refusing indirect Cargo lanes root {lane_root}"
+        )
+    lane_root = lane_root.resolve()
+    default_root = default_cargo_lanes_root(repo_root)
+    if not lane_root.exists():
+        lane_root.mkdir(parents=True)
+    marker = lane_root / CARGO_LANES_ROOT_MARKER
+    if marker.exists():
+        try:
+            valid_marker = (
+                not marker.is_symlink()
+                and stat.S_ISREG(marker.stat().st_mode)
+                and marker.read_text(encoding="utf-8").strip()
+                == CARGO_LANES_ROOT_MARKER_CONTENT
+            )
+        except (OSError, UnicodeError):
+            valid_marker = False
+        if not valid_marker:
+            raise CargoLanesRootValidationError(
+                f"invalid Cargo lanes root marker {marker}"
+            )
+    else:
+        entries = list(lane_root.iterdir())
+        if lane_root != default_root and entries:
+            raise CargoLanesRootValidationError(
+                f"custom Cargo lanes root must be empty or contain {CARGO_LANES_ROOT_MARKER}: "
+                f"{lane_root}"
+            )
+        marker.write_text(f"{CARGO_LANES_ROOT_MARKER_CONTENT}\n", encoding="utf-8")
+    return lane_root
+
+
+def _lane_reservation_candidates(
+    lane_root: Path,
+    base_lane: str,
+    *,
+    prefer_warm: bool,
+) -> list[str]:
+    candidates: list[str] = []
+    if prefer_warm:
+        pattern = re.compile(rf"^{re.escape(base_lane)}(?:-\d+)?$")
+        warm = [
+            path
+            for path in lane_root.iterdir()
+            if path.is_dir()
+            and not is_indirect_directory(path)
+            and pattern.fullmatch(path.name)
+        ]
+        warm.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+        candidates.extend(path.name for path in warm)
+    candidates.extend([base_lane, *(f"{base_lane}-{index}" for index in range(2, 66))])
+    return list(dict.fromkeys(candidates))
+
+
+@contextmanager
+def reserve_cargo_lane(
+    *,
+    repo_root: Path,
+    requested_lane: str,
+    command: Sequence[str],
+    lane_root: Path | None = None,
+    lock_timeout_seconds: float = 30.0,
+) -> Iterator[tuple[str, Path]]:
+    root = initialize_cargo_lanes_root(
+        repo_root,
+        lane_root or default_cargo_lanes_root(repo_root),
+    )
+    explicit = requested_lane != "auto"
+    base_lane = _safe_lane_name(
+        requested_lane if explicit else _auto_lane_base(command)
+    )
+    active_handle: BinaryIO | None = None
+    target_dir: Path | None = None
+    resolved_lane: str | None = None
+    with cargo_lane_coordination_lock(
+        root,
+        timeout_seconds=lock_timeout_seconds,
+    ):
+        for candidate in _lane_reservation_candidates(
+            root,
+            base_lane,
+            prefer_warm=not explicit,
+        ):
+            candidate = _safe_lane_name(candidate)
+            candidate_dir = root / candidate
+            if candidate_dir.exists() and is_indirect_directory(candidate_dir):
+                raise CargoLanesRootValidationError(
+                    f"refusing indirect Cargo lane path {candidate_dir}"
+                )
+            candidate_dir.mkdir(exist_ok=True)
+            active_handle = _try_acquire_binary_file_lock(
+                candidate_dir / ".lane-active.lock"
+            )
+            if active_handle is not None:
+                target_dir = candidate_dir.resolve()
+                resolved_lane = candidate
+                break
+    if active_handle is None or target_dir is None or resolved_lane is None:
+        raise RuntimeError(f"unable to reserve an idle Cargo lane for {base_lane!r}")
+    stamp = target_dir / LANE_LAST_USED_STAMP
+    try:
+        stamp.write_text(f"{time.time()}\n", encoding="utf-8")
+        yield resolved_lane, target_dir
+    finally:
+        try:
+            stamp.write_text(f"{time.time()}\n", encoding="utf-8")
+        finally:
+            try:
+                _release_binary_file_lock(active_handle)
+            finally:
+                active_handle.close()
+
+
+def _cargo_watch_exec_with_target_dir(command: str, target_dir: Path) -> str:
+    if re.search(r"(?:^|\s)--target-dir(?:=|\s+)", command):
+        return command
+    build_commands = {
+        "bench",
+        "build",
+        "check",
+        "clippy",
+        "doc",
+        "fix",
+        "llvm-cov",
+        "run",
+        "rustc",
+        "test",
+    }
+    stripped = command.strip()
+    if not stripped or stripped.split(maxsplit=1)[0] not in build_commands:
+        return command
+    target_arg = str(target_dir)
+    if os.name == "nt":
+        escaped_target = target_arg.replace('"', '\\"')
+        quoted_target = (
+            f'"{escaped_target}"'
+            if re.search(r"\s", target_arg)
+            else target_arg
+        )
+    else:
+        quoted_target = shlex.quote(target_arg)
+    insertion = f" --target-dir {quoted_target}"
+    separator_index = command.find(" -- ")
+    if separator_index >= 0:
+        return command[:separator_index] + insertion + command[separator_index:]
+    return command + insertion
+
+
+def _cargo_command_with_target_dir(
+    command: Sequence[str],
+    target_dir: Path,
+) -> list[str]:
+    result = list(command)
+    if len(result) < 2 or Path(result[0]).stem.lower() != "cargo":
+        return result
+    subcommand_index = 1
+    while subcommand_index < len(result) and result[subcommand_index].startswith("-"):
+        subcommand_index += 1
+    if subcommand_index >= len(result):
+        return result
+    subcommand = result[subcommand_index]
+    target_arg = str(target_dir)
+    tail = result[subcommand_index + 1 :]
+    if any(arg == "--target-dir" or arg.startswith("--target-dir=") for arg in tail):
+        return result
+    if subcommand == "nextest":
+        if not tail or tail[0] not in {"archive", "run"}:
+            return result
+        return [
+            *result[: subcommand_index + 2],
+            "--target-dir",
+            target_arg,
+            *result[subcommand_index + 2 :],
+        ]
+    if subcommand == "watch":
+        for index in range(subcommand_index + 1, len(result)):
+            if result[index] in {"-x", "--exec"} and index + 1 < len(result):
+                result[index + 1] = _cargo_watch_exec_with_target_dir(
+                    result[index + 1],
+                    target_dir,
+                )
+                return result
+            if result[index].startswith("--exec="):
+                result[index] = "--exec=" + _cargo_watch_exec_with_target_dir(
+                    result[index].removeprefix("--exec="),
+                    target_dir,
+                )
+                return result
+        return result
+    if subcommand not in {
+        "bench",
+        "build",
+        "check",
+        "clippy",
+        "doc",
+        "fix",
+        "llvm-cov",
+        "run",
+        "rustc",
+        "test",
+    }:
+        return result
+    return [
+        *result[: subcommand_index + 1],
+        "--target-dir",
+        target_arg,
+        *result[subcommand_index + 1 :],
+    ]
+
+
+def run_in_cargo_lane(
+    *,
+    repo_root: Path,
+    requested_lane: str,
+    command: Sequence[str],
+    lane_root: Path | None = None,
+    lock_timeout_seconds: float = 30.0,
+) -> int:
+    if not command:
+        raise ValueError("run-lane requires a command after --")
+    with reserve_cargo_lane(
+        repo_root=repo_root,
+        requested_lane=requested_lane,
+        command=command,
+        lane_root=lane_root,
+        lock_timeout_seconds=lock_timeout_seconds,
+    ) as (resolved_lane, target_dir):
+        if requested_lane != "auto" and resolved_lane != requested_lane:
+            print(
+                f"warning: requested Cargo lane {requested_lane!r} is busy; "
+                f"using {resolved_lane!r}",
+                file=sys.stderr,
+            )
+        child_env = os.environ.copy()
+        child_env.pop("CARGO_TARGET_DIR", None)
+        child_env["CODEX_CARGO_LANE_TARGET_DIR"] = str(target_dir)
+        child_command = _cargo_command_with_target_dir(command, target_dir)
+        if os.name == "nt" and not Path(child_command[0]).parent.name:
+            resolved_program = shutil.which(
+                child_command[0],
+                path=child_env.get("PATH"),
+            )
+            if resolved_program is not None:
+                child_command[0] = resolved_program
+        return subprocess.run(child_command, env=child_env, check=False).returncode
 
 
 def is_protected_target_dir_name(name: str) -> bool:
@@ -1024,7 +1400,7 @@ def prune_stray_cargo_target_dirs(
     if not target_root.exists():
         return []
     resolved_target_root = target_root.resolve()
-    removed: list[Path] = []
+    detected: list[Path] = []
     for path in stray_cargo_target_dirs(repo_root=repo_root):
         if is_indirect_directory(path):
             print(f"warning: skipping indirect target path: {path}", file=sys.stderr)
@@ -1036,22 +1412,12 @@ def prune_stray_cargo_target_dirs(
                 file=sys.stderr,
             )
             continue
-        if cargo_lock_is_busy(resolved_path):
-            continue
-        if not dry_run:
-            try:
-                if is_indirect_directory(path) or cargo_lock_is_busy(path):
-                    continue
-                remove_tree_allow_readonly(path)
-            except OSError as exc:
-                if not cargo_lock_is_busy(path):
-                    print(
-                        f"warning: failed to prune stray target {path}: {exc}",
-                        file=sys.stderr,
-                    )
-                continue
-        removed.append(path)
-    return removed
+        # Raw Cargo commands do not participate in the lane reservation
+        # protocol. A second liveness check therefore cannot close the race
+        # between inspection and recursive deletion. Keep these paths visible
+        # in plans and reports, but never auto-delete them.
+        detected.append(path)
+    return detected
 
 
 def prune_stale_lanes_report(
@@ -1086,7 +1452,7 @@ def prune_stale_lanes_report(
         max_total_target_bytes=max_total_target_bytes,
         size_workers=size_workers,
     )
-    removed_strays = prune_stray_cargo_target_dirs(
+    detected_strays = prune_stray_cargo_target_dirs(
         repo_root=repo_root,
         dry_run=dry_run,
     )
@@ -1109,11 +1475,12 @@ def prune_stale_lanes_report(
             lines.append(f"{action}: {path}")
     else:
         lines.append("no stale lanes to prune")
-    if removed_strays:
-        for path in removed_strays:
-            lines.append(f"{action} stray target: {path}")
+    if detected_strays:
+        for path in detected_strays:
+            lines.append(f"detected stray target (not auto-pruned): {path}")
+        lines.append("stray targets are diagnostic-only and were preserved")
     else:
-        lines.append("no stray cargo target dirs to prune")
+        lines.append("no stray cargo target dirs detected")
     if include_disk_report:
         lines.extend(
             target_disk_report_lines(repo_root=repo_root, warn_bytes=warn_bytes)
@@ -1147,6 +1514,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     add_prune_arguments(optimize_parser)
     optimize_parser.add_argument("--include-prune-disk-report", action="store_true")
+    run_lane_parser = subparsers.add_parser(
+        "run-lane",
+        help="Reserve a Cargo target lane for the lifetime of a child command.",
+    )
+    run_lane_parser.add_argument("--lane", required=True)
+    run_lane_parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
+    run_lane_parser.add_argument("--lanes-root", type=Path)
+    run_lane_parser.add_argument(
+        "--lock-timeout-seconds",
+        type=positive_float,
+        default=30.0,
+    )
+    run_lane_parser.add_argument("command_args", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     keep_warm_per_base = getattr(args, "keep_warm_per_base", None)
     max_age_days = getattr(args, "max_age_days", None)
@@ -1206,9 +1586,20 @@ def main(argv: list[str] | None = None) -> int:
                     size_workers=args.size_workers,
                 )
             )
+        elif args.command == "run-lane":
+            command_args = list(args.command_args)
+            if command_args[:1] == ["--"]:
+                command_args = command_args[1:]
+            return run_in_cargo_lane(
+                repo_root=args.repo_root.resolve(),
+                requested_lane=args.lane,
+                command=command_args,
+                lane_root=args.lanes_root,
+                lock_timeout_seconds=args.lock_timeout_seconds,
+            )
         else:
             parser.error(f"unknown command {args.command}")
-    except CargoLanesRootValidationError as exc:
+    except (CargoLanesRootValidationError, OSError, RuntimeError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     return 0

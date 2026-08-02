@@ -24,6 +24,12 @@ const APPROVAL_POLICY_ON_REQUEST_RULE: &str =
 const APPROVAL_POLICY_ON_REQUEST_RULE_REQUEST_PERMISSION: &str =
     include_str!("../templates/permissions/approval_policy/on_request_rule_request_permission.md");
 const AUTO_REVIEW_APPROVAL_SUFFIX: &str = "`approvals_reviewer` is `auto_review`: Sandbox escalations with require_escalated will be reviewed for compliance with the policy. If a rejection happens, you should proceed only with a materially safer alternative, or inform the user of the risk and send a final message to ask for approval.";
+const MAX_APPROVAL_MESSAGE_BYTES: usize = 12_000;
+const APPROVAL_MESSAGE_TRUNCATED_MARKER: &str =
+    "\n\n[Additional approval instructions were truncated.]";
+const MAX_PERMISSION_LIST_ENTRIES: usize = 64;
+const MAX_PERMISSION_LIST_BYTES: usize = 4_096;
+const PERMISSION_LIST_TRUNCATED_MARKER: &str = "- ... [additional permission entries omitted]";
 
 const SANDBOX_MODE_DANGER_FULL_ACCESS: &str =
     include_str!("../templates/permissions/sandbox_mode/danger_full_access.md");
@@ -221,7 +227,11 @@ fn approval_text(
             ApprovalsReviewer::AutoReview => approval_messages.on_request_auto_review.as_ref(),
         };
         if let Some(selected) = selected {
-            return selected.clone();
+            return truncate_prompt_text(
+                selected,
+                MAX_APPROVAL_MESSAGE_BYTES,
+                APPROVAL_MESSAGE_TRUNCATED_MARKER,
+            );
         }
     }
 
@@ -291,15 +301,15 @@ fn writable_roots_text(writable_roots: Option<Vec<WritableRoot>>) -> Option<Stri
     }
     roots.sort_by(|left, right| left.root.as_path().cmp(right.root.as_path()));
 
-    let roots_list: Vec<String> = roots
+    let roots_list = roots
         .iter()
-        .map(|r| format!("`{}`", r.root.to_string_lossy()))
-        .collect();
-    Some(if roots_list.len() == 1 {
-        format!(" The writable root is {}.", roots_list[0])
-    } else {
-        format!(" The writable roots are {}.", roots_list.join(", "))
-    })
+        .map(|r| format!("- `{}`", r.root.to_string_lossy()))
+        .collect::<Vec<_>>();
+    let roots_list = bounded_permission_entries(roots_list);
+    Some(format!(
+        "## Writable roots\nThe sandbox permits writes in these roots:\n{}",
+        roots_list.join("\n")
+    ))
 }
 
 fn denied_reads_text(file_system_policy: &FileSystemSandboxPolicy, cwd: &Path) -> Option<String> {
@@ -318,10 +328,71 @@ fn denied_reads_text(file_system_policy: &FileSystemSandboxPolicy, cwd: &Path) -
         return None;
     }
 
+    let entries = bounded_permission_entries(entries);
     Some(format!(
         "## Denied filesystem reads\nThe active permission profile denies reading these paths/globs. Do not request escalation or additional permissions to read them; these denials are policy restrictions.\n{}",
         entries.join("\n")
     ))
+}
+
+fn bounded_permission_entries(entries: Vec<String>) -> Vec<String> {
+    let total_entries = entries.len();
+    let mut rendered = Vec::new();
+    let mut rendered_bytes = 0usize;
+
+    for entry in entries {
+        if rendered.len() == MAX_PERMISSION_LIST_ENTRIES {
+            break;
+        }
+        let separator_bytes = usize::from(!rendered.is_empty());
+        let next_bytes = rendered_bytes
+            .saturating_add(separator_bytes)
+            .saturating_add(entry.len());
+        if next_bytes > MAX_PERMISSION_LIST_BYTES {
+            break;
+        }
+        rendered_bytes = next_bytes;
+        rendered.push(entry);
+    }
+
+    if rendered.len() == total_entries {
+        return rendered;
+    }
+
+    let marker_bytes = PERMISSION_LIST_TRUNCATED_MARKER.len();
+    while !rendered.is_empty()
+        && (rendered.len() == MAX_PERMISSION_LIST_ENTRIES
+            || rendered_bytes
+                .saturating_add(1)
+                .saturating_add(marker_bytes)
+                > MAX_PERMISSION_LIST_BYTES)
+    {
+        let removed = rendered.pop().expect("checked non-empty");
+        rendered_bytes = rendered_bytes.saturating_sub(removed.len());
+        if !rendered.is_empty() {
+            rendered_bytes = rendered_bytes.saturating_sub(1);
+        }
+    }
+
+    if marker_bytes <= MAX_PERMISSION_LIST_BYTES {
+        rendered.push(PERMISSION_LIST_TRUNCATED_MARKER.to_string());
+    }
+    rendered
+}
+
+fn truncate_prompt_text(text: &str, max_bytes: usize, marker: &str) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+
+    let content_budget = max_bytes.saturating_sub(marker.len());
+    let mut end = content_budget.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut truncated = text[..end].trim_end().to_string();
+    truncated.push_str(marker);
+    truncated
 }
 
 fn approved_command_prefixes_text(exec_policy: &Policy) -> Option<String> {

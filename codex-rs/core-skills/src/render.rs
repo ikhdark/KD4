@@ -30,6 +30,7 @@ const SKILLS_INTRO_WITH_ALIASES: &str = "A skill is a set of local instructions 
 pub const SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS: &str = r###"- Discovery: The list above is the skills available in this session (name + description + source locator). `file` entries live on the host filesystem, `environment resource` entries are owned by their execution environment, `orchestrator resource` entries must be accessed through `skills.list` and `skills.read`, and `custom resource` entries use their provider's access mechanism.
 - Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.
 - Missing/blocked: If a named skill isn't in the list or its source can't be read, say so briefly and continue with the best fallback.
+- Read recovery: If a shell read is rejected as potentially mutating, retry with a dedicated read-only API or command. Do not treat that rejection as proof the skill is unavailable or proceed from cached or indexed contents; required reads must succeed first.
 - How to use a skill (progressive disclosure):
   1) After deciding to use a skill, the main agent must read its `SKILL.md` completely before taking task actions. For a `file` entry, open the listed path. For an `environment resource`, use the filesystem of the owning environment. For an `orchestrator resource`, call `skills.list` with `{"authority":{"kind":"orchestrator"}}`, select the matching package, and pass its `main_resource` to `skills.read`. If a read is truncated or paginated, continue until EOF.
   2) When `SKILL.md` references another resource, use the same access mechanism. Resolve relative paths against a filesystem-backed skill directory. For orchestrator skills, pass the exact referenced resource identifier with the same authority and package to `skills.read`; do not treat `skill://` identifiers as filesystem paths.
@@ -47,6 +48,7 @@ pub const SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS: &str = r###"- Discovery: The li
 pub const SKILLS_HOW_TO_USE_WITH_ALIASES: &str = r###"- Discovery: The list above is the skills available in this session (name + description + short path). Skill bodies live on disk at the listed paths after expanding the matching alias from `### Skill roots`.
 - Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.
 - Missing/blocked: If a named skill isn't in the list or the path can't be read, say so briefly and continue with the best fallback.
+- Read recovery: If a shell read is rejected as potentially mutating, retry with a dedicated read-only API or command. Do not treat that rejection as proof the skill is unavailable or proceed from cached or indexed contents; required reads must succeed first.
 - How to use a skill (progressive disclosure):
   1) After deciding to use a skill, the main agent must expand the listed short `path` with the matching alias from `### Skill roots`, then open and read its `SKILL.md` completely before taking task actions. If a read is truncated or paginated, continue until EOF.
   2) When `SKILL.md` references relative paths (e.g., `scripts/foo.py`), resolve them relative to the directory containing that expanded `SKILL.md` first, and only consider other paths if needed.
@@ -1017,6 +1019,12 @@ mod tests {
             ));
             assert!(instructions.contains(
                 "Progressive disclosure applies to selecting relevant files, not partially reading a selected instruction file"
+            ));
+            assert!(instructions.contains(
+                "If a shell read is rejected as potentially mutating, retry with a dedicated read-only API or command"
+            ));
+            assert!(instructions.contains(
+                "Do not treat that rejection as proof the skill is unavailable or proceed from cached or indexed contents"
             ));
             assert!(!instructions.contains("Read only enough to follow the workflow"));
         }

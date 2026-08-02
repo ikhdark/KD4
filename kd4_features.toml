@@ -504,11 +504,11 @@ retired_paths = ["codex-rs/config/src/coding_budgets.rs"]
 
 [[features]]
 id = "task-evidence-completion-gate"
-version = 3
+version = 4
 status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Persisted plan-status completion evidence with explicit Passed acknowledgement, dependency and generated-artifact checks, and reopening after later edit, command, or freshness mutations."
+summary = "Persisted schema-v4 plan-status completion evidence with explicit Passed acknowledgement, dependency and generated-artifact checks, reopening after later mutations, and bounded observational completion-review receipts."
 upstream_equivalent = "none"
 config_keys = []
 
@@ -544,8 +544,8 @@ contains = ".task_evidence.completion_gate().await"
 
 [[features.evidence]]
 kind = "registration"
-path = "codex-rs/core/src/session/turn.rs"
-contains = ".take_finalization_warning()"
+path = "codex-rs/core/src/tasks/completion_review.rs"
+contains = ".disabled_finalization_advisory()"
 
 [[features.evidence]]
 kind = "protocol"
@@ -561,6 +561,46 @@ contains = "pub struct TaskCompletionGate"
 kind = "test"
 path = "codex-rs/core/src/task_evidence_tests.rs"
 contains = "explicit_passed_and_completed_are_authoritative_success_states"
+
+[[features]]
+id = "task-completion-reviewer"
+version = 1
+status = "enabled"
+capability_kind = "runtime"
+owner = "codex-rs/core"
+summary = "Independent bounded KD4 completion review with one turn-local repair continuation and fail-open infrastructure status."
+upstream_equivalent = "none"
+config_keys = ["features.task_completion_reviewer"]
+
+[[features.evidence]]
+kind = "entrypoint"
+path = "codex-rs/core/src/tasks/completion_review.rs"
+contains = "pub(crate) async fn coordinate_completion_review"
+
+[[features.evidence]]
+kind = "registration"
+path = "codex-rs/core/src/session/turn.rs"
+contains = "coordinate_completion_review("
+
+[[features.evidence]]
+kind = "module"
+path = "codex-rs/core/src/tasks/mod.rs"
+contains = "pub(crate) mod completion_review;"
+
+[[features.evidence]]
+kind = "config"
+path = "codex-rs/features/src/lib.rs"
+contains = "key: \"task_completion_reviewer\""
+
+[[features.evidence]]
+kind = "config"
+path = ".codex/config.toml"
+contains = "task_completion_reviewer = true"
+
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/tasks/completion_review.rs"
+contains = "request_and_history_caps_include_serialization_expansion"
 
 [[features]]
 id = "desktop-runtime-receipt"

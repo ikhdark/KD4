@@ -399,9 +399,7 @@ class CodexClient:
         """Stop routing notifications for one turn into its dedicated queue."""
         self._router.unregister_turn(turn_id)
 
-    def next_turn_notification(
-        self, turn_id: str, timeout_s: float | None = None
-    ) -> Notification:
+    def next_turn_notification(self, turn_id: str, timeout_s: float | None = None) -> Notification:
         """Return the next routed notification for the requested turn id."""
         return self._router.next_turn_notification(turn_id, timeout_s)
 
@@ -823,9 +821,7 @@ class CodexClient:
         self._stderr_thread = threading.Thread(target=_drain, daemon=True)
         self._stderr_thread.start()
 
-    def _start_reader_thread(
-        self, proc: subprocess.Popen[str], router: MessageRouter
-    ) -> None:
+    def _start_reader_thread(self, proc: subprocess.Popen[str], router: MessageRouter) -> None:
         """Start the sole stdout reader that fans messages into router queues."""
         if proc.stdout is None:
             return
@@ -883,9 +879,7 @@ class CodexClient:
             target.stdin.write(json.dumps(payload) + "\n")
             target.stdin.flush()
 
-    def _read_message(
-        self, proc: subprocess.Popen[str] | None = None
-    ) -> dict[str, JsonValue]:
+    def _read_message(self, proc: subprocess.Popen[str] | None = None) -> dict[str, JsonValue]:
         target = proc or self._proc
         if target is None or target.stdout is None:
             raise TransportClosedError("Codex process is not running")

@@ -4,7 +4,7 @@ use crate::agent::control::SpawnAgentOptions;
 use crate::agent::control::render_input_preview;
 use crate::agent::exceeds_thread_spawn_depth_limit;
 use crate::agent::next_thread_spawn_depth;
-use crate::agent::role::AgentRoleModelLocks;
+use crate::agent::role::AgentRoleLocks;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
 use crate::tools::handlers::multi_agents_spec::SpawnAgentToolOptions;
@@ -82,8 +82,8 @@ async fn handle_spawn_agent(
             args.reasoning_effort.clone(),
         )?;
     }
-    let role_model_locks = if args.fork_context {
-        AgentRoleModelLocks::default()
+    let role_locks = if args.fork_context {
+        AgentRoleLocks::default()
     } else {
         apply_role_to_config(&mut config, role_name)
             .await
@@ -95,7 +95,7 @@ async fn handle_spawn_agent(
         &mut config,
         args.model.as_deref(),
         args.reasoning_effort.clone(),
-        role_model_locks,
+        role_locks,
     )
     .await?;
     apply_spawn_agent_service_tier(
@@ -106,7 +106,7 @@ async fn handle_spawn_agent(
         args.service_tier.as_deref(),
     )
     .await?;
-    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref(), role_locks)?;
     let resolved_model = config.model.clone().unwrap_or_default();
     let resolved_reasoning_effort = config.model_reasoning_effort.clone().unwrap_or_default();
 

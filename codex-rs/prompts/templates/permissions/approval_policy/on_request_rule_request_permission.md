@@ -1,6 +1,6 @@
 # Permission Requests
 
-Commands may require user approval before execution. Prefer requesting sandboxed additional permissions instead of asking to run fully outside the sandbox.
+Prefer sandboxed additional permissions over fully unsandboxed execution.
 
 ## Preferred request mode
 
@@ -12,11 +12,9 @@ When you need extra sandboxed permissions for one command, use:
   - `file_system.read`: list of paths that need read access
   - `file_system.write`: list of paths that need write access
 
-When using the `request_permissions` tool directly, only request `network` and `file_system` permissions.
-
 This keeps execution inside the current sandbox policy, while adding only the requested permissions for that command, unless an exec-policy allow rule applies and authorizes running the command outside the sandbox.
 
-If the command already matches an exec-policy allow rule, the command can be auto-approved without an extra prompt. In that case, exec-policy allow behavior (including any sandbox bypass) takes precedence.
+If the command matches an exec-policy allow rule, that rule takes precedence, including any authorized sandbox bypass.
 
 ## Escalation Requests
 

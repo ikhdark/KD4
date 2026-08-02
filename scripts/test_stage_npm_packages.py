@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import errno
 import io
+import hashlib
 import json
 import os
 import sys
@@ -10,10 +12,12 @@ import threading
 import time
 import types
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
 import scripts.stage_npm_packages as stage
+import scripts.stage_npm_archives as archives
 
 
 class StageNpmPackagesTests(unittest.TestCase):
@@ -35,7 +39,9 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_stage_models_use_slots(self) -> None:
-        self.assertFalse(hasattr(stage.WorkflowArtifact("target", 1), "__dict__"))
+        self.assertFalse(
+            hasattr(stage.WorkflowArtifact("target", 1, 1, "0" * 64), "__dict__")
+        )
         self.assertFalse(
             hasattr(stage.BinaryComponent("artifact", "dest", "binary"), "__dict__")
         )
@@ -269,13 +275,11 @@ class StageNpmPackagesTests(unittest.TestCase):
             "local/fork",
         )
 
-    def test_workflow_run_id_ignores_attempt_suffix(self) -> None:
-        self.assertEqual(
+    def test_attempt_qualified_workflow_url_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "workflow URL must match"):
             stage.workflow_id_from_url(
                 "https://github.com/local/fork/actions/runs/12345/attempts/2"
-            ),
-            "12345",
-        )
+            )
 
     def test_workflow_url_parser_rejects_non_https_and_unknown_suffixes(self) -> None:
         for workflow_url in (
@@ -373,7 +377,10 @@ class StageNpmPackagesTests(unittest.TestCase):
         with mock.patch.object(
             stage.subprocess,
             "check_output",
-            return_value="x86_64-unknown-linux-musl\t1024\n",
+            return_value=(
+                "42\tx86_64-unknown-linux-musl\t1024\t"
+                f"sha256:{'a' * 64}\n"
+            ),
         ) as check_output:
             first = stage.list_workflow_artifacts("12345", "local/fork")
             second = stage.list_workflow_artifacts("12345", "local/fork")
@@ -382,6 +389,8 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first, third)
         self.assertEqual(first[0].name, "x86_64-unknown-linux-musl")
+        self.assertEqual(first[0].artifact_id, 42)
+        self.assertEqual(first[0].archive_sha256, "a" * 64)
         self.assertEqual(check_output.call_count, 2)
         self.assertIn(
             "repos/local/fork/actions/runs/12345/artifacts",
@@ -394,8 +403,8 @@ class StageNpmPackagesTests(unittest.TestCase):
 
     def test_select_target_artifacts_uses_requested_targets_only(self) -> None:
         artifacts = (
-            stage.WorkflowArtifact("x86_64-pc-windows-msvc", 10),
-            stage.WorkflowArtifact("x86_64-unknown-linux-musl", 20),
+            stage.WorkflowArtifact("x86_64-pc-windows-msvc", 10, 1, "a" * 64),
+            stage.WorkflowArtifact("x86_64-unknown-linux-musl", 20, 2, "b" * 64),
         )
         with mock.patch.object(
             stage,
@@ -410,6 +419,27 @@ class StageNpmPackagesTests(unittest.TestCase):
             )
 
         self.assertEqual(selected, [artifacts[0]])
+
+    def test_duplicate_selected_artifact_names_are_rejected(self) -> None:
+        artifacts = (
+            stage.WorkflowArtifact("target", 10, 1, "a" * 64),
+            stage.WorkflowArtifact("target", 10, 2, "b" * 64),
+        )
+        with (
+            mock.patch.object(stage, "list_workflow_artifacts", return_value=artifacts),
+            mock.patch.object(stage, "codex_package_component", return_value="package"),
+            self.assertRaisesRegex(RuntimeError, "duplicate workflow artifact name"),
+        ):
+            stage.select_target_artifacts("123", "local/fork", ["package"], ["target"])
+
+    def test_selected_artifact_requires_authoritative_digest(self) -> None:
+        artifact = stage.WorkflowArtifact("target", 10, 1, None)
+        with (
+            mock.patch.object(stage, "list_workflow_artifacts", return_value=(artifact,)),
+            mock.patch.object(stage, "codex_package_component", return_value="package"),
+            self.assertRaisesRegex(RuntimeError, "no authoritative sha256"),
+        ):
+            stage.select_target_artifacts("123", "local/fork", ["package"], ["target"])
 
     def test_build_stage_command_uses_target_specific_vendor_src(self) -> None:
         key = (("codex-package",), ("x86_64-unknown-linux-musl",))
@@ -426,23 +456,34 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertEqual(command[command.index("--vendor-src") + 1], str(vendor_src))
 
     def test_download_artifacts_uses_complete_markers(self) -> None:
-        artifacts = (
-            stage.WorkflowArtifact("linux", 10),
-            stage.WorkflowArtifact("macos", 20),
-        )
+        archives_by_id: dict[int, bytes] = {}
+        artifacts_list: list[stage.WorkflowArtifact] = []
+        for artifact_id, name in ((10, "linux"), (20, "macos")):
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
+                archive.writestr(f"{name}.txt", name)
+            archive_bytes = payload.getvalue()
+            archives_by_id[artifact_id] = archive_bytes
+            artifacts_list.append(
+                stage.WorkflowArtifact(
+                    name,
+                    len(archive_bytes),
+                    artifact_id,
+                    hashlib.sha256(archive_bytes).hexdigest(),
+                )
+            )
+        artifacts = tuple(artifacts_list)
         calls: list[str] = []
 
-        def fake_check_call(cmd: list[str]) -> None:
-            artifact_name = cmd[cmd.index("--name") + 1]
-            artifact_dir = Path(cmd[cmd.index("--dir") + 1])
-            self.assertEqual(cmd[cmd.index("--repo") + 1], "local/fork")
-            artifact_dir.mkdir(parents=True, exist_ok=True)
-            (artifact_dir / f"{artifact_name}.txt").write_text(
-                artifact_name, encoding="utf-8"
-            )
-            calls.append(artifact_name)
+        def fake_run(cmd: list[str], **kwargs: object) -> mock.Mock:
+            endpoint = cmd[-1]
+            artifact_id = int(endpoint.split("/")[-2])
+            output = kwargs["stdout"]
+            output.write(archives_by_id[artifact_id])  # type: ignore[union-attr]
+            calls.append(next(item.name for item in artifacts if item.artifact_id == artifact_id))
+            return mock.Mock(returncode=0)
 
-        with mock.patch.object(stage.subprocess, "check_call", fake_check_call):
+        with mock.patch.object(stage.subprocess, "run", fake_run):
             stage.download_artifacts(
                 "999", "local/fork", self.root / "artifacts", artifacts, 2
             )
@@ -455,6 +496,45 @@ class StageNpmPackagesTests(unittest.TestCase):
             self.assertTrue(
                 (self.root / "artifacts" / artifact.name / ".complete").is_file()
             )
+
+    def test_digest_mismatch_preserves_existing_artifact_cache(self) -> None:
+        artifact_dir = self.root / "artifacts" / "linux"
+        artifact_dir.mkdir(parents=True)
+        (artifact_dir / "existing.txt").write_text("existing", encoding="utf-8")
+        old = stage.WorkflowArtifact("linux", 1, 1, "a" * 64)
+        stage.write_complete_marker(artifact_dir, old)
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("new.txt", "new")
+        archive_bytes = payload.getvalue()
+        replacement = stage.WorkflowArtifact(
+            "linux", len(archive_bytes), 2, "0" * 64
+        )
+
+        def fake_run(_cmd: list[str], **kwargs: object) -> mock.Mock:
+            kwargs["stdout"].write(archive_bytes)  # type: ignore[union-attr]
+            return mock.Mock(returncode=0)
+
+        with (
+            mock.patch.object(stage.subprocess, "run", fake_run),
+            self.assertRaisesRegex(RuntimeError, "sha256 mismatch"),
+        ):
+            stage.download_single_artifact(
+                "999", "local/fork", self.root / "artifacts", replacement
+            )
+        self.assertEqual(
+            (artifact_dir / "existing.txt").read_text(encoding="utf-8"), "existing"
+        )
+        self.assertTrue(stage.artifact_is_complete(artifact_dir, old))
+
+    def test_changed_remote_artifact_id_invalidates_complete_marker(self) -> None:
+        artifact_dir = self.root / "artifacts" / "linux"
+        artifact_dir.mkdir(parents=True)
+        (artifact_dir / "payload.txt").write_text("payload", encoding="utf-8")
+        old = stage.WorkflowArtifact("linux", 10, 1, "a" * 64)
+        stage.write_complete_marker(artifact_dir, old)
+        replacement = stage.WorkflowArtifact("linux", 10, 2, "a" * 64)
+        self.assertFalse(stage.artifact_is_complete(artifact_dir, replacement))
 
     def test_codex_package_archive_extraction_is_reused(self) -> None:
         target = "x86_64-unknown-linux-musl"
@@ -694,7 +774,49 @@ class StageNpmPackagesTests(unittest.TestCase):
         self.assertTrue(second_acquired.is_set())
         self.assertTrue(lock_path.exists())
 
-    def test_lock_initialization_failure_closes_but_keeps_stable_lock_file(self) -> None:
+    def test_lock_retries_contention_then_succeeds(self) -> None:
+        lock_path = self.root / "cache" / ".retry.lock"
+        contention = OSError(errno.EAGAIN, "busy")
+        with mock.patch.object(
+            archives, "_acquire_file_lock", side_effect=[contention, None]
+        ) as acquire:
+            with archives.exclusive_file_lock(
+                lock_path, timeout_seconds=1, poll_seconds=0.001
+            ):
+                pass
+        self.assertEqual(acquire.call_count, 2)
+
+    def test_lock_propagates_permanent_error_without_retry(self) -> None:
+        lock_path = self.root / "cache" / ".unsupported.lock"
+        permanent = OSError(errno.ENOTSUP, "unsupported")
+        with (
+            mock.patch.object(archives, "_acquire_file_lock", side_effect=permanent) as acquire,
+            self.assertRaisesRegex(OSError, "unsupported"),
+        ):
+            with archives.exclusive_file_lock(
+                lock_path, timeout_seconds=1, poll_seconds=0.001
+            ):
+                self.fail("permanent lock failure must not enter the context")
+        acquire.assert_called_once()
+
+    def test_lock_times_out_on_persistent_contention(self) -> None:
+        lock_path = self.root / "cache" / ".timeout.lock"
+        with (
+            mock.patch.object(
+                archives,
+                "_acquire_file_lock",
+                side_effect=OSError(errno.EAGAIN, "busy"),
+            ),
+            self.assertRaisesRegex(TimeoutError, "timed out acquiring lock"),
+        ):
+            with archives.exclusive_file_lock(
+                lock_path, timeout_seconds=0.01, poll_seconds=0.001
+            ):
+                self.fail("contended lock must time out")
+
+    def test_lock_initialization_failure_closes_but_keeps_stable_lock_file(
+        self,
+    ) -> None:
         lock_path = self.root / "cache" / ".artifact.lock"
 
         with (
@@ -712,7 +834,7 @@ class StageNpmPackagesTests(unittest.TestCase):
             mock.patch.object(
                 stage.subprocess,
                 "check_output",
-                side_effect=["current-head\n", ""],
+                side_effect=["current-head\n", b""],
             ),
             mock.patch.object(sys, "stderr", stderr),
             self.assertRaisesRegex(RuntimeError, "source/native mismatch"),
@@ -723,7 +845,7 @@ class StageNpmPackagesTests(unittest.TestCase):
             mock.patch.object(
                 stage.subprocess,
                 "check_output",
-                side_effect=["current-head\n", "dirty\n"],
+                side_effect=["current-head\n", b"?? dirty\0"],
             ),
             mock.patch.object(sys, "stderr", stderr),
         ):
@@ -731,6 +853,66 @@ class StageNpmPackagesTests(unittest.TestCase):
                 "workflow-head", repo_root=self.root, allow_mismatch=True
             )
         self.assertIn("WARNING: allowing source/native mismatch", stderr.getvalue())
+
+    def test_source_validation_ignores_only_owned_paths(self) -> None:
+        owned = self.root / "dist"
+        with mock.patch.object(
+            stage.subprocess,
+            "check_output",
+            side_effect=["workflow-head\n", b"?? dist/package.tgz\0"],
+        ):
+            stage.ensure_source_matches_workflow(
+                "workflow-head", repo_root=self.root, owned_paths=[owned]
+            )
+
+        with (
+            mock.patch.object(
+                stage.subprocess,
+                "check_output",
+                side_effect=[
+                    "workflow-head\n",
+                    b"?? dist/package.tgz\0?? unrelated.txt\0",
+                ],
+            ),
+            self.assertRaisesRegex(RuntimeError, "uncommitted changes"),
+        ):
+            stage.ensure_source_matches_workflow(
+                "workflow-head", repo_root=self.root, owned_paths=[owned]
+            )
+
+    def test_archive_cache_key_uses_content_not_stat_tuple(self) -> None:
+        archive_path = self.root / "archive.tar.gz"
+        cache_root = self.root / "cache"
+        archive_path.write_bytes(b"AAAA")
+        fixed_time = 946684800
+        os.utime(archive_path, ns=(fixed_time * 1_000_000_000,) * 2)
+
+        def fake_extract(source: Path, destination: Path) -> None:
+            (destination / "payload.bin").write_bytes(source.read_bytes())
+
+        with mock.patch.object(archives, "extract_tar_data", fake_extract):
+            first = archives.cached_codex_package_archive(
+                archive_path, "target", cache_root
+            )
+            archive_path.write_bytes(b"BBBB")
+            os.utime(archive_path, ns=(fixed_time * 1_000_000_000,) * 2)
+            second = archives.cached_codex_package_archive(
+                archive_path, "target", cache_root
+            )
+
+        self.assertNotEqual(first, second)
+        self.assertEqual((second / "payload.bin").read_bytes(), b"BBBB")
+
+    @unittest.skipIf(os.name == "nt", "POSIX executable modes are required")
+    def test_cache_tree_digest_includes_executable_mode(self) -> None:
+        root = self.root / "tree"
+        root.mkdir()
+        executable = root / "tool"
+        executable.write_text("tool", encoding="utf-8")
+        executable.chmod(0o755)
+        before = archives.cache_tree_digest(root)
+        executable.chmod(0o644)
+        self.assertNotEqual(before, archives.cache_tree_digest(root))
 
     def test_stage_packages_returns_results_in_package_order(self) -> None:
         calls: list[tuple[str, bool]] = []

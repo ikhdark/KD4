@@ -58,7 +58,11 @@ def _require(condition: bool, message: str) -> None:
 
 def _resolve_results_path(value: str) -> Path:
     candidate = Path(value)
-    resolved = candidate.resolve() if candidate.is_absolute() else (REPO_ROOT / candidate).resolve()
+    resolved = (
+        candidate.resolve()
+        if candidate.is_absolute()
+        else (REPO_ROOT / candidate).resolve()
+    )
     _require(resolved.is_dir(), f"results directory does not exist: {value}")
     return resolved
 
@@ -74,7 +78,7 @@ def _is_rfc3339_timestamp(value: Any) -> bool:
         normalized = f"{normalized[:-1]}+00:00"
     if match.group("second") == "60":
         second_start = match.start("second")
-        normalized = f"{normalized[:second_start]}59{normalized[second_start + 2:]}"
+        normalized = f"{normalized[:second_start]}59{normalized[second_start + 2 :]}"
     try:
         datetime.fromisoformat(normalized)
     except ValueError:
@@ -103,7 +107,10 @@ def _load_result(
         "metrics",
         "raw_events",
     }
-    _require(set(result) == required, f"{path}: result fields must be exactly {sorted(required)}")
+    _require(
+        set(result) == required,
+        f"{path}: result fields must be exactly {sorted(required)}",
+    )
     _require(result["case_id"] == case["id"], f"{path}: case_id mismatch")
     _require(
         result["case_fingerprint"] == case_fingerprint(case),
@@ -114,8 +121,13 @@ def _load_result(
         _is_rfc3339_timestamp(completed_at),
         f"{path}: completed_at must be an RFC 3339 timestamp",
     )
-    _require(isinstance(result["final_output"], str), f"{path}: final_output must be a string")
-    _require(isinstance(result["raw_events"], list), f"{path}: raw_events must be an array")
+    _require(
+        isinstance(result["final_output"], str),
+        f"{path}: final_output must be a string",
+    )
+    _require(
+        isinstance(result["raw_events"], list), f"{path}: raw_events must be an array"
+    )
 
     model = result["model"]
     _require(isinstance(model, dict), f"{path}: model must be an object")
@@ -123,8 +135,14 @@ def _load_result(
         set(model) == {"name", "reasoning_effort", "codex_version", "binary_sha256"},
         f"{path}: invalid model metadata fields",
     )
-    _require(all(isinstance(model[key], str) and model[key] for key in model), f"{path}: invalid model metadata")
-    _require(SHA256_RE.fullmatch(model["binary_sha256"]) is not None, f"{path}: invalid binary_sha256")
+    _require(
+        all(isinstance(model[key], str) and model[key] for key in model),
+        f"{path}: invalid model metadata",
+    )
+    _require(
+        SHA256_RE.fullmatch(model["binary_sha256"]) is not None,
+        f"{path}: invalid binary_sha256",
+    )
     model_settings = {key: model[key] for key in FROZEN_MODEL_SETTINGS}
     _require(
         model_settings == FROZEN_MODEL_SETTINGS,
@@ -138,19 +156,32 @@ def _load_result(
 
     execution = result["execution"]
     _require(isinstance(execution, dict), f"{path}: execution must be an object")
-    _require(execution == FROZEN_EXECUTION, f"{path}: execution settings do not match the frozen baseline")
+    _require(
+        execution == FROZEN_EXECUTION,
+        f"{path}: execution settings do not match the frozen baseline",
+    )
 
     findings = result["reported_findings"]
     _require(isinstance(findings, list), f"{path}: reported_findings must be an array")
     for index, finding in enumerate(findings):
         prefix = f"{path}: reported_findings[{index}]"
         _require(isinstance(finding, dict), f"{prefix} must be an object")
-        _require(set(finding) == {"kind", "status", "locators"}, f"{prefix}: invalid fields")
-        _require(isinstance(finding["kind"], str) and finding["kind"], f"{prefix}: invalid kind")
-        _require(finding["status"] in FINDING_STATUSES, f"{prefix}: invalid status")
-        _require(isinstance(finding["locators"], list), f"{prefix}: locators must be an array")
         _require(
-            all(isinstance(locator, str) and locator for locator in finding["locators"]),
+            set(finding) == {"kind", "status", "locators"}, f"{prefix}: invalid fields"
+        )
+        _require(
+            isinstance(finding["kind"], str) and finding["kind"],
+            f"{prefix}: invalid kind",
+        )
+        _require(finding["status"] in FINDING_STATUSES, f"{prefix}: invalid status")
+        _require(
+            isinstance(finding["locators"], list),
+            f"{prefix}: locators must be an array",
+        )
+        _require(
+            all(
+                isinstance(locator, str) and locator for locator in finding["locators"]
+            ),
             f"{prefix}: locators must contain non-empty strings",
         )
 
@@ -166,10 +197,15 @@ def _load_result(
     _require(set(metrics) == expected_metric_fields, f"{path}: invalid metrics fields")
     for field in ("tool_calls", "repeated_equivalent_actions"):
         _require(
-            isinstance(metrics[field], int) and not isinstance(metrics[field], bool) and metrics[field] >= 0,
+            isinstance(metrics[field], int)
+            and not isinstance(metrics[field], bool)
+            and metrics[field] >= 0,
             f"{path}: {field} must be a non-negative integer",
         )
-    _require(isinstance(metrics["premature_completion"], bool), f"{path}: premature_completion must be boolean")
+    _require(
+        isinstance(metrics["premature_completion"], bool),
+        f"{path}: premature_completion must be boolean",
+    )
     for field in ("model_cost", "tool_cost"):
         value = metrics[field]
         _require(
@@ -189,7 +225,9 @@ def _finding_matches(reported: dict[str, Any], expected: dict[str, Any]) -> bool
     if reported["kind"] != expected["kind"]:
         return False
     haystack = "\n".join(reported["locators"]).casefold()
-    return all(locator.casefold() in haystack for locator in expected["required_locators"])
+    return all(
+        locator.casefold() in haystack for locator in expected["required_locators"]
+    )
 
 
 def _ratio(numerator: int, denominator: int) -> float:
@@ -223,7 +261,9 @@ def score(
         if run_binary_sha256 is None:
             run_binary_sha256 = result["model"]["binary_sha256"]
         confirmed = [
-            finding for finding in result["reported_findings"] if finding["status"] == "confirmed"
+            finding
+            for finding in result["reported_findings"]
+            if finding["status"] == "confirmed"
         ]
         deferred_or_uncertain += sum(
             finding["status"] in {"deferred", "uncertain"}
@@ -299,8 +339,12 @@ def score(
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--results", required=True, help="directory containing <case-id>.json files")
-    parser.add_argument("--cases", default=str(DEFAULT_CASES), help="case manifest JSONL path")
+    parser.add_argument(
+        "--results", required=True, help="directory containing <case-id>.json files"
+    )
+    parser.add_argument(
+        "--cases", default=str(DEFAULT_CASES), help="case manifest JSONL path"
+    )
     parser.add_argument(
         "--binary-sha256",
         help="optional expected binary SHA-256; otherwise derive it from the first result",

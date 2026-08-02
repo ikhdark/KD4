@@ -106,22 +106,21 @@ async fn exec_command_with_tty(
     let command = vec!["bash".to_string(), "-lc".to_string(), cmd.to_string()];
     let request = test_exec_request(turn, command.clone(), cwd.clone(), shell_env());
 
-    let process = Arc::new(
-        manager
-            .open_session_with_prepared_exec_env(
-                process_id,
-                &request,
-                tty,
-                Box::new(NoopSpawnLifecycle),
-                None,
-                turn.environments
-                    .primary()
-                    .expect("turn environment")
-                    .environment
-                    .as_ref(),
-            )
-            .await?,
-    );
+    let process = manager
+        .open_session_with_prepared_exec_env(
+            process_id,
+            &request,
+            tty,
+            Box::new(NoopSpawnLifecycle),
+            None,
+            turn.environments
+                .primary()
+                .expect("turn environment")
+                .environment
+                .as_ref(),
+            &PendingSpawnRegistration::default(),
+        )
+        .await?;
     let context =
         UnifiedExecContext::new(Arc::clone(session), Arc::clone(turn), "call".to_string());
     let started_at = Instant::now();
@@ -289,20 +288,19 @@ async fn blocking_terminate_unified_process(
     allow_terminate: Arc<Notify>,
 ) -> anyhow::Result<Arc<UnifiedExecProcess>> {
     let (wake_tx, _wake_rx) = watch::channel(0);
-    Ok(Arc::new(
-        UnifiedExecProcess::from_exec_server_started(
-            StartedExecProcess {
-                process: Arc::new(BlockingTerminateExecProcess {
-                    process_id: process_id.to_string().into(),
-                    terminate_started,
-                    allow_terminate,
-                    wake_tx,
-                }),
-            },
-            None,
-        )
-        .await?,
-    ))
+    Ok(UnifiedExecProcess::from_exec_server_started(
+        StartedExecProcess {
+            process: Arc::new(BlockingTerminateExecProcess {
+                process_id: process_id.to_string().into(),
+                terminate_started,
+                allow_terminate,
+                wake_tx,
+            }),
+        },
+        None,
+        &PendingSpawnRegistration::default(),
+    )
+    .await?)
 }
 
 async fn write_stdin(
@@ -821,6 +819,7 @@ async fn completed_pipe_commands_preserve_exit_code() -> anyhow::Result<()> {
             Box::new(NoopSpawnLifecycle),
             None,
             &environment,
+            &PendingSpawnRegistration::default(),
         )
         .await?;
 
@@ -862,6 +861,7 @@ async fn unified_exec_uses_remote_exec_server_when_configured() -> anyhow::Resul
             Box::new(NoopSpawnLifecycle),
             None,
             remote_test_env.environment(),
+            &PendingSpawnRegistration::default(),
         )
         .await?;
 
@@ -924,6 +924,7 @@ async fn remote_exec_server_rejects_inherited_fd_launches() -> anyhow::Result<()
                 .expect("turn environment")
                 .environment
                 .as_ref(),
+            &PendingSpawnRegistration::default(),
         )
         .await
         .expect_err("expected inherited fd rejection");

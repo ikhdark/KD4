@@ -53,6 +53,7 @@ use self::execution::AgentExecutionLimiter;
 use self::residency::V2Residency;
 
 const ROOT_LAST_TASK_MESSAGE: &str = "Main thread";
+const TYPED_ACTOR_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 mod execution;
 mod legacy;
@@ -231,6 +232,87 @@ impl AgentControl {
 
     pub(crate) fn task_coordinator(&self) -> &AgentTaskCoordinator {
         &self.task_coordinator
+    }
+
+    pub(crate) fn start_typed_actor_heartbeat_watcher(
+        &self,
+        agent_path: AgentPath,
+        thread_id: ThreadId,
+    ) {
+        let control = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(TYPED_ACTOR_HEARTBEAT_INTERVAL);
+            loop {
+                interval.tick().await;
+                if !matches!(
+                    control.get_status(thread_id).await,
+                    AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted
+                ) {
+                    break;
+                }
+                let Some(binding) = control
+                    .task_coordinator()
+                    .binding_for_agent_path(&agent_path)
+                else {
+                    warn!(%thread_id, %agent_path, "live typed agent has no durable binding to heartbeat");
+                    continue;
+                };
+                if binding.thread_id.as_deref() != Some(thread_id.to_string().as_str()) {
+                    warn!(%thread_id, %agent_path, "live typed agent binding points at a different thread");
+                    continue;
+                }
+                match control
+                    .task_coordinator()
+                    .heartbeat_typed_actor_binding(&binding)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => warn!(
+                        %thread_id,
+                        attempt_id = %binding.attempt_id,
+                        "live typed actor heartbeat was rejected"
+                    ),
+                    Err(error) => warn!(
+                        %thread_id,
+                        attempt_id = %binding.attempt_id,
+                        %error,
+                        "live typed actor heartbeat failed"
+                    ),
+                }
+            }
+        });
+    }
+
+    pub(crate) async fn reconcile_live_typed_actor_heartbeats(
+        &self,
+    ) -> codex_agent_task_store::StoreResult<()> {
+        for metadata in self.state.live_agents() {
+            let (Some(agent_path), Some(thread_id)) = (metadata.agent_path, metadata.agent_id)
+            else {
+                continue;
+            };
+            let Some(binding) = self.task_coordinator().binding_for_agent_path(&agent_path) else {
+                continue;
+            };
+            if binding.thread_id.as_deref() != Some(thread_id.to_string().as_str())
+                || !matches!(
+                    self.get_status(thread_id).await,
+                    AgentStatus::PendingInit | AgentStatus::Running | AgentStatus::Interrupted
+                )
+            {
+                continue;
+            }
+            if !self
+                .task_coordinator()
+                .heartbeat_typed_actor_binding(&binding)
+                .await?
+            {
+                return Err(codex_agent_task_store::StoreError::AttemptNotActive(
+                    binding.attempt_id,
+                ));
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]

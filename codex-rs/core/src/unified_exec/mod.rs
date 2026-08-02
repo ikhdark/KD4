@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::Weak;
 use std::sync::atomic::AtomicBool;
 
@@ -37,7 +38,6 @@ use rand::Rng;
 use rand::rng;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
-use tokio_util::sync::CancellationToken;
 
 use crate::sandboxing::SandboxPermissions;
 use crate::session::session::Session;
@@ -45,6 +45,7 @@ use crate::session::turn_context::TurnContext;
 use crate::session::turn_context::TurnEnvironment;
 use crate::shell::ShellType;
 use crate::tools::command_execution::CommandAttemptKey;
+use crate::tools::command_execution::RunningWorkspaceMutation;
 use crate::tools::command_output_artifact::RawOutputArtifact;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::network_approval::DeferredNetworkApproval;
@@ -135,9 +136,62 @@ pub(crate) struct ExecCommandRequest {
     pub additional_permissions_preapproved: bool,
     pub justification: Option<String>,
     pub prefix_rule: Option<Vec<String>>,
-    /// Cancels when the repository mutation lease can no longer be renewed.
-    /// A mutating process must not continue after losing coordination authority.
-    pub mutation_lease_lost: Option<CancellationToken>,
+    /// Mutation ownership is moved into the process manager on its first poll.
+    /// If the manager future is never polled, `Drop` finalizes this unstarted lease.
+    pub workspace_mutation: Option<RunningWorkspaceMutation>,
+}
+
+impl Drop for ExecCommandRequest {
+    fn drop(&mut self) {
+        let Some(workspace_mutation) = self.workspace_mutation.take() else {
+            return;
+        };
+        workspace_mutation.cancel_owner();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                "cannot finalize an unstarted unified exec mutation without a Tokio runtime"
+            );
+            return;
+        };
+        runtime.spawn(async move {
+            if let Err(error) = workspace_mutation.finish().await {
+                tracing::error!(
+                    %error,
+                    "failed to finalize an unstarted unified exec workspace mutation"
+                );
+            }
+        });
+    }
+}
+
+/// Retains every process created by sandbox retries until startup is either
+/// committed to the process store/ledger or cancelled and cleaned up.
+#[derive(Clone, Default)]
+pub(crate) struct PendingSpawnRegistration {
+    processes: Arc<StdMutex<Vec<Arc<UnifiedExecProcess>>>>,
+}
+
+impl PendingSpawnRegistration {
+    pub(crate) fn register(&self, process: Arc<UnifiedExecProcess>) {
+        self.processes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(process);
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<Arc<UnifiedExecProcess>> {
+        self.processes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn clear(&self) {
+        self.processes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
 #[derive(Debug)]

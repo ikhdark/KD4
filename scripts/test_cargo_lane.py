@@ -10,8 +10,13 @@ import tempfile
 import time
 import unittest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts import rust_build_status  # noqa: E402
+
+
 SCRIPT = REPO_ROOT / "scripts" / "cargo-lane.ps1"
 CLEANUP_SCRIPT = REPO_ROOT / "scripts" / "cargo-lane-trash-cleanup.ps1"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -20,7 +25,9 @@ LANES_ROOT_MARKER_CONTENT = "codex-kd cargo lanes root v1"
 
 
 def powershell() -> str | None:
-    return shutil.which("pwsh") or shutil.which("powershell")
+    # Production recipes explicitly invoke Windows PowerShell 5.1. Exercise
+    # that host first so tests cannot pass only under PowerShell 7 semantics.
+    return shutil.which("powershell") or shutil.which("pwsh")
 
 
 def ps_single_quote(value: str | Path) -> str:
@@ -130,6 +137,18 @@ class CargoLaneTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not start with '-'", result.stderr)
 
+    def test_pure_dot_lane_names_are_rejected_before_root_mutation(self) -> None:
+        before = sorted(path.name for path in self.lanes_root.iterdir())
+        for lane in (".", "..", "..."):
+            with self.subTest(lane=lane):
+                result = self.run_script("-Lane", lane, "cmd.exe", "/c", "echo ok")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("not a valid lane name", result.stderr)
+                self.assertEqual(
+                    sorted(path.name for path in self.lanes_root.iterdir()),
+                    before,
+                )
+
     def test_missing_python_does_not_block_lane_command(self) -> None:
         lane = f"unit-no-python-{os.getpid()}"
         fake_bin = self.fake_cargo_bin()
@@ -201,6 +220,26 @@ class CargoLaneTest(unittest.TestCase):
         self.assertIn(f"'{lane}-2'", warning_output)
         self.assertIn(f"--target-dir {self.lane_path(f'{lane}-2')}", result.stdout)
 
+    def test_powershell_runner_honors_python_active_lane_lock(self) -> None:
+        lane = f"unit-python-lock-{os.getpid()}"
+        with rust_build_status.reserve_cargo_lane(
+            repo_root=REPO_ROOT,
+            requested_lane=lane,
+            command=["cargo", "check"],
+            lane_root=self.lanes_root,
+        ):
+            result = self.run_fake_cargo("-Lane", lane, "cargo", "check")
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        output = result.stdout + result.stderr
+        self.assertIn(f"'{lane}' is busy", output)
+        self.assertIn(f"'{lane}-2'", output)
+        self.assertIn(f"--target-dir {self.lane_path(f'{lane}-2')}", result.stdout)
+
     def test_relative_lanes_root_follows_powershell_location(self) -> None:
         relative_root = "relative-lanes"
         command = (
@@ -234,9 +273,7 @@ class CargoLaneTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertTrue((self.temp_root / relative_root / "relative").is_dir())
-        self.assertTrue(
-            (self.temp_root / relative_root / LANES_ROOT_MARKER).is_file()
-        )
+        self.assertTrue((self.temp_root / relative_root / LANES_ROOT_MARKER).is_file())
 
     def test_cleanup_relative_root_follows_powershell_location(self) -> None:
         relative_root = self.temp_root / "cleanup-lanes"
@@ -335,6 +372,54 @@ class CargoLaneTest(unittest.TestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
         self.assertTrue(trash.exists())
+
+    def test_cleanup_preserves_trash_named_junction_and_external_target(self) -> None:
+        self.mark_lanes_root()
+        external = self.temp_root / "external-sentinel"
+        external.mkdir()
+        sentinel = external / "keep.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        junction = self.lanes_root / "linked.trash-20260728123456789"
+        created = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(external)],
+            text=True,
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=30,
+        )
+        if created.returncode != 0:
+            self.skipTest(f"could not create test junction: {created.stderr}")
+
+        result = subprocess.run(
+            [
+                self.shell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(CLEANUP_SCRIPT),
+                "-LanesRoot",
+                str(self.lanes_root),
+                "-MaxPasses",
+                "1",
+                "-RetryDelaySeconds",
+                "0",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=30,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertTrue(junction.exists())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
 
     def hold_lane_lock(
         self,

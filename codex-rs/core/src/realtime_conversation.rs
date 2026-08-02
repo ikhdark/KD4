@@ -1,5 +1,6 @@
 use crate::client::ModelClient;
 use crate::client::add_originator_header;
+use crate::realtime_context::approx_realtime_token_count;
 use crate::realtime_context::build_realtime_startup_context;
 use crate::realtime_context::truncate_realtime_text_to_token_budget;
 use crate::realtime_prompt::prepare_realtime_backend_prompt;
@@ -71,6 +72,7 @@ const TEXT_IN_QUEUE_CAPACITY: usize = 64;
 const HANDOFF_OUT_QUEUE_CAPACITY: usize = 64;
 const OUTPUT_EVENTS_QUEUE_CAPACITY: usize = 256;
 const REALTIME_STARTUP_CONTEXT_TOKEN_BUDGET: usize = 5_300;
+const REALTIME_INSTRUCTIONS_TOKEN_BUDGET: usize = 9_000;
 const REALTIME_ASSISTANT_OUTPUT_TOKEN_BUDGET: usize = 1_000;
 const STANDALONE_HANDOFF_ID: &str = "codex";
 const DEFAULT_REALTIME_MODEL: &str = "gpt-realtime-1.5";
@@ -877,6 +879,31 @@ fn validate_avas_webrtc_start(
     Ok(())
 }
 
+fn remaining_realtime_startup_context_budget(prompt: &str) -> usize {
+    let separator_tokens = (!prompt.is_empty())
+        .then(|| approx_realtime_token_count("\n\n"))
+        .unwrap_or_default();
+    REALTIME_INSTRUCTIONS_TOKEN_BUDGET
+        .saturating_sub(approx_realtime_token_count(prompt))
+        .saturating_sub(separator_tokens)
+}
+
+fn join_realtime_instructions(prompt: &str, startup_context: &str) -> String {
+    let prompt = truncate_realtime_text_to_token_budget(prompt, REALTIME_INSTRUCTIONS_TOKEN_BUDGET);
+    let startup_context = truncate_realtime_text_to_token_budget(
+        startup_context,
+        remaining_realtime_startup_context_budget(&prompt),
+    );
+    let instructions = match (prompt.is_empty(), startup_context.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => startup_context,
+        (false, true) => prompt,
+        (false, false) => format!("{prompt}\n\n{startup_context}"),
+    };
+    debug_assert!(approx_realtime_token_count(&instructions) <= REALTIME_INSTRUCTIONS_TOKEN_BUDGET);
+    instructions
+}
+
 pub(crate) async fn build_realtime_session_config(
     sess: &Arc<Session>,
     params: &ConversationStartParams,
@@ -884,28 +911,30 @@ pub(crate) async fn build_realtime_session_config(
     configured_voice: ConfiguredRealtimeVoice,
 ) -> CodexResult<RealtimeSessionConfig> {
     let config = sess.get_config().await;
-    let prompt = prepare_realtime_backend_prompt(
-        params.prompt.clone(),
-        config.experimental_realtime_ws_backend_prompt.clone(),
+    let prompt = truncate_realtime_text_to_token_budget(
+        &prepare_realtime_backend_prompt(
+            params.prompt.clone(),
+            config.experimental_realtime_ws_backend_prompt.clone(),
+        ),
+        REALTIME_INSTRUCTIONS_TOKEN_BUDGET,
     );
-    let startup_context = if params.include_startup_context {
+    let startup_context_budget = remaining_realtime_startup_context_budget(&prompt);
+    let startup_context = if params.include_startup_context && startup_context_budget > 0 {
         match config.experimental_realtime_ws_startup_context.clone() {
-            Some(startup_context) => startup_context,
-            None => {
-                build_realtime_startup_context(sess.as_ref(), REALTIME_STARTUP_CONTEXT_TOKEN_BUDGET)
-                    .await
-                    .unwrap_or_default()
+            Some(startup_context) => {
+                truncate_realtime_text_to_token_budget(&startup_context, startup_context_budget)
             }
+            None => build_realtime_startup_context(
+                sess.as_ref(),
+                REALTIME_STARTUP_CONTEXT_TOKEN_BUDGET.min(startup_context_budget),
+            )
+            .await
+            .unwrap_or_default(),
         }
     } else {
         String::new()
     };
-    let prompt = match (prompt.is_empty(), startup_context.is_empty()) {
-        (true, true) => String::new(),
-        (true, false) => startup_context,
-        (false, true) => prompt,
-        (false, false) => format!("{prompt}\n\n{startup_context}"),
-    };
+    let prompt = join_realtime_instructions(&prompt, &startup_context);
     let model = Some(
         params
             .model

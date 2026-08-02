@@ -3,10 +3,13 @@
 import contextlib
 import io
 import importlib.util
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import tomllib
 import unittest
 from unittest import mock
@@ -74,6 +77,91 @@ def load_toml(path: Path):
 
 
 class BuildToolingStorageTest(unittest.TestCase):
+    def test_run_lane_holds_reservation_and_passes_target_without_cargo_env(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir) / "repo"
+            lanes_root = Path(temp_dir) / "lanes"
+            output = Path(temp_dir) / "child.txt"
+            script = (
+                "import os, pathlib, sys; "
+                "pathlib.Path(sys.argv[1]).write_text("
+                "os.environ['CODEX_CARGO_LANE_TARGET_DIR'] + '\\n' + "
+                "str('CARGO_TARGET_DIR' in os.environ), encoding='utf-8')"
+            )
+
+            result = rust_build_status.run_in_cargo_lane(
+                repo_root=repo_root,
+                requested_lane="unit",
+                lane_root=lanes_root,
+                command=[sys.executable, "-c", script, str(output)],
+            )
+
+            lines = output.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(result, 0)
+            self.assertEqual(Path(lines[0]), (lanes_root / "unit").resolve())
+            self.assertEqual(lines[1], "False")
+            self.assertFalse(
+                rust_build_status.lane_active_lock_is_held(lanes_root / "unit")
+            )
+
+    def test_reserve_lane_suffixes_an_active_explicit_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_root = Path(temp_dir) / "repo"
+            lanes_root = Path(temp_dir) / "lanes"
+            with rust_build_status.reserve_cargo_lane(
+                repo_root=repo_root,
+                requested_lane="unit",
+                command=["cargo", "check"],
+                lane_root=lanes_root,
+            ) as first:
+                with rust_build_status.reserve_cargo_lane(
+                    repo_root=repo_root,
+                    requested_lane="unit",
+                    command=["cargo", "check"],
+                    lane_root=lanes_root,
+                ) as second:
+                    self.assertEqual(first[0], "unit")
+                    self.assertEqual(second[0], "unit-2")
+
+    @unittest.skipIf(os.name == "nt", "POSIX flock behavior")
+    def test_coordination_lock_honors_timeout_on_posix(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lane_root = Path(temp_dir)
+            with rust_build_status.cargo_lane_coordination_lock(lane_root):
+                started = time.monotonic()
+                with self.assertRaises(TimeoutError):
+                    with rust_build_status.cargo_lane_coordination_lock(
+                        lane_root,
+                        timeout_seconds=0.05,
+                    ):
+                        self.fail("held coordination lock was acquired")
+                self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_cargo_command_target_dir_is_injected_once(self) -> None:
+        target = Path("lane-target")
+        self.assertEqual(
+            rust_build_status._cargo_command_with_target_dir(
+                ["cargo", "nextest", "run", "-p", "codex-core"],
+                target,
+            ),
+            [
+                "cargo",
+                "nextest",
+                "run",
+                "--target-dir",
+                str(target),
+                "-p",
+                "codex-core",
+            ],
+        )
+        explicit = ["cargo", "check", "--target-dir", "custom"]
+        self.assertEqual(
+            rust_build_status._cargo_command_with_target_dir(explicit, target),
+            explicit,
+        )
+
     def test_cargo_config_disables_duplicate_incremental_cache_by_default(self) -> None:
         config = load_toml(REPO_ROOT / "codex-rs" / ".cargo" / "config.toml")
 
@@ -235,7 +323,7 @@ class BuildToolingStorageTest(unittest.TestCase):
 
         self.assertEqual((size, errors), (0, 0))
 
-    def test_prune_stray_target_dirs_removes_read_only_trees(self) -> None:
+    def test_prune_stray_target_dirs_reports_but_preserves_trees(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = Path(temp_dir)
             stray_root = (
@@ -249,14 +337,18 @@ class BuildToolingStorageTest(unittest.TestCase):
             read_only_file.write_text("artifact", encoding="utf-8")
             read_only_file.chmod(0o400)
 
-            removed = rust_build_status.prune_stray_cargo_target_dirs(
-                repo_root=repo_root,
-            )
+            with mock.patch.object(
+                rust_build_status, "remove_tree_allow_readonly"
+            ) as remove_tree:
+                detected = rust_build_status.prune_stray_cargo_target_dirs(
+                    repo_root=repo_root,
+                )
 
-        self.assertEqual(
-            [path.name for path in removed], ["codex-tools-responses-check"]
-        )
-        self.assertFalse(stray_root.exists())
+            self.assertEqual(
+                [path.name for path in detected], ["codex-tools-responses-check"]
+            )
+            remove_tree.assert_not_called()
+            self.assertTrue(stray_root.exists())
 
     def test_prune_stale_lanes_removes_only_inactive_lanes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -504,13 +596,11 @@ class BuildToolingStorageTest(unittest.TestCase):
             self.assertTrue(outside.exists())
             self.assertIn("warning: skipping stray target outside", stderr.getvalue())
 
-    def test_prune_strays_warns_when_delete_fails(self) -> None:
+    def test_prune_strays_never_calls_delete_after_classification(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repo_root = Path(temp_dir)
             stray = repo_root / "codex-rs" / "target" / "stray"
             stray.mkdir(parents=True)
-            stderr = io.StringIO()
-
             with (
                 mock.patch.object(
                     rust_build_status,
@@ -518,21 +608,17 @@ class BuildToolingStorageTest(unittest.TestCase):
                     return_value=[stray],
                 ),
                 mock.patch.object(
-                    rust_build_status, "cargo_lock_is_busy", return_value=False
-                ),
-                mock.patch.object(
                     rust_build_status,
                     "remove_tree_allow_readonly",
-                    side_effect=OSError("denied"),
-                ),
-                contextlib.redirect_stderr(stderr),
+                ) as remove_tree,
             ):
-                removed = rust_build_status.prune_stray_cargo_target_dirs(
+                detected = rust_build_status.prune_stray_cargo_target_dirs(
                     repo_root=repo_root
                 )
 
-            self.assertEqual(removed, [])
-            self.assertIn("warning: failed to prune stray target", stderr.getvalue())
+            self.assertEqual(detected, [stray])
+            remove_tree.assert_not_called()
+            self.assertTrue(stray.exists())
 
     def test_prune_stale_lanes_keeps_two_newest_warm_lanes_per_base(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -819,7 +905,8 @@ class BuildToolingStorageTest(unittest.TestCase):
         self.assertIn("prunable:", report)
         self.assertIn("stale-2", report)
         self.assertIn("safe prune suggestions:", report)
-        self.assertIn("Remove-Item -Recurse -Force -LiteralPath", report)
+        self.assertIn("just target-prune", report)
+        self.assertNotIn("Remove-Item -Recurse -Force", report)
         self.assertNotIn("active\\debug", report)
 
     def test_build_doctor_displays_reserved_lane_without_process(self) -> None:

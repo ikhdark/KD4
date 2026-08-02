@@ -21,9 +21,13 @@ class FakeChildProcess extends EventEmitter {
   stdout = new PassThrough();
   stderr = new PassThrough();
   killed = false;
+  killSignals: Array<NodeJS.Signals | number | undefined> = [];
+  onKill?: (signal: NodeJS.Signals | number | undefined) => void;
 
-  kill(): boolean {
+  kill(signal?: NodeJS.Signals | number): boolean {
     this.killed = true;
+    this.killSignals.push(signal);
+    this.onKill?.(signal);
     return true;
   }
 }
@@ -69,6 +73,45 @@ describe("CodexExec", () => {
       expect(result.error).toBeInstanceOf(Error);
       expect(result.error.message).toMatch(/Codex Exec exited/);
     }
+  });
+
+  it("escalates to SIGKILL when an early-returned child ignores SIGTERM", async () => {
+    const { CodexExec } = await import("../src/exec");
+    spawnMock.mockClear();
+    const child = new FakeChildProcess();
+    child.onKill = (signal) => {
+      if (signal === "SIGKILL") {
+        setImmediate(() => child.emit("exit", null, "SIGKILL"));
+      }
+    };
+    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+
+    const exec = new CodexExec("codex");
+    const iterator = exec.run({ input: "hi" });
+    child.stdout.write("first line\n");
+    await expect(iterator.next()).resolves.toEqual({ done: false, value: "first line" });
+
+    await iterator.return(undefined);
+    expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+  });
+
+  it("bounds cleanup even when the child never emits exit", async () => {
+    const { CodexExec } = await import("../src/exec");
+    spawnMock.mockClear();
+    const child = new FakeChildProcess();
+    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+
+    const exec = new CodexExec("codex");
+    const iterator = exec.run({ input: "hi" });
+    child.stdout.write("first line\n");
+    await expect(iterator.next()).resolves.toEqual({ done: false, value: "first line" });
+
+    const result = await Promise.race([
+      iterator.return(undefined).then(() => "returned" as const),
+      delay(2_500).then(() => "timeout" as const),
+    ]);
+    expect(result).toBe("returned");
+    expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
   });
 
   it("places resume args before image args", async () => {

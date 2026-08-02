@@ -6,10 +6,12 @@ from __future__ import annotations
 from concurrent.futures import as_completed
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import errno
 import hashlib
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tarfile
 import threading
@@ -26,6 +28,7 @@ if TYPE_CHECKING:
 
 COMPLETE_MARKER = ".complete"
 LOCK_POLL_SECONDS = 0.1
+DEFAULT_LOCK_TIMEOUT_SECONDS = 60 * 60
 DEFAULT_GHA_DOWNLOAD_WORKERS = 8
 
 
@@ -40,10 +43,20 @@ def _gha_enabled() -> bool:
 
 
 @contextmanager
-def exclusive_file_lock(lock_path: Path):
+def exclusive_file_lock(
+    lock_path: Path,
+    *,
+    timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+    poll_seconds: float = LOCK_POLL_SECONDS,
+):
+    if timeout_seconds < 0:
+        raise ValueError("lock timeout must be non-negative")
+    if poll_seconds <= 0:
+        raise ValueError("lock poll interval must be positive")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     acquired = False
+    deadline = time.monotonic() + timeout_seconds
     try:
         if os.name == "nt" and os.fstat(fd).st_size == 0:
             os.write(fd, b"\0")
@@ -51,17 +64,18 @@ def exclusive_file_lock(lock_path: Path):
         while not acquired:
             os.lseek(fd, 0, os.SEEK_SET)
             try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _acquire_file_lock(fd)
                 acquired = True
-            except OSError:
-                time.sleep(LOCK_POLL_SECONDS)
+            except OSError as error:
+                if not _lock_error_is_contention(error):
+                    raise
+                if time.monotonic() >= deadline:
+                    owner = lock_owner_pid(lock_path)
+                    owner_detail = f" (reported owner pid {owner})" if owner else ""
+                    raise TimeoutError(
+                        f"timed out acquiring lock {lock_path}{owner_detail}"
+                    ) from error
+                time.sleep(poll_seconds)
 
         payload = f"pid={os.getpid()} thread={threading.get_ident()}\n".encode("utf-8")
         os.ftruncate(fd, 0)
@@ -74,17 +88,38 @@ def exclusive_file_lock(lock_path: Path):
         if acquired:
             os.lseek(fd, 0, os.SEEK_SET)
             try:
-                if os.name == "nt":
-                    import msvcrt
-
-                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+                _release_file_lock(fd)
             except OSError:
                 pass
         os.close(fd)
+
+
+def _acquire_file_lock(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _release_file_lock(fd: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def _lock_error_is_contention(error: OSError) -> bool:
+    if getattr(error, "winerror", None) in {33, 36}:
+        return True
+    return error.errno in {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK}
 
 
 def lock_owner_pid(lock_path: Path) -> int | None:
@@ -267,15 +302,15 @@ def cached_codex_package_archive(
     cache_root: Path,
 ) -> Path:
     cache_root.mkdir(parents=True, exist_ok=True)
-    stat = archive_path.stat()
-    cache_dir = cache_root / f"{target}-{stat.st_size}-{stat.st_mtime_ns}"
+    archive_sha256 = file_sha256(archive_path)
+    cache_dir = cache_root / f"{target}-{archive_sha256}"
     marker_path = cache_dir / COMPLETE_MARKER
-    if extracted_cache_is_complete(cache_dir, marker_path):
+    if extracted_cache_is_complete(cache_dir, marker_path, archive_sha256):
         return cache_dir
 
     lock_path = cache_root / f".{cache_dir.name}.lock"
     with exclusive_file_lock(lock_path):
-        if extracted_cache_is_complete(cache_dir, marker_path):
+        if extracted_cache_is_complete(cache_dir, marker_path, archive_sha256):
             return cache_dir
 
         temp_dir = (
@@ -287,9 +322,9 @@ def cached_codex_package_archive(
             extract_tar_data(archive_path, temp_dir)
             tree_sha256 = cache_tree_digest(temp_dir)
             (temp_dir / COMPLETE_MARKER).write_text(
+                "version=2\n"
                 f"source={archive_path}\n"
-                f"size={stat.st_size}\n"
-                f"mtime_ns={stat.st_mtime_ns}\n"
+                f"archive_sha256={archive_sha256}\n"
                 f"tree_sha256={tree_sha256}\n",
                 encoding="utf-8",
             )
@@ -303,12 +338,14 @@ def cached_codex_package_archive(
     return cache_dir
 
 
-def extracted_cache_is_complete(cache_dir: Path, marker_path: Path) -> bool:
+def extracted_cache_is_complete(
+    cache_dir: Path, marker_path: Path, archive_sha256: str
+) -> bool:
     try:
         marker = marker_path.read_text(encoding="utf-8")
     except OSError:
         return False
-    expected = next(
+    expected_tree = next(
         (
             line.removeprefix("tree_sha256=")
             for line in marker.splitlines()
@@ -316,17 +353,32 @@ def extracted_cache_is_complete(cache_dir: Path, marker_path: Path) -> bool:
         ),
         None,
     )
-    if expected is None:
+    expected_archive = next(
+        (
+            line.removeprefix("archive_sha256=")
+            for line in marker.splitlines()
+            if line.startswith("archive_sha256=")
+        ),
+        None,
+    )
+    if (
+        "version=2\n" not in marker
+        or expected_tree is None
+        or expected_archive != archive_sha256
+    ):
         return False
     try:
-        return cache_tree_digest(cache_dir) == expected
+        return cache_tree_digest(cache_dir) == expected_tree
     except (OSError, RuntimeError):
         return False
 
 
 def cache_tree_digest(root: Path) -> str:
     digest = hashlib.sha256()
-    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+    digest.update(b"codex-extracted-archive-cache-v2\0")
+    for path in sorted(
+        root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()
+    ):
         if path.name == COMPLETE_MARKER:
             continue
         relative = path.relative_to(root).as_posix().encode("utf-8")
@@ -338,10 +390,20 @@ def cache_tree_digest(root: Path) -> str:
         digest.update(kind)
         digest.update(len(relative).to_bytes(8, "big"))
         digest.update(relative)
+        mode = stat.S_IMODE(path.lstat().st_mode) & 0o777
+        digest.update(mode.to_bytes(4, "big"))
         if kind == b"f":
             with path.open("rb") as handle:
                 while chunk := handle.read(1024 * 1024):
                     digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
     return digest.hexdigest()
 
 

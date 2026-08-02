@@ -1,0 +1,64 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent UserPromptSubmit",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent UserPromptSubmit",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent PreCompact",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent PreCompact",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent PostCompact",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent PostCompact",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent SessionStart",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent Stop",
+            "commandWindows": "powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"C:\\Users\\kuh\\Desktop\\kd4\\.codex\\hooks\\task-continuity-entry.ps1\" -ExpectedEvent Stop",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

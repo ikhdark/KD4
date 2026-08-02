@@ -2,6 +2,7 @@ use super::TASK_COMPACT_METRIC;
 use super::emit_compact_metric;
 use super::emit_turn_memory_metric;
 use super::emit_turn_network_proxy_metric;
+use super::merge_completion_review_partial;
 use crate::session::tests::make_session_and_context_with_rx;
 use crate::state::ActiveTurn;
 use codex_otel::MetricsClient;
@@ -11,6 +12,8 @@ use codex_otel::TURN_MEMORY_METRIC;
 use codex_otel::TURN_NETWORK_PROXY_METRIC;
 use codex_protocol::ThreadId;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::TaskCompletionGate;
+use codex_protocol::protocol::TaskCompletionStatus;
 use codex_protocol::protocol::TurnAbortReason;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::InMemoryMetricExporter;
@@ -76,6 +79,36 @@ fn metric_point(resource_metrics: &ResourceMetrics, name: &str) -> (BTreeMap<Str
         },
         _ => panic!("unexpected counter data type"),
     }
+}
+
+#[test]
+fn completion_review_partial_status_never_overrides_concrete_blockers() {
+    for (initial, expected) in [
+        (TaskCompletionStatus::Passed, TaskCompletionStatus::Partial),
+        (TaskCompletionStatus::Partial, TaskCompletionStatus::Partial),
+        (TaskCompletionStatus::Blocked, TaskCompletionStatus::Blocked),
+    ] {
+        let mut completion = Some(TaskCompletionGate {
+            status: initial,
+            reasons: vec!["task state".to_string()],
+            evidence_path: None,
+        });
+        merge_completion_review_partial(&mut completion, vec!["review infrastructure".to_string()]);
+        let completion = completion.expect("completion");
+        assert_eq!(completion.status, expected);
+        assert!(
+            completion
+                .reasons
+                .contains(&"review infrastructure".to_string())
+        );
+    }
+
+    let mut completion = None;
+    merge_completion_review_partial(&mut completion, vec!["review infrastructure".to_string()]);
+    assert_eq!(
+        completion.expect("partial completion").status,
+        TaskCompletionStatus::Partial
+    );
 }
 
 #[tokio::test]

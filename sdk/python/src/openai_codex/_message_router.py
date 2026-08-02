@@ -130,9 +130,7 @@ class MessageRouter:
             else:
                 self._abandoned_turns.add(turn_id)
 
-    def next_turn_notification(
-        self, turn_id: str, timeout_s: float | None = None
-    ) -> Notification:
+    def next_turn_notification(self, turn_id: str, timeout_s: float | None = None) -> Notification:
         """Block until the next notification for a registered turn."""
 
         with self._lock:

@@ -71,3 +71,17 @@ pub(super) fn communication_from_tool_message(
         /*trigger_turn*/ true,
     )
 }
+
+pub(super) fn communication_from_plaintext_message(
+    author: AgentPath,
+    recipient: AgentPath,
+    message: String,
+) -> InterAgentCommunication {
+    InterAgentCommunication::new(
+        author,
+        recipient,
+        Vec::new(),
+        message,
+        /*trigger_turn*/ true,
+    )
+}

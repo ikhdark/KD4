@@ -199,6 +199,7 @@ pub(crate) struct TurnState {
     pub(crate) tool_calls: u64,
     pub(crate) has_memory_citation: bool,
     pub(crate) token_usage_at_turn_start: TokenUsage,
+    completion_review_partial_reasons: Vec<String>,
 }
 
 pub(crate) struct PendingRequestPermissions {
@@ -339,5 +340,15 @@ impl TurnState {
 
     pub(crate) fn strict_auto_review_enabled(&self) -> bool {
         self.strict_auto_review_enabled
+    }
+
+    pub(crate) fn record_completion_review_partial_reason(&mut self, reason: String) {
+        if !self.completion_review_partial_reasons.contains(&reason) {
+            self.completion_review_partial_reasons.push(reason);
+        }
+    }
+
+    pub(crate) fn completion_review_partial_reasons(&self) -> Vec<String> {
+        self.completion_review_partial_reasons.clone()
     }
 }

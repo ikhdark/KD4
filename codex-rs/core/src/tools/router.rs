@@ -485,19 +485,36 @@ async fn authorize_bound_typed_tool_call(
         },
     );
     match authorization {
-        Ok(_) => Ok(()),
+        Ok(_) => {}
         Err(CapabilityPolicyError::MissingStructuredEditPaths)
             if class == TypedToolClass::StructuredEdit =>
         {
             // The verified apply-patch runtime owns complete path extraction and repeats
             // authorization with that closed path set immediately before execution.
-            Ok(())
         }
-        Err(error) => Err(FunctionCallError::RespondToModel(format!(
-            "{}: typed assignment capability denied: {error}",
-            call.tool_name.name
-        ))),
+        Err(error) => {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "{}: typed assignment capability denied: {error}",
+                call.tool_name.name
+            )));
+        }
     }
+    let heartbeated = coordinator
+        .heartbeat_typed_actor_binding(&binding)
+        .await
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "{}: typed assignment heartbeat failed: {error}",
+                call.tool_name.name
+            ))
+        })?;
+    if !heartbeated {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "{}: the bound typed assignment attempt is no longer active",
+            call.tool_name.name
+        )));
+    }
+    Ok(())
 }
 
 #[instrument(level = "trace", skip_all)]

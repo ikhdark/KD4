@@ -31,6 +31,7 @@ use codex_utils_pty::ExecCommandSession;
 use codex_utils_pty::ProcessSignal as PtyProcessSignal;
 use codex_utils_pty::SpawnedPty;
 
+use super::PendingSpawnRegistration;
 use super::UNIFIED_EXEC_OUTPUT_MAX_TOKENS;
 use super::UnifiedExecError;
 use super::head_tail_buffer::HeadTailBuffer;
@@ -358,7 +359,8 @@ impl UnifiedExecProcess {
         sandbox_type: SandboxType,
         spawn_lifecycle: SpawnLifecycleHandle,
         raw_output_artifact: Option<RawOutputArtifact>,
-    ) -> Result<Self, UnifiedExecError> {
+        pending_spawns: &PendingSpawnRegistration,
+    ) -> Result<Arc<Self>, UnifiedExecError> {
         let SpawnedPty {
             session: process_handle,
             stdout_rx,
@@ -379,6 +381,8 @@ impl UnifiedExecProcess {
             managed.output_tx.clone(),
             managed.raw_output_artifact.clone(),
         ));
+        let managed = Arc::new(managed);
+        pending_spawns.register(Arc::clone(&managed));
 
         match exit_rx.try_recv() {
             Ok(exit_code) => {
@@ -417,7 +421,8 @@ impl UnifiedExecProcess {
     pub(super) async fn from_exec_server_started(
         started: StartedExecProcess,
         raw_output_artifact: Option<RawOutputArtifact>,
-    ) -> Result<Self, UnifiedExecError> {
+        pending_spawns: &PendingSpawnRegistration,
+    ) -> Result<Arc<Self>, UnifiedExecError> {
         let process_handle = ProcessHandle::ExecServer(Arc::clone(&started.process));
         let mut managed = Self::new(
             process_handle,
@@ -433,6 +438,8 @@ impl UnifiedExecProcess {
             managed.state_tx.clone(),
             managed.raw_output_artifact.clone(),
         ));
+        let managed = Arc::new(managed);
+        pending_spawns.register(Arc::clone(&managed));
 
         let mut state_rx = managed.state_rx.clone();
         if tokio::time::timeout(EARLY_EXIT_GRACE_PERIOD, async {

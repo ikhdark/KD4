@@ -1,3 +1,4 @@
+use chrono::Duration;
 use chrono::Utc;
 use codex_state::StateRuntime;
 use serde::Serialize;
@@ -219,6 +220,7 @@ impl LocalAgentTaskStore {
             .bind(&repository.workspace_id)
             .execute(&mut *transaction)
             .await?;
+        release_orphaned_claims_tx(&mut transaction, &repository.workspace_id).await?;
         let allowed_pending_gate = assignment.relation.as_ref().and_then(|relation| {
             let gate = match (assignment.role, relation.kind) {
                 (AgentRole::Reviewer, RelationKind::Review) => GateKind::Review,
@@ -710,6 +712,33 @@ impl LocalAgentTaskStore {
         rows.into_iter().map(|row| binding_from_row(&row)).collect()
     }
 
+    async fn heartbeat_typed_workspace_actor_impl(
+        &self,
+        binding: AgentTaskBinding,
+    ) -> StoreResult<bool> {
+        if binding
+            .thread_id
+            .as_deref()
+            .is_none_or(|thread_id| thread_id.trim().is_empty())
+        {
+            return Ok(false);
+        }
+        let mut transaction = self.pool.begin().await?;
+        let workspace_id = sqlx::query_scalar::<_, String>(
+            "SELECT workspace_id FROM assignment_repositories WHERE assignment_id = ?",
+        )
+        .bind(binding.assignment_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(workspace_id) = workspace_id else {
+            return Ok(false);
+        };
+        let updated =
+            heartbeat_typed_workspace_actor_tx(&mut transaction, &workspace_id, &binding).await?;
+        transaction.commit().await?;
+        Ok(updated)
+    }
+
     async fn append_observation_impl(
         &self,
         attempt_id: AttemptId,
@@ -1009,6 +1038,27 @@ impl LocalAgentTaskStore {
             return Ok(false);
         };
         let mut call: ValidationCall = decode(&body)?;
+        let binding = sqlx::query(
+            "SELECT assignment_id, attempt_id, root_session_id, agent_path, task_name, thread_id,
+                    bound_at, updated_at
+             FROM agent_task_bindings
+             WHERE attempt_id = ?",
+        )
+        .bind(call.attempt_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?
+        .map(|row| binding_from_row(&row))
+        .transpose()?;
+        if let Some(binding) = binding {
+            let workspace_id =
+                assignment_workspace_id_tx(&mut transaction, binding.assignment_id).await?;
+            if !heartbeat_typed_workspace_actor_tx(&mut transaction, &workspace_id, &binding)
+                .await?
+            {
+                transaction.commit().await?;
+                return Ok(false);
+            }
+        }
         call.evidence.lease_expires_at = Some(lease_expires_at);
         let updated = sqlx::query(
             "UPDATE validation_calls SET body_json = ?
@@ -1471,6 +1521,7 @@ impl LocalAgentTaskStore {
         let mut transaction = self.pool.begin().await?;
         lock_assignment_tx(&mut transaction, assignment_id).await?;
         let assignment = load_assignment_tx(&mut transaction, assignment_id).await?;
+        release_orphaned_claims_tx(&mut transaction, &assignment.workspace_id).await?;
         if assignment.role != AgentRole::Worker {
             return Err(StoreError::WorkerCorrectionRequired(assignment_id));
         }
@@ -2641,6 +2692,13 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
             self.list_agent_task_bindings_impl(root_session_id, limit)
                 .await
         })
+    }
+
+    fn heartbeat_typed_workspace_actor(
+        &self,
+        binding: AgentTaskBinding,
+    ) -> TaskStoreFuture<'_, bool> {
+        Box::pin(async move { self.heartbeat_typed_workspace_actor_impl(binding).await })
     }
 
     fn append_observation(
@@ -4555,6 +4613,231 @@ async fn validate_completed_mutation_evidence_tx(
     Ok(())
 }
 
+pub(crate) async fn heartbeat_typed_workspace_actor_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workspace_id: &str,
+    binding: &AgentTaskBinding,
+) -> StoreResult<bool> {
+    let Some(thread_id) = binding
+        .thread_id
+        .as_deref()
+        .filter(|thread_id| !thread_id.trim().is_empty())
+    else {
+        return Ok(false);
+    };
+
+    // Match orphan scavenging's lock order: workspace writer first, then assignment.
+    sqlx::query("UPDATE workspace_repositories SET epoch = epoch WHERE workspace_id = ?")
+        .bind(workspace_id)
+        .execute(&mut **transaction)
+        .await?;
+    lock_assignment_tx(transaction, binding.assignment_id).await?;
+
+    let now = Utc::now();
+    let lease_expires_at = now + chrono::Duration::seconds(crate::DEFAULT_WORKSPACE_LEASE_SECONDS);
+    let updated = sqlx::query(
+        "UPDATE workspace_actors
+         SET state = 'active', last_progress_at = ?, lease_expires_at = ?, nudge_sent_at = NULL
+         WHERE workspace_id = ?
+           AND actor_id = ?
+           AND root_session_id = ?
+           AND kind = ?
+           AND assignment_id = ?
+           AND attempt_id = ?
+           AND state <> 'terminal'
+           AND EXISTS (
+               SELECT 1
+               FROM agent_task_bindings bindings
+               JOIN attempts ON attempts.attempt_id = bindings.attempt_id
+               JOIN assignments ON assignments.assignment_id = bindings.assignment_id
+               JOIN assignment_repositories repositories
+                 ON repositories.assignment_id = bindings.assignment_id
+               WHERE bindings.assignment_id = ?
+                 AND bindings.attempt_id = ?
+                 AND bindings.root_session_id = ?
+                 AND bindings.agent_path = ?
+                 AND bindings.task_name = ?
+                 AND bindings.thread_id = ?
+                 AND attempts.assignment_id = bindings.assignment_id
+                 AND attempts.state = ?
+                 AND attempts.sealed_at IS NULL
+                 AND attempts.ordinal = (
+                     SELECT MAX(current.ordinal)
+                     FROM attempts current
+                     WHERE current.assignment_id = bindings.assignment_id
+                 )
+                 AND assignments.root_session_id = ?
+                 AND repositories.workspace_id = ?
+           )",
+    )
+    .bind(encode(&now)?)
+    .bind(encode(&lease_expires_at)?)
+    .bind(workspace_id)
+    .bind(format!("attempt:{}", binding.attempt_id))
+    .bind(&binding.root_session_id)
+    .bind(encode(&crate::WorkspaceActorKind::Typed)?)
+    .bind(binding.assignment_id.to_string())
+    .bind(binding.attempt_id.to_string())
+    .bind(binding.assignment_id.to_string())
+    .bind(binding.attempt_id.to_string())
+    .bind(&binding.root_session_id)
+    .bind(&binding.agent_path)
+    .bind(&binding.task_name)
+    .bind(thread_id)
+    .bind(encode(&AttemptState::Active)?)
+    .bind(&binding.root_session_id)
+    .bind(workspace_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(updated.rows_affected() == 1)
+}
+
+pub(crate) async fn release_orphaned_claims_tx(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    workspace_id: &str,
+) -> StoreResult<Vec<AssignmentId>> {
+    let now = Utc::now();
+    let recent_after = now - Duration::seconds(crate::DEFAULT_WORKSPACE_LEASE_SECONDS);
+
+    // Acquire SQLite's writer lock before evaluating liveness so a concurrent heartbeat or
+    // relation spawn cannot be missed between the read and the claim release.
+    sqlx::query("UPDATE workspace_repositories SET epoch = epoch WHERE workspace_id = ?")
+        .bind(workspace_id)
+        .execute(&mut **transaction)
+        .await?;
+
+    let live_actor_rows = sqlx::query(
+        "SELECT assignments.body_json
+         FROM workspace_actors
+         JOIN assignments USING (assignment_id)
+         WHERE workspace_actors.workspace_id = ?
+           AND workspace_actors.state <> 'terminal'
+           AND (
+               workspace_actors.lease_expires_at >= ?
+               OR workspace_actors.last_progress_at >= ?
+           )",
+    )
+    .bind(workspace_id)
+    .bind(encode(&now)?)
+    .bind(encode(&recent_after)?)
+    .fetch_all(&mut **transaction)
+    .await?;
+    let mut live_relation_targets = HashSet::new();
+    for row in live_actor_rows {
+        let assignment: Assignment = decode(row.get::<String, _>("body_json").as_str())?;
+        if let Some(relation) = assignment.relation {
+            live_relation_targets.extend(relation.target_assignment_ids);
+        }
+    }
+
+    let claim_rows = sqlx::query(
+        "SELECT assignment_id, attempt_id
+         FROM (
+             SELECT write_claims.assignment_id, write_claims.attempt_id
+             FROM write_claims
+             JOIN assignment_repositories USING (assignment_id)
+             WHERE write_claims.active = 1 AND assignment_repositories.workspace_id = ?
+             UNION
+             SELECT contract_claims.assignment_id, contract_claims.attempt_id
+             FROM contract_claims
+             WHERE contract_claims.active = 1 AND contract_claims.workspace_id = ?
+         ) claims
+         ORDER BY assignment_id",
+    )
+    .bind(workspace_id)
+    .bind(workspace_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let mut released = Vec::new();
+    for row in claim_rows {
+        let assignment_id = AssignmentId::parse(&row.get::<String, _>("assignment_id"))?;
+        let attempt_id = AttemptId::parse(&row.get::<String, _>("attempt_id"))?;
+        lock_assignment_tx(transaction, assignment_id).await?;
+
+        let claim_is_active = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM write_claims
+                 JOIN assignment_repositories USING (assignment_id)
+                 WHERE write_claims.assignment_id = ?
+                   AND write_claims.attempt_id = ?
+                   AND write_claims.active = 1
+                   AND assignment_repositories.workspace_id = ?
+                 UNION
+                 SELECT 1
+                 FROM contract_claims
+                 WHERE contract_claims.assignment_id = ?
+                   AND contract_claims.attempt_id = ?
+                   AND contract_claims.active = 1
+                   AND contract_claims.workspace_id = ?
+             )",
+        )
+        .bind(assignment_id.to_string())
+        .bind(attempt_id.to_string())
+        .bind(workspace_id)
+        .bind(assignment_id.to_string())
+        .bind(attempt_id.to_string())
+        .bind(workspace_id)
+        .fetch_one(&mut **transaction)
+        .await?
+            != 0;
+        if !claim_is_active {
+            continue;
+        }
+
+        let owner_is_live = sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM workspace_actors
+                 WHERE workspace_id = ?
+                   AND assignment_id = ?
+                   AND attempt_id = ?
+                   AND state <> 'terminal'
+                   AND (lease_expires_at >= ? OR last_progress_at >= ?)
+             )",
+        )
+        .bind(workspace_id)
+        .bind(assignment_id.to_string())
+        .bind(attempt_id.to_string())
+        .bind(encode(&now)?)
+        .bind(encode(&recent_after)?)
+        .fetch_one(&mut **transaction)
+        .await?
+            != 0;
+        if owner_is_live || live_relation_targets.contains(&assignment_id) {
+            continue;
+        }
+
+        let attempt = load_attempt_tx(transaction, attempt_id).await?;
+        let assignment = load_assignment_tx(transaction, assignment_id).await?;
+        let escalated = if attempt.state == AttemptState::Active && attempt.sealed_at.is_none() {
+            pause_active_attempt_for_stale_recovery_tx(transaction, &attempt).await?;
+            true
+        } else if attempt.state == AttemptState::Completed && attempt.sealed_at.is_some() {
+            transition_attempt_to_needs_main_tx(transaction, &attempt).await?;
+            true
+        } else {
+            false
+        };
+        release_claim(transaction, assignment_id, None).await?;
+        if escalated {
+            append_observation_tx(
+                transaction,
+                &assignment,
+                attempt_id,
+                ObservationKind::NeedsMain,
+                "workspace claim released after its owner lease expired with no live related agent"
+                    .to_string(),
+                None,
+            )
+            .await?;
+        }
+        released.push(assignment_id);
+    }
+    Ok(released)
+}
+
 async fn workspace_mutation_claim_conflicts_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     assignment: &Assignment,
@@ -4902,7 +5185,7 @@ async fn transition_attempt_to_needs_main_tx(
     Ok(())
 }
 
-fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> StoreResult<AgentTaskBinding> {
+pub(crate) fn binding_from_row(row: &sqlx::sqlite::SqliteRow) -> StoreResult<AgentTaskBinding> {
     Ok(AgentTaskBinding {
         assignment_id: AssignmentId::parse(row.get::<String, _>("assignment_id").as_str())?,
         attempt_id: AttemptId::parse(row.get::<String, _>("attempt_id").as_str())?,

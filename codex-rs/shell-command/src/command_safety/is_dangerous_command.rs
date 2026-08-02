@@ -200,6 +200,7 @@ fn sudo_subcommand(command: &[String]) -> Option<&[String]> {
                     | "--command-timeout"
                     | "--group"
                     | "--host"
+                    | "--login-class"
                     | "--prompt"
                     | "--role"
                     | "--type"
@@ -218,7 +219,7 @@ fn sudo_short_option_consumes_next(arg: &str) -> bool {
     for (index, flag) in flags.iter().enumerate() {
         if matches!(
             flag,
-            'a' | 'C' | 'D' | 'g' | 'h' | 'p' | 'R' | 'r' | 'T' | 't' | 'u'
+            'a' | 'c' | 'C' | 'D' | 'g' | 'h' | 'p' | 'R' | 'r' | 'T' | 't' | 'u'
         ) {
             return index + 1 == flags.len();
         }
@@ -274,6 +275,20 @@ mod tests {
         ])));
         assert!(command_might_be_dangerous(&vec_str(&[
             "sudo", "-uroot", "/bin/rm", "-f", "target"
+        ])));
+        assert!(command_might_be_dangerous(&vec_str(&[
+            "sudo", "-c", "staff", "rm", "-rf", "target"
+        ])));
+        assert!(command_might_be_dangerous(&vec_str(&[
+            "sudo", "-cstaff", "rm", "-rf", "target"
+        ])));
+        assert!(command_might_be_dangerous(&vec_str(&[
+            "sudo",
+            "--login-class",
+            "staff",
+            "rm",
+            "-rf",
+            "target"
         ])));
     }
 

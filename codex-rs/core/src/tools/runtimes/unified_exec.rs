@@ -38,6 +38,7 @@ use crate::tools::sandboxing::managed_network_for_sandbox_permissions;
 use crate::tools::sandboxing::sandbox_permissions_preserving_denied_reads;
 use crate::tools::sandboxing::with_cached_approval;
 use crate::unified_exec::NoopSpawnLifecycle;
+use crate::unified_exec::PendingSpawnRegistration;
 use crate::unified_exec::UnifiedExecError;
 use crate::unified_exec::UnifiedExecProcess;
 use crate::unified_exec::UnifiedExecProcessManager;
@@ -55,6 +56,7 @@ use codex_utils_path_uri::PathUri;
 use futures::future::BoxFuture;
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
 
@@ -103,6 +105,7 @@ pub struct UnifiedExecApprovalKey {
 pub struct UnifiedExecRuntime<'a> {
     manager: &'a UnifiedExecProcessManager,
     shell_mode: UnifiedExecShellMode,
+    pending_spawns: PendingSpawnRegistration,
 }
 
 fn unified_exec_options(
@@ -140,10 +143,20 @@ fn build_unified_exec_sandbox_command(
 
 impl<'a> UnifiedExecRuntime<'a> {
     /// Creates a runtime bound to the shared unified-exec process manager.
+    #[cfg(test)]
     pub fn new(manager: &'a UnifiedExecProcessManager, shell_mode: UnifiedExecShellMode) -> Self {
+        Self::new_with_pending_spawns(manager, shell_mode, PendingSpawnRegistration::default())
+    }
+
+    pub(crate) fn new_with_pending_spawns(
+        manager: &'a UnifiedExecProcessManager,
+        shell_mode: UnifiedExecShellMode,
+        pending_spawns: PendingSpawnRegistration,
+    ) -> Self {
         Self {
             manager,
             shell_mode,
+            pending_spawns,
         }
     }
 }
@@ -259,7 +272,7 @@ impl Approvable<UnifiedExecRequest> for UnifiedExecRuntime<'_> {
     }
 }
 
-impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRuntime<'a> {
+impl<'a> ToolRuntime<UnifiedExecRequest, Arc<UnifiedExecProcess>> for UnifiedExecRuntime<'a> {
     fn sandbox_cwd<'b>(&self, req: &'b UnifiedExecRequest) -> Option<&'b PathUri> {
         Some(&req.sandbox_cwd)
     }
@@ -299,7 +312,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
         req: &UnifiedExecRequest,
         attempt: &SandboxAttempt<'_>,
         ctx: &ToolCtx,
-    ) -> Result<UnifiedExecProcess, ToolError> {
+    ) -> Result<Arc<UnifiedExecProcess>, ToolError> {
         let base_command = &req.command;
         let session_shell = ctx.session.user_shell();
         let shell = req
@@ -441,6 +454,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                             prepared.spawn_lifecycle,
                             Some(req.raw_output_artifact.clone()),
                             req.turn_environment.environment.as_ref(),
+                            &self.pending_spawns,
                         )
                         .await
                         .map_err(|err| match err {
@@ -487,6 +501,7 @@ impl<'a> ToolRuntime<UnifiedExecRequest, UnifiedExecProcess> for UnifiedExecRunt
                 Box::new(NoopSpawnLifecycle),
                 Some(req.raw_output_artifact.clone()),
                 req.turn_environment.environment.as_ref(),
+                &self.pending_spawns,
             )
             .await
     }

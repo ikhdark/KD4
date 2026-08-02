@@ -49,6 +49,14 @@ ParamsT = ParamSpec("ParamsT")
 ReturnT = TypeVar("ReturnT")
 
 
+def _consume_background_future_result(future: Future[ReturnT]) -> None:
+    """Retrieve a detached worker result so late failures are not reported as unhandled."""
+    try:
+        future.result()
+    except BaseException:
+        pass
+
+
 class AsyncCodexClient:
     """Async wrapper around CodexClient using thread offloading."""
 
@@ -78,17 +86,26 @@ class AsyncCodexClient:
         **kwargs: ParamsT.kwargs,
     ) -> ReturnT:
         """Run a blocking sync-client operation without blocking the event loop."""
-        operation = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
-        try:
-            return await asyncio.shield(operation)
-        except asyncio.CancelledError:
-            # asyncio cannot stop a to_thread worker. Reconcile the finite sync
-            # operation before propagating cancellation so it cannot outlive its
-            # async owner.
+        operation: Future[ReturnT] = Future()
+
+        def run_operation() -> None:
             try:
-                await asyncio.shield(operation)
-            except BaseException:
-                pass
+                operation.set_result(fn(*args, **kwargs))
+            except BaseException as exc:
+                operation.set_exception(exc)
+
+        threading.Thread(
+            target=run_operation,
+            name="codex-async-client-rpc",
+            daemon=True,
+        ).start()
+        try:
+            return await asyncio.shield(asyncio.wrap_future(operation))
+        except asyncio.CancelledError:
+            # The daemon worker is independent from the event loop's default
+            # executor, so asyncio.run() shutdown cannot wait for an unbounded
+            # RPC after its caller is cancelled.
+            operation.add_done_callback(_consume_background_future_result)
             raise
 
     async def start(self) -> None:
@@ -262,6 +279,7 @@ class AsyncCodexClient:
         try:
             return await asyncio.shield(asyncio.wrap_future(operation))
         except asyncio.CancelledError:
+
             def cleanup_cancelled_start(
                 completed: Future[tuple[_GoalOperationState, str]],
             ) -> None:
@@ -293,22 +311,46 @@ class AsyncCodexClient:
         params: V2TurnStartParams | JsonObject | None = None,
     ) -> TurnStartResponse:
         """Start a turn using the wrapped sync client."""
-        operation = asyncio.create_task(
-            asyncio.to_thread(self._sync.turn_start, thread_id, input_items, params)
-        )
+        operation: Future[TurnStartResponse] = Future()
+
+        def start_turn() -> None:
+            try:
+                operation.set_result(self._sync.turn_start(thread_id, input_items, params))
+            except BaseException as exc:
+                operation.set_exception(exc)
+
+        threading.Thread(
+            target=start_turn,
+            name="codex-turn-start",
+            daemon=True,
+        ).start()
         try:
-            return await asyncio.shield(operation)
+            return await asyncio.shield(asyncio.wrap_future(operation))
         except asyncio.CancelledError:
-            try:
-                started = await asyncio.shield(operation)
-            except BaseException:
-                raise
-            try:
-                await asyncio.shield(
-                    asyncio.to_thread(self._sync.turn_interrupt, thread_id, started.turn.id)
-                )
-            finally:
-                self._sync.unregister_turn_notifications(started.turn.id)
+
+            def cleanup_cancelled_start(
+                completed: Future[TurnStartResponse],
+            ) -> None:
+                try:
+                    started = completed.result()
+                except BaseException:
+                    return
+
+                def stop_cancelled_turn() -> None:
+                    try:
+                        self._sync.turn_interrupt(thread_id, started.turn.id)
+                    except BaseException:
+                        pass
+                    finally:
+                        self._sync.unregister_turn_notifications(started.turn.id)
+
+                threading.Thread(
+                    target=stop_cancelled_turn,
+                    name="codex-turn-start-cleanup",
+                    daemon=True,
+                ).start()
+
+            operation.add_done_callback(cleanup_cancelled_start)
             raise
 
     async def turn_interrupt(self, thread_id: str, turn_id: str) -> TurnInterruptResponse:
@@ -358,33 +400,33 @@ class AsyncCodexClient:
         """Wait for the next global notification without blocking the event loop."""
         while True:
             try:
-                return await self._call_sync(self._sync.next_notification, 0.1)
+                return self._sync.next_notification(0.0)
             except queue.Empty:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
 
     async def next_login_notification(self, login_id: str) -> Notification:
         """Wait for the next notification routed to one login attempt."""
         while True:
             try:
-                return await self._call_sync(self._sync.next_login_notification, login_id, 0.1)
+                return self._sync.next_login_notification(login_id, 0.0)
             except queue.Empty:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
 
     async def next_turn_notification(self, turn_id: str) -> Notification:
         """Wait for the next notification routed to one turn."""
         while True:
             try:
-                return await self._call_sync(self._sync.next_turn_notification, turn_id, 0.1)
+                return self._sync.next_turn_notification(turn_id, 0.0)
             except queue.Empty:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
 
     async def next_goal_notification(self, state: _GoalOperationState) -> Notification:
         """Wait for the next notification in a logical goal turn."""
         while True:
             try:
-                return await self._call_sync(self._sync.next_goal_notification, state, 0.1)
+                return self._sync.next_goal_notification(state, 0.0)
             except queue.Empty:
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
 
     async def wait_for_login_completed(
         self,

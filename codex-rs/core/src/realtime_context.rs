@@ -60,6 +60,10 @@ pub(crate) async fn build_realtime_startup_context(
     sess: &Session,
     budget_tokens: usize,
 ) -> Option<String> {
+    if budget_tokens == 0 {
+        return None;
+    }
+
     let config = sess.get_config().await;
     let cwd = config.cwd.clone();
     let history = sess.clone_history().await;
@@ -111,9 +115,9 @@ pub(crate) async fn build_realtime_startup_context(
         parts.push(section);
     }
 
-    let context = format_startup_context_blob(&parts.join("\n\n"));
+    let context = format_startup_context_blob(&parts.join("\n\n"), budget_tokens)?;
     debug!(
-        approx_tokens = approx_token_count(&context),
+        approx_tokens = approx_realtime_token_count(&context),
         requested_budget_tokens = budget_tokens,
         bytes = context.len(),
         has_current_thread_section,
@@ -266,8 +270,8 @@ fn build_current_thread_section(items: &[ResponseItem]) -> Option<String> {
     let mut lines = vec![
         "Most recent user/assistant turns from this exact thread. Use them for continuity when responding.".to_string(),
     ];
-    let mut remaining_budget =
-        CURRENT_THREAD_SECTION_TOKEN_BUDGET.saturating_sub(approx_token_count(&lines.join("\n")));
+    let mut remaining_budget = CURRENT_THREAD_SECTION_TOKEN_BUDGET
+        .saturating_sub(approx_realtime_token_count(&lines.join("\n")));
     let mut retained_turn_count = 0;
 
     for (index, (user_messages, assistant_messages)) in turns.into_iter().rev().enumerate() {
@@ -295,7 +299,7 @@ fn build_current_thread_section(items: &[ResponseItem]) -> Option<String> {
         let turn_budget = REALTIME_TURN_TOKEN_BUDGET.min(remaining_budget);
         let turn_text = turn_lines.join("\n");
         let turn_text = truncate_realtime_text_to_token_budget(&turn_text, turn_budget);
-        let turn_tokens = approx_token_count(&turn_text);
+        let turn_tokens = approx_realtime_token_count(&turn_text);
         if turn_tokens == 0 {
             continue;
         }
@@ -313,7 +317,7 @@ pub(crate) fn truncate_realtime_text_to_token_budget(text: &str, budget_tokens: 
     let mut truncation_budget = budget_tokens;
     loop {
         let candidate = truncate_text(text, TruncationPolicy::Tokens(truncation_budget));
-        let candidate_tokens = approx_token_count(&candidate);
+        let candidate_tokens = approx_realtime_token_count(&candidate);
         if candidate_tokens <= budget_tokens {
             break candidate;
         }
@@ -325,7 +329,7 @@ pub(crate) fn truncate_realtime_text_to_token_budget(text: &str, budget_tokens: 
         let next_budget = truncation_budget.saturating_sub(excess_tokens.max(1));
         if next_budget == 0 {
             let candidate = truncate_text(text, TruncationPolicy::Tokens(0));
-            if approx_token_count(&candidate) <= budget_tokens {
+            if approx_realtime_token_count(&candidate) <= budget_tokens {
                 break candidate;
             }
             break String::new();
@@ -469,7 +473,7 @@ fn format_section(title: &str, body: Option<String>, budget_tokens: usize) -> Op
     }
 
     let heading = format!("## {title}\n");
-    let body_budget = budget_tokens.saturating_sub(approx_token_count(&heading));
+    let body_budget = budget_tokens.saturating_sub(approx_realtime_token_count(&heading));
     if body_budget == 0 {
         return None;
     }
@@ -482,8 +486,25 @@ fn format_section(title: &str, body: Option<String>, budget_tokens: usize) -> Op
     Some(format!("{heading}{body}"))
 }
 
-fn format_startup_context_blob(body: &str) -> String {
-    format!("{STARTUP_CONTEXT_OPEN_TAG}\n{body}\n{STARTUP_CONTEXT_CLOSE_TAG}")
+fn format_startup_context_blob(body: &str, budget_tokens: usize) -> Option<String> {
+    let body = body.trim();
+    if body.is_empty() || budget_tokens == 0 {
+        return None;
+    }
+
+    let framing = format!("{STARTUP_CONTEXT_OPEN_TAG}\n\n{STARTUP_CONTEXT_CLOSE_TAG}");
+    let body_budget = budget_tokens.saturating_sub(approx_realtime_token_count(&framing));
+    if body_budget == 0 {
+        return None;
+    }
+
+    let body = truncate_realtime_text_to_token_budget(body, body_budget);
+    if body.is_empty() {
+        return None;
+    }
+
+    let context = format!("{STARTUP_CONTEXT_OPEN_TAG}\n{body}\n{STARTUP_CONTEXT_CLOSE_TAG}");
+    (approx_realtime_token_count(&context) <= budget_tokens).then_some(context)
 }
 
 async fn format_thread_group(
@@ -568,7 +589,7 @@ fn file_name_string(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-fn approx_token_count(text: &str) -> usize {
+pub(crate) fn approx_realtime_token_count(text: &str) -> usize {
     text.len().div_ceil(APPROX_BYTES_PER_TOKEN)
 }
 

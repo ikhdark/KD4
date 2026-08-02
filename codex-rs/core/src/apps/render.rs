@@ -61,6 +61,9 @@ mod tests {
 
         assert!(rendered.starts_with(APPS_INSTRUCTIONS_OPEN_TAG));
         assert!(rendered.contains("## Apps (Connectors)"));
+        assert!(rendered.contains("discoverable through `tool_search`"));
+        assert!(!rendered.contains("tools_search"));
+        assert!(rendered.contains("when it is clearly relevant to the request"));
         assert!(rendered.ends_with(APPS_INSTRUCTIONS_CLOSE_TAG));
     }
 }

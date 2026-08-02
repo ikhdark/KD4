@@ -677,6 +677,9 @@
             "steer": {
               "type": "boolean"
             },
+            "task_completion_reviewer": {
+              "type": "boolean"
+            },
             "telepathy": {
               "type": "boolean"
             },
@@ -5090,6 +5093,9 @@
           "type": "boolean"
         },
         "steer": {
+          "type": "boolean"
+        },
+        "task_completion_reviewer": {
           "type": "boolean"
         },
         "telepathy": {

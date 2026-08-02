@@ -1,6 +1,10 @@
+use codex_protocol::protocol::MAX_THREAD_GOAL_OBJECTIVE_CHARS;
 use codex_protocol::protocol::ThreadGoal;
 use codex_utils_template::Template;
 use std::sync::LazyLock;
+
+const MAX_RENDERED_GOAL_OBJECTIVE_BYTES: usize = MAX_THREAD_GOAL_OBJECTIVE_CHARS * "&amp;".len();
+const GOAL_OBJECTIVE_TRUNCATED_MARKER: &str = "\n[objective truncated]";
 
 static CONTINUATION_PROMPT_TEMPLATE: LazyLock<Template> =
     LazyLock::new(
@@ -39,7 +43,7 @@ pub fn continuation_prompt(goal: &ThreadGoal) -> String {
         .map(|budget| (budget - goal.tokens_used).max(0).to_string())
         .unwrap_or_else(|| "unbounded".to_string());
     let tokens_used = goal.tokens_used.to_string();
-    let objective = escape_xml_text(&goal.objective);
+    let objective = bounded_goal_objective(&goal.objective);
 
     match CONTINUATION_PROMPT_TEMPLATE.render([
         ("objective", objective.as_str()),
@@ -61,7 +65,7 @@ pub fn budget_limit_prompt(goal: &ThreadGoal) -> String {
         .unwrap_or_else(|| "none".to_string());
     let tokens_used = goal.tokens_used.to_string();
     let time_used_seconds = goal.time_used_seconds.to_string();
-    let objective = escape_xml_text(&goal.objective);
+    let objective = bounded_goal_objective(&goal.objective);
 
     match BUDGET_LIMIT_PROMPT_TEMPLATE.render([
         ("objective", objective.as_str()),
@@ -85,7 +89,7 @@ pub fn objective_updated_prompt(goal: &ThreadGoal) -> String {
         .map(|budget| (budget - goal.tokens_used).max(0).to_string())
         .unwrap_or_else(|| "unbounded".to_string());
     let tokens_used = goal.tokens_used.to_string();
-    let objective = escape_xml_text(&goal.objective);
+    let objective = bounded_goal_objective(&goal.objective);
 
     match OBJECTIVE_UPDATED_PROMPT_TEMPLATE.render([
         ("objective", objective.as_str()),
@@ -103,6 +107,33 @@ fn escape_xml_text(input: &str) -> String {
         .replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+fn bounded_goal_objective(input: &str) -> String {
+    let escaped = escape_xml_text(input);
+    if escaped.len() <= MAX_RENDERED_GOAL_OBJECTIVE_BYTES {
+        return escaped;
+    }
+
+    let content_budget =
+        MAX_RENDERED_GOAL_OBJECTIVE_BYTES.saturating_sub(GOAL_OBJECTIVE_TRUNCATED_MARKER.len());
+    let mut bounded = String::with_capacity(MAX_RENDERED_GOAL_OBJECTIVE_BYTES);
+    for character in input.chars() {
+        let mut utf8 = [0; 4];
+        let escaped_character = match character {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            _ => character.encode_utf8(&mut utf8),
+        };
+        if bounded.len() + escaped_character.len() > content_budget {
+            break;
+        }
+        bounded.push_str(escaped_character);
+    }
+    bounded.truncate(bounded.trim_end().len());
+    bounded.push_str(GOAL_OBJECTIVE_TRUNCATED_MARKER);
+    bounded
 }
 
 #[cfg(test)]

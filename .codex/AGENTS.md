@@ -18,6 +18,8 @@ Durable files include, when present:
 - `.codex/AGENTS.md`
 - `.codex/agents/**`
 - `.codex/config.toml`
+- `.codex/hooks.json`
+- `.codex/hooks/**`
 - `.codex/environments/README.md`
 - `.codex/environments/setup.py`
 - `.codex/harness/README.md`
@@ -32,6 +34,7 @@ Generated or local runtime state includes:
 
 - `.codex/environments/environment.toml`
 - `.codex/harness/runs/**`
+- `.codex/harness/runs/task-continuity/v1/**` capsule state
 - `.codex/app-asar-backups/**`
 - `.codex/app-asar-work/**`, except durable instructions explicitly kept there
 - `.codex/codex-desktop-patched/**`
@@ -68,6 +71,22 @@ editing a skill:
 
 Do not move workflow guidance into a skill when it should apply to the directory
 itself; add or update the closest `AGENTS.md` instead.
+
+## Task continuity hooks
+
+`.codex/hooks.json` owns the synchronous project-hook registrations. The
+PowerShell entrypoint and its event-specific fast paths live under
+`.codex/hooks/`; `task-continuity.ps1` owns the validated slow path. Capsules
+belong only in ignored `.codex/harness/runs/task-continuity/v1/` state.
+
+Hook stdout is a wire contract: emit exactly `{}` or the exact `SessionStart`
+injection object, with no newline or decoration. Send every diagnostic to stderr
+and keep every handled failure fail-open.
+
+Use `/hooks` to review and trust handlers. Never auto-trust, bypass trust, or
+check trusted hashes into this repository. Hook trust covers the normalized
+manifest entry, including its command and timeout; it does not authenticate the
+contents of the referenced PowerShell files.
 
 ## Validation
 

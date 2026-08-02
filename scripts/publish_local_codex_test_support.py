@@ -130,11 +130,25 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         return env
 
     def expected_windows_rusty_v8_target(self) -> str:
-        arch = (
-            os.environ.get("PROCESSOR_ARCHITEW6432")
-            or os.environ.get("PROCESSOR_ARCHITECTURE")
-            or "AMD64"
-        ).upper()
+        rustc = shutil.which("rustc")
+        if rustc is not None:
+            result = subprocess.run(
+                [rustc, "-vV"],
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    if line.startswith("host: "):
+                        host = line.removeprefix("host: ").strip()
+                        if host in {
+                            "x86_64-pc-windows-msvc",
+                            "aarch64-pc-windows-msvc",
+                        }:
+                            return host
+        arch = (os.environ.get("PROCESSOR_ARCHITECTURE") or "AMD64").upper()
         if arch == "ARM64":
             return "aarch64-pc-windows-msvc"
         return "x86_64-pc-windows-msvc"
@@ -326,8 +340,8 @@ class PublishLocalCodexTestBase(unittest.TestCase):
         timestamp: float | None = None,
         append_padding: bool = False,
     ) -> Path:
-        # Use %ComSpec% as a tiny executable stand-in that satisfies the script's
-        # version probe under redirected stdio.
+        # Use %ComSpec% as a tiny executable stand-in. The production version
+        # probe closes redirected stdin, so cmd emits its banner and exits.
         path.write_bytes(self.source_exe_bytes)
         if append_padding:
             with path.open("ab") as handle:

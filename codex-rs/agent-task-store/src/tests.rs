@@ -38,6 +38,62 @@ impl Fixture {
     }
 }
 
+async fn expire_workspace_actor_leases(fixture: &Fixture, attempt_ids: &[AttemptId]) {
+    let database_path = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination")
+        .join("agent_tasks.sqlite");
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(database_path)
+        .foreign_keys(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("coordination database opens");
+    let stale_at = Utc::now() - Duration::seconds(DEFAULT_WORKSPACE_LEASE_SECONDS + 1);
+    let encoded_stale_at = serde_json::to_string(&stale_at).expect("stale time serializes");
+    for attempt_id in attempt_ids {
+        let updated = sqlx::query(
+            "UPDATE workspace_actors
+             SET state = 'active', last_progress_at = ?, lease_expires_at = ?
+             WHERE attempt_id = ?",
+        )
+        .bind(&encoded_stale_at)
+        .bind(&encoded_stale_at)
+        .bind(attempt_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("workspace actor lease expires");
+        assert_eq!(updated.rows_affected(), 1);
+    }
+    pool.close().await;
+}
+
+async fn remove_workspace_actor(fixture: &Fixture, attempt_id: AttemptId) {
+    let database_path = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination")
+        .join("agent_tasks.sqlite");
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(database_path)
+        .foreign_keys(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("coordination database opens");
+    let deleted = sqlx::query("DELETE FROM workspace_actors WHERE attempt_id = ?")
+        .bind(attempt_id.to_string())
+        .execute(&pool)
+        .await
+        .expect("workspace actor is removed");
+    assert_eq!(deleted.rows_affected(), 1);
+    pool.close().await;
+}
+
 fn criterion() -> AcceptanceCriterion {
     AcceptanceCriterion {
         id: "criterion-1".to_string(),
@@ -167,6 +223,7 @@ async fn controlled_write(
     path: &str,
     contents: &str,
 ) {
+    bind_test_agent(store, assignment_id, attempt_id, root_session_id).await;
     store
         .begin_mutation(
             attempt_id,
@@ -201,6 +258,24 @@ async fn controlled_write(
         .await
         .expect("typed mutation evidence finalizes");
     assert_eq!(evidence.assignment_id, assignment_id);
+}
+
+async fn bind_test_agent(
+    store: &LocalAgentTaskStore,
+    assignment_id: AssignmentId,
+    attempt_id: AttemptId,
+    root_session_id: &str,
+) -> AgentTaskBinding {
+    store
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id,
+            attempt_id,
+            agent_path: format!("/root/test-{attempt_id}"),
+            task_name: format!("test-{attempt_id}"),
+            thread_id: Some(format!("thread-{root_session_id}-{attempt_id}")),
+        })
+        .await
+        .expect("test agent binds")
 }
 
 fn relation_draft(root_session_id: &str, role: AgentRole, target: AssignmentId) -> AssignmentDraft {
@@ -1026,6 +1101,252 @@ async fn risk_review_progresses_to_independent_verification_without_releasing_cl
         )
         .await
         .expect("claim releases only after verification passes");
+}
+
+#[tokio::test]
+async fn exact_typed_actor_heartbeat_renews_only_the_current_bound_attempt() {
+    let fixture = Fixture::new().await;
+    std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");
+    std::fs::write(fixture.repo.path().join("src/lib.rs"), "before\n").expect("source");
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("heartbeat-root", "src/lib.rs"),
+        )
+        .await
+        .expect("worker assignment");
+    let binding = bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        "heartbeat-root",
+    )
+    .await;
+    expire_workspace_actor_leases(&fixture, &[attempt.attempt_id]).await;
+
+    assert!(
+        fixture
+            .store
+            .heartbeat_typed_workspace_actor(binding.clone())
+            .await
+            .expect("typed heartbeat")
+    );
+    let mut mismatched = binding.clone();
+    mismatched.thread_id = Some("wrong-thread".to_string());
+    assert!(
+        !fixture
+            .store
+            .heartbeat_typed_workspace_actor(mismatched)
+            .await
+            .expect("mismatched heartbeat is rejected")
+    );
+
+    expire_workspace_actor_leases(&fixture, &[attempt.attempt_id]).await;
+    let lease = fixture
+        .store
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "heartbeat-root".to_string(),
+                actor_id: format!("attempt:{}", attempt.attempt_id),
+                kind: WorkspaceActorKind::Typed,
+                attempt_id: Some(attempt.attempt_id),
+                paths: vec!["src/lib.rs".to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("typed mutation self-renews before orphan scavenging");
+    fixture
+        .store
+        .finish_workspace_mutation(fixture.repo.path(), lease)
+        .await
+        .expect("typed mutation finishes");
+
+    fixture
+        .store
+        .abandon_agent_task(
+            TaskActor::Root,
+            assignment.assignment_id,
+            "test terminal heartbeat".to_string(),
+        )
+        .await
+        .expect("attempt is sealed");
+    assert!(
+        !fixture
+            .store
+            .heartbeat_typed_workspace_actor(binding)
+            .await
+            .expect("sealed heartbeat is rejected")
+    );
+}
+
+#[tokio::test]
+async fn orphaned_owner_claims_release_after_the_liveness_window() {
+    let expired_fixture = Fixture::new().await;
+    let (expired_assignment, expired_attempt) = expired_fixture
+        .store
+        .create_assignment(
+            expired_fixture.repo.path(),
+            worker_draft("expired-owner-root", "src"),
+        )
+        .await
+        .expect("expired-owner assignment");
+    assert!(matches!(
+        expired_fixture
+            .store
+            .begin_workspace_mutation(
+                expired_fixture.repo.path(),
+                WorkspaceMutationRequest {
+                    root_session_id: "competing-root".to_string(),
+                    actor_id: "root:competing-root".to_string(),
+                    kind: WorkspaceActorKind::Root,
+                    attempt_id: None,
+                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                    contracts: Vec::new(),
+                    expected_manifest: Vec::new(),
+                }
+            )
+            .await,
+        Err(StoreError::WorkspaceClaimConflict { .. })
+    ));
+
+    expire_workspace_actor_leases(&expired_fixture, &[expired_attempt.attempt_id]).await;
+    let lease = expired_fixture
+        .store
+        .begin_workspace_mutation(
+            expired_fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "competing-root".to_string(),
+                actor_id: "root:competing-root".to_string(),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("expired owner no longer blocks a repository-wide mutation");
+    expired_fixture
+        .store
+        .finish_workspace_mutation(expired_fixture.repo.path(), lease)
+        .await
+        .expect("repository-wide mutation lease releases");
+    let expired_task = expired_fixture
+        .store
+        .get_agent_task(expired_assignment.assignment_id, Some(10))
+        .await
+        .expect("expired owner task reads");
+    assert_eq!(expired_task.current_attempt.state, AttemptState::NeedsMain);
+    assert!(expired_task.observations.iter().any(|observation| {
+        observation.kind == ObservationKind::NeedsMain
+            && observation.summary.contains("owner lease expired")
+    }));
+
+    let missing_fixture = Fixture::new().await;
+    let (missing_assignment, missing_attempt) = missing_fixture
+        .store
+        .create_assignment(
+            missing_fixture.repo.path(),
+            worker_draft("missing-owner-root", "src"),
+        )
+        .await
+        .expect("missing-owner assignment");
+    remove_workspace_actor(&missing_fixture, missing_attempt.attempt_id).await;
+    let lease = missing_fixture
+        .store
+        .begin_workspace_mutation(
+            missing_fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "replacement-root".to_string(),
+                actor_id: "root:replacement-root".to_string(),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("missing owner record cannot strand a claim");
+    missing_fixture
+        .store
+        .finish_workspace_mutation(missing_fixture.repo.path(), lease)
+        .await
+        .expect("replacement mutation lease releases");
+    assert_eq!(
+        missing_fixture
+            .store
+            .get_agent_task(missing_assignment.assignment_id, Some(0))
+            .await
+            .expect("missing owner task reads")
+            .current_attempt
+            .state,
+        AttemptState::NeedsMain
+    );
+}
+
+#[tokio::test]
+async fn live_reviewer_preserves_a_gated_claim_after_the_worker_lease_expires() {
+    let fixture = Fixture::new().await;
+    let (worker, worker_attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft("review-root", "src"))
+        .await
+        .expect("worker assignment");
+    fixture
+        .store
+        .submit_agent_receipt_with_review(
+            worker_attempt.attempt_id,
+            completed_receipt(Vec::new()),
+            "cold review required".to_string(),
+        )
+        .await
+        .expect("review-gated receipt");
+    let (_, reviewer_attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            relation_draft("review-root", AgentRole::Reviewer, worker.assignment_id),
+        )
+        .await
+        .expect("reviewer assignment");
+
+    expire_workspace_actor_leases(&fixture, &[worker_attempt.attempt_id]).await;
+    assert!(matches!(
+        fixture
+            .store
+            .create_assignment(
+                fixture.repo.path(),
+                worker_draft("competing-root", "src/file.rs")
+            )
+            .await,
+        Err(StoreError::WriteClaimConflict { .. })
+    ));
+
+    expire_workspace_actor_leases(&fixture, &[reviewer_attempt.attempt_id]).await;
+    fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("competing-root", "src/file.rs"),
+        )
+        .await
+        .expect("claim releases after both the owner and related reviewer become stale");
+    let task = fixture
+        .store
+        .get_agent_task(worker.assignment_id, Some(10))
+        .await
+        .expect("orphaned gated task reads");
+    assert_eq!(task.current_attempt.state, AttemptState::NeedsMain);
+    assert!(
+        task.gates
+            .iter()
+            .any(|gate| gate.kind == GateKind::Review && gate.status == GateStatus::Pending)
+    );
 }
 
 #[tokio::test]
@@ -1921,11 +2242,18 @@ async fn typed_claims_block_untyped_writers_and_supporting_reads_enforce_cas() {
     std::fs::write(fixture.repo.path().join("src/lib.rs"), "before\n").expect("lib fixture");
     let mut draft = worker_draft("claim-root", "src/lib.rs");
     draft.contract_claims = vec!["schema-owner".to_string()];
-    let (_, attempt) = fixture
+    let (assignment, attempt) = fixture
         .store
         .create_assignment(fixture.repo.path(), draft)
         .await
         .expect("claimed assignment");
+    bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        "claim-root",
+    )
+    .await;
     assert!(
         matches!(
             fixture
@@ -2113,11 +2441,18 @@ async fn partial_supporting_reads_cannot_bypass_multi_file_cas() {
     std::fs::create_dir_all(fixture.repo.path().join("src")).expect("src directory");
     std::fs::write(fixture.repo.path().join("src/a.rs"), "a\n").expect("a fixture");
     std::fs::write(fixture.repo.path().join("src/b.rs"), "b\n").expect("b fixture");
-    let (_, attempt) = fixture
+    let (assignment, attempt) = fixture
         .store
         .create_assignment(fixture.repo.path(), worker_draft("partial-cas-root", "src"))
         .await
         .expect("partial CAS assignment");
+    bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        "partial-cas-root",
+    )
+    .await;
     let actor_id = format!("attempt:{}", attempt.attempt_id);
     fixture
         .store

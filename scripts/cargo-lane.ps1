@@ -94,9 +94,10 @@ function Parse-CargoLaneArguments {
     if ($parsedLane -notmatch "^[A-Za-z0-9_.-]+$") {
         throw "Lane '$parsedLane' contains unsupported characters."
     }
-    if ($parsedLane -match "^\.\.?$") {
-        # "." and ".." pass the character filter but resolve the lane dir to
-        # the lanes root or the shared target root, escaping lane isolation.
+    if ($parsedLane -match "^\.+$") {
+        # Pure-dot names pass the character filter but Windows path
+        # normalization can collapse them to a parent directory, escaping lane
+        # isolation.
         throw "Lane '$parsedLane' is not a valid lane name."
     }
 
@@ -894,6 +895,8 @@ $candidateLane = Resolve-CargoLaneName -RequestedLane $requestedLane -CommandArg
 $reservation = Acquire-CargoLaneReservation -LaneRoot $cargoLanesRoot -BaseLane $candidateLane -ActiveNames $activeLaneNames
 $resolvedLane = $reservation.Lane
 $targetDir = $reservation.TargetDir
+$previousLaneTargetDir = $env:CODEX_CARGO_LANE_TARGET_DIR
+$env:CODEX_CARGO_LANE_TARGET_DIR = $targetDir
 if ($requestedLane -ne "auto" -and $resolvedLane -ne $requestedLane) {
     Write-Warning "Requested Cargo lane '$requestedLane' is busy; using '$resolvedLane'."
 }
@@ -977,6 +980,7 @@ finally {
         Update-CargoLaneLastUsed -TargetDir $targetDir
     }
     finally {
+        $env:CODEX_CARGO_LANE_TARGET_DIR = $previousLaneTargetDir
         if ($null -ne $reservation -and $null -ne $reservation.Stream) {
             $reservation.Stream.Dispose()
         }

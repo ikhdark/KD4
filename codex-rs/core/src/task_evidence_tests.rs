@@ -965,7 +965,7 @@ async fn evidence_only_mode_never_derives_completion_state() {
     assert_eq!(ledger.record_plan_update(&requested).await, requested);
     ledger.record_edit_result("edit", "completed").await;
     assert!(ledger.completion_gate().await.is_none());
-    assert!(ledger.take_finalization_warning().await.is_none());
+    assert!(ledger.finalization_advisory().await.is_none());
     let guard = ledger.document.lock().await;
     let document = guard.as_ref().expect("document");
     assert_eq!(document.host_mutation_revision, 1);
@@ -1019,6 +1019,71 @@ fn command_receipt(id: &str) -> CommandReceipt {
         duration_ms: 1,
         possible_mutation: false,
     }
+}
+
+#[tokio::test]
+async fn completion_review_summary_distinguishes_command_receipts_from_validation() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    {
+        let mut guard = ledger.document.lock().await;
+        let document = guard.as_mut().expect("document");
+        document.evidence_epoch = 2;
+        document.command_receipts = vec![
+            CommandReceipt {
+                id: "successful".to_string(),
+                recorded_at: timestamp(),
+                epoch: 2,
+                step_id: None,
+                command: vec!["cargo".to_string(), "test".to_string()],
+                cwd: ".".to_string(),
+                exit_code: 0,
+                timed_out: false,
+                duration_ms: 1,
+                possible_mutation: false,
+            },
+            CommandReceipt {
+                id: "timed-out".to_string(),
+                recorded_at: timestamp(),
+                epoch: 2,
+                step_id: None,
+                command: vec!["slow-check".to_string()],
+                cwd: ".".to_string(),
+                exit_code: 124,
+                timed_out: true,
+                duration_ms: 1,
+                possible_mutation: true,
+            },
+            CommandReceipt {
+                id: "stale".to_string(),
+                recorded_at: timestamp(),
+                epoch: 1,
+                step_id: None,
+                command: vec!["secret-from-prior-epoch".to_string()],
+                cwd: ".".to_string(),
+                exit_code: 0,
+                timed_out: false,
+                duration_ms: 1,
+                possible_mutation: false,
+            },
+        ];
+    }
+    let gate = TaskCompletionGate {
+        status: TaskCompletionStatus::Passed,
+        reasons: Vec::new(),
+        evidence_path: None,
+    };
+
+    let summary = ledger.completion_review_evidence_summary(&gate).await;
+
+    assert!(summary.contains(
+        "Command receipt [current epoch 2, outcome: succeeded, possible mutation: false]: cargo test"
+    ));
+    assert!(summary.contains(
+        "Command receipt [current epoch 2, outcome: timed_out, possible mutation: true]: slow-check"
+    ));
+    assert!(summary.contains("Prior-epoch command receipts omitted: 1"));
+    assert!(!summary.contains("secret-from-prior-epoch"));
+    assert!(!summary.contains("Validation:"));
 }
 
 #[tokio::test]
@@ -1690,6 +1755,118 @@ async fn v3_obsolete_validation_state_is_discarded_during_shape_migration() {
 }
 
 #[tokio::test]
+async fn v3_to_v4_discards_obsolete_repair_counter_without_reopening_passed_work() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .await;
+    let gate = ledger.completion_gate().await.expect("completion gate");
+    assert_eq!(gate.status, TaskCompletionStatus::Passed);
+
+    let codex_home = ledger.codex_home.as_ref().expect("codex home").clone();
+    let evidence_path = ledger
+        .evidence_path
+        .as_ref()
+        .expect("evidence path")
+        .clone();
+    let thread_id = ledger.thread_id.as_deref().expect("thread id").to_string();
+    let document = ledger
+        .document
+        .lock()
+        .await
+        .as_ref()
+        .expect("document")
+        .clone();
+    let mut v3 = serde_json::to_value(document).expect("serialize v3 fixture");
+    v3["schema_version"] = serde_json::json!(3);
+    v3["repair_turns_used"] = serde_json::json!(7);
+    tokio::fs::write(
+        &evidence_path,
+        serde_json::to_vec_pretty(&v3).expect("serialize v3 evidence"),
+    )
+    .await
+    .expect("write v3 evidence");
+    drop(ledger);
+
+    let reloaded = TaskEvidenceLedger::load_or_new(
+        codex_home,
+        ThreadId::from_string(&thread_id).expect("thread id"),
+        &repo,
+    )
+    .await;
+    {
+        let guard = reloaded.document.lock().await;
+        let migrated = guard.as_ref().expect("migrated document");
+        assert_eq!(migrated.schema_version, TASK_EVIDENCE_SCHEMA_VERSION);
+        assert_eq!(migrated.plan[0].status, StepStatus::Passed);
+        assert_eq!(
+            migrated.completion.as_ref().map(|gate| gate.status),
+            Some(TaskCompletionStatus::Passed)
+        );
+        assert!(migrated.completion_review_receipts.is_empty());
+    }
+    let persisted: Value = serde_json::from_slice(
+        &tokio::fs::read(&evidence_path)
+            .await
+            .expect("persisted v4 evidence"),
+    )
+    .expect("valid persisted v4 evidence");
+    assert_eq!(persisted["schema_version"], serde_json::json!(4));
+    assert!(persisted.get("repair_turns_used").is_none());
+}
+
+#[tokio::test]
+async fn completion_review_receipts_are_bounded_and_never_change_completion_control_flow() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .await;
+    assert_eq!(
+        ledger.completion_gate().await.expect("initial gate").status,
+        TaskCompletionStatus::Passed
+    );
+    let (initial_epoch, initial_mutation_revision) = {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("document");
+        (document.evidence_epoch, document.host_mutation_revision)
+    };
+
+    for index in 0..=MAX_COMPLETION_REVIEW_RECEIPTS {
+        assert!(
+            ledger
+                .record_completion_review_audit(
+                    &format!("turn-{index}"),
+                    "clean",
+                    None,
+                    vec![format!("finding-{index}")],
+                    false,
+                )
+                .await
+        );
+    }
+
+    {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("document");
+        assert_eq!(
+            document.completion_review_receipts.len(),
+            MAX_COMPLETION_REVIEW_RECEIPTS
+        );
+        assert_eq!(document.completion_review_receipts[0].turn_id, "turn-1");
+        assert_eq!(document.evidence_epoch, initial_epoch);
+        assert_eq!(document.host_mutation_revision, initial_mutation_revision);
+        assert_eq!(
+            document.completion.as_ref().map(|gate| gate.status),
+            Some(TaskCompletionStatus::Passed)
+        );
+    }
+    assert_eq!(
+        ledger.completion_gate().await.expect("final gate").status,
+        TaskCompletionStatus::Passed
+    );
+}
+
+#[tokio::test]
 async fn newer_schema_payload_disables_ledger_without_modifying_the_file() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     ledger
@@ -1710,22 +1887,22 @@ async fn newer_schema_payload_disables_ledger_without_modifying_the_file() {
         .expect("document")
         .clone();
     let mut legacy = serde_json::to_value(document).expect("serialize");
-    legacy["schema_version"] = serde_json::json!(4);
+    legacy["schema_version"] = serde_json::json!(5);
     legacy["lifecycle"] = serde_json::json!({
         "phase": "ready",
         "outcome": "passed",
         "mutation_revision": 1,
         "accepted_evidence_revision": 1
     });
-    let legacy_bytes = serde_json::to_vec_pretty(&legacy).expect("serialize v4 evidence");
+    let legacy_bytes = serde_json::to_vec_pretty(&legacy).expect("serialize v5 evidence");
     tokio::fs::write(&evidence_path, &legacy_bytes)
         .await
-        .expect("write v4 evidence");
+        .expect("write v5 evidence");
     drop(ledger);
 
     assert!(matches!(
         load_existing_document(&evidence_path, &thread_id, &repo).await,
-        ExistingDocument::NewerSchema { schema_version: 4 }
+        ExistingDocument::NewerSchema { schema_version: 5 }
     ));
 
     let reloaded = TaskEvidenceLedger::load_or_new(
@@ -1738,7 +1915,7 @@ async fn newer_schema_payload_disables_ledger_without_modifying_the_file() {
     assert_eq!(
         tokio::fs::read(&evidence_path)
             .await
-            .expect("untouched v4 evidence"),
+            .expect("untouched v5 evidence"),
         legacy_bytes
     );
 

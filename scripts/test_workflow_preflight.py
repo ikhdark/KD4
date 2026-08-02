@@ -26,7 +26,9 @@ class WorkflowPreflightTest(unittest.TestCase):
             check=True,
         )
         (self.repo / "src").mkdir()
-        (self.repo / "src" / "lib.rs").write_text("pub fn value() {}\n", encoding="utf-8")
+        (self.repo / "src" / "lib.rs").write_text(
+            "pub fn value() {}\n", encoding="utf-8"
+        )
         subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
         subprocess.run(
             ["git", "-C", str(self.repo), "commit", "-qm", "baseline"],
@@ -129,6 +131,15 @@ class WorkflowPreflightTest(unittest.TestCase):
             workflow_preflight.PreflightError, "active claim conflict"
         ):
             self.resolve(contender, (active,))
+
+    def test_case_only_claim_aliases_overlap_on_case_insensitive_filesystems(self) -> None:
+        left = {"path": "src/Foo", "recursive": True}
+        right = {"path": "src/foo/child.rs", "recursive": False}
+        self.assertTrue(
+            workflow_preflight.claims_overlap(
+                left, right, case_insensitive=True
+            )
+        )
 
     def test_workspace_fingerprint_hashes_dirty_content_not_only_status_shape(
         self,
@@ -243,6 +254,45 @@ class WorkflowPreflightTest(unittest.TestCase):
             0,
         )
         self.assertEqual(workflow_preflight.main([str(second_path)]), 0)
+
+    def test_failed_output_write_removes_new_registry_receipt(self) -> None:
+        manifest = self.manifest("root:output-failure")
+        manifest_path = self.repo / "output-failure.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        output_directory = self.repo / "receipt-directory"
+        output_directory.mkdir()
+
+        self.assertEqual(
+            workflow_preflight.main(
+                [str(manifest_path), "--output", str(output_directory)]
+            ),
+            2,
+        )
+        self.assertFalse(
+            workflow_preflight.registry_receipt_path(
+                self.repo, "root:output-failure"
+            ).exists()
+        )
+
+    def test_failed_output_write_restores_previous_registry_receipt(self) -> None:
+        manifest = self.manifest("root:output-restore")
+        manifest_path = self.repo / "output-restore.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        self.assertEqual(workflow_preflight.main([str(manifest_path)]), 0)
+        receipt_path = workflow_preflight.registry_receipt_path(
+            self.repo, "root:output-restore"
+        )
+        previous = receipt_path.read_bytes()
+        output_directory = self.repo / "receipt-directory"
+        output_directory.mkdir()
+
+        self.assertEqual(
+            workflow_preflight.main(
+                [str(manifest_path), "--output", str(output_directory)]
+            ),
+            2,
+        )
+        self.assertEqual(receipt_path.read_bytes(), previous)
 
 
 if __name__ == "__main__":

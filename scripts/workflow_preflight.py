@@ -95,7 +95,9 @@ def string_list(value: Any, field: str) -> list[str]:
 def normalize_claim_path(value: Any, root: Path) -> str:
     path = nonempty_string(value, "path_claims.path").replace("\\", "/")
     candidate = PurePosixPath(path)
-    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+    if candidate.is_absolute() or any(
+        part in {"", ".", ".."} for part in candidate.parts
+    ):
         raise PreflightError(f"unsafe repository-relative claim path: {path}")
     normalized = candidate.as_posix()
     resolved = (root / Path(*candidate.parts)).resolve(strict=False)
@@ -127,23 +129,46 @@ def normalize_claims(value: Any, root: Path) -> list[dict[str, Any]]:
     return claims
 
 
-def claim_covers(claim: dict[str, Any], path: str) -> bool:
-    claim_path = claim["path"].casefold() if os.name == "nt" else claim["path"]
-    candidate = path.casefold() if os.name == "nt" else path
+def repository_paths_are_case_insensitive(root: Path) -> bool:
+    """Detect case aliases without writing a probe into the repository."""
+    current = root.resolve()
+    for path in (current, *current.parents):
+        swapped = "".join(
+            character.swapcase() if character.isalpha() else character
+            for character in path.name
+        )
+        if not swapped or swapped == path.name:
+            continue
+        alias = path.with_name(swapped)
+        try:
+            if alias.exists() and os.path.samefile(path, alias):
+                return True
+        except OSError:
+            continue
+    return os.name == "nt"
+
+
+def claim_covers(
+    claim: dict[str, Any], path: str, *, case_insensitive: bool = False
+) -> bool:
+    claim_path = claim["path"].casefold() if case_insensitive else claim["path"]
+    candidate = path.casefold() if case_insensitive else path
     return candidate == claim_path or (
         claim["recursive"] and candidate.startswith(f"{claim_path}/")
     )
 
 
-def claims_overlap(left: dict[str, Any], right: dict[str, Any]) -> bool:
-    return claim_covers(left, right["path"]) or claim_covers(right, left["path"])
+def claims_overlap(
+    left: dict[str, Any], right: dict[str, Any], *, case_insensitive: bool = False
+) -> bool:
+    return claim_covers(
+        left, right["path"], case_insensitive=case_insensitive
+    ) or claim_covers(right, left["path"], case_insensitive=case_insensitive)
 
 
 def workspace_fingerprint(root: Path) -> str:
     digest = hashlib.sha256()
-    tracked_diff = git_bytes(
-        root, "diff", "--binary", "--no-ext-diff", "HEAD", "--"
-    )
+    tracked_diff = git_bytes(root, "diff", "--binary", "--no-ext-diff", "HEAD", "--")
     digest.update(len(tracked_diff).to_bytes(8, "big"))
     digest.update(tracked_diff)
     untracked = git_bytes(root, "ls-files", "--others", "--exclude-standard", "-z")
@@ -197,7 +222,9 @@ def persistent_identity(path: Path) -> str:
             except FileNotFoundError:
                 existing = ""
             except OSError as error:
-                raise PreflightError(f"could not read repository identity {path}: {error}") from error
+                raise PreflightError(
+                    f"could not read repository identity {path}: {error}"
+                ) from error
             if existing:
                 return existing
             temporary.replace(path)
@@ -339,6 +366,7 @@ def resolve_manifest(
         )
 
     path_claims = normalize_claims(raw["path_claims"], repository_root)
+    repository_case_insensitive = repository_paths_are_case_insensitive(repository_root)
     contract_claims = string_list(raw["contract_claims"], "contract_claims")
     dependencies = string_list(raw["dependencies"], "dependencies")
     generated_outputs = [
@@ -356,9 +384,16 @@ def resolve_manifest(
             f"workspace_strategy must be one of {sorted(WORKSPACE_STRATEGIES)}"
         )
     if generated_outputs and generated_owner.casefold() == "none":
-        raise PreflightError("generated outputs require a concrete generated_output_owner")
+        raise PreflightError(
+            "generated outputs require a concrete generated_output_owner"
+        )
     for output in generated_outputs:
-        if not any(claim_covers(claim, output) for claim in path_claims):
+        if not any(
+            claim_covers(
+                claim, output, case_insensitive=repository_case_insensitive
+            )
+            for claim in path_claims
+        ):
             raise PreflightError(f"generated output is outside path claims: {output}")
 
     cargo_lane = raw["cargo_lane"]
@@ -422,19 +457,24 @@ def resolve_manifest(
             active.get("workspace_strategy"), "workspace_strategy"
         )
         active_claims = normalize_claims(active.get("path_claims"), active_root_path)
+        compare_case_insensitively = (
+            repository_case_insensitive
+            or repository_paths_are_case_insensitive(active_root_path)
+        )
         overlap = [
             (left["path"], right["path"])
             for left in path_claims
             for right in active_claims
-            if claims_overlap(left, right)
+            if claims_overlap(
+                left, right, case_insensitive=compare_case_insensitively
+            )
         ]
         shared_contracts = sorted(
             set(contract_claims)
             & set(string_list(active.get("contract_claims"), "contract_claims"))
         )
-        isolated_elsewhere = (
-            workspace_id != active_workspace_id
-            and (strategy == "isolated" or active_strategy == "isolated")
+        isolated_elsewhere = workspace_id != active_workspace_id and (
+            strategy == "isolated" or active_strategy == "isolated"
         )
         if (overlap or shared_contracts) and not isolated_elsewhere:
             raise PreflightError(
@@ -461,7 +501,10 @@ def resolve_manifest(
 
     ending_commit = git(repository_root, "rev-parse", "HEAD").strip()
     ending_workspace_fingerprint = workspace_fingerprint(repository_root)
-    if ending_commit != commit or ending_workspace_fingerprint != starting_workspace_fingerprint:
+    if (
+        ending_commit != commit
+        or ending_workspace_fingerprint != starting_workspace_fingerprint
+    ):
         raise PreflightError(
             "repository changed while workflow preflight was being resolved; retry after the current writer finishes"
         )
@@ -470,17 +513,20 @@ def resolve_manifest(
 
 
 def write_atomic(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(value, indent=2, sort_keys=True) + "\n"
+    write_atomic_bytes(path, payload.encode("utf-8"))
+
+
+def write_atomic_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.",
         suffix=".tmp",
         dir=path.parent,
-        text=True,
     )
     temporary = Path(temporary_name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+        with os.fdopen(descriptor, "wb") as handle:
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
@@ -552,9 +598,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             / "codex"
             / "workflow-preflight.lock"
         )
-        with repository_lock(
-            lock_path, assignment_id, "workflow preflight registry"
-        ):
+        with repository_lock(lock_path, assignment_id, "workflow preflight registry"):
             now = datetime.now(timezone.utc)
             explicit_receipts = [load_json(path) for path in args.against]
             resolved = resolve_manifest(
@@ -562,14 +606,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                 manifest_path=manifest_path,
                 against=[
                     *active_registry_receipts(root, assignment_id, now),
-                    *(receipt for receipt in explicit_receipts if receipt_is_active(receipt, now)),
+                    *(
+                        receipt
+                        for receipt in explicit_receipts
+                        if receipt_is_active(receipt, now)
+                    ),
                 ],
                 lease_seconds=args.lease_seconds,
                 now=now,
             )
-            write_atomic(registry_receipt_path(root, assignment_id), resolved)
-            if args.output:
-                write_atomic(args.output, resolved)
+            receipt_path = registry_receipt_path(root, assignment_id)
+            previous_receipt = receipt_path.read_bytes() if receipt_path.exists() else None
+            write_atomic(receipt_path, resolved)
+            try:
+                if args.output:
+                    write_atomic(args.output, resolved)
+            except OSError as output_error:
+                try:
+                    if previous_receipt is None:
+                        receipt_path.unlink(missing_ok=True)
+                    else:
+                        write_atomic_bytes(receipt_path, previous_receipt)
+                except OSError as rollback_error:
+                    raise PreflightError(
+                        "output publication failed and the previous registry receipt "
+                        f"could not be restored: output={output_error}; rollback={rollback_error}"
+                    ) from output_error
+                raise
         print(json.dumps(resolved, indent=2, sort_keys=True))
         return 0
     except (GenerationLockError, PreflightError, OSError) as error:

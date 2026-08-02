@@ -24,6 +24,7 @@ use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TurnEnvironmentSelections;
 use std::sync::OnceLock;
 use tokio::sync::Semaphore;
+use tokio::sync::SemaphorePermit;
 
 /// Context for an initialized model agent
 ///
@@ -52,6 +53,8 @@ pub(crate) struct Session {
     pub(crate) shutting_down: std::sync::atomic::AtomicBool,
     pub(crate) input_queue: InputQueue,
     pub(crate) guardian_review_session: GuardianReviewSessionManager,
+    /// Independent one-shot completion reviews never consume normal agent capacity.
+    pub(super) completion_review_slot: Semaphore,
     pub(crate) services: SessionServices,
     pub(super) next_internal_sub_id: AtomicU64,
 }
@@ -476,6 +479,10 @@ impl Session {
     /// Returns the identity shared by the root thread and all descendant threads.
     pub(crate) fn session_id(&self) -> SessionId {
         self.services.agent_control.session_id()
+    }
+
+    pub(crate) fn try_acquire_completion_review_slot(&self) -> Option<SemaphorePermit<'_>> {
+        self.completion_review_slot.try_acquire().ok()
     }
 
     pub(crate) async fn originator(&self) -> String {
@@ -1077,12 +1084,21 @@ impl Session {
                     thread_store: &thread_extension_data,
                 }).await;
             }
-            let task_evidence = crate::task_evidence::TaskEvidenceLedger::load_or_new(
-                config.codex_home.to_path_buf(),
-                thread_id,
-                session_configuration.cwd().as_path(),
-            )
-            .await;
+            let task_evidence = if config.ephemeral
+                && matches!(
+                    session_configuration.session_source,
+                    SessionSource::SubAgent(SubAgentSource::Review)
+                )
+            {
+                crate::task_evidence::TaskEvidenceLedger::disabled()
+            } else {
+                crate::task_evidence::TaskEvidenceLedger::load_or_new(
+                    config.codex_home.to_path_buf(),
+                    thread_id,
+                    session_configuration.cwd().as_path(),
+                )
+                .await
+            };
 
             let executor_readiness_timing_guard =
                 startup_timing.begin_phase(crate::startup_timing::StartupPhase::ExecutorReadiness);
@@ -1203,6 +1219,7 @@ impl Session {
                 shutting_down: std::sync::atomic::AtomicBool::new(false),
                 input_queue: InputQueue::new(),
                 guardian_review_session: GuardianReviewSessionManager::default(),
+                completion_review_slot: Semaphore::new(/*permits*/ 1),
                 services,
                 next_internal_sub_id: AtomicU64::new(0),
             });

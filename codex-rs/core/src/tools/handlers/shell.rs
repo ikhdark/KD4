@@ -239,6 +239,16 @@ pub(super) async fn run_exec_like_with_exit_code(
             WorkspaceActorKind::Legacy => format!("legacy:{root_session_id}:{agent_path}"),
             WorkspaceActorKind::Typed | WorkspaceActorKind::External => unreachable!(),
         };
+        args.session
+            .services
+            .agent_control
+            .reconcile_live_typed_actor_heartbeats()
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "shell typed-agent liveness could not be reconciled: {error}"
+                ))
+            })?;
         let lease = store
             .begin_workspace_mutation(
                 &repo_root,

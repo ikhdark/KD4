@@ -347,7 +347,7 @@ async fn record_supporting_source_reads(
         .get_agent_path()
         .map(|path| path.to_string())
         .unwrap_or_else(|| "/root".to_string());
-    let (actor_id, kind) = if let Some(binding) = binding {
+    let (actor_id, kind) = if let Some(binding) = binding.as_ref() {
         (
             format!("attempt:{}", binding.attempt_id),
             WorkspaceActorKind::Typed,
@@ -365,6 +365,20 @@ async fn record_supporting_source_reads(
     } else {
         (format!("root:{root_session_id}"), WorkspaceActorKind::Root)
     };
+    if let Some(binding) = binding.as_ref()
+        && !coordinator
+            .heartbeat_typed_actor_binding(binding)
+            .await
+            .map_err(|error| {
+                FunctionCallError::RespondToModel(format!(
+                    "read_file_span: typed reader heartbeat failed: {error}"
+                ))
+            })?
+    {
+        return Err(FunctionCallError::RespondToModel(
+            "read_file_span: the bound typed assignment attempt is no longer active".to_string(),
+        ));
+    }
     if kind != WorkspaceActorKind::Typed {
         store
             .register_workspace_actor(

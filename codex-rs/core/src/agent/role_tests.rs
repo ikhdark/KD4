@@ -5,6 +5,7 @@ use crate::skills_load_input_from_config;
 use codex_config::ConfigLayerStackOrdering;
 use codex_core_plugins::PluginsManager;
 use codex_protocol::config_types::ServiceTier;
+use codex_protocol::models::PermissionProfile;
 use codex_protocol::openai_models::ReasoningEffort;
 use codex_utils_absolute_path::test_support::PathExt;
 use pretty_assertions::assert_eq;
@@ -87,19 +88,20 @@ async fn apply_explorer_role_sets_model_and_adds_session_flags_layer() {
 }
 
 #[tokio::test]
-async fn apply_empty_explorer_role_preserves_current_model_and_reasoning_effort() {
+async fn apply_explorer_role_sets_read_only_permissions() {
     let (_home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
     let before_layers = session_flags_layer_count(&config);
-    config.model = Some("gpt-5.4-mini".to_string());
-    config.model_reasoning_effort = Some(ReasoningEffort::High);
 
-    apply_role_to_config(&mut config, Some("explorer"))
+    let locks = apply_role_to_config(&mut config, Some("explorer"))
         .await
         .expect("explorer role should apply");
 
-    assert_eq!(config.model.as_deref(), Some("gpt-5.4-mini"));
-    assert_eq!(config.model_reasoning_effort, Some(ReasoningEffort::High));
-    assert_eq!(session_flags_layer_count(&config), before_layers);
+    assert!(locks.permissions);
+    assert_eq!(
+        config.permissions.permission_profile(),
+        &PermissionProfile::read_only()
+    );
+    assert_eq!(session_flags_layer_count(&config), before_layers + 1);
 }
 
 #[tokio::test]
@@ -149,23 +151,35 @@ async fn apply_role_reports_independent_model_and_reasoning_locks() {
             "developer_instructions = \"Stay focused\"",
             false,
             false,
+            false,
         ),
-        ("model-only", "model = \"role-model\"", true, false),
+        ("model-only", "model = \"role-model\"", true, false, false),
         (
             "effort-only",
             "model_reasoning_effort = \"high\"",
             false,
             true,
+            false,
         ),
         (
             "model-and-effort",
             "model = \"role-model\"\nmodel_reasoning_effort = \"high\"",
             true,
             true,
+            false,
+        ),
+        (
+            "permissions-only",
+            "sandbox_mode = \"read-only\"",
+            false,
+            false,
+            true,
         ),
     ];
 
-    for (role_name, contents, expected_model, expected_reasoning_effort) in cases {
+    for (role_name, contents, expected_model, expected_reasoning_effort, expected_permissions) in
+        cases
+    {
         let (home, mut config) = test_config_with_cli_overrides(Vec::new()).await;
         let role_path = write_role_config(&home, &format!("{role_name}.toml"), contents).await;
         config.agent_roles.insert(
@@ -188,6 +202,10 @@ async fn apply_role_reports_independent_model_and_reasoning_locks() {
         assert_eq!(
             locks.reasoning_effort, expected_reasoning_effort,
             "unexpected reasoning lock for {role_name}"
+        );
+        assert_eq!(
+            locks.permissions, expected_permissions,
+            "unexpected permissions lock for {role_name}"
         );
     }
 }
@@ -609,7 +627,14 @@ fn spawn_tool_spec_marks_role_locked_service_tier() {
 }
 
 #[test]
-fn built_in_config_file_contents_resolves_explorer_only() {
+fn built_in_read_only_roles_resolve_embedded_config() {
+    for role_file in ["explorer.toml", "reviewer.toml", "verifier.toml"] {
+        assert_eq!(
+            built_in::config_file_contents(Path::new(role_file)),
+            Some("sandbox_mode = \"read-only\"\n"),
+            "unexpected embedded config for {role_file}"
+        );
+    }
     assert_eq!(
         built_in::config_file_contents(Path::new("missing.toml")),
         None

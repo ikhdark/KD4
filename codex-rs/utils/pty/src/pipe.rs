@@ -16,6 +16,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
+#[cfg(windows)]
+use tokio::time::Duration;
 
 use crate::process::ChildTerminator;
 use crate::process::ProcessHandle;
@@ -42,6 +44,29 @@ enum WindowsChildTerminator {
         process: OwnedHandle,
     },
     Process(OwnedHandle),
+}
+
+#[cfg(windows)]
+const WINDOWS_PROCESS_SPAWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(windows)]
+async fn run_windows_spawn_operation<T, F>(timeout: Duration, operation: F) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+{
+    tokio::time::timeout(timeout, tokio::task::spawn_blocking(operation))
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "Windows process creation did not return within {} seconds",
+                    timeout.as_secs()
+                ),
+            )
+        })?
+        .map_err(|error| io::Error::other(format!("Windows process spawn task failed: {error}")))?
 }
 
 struct PipeChildTerminator {
@@ -209,6 +234,16 @@ async fn spawn_process_with_stdin_mode(
 
     #[cfg(windows)]
     let job = crate::win::JobObject::create().map(Arc::new);
+    #[cfg(windows)]
+    let mut child = {
+        // CreateProcessW can block inside the Windows loader. Keep that synchronous call off the
+        // async runtime so timers and cancellation continue to make progress. kill_on_drop also
+        // ensures that a child returned after this future times out is terminated when the
+        // detached spawn result is discarded.
+        command.kill_on_drop(true);
+        run_windows_spawn_operation(WINDOWS_PROCESS_SPAWN_TIMEOUT, move || command.spawn()).await?
+    };
+    #[cfg(not(windows))]
     let mut child = command.spawn()?;
     #[cfg(windows)]
     let windows_terminator = {

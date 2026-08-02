@@ -196,6 +196,18 @@ impl ApplyPatchRuntime {
         } else {
             repo_paths
         };
+        if binding.is_none() {
+            ctx.session
+                .services
+                .agent_control
+                .reconcile_live_typed_actor_heartbeats()
+                .await
+                .map_err(|error| {
+                    ToolError::Rejected(format!(
+                        "apply_patch: typed-agent liveness could not be reconciled: {error}"
+                    ))
+                })?;
+        }
         let store = coordinator.store().ok_or_else(|| {
             ToolError::Rejected("apply_patch: the workspace task store is unavailable".to_string())
         })?;

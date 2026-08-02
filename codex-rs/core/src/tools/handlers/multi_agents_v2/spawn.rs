@@ -2,7 +2,7 @@ use super::*;
 use crate::agent::control::SpawnAgentForkMode;
 use crate::agent::control::SpawnAgentOptions;
 use crate::agent::next_thread_spawn_depth;
-use crate::agent::role::AgentRoleModelLocks;
+use crate::agent::role::AgentRoleLocks;
 use crate::agent::role::DEFAULT_ROLE_NAME;
 use crate::agent::role::apply_role_to_config;
 use crate::agent_communication::AgentCommunicationContext;
@@ -136,8 +136,8 @@ async fn handle_spawn_agent(
             args.reasoning_effort.clone(),
         )?;
     }
-    let role_model_locks = if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)) {
-        AgentRoleModelLocks::default()
+    let role_locks = if matches!(fork_mode, Some(SpawnAgentForkMode::FullHistory)) {
+        AgentRoleLocks::default()
     } else {
         apply_role_to_config(&mut config, role_name)
             .await
@@ -149,7 +149,7 @@ async fn handle_spawn_agent(
         &mut config,
         args.model.as_deref(),
         args.reasoning_effort.clone(),
-        role_model_locks,
+        role_locks,
     )
     .await?;
     apply_spawn_agent_service_tier(
@@ -160,7 +160,7 @@ async fn handle_spawn_agent(
         args.service_tier.as_deref(),
     )
     .await?;
-    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref())?;
+    apply_spawn_agent_runtime_overrides(&mut config, turn.as_ref(), role_locks)?;
 
     let spawn_source = thread_spawn_source(
         session.thread_id,
@@ -236,6 +236,12 @@ async fn handle_spawn_agent(
         } else {
             main_repo_root
         };
+        session
+            .services
+            .agent_control
+            .reconcile_live_typed_actor_heartbeats()
+            .await
+            .map_err(typed_task_store_error)?;
         let draft = assignment_args.into_draft(root_session_id, role);
         let (assignment, attempt) = match coordinator.create_assignment(&repo_root, draft).await {
             Ok(task) => task,
@@ -256,19 +262,26 @@ async fn handle_spawn_agent(
     } else {
         None
     };
-    let message = match typed_task.as_ref() {
-        Some((assignment, attempt)) => typed_assignment_message(assignment, attempt),
-        None => legacy_message.ok_or_else(|| {
-            FunctionCallError::RespondToModel(
-                "spawn_agent: either assignment or message is required".to_string(),
-            )
-        })?,
-    };
     let author = turn
         .session_source
         .get_agent_path()
         .unwrap_or_else(AgentPath::root);
-    let communication = communication_from_tool_message(author, new_agent_path.clone(), message);
+    let communication = match typed_task.as_ref() {
+        Some((assignment, attempt)) => communication_from_plaintext_message(
+            author,
+            new_agent_path.clone(),
+            typed_assignment_message(assignment, attempt),
+        ),
+        None => communication_from_tool_message(
+            author,
+            new_agent_path.clone(),
+            legacy_message.ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "spawn_agent: either assignment or message is required".to_string(),
+                )
+            })?,
+        ),
+    };
     let context = AgentCommunicationContext::new(AgentCommunicationKind::Spawn, session.thread_id);
     let spawned_agent = Box::pin(
         session

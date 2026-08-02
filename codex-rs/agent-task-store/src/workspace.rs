@@ -297,6 +297,40 @@ pub(crate) async fn begin_mutation(
     let mut transaction = pool.begin().await?;
     ensure_workspace_tx(&mut transaction, &repository).await?;
     expire_mutation_leases_tx(&mut transaction, &repository.workspace_id).await?;
+    if request.kind == WorkspaceActorKind::Typed {
+        let Some(attempt_id) = request.attempt_id else {
+            return Err(StoreError::InvalidAssignment(
+                "typed workspace mutation requires an attempt identity".to_string(),
+            ));
+        };
+        if request.actor_id != format!("attempt:{attempt_id}") {
+            return Err(StoreError::AttemptNotActive(attempt_id));
+        }
+        let binding_row = sqlx::query(
+            "SELECT assignment_id, attempt_id, root_session_id, agent_path, task_name, thread_id,
+                    bound_at, updated_at
+             FROM agent_task_bindings
+             WHERE attempt_id = ?",
+        )
+        .bind(attempt_id.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(binding_row) = binding_row else {
+            return Err(StoreError::AttemptNotActive(attempt_id));
+        };
+        let binding = crate::local::binding_from_row(&binding_row)?;
+        if binding.root_session_id != request.root_session_id
+            || !crate::local::heartbeat_typed_workspace_actor_tx(
+                &mut transaction,
+                &repository.workspace_id,
+                &binding,
+            )
+            .await?
+        {
+            return Err(StoreError::AttemptNotActive(attempt_id));
+        }
+    }
+    crate::local::release_orphaned_claims_tx(&mut transaction, &repository.workspace_id).await?;
     let start_epoch =
         reconcile_entries_tx(&mut transaction, &repository, &paths, &mut entries).await?;
     require_claim_authority_tx(
@@ -643,6 +677,7 @@ pub(crate) async fn assert_unclaimed(
     let repository = repository_identity(repo_root)?;
     let mut transaction = pool.begin().await?;
     ensure_workspace_tx(&mut transaction, &repository).await?;
+    crate::local::release_orphaned_claims_tx(&mut transaction, &repository.workspace_id).await?;
     let mut conflicts = Vec::new();
     let rows = sqlx::query(
         "SELECT write_claims.assignment_id, write_claims.attempt_id
@@ -691,6 +726,21 @@ pub(crate) async fn quiescence(
     pool: &SqlitePool,
     root_session_id: &str,
 ) -> StoreResult<QuiescenceStatus> {
+    let mut transaction = pool.begin().await?;
+    let workspace_ids = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT assignment_repositories.workspace_id
+         FROM assignments
+         JOIN assignment_repositories USING (assignment_id)
+         WHERE assignments.root_session_id = ?",
+    )
+    .bind(root_session_id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    for workspace_id in workspace_ids {
+        crate::local::release_orphaned_claims_tx(&mut transaction, &workspace_id).await?;
+    }
+    transaction.commit().await?;
+
     let now = Utc::now();
     let encoded_now = json(&now)?;
     sqlx::query(

@@ -24,7 +24,7 @@ fn renders_sandbox_mode_text() {
 
     assert_eq!(
         sandbox_text(SandboxMode::DangerFullAccess, NetworkAccess::Enabled),
-        "Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `danger-full-access`: No filesystem sandboxing - all commands are permitted. Network access is enabled."
+        "Filesystem sandboxing defines which files can be read or written. `sandbox_mode` is `danger-full-access`: filesystem access is unrestricted. Network access is enabled."
     );
 }
 
@@ -50,7 +50,7 @@ fn builds_permissions_with_network_access_override() {
         "expected network access to be enabled in message"
     );
     assert!(
-        text.contains("How to request escalation"),
+        text.contains("## Requesting escalation"),
         "expected approval guidance to be included"
     );
 }
@@ -221,7 +221,7 @@ fn includes_request_permissions_tool_instructions_for_on_request_when_tool_is_en
 }
 
 #[test]
-fn on_request_includes_tool_guidance_alongside_inline_permission_guidance_when_both_exist() {
+fn on_request_keeps_inline_and_direct_tool_guidance_separate() {
     let instructions = PermissionsInstructions::from_permissions_with_network(
         SandboxMode::WorkspaceWrite,
         NetworkAccess::Enabled,
@@ -238,7 +238,7 @@ fn on_request_includes_tool_guidance_alongside_inline_permission_guidance_when_b
 
     let text = instructions.body();
     assert!(text.contains("with_additional_permissions"));
-    assert!(text.contains("# request_permissions Tool"));
+    assert_eq!(text.matches("# request_permissions Tool").count(), 1);
 }
 
 #[test]
@@ -267,6 +267,27 @@ fn catalog_approval_messages_select_reviewer_variant() {
             expected
         );
     }
+}
+
+#[test]
+fn catalog_approval_messages_are_hard_capped() {
+    let oversized = "approval guidance ".repeat(MAX_APPROVAL_MESSAGE_BYTES);
+    let messages = ApprovalMessages {
+        on_request: Some(oversized),
+        on_request_auto_review: None,
+    };
+
+    let text = approval_text(
+        AskForApproval::OnRequest,
+        ApprovalsReviewer::User,
+        Some(&messages),
+        &Policy::empty(),
+        /*exec_permission_approvals_enabled*/ false,
+        /*request_permissions_tool_enabled*/ false,
+    );
+
+    assert!(text.len() <= MAX_APPROVAL_MESSAGE_BYTES);
+    assert!(text.ends_with(APPROVAL_MESSAGE_TRUNCATED_MARKER));
 }
 
 #[test]
@@ -304,7 +325,7 @@ fn empty_catalog_approval_message_suppresses_legacy_approval_section() {
     assert!(text.contains("`sandbox_mode` is `workspace-write`"));
     assert!(text.contains("Network access is restricted."));
     assert!(text.contains(writable_root.to_string_lossy().as_ref()));
-    assert!(!text.contains("How to request escalation"));
+    assert!(!text.contains("## Requesting escalation"));
     assert!(!text.contains("request_permissions Tool"));
     assert!(!text.contains("Approved command prefixes"));
 }
@@ -333,7 +354,7 @@ fn missing_catalog_key_and_non_on_request_policy_use_legacy_approval_text() {
         /*request_permissions_tool_enabled*/ false,
     );
 
-    assert!(on_request.contains("How to request escalation"));
+    assert!(on_request.contains("## Requesting escalation"));
     assert_eq!(never, APPROVAL_POLICY_NEVER);
 }
 
@@ -558,4 +579,42 @@ fn granular_policy_lists_request_permissions_category_without_tool_section_when_
 
     assert!(!text.contains("- `request_permissions`"));
     assert!(!text.contains("# request_permissions Tool"));
+}
+
+#[test]
+fn dynamic_permission_lists_are_deterministically_bounded() {
+    let entries = (0..100)
+        .map(|index| {
+            format!(
+                "- path `/very/long/permission/path/{index:03}/{}`",
+                "x".repeat(80)
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let rendered = bounded_permission_entries(entries);
+    let text = rendered.join("\n");
+
+    assert!(rendered.len() <= MAX_PERMISSION_LIST_ENTRIES);
+    assert!(text.len() <= MAX_PERMISSION_LIST_BYTES);
+    assert_eq!(
+        rendered.last().map(String::as_str),
+        Some(PERMISSION_LIST_TRUNCATED_MARKER)
+    );
+}
+
+#[test]
+fn oversized_first_permission_entry_still_renders_a_truncation_marker() {
+    let rendered = bounded_permission_entries(vec![format!(
+        "- path `/oversized/{}`",
+        "x".repeat(MAX_PERMISSION_LIST_BYTES * 2)
+    )]);
+
+    assert_eq!(rendered, vec![PERMISSION_LIST_TRUNCATED_MARKER]);
+}
+
+#[test]
+fn static_permission_templates_stay_within_size_ceiling() {
+    assert!(APPROVAL_POLICY_ON_REQUEST_RULE.len() <= 3_000);
+    assert!(APPROVAL_POLICY_ON_REQUEST_RULE_REQUEST_PERMISSION.len() <= 1_800);
 }

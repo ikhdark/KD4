@@ -29,11 +29,12 @@ use toml::Value as TomlValue;
 pub const DEFAULT_ROLE_NAME: &str = "default";
 const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
 
-/// Model settings that a role explicitly owns and that spawn defaults must not replace.
+/// Settings that a role explicitly owns and that spawn defaults must not replace.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct AgentRoleModelLocks {
+pub(crate) struct AgentRoleLocks {
     pub(crate) model: bool,
     pub(crate) reasoning_effort: bool,
+    pub(crate) permissions: bool,
 }
 
 /// Applies a named role layer to `config` while preserving caller-owned provider settings.
@@ -45,7 +46,7 @@ pub(crate) struct AgentRoleModelLocks {
 pub(crate) async fn apply_role_to_config(
     config: &mut Config,
     role_name: Option<&str>,
-) -> Result<AgentRoleModelLocks, String> {
+) -> Result<AgentRoleLocks, String> {
     let role_name = role_name.unwrap_or(DEFAULT_ROLE_NAME);
 
     let role = resolve_role_config(config, role_name)
@@ -64,21 +65,29 @@ async fn apply_role_to_config_inner(
     config: &mut Config,
     role_name: &str,
     role: &AgentRoleConfig,
-) -> anyhow::Result<AgentRoleModelLocks> {
+) -> anyhow::Result<AgentRoleLocks> {
     let is_built_in = !config.agent_roles.contains_key(role_name);
     let Some(config_file) = role.config_file.as_ref() else {
-        return Ok(AgentRoleModelLocks::default());
+        return Ok(AgentRoleLocks::default());
     };
     let role_layer_toml = load_role_layer_toml(config, config_file, is_built_in, role_name).await?;
     if role_layer_toml
         .as_table()
         .is_some_and(toml::map::Map::is_empty)
     {
-        return Ok(AgentRoleModelLocks::default());
+        return Ok(AgentRoleLocks::default());
     }
-    let model_locks = AgentRoleModelLocks {
+    let role_locks = AgentRoleLocks {
         model: role_layer_toml.get("model").is_some(),
         reasoning_effort: role_layer_toml.get("model_reasoning_effort").is_some(),
+        permissions: [
+            "sandbox_mode",
+            "sandbox_workspace_write",
+            "default_permissions",
+            "permissions",
+        ]
+        .iter()
+        .any(|key| role_layer_toml.get(*key).is_some()),
     };
     let preserve_current_provider = role_layer_toml.get("model_provider").is_none();
     let preserve_current_service_tier = role_layer_toml.get("service_tier").is_none();
@@ -90,7 +99,7 @@ async fn apply_role_to_config_inner(
         preserve_current_service_tier,
     )
     .await?;
-    Ok(model_locks)
+    Ok(role_locks)
 }
 
 async fn load_role_layer_toml(
@@ -332,7 +341,7 @@ mod built_in {
                     "explorer".to_string(),
                     AgentRoleConfig {
                         description: Some(r#"Use `explorer` for specific codebase questions.
-Explorers are fast and authoritative.
+Explorers are fast, authoritative, and read-only.
 They must be used to ask specific, well-scoped questions on the codebase.
 Rules:
 - In order to avoid redundant work, you should avoid exploring the same problem that explorers have already covered. Typically, you should trust the explorer results without additional verification. You are still allowed to inspect the code yourself to gain the needed context!
@@ -364,7 +373,7 @@ Rules:
                             "Review one completed assignment against its contract and evidence. Remain read-only and report findings without editing source."
                                 .to_string(),
                         ),
-                        config_file: None,
+                        config_file: Some("reviewer.toml".to_string().parse().unwrap_or_default()),
                         nickname_candidates: None,
                     },
                 ),
@@ -375,7 +384,7 @@ Rules:
                             "Run focused validation for one completed assignment. Remain read-only for source and report reproducible evidence."
                                 .to_string(),
                         ),
-                        config_file: None,
+                        config_file: Some("verifier.toml".to_string().parse().unwrap_or_default()),
                         nickname_candidates: None,
                     },
                 ),
@@ -415,10 +424,10 @@ Rules:
 
     /// Resolves a built-in role `config_file` path to embedded content.
     pub(super) fn config_file_contents(path: &Path) -> Option<&'static str> {
-        const EXPLORER: &str = "";
+        const READ_ONLY: &str = "sandbox_mode = \"read-only\"\n";
         const AWAITER: &str = include_str!("builtins/awaiter.toml");
         match path.to_str()? {
-            "explorer.toml" => Some(EXPLORER),
+            "explorer.toml" | "reviewer.toml" | "verifier.toml" => Some(READ_ONLY),
             "awaiter.toml" => Some(AWAITER),
             _ => None,
         }

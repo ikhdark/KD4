@@ -30,11 +30,13 @@ use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
 use tracing::warn;
 
-const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 3;
+const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 4;
+const TASK_EVIDENCE_COMPLETION_MODEL_VERSION: u32 = 3;
 const FILE_HASH_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_COMMAND_RECEIPTS: usize = 256;
 const MAX_EDIT_RECEIPTS: usize = 256;
 const MAX_EXTERNAL_EVIDENCE_RECEIPTS: usize = 256;
+const MAX_COMPLETION_REVIEW_RECEIPTS: usize = 256;
 const EXTERNAL_EVIDENCE_INLINE_PAYLOAD_BYTES: usize = 16 * 1024;
 const EXTERNAL_EVIDENCE_ARTIFACT_CHUNK_BYTES: usize = 8 * 1024;
 const EXTERNAL_EVIDENCE_ARTIFACT_HEADER: &str =
@@ -102,13 +104,14 @@ struct TaskEvidenceDocument {
     command_receipts: Vec<CommandReceipt>,
     #[serde(default)]
     external_evidence: Vec<ExternalEvidenceReceipt>,
+    #[serde(default)]
+    completion_review_receipts: Vec<CompletionReviewAuditReceipt>,
     generated_artifact_requirements: Vec<GeneratedArtifactRequirement>,
     #[serde(default)]
     latest_generated_artifact_hashes: BTreeMap<String, FileHashSnapshot>,
     latest_file_hashes: BTreeMap<String, FileHashSnapshot>,
     risks: Vec<EvidenceRisk>,
     desktop_activation_receipt: Option<DesktopActivationReceipt>,
-    repair_turns_used: u8,
     #[serde(default = "initial_receipt_sequence")]
     next_edit_receipt_sequence: u64,
     #[serde(default = "initial_receipt_sequence")]
@@ -232,6 +235,17 @@ struct ExternalEvidenceReceipt {
     payload_artifact_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompletionReviewAuditReceipt {
+    turn_id: String,
+    recorded_at: String,
+    evidence_epoch: u64,
+    outcome: String,
+    failure_category: Option<String>,
+    finding_summary: Vec<String>,
+    repair_injected: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GeneratedArtifactRequirement {
     id: String,
@@ -343,6 +357,7 @@ impl TaskEvidenceLedger {
                 edit_receipts: Vec::new(),
                 command_receipts: Vec::new(),
                 external_evidence: Vec::new(),
+                completion_review_receipts: Vec::new(),
                 generated_artifact_requirements: Vec::new(),
                 latest_generated_artifact_hashes: BTreeMap::new(),
                 latest_file_hashes: BTreeMap::new(),
@@ -351,7 +366,6 @@ impl TaskEvidenceLedger {
                     .map(|reason| vec![task_evidence_storage_risk(reason, 0)])
                     .unwrap_or_default(),
                 desktop_activation_receipt: None,
-                repair_turns_used: 0,
                 next_edit_receipt_sequence: initial_receipt_sequence(),
                 next_command_receipt_sequence: initial_receipt_sequence(),
                 next_external_evidence_receipt_sequence: initial_receipt_sequence(),
@@ -799,27 +813,19 @@ impl TaskEvidenceLedger {
         self.persist_document(&snapshot).await;
     }
 
-    pub(crate) async fn take_finalization_warning(&self) -> Option<String> {
+    pub(crate) async fn finalization_advisory(&self) -> Option<String> {
         if !self.allows_kd4_completion() {
             return None;
         }
-        let gate = self.completion_gate().await?;
+        let gate = {
+            let guard = self.document.lock().await;
+            let document = guard.as_ref()?;
+            task_is_tracked(document)
+                .then(|| derive_completion_gate(document, self.evidence_path.as_deref()))?
+        };
         if gate.status == TaskCompletionStatus::Passed {
             return None;
         }
-        let (should_warn, snapshot) = self
-            .update_document(|document| {
-                if document.repair_turns_used >= 1 {
-                    return None;
-                }
-                document.repair_turns_used += 1;
-                document.updated_at = timestamp();
-                Some(())
-            })
-            .await?;
-        should_warn?;
-        self.persist_document(&snapshot).await;
-
         let reasons = gate.reasons.iter().take(2).cloned().collect::<Vec<_>>();
         let reason_summary = if reasons.is_empty() {
             "evidence is incomplete".to_string()
@@ -833,9 +839,127 @@ impl TaskEvidenceLedger {
             format!("; and {remaining} more")
         };
         Some(format!(
-            "KD4 task evidence is {status}: {reason_summary}{remaining}. No automatic repair turn was started.",
+            "KD4 task evidence is {status}: {reason_summary}{remaining}.",
             status = completion_status_name(gate.status),
         ))
+    }
+
+    pub(crate) async fn host_mutation_revision(&self) -> Option<u64> {
+        if !self.allows_kd4_completion() {
+            return None;
+        }
+        self.document
+            .lock()
+            .await
+            .as_ref()
+            .map(|document| document.host_mutation_revision)
+    }
+
+    pub(crate) async fn completion_review_evidence_summary(
+        &self,
+        gate: &TaskCompletionGate,
+    ) -> String {
+        let mut lines = vec![format!(
+            "Evidence gate: {}",
+            completion_status_name(gate.status)
+        )];
+        lines.extend(
+            gate.reasons
+                .iter()
+                .map(|reason| format!("Gate reason: {reason}")),
+        );
+
+        let guard = self.document.lock().await;
+        let Some(document) = guard.as_ref() else {
+            return lines.join("\n");
+        };
+        for step in &document.plan {
+            lines.push(format!(
+                "Plan step {} [{:?}]: {}",
+                step.id, step.status, step.step
+            ));
+            lines.extend(
+                step.acceptance_criteria
+                    .iter()
+                    .map(|criterion| format!("Acceptance criterion: {criterion}")),
+            );
+        }
+        for snapshot in document.latest_file_hashes.values() {
+            lines.push(format!(
+                "Changed path: {} (exists: {}, sha1: {})",
+                snapshot.path,
+                snapshot.exists,
+                snapshot.sha1.as_deref().unwrap_or("unavailable")
+            ));
+        }
+        let mut prior_epoch_receipt_count = 0usize;
+        for receipt in &document.command_receipts {
+            if receipt.epoch != document.evidence_epoch {
+                prior_epoch_receipt_count = prior_epoch_receipt_count.saturating_add(1);
+                continue;
+            }
+            let outcome = if receipt.timed_out {
+                "timed_out"
+            } else if receipt.exit_code == 0 {
+                "succeeded"
+            } else {
+                "failed"
+            };
+            lines.push(format!(
+                "Command receipt [current epoch {}, outcome: {}, possible mutation: {}]: {}",
+                receipt.epoch,
+                outcome,
+                receipt.possible_mutation,
+                receipt.command.join(" "),
+            ));
+        }
+        if prior_epoch_receipt_count > 0 {
+            lines.push(format!(
+                "Prior-epoch command receipts omitted: {prior_epoch_receipt_count}"
+            ));
+        }
+        lines.join("\n")
+    }
+
+    pub(crate) async fn record_completion_review_audit(
+        &self,
+        turn_id: &str,
+        outcome: &str,
+        failure_category: Option<&str>,
+        finding_summary: Vec<String>,
+        repair_injected: bool,
+    ) -> bool {
+        if !self.allows_kd4_completion() {
+            return false;
+        }
+        let Some(((), snapshot)) = self
+            .update_document(|document| {
+                document
+                    .completion_review_receipts
+                    .push(CompletionReviewAuditReceipt {
+                        turn_id: turn_id.to_string(),
+                        recorded_at: timestamp(),
+                        evidence_epoch: document.evidence_epoch,
+                        outcome: outcome.to_string(),
+                        failure_category: failure_category.map(str::to_string),
+                        finding_summary,
+                        repair_injected,
+                    });
+                trim_to_last(
+                    &mut document.completion_review_receipts,
+                    MAX_COMPLETION_REVIEW_RECEIPTS,
+                );
+                document.updated_at = timestamp();
+            })
+            .await
+        else {
+            return false;
+        };
+        if self.persist_document(&snapshot).await != PersistOutcome::Persisted {
+            warn!("failed to persist observational completion-review audit receipt");
+            return false;
+        }
+        true
     }
 
     pub(crate) async fn completion_gate(&self) -> Option<TaskCompletionGate> {
@@ -1724,7 +1848,7 @@ async fn load_existing_document(
         };
     }
     let schema_version = schema_version as u32;
-    let legacy_completion_model = schema_version < TASK_EVIDENCE_SCHEMA_VERSION
+    let legacy_completion_model = schema_version < TASK_EVIDENCE_COMPLETION_MODEL_VERSION
         || uses_retired_v3_completion_shape(schema_version, &value);
     let document = match serde_json::from_value::<TaskEvidenceDocument>(value) {
         Ok(document) => document,
@@ -1832,7 +1956,7 @@ async fn quarantine_evidence_file(path: &Path, kind: &str) -> io::Result<PathBuf
 
 #[cfg(test)]
 fn migrate_document(document: &mut TaskEvidenceDocument) {
-    let legacy_completion_model = document.schema_version < TASK_EVIDENCE_SCHEMA_VERSION;
+    let legacy_completion_model = document.schema_version < TASK_EVIDENCE_COMPLETION_MODEL_VERSION;
     migrate_document_with_completion_model(document, legacy_completion_model);
 }
 
@@ -2369,7 +2493,6 @@ fn invalidate_for_mutation(document: &mut TaskEvidenceDocument) {
     document.evidence_epoch = document.evidence_epoch.saturating_add(1);
     document.last_mutation_at = Some(timestamp());
     document.desktop_activation_receipt = None;
-    document.repair_turns_used = 0;
     document.completion = None;
     for step in &mut document.plan {
         if step.status == StepStatus::Passed {
@@ -2657,14 +2780,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalization_warning_is_bounded_and_does_not_request_a_turn() {
+    async fn finalization_advisory_is_bounded_and_read_only() {
         let (_temp, ledger) = ledger_fixture().await;
         ledger
             .record_plan_update(&plan(StepStatus::InProgress))
             .await;
-        let warning = ledger.take_finalization_warning().await.expect("warning");
-        assert!(warning.contains("No automatic repair turn was started"));
-        assert!(ledger.take_finalization_warning().await.is_none());
+        let revision = ledger
+            .document
+            .lock()
+            .await
+            .as_ref()
+            .expect("document")
+            .revision;
+        let warning = ledger.finalization_advisory().await.expect("warning");
+        assert!(!warning.contains("No automatic repair turn was started"));
+        assert!(ledger.finalization_advisory().await.is_some());
+        assert_eq!(
+            ledger
+                .document
+                .lock()
+                .await
+                .as_ref()
+                .expect("document")
+                .revision,
+            revision
+        );
     }
 }
 

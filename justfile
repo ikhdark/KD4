@@ -61,12 +61,19 @@ source-search *args:
 # Build the CLI and run the app-server test client in one target lane.
 [unix]
 app-server-test-client *args:
-    cargo build --target-dir target/lanes/app-server-test-client -p codex-cli
-    cargo run --target-dir target/lanes/app-server-test-client -p codex-app-server-test-client -- --codex-bin ./target/lanes/app-server-test-client/debug/codex "$@"
+    {{ python }} ../scripts/rust_build_status.py run-lane --lane app-server-test-client -- just _app-server-test-client-reserved "$@"
 
 [windows]
 app-server-test-client *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = "target\lanes\app-server-test-client"; cargo build --target-dir $target_dir -p codex-cli; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo run --target-dir $target_dir -p codex-app-server-test-client -- --codex-bin ".\$target_dir\debug\codex.exe" @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\cargo-lane.ps1" -Lane app-server-test-client just _app-server-test-client-reserved @forwarded_args
+
+[unix]
+_app-server-test-client-reserved *args:
+    target_dir="${CODEX_CARGO_LANE_TARGET_DIR:?missing Cargo lane reservation}"; unset CODEX_CARGO_LANE_TARGET_DIR; cargo build --target-dir "$target_dir" -p codex-cli && cargo run --target-dir "$target_dir" -p codex-app-server-test-client -- --codex-bin "$target_dir/debug/codex" "$@"
+
+[windows]
+_app-server-test-client-reserved *args:
+    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; cargo build --target-dir $target_dir -p codex-cli; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; cargo run --target-dir $target_dir -p codex-app-server-test-client -- --codex-bin (Join-Path $target_dir "debug\codex.exe") @forwarded_args
 
 # Format the justfile and Rust code for the high-frequency local edit path.
 fmt:
@@ -307,24 +314,32 @@ local-release package:
 # validate different slices without contending on the default Cargo target lock.
 [unix]
 test-lane lane *args:
-    shift; RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local cargo nextest run --target-dir "target/lanes/{{ lane }}" --no-fail-fast "$@"
+    shift; RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=local {{ python }} ../scripts/rust_build_status.py run-lane --lane "{{ lane }}" -- cargo nextest run --no-fail-fast "$@"
 
 [windows]
 test-lane lane *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = "target\lanes\{{ lane }}"; if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed $target_dir @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --target-dir $target_dir --no-fail-fast @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 2); powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\cargo-lane.ps1" -Lane "{{ lane }}" just _test-lane-local-reserved @forwarded_args
 
 [windows]
 test-lane-main *args:
-    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = "target\lanes\main"; if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed $target_dir @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --target-dir $target_dir --no-fail-fast @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 1); powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\cargo-lane.ps1" -Lane main just _test-lane-local-reserved @forwarded_args
 
 # Fast isolated local test loop for parallel validation lanes.
 [unix]
 test-lane-fast lane *args:
-    shift; RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=fast cargo nextest run --target-dir "target/lanes/{{ lane }}" "$@"
+    shift; RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=fast {{ python }} ../scripts/rust_build_status.py run-lane --lane "{{ lane }}" -- cargo nextest run "$@"
 
 [windows]
 test-lane-fast lane *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = "target\lanes\{{ lane }}"; if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed $target_dir @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 2); powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\cargo-lane.ps1" -Lane "{{ lane }}" just _test-lane-fast-reserved @forwarded_args
+
+[windows]
+_test-lane-local-reserved *args:
+    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed $target_dir @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "local"; cargo nextest run --target-dir $target_dir --no-fail-fast @forwarded_args
+
+[windows]
+_test-lane-fast-reserved *args:
+    $forwarded_args = @($args | Select-Object -Skip 1); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; if (($forwarded_args -contains "codex-core") -and (($forwarded_args -contains "-p") -or ($forwarded_args -contains "--package"))) { just _core-test-helpers-if-needed $target_dir @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir @forwarded_args
 
 # Emit nextest timing reports for the selected local test slice.
 [unix]
@@ -351,7 +366,7 @@ validate-crate-full crate:
 
 [unix]
 cargo-lane lane *args:
-    shift; target_dir="target/lanes/{{ lane }}"; if [ "${1:-}" = "cargo" ]; then shift; if [ "${1:-}" = "nextest" ] && { [ "${2:-}" = "run" ] || [ "${2:-}" = "archive" ]; }; then nextest_cmd="$2"; shift 2; cargo nextest "$nextest_cmd" --target-dir "$target_dir" "$@"; elif case "${1:-}" in bench|build|check|clippy|doc|fix|run|rustc|test) true;; *) false;; esac; then cargo_cmd="$1"; shift; cargo "$cargo_cmd" --target-dir "$target_dir" "$@"; else cargo "$@"; fi; else "$@"; fi
+    shift; {{ python }} ../scripts/rust_build_status.py run-lane --lane "{{ lane }}" -- "$@"
 
 [windows]
 cargo-lane lane *args:
@@ -403,15 +418,19 @@ lanes:
 
 [unix]
 test-lane-package package *args:
-    shift; RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=fast cargo nextest run --target-dir "target/lanes/{{ package }}" -p {{ package }} "$@"
+    shift; RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=fast {{ python }} ../scripts/rust_build_status.py run-lane --lane "{{ package }}" -- cargo nextest run -p {{ package }} "$@"
 
 [windows]
 test-lane-package package *args:
-    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = "target\lanes\{{ package }}"; if ("{{ package }}" -eq "codex-core") { just _core-test-helpers-if-needed $target_dir "-p" "{{ package }}" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args
+    $forwarded_args = @($args | Select-Object -Skip 2); powershell -NoProfile -ExecutionPolicy Bypass -File "{{ justfile_directory() }}\scripts\cargo-lane.ps1" -Lane "{{ package }}" just _test-lane-package-reserved "{{ package }}" @forwarded_args
+
+[windows]
+_test-lane-package-reserved package *args:
+    $forwarded_args = @($args | Select-Object -Skip 2); $target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR; Remove-Item Env:CODEX_CARGO_LANE_TARGET_DIR -ErrorAction SilentlyContinue; if ([string]::IsNullOrWhiteSpace($target_dir)) { throw "missing Cargo lane reservation" }; if ("{{ package }}" -eq "codex-core") { just _core-test-helpers-if-needed $target_dir "-p" "{{ package }}" @forwarded_args; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } }; $env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args
 
 [unix]
 check-lane package *args:
-    shift; cargo check --target-dir "target/lanes/{{ package }}" -p {{ package }} "$@"
+    shift; {{ python }} ../scripts/rust_build_status.py run-lane --lane "{{ package }}" -- cargo check -p {{ package }} "$@"
 
 [windows]
 check-lane package *args:
@@ -419,7 +438,7 @@ check-lane package *args:
 
 [unix]
 clippy-lane package *args:
-    shift; cargo clippy --tests --target-dir "target/lanes/{{ package }}" -p {{ package }} "$@"
+    shift; {{ python }} ../scripts/rust_build_status.py run-lane --lane "{{ package }}" -- cargo clippy --tests -p {{ package }} "$@"
 
 [windows]
 clippy-lane package *args:
@@ -427,7 +446,7 @@ clippy-lane package *args:
 
 [unix]
 watch-lane package *args:
-    shift; cargo watch -x "check -p {{ package }} --target-dir target/lanes/{{ package }}" "$@"
+    shift; {{ python }} ../scripts/rust_build_status.py run-lane --lane "{{ package }}" -- cargo watch -x "check -p {{ package }}" "$@"
 
 [windows]
 watch-lane package *args:
@@ -435,7 +454,7 @@ watch-lane package *args:
 
 [unix]
 coverage-lane package *args:
-    shift; cargo llvm-cov --target-dir "target/lanes/{{ package }}" -p {{ package }} "$@"
+    shift; {{ python }} ../scripts/rust_build_status.py run-lane --lane "{{ package }}" -- cargo llvm-cov -p {{ package }} "$@"
 
 [windows]
 coverage-lane package *args:
@@ -444,7 +463,7 @@ coverage-lane package *args:
 # Match the Windows variant: fix only the named package in its own lane.
 [unix]
 fix-lane package *args:
-    shift; cargo clippy --target-dir "target/lanes/{{ package }}" --fix --tests --allow-dirty -p {{ package }} "$@"
+    shift; {{ python }} ../scripts/rust_build_status.py run-lane --lane "{{ package }}" -- cargo clippy --fix --tests --allow-dirty -p {{ package }} "$@"
 
 [windows]
 fix-lane package *args:
@@ -452,7 +471,7 @@ fix-lane package *args:
 
 [unix]
 release-lane *args:
-    cargo build --release --target-dir target/lanes/release "$@"
+    {{ python }} ../scripts/rust_build_status.py run-lane --lane release -- cargo build --release "$@"
 
 [windows]
 release-lane *args:

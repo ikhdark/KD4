@@ -43,6 +43,7 @@ export type CodexExecArgs = {
 const INTERNAL_ORIGINATOR_ENV = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
 const TYPESCRIPT_SDK_ORIGINATOR = "codex_sdk_ts";
 const CODEX_NPM_NAME = "@openai/codex";
+const CHILD_TERMINATION_GRACE_MS = 1_000;
 
 const PLATFORM_PACKAGE_BY_TARGET: Record<string, string> = {
   "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
@@ -184,6 +185,7 @@ export class CodexExec {
     });
 
     let spawnError: unknown | null = null;
+    let processExited = false;
     child.once("error", (err) => (spawnError = err));
 
     if (!child.stdin) {
@@ -208,6 +210,7 @@ export class CodexExec {
     const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
       (resolve) => {
         child.once("exit", (code, signal) => {
+          processExited = true;
           resolve({ code, signal });
         });
       },
@@ -233,14 +236,40 @@ export class CodexExec {
       }
     } finally {
       rl.close();
-      child.removeAllListeners();
       try {
-        if (!child.killed) child.kill();
+        if (!processExited) child.kill("SIGTERM");
       } catch {
         // ignore
       }
+      if (!spawnError && !processExited) {
+        const exitedGracefully = await resolvesBeforeDeadline(
+          exitPromise,
+          CHILD_TERMINATION_GRACE_MS,
+        );
+        if (!exitedGracefully && !processExited) {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // ignore
+          }
+          if (!processExited) {
+            await resolvesBeforeDeadline(exitPromise, CHILD_TERMINATION_GRACE_MS);
+          }
+        }
+      }
+      child.removeAllListeners();
     }
   }
+}
+
+function resolvesBeforeDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(false), timeoutMs);
+    void promise.then(() => {
+      clearTimeout(timeout);
+      resolve(true);
+    });
+  });
 }
 
 function serializeConfigOverrides(configOverrides: CodexConfigObject): string[] {

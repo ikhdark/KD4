@@ -164,6 +164,9 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
+    let initial_host_mutation_revision = sess.services.task_evidence.host_mutation_revision().await;
+    let mut completion_review_state =
+        crate::tasks::completion_review::CompletionReviewState::default();
     let mut preparation_timing_guard = Some(
         turn_context
             .turn_timing_state
@@ -451,20 +454,42 @@ pub(crate) async fn run_turn(
                             .await;
                         }
                     }
-                    if let Some(warning) = sess
-                        .services
-                        .task_evidence
-                        .take_finalization_warning()
-                        .await
-                    {
+                    if stop_outcome.should_stop {
+                        break;
+                    }
+                    let review_outcome =
+                        crate::tasks::completion_review::coordinate_completion_review(
+                            &sess,
+                            &turn_context,
+                            &cancellation_token,
+                            initial_host_mutation_revision,
+                            last_agent_message.as_deref(),
+                            &mut completion_review_state,
+                        )
+                        .await?;
+                    if let Some(warning) = review_outcome.advisory {
                         sess.send_event(
                             &turn_context,
                             EventMsg::Warning(WarningEvent { message: warning }),
                         )
                         .await;
                     }
-                    if stop_outcome.should_stop {
-                        break;
+                    if !review_outcome.partial_reasons.is_empty() {
+                        let turn_state = {
+                            let active_turn = sess.active_turn.lock().await;
+                            active_turn
+                                .as_ref()
+                                .map(|active_turn| Arc::clone(&active_turn.turn_state))
+                        };
+                        if let Some(turn_state) = turn_state {
+                            let mut turn_state = turn_state.lock().await;
+                            for reason in review_outcome.partial_reasons {
+                                turn_state.record_completion_review_partial_reason(reason);
+                            }
+                        }
+                    }
+                    if review_outcome.repair_injected {
+                        continue;
                     }
                     if run_legacy_after_agent_hook(
                         &sess,

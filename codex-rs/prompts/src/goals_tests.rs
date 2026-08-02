@@ -19,12 +19,12 @@ fn continuation_prompt_allows_complete_and_strict_blocked_updates() {
     assert!(prompt.contains("finish the stack"));
     assert!(prompt.contains("<objective>\nfinish the stack\n</objective>"));
     assert!(prompt.contains("Token budget: 10000"));
-    assert!(prompt.contains("call update_goal with status \"complete\""));
-    assert!(prompt.contains("status \"blocked\""));
+    assert!(prompt.contains("Call `update_goal` with status `\"complete\"`"));
+    assert!(prompt.contains("status `\"blocked\"`"));
     assert!(prompt.contains("at least three consecutive goal turns"));
     assert!(prompt.contains("same blocking condition"));
-    assert!(prompt.contains("original/user-triggered turn"));
-    assert!(prompt.contains("truly at an impasse"));
+    assert!(prompt.contains("original user-triggered turn"));
+    assert!(prompt.contains("no meaningful progress"));
     assert!(!prompt.contains("budgetLimited"));
     assert!(!prompt.contains("status \"paused\""));
 }
@@ -117,4 +117,47 @@ fn goal_prompts_escape_objective_delimiters() {
         assert!(prompt.contains(&escaped_objective));
         assert!(!prompt.contains(objective));
     }
+}
+
+#[test]
+fn goal_objective_rendering_is_hard_capped_after_escaping() {
+    let objective = "<&> objective ".repeat(MAX_RENDERED_GOAL_OBJECTIVE_BYTES);
+    let rendered = bounded_goal_objective(&objective);
+
+    assert!(rendered.len() <= MAX_RENDERED_GOAL_OBJECTIVE_BYTES);
+    assert!(rendered.ends_with(GOAL_OBJECTIVE_TRUNCATED_MARKER));
+    assert!(!rendered.contains("<&>"));
+    assert!(!rendered[..rendered.len() - GOAL_OBJECTIVE_TRUNCATED_MARKER.len()].ends_with("&am"));
+}
+
+#[test]
+fn protocol_maximum_objective_survives_worst_case_escaping() {
+    let objective = format!(
+        "{}TAIL",
+        "&".repeat(MAX_THREAD_GOAL_OBJECTIVE_CHARS - "TAIL".chars().count())
+    );
+    let goal = |status| ThreadGoal {
+        thread_id: ThreadId::new(),
+        objective: objective.clone(),
+        status,
+        token_budget: Some(10_000),
+        tokens_used: 1_000,
+        time_used_seconds: 56,
+        created_at: 1,
+        updated_at: 2,
+    };
+
+    for prompt in [
+        continuation_prompt(&goal(ThreadGoalStatus::Active)),
+        budget_limit_prompt(&goal(ThreadGoalStatus::BudgetLimited)),
+        objective_updated_prompt(&goal(ThreadGoalStatus::Active)),
+    ] {
+        assert!(prompt.contains("TAIL"));
+        assert!(!prompt.contains(GOAL_OBJECTIVE_TRUNCATED_MARKER));
+    }
+}
+
+#[test]
+fn continuation_template_stays_within_size_ceiling() {
+    assert!(include_str!("../templates/goals/continuation.md").len() <= 3_500);
 }

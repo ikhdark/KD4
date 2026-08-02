@@ -1,4 +1,5 @@
 mod compact;
+pub(crate) mod completion_review;
 mod lifecycle;
 mod regular;
 mod review;
@@ -711,6 +712,10 @@ impl Session {
 
     async fn finalize_turn_terminal(self: &Arc<Self>, finalization: &mut TerminalFinalization) {
         let turn_context = Arc::clone(&finalization.task.turn_context);
+        self.services
+            .command_execution
+            .cancel_mutations_for_turn(&turn_context.sub_id)
+            .await;
         turn_context
             .turn_metadata_state
             .cancel_git_enrichment_task();
@@ -821,12 +826,18 @@ impl Session {
             }
         }
 
-        let (turn_had_memory_citation, turn_tool_calls, token_usage_at_turn_start) = {
+        let (
+            turn_had_memory_citation,
+            turn_tool_calls,
+            token_usage_at_turn_start,
+            completion_review_partial_reasons,
+        ) = {
             let ts = finalization.turn_state.lock().await;
             (
                 ts.has_memory_citation,
                 ts.tool_calls,
                 ts.token_usage_at_turn_start.clone(),
+                ts.completion_review_partial_reasons(),
             )
         };
         // Emit token usage metrics.
@@ -960,9 +971,22 @@ impl Session {
             ) =
                 (coordinator.store(), coordinator.root_session_id())
             {
-                match store.check_quiescence(root_session_id).await {
-                    Ok(status) => {
-                        let reason = (!status.quiescent).then(|| {
+                if let Err(error) = self
+                    .services
+                    .agent_control
+                    .reconcile_live_typed_actor_heartbeats()
+                    .await
+                {
+                    (
+                        Some(format!(
+                            "linked typed work liveness could not be reconciled: {error}"
+                        )),
+                        Vec::new(),
+                    )
+                } else {
+                    match store.check_quiescence(root_session_id).await {
+                        Ok(status) => {
+                            let reason = (!status.quiescent).then(|| {
                                 format!(
                                     "linked typed work is not quiescent: active assignments [{}]; running validations [{}]; pending gates [{}]; active claims [{}]; active mutation leases [{}]",
                                     status
@@ -987,14 +1011,15 @@ impl Session {
                                     status.active_mutation_lease_ids.join(", "),
                                 )
                             });
-                        (reason, status.warnings)
+                            (reason, status.warnings)
+                        }
+                        Err(error) => (
+                            Some(format!(
+                                "linked typed-work quiescence could not be established: {error}"
+                            )),
+                            Vec::new(),
+                        ),
                     }
-                    Err(error) => (
-                        Some(format!(
-                            "linked typed-work quiescence could not be established: {error}"
-                        )),
-                        Vec::new(),
-                    ),
                 }
             } else {
                 (None, Vec::new())
@@ -1021,6 +1046,18 @@ impl Session {
                     }
                 }
             }
+        }
+        if abort_reason.is_none() {
+            merge_completion_review_partial(&mut completion, completion_review_partial_reasons);
+        }
+        if abort_reason.is_none()
+            && !turn_context.session_source.is_non_root_agent()
+            && completion
+                .as_ref()
+                .is_some_and(|gate| gate.status == TaskCompletionStatus::Passed)
+        {
+            self.set_last_passed_root_completion_turn_id(Some(turn_context.sub_id.clone()))
+                .await;
         }
         if let Some(reason) = abort_reason.as_ref() {
             self.emit_turn_abort_lifecycle(reason.clone(), turn_context.extension_data.as_ref())
@@ -1161,6 +1198,10 @@ impl Session {
         finalization: &mut TerminalFinalization,
     ) {
         let turn_context = Arc::clone(&finalization.task.turn_context);
+        self.services
+            .command_execution
+            .cancel_mutations_for_turn(&turn_context.sub_id)
+            .await;
         finalization.task.cancellation_token.cancel();
         finalization.task.worker_abort_handle.abort();
         turn_context
@@ -1256,6 +1297,32 @@ impl Session {
         }
         if let Err(err) = self.flush_rollout().await {
             warn!("failed to flush rollout after fail-safe terminal event: {err}");
+        }
+    }
+}
+
+fn merge_completion_review_partial(
+    completion: &mut Option<TaskCompletionGate>,
+    partial_reasons: Vec<String>,
+) {
+    if partial_reasons.is_empty() {
+        return;
+    }
+    match completion.as_mut() {
+        Some(gate) => {
+            if gate.status == TaskCompletionStatus::Passed {
+                gate.status = TaskCompletionStatus::Partial;
+            }
+            gate.reasons.extend(partial_reasons);
+            gate.reasons.sort();
+            gate.reasons.dedup();
+        }
+        None => {
+            *completion = Some(TaskCompletionGate {
+                status: TaskCompletionStatus::Partial,
+                reasons: partial_reasons,
+                evidence_path: None,
+            });
         }
     }
 }

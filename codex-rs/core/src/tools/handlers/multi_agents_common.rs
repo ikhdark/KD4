@@ -1,4 +1,4 @@
-use crate::agent::role::AgentRoleModelLocks;
+use crate::agent::role::AgentRoleLocks;
 use crate::config::Config;
 use crate::config::DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS;
 use crate::config::HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS;
@@ -190,7 +190,7 @@ fn build_agent_shared_config(turn: &TurnContext) -> Result<Config, FunctionCallE
         .or_else(|| turn.model_info.default_reasoning_level.clone());
     config.model_reasoning_summary = Some(turn.reasoning_summary);
     config.developer_instructions = turn.developer_instructions.clone();
-    apply_spawn_agent_runtime_overrides(&mut config, turn)?;
+    apply_spawn_agent_runtime_overrides(&mut config, turn, AgentRoleLocks::default())?;
 
     Ok(config)
 }
@@ -211,10 +211,12 @@ pub(crate) fn reject_full_fork_spawn_overrides(
 /// Copies runtime-only turn state onto a child config before it is handed to `AgentControl`.
 ///
 /// These values are chosen by the live turn rather than persisted config, so leaving them stale
-/// can make a child agent disagree with its parent about approval policy, cwd, or sandboxing.
+/// can make a child agent disagree with its parent about approval policy, cwd, or sandboxing. A
+/// permission profile explicitly supplied by the role remains authoritative.
 pub(crate) fn apply_spawn_agent_runtime_overrides(
     config: &mut Config,
     turn: &TurnContext,
+    role_locks: AgentRoleLocks,
 ) -> Result<(), FunctionCallError> {
     config
         .permissions
@@ -227,12 +229,14 @@ pub(crate) fn apply_spawn_agent_runtime_overrides(
     #[allow(deprecated)]
     let turn_cwd = turn.cwd.clone();
     config.cwd = turn_cwd;
-    config
-        .permissions
-        .set_permission_profile(turn.permission_profile())
-        .map_err(|err| {
-            FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
-        })?;
+    if !role_locks.permissions {
+        config
+            .permissions
+            .set_permission_profile(turn.permission_profile())
+            .map_err(|err| {
+                FunctionCallError::RespondToModel(format!("permission_profile is invalid: {err}"))
+            })?;
+    }
     Ok(())
 }
 
@@ -248,10 +252,10 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     config: &mut Config,
     requested_model: Option<&str>,
     requested_reasoning_effort: Option<ReasoningEffort>,
-    role_model_locks: AgentRoleModelLocks,
+    role_locks: AgentRoleLocks,
 ) -> Result<(), FunctionCallError> {
     let models_manager = models_manager_for_spawn_config(session, turn, config);
-    let selected_model_name = if role_model_locks.model {
+    let selected_model_name = if role_locks.model {
         config.model.clone().ok_or_else(|| {
             FunctionCallError::RespondToModel(
                 "spawn_agent role did not resolve its configured model".to_string(),
@@ -270,7 +274,7 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
     };
 
     config.model = Some(selected_model_name.clone());
-    let reasoning_effort = if role_model_locks.reasoning_effort {
+    let reasoning_effort = if role_locks.reasoning_effort {
         config.model_reasoning_effort.clone().ok_or_else(|| {
             FunctionCallError::RespondToModel(
                 "spawn_agent role did not resolve its configured reasoning effort".to_string(),
@@ -284,7 +288,7 @@ pub(crate) async fn apply_spawn_agent_model_defaults_and_overrides(
         .await;
     // Fallback metadata has no authoritative effort list. Preserve an explicit role-owned effort
     // for custom models while still validating every catalog-backed final pair.
-    if !role_model_locks.reasoning_effort || !selected_model_info.used_fallback_model_metadata {
+    if !role_locks.reasoning_effort || !selected_model_info.used_fallback_model_metadata {
         validate_spawn_agent_reasoning_effort(
             &selected_model_name,
             &selected_model_info.supported_reasoning_levels,

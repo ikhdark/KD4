@@ -1,3 +1,4 @@
+use super::PendingSpawnRegistration;
 use super::ProcessEntry;
 use super::UNIFIED_EXEC_OUTPUT_MAX_BYTES;
 use super::UnifiedExecContext;
@@ -7,6 +8,7 @@ use super::async_watcher::resolve_aggregated_output;
 use super::async_watcher::start_streaming_output;
 use super::head_tail_buffer::HeadTailBuffer;
 use super::process::UnifiedExecProcess;
+use super::process_manager::PendingProcessRegistration;
 use crate::function_tool::FunctionCallError;
 use crate::session::session::Session;
 use crate::session::step_context::StepContext;
@@ -140,7 +142,7 @@ impl ExecProcess for MockExecProcess {
 async fn remote_process(
     write_status: WriteStatus,
     terminate_error: Option<String>,
-) -> UnifiedExecProcess {
+) -> Arc<UnifiedExecProcess> {
     remote_process_with_termination_control(write_status, terminate_error, None).await
 }
 
@@ -148,7 +150,7 @@ async fn remote_process_with_termination_control(
     write_status: WriteStatus,
     terminate_error: Option<String>,
     termination_control: Option<Arc<TerminationControl>>,
-) -> UnifiedExecProcess {
+) -> Arc<UnifiedExecProcess> {
     let (wake_tx, _wake_rx) = watch::channel(0);
     let started = StartedExecProcess {
         process: Arc::new(MockExecProcess {
@@ -163,9 +165,13 @@ async fn remote_process_with_termination_control(
         }),
     };
 
-    UnifiedExecProcess::from_exec_server_started(started, None)
-        .await
-        .expect("remote process should start")
+    UnifiedExecProcess::from_exec_server_started(
+        started,
+        None,
+        &PendingSpawnRegistration::default(),
+    )
+    .await
+    .expect("remote process should start")
 }
 
 async fn store_process_for_test(
@@ -297,19 +303,189 @@ async fn remote_terminate_confirmed_updates_state_on_success_only() {
 }
 
 #[tokio::test]
+async fn spawned_process_is_retained_when_constructor_future_is_cancelled() {
+    let termination_control = Arc::new(TerminationControl::new());
+    let (wake_tx, _wake_rx) = watch::channel(0);
+    let started = StartedExecProcess {
+        process: Arc::new(MockExecProcess {
+            process_id: "cancelled-constructor".to_string().into(),
+            write_response: WriteResponse {
+                status: WriteStatus::Accepted,
+            },
+            read_responses: Mutex::new(VecDeque::new()),
+            terminate_error: None,
+            termination_control: Some(Arc::clone(&termination_control)),
+            wake_tx,
+        }),
+    };
+    let pending_spawns = PendingSpawnRegistration::default();
+    let mut constructor = Box::pin(UnifiedExecProcess::from_exec_server_started(
+        started,
+        None,
+        &pending_spawns,
+    ));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut constructor)
+            .await
+            .is_err(),
+        "constructor should still be inside the early-exit grace period"
+    );
+    drop(constructor);
+    let retained = pending_spawns.snapshot();
+    assert_eq!(retained.len(), 1);
+
+    let process = Arc::clone(&retained[0]);
+    let terminate_task = tokio::spawn(async move { process.terminate_confirmed().await });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        termination_control.started.notified(),
+    )
+    .await
+    .expect("confirmed termination starts");
+    assert!(!termination_control.completed.load(Ordering::Acquire));
+    termination_control
+        .allowed
+        .send(true)
+        .expect("termination waiter remains subscribed");
+    terminate_task
+        .await
+        .expect("termination task joins")
+        .expect("termination succeeds");
+    assert!(termination_control.completed.load(Ordering::Acquire));
+    pending_spawns.clear();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed() {
+    let (session, turn) = make_session_and_context().await;
+    let session = Arc::new(session);
+    let turn = Arc::new(turn);
+    let manager = &session.services.unified_exec_manager;
+    let process_id = 4_242;
+    let termination_control = Arc::new(TerminationControl::new());
+    let process = remote_process_with_termination_control(
+        WriteStatus::Accepted,
+        /*terminate_error*/ None,
+        Some(Arc::clone(&termination_control)),
+    )
+    .await;
+    let active = Arc::new(AtomicBool::new(true));
+    #[allow(deprecated)]
+    let cwd = turn.cwd.clone().into();
+    manager.process_store.lock().await.processes.insert(
+        process_id,
+        ProcessEntry {
+            process: Arc::clone(&process),
+            call_id: "cancelled-startup".to_string(),
+            process_id,
+            cwd,
+            initial_exec_command_active: Arc::clone(&active),
+            hook_command: "blocking-test".to_string(),
+            tty: false,
+            network_approval: None,
+            session: Arc::downgrade(&session),
+            last_used: Instant::now(),
+        },
+    );
+    let attempt_key = crate::tools::command_execution::CommandAttemptKey::new(
+        "exec_command",
+        "test",
+        "test-cwd",
+        &["blocking-test".to_string()],
+    );
+    session
+        .services
+        .command_execution
+        .track_running_process(
+            process_id,
+            attempt_key.clone(),
+            crate::tools::command_output_artifact::RawOutputArtifact::unavailable(
+                "cancelled startup fixture",
+            ),
+            turn.sub_id.clone(),
+            None,
+        )
+        .await;
+    let context =
+        UnifiedExecContext::new(Arc::clone(&session), Arc::clone(&turn), "call".to_string());
+    let mut registration = PendingProcessRegistration::new(
+        Arc::clone(&manager.process_store),
+        &context,
+        attempt_key,
+        process_id,
+        None,
+    );
+    registration.attach_process(Arc::clone(&process), None);
+    registration.set_initial_exec_command_active(Arc::clone(&active));
+
+    drop(registration);
+
+    assert!(!active.load(Ordering::Acquire));
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        termination_control.started.notified(),
+    )
+    .await
+    .expect("termination starts");
+    assert!(
+        manager
+            .process_store
+            .lock()
+            .await
+            .processes
+            .contains_key(&process_id)
+    );
+    assert!(
+        session
+            .services
+            .command_execution
+            .running_process(process_id)
+            .await
+            .is_some()
+    );
+
+    termination_control
+        .allowed
+        .send(true)
+        .expect("termination waiters remain subscribed");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !manager
+                .process_store
+                .lock()
+                .await
+                .processes
+                .contains_key(&process_id)
+                && session
+                    .services
+                    .command_execution
+                    .running_process(process_id)
+                    .await
+                    .is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cleanup finishes after termination confirmation");
+    assert!(termination_control.completed.load(Ordering::Acquire));
+}
+
+#[tokio::test]
 async fn terminate_all_processes_confirms_remote_termination_for_failed_process() {
     let manager = Arc::new(UnifiedExecProcessManager::default());
     let (session, turn) = make_session_and_context().await;
     let session = Arc::new(session);
     let termination_control = Arc::new(TerminationControl::new());
-    let process = Arc::new(
-        remote_process_with_termination_control(
-            WriteStatus::Accepted,
-            /*terminate_error*/ None,
-            Some(Arc::clone(&termination_control)),
-        )
-        .await,
-    );
+    let process = remote_process_with_termination_control(
+        WriteStatus::Accepted,
+        /*terminate_error*/ None,
+        Some(Arc::clone(&termination_control)),
+    )
+    .await;
     store_process_for_test(&manager, &session, &turn, 1000, Arc::clone(&process)).await;
 
     process.fail_and_terminate("test failure".to_string());
@@ -440,8 +616,8 @@ async fn independent_process_polls_do_not_share_an_interaction_lock() {
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     let manager = &session.services.unified_exec_manager;
-    let process_a = Arc::new(remote_process(WriteStatus::Accepted, None).await);
-    let process_b = Arc::new(remote_process(WriteStatus::Accepted, None).await);
+    let process_a = remote_process(WriteStatus::Accepted, None).await;
+    let process_b = remote_process(WriteStatus::Accepted, None).await;
     store_process_for_test(manager, &session, &turn, 1001, Arc::clone(&process_a)).await;
     store_process_for_test(manager, &session, &turn, 1002, Arc::clone(&process_b)).await;
 
@@ -488,7 +664,7 @@ async fn concurrent_completed_process_polls_emit_one_completion_and_post_hook() 
     let session = Arc::new(session);
     let turn = Arc::new(turn);
     let manager = &session.services.unified_exec_manager;
-    let process = Arc::new(remote_process(WriteStatus::Accepted, None).await);
+    let process = remote_process(WriteStatus::Accepted, None).await;
     store_process_for_test(manager, &session, &turn, 1003, Arc::clone(&process)).await;
 
     let interaction_guard = process.interaction_lock().lock_owned().await;

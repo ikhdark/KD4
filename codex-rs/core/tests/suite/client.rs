@@ -1729,8 +1729,7 @@ async fn includes_apps_guidance_as_developer_message_for_chatgpt_auth() {
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
 
     let request = resp_mock.single_request();
-    let apps_snippet =
-        "Apps (Connectors) can be explicitly triggered in user messages in the format";
+    let apps_snippet = "Apps expose MCP tools through the";
 
     assert!(
         message_input_text_contains(&request, "developer", apps_snippet),

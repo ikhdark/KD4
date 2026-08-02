@@ -70,6 +70,50 @@ function Write-CleanupLog {
     }
 }
 
+function Get-SafeTrashDirectory {
+    param([string]$CandidatePath)
+
+    try {
+        $item = Get-Item -LiteralPath $CandidatePath -Force -ErrorAction Stop
+        if ($item.Name -notmatch "\.trash-\d{17}$") {
+            Write-CleanupLog ("skipped path with a non-trash name: {0}" -f $item.FullName)
+            return $null
+        }
+        if (-not $item.PSIsContainer) {
+            Write-CleanupLog ("skipped non-directory trash path: {0}" -f $item.FullName)
+            return $null
+        }
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            Write-CleanupLog ("skipped reparse-point trash directory: {0}" -f $item.FullName)
+            return $null
+        }
+        if (-not (Test-IsChildPath -ChildPath $item.FullName -ParentPath $root)) {
+            Write-CleanupLog ("skipped trash directory outside lanes root: {0}" -f $item.FullName)
+            return $null
+        }
+        return $item
+    }
+    catch [System.Management.Automation.ItemNotFoundException] {
+        return $null
+    }
+    catch {
+        Write-CleanupLog ("skipped unreadable trash path {0}: {1}" -f $CandidatePath, $_.Exception.Message)
+        return $null
+    }
+}
+
+function Get-SafeTrashDirectories {
+    $safe = @()
+    $candidates = @(Get-ChildItem -LiteralPath $root -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "\.trash-\d{17}$" })
+    foreach ($candidate in $candidates) {
+        $current = Get-SafeTrashDirectory -CandidatePath $candidate.FullName
+        if ($null -ne $current) {
+            $safe += $current
+        }
+    }
+    return @($safe | Sort-Object -Property LastWriteTimeUtc)
+}
+
 $lockStream = $null
 try {
     try {
@@ -85,25 +129,27 @@ try {
     }
 
     for ($pass = 1; $pass -le $MaxPasses; $pass++) {
-        $trashDirs = @(Get-ChildItem -LiteralPath $root -Directory -Filter "*.trash-*" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "\.trash-\d{17}$" } | Sort-Object -Property LastWriteTimeUtc)
+        $trashDirs = @(Get-SafeTrashDirectories)
         if ($trashDirs.Count -eq 0) {
             break
         }
 
         foreach ($trash in $trashDirs) {
             try {
-                if (-not (Test-IsChildPath -ChildPath $trash.FullName -ParentPath $root)) {
-                    Write-CleanupLog ("skipped trash directory outside lanes root: {0}" -f $trash.FullName)
+                # Re-fetch and revalidate immediately before the destructive
+                # operation instead of trusting the earlier enumeration.
+                $currentTrash = Get-SafeTrashDirectory -CandidatePath $trash.FullName
+                if ($null -eq $currentTrash) {
                     continue
                 }
-                Remove-Item -LiteralPath $trash.FullName -Recurse -Force -ErrorAction Stop
+                Remove-Item -LiteralPath $currentTrash.FullName -Recurse -Force -ErrorAction Stop
             }
             catch {
                 Write-CleanupLog ("failed attempt {0}/{1}: {2}: {3}" -f $pass, $MaxPasses, $trash.FullName, $_.Exception.Message)
             }
         }
 
-        $remainingAfterPass = @(Get-ChildItem -LiteralPath $root -Directory -Filter "*.trash-*" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "\.trash-\d{17}$" })
+        $remainingAfterPass = @(Get-SafeTrashDirectories)
         if ($remainingAfterPass.Count -eq 0) {
             break
         }
@@ -112,7 +158,7 @@ try {
         }
     }
 
-    $remaining = @(Get-ChildItem -LiteralPath $root -Directory -Filter "*.trash-*" -ErrorAction SilentlyContinue | Where-Object { $_.Name -match "\.trash-\d{17}$" })
+    $remaining = @(Get-SafeTrashDirectories)
     if ($remaining.Count -gt 0) {
         Write-CleanupLog ("remaining trash directories after cleanup worker: {0}" -f $remaining.Count)
     }

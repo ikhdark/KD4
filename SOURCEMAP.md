@@ -129,6 +129,7 @@ below.
 | `.npmrc` | npm and pnpm behavior used by the JavaScript workspace |
 | `AGENTS.md`, `SOURCEMAP.md` | Repository-wide editing policy and this cross-cutting ownership contract |
 | `CHANGELOG.md`, `LICENSE`, `NOTICE` | Release history and legal notices |
+| `REPOSITORY_AUDIT.txt`, `WORKING_TREE_AUDIT.txt` | Historical fork-delta and working-tree audit records used as evidence and risk indexes |
 | `flake.nix`, `flake.lock` | Nix development/build environment and its locked inputs |
 | `justfile`, `kd4_features.toml` | Preferred command router and KD4 feature inventory |
 | `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml` | Root maintenance commands, JavaScript dependency state, and workspace membership |

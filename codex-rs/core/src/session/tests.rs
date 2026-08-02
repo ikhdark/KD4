@@ -278,6 +278,34 @@ async fn paginated_turn_context_assigns_missing_response_item_ids_without_featur
     );
 }
 
+#[tokio::test]
+async fn completion_review_private_slot_fails_open_while_occupied_and_is_reusable() {
+    let (session, _turn_context) = make_session_and_context().await;
+    let normal_control = session
+        .services
+        .agent_control
+        .clone()
+        .with_session_id(session.session_id(), /*max_threads*/ 1);
+    let normal_source = codex_protocol::protocol::SessionSource::SubAgent(
+        codex_protocol::protocol::SubAgentSource::Other("capacity-test".to_string()),
+    );
+    let _normal_permit = normal_control
+        .reserve_execution_capacity(MultiAgentVersion::V2, &normal_source)
+        .expect("reserve normal agent capacity")
+        .expect("normal agent permit");
+    assert!(matches!(
+        normal_control.reserve_execution_capacity(MultiAgentVersion::V2, &normal_source),
+        Err(codex_protocol::error::CodexErr::AgentLimitReached { max_threads: 1 })
+    ));
+
+    let permit = session
+        .try_acquire_completion_review_slot()
+        .expect("private reviewer slot");
+    assert!(session.try_acquire_completion_review_slot().is_none());
+    drop(permit);
+    assert!(session.try_acquire_completion_review_slot().is_some());
+}
+
 fn assistant_message(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: None,
@@ -5643,6 +5671,7 @@ pub(crate) async fn make_session_and_context() -> (Session, TurnContext) {
         shutting_down: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
+        completion_review_slot: Semaphore::new(/*permits*/ 1),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     };
@@ -7789,6 +7818,7 @@ where
         shutting_down: std::sync::atomic::AtomicBool::new(false),
         input_queue: super::input_queue::InputQueue::new(),
         guardian_review_session: crate::guardian::GuardianReviewSessionManager::default(),
+        completion_review_slot: Semaphore::new(/*permits*/ 1),
         services,
         next_internal_sub_id: AtomicU64::new(0),
     });

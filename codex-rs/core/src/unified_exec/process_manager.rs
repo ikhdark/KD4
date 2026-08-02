@@ -38,6 +38,7 @@ use crate::unified_exec::MAX_UNIFIED_EXEC_PROCESSES;
 use crate::unified_exec::MAX_YIELD_TIME_MS;
 use crate::unified_exec::MIN_EMPTY_YIELD_TIME_MS;
 use crate::unified_exec::MIN_YIELD_TIME_MS;
+use crate::unified_exec::PendingSpawnRegistration;
 use crate::unified_exec::ProcessEntry;
 use crate::unified_exec::ProcessIdReservation;
 use crate::unified_exec::ProcessStore;
@@ -239,6 +240,228 @@ impl Drop for InitialExecCommandGuard {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
     }
+}
+
+pub(super) struct PendingProcessRegistration {
+    process_store: Arc<tokio::sync::Mutex<ProcessStore>>,
+    session: Arc<crate::session::session::Session>,
+    attempt_key: crate::tools::command_execution::CommandAttemptKey,
+    process_id: i32,
+    workspace_mutation: Option<crate::tools::command_execution::RunningWorkspaceMutation>,
+    pending_spawns: PendingSpawnRegistration,
+    primary_process: Option<Arc<UnifiedExecProcess>>,
+    network_approval: Option<DeferredNetworkApproval>,
+    initial_exec_command_active: Option<Arc<AtomicBool>>,
+    committed: bool,
+}
+
+#[derive(Clone)]
+struct PendingProcessCleanup {
+    process_store: Arc<tokio::sync::Mutex<ProcessStore>>,
+    session: Arc<crate::session::session::Session>,
+    attempt_key: crate::tools::command_execution::CommandAttemptKey,
+    process_id: i32,
+    workspace_mutation: Option<crate::tools::command_execution::RunningWorkspaceMutation>,
+    processes: Vec<PendingProcessToTerminate>,
+    primary_process: Option<Arc<UnifiedExecProcess>>,
+    network_approval: Option<DeferredNetworkApproval>,
+}
+
+#[derive(Clone)]
+struct PendingProcessToTerminate {
+    process: Arc<UnifiedExecProcess>,
+    requires_confirmed_termination: bool,
+}
+
+impl PendingProcessRegistration {
+    pub(super) fn new(
+        process_store: Arc<tokio::sync::Mutex<ProcessStore>>,
+        context: &UnifiedExecContext,
+        attempt_key: crate::tools::command_execution::CommandAttemptKey,
+        process_id: i32,
+        workspace_mutation: Option<crate::tools::command_execution::RunningWorkspaceMutation>,
+    ) -> Self {
+        Self {
+            process_store,
+            session: Arc::clone(&context.session),
+            attempt_key,
+            process_id,
+            workspace_mutation,
+            pending_spawns: PendingSpawnRegistration::default(),
+            primary_process: None,
+            network_approval: None,
+            initial_exec_command_active: None,
+            committed: false,
+        }
+    }
+
+    pub(super) fn pending_spawns(&self) -> PendingSpawnRegistration {
+        self.pending_spawns.clone()
+    }
+
+    pub(super) fn attach_process(
+        &mut self,
+        process: Arc<UnifiedExecProcess>,
+        network_approval: Option<DeferredNetworkApproval>,
+    ) {
+        self.primary_process = Some(process);
+        self.network_approval = network_approval;
+    }
+
+    pub(super) fn set_initial_exec_command_active(&mut self, active: Arc<AtomicBool>) {
+        self.initial_exec_command_active = Some(active);
+    }
+
+    fn lease_lost_token(&self) -> Option<CancellationToken> {
+        self.workspace_mutation
+            .as_ref()
+            .map(crate::tools::command_execution::RunningWorkspaceMutation::lease_lost_token)
+    }
+
+    fn cleanup_payload(&self) -> PendingProcessCleanup {
+        let mut processes = self.pending_spawns.snapshot();
+        if let Some(primary_process) = self.primary_process.as_ref()
+            && !processes
+                .iter()
+                .any(|process| Arc::ptr_eq(process, primary_process))
+        {
+            processes.push(Arc::clone(primary_process));
+        }
+        let processes = processes
+            .into_iter()
+            .map(|process| PendingProcessToTerminate {
+                requires_confirmed_termination: !process.has_exited(),
+                process,
+            })
+            .collect();
+        PendingProcessCleanup {
+            process_store: Arc::clone(&self.process_store),
+            session: Arc::clone(&self.session),
+            attempt_key: self.attempt_key.clone(),
+            process_id: self.process_id,
+            workspace_mutation: self.workspace_mutation.clone(),
+            processes,
+            primary_process: self.primary_process.clone(),
+            network_approval: self.network_approval.clone(),
+        }
+    }
+
+    async fn cleanup(&mut self) -> Result<(), String> {
+        if let Some(active) = self.initial_exec_command_active.as_ref() {
+            active.store(false, Ordering::Release);
+        }
+        cleanup_pending_process_registration(self.cleanup_payload()).await?;
+        self.committed = true;
+        self.workspace_mutation.take();
+        self.pending_spawns.clear();
+        Ok(())
+    }
+
+    fn commit(&mut self) {
+        self.committed = true;
+        self.workspace_mutation.take();
+        self.pending_spawns.clear();
+    }
+}
+
+impl Drop for PendingProcessRegistration {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        if let Some(active) = self.initial_exec_command_active.as_ref() {
+            active.store(false, Ordering::Release);
+        }
+        if let Some(workspace_mutation) = self.workspace_mutation.as_ref() {
+            workspace_mutation.cancel_owner();
+        }
+        let cleanup = self.cleanup_payload();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                process_id = self.process_id,
+                "cannot clean up cancelled unified exec startup without a Tokio runtime"
+            );
+            return;
+        };
+        for pending_process in &cleanup.processes {
+            pending_process.process.terminate();
+        }
+        runtime.spawn(async move {
+            if let Err(error) = cleanup_pending_process_registration(cleanup).await {
+                tracing::error!(%error, "failed to clean up cancelled unified exec startup");
+            }
+        });
+    }
+}
+
+async fn cleanup_pending_process_registration(
+    cleanup: PendingProcessCleanup,
+) -> Result<(), String> {
+    if let Some(workspace_mutation) = cleanup.workspace_mutation.as_ref() {
+        workspace_mutation.cancel_owner();
+    }
+    for pending_process in &cleanup.processes {
+        if pending_process.requires_confirmed_termination {
+            pending_process
+                .process
+                .terminate_confirmed()
+                .await
+                .map_err(|error| format!("process termination was not confirmed: {error}"))?;
+        }
+    }
+
+    let (removed_entry, process_id_conflict) = {
+        let mut store = cleanup.process_store.lock().await;
+        match (
+            store.processes.get(&cleanup.process_id),
+            cleanup.primary_process.as_ref(),
+        ) {
+            (Some(entry), Some(primary_process))
+                if Arc::ptr_eq(&entry.process, primary_process) =>
+            {
+                (store.remove(cleanup.process_id), false)
+            }
+            (Some(_), Some(_)) => (None, true),
+            _ => (None, false),
+        }
+    };
+    if let Some(entry) = removed_entry.as_ref() {
+        unregister_network_approval_for_entry(entry).await;
+    } else if let Some(network_approval) = cleanup.network_approval.as_ref() {
+        cleanup
+            .session
+            .services
+            .network_approval
+            .unregister_call(network_approval.registration_id())
+            .await;
+    }
+
+    let running = cleanup
+        .session
+        .services
+        .command_execution
+        .running_process(cleanup.process_id)
+        .await;
+    let tracked_attempt = !process_id_conflict
+        && running
+            .as_ref()
+            .is_some_and(|running| running.key == cleanup.attempt_key);
+    if tracked_attempt {
+        let exit_code = cleanup
+            .primary_process
+            .as_ref()
+            .and_then(|process| process.exit_code())
+            .unwrap_or(-1);
+        cleanup
+            .session
+            .services
+            .command_execution
+            .finish_running_process_checked(cleanup.process_id, Some(exit_code))
+            .await?;
+    } else if let Some(workspace_mutation) = cleanup.workspace_mutation.as_ref() {
+        workspace_mutation.finish().await?;
+    }
+    Ok(())
 }
 
 async fn unregister_network_approval_for_entry(entry: &ProcessEntry) {
@@ -456,31 +679,63 @@ impl UnifiedExecProcessManager {
 
     pub(crate) async fn exec_command(
         &self,
-        request: ExecCommandRequest,
+        mut request: ExecCommandRequest,
         mut process_id_reservation: ProcessIdReservation,
         context: &UnifiedExecContext,
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         debug_assert_eq!(request.process_id, process_id_reservation.process_id());
+        let workspace_mutation = request.workspace_mutation.take();
+        let mut registration = PendingProcessRegistration::new(
+            Arc::clone(&self.process_store),
+            context,
+            request.attempt_key.clone(),
+            request.process_id,
+            workspace_mutation,
+        );
+        let result = self
+            .exec_command_inner(
+                &request,
+                &mut process_id_reservation,
+                context,
+                &mut registration,
+            )
+            .await;
+        if !registration.committed
+            && let Err(error) = registration.cleanup().await
+        {
+            return Err(UnifiedExecError::process_failed(format!(
+                "unified exec startup cleanup failed: {error}"
+            )));
+        }
+        result
+    }
+
+    async fn exec_command_inner(
+        &self,
+        request: &ExecCommandRequest,
+        process_id_reservation: &mut ProcessIdReservation,
+        context: &UnifiedExecContext,
+        registration: &mut PendingProcessRegistration,
+    ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         let cwd = request.cwd.clone();
         let executor_readiness_timing_guard = context
             .turn
             .turn_timing_state
             .begin_local_phase(TurnLocalPhase::ExecutorReadinessWait);
         let process = self
-            .open_session_with_sandbox(&request, cwd.clone(), context)
+            .open_session_with_sandbox(request, cwd.clone(), context, registration.pending_spawns())
             .await;
         drop(executor_readiness_timing_guard);
 
         let (process, mut deferred_network_approval) = match process {
-            Ok((process, deferred_network_approval)) => {
-                (Arc::new(process), deferred_network_approval)
-            }
+            Ok((process, deferred_network_approval)) => (process, deferred_network_approval),
             Err(err) => {
                 self.release_process_id(request.process_id).await;
                 return Err(err);
             }
         };
-        if let Some(lease_lost) = request.mutation_lease_lost.clone() {
+        registration.attach_process(Arc::clone(&process), deferred_network_approval.clone());
+        if let Some(lease_lost) = registration.lease_lost_token() {
             let leased_process = Arc::clone(&process);
             let process_exited = process.cancellation_token();
             tokio::spawn(async move {
@@ -525,11 +780,13 @@ impl UnifiedExecProcessManager {
 
         start_streaming_output(&process, context, Arc::clone(&transcript))?;
         let start = Instant::now();
-        // Persist live sessions before the initial yield wait so interrupting the
-        // turn cannot drop the last Arc and terminate the background process.
+        // Persist live sessions before the initial yield wait so handler cancellation cannot
+        // orphan the process. Mutating sessions are explicitly terminated when their owning turn
+        // reaches a terminal state; non-mutating sessions remain resumable across turns.
         let process_started_alive = !process.has_exited() && process.exit_code().is_none();
         let _initial_exec_command_guard = if process_started_alive {
             let initial_exec_command_active = Arc::new(AtomicBool::new(true));
+            registration.set_initial_exec_command_active(Arc::clone(&initial_exec_command_active));
             self.store_process(
                 Arc::clone(&process),
                 context,
@@ -539,13 +796,14 @@ impl UnifiedExecProcessManager {
                 request.turn_environment.environment_id.clone(),
                 start,
                 request.process_id,
-                &mut process_id_reservation,
+                process_id_reservation,
                 request.tty,
                 request.attempt_key.clone(),
                 request.raw_output_artifact.clone(),
                 deferred_network_approval.clone(),
                 Arc::clone(&transcript),
                 Arc::clone(&initial_exec_command_active),
+                registration,
             )
             .await?;
             Some(InitialExecCommandGuard {
@@ -979,6 +1237,7 @@ impl UnifiedExecProcessManager {
         network_approval: Option<DeferredNetworkApproval>,
         transcript: Arc<tokio::sync::Mutex<HeadTailBuffer>>,
         initial_exec_command_active: Arc<AtomicBool>,
+        registration: &mut PendingProcessRegistration,
     ) -> Result<(), UnifiedExecError> {
         let entry = ProcessEntry {
             process: Arc::clone(&process),
@@ -1027,7 +1286,13 @@ impl UnifiedExecProcessManager {
             .session
             .services
             .command_execution
-            .track_running_process(process_id, attempt_key, raw_output_artifact.clone())
+            .track_running_process(
+                process_id,
+                attempt_key,
+                raw_output_artifact.clone(),
+                context.turn.sub_id.clone(),
+                registration.workspace_mutation.clone(),
+            )
             .await;
 
         spawn_exit_watcher(
@@ -1043,6 +1308,7 @@ impl UnifiedExecProcessManager {
             started_at,
             context.tracker.clone(),
         );
+        registration.commit();
         Ok(())
     }
 
@@ -1060,7 +1326,8 @@ impl UnifiedExecProcessManager {
         spawn_lifecycle: SpawnLifecycleHandle,
         raw_output_artifact: Option<crate::tools::command_output_artifact::RawOutputArtifact>,
         environment: &codex_exec_server::Environment,
-    ) -> Result<UnifiedExecProcess, ToolError> {
+        pending_spawns: &PendingSpawnRegistration,
+    ) -> Result<Arc<UnifiedExecProcess>, ToolError> {
         let mut request = if environment.is_remote() {
             attempt.env_for_exec_server(command, options, network, environment_id)
         } else {
@@ -1075,6 +1342,7 @@ impl UnifiedExecProcessManager {
             spawn_lifecycle,
             raw_output_artifact,
             environment,
+            pending_spawns,
         )
         .await
         .map_err(|err| match err {
@@ -1096,7 +1364,8 @@ impl UnifiedExecProcessManager {
         mut spawn_lifecycle: SpawnLifecycleHandle,
         raw_output_artifact: Option<crate::tools::command_output_artifact::RawOutputArtifact>,
         environment: &codex_exec_server::Environment,
-    ) -> Result<UnifiedExecProcess, UnifiedExecError> {
+        pending_spawns: &PendingSpawnRegistration,
+    ) -> Result<Arc<UnifiedExecProcess>, UnifiedExecError> {
         let inherited_fds = spawn_lifecycle.inherited_fds();
 
         #[cfg(target_os = "windows")]
@@ -1183,6 +1452,7 @@ impl UnifiedExecProcessManager {
                 request.sandbox,
                 spawn_lifecycle,
                 raw_output_artifact,
+                pending_spawns,
             )
             .await;
         }
@@ -1199,8 +1469,12 @@ impl UnifiedExecProcessManager {
                 .await
                 .map_err(|err| UnifiedExecError::create_process(err.to_string()))?;
             spawn_lifecycle.after_spawn();
-            return UnifiedExecProcess::from_exec_server_started(started, raw_output_artifact)
-                .await;
+            return UnifiedExecProcess::from_exec_server_started(
+                started,
+                raw_output_artifact,
+                pending_spawns,
+            )
+            .await;
         }
 
         // TODO(anp): Keep PathUri through the local PTY/process launch boundary.
@@ -1245,6 +1519,7 @@ impl UnifiedExecProcessManager {
             request.sandbox,
             spawn_lifecycle,
             raw_output_artifact,
+            pending_spawns,
         )
         .await
     }
@@ -1254,7 +1529,8 @@ impl UnifiedExecProcessManager {
         request: &ExecCommandRequest,
         cwd: PathUri,
         context: &UnifiedExecContext,
-    ) -> Result<(UnifiedExecProcess, Option<DeferredNetworkApproval>), UnifiedExecError> {
+        pending_spawns: PendingSpawnRegistration,
+    ) -> Result<(Arc<UnifiedExecProcess>, Option<DeferredNetworkApproval>), UnifiedExecError> {
         let (env, local_policy_env) = build_unified_exec_environment(context);
         let exec_server_env_config = ExecServerEnvConfig {
             policy: exec_env_policy_from_shell_policy(
@@ -1263,7 +1539,11 @@ impl UnifiedExecProcessManager {
             local_policy_env,
         };
         let mut orchestrator = ToolOrchestrator::new();
-        let mut runtime = UnifiedExecRuntime::new(self, request.shell_mode.clone());
+        let mut runtime = UnifiedExecRuntime::new_with_pending_spawns(
+            self,
+            request.shell_mode.clone(),
+            pending_spawns,
+        );
         let exec_approval_requirement = context
             .session
             .services

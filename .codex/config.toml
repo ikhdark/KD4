@@ -1,6 +1,10 @@
 model_context_window = 372000
 
 approval_policy = "never"
+
+[features]
+task_completion_reviewer = true
+
 [agents]
 max_depth = 1
 
@@ -9,15 +13,15 @@ enabled = true
 max_concurrent_threads_per_session = 5
 
 [agents.kd4_explorer]
-description = "Read-only KD4 source, ownership, and dependency investigator."
+description = "Produces binding read-only KD4 implementation contracts for risky work."
 config_file = "./agents/kd4_explorer.toml"
 
 [agents.kd4_worker]
-description = "Implements one bounded, owner-isolated KD4 item or lane."
+description = "Implements an architect-derived KD4 contract as its sole behavior owner."
 config_file = "./agents/kd4_worker.toml"
 
 [agents.kd4_verifier]
-description = "Reviews and validates KD4 changes with focused evidence."
+description = "Read-only verification of completed KD4 changes against their typed contract."
 config_file = "./agents/kd4_verifier.toml"
 
 [agents.kd4_integrator]

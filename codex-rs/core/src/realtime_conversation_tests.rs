@@ -1,14 +1,51 @@
+use super::REALTIME_INSTRUCTIONS_TOKEN_BUDGET;
 use super::RealtimeHandoffState;
 use super::RealtimeSessionKind;
+use super::join_realtime_instructions;
 use super::realtime_delegation_from_handoff;
 use super::realtime_request_headers;
 use super::realtime_text_from_handoff_request;
+use super::remaining_realtime_startup_context_budget;
 use super::wrap_realtime_delegation_input;
+use crate::realtime_context::approx_realtime_token_count;
 use async_channel::bounded;
 use codex_config::config_toml::RealtimeWsVersion;
 use codex_protocol::protocol::RealtimeHandoffRequested;
 use codex_protocol::protocol::RealtimeTranscriptEntry;
 use pretty_assertions::assert_eq;
+
+#[test]
+fn realtime_instruction_join_preserves_separator_for_short_inputs() {
+    assert_eq!(
+        join_realtime_instructions("backend", "<startup_context>context</startup_context>"),
+        "backend\n\n<startup_context>context</startup_context>"
+    );
+    assert_eq!(
+        remaining_realtime_startup_context_budget(""),
+        REALTIME_INSTRUCTIONS_TOKEN_BUDGET
+    );
+    assert_eq!(
+        remaining_realtime_startup_context_budget("abc"),
+        REALTIME_INSTRUCTIONS_TOKEN_BUDGET - 2
+    );
+}
+
+#[test]
+fn realtime_instruction_join_enforces_total_budget() {
+    let backend = format!("backend-start {} backend-end", "x".repeat(12_000));
+    let startup_context = format!(
+        "<startup_context>\nstartup-start {} startup-end\n</startup_context>",
+        "y".repeat(50_000)
+    );
+    let instructions = join_realtime_instructions(&backend, &startup_context);
+
+    assert!(approx_realtime_token_count(&instructions) <= REALTIME_INSTRUCTIONS_TOKEN_BUDGET);
+    assert!(instructions.contains("backend-start"));
+    assert!(instructions.contains("backend-end"));
+    assert!(instructions.contains("<startup_context>"));
+    assert!(instructions.contains("</startup_context>"));
+    assert!(instructions.contains("tokens truncated"));
+}
 
 #[test]
 fn prefers_handoff_input_transcript_over_active_transcript() {

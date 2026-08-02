@@ -218,6 +218,8 @@ pub enum Feature {
     DefaultModeRequestUserInput,
     /// Enable automatic review for approval prompts.
     GuardianApproval,
+    /// Run an independent KD4 completion review before eligible root turns finish.
+    TaskCompletionReviewer,
     /// Enable persisted thread goals and automatic goal continuation.
     Goals,
     /// Add current context-window metadata to model-visible context.
@@ -1239,6 +1241,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         key: "guardian_approval",
         stage: Stage::Stable,
         default_enabled: true,
+    },
+    FeatureSpec {
+        id: Feature::TaskCompletionReviewer,
+        key: "task_completion_reviewer",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
     },
     FeatureSpec {
         id: Feature::Goals,

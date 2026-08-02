@@ -1407,6 +1407,7 @@ impl Session {
             first_window_id,
             previous_window_id,
             window_id,
+            last_passed_root_completion_turn_id,
         } = self
             .reconstruct_history_from_rollout(turn_context, rollout_items)
             .await;
@@ -1444,6 +1445,7 @@ impl Session {
                 },
             );
             state.set_previous_turn_settings(previous_turn_settings.clone());
+            state.set_last_passed_root_completion_turn_id(last_passed_root_completion_turn_id);
         }
         if let Some(prefix_tokens) = prefix_tokens {
             self.set_auto_compact_window_estimated_prefill_for_scope(turn_context, prefix_tokens)
@@ -3582,6 +3584,20 @@ impl Session {
         state.clone_history()
     }
 
+    pub(crate) async fn last_passed_root_completion_turn_id(&self) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .last_passed_root_completion_turn_id()
+    }
+
+    pub(crate) async fn set_last_passed_root_completion_turn_id(&self, turn_id: Option<String>) {
+        self.state
+            .lock()
+            .await
+            .set_last_passed_root_completion_turn_id(turn_id);
+    }
+
     pub(crate) async fn current_window_id(&self) -> String {
         let state = self.state.lock().await;
         let thread_id = self.thread_id;
@@ -3801,6 +3817,21 @@ impl Session {
                     1,
                 );
             budget_result?;
+        }
+        let coordinator = self.services.agent_control.task_coordinator();
+        if let Some(binding) = coordinator.binding_for_source(&turn_context.session_source) {
+            match coordinator.heartbeat_typed_actor_binding(&binding).await {
+                Ok(true) => {}
+                Ok(false) => warn!(
+                    attempt_id = %binding.attempt_id,
+                    "typed actor heartbeat was rejected after model progress"
+                ),
+                Err(error) => warn!(
+                    attempt_id = %binding.attempt_id,
+                    %error,
+                    "typed actor heartbeat failed after model progress"
+                ),
+            }
         }
         Ok(())
     }

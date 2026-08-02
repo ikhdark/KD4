@@ -767,7 +767,10 @@ def generate_notification_registry(schema_dir: Path) -> None:
         [
             "",
             "GeneratedNotificationPayload: TypeAlias = (",
-            *(f"    {class_name}" if index == 0 else f"    | {class_name}" for index, class_name in enumerate(class_names)),
+            *(
+                f"    {class_name}" if index == 0 else f"    | {class_name}"
+                for index, class_name in enumerate(class_names)
+            ),
             ")",
         ]
     )

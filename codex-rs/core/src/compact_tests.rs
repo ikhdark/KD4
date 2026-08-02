@@ -46,7 +46,10 @@ fn user_message(text: &str) -> ResponseItem {
 
 fn compacted_user_message(text: &str) -> CompactedUserMessage {
     CompactedUserMessage {
-        message: text.to_string(),
+        content: vec![UserInput::Text {
+            text: text.to_string(),
+            text_elements: Vec::new(),
+        }],
         internal_chat_message_metadata_passthrough: None,
     }
 }
@@ -109,6 +112,90 @@ fn collect_user_messages_extracts_user_text_only() {
     let collected = collect_user_messages(&items);
 
     assert_eq!(vec![compacted_user_message("first")], collected);
+}
+
+#[test]
+fn compacted_history_preserves_mixed_and_image_only_user_requirements() {
+    let metadata = InternalChatMessageMetadataPassthrough {
+        turn_id: Some("turn-with-image".to_string()),
+    };
+    let items = vec![
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![
+                ContentItem::InputText {
+                    text: r#"<image name=[Image #1] path="C:\private\original.png">"#.to_string(),
+                },
+                ContentItem::InputImage {
+                    image_url: "data:image/png;base64,mixed".to_string(),
+                    detail: Some(codex_protocol::models::ImageDetail::Low),
+                },
+                ContentItem::InputText {
+                    text: "</image>".to_string(),
+                },
+                ContentItem::InputText {
+                    text: "compare this image".to_string(),
+                },
+            ],
+            phase: None,
+            internal_chat_message_metadata_passthrough: Some(metadata.clone()),
+        },
+        ResponseItem::Message {
+            id: None,
+            role: "user".to_string(),
+            content: vec![ContentItem::InputImage {
+                image_url: "data:image/png;base64,image-only".to_string(),
+                detail: Some(codex_protocol::models::ImageDetail::Original),
+            }],
+            phase: None,
+            internal_chat_message_metadata_passthrough: None,
+        },
+    ];
+
+    let collected = collect_user_messages(&items);
+    let history = build_compacted_history(Vec::new(), &collected, "SUMMARY");
+
+    assert_eq!(collected.len(), 2);
+    assert_eq!(
+        collected[0].content,
+        vec![
+            UserInput::Image {
+                image_url: "data:image/png;base64,mixed".to_string(),
+                detail: Some(codex_protocol::models::ImageDetail::Low),
+            },
+            UserInput::Text {
+                text: "compare this image".to_string(),
+                text_elements: Vec::new(),
+            },
+        ]
+    );
+    let ResponseItem::Message {
+        content,
+        internal_chat_message_metadata_passthrough,
+        ..
+    } = &history[0]
+    else {
+        panic!("expected rebuilt mixed user message");
+    };
+    assert_eq!(
+        content,
+        &vec![
+            ContentItem::InputImage {
+                image_url: "data:image/png;base64,mixed".to_string(),
+                detail: Some(codex_protocol::models::ImageDetail::Low),
+            },
+            ContentItem::InputText {
+                text: "compare this image".to_string(),
+            },
+        ]
+    );
+    assert_eq!(
+        internal_chat_message_metadata_passthrough.as_ref(),
+        Some(&metadata)
+    );
+    assert!(format!("{history:?}").contains("image-only"));
+    assert!(!format!("{history:?}").contains("private\\original.png"));
 }
 
 #[test]
@@ -217,6 +304,74 @@ fn build_token_limited_compacted_history_truncates_overlong_user_messages() {
 }
 
 #[test]
+fn text_truncation_keeps_images_in_their_original_order() {
+    let message = CompactedUserMessage {
+        content: vec![
+            UserInput::Text {
+                text: "word ".repeat(200),
+                text_elements: Vec::new(),
+            },
+            UserInput::Image {
+                image_url: "data:image/png;base64,retained".to_string(),
+                detail: Some(codex_protocol::models::ImageDetail::High),
+            },
+            UserInput::Text {
+                text: "older text outside the budget".to_string(),
+                text_elements: Vec::new(),
+            },
+        ],
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let history = super::build_compacted_history_with_limit(Vec::new(), &[message], "SUMMARY", 8);
+    let ResponseItem::Message { content, .. } = &history[0] else {
+        panic!("expected rebuilt user message");
+    };
+
+    assert!(matches!(
+        content.first(),
+        Some(ContentItem::InputText { .. })
+    ));
+    assert!(matches!(
+        content.get(1),
+        Some(ContentItem::InputImage { image_url, .. }) if image_url.ends_with("retained")
+    ));
+}
+
+#[test]
+fn image_limits_emit_a_stable_compaction_omission_marker() {
+    let images = (0..3)
+        .map(|index| UserInput::Image {
+            image_url: format!("img-{index}"),
+            detail: None,
+        })
+        .collect();
+    let message = CompactedUserMessage {
+        content: images,
+        internal_chat_message_metadata_passthrough: None,
+    };
+
+    let history =
+        super::build_compacted_history_with_limits(Vec::new(), &[message], "SUMMARY", 0, 2, 9);
+    let retained_images = match &history[0] {
+        ResponseItem::Message { content, .. } => content
+            .iter()
+            .filter(|item| matches!(item, ContentItem::InputImage { .. }))
+            .count(),
+        other => panic!("expected rebuilt user message, found {other:?}"),
+    };
+    let summary = match history.last() {
+        Some(ResponseItem::Message { content, .. }) => {
+            content_items_to_text(content).unwrap_or_default()
+        }
+        other => panic!("expected summary message, found {other:?}"),
+    };
+
+    assert_eq!(retained_images, 1);
+    assert!(summary.contains(COMPACT_IMAGE_OMISSION_MARKER));
+}
+
+#[test]
 fn build_token_limited_compacted_history_appends_summary_message() {
     let initial_context: Vec<ResponseItem> = Vec::new();
     let user_messages = vec![compacted_user_message("first user message")];
@@ -243,7 +398,10 @@ fn build_compacted_history_preserves_user_message_passthrough_metadata() {
     let history = build_compacted_history(
         Vec::new(),
         &[CompactedUserMessage {
-            message: "first user message".to_string(),
+            content: vec![UserInput::Text {
+                text: "first user message".to_string(),
+                text_elements: Vec::new(),
+            }],
             internal_chat_message_metadata_passthrough: Some(
                 InternalChatMessageMetadataPassthrough {
                     turn_id: Some("turn-1".to_string()),

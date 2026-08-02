@@ -1,4 +1,6 @@
 use super::*;
+use codex_collaboration_mode_templates::EXECUTE;
+use codex_collaboration_mode_templates::PAIR_PROGRAMMING;
 use pretty_assertions::assert_eq;
 
 #[test]
@@ -20,6 +22,10 @@ fn default_mode_instructions_replace_mode_names_placeholder() {
         .developer_instructions
         .expect("default preset should include instructions")
         .expect("default instructions should be set");
+    let normalized_instructions = default_instructions
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
 
     assert!(!default_instructions.contains("{{KNOWN_MODE_NAMES}}"));
 
@@ -27,27 +33,58 @@ fn default_mode_instructions_replace_mode_names_placeholder() {
     let expected_snippet = format!("Known mode names are: {known_mode_names}.");
     assert!(default_instructions.contains(&expected_snippet));
 
-    assert!(default_instructions.contains(
-        "Use the `request_user_input` tool only when it is listed in the available tools"
-    ));
     assert!(
-        default_instructions.contains("ask the user directly with one concise plain-text question")
+        default_instructions.contains(
+            "Use `request_user_input` only when it is available and a structured choice is"
+        )
     );
-    assert!(default_instructions.contains("materially different interpretations"));
-    assert!(default_instructions.contains("`performance`"));
-    assert!(default_instructions.contains("`optimize`"));
-    assert!(default_instructions.contains("`bugs`"));
-    assert!(default_instructions.contains("`fix`"));
-    assert!(default_instructions.contains("`fix this`"));
-    assert!(default_instructions.contains("`do this`"));
-    assert!(default_instructions.contains("`double check`"));
-    assert!(default_instructions.contains("`make this better`"));
-    assert!(default_instructions.contains("`improve`"));
-    assert!(default_instructions.contains("`give suggestions`"));
-    assert!(default_instructions.contains("`top 10 ways to...`"));
-    assert!(default_instructions.contains("`how can we improve this`"));
-    assert!(default_instructions.contains("`audit`"));
-    assert!(default_instructions.contains("`implement`"));
-    assert!(default_instructions.contains("Offer two to four concrete"));
-    assert!(default_instructions.contains("selected choices as implementation acceptance"));
+    assert!(default_instructions.contains("ask one concise plain-text question"));
+    assert!(normalized_instructions.contains("ask one targeted question only when all"));
+    assert!(default_instructions.contains("cannot reasonably be discovered"));
+    assert!(default_instructions.contains("`double check` and `audit` are read-only"));
+    assert!(default_instructions.contains("Offer two to four mutually exclusive options"));
+    assert!(default_instructions.contains("implementation acceptance"));
+    assert!(default_instructions.len() < 3_000);
+}
+
+#[test]
+fn plan_mode_instructions_preserve_planning_contract() {
+    let plan_instructions = plan_preset()
+        .developer_instructions
+        .expect("plan preset should include instructions")
+        .expect("plan instructions should be set");
+    let normalized_instructions = plan_instructions
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    assert!(plan_instructions.contains("Plan Mode remains active"));
+    assert!(plan_instructions.contains("`update_plan`"));
+    assert!(normalized_instructions.contains("must not be used while Plan Mode is active"));
+    assert!(plan_instructions.contains("Do not edit persistent files"));
+    assert!(plan_instructions.contains("`request_user_input` is available"));
+    assert!(plan_instructions.contains("<proposed_plan>"));
+    assert!(plan_instructions.contains("completely replace the prior plan"));
+    assert!(plan_instructions.len() < 6_000);
+}
+
+#[test]
+fn collaboration_mode_templates_stay_within_prompt_budgets() {
+    assert!(COLLABORATION_MODE_DEFAULT.len() < 3_000);
+    assert!(EXECUTE.len() < 4_000);
+    assert!(PAIR_PROGRAMMING.len() < 5_000);
+    assert!(COLLABORATION_MODE_PLAN.len() < 6_000);
+}
+
+#[test]
+fn auxiliary_mode_templates_keep_their_distinct_execution_contracts() {
+    assert!(EXECUTE.contains("Complete the task end to end"));
+    assert!(EXECUTE.contains("low-risk, reversible assumption"));
+    assert!(EXECUTE.contains("Do not treat user silence as authority"));
+    assert!(EXECUTE.contains("Implement the smallest complete change"));
+
+    assert!(PAIR_PROGRAMMING.contains("Treat the user as an active collaborator"));
+    assert!(PAIR_PROGRAMMING.contains("meaningful increments"));
+    assert!(PAIR_PROGRAMMING.contains("For material choices"));
+    assert!(PAIR_PROGRAMMING.contains("structured user-input tool"));
 }

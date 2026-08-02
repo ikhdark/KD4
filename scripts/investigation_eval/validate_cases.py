@@ -50,9 +50,14 @@ def _require(condition: bool, message: str) -> None:
 
 
 def _repo_relative_file(value: Any, *, field: str, case_id: str) -> Path:
-    _require(isinstance(value, str) and value, f"{case_id}: {field} must be a non-empty string")
+    _require(
+        isinstance(value, str) and value,
+        f"{case_id}: {field} must be a non-empty string",
+    )
     candidate = Path(value)
-    _require(not candidate.is_absolute(), f"{case_id}: {field} must be repository-relative")
+    _require(
+        not candidate.is_absolute(), f"{case_id}: {field} must be repository-relative"
+    )
     resolved = (REPO_ROOT / candidate).resolve()
     try:
         resolved.relative_to(REPO_ROOT)
@@ -64,14 +69,20 @@ def _repo_relative_file(value: Any, *, field: str, case_id: str) -> Path:
 
 def load_cases(path: Path = DEFAULT_CASES) -> list[dict[str, Any]]:
     cases: list[dict[str, Any]] = []
-    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         if not raw_line.strip():
             continue
         try:
             value = json.loads(raw_line)
         except json.JSONDecodeError as exc:
-            raise ValidationError(f"{path}:{line_number}: invalid JSON: {exc.msg}") from exc
-        _require(isinstance(value, dict), f"{path}:{line_number}: record must be an object")
+            raise ValidationError(
+                f"{path}:{line_number}: invalid JSON: {exc.msg}"
+            ) from exc
+        _require(
+            isinstance(value, dict), f"{path}:{line_number}: record must be an object"
+        )
         cases.append(value)
     _require(cases, f"{path}: no cases found")
     return cases
@@ -98,17 +109,25 @@ def case_fingerprint(case: dict[str, Any]) -> str:
 def _validate_expected_findings(case: dict[str, Any]) -> None:
     case_id = case["id"]
     findings = case["expected_findings"]
-    _require(isinstance(findings, list), f"{case_id}: expected_findings must be an array")
+    _require(
+        isinstance(findings, list), f"{case_id}: expected_findings must be an array"
+    )
     for index, finding in enumerate(findings):
         prefix = f"{case_id}: expected_findings[{index}]"
         _require(isinstance(finding, dict), f"{prefix} must be an object")
-        _require(set(finding) == {"kind", "required_locators"}, f"{prefix} has the wrong fields")
+        _require(
+            set(finding) == {"kind", "required_locators"},
+            f"{prefix} has the wrong fields",
+        )
         _require(
             isinstance(finding["kind"], str) and finding["kind"],
             f"{prefix}.kind must be a non-empty string",
         )
         locators = finding["required_locators"]
-        _require(isinstance(locators, list) and locators, f"{prefix}.required_locators must be non-empty")
+        _require(
+            isinstance(locators, list) and locators,
+            f"{prefix}.required_locators must be non-empty",
+        )
         _require(
             all(isinstance(locator, str) and locator for locator in locators),
             f"{prefix}.required_locators must contain non-empty strings",
@@ -140,14 +159,17 @@ def _scan_unified_diff(
 
 
 def _validate_patch(patch: Path, *, case_id: str) -> None:
-    patch_lines = patch.read_text(encoding="utf-8").splitlines()
+    patch_text = patch.read_text(encoding="utf-8")
+    patch_lines = patch_text.splitlines()
     raw_added, raw_removed, old_paths, new_paths = _scan_unified_diff(patch_lines)
     _require(
         old_paths and len(old_paths) == len(new_paths),
         f"{case_id}: patch must contain paired file headers",
     )
     for old_path, new_path in zip(old_paths, new_paths, strict=True):
-        _require(old_path == "/dev/null", f"{case_id}: fixtures must add new files only")
+        _require(
+            old_path == "/dev/null", f"{case_id}: fixtures must add new files only"
+        )
         _require(
             new_path.startswith("b/investigation_cases/"),
             f"{case_id}: fixture path must stay under investigation_cases/",
@@ -157,34 +179,47 @@ def _validate_patch(patch: Path, *, case_id: str) -> None:
             not relative.is_absolute() and ".." not in relative.parts,
             f"{case_id}: fixture path escapes investigation_cases/",
         )
-    numstat = subprocess.run(
-        ["git", "apply", "--numstat", str(patch)],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    _require(numstat.returncode == 0, f"{case_id}: patch has invalid unified-diff structure")
-    declared_added = 0
-    declared_removed = 0
-    for line in numstat.stdout.splitlines():
-        fields = line.split("\t", maxsplit=2)
-        _require(len(fields) == 3, f"{case_id}: patch numstat output is invalid")
-        _require(fields[0].isdigit() and fields[1].isdigit(), f"{case_id}: binary patches are unsupported")
-        declared_added += int(fields[0])
-        declared_removed += int(fields[1])
-        _require(
-            fields[2].replace("\\", "/").startswith("investigation_cases/"),
-            f"{case_id}: patch numstat path escapes investigation_cases/",
-        )
-    _require(
-        (declared_added, declared_removed) == (raw_added, raw_removed),
-        f"{case_id}: patch hunk counts do not cover every added or removed line",
-    )
-    _require(declared_removed == 0, f"{case_id}: fixtures must not remove existing lines")
-
     with tempfile.TemporaryDirectory(prefix="investigation-eval-index-") as temp_dir:
-        index_path = Path(temp_dir) / "index"
+        temp_root = Path(temp_dir)
+        normalized_patch = temp_root / "fixture.patch"
+        normalized_patch.write_bytes(patch_text.encode("utf-8"))
+
+        numstat = subprocess.run(
+            ["git", "apply", "--numstat", str(normalized_patch)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        _require(
+            numstat.returncode == 0,
+            f"{case_id}: patch has invalid unified-diff structure",
+        )
+        declared_added = 0
+        declared_removed = 0
+        for line in numstat.stdout.splitlines():
+            fields = line.split("\t", maxsplit=2)
+            _require(len(fields) == 3, f"{case_id}: patch numstat output is invalid")
+            _require(
+                fields[0].isdigit() and fields[1].isdigit(),
+                f"{case_id}: binary patches are unsupported",
+            )
+            declared_added += int(fields[0])
+            declared_removed += int(fields[1])
+            _require(
+                fields[2].replace("\\", "/").startswith("investigation_cases/"),
+                f"{case_id}: patch numstat path escapes investigation_cases/",
+            )
+        _require(
+            (declared_added, declared_removed) == (raw_added, raw_removed),
+            f"{case_id}: patch hunk counts do not cover every added or removed line",
+        )
+        _require(
+            declared_removed == 0,
+            f"{case_id}: fixtures must not remove existing lines",
+        )
+
+        index_path = temp_root / "index"
         index_env = os.environ.copy()
         index_env["GIT_INDEX_FILE"] = str(index_path)
         read_tree = subprocess.run(
@@ -195,9 +230,19 @@ def _validate_patch(patch: Path, *, case_id: str) -> None:
             text=True,
             check=False,
         )
-        _require(read_tree.returncode == 0, f"{case_id}: could not initialize a temporary index")
+        _require(
+            read_tree.returncode == 0,
+            f"{case_id}: could not initialize a temporary index",
+        )
         result = subprocess.run(
-            ["git", "apply", "--check", "--cached", "--whitespace=error-all", str(patch)],
+            [
+                "git",
+                "apply",
+                "--check",
+                "--cached",
+                "--whitespace=error-all",
+                str(normalized_patch),
+            ],
             cwd=REPO_ROOT,
             env=index_env,
             capture_output=True,
@@ -205,7 +250,9 @@ def _validate_patch(patch: Path, *, case_id: str) -> None:
             check=False,
         )
     detail = (result.stderr or result.stdout).strip()
-    _require(result.returncode == 0, f"{case_id}: patch does not apply cleanly: {detail}")
+    _require(
+        result.returncode == 0, f"{case_id}: patch does not apply cleanly: {detail}"
+    )
 
 
 def validate_cases(cases: list[dict[str, Any]]) -> None:
@@ -213,14 +260,22 @@ def validate_cases(cases: list[dict[str, Any]]) -> None:
     category_counts: Counter[str] = Counter()
 
     for case in cases:
-        _require(set(case) == REQUIRED_FIELDS, f"record fields must be exactly {sorted(REQUIRED_FIELDS)}")
+        _require(
+            set(case) == REQUIRED_FIELDS,
+            f"record fields must be exactly {sorted(REQUIRED_FIELDS)}",
+        )
         case_id = case["id"]
-        _require(isinstance(case_id, str) and CASE_ID_RE.fullmatch(case_id) is not None, "invalid case id")
+        _require(
+            isinstance(case_id, str) and CASE_ID_RE.fullmatch(case_id) is not None,
+            "invalid case id",
+        )
         _require(case_id not in seen_ids, f"duplicate case id: {case_id}")
         seen_ids.add(case_id)
 
         category = case["category"]
-        _require(category in ALLOWED_CATEGORIES, f"{case_id}: invalid category: {category}")
+        _require(
+            category in ALLOWED_CATEGORIES, f"{case_id}: invalid category: {category}"
+        )
         category_counts[category] += 1
         _require(
             isinstance(case["repository"], str) and case["repository"],
@@ -231,19 +286,27 @@ def validate_cases(cases: list[dict[str, Any]]) -> None:
         patch_value = case["patch"]
         if patch_value is not None:
             patch = _repo_relative_file(patch_value, field="patch", case_id=case_id)
-            _require(patch.suffix == ".patch", f"{case_id}: patch must use the .patch suffix")
+            _require(
+                patch.suffix == ".patch", f"{case_id}: patch must use the .patch suffix"
+            )
             _validate_patch(patch, case_id=case_id)
 
         _validate_expected_findings(case)
         forbidden = case["forbidden_findings"]
-        _require(isinstance(forbidden, list), f"{case_id}: forbidden_findings must be an array")
+        _require(
+            isinstance(forbidden, list),
+            f"{case_id}: forbidden_findings must be an array",
+        )
         _require(
             all(isinstance(kind, str) and kind for kind in forbidden),
             f"{case_id}: forbidden_findings must contain non-empty strings",
         )
         _require(isinstance(case["notes"], str), f"{case_id}: notes must be a string")
 
-    _require(category_counts["clean-control"] >= 2, "corpus requires at least two clean controls")
+    _require(
+        category_counts["clean-control"] >= 2,
+        "corpus requires at least two clean controls",
+    )
     required_groups = {
         "wiring": {"wiring"},
         "lifecycle/cancellation": {"lifecycle", "cancellation"},

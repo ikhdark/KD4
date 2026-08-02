@@ -51,7 +51,9 @@ def build_standalone_installer(output_path: Path) -> None:
     os.close(descriptor)
     temp_path = Path(temp_name)
     try:
-        temp_path.write_text(standalone_installer_text(), encoding="utf-8", newline="\n")
+        temp_path.write_text(
+            standalone_installer_text(), encoding="utf-8", newline="\n"
+        )
         temp_path.chmod(SOURCE_PATH.stat().st_mode)
         temp_path.replace(output_path)
     finally:

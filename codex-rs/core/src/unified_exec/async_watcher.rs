@@ -176,7 +176,23 @@ pub(crate) fn spawn_exit_watcher(
         output_drained.notified().await;
 
         let duration = Instant::now().saturating_duration_since(started_at);
-        let (exit_code, failure_message) = if let Some(message) = process.failure_message() {
+        let failure_message = process.failure_message();
+        let exit_code = if failure_message.is_some() {
+            -1
+        } else {
+            process.exit_code().unwrap_or(-1)
+        };
+
+        // Process exit is the mutation-safety boundary. Finalize its repository lease before
+        // event delivery or artifact work so a completed command cannot retain ownership merely
+        // because nobody polls it or its original turn is already idle.
+        session_ref
+            .services
+            .command_execution
+            .mark_running_process_completed(process_id, exit_code)
+            .await;
+
+        if let Some(message) = failure_message.as_ref() {
             emit_failed_exec_end_for_unified_exec(
                 Arc::clone(&session_ref),
                 Arc::clone(&turn_ref),
@@ -192,9 +208,7 @@ pub(crate) fn spawn_exit_watcher(
                 tracker.clone(),
             )
             .await;
-            (-1, Some(message))
         } else {
-            let exit_code = process.exit_code().unwrap_or(-1);
             emit_exec_end_for_unified_exec(
                 Arc::clone(&session_ref),
                 Arc::clone(&turn_ref),
@@ -210,8 +224,7 @@ pub(crate) fn spawn_exit_watcher(
                 tracker.clone(),
             )
             .await;
-            (exit_code, None)
-        };
+        }
 
         if let Some(tracker) = tracker.as_ref() {
             let observed_mutation_revision = tracker.lock().await.current_mutation_revision();
@@ -247,11 +260,6 @@ pub(crate) fn spawn_exit_watcher(
                 .update_running_artifact(process_id, finalized_artifact)
                 .await;
         }
-        session_ref
-            .services
-            .command_execution
-            .mark_running_process_completed(process_id, exit_code)
-            .await;
     });
 }
 

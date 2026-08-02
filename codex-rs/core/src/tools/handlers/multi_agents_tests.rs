@@ -971,6 +971,24 @@ async fn multi_agent_v2_typed_spawn_persists_and_binds_assignment_before_start()
         result["assignment_id"].as_str(),
         Some(assignment_id_text.as_str())
     );
+    let assignment_attempt_marker = format!(
+        "assignment_id={assignment_id} attempt_id={}",
+        binding.attempt_id
+    );
+    assert!(manager.captured_ops().iter().any(|(id, op)| {
+        *id == child_thread_id
+            && matches!(
+                op,
+                Op::InterAgentCommunication { communication }
+                    if communication.author == AgentPath::root()
+                        && communication.recipient == agent_path
+                        && communication.other_recipients.is_empty()
+                        && communication.content.starts_with("You have a durable typed assignment.")
+                        && communication.content.contains(&assignment_attempt_marker)
+                        && communication.encrypted_content.is_none()
+                        && communication.trigger_turn
+            )
+    }), "typed assignment should be submitted as plaintext communication");
     let _ = agent_control
         .shutdown_live_agent(child_thread_id)
         .await
@@ -3140,7 +3158,7 @@ async fn multi_agent_v2_spawn_surfaces_task_name_validation_errors() {
 }
 
 #[tokio::test]
-async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
+async fn spawn_agent_reapplies_runtime_sandbox_when_role_does_not_override_permissions() {
     #[derive(Debug, Deserialize)]
     struct SpawnAgentResult {
         agent_id: String,
@@ -3187,7 +3205,7 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         "spawn_agent",
         function_payload(json!({
             "message": "await this command",
-            "agent_type": "explorer"
+            "agent_type": "default"
         })),
     );
     let output = SpawnAgentHandler::default()
@@ -3229,6 +3247,57 @@ async fn spawn_agent_reapplies_runtime_sandbox_after_role_config() {
         expected_network_sandbox_policy
     );
     assert_eq!(child_turn.permission_profile(), expected_permission_profile);
+}
+
+#[tokio::test]
+async fn spawn_agent_preserves_read_only_role_permissions_over_runtime_profile() {
+    let (mut session, mut turn) = make_session_and_context().await;
+    let manager = thread_manager();
+    session.services.agent_control = manager.agent_control();
+    let parent_permission_profile = PermissionProfile::workspace_write();
+    turn.permission_profile = parent_permission_profile.clone();
+    assert_ne!(parent_permission_profile, PermissionProfile::read_only());
+
+    let output = SpawnAgentHandler::default()
+        .handle(invocation(
+            Arc::new(session),
+            Arc::new(turn),
+            "spawn_agent",
+            function_payload(json!({
+                "message": "inspect this repo without editing it",
+                "agent_type": "explorer"
+            })),
+        ))
+        .await
+        .expect("read-only explorer spawn should succeed");
+    let (content, _) = expect_text_output(output);
+    let result: serde_json::Value =
+        serde_json::from_str(&content).expect("spawn_agent result should be json");
+    let agent_id = parse_agent_id(
+        result["agent_id"]
+            .as_str()
+            .expect("spawn result should include agent_id"),
+    );
+
+    let child_thread = manager
+        .get_thread(agent_id)
+        .await
+        .expect("spawned explorer thread should exist");
+    let snapshot = child_thread.config_snapshot().await;
+    assert_eq!(snapshot.permission_profile, PermissionProfile::read_only());
+    assert!(matches!(
+        snapshot.sandbox_policy(),
+        SandboxPolicy::ReadOnly { .. }
+    ));
+    let child_turn = child_thread.codex.session.new_default_turn().await;
+    assert_eq!(
+        child_turn.permission_profile(),
+        PermissionProfile::read_only()
+    );
+    assert_eq!(
+        child_turn.file_system_sandbox_policy(),
+        FileSystemSandboxPolicy::read_only()
+    );
 }
 
 #[tokio::test]

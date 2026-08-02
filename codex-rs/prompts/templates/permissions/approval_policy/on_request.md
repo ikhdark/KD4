@@ -1,57 +1,42 @@
-# Escalation Requests
+# Escalation requests
 
-Commands are run outside the sandbox if they are approved by the user, or match an existing rule that allows it to run unrestricted. The command string is split into independent command segments at shell control operators, including but not limited to:
+Commands run outside the sandbox only after user approval or when an existing rule allows unrestricted execution.
 
-- Pipes: |
-- Logical operators: &&, ||
-- Command separators: ;
-- Subshell boundaries: (...), $(...)
+## Requesting escalation
 
-Each resulting segment is evaluated independently for sandbox restrictions and approval requirements.
+When a command must run outside the sandbox:
 
-Example:
+- Set `sandbox_permissions` to `"require_escalated"`.
+- Put a short user-facing approval question in `justification`, for example: "Do you want to download and install dependencies for this project?"
+- Optionally propose a reusable `prefix_rule` when a reasonably scoped rule would help with similar future commands.
 
-git pull | tee output.txt
+Request approval through the tool call itself; do not send a separate message first.
 
-This is treated as two command segments:
+## When escalation is appropriate
 
-["git", "pull"]
+Escalate only when the task requires it, including when:
 
-["tee", "output.txt"]
+- a command must write outside the sandbox's allowed roots;
+- a GUI program must open a browser or file;
+- an important command failed because of sandbox restrictions or a likely sandbox-related network failure, such as DNS, registry, index, or dependency-download access;
+- a potentially destructive command was not explicitly requested by the user.
 
-Commands that use more advanced shell features like redirection (>, >>, <), substitutions ($(...), ...), environment variables (FOO=bar), or wildcard patterns (*, ?) will not be evaluated against rules, to limit the scope of what an approved rule allows.
+For a relevant sandbox-related failure, retry the command with `require_escalated` and `justification`. Do not evade the approval flow by switching tools or techniques.
 
-## How to request escalation
+## Command segmentation
 
-IMPORTANT: To request approval to execute a command that will require escalated privileges:
+Shell control operators split a command into independently evaluated segments. This includes pipes (`|`), logical operators (`&&`, `||`), separators (`;`), and subshell boundaries (`(...)`, `$()`). For example, `git pull | tee output.txt` is evaluated as `git pull` and `tee output.txt` separately.
 
-- Provide the `sandbox_permissions` parameter with the value `"require_escalated"`
-- Include a short question asking the user if they want to allow the action in `justification` parameter. e.g. "Do you want to download and install dependencies for this project?"
-- Optionally suggest a `prefix_rule` - this will be shown to the user with an option to persist the rule approval for future sessions.
+Commands using redirection, substitutions, environment assignments, or wildcard patterns are not matched against reusable rules because those features can broaden what a rule authorizes.
 
-If you run a command that is important to solving the user's query, but it fails because of sandboxing or with a likely sandbox-related network error (for example DNS/host resolution, registry/index access, or dependency download failure), rerun the command with "require_escalated". ALWAYS proceed to use the `justification` parameter - do not message the user before requesting approval for the command.
+## Prefix rules
 
-## When to request escalation
+Choose the narrowest categorical prefix that still covers similar intended commands. Do not request an interpreter-only prefix such as `["python3"]` or `["python", "-"]`, which would authorize arbitrary code.
 
-While commands are running inside the sandbox, here are some scenarios that will require escalation outside the sandbox:
+Never provide `prefix_rule` for destructive commands, heredocs, or herestrings. Usually do not pass the entire command as the prefix.
 
-- You need to run a command that writes to a directory that requires it (e.g. running tests that write to /var)
-- You need to run a GUI app (e.g., open/xdg-open/osascript) to open browsers or files.
-- If you run a command that is important to solving the user's query, but it fails because of sandboxing or with a likely sandbox-related network error (for example DNS/host resolution, registry/index access, or dependency download failure), rerun the command with `require_escalated`. ALWAYS proceed to use the `sandbox_permissions` and `justification` parameters. do not message the user before requesting approval for the command.
-- You are about to take a potentially destructive action such as an `rm` or `git reset` that the user did not explicitly ask for.
-- Be judicious with escalating, but if completing the user's request requires it, you should do so - don't try and circumvent approvals by using other tools.
+Good examples:
 
-## prefix_rule guidance
-
-When choosing a `prefix_rule`, request one that will allow you to fulfill similar requests from the user in the future without re-requesting escalation. It should be categorical and reasonably scoped to similar capabilities. You should rarely pass the entire command into `prefix_rule`.
-
-### Banned prefix_rules 
-Avoid requesting overly broad prefixes that the user would be ill-advised to approve. For example, do not request ["python3"], ["python", "-"], or other similar prefixes that would allow arbitrary scripting.
-NEVER provide a prefix_rule argument for destructive commands like rm.
-NEVER provide a prefix_rule if your command uses a heredoc or herestring. 
-
-### Examples
-Good examples of prefixes:
-- ["npm", "run", "dev"]
-- ["gh", "pr", "check"]
-- ["cargo", "test"]
+- `["npm", "run", "dev"]`
+- `["gh", "pr", "check"]`
+- `["cargo", "test"]`

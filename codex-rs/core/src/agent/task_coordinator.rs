@@ -234,6 +234,15 @@ impl AgentTaskCoordinator {
             .and_then(|path| self.binding_for_agent_path(&path))
     }
 
+    pub(crate) async fn heartbeat_typed_actor_binding(
+        &self,
+        binding: &AgentTaskBinding,
+    ) -> StoreResult<bool> {
+        self.required_store()?
+            .heartbeat_typed_workspace_actor(binding.clone())
+            .await
+    }
+
     pub(crate) fn binding_for_agent_path(
         &self,
         agent_path: &AgentPath,

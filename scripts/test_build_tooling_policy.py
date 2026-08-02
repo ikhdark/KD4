@@ -931,9 +931,9 @@ class BuildToolingPolicyTest(unittest.TestCase):
         sandbox_tests = (
             REPO_ROOT / "codex-rs/windows-sandbox-rs/src/unified_exec/tests.rs"
         ).read_text(encoding="utf-8")
-        pty_tests = (
-            REPO_ROOT / "codex-rs/utils/pty/src/windows_tests.rs"
-        ).read_text(encoding="utf-8")
+        pty_tests = (REPO_ROOT / "codex-rs/utils/pty/src/windows_tests.rs").read_text(
+            encoding="utf-8"
+        )
 
         self.assertIn(
             "SKIP: test-windows-sandbox-processes requires a Windows host; "
@@ -976,16 +976,18 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("cargo deny check bans sources licenses", justfile)
         self.assertIn("cargo tree -d --workspace --target all", justfile)
 
-    def test_unix_lane_recipes_mirror_windows_focused_lanes(self) -> None:
+    def test_unix_lane_recipes_use_the_reserved_runner(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
 
         for snippet in (
-            'shift; RUST_MIN_STACK={{ rust_min_stack }} NEXTEST_PROFILE=fast cargo nextest run --target-dir "target/lanes/{{ package }}" -p {{ package }} "$@"',
-            'shift; cargo check --target-dir "target/lanes/{{ package }}" -p {{ package }} "$@"',
-            'shift; cargo clippy --tests --target-dir "target/lanes/{{ package }}" -p {{ package }} "$@"',
-            'cargo build --release --target-dir target/lanes/release "$@"',
+            'run-lane --lane "{{ package }}" -- cargo nextest run',
+            'run-lane --lane "{{ package }}" -- cargo check',
+            'run-lane --lane "{{ package }}" -- cargo clippy',
+            "run-lane --lane release -- cargo build --release",
+            "run-lane --lane app-server-test-client -- just _app-server-test-client-reserved",
         ):
             self.assertIn(snippet, justfile)
+        self.assertNotIn("target/lanes/", justfile)
 
     def test_high_contention_just_recipes_use_cargo_lanes_on_windows(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1005,7 +1007,8 @@ class BuildToolingPolicyTest(unittest.TestCase):
             "_core-test-helpers-windows-sandbox target_dir:",
             'cargo build --target-dir "{{ target_dir }}" -p codex-cli --bin codex',
             'cargo build --target-dir "{{ target_dir }}" -p codex-code-mode-host --bin codex-code-mode-host',
-            '$forwarded_args = @($args | Select-Object -Skip 2); $target_dir = "target\\lanes\\{{ package }}"',
+            "just _test-lane-package-reserved",
+            "$target_dir = $env:CODEX_CARGO_LANE_TARGET_DIR",
             '$env:RUST_MIN_STACK = "{{ rust_min_stack }}"; $env:NEXTEST_PROFILE = "fast"; cargo nextest run --target-dir $target_dir -p "{{ package }}" @forwarded_args',
             '$text -match "(?i)rmcp|mcp|plugin|test_stdio_server"',
             '$text -match "(?i)windows_sandbox|windows-sandbox|sandbox|codex_command_runner"',
@@ -1016,6 +1019,7 @@ class BuildToolingPolicyTest(unittest.TestCase):
             justfile,
         )
         self.assertGreaterEqual(justfile.count("scripts\\cargo-lane.ps1"), 3)
+        self.assertNotIn('$target_dir = "target\\lanes\\', justfile)
 
     def test_perf_env_recipes_pass_structured_argv(self) -> None:
         justfile = (REPO_ROOT / "justfile").read_text(encoding="utf-8")
@@ -1027,6 +1031,8 @@ class BuildToolingPolicyTest(unittest.TestCase):
         self.assertIn("[Parameter(ValueFromRemainingArguments = $true)]", perf_env)
         self.assertIn("[string[]]$ProgramArgs", perf_env)
         self.assertIn("& $program @arguments", perf_env)
+        self.assertIn('"run-lane"', perf_env)
+        self.assertIn('"--lane"', perf_env)
         self.assertIn("-ProgramArgs $forwarded_args", justfile)
         self.assertIn("-ProgramArgs $command_args", justfile)
         self.assertIn('"--release"', justfile)
