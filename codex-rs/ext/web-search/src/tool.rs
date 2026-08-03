@@ -72,7 +72,7 @@ impl ToolExecutor<ToolCall> for WebSearchTool {
     }
 
     fn exposure(&self) -> ToolExposure {
-        ToolExposure::Direct
+        ToolExposure::Deferred
     }
 
     fn supports_parallel_tool_calls(&self) -> bool {

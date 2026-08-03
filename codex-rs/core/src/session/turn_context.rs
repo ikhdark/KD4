@@ -608,11 +608,9 @@ impl Session {
         sub_id: &str,
         updates: &SessionSettingsUpdate,
     ) -> CodexResult<SessionConfiguration> {
-        let _refresh_guard = self
-            .managed_network_proxy_refresh_lock
-            .acquire()
-            .await
-            .expect("managed network proxy refresh semaphore is never closed");
+        let Ok(_refresh_guard) = self.managed_network_proxy_refresh_lock.acquire().await else {
+            unreachable!("managed network proxy refresh semaphore is never closed");
+        };
         let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
         let update_result: CodexResult<_> = {
             let mut state = self.state.lock().await;
@@ -666,23 +664,22 @@ impl Session {
             }
         };
 
-        if permission_profile_changed {
-            if let Err(error) = self
+        if permission_profile_changed
+            && let Err(error) = self
                 .refresh_managed_network_proxy_for_current_permission_profile()
                 .await
-            {
-                self.state.lock().await.session_configuration = previous_session_configuration;
-                let message = format!("managed network policy update failed: {error}");
-                self.send_event_raw(Event {
-                    id: sub_id.to_string(),
-                    msg: EventMsg::Error(ErrorEvent {
-                        message: message.clone(),
-                        codex_error_info: Some(CodexErrorInfo::BadRequest),
-                    }),
-                })
-                .await;
-                return Err(CodexErr::InvalidRequest(message));
-            }
+        {
+            self.state.lock().await.session_configuration = previous_session_configuration;
+            let message = format!("managed network policy update failed: {error}");
+            self.send_event_raw(Event {
+                id: sub_id.to_string(),
+                msg: EventMsg::Error(ErrorEvent {
+                    message: message.clone(),
+                    codex_error_info: Some(CodexErrorInfo::BadRequest),
+                }),
+            })
+            .await;
+            return Err(CodexErr::InvalidRequest(message));
         }
         if environments_changed {
             self.services

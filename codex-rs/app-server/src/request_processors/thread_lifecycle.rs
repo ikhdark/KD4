@@ -322,9 +322,14 @@ pub(super) async fn ensure_listener_task_running(
                     let subscribed_connection_ids = thread_state_manager
                         .subscribed_connection_ids(conversation_id)
                         .await;
-                    let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
+                    let experimental_api_connection_ids = thread_state_manager
+                        .experimental_api_connection_ids(conversation_id)
+                        .await;
+                    let thread_outgoing =
+                        ThreadScopedOutgoingMessageSender::new_with_experimental_api_connections(
                         outgoing_for_task.clone(),
                         subscribed_connection_ids,
+                        experimental_api_connection_ids,
                         conversation_id,
                     );
 
@@ -684,8 +689,15 @@ pub(super) async fn handle_pending_thread_resume_request(
             );
         }
     }
+    let experimental_api_enabled = thread_state_manager
+        .connection_supports_experimental_api(connection_id)
+        .await;
     outgoing
-        .replay_requests_to_connection_for_thread(connection_id, conversation_id)
+        .replay_requests_to_connection_for_thread(
+            connection_id,
+            conversation_id,
+            experimental_api_enabled,
+        )
         .await;
     // App-server owns resume response and snapshot ordering, so wait until
     // replay completes before letting extensions react to the idle thread.

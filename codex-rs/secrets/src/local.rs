@@ -232,6 +232,13 @@ impl SecretsBackend for LocalSecretsBackend {
 }
 
 fn write_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    write_file_atomically_with_replace(path, contents, |from, to| fs::rename(from, to))
+}
+
+fn write_file_atomically_with_replace<F>(path: &Path, contents: &[u8], replace: F) -> Result<()>
+where
+    F: FnOnce(&Path, &Path) -> std::io::Result<()>,
+{
     let dir = path.parent().with_context(|| {
         format!(
             "failed to compute parent directory for secrets file at {}",
@@ -275,29 +282,9 @@ fn write_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
         })?;
     }
 
-    match fs::rename(&tmp_path, path) {
+    match replace(&tmp_path, path) {
         Ok(()) => Ok(()),
         Err(initial_error) => {
-            #[cfg(target_os = "windows")]
-            {
-                if path.exists() {
-                    fs::remove_file(path).with_context(|| {
-                        format!(
-                            "failed to remove existing secrets file at {} before replace",
-                            path.display()
-                        )
-                    })?;
-                    fs::rename(&tmp_path, path).with_context(|| {
-                        format!(
-                            "failed to replace secrets file at {} with {}",
-                            path.display(),
-                            tmp_path.display()
-                        )
-                    })?;
-                    return Ok(());
-                }
-            }
-
             let _ = fs::remove_file(&tmp_path);
             Err(initial_error).with_context(|| {
                 format!(
@@ -427,7 +414,7 @@ mod tests {
     fn save_file_does_not_leave_temp_files() -> Result<()> {
         let codex_home = tempfile::tempdir().expect("tempdir");
         let keyring = Arc::new(MockKeyringStore::default());
-        let backend = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring);
+        let backend = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring.clone());
 
         let scope = SecretScope::Global;
         let name = SecretName::new("TEST_SECRET")?;
@@ -445,7 +432,86 @@ mod tests {
             .filter_map(|entry| entry.file_name().to_str().map(ToString::to_string))
             .collect();
         assert_eq!(filenames, vec![LOCAL_SECRETS_FILENAME.to_string()]);
-        assert_eq!(backend.get(&scope, &name)?, Some("two".to_string()));
+        let reopened = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring);
+        assert_eq!(reopened.get(&scope, &name)?, Some("two".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn replacement_failure_preserves_existing_encrypted_store() -> Result<()> {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let keyring = Arc::new(MockKeyringStore::default());
+        let backend = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring.clone());
+        let scope = SecretScope::Global;
+        let name = SecretName::new("TEST_SECRET")?;
+        backend.set(&scope, &name, "original")?;
+
+        let path = backend.secrets_path();
+        let original_ciphertext = fs::read(&path)?;
+        let mut replacement_file = backend.load_file()?;
+        replacement_file
+            .secrets
+            .insert(scope.canonical_key(&name), "replacement".to_string());
+        let plaintext = serde_json::to_vec(&replacement_file)?;
+        let passphrase = backend.load_or_create_passphrase()?;
+        let replacement_ciphertext = encrypt_with_passphrase(&plaintext, &passphrase)?;
+
+        let mut observed_prepared_temp = false;
+        let error = write_file_atomically_with_replace(
+            &path,
+            &replacement_ciphertext,
+            |tmp_path, destination| {
+                observed_prepared_temp = true;
+                assert_eq!(destination, path);
+                assert_eq!(fs::read(tmp_path)?, replacement_ciphertext);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected replacement failure",
+                ))
+            },
+        )
+        .expect_err("replacement must fail after the temp file is prepared");
+        assert!(observed_prepared_temp);
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string() == "injected replacement failure"),
+            "unexpected error: {error:#}"
+        );
+
+        assert_eq!(fs::read(&path)?, original_ciphertext);
+        let reopened = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring);
+        assert_eq!(reopened.get(&scope, &name)?, Some("original".to_string()));
+        let filenames = fs::read_dir(backend.secrets_dir())?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(
+            filenames,
+            vec![std::ffi::OsString::from(LOCAL_SECRETS_FILENAME)]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stale_temp_file_does_not_corrupt_live_store() -> Result<()> {
+        let codex_home = tempfile::tempdir().expect("tempdir");
+        let keyring = Arc::new(MockKeyringStore::default());
+        let backend = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring.clone());
+        let scope = SecretScope::Global;
+        let name = SecretName::new("TEST_SECRET")?;
+        backend.set(&scope, &name, "one")?;
+
+        let stale_path = backend
+            .secrets_dir()
+            .join(format!(".{LOCAL_SECRETS_FILENAME}.tmp-stale"));
+        let stale_contents = b"incomplete encrypted replacement";
+        fs::write(&stale_path, stale_contents)?;
+        assert_eq!(backend.get(&scope, &name)?, Some("one".to_string()));
+
+        backend.set(&scope, &name, "two")?;
+        let reopened = LocalSecretsBackend::new(codex_home.path().to_path_buf(), keyring);
+        assert_eq!(reopened.get(&scope, &name)?, Some("two".to_string()));
+        assert_eq!(fs::read(stale_path)?, stale_contents);
         Ok(())
     }
 

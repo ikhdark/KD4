@@ -396,6 +396,15 @@ pub struct WorkspaceMutationResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceFinalizationFence {
+    pub fence_id: String,
+    pub repository_id: String,
+    pub workspace_id: String,
+    pub root_session_id: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WorkspaceEvent {
     pub workspace_id: String,
     pub epoch: u64,

@@ -13,7 +13,8 @@ pub(crate) const MAX_LIST_RESULTS: usize = 2_000;
 pub(crate) const DEFAULT_SEARCH_MAX_RESULTS: usize = 200;
 pub(crate) const MAX_SEARCH_RESULTS: usize = 200;
 pub(crate) const DEFAULT_READ_MAX_TOKENS: usize = 20_000;
-pub(crate) const MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_SUMMARY_TOKEN_LIMIT: usize = 2_500;
+pub(crate) const MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_SUMMARY_TOKEN_LIMIT: usize = 1_000;
+pub(crate) const MEMORY_TOOL_DEVELOPER_INSTRUCTIONS_TOKEN_LIMIT: usize = 2_000;
 
 pub(crate) const MEMORY_TOOLS_NAMESPACE: &str = "memories";
 pub(crate) const ADD_AD_HOC_NOTE_TOOL_NAME: &str = "add_ad_hoc_note";

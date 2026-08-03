@@ -68,6 +68,7 @@ use crate::tools::registry::ToolRegistry;
 use crate::tools::registry::override_tool_exposure;
 use crate::tools::router::ToolRouter;
 use crate::tools::router::ToolRouterParams;
+use codex_context_fragments::ModelContextBudget;
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_mcp::ToolInfo;
@@ -205,10 +206,26 @@ fn build_tool_specs_and_registry(
     };
     let mut planned_tools = PlannedTools::default();
     add_tool_sources(&context, &mut planned_tools);
+    promote_deferred_tools_without_search(turn_context, &mut planned_tools);
     apply_direct_model_only_namespace_overrides(turn_context, &mut planned_tools);
     append_tool_search_executor(&context, &mut planned_tools);
     prepend_code_mode_executors(&context, &mut planned_tools);
     build_model_visible_specs_and_registry(turn_context, planned_tools)
+}
+
+fn promote_deferred_tools_without_search(
+    turn_context: &TurnContext,
+    planned_tools: &mut PlannedTools,
+) {
+    if search_tool_enabled(turn_context) {
+        return;
+    }
+
+    for runtime in &mut planned_tools.runtimes {
+        if runtime.exposure() == ToolExposure::Deferred {
+            *runtime = override_tool_exposure(Arc::clone(runtime), ToolExposure::Direct);
+        }
+    }
 }
 
 fn apply_direct_model_only_namespace_overrides(
@@ -548,6 +565,7 @@ fn merge_into_namespaces(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
         }
     }
 
+    let mut description_budget = ModelContextBudget::default();
     for spec in &mut merged_specs {
         let ToolSpec::Namespace(namespace) = spec else {
             continue;
@@ -563,6 +581,9 @@ fn merge_into_namespaces(specs: Vec<ToolSpec>) -> Vec<ToolSpec> {
         if namespace.description.trim().is_empty() {
             namespace.description = default_namespace_description(&namespace.name);
         }
+        namespace.description = description_budget
+            .take(&namespace.description)
+            .unwrap_or_default();
     }
 
     merged_specs
@@ -572,11 +593,15 @@ fn code_mode_namespace_descriptions(
     specs: &[ToolSpec],
 ) -> BTreeMap<String, codex_code_mode::ToolNamespaceDescription> {
     let mut namespace_descriptions = BTreeMap::new();
+    let mut namespace_order = Vec::new();
     for spec in specs {
         let ToolSpec::Namespace(namespace) = spec else {
             continue;
         };
 
+        if !namespace_descriptions.contains_key(&namespace.name) {
+            namespace_order.push(namespace.name.clone());
+        }
         let entry = namespace_descriptions
             .entry(namespace.name.clone())
             .or_insert_with(|| codex_code_mode::ToolNamespaceDescription {
@@ -586,6 +611,15 @@ fn code_mode_namespace_descriptions(
         if entry.description.trim().is_empty() && !namespace.description.trim().is_empty() {
             entry.description = namespace.description.clone();
         }
+    }
+    let mut description_budget = ModelContextBudget::default();
+    for namespace_name in namespace_order {
+        let Some(entry) = namespace_descriptions.get_mut(&namespace_name) else {
+            continue;
+        };
+        entry.description = description_budget
+            .take(&entry.description)
+            .unwrap_or_default();
     }
     namespace_descriptions
 }

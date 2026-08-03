@@ -19,6 +19,7 @@ const ARTIFACT_EXPIRED_MESSAGE: &str = "artifact expired or does not belong to t
 const ARTIFACT_WRITING_MESSAGE: &str =
     "artifact is still being written; retry after the command yields or exits";
 const EVIDENCE_PROTECTION_EXTENSION: &str = "evidence-protected";
+const EVIDENCE_PROTECTION_MARKER_BYTES: &[u8; 34] = b"KD4_EXTERNAL_EVIDENCE_ARTIFACT_V1\n";
 const MAX_RAW_OUTPUT_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_PER_THREAD: u64 = 256 * 1024 * 1024;
 const MAX_RETAINED_ARTIFACT_BYTES_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
@@ -458,8 +459,7 @@ pub(crate) async fn create_evidence_output_artifact(
 ) -> Result<PendingEvidenceArtifact, String> {
     if output.len() > MAX_RAW_OUTPUT_ARTIFACT_BYTES {
         return Err(format!(
-            "evidence output exceeds the {} byte artifact safety limit",
-            MAX_RAW_OUTPUT_ARTIFACT_BYTES
+            "evidence output exceeds the {MAX_RAW_OUTPUT_ARTIFACT_BYTES} byte artifact safety limit"
         ));
     }
     create_evidence_output_artifact_inner(codex_home, thread_id, output, None).await
@@ -473,8 +473,7 @@ async fn create_evidence_output_artifact_inner(
 ) -> Result<PendingEvidenceArtifact, String> {
     if output.len() > MAX_RAW_OUTPUT_ARTIFACT_BYTES {
         return Err(format!(
-            "evidence output exceeds the {} byte artifact safety limit",
-            MAX_RAW_OUTPUT_ARTIFACT_BYTES
+            "evidence output exceeds the {MAX_RAW_OUTPUT_ARTIFACT_BYTES} byte artifact safety limit"
         ));
     }
     let directory = codex_home.join("tool-output").join(thread_id);
@@ -595,7 +594,7 @@ fn create_new_evidence_protection_marker(marker: &Path) -> std::io::Result<()> {
         .write(true)
         .open(marker)?;
     if let Err(err) = file
-        .write_all(b"KD4_EXTERNAL_EVIDENCE_ARTIFACT_V1\n")
+        .write_all(EVIDENCE_PROTECTION_MARKER_BYTES)
         .and_then(|()| file.sync_all())
     {
         drop(file);
@@ -710,8 +709,15 @@ fn evidence_protection_marker_is_valid(marker: &Path) -> bool {
     if !metadata.is_file() || metadata_is_reparse_point(&metadata) {
         return false;
     }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).is_ok() && bytes == b"KD4_EXTERNAL_EVIDENCE_ARTIFACT_V1\n"
+    if metadata.len() != EVIDENCE_PROTECTION_MARKER_BYTES.len() as u64 {
+        return false;
+    }
+    let mut bytes = [0_u8; EVIDENCE_PROTECTION_MARKER_BYTES.len()];
+    if file.read_exact(&mut bytes).is_err() || bytes != *EVIDENCE_PROTECTION_MARKER_BYTES {
+        return false;
+    }
+    let mut trailing = [0_u8; 1];
+    matches!(file.read(&mut trailing), Ok(0))
 }
 
 pub(crate) async fn append_raw_output_artifact(
@@ -1246,7 +1252,7 @@ async fn enforce_global_retention_locked(tool_output_root: &Path, keep_path: &Pa
             let path = entry.path();
             if path.extension().and_then(|extension| extension.to_str()) == Some("log") {
                 let metadata = entry.metadata().await.ok();
-                let bytes = metadata.as_ref().map_or(0, |metadata| metadata.len());
+                let bytes = metadata.as_ref().map_or(0, std::fs::Metadata::len);
                 total_bytes = total_bytes.saturating_add(bytes);
                 let modified = metadata
                     .and_then(|metadata| metadata.modified().ok())
@@ -1451,6 +1457,22 @@ mod tests {
             artifact,
             RawOutputArtifact::Failed { bytes: 17, .. }
         ));
+    }
+
+    #[test]
+    fn evidence_protection_marker_rejects_oversized_contents() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("artifact.evidence-protected");
+        create_new_evidence_protection_marker(&marker).expect("create evidence marker");
+        assert!(evidence_protection_marker_is_valid(&marker));
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&marker)
+            .expect("open evidence marker for append");
+        file.write_all(b"x").expect("append trailing marker byte");
+
+        assert!(!evidence_protection_marker_is_valid(&marker));
     }
 
     fn stored_id(artifact: &RawOutputArtifact) -> ToolOutputArtifactId {

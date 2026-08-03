@@ -15,6 +15,8 @@ jest.mock("node:child_process", () => {
 const _actualChildProcess =
   jest.requireActual<typeof import("node:child_process")>("node:child_process");
 const spawnMock = child_process.spawn as jest.MockedFunction<typeof _actualChildProcess.spawn>;
+const STDERR_TAIL_MAX_BYTES = 64 * 1024;
+const STDERR_TRUNCATION_MARKER = `[stderr truncated; showing last ${STDERR_TAIL_MAX_BYTES} bytes]\n`;
 
 class FakeChildProcess extends EventEmitter {
   stdin = new PassThrough();
@@ -45,6 +47,34 @@ function createEarlyExitChild(exitCode = 2): FakeChildProcess {
   return child;
 }
 
+function createCompletedChild(
+  stderr: Buffer,
+  exitCode: number,
+  delayStderrUntilAfterExit = false,
+): FakeChildProcess {
+  const child = new FakeChildProcess();
+  setImmediate(() => {
+    if (delayStderrUntilAfterExit) {
+      child.stdout.end();
+      child.emit("exit", exitCode, null);
+      setImmediate(() => child.stderr.end(stderr));
+    } else {
+      child.stderr.end(stderr);
+      child.stdout.end();
+      child.emit("exit", exitCode, null);
+    }
+  });
+  return child;
+}
+
+function newlineFreeStderrOverCap(): Buffer {
+  return Buffer.concat([
+    Buffer.from("discard-me"),
+    Buffer.from(String.fromCodePoint(0x1f642).repeat(STDERR_TAIL_MAX_BYTES / 4 + 2)),
+    Buffer.from("END"),
+  ]);
+}
+
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 describe("CodexExec", () => {
@@ -73,6 +103,50 @@ describe("CodexExec", () => {
       expect(result.error).toBeInstanceOf(Error);
       expect(result.error.message).toMatch(/Codex Exec exited/);
     }
+  });
+
+  it("bounds and renders a newline-free stderr tail on failure", async () => {
+    const { CodexExec } = await import("../src/exec");
+    spawnMock.mockClear();
+    const child = createCompletedChild(newlineFreeStderrOverCap(), 2, true);
+    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+
+    const exec = new CodexExec("codex");
+    let error: unknown;
+    try {
+      for await (const _ of exec.run({ input: "hi" })) {
+        // no-op
+      }
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error).toBeInstanceOf(Error);
+    const message = (error as Error).message;
+    expect(message).toContain(STDERR_TRUNCATION_MARKER);
+    expect(message).toContain("END");
+    expect(message).not.toContain("discard-me");
+    expect(message).not.toContain("\ufffd");
+  });
+
+  it("drains over-cap newline-free stderr when the child succeeds", async () => {
+    const { CodexExec } = await import("../src/exec");
+    spawnMock.mockClear();
+    const child = createCompletedChild(newlineFreeStderrOverCap(), 0);
+    spawnMock.mockReturnValue(child as unknown as child_process.ChildProcess);
+
+    const exec = new CodexExec("codex");
+    const result = await Promise.race([
+      (async () => {
+        for await (const _ of exec.run({ input: "hi" })) {
+          // no-op
+        }
+        return "resolved" as const;
+      })(),
+      delay(500).then(() => "timeout" as const),
+    ]);
+
+    expect(result).toBe("resolved");
   });
 
   it("escalates to SIGKILL when an early-returned child ignores SIGTERM", async () => {

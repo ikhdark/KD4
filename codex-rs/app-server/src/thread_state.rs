@@ -422,6 +422,7 @@ struct ThreadStateManagerInner {
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ConnectionCapabilities {
     pub(crate) request_attestation: bool,
+    pub(crate) experimental_api: bool,
 }
 
 #[derive(Clone, Default)]
@@ -494,6 +495,38 @@ impl ThreadStateManager {
             .get(&thread_id)
             .map(|thread_entry| thread_entry.connection_ids.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    pub(crate) async fn experimental_api_connection_ids(
+        &self,
+        thread_id: ThreadId,
+    ) -> Vec<ConnectionId> {
+        let state = self.state.lock().await;
+        state
+            .threads
+            .get(&thread_id)
+            .into_iter()
+            .flat_map(|thread_entry| thread_entry.connection_ids.iter())
+            .filter_map(|connection_id| {
+                state
+                    .live_connections
+                    .get(connection_id)
+                    .is_some_and(|capabilities| capabilities.experimental_api)
+                    .then_some(*connection_id)
+            })
+            .collect()
+    }
+
+    pub(crate) async fn connection_supports_experimental_api(
+        &self,
+        connection_id: ConnectionId,
+    ) -> bool {
+        self.state
+            .lock()
+            .await
+            .live_connections
+            .get(&connection_id)
+            .is_some_and(|capabilities| capabilities.experimental_api)
     }
 
     pub(crate) async fn thread_state(&self, thread_id: ThreadId) -> Arc<Mutex<ThreadState>> {

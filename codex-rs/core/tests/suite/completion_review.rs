@@ -1,8 +1,14 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
+use codex_config::types::Personality;
 use codex_core::config::AgentRoleConfig;
 use codex_features::Feature;
 use codex_protocol::config_types::CollaborationMode;
@@ -24,6 +30,7 @@ use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::mount_sse_sequence;
 use core_test_support::responses::sse;
+use core_test_support::responses::sse_response;
 use core_test_support::responses::start_mock_server;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
@@ -34,9 +41,25 @@ use serde_json::Value;
 use serde_json::json;
 use tokio::time::sleep;
 use tokio::time::timeout;
+use wiremock::Mock;
+use wiremock::Respond;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path_regex;
 
-const REVIEW_REQUEST_MARKER: &str = "KD4_COMPLETION_REVIEW_REQUEST_V1";
+const CLASSIFICATION_REQUEST_MARKER: &str = "KD4_SOURCE_CLASSIFICATION_REQUEST_V1";
+const REVIEW_REQUEST_MARKER: &str = "KD4_COMPLETION_REVIEW_REQUEST_V2";
 const REPAIR_MARKER: &str = "<kd4_completion_repair>";
+const REVIEW_LENSES: [&str; 8] = [
+    "requirements_and_behavioral_compatibility",
+    "lifecycle_and_concurrency",
+    "persistence_filesystem_safety_rollback_and_atomicity",
+    "schema_protocol_and_generated_representations",
+    "security_and_trust_boundaries",
+    "platform_configuration_packaging_and_installation",
+    "pipeline_cache_snapshot_and_artifact_identity",
+    "validation_quality_and_changed_test_oracle_integrity",
+];
 
 fn completion_review_builder() -> TestCodexBuilder {
     completion_review_builder_with_role(true)
@@ -190,7 +213,7 @@ $receipt = Get-ChildItem -Path (Join-Path $PSScriptRoot 'task-evidence\*.json') 
 $result = 'missing-review'
 if ($null -ne $receipt) {
     $content = Get-Content -LiteralPath $receipt.FullName -Raw
-    if ($content -match '"completion_review_receipts"\s*:\s*\[\s*\{' -and $content -match '"outcome"\s*:\s*"clean"') {
+    if ($content -match '"attempt_kind"\s*:\s*"initial_review"' -and $content -match '"review_clean"\s*:\s*true') {
         $result = 'reviewed'
     }
 }
@@ -210,7 +233,7 @@ Set-Content -LiteralPath (Join-Path $PSScriptRoot 'after-agent-order.txt') -Valu
             let script = config.codex_home.join("after-agent-order.sh");
             fs::write(
                 &script,
-                "#!/bin/sh\nif grep -Eq '\"completion_review_receipts\"[[:space:]]*:[[:space:]]*\\[[[:space:]]*\\{' \"$(dirname \"$0\")\"/task-evidence/*.json && grep -Eq '\"outcome\"[[:space:]]*:[[:space:]]*\"clean\"' \"$(dirname \"$0\")\"/task-evidence/*.json; then\n  printf reviewed > \"$(dirname \"$0\")/after-agent-order.txt\"\nelse\n  printf missing-review > \"$(dirname \"$0\")/after-agent-order.txt\"\nfi\n",
+                "#!/bin/sh\nif grep -Eq '\"attempt_kind\"[[:space:]]*:[[:space:]]*\"initial_review\"' \"$(dirname \"$0\")\"/task-evidence/*.json && grep -Eq '\"review_clean\"[[:space:]]*:[[:space:]]*true' \"$(dirname \"$0\")\"/task-evidence/*.json; then\n  printf reviewed > \"$(dirname \"$0\")/after-agent-order.txt\"\nelse\n  printf missing-review > \"$(dirname \"$0\")/after-agent-order.txt\"\nfi\n",
             )
             .expect("write AfterAgent probe");
             config.notify = Some(vec!["sh".to_string(), script.display().to_string()]);
@@ -258,30 +281,387 @@ fn message_response(response_id: &str, message_id: &str, text: &str) -> String {
     ])
 }
 
-fn clean_review_response(response_id: &str) -> String {
-    message_response(
-        response_id,
-        "review-clean-message",
-        &json!({"verdict": "clean", "findings": []}).to_string(),
-    )
+#[derive(Clone)]
+enum ReviewScenario {
+    Clean,
+    FindingThenClean { summary: String },
+    FindingThenUnresolved { summary: String },
+    Malformed,
+    Oversized,
+    ManifestGap,
 }
 
-fn repair_review_response(response_id: &str, summary: &str) -> String {
-    message_response(
-        response_id,
-        "review-repair-message",
-        &json!({
-            "verdict": "repair_needed",
-            "findings": [{
-                "severity": "high",
-                "summary": summary,
-                "evidence": "the candidate omitted the stated requirement",
-                "smallest_correction": "add the omitted requirement to completed.txt",
-                "proof_command": "cargo test -p codex-core completion_review"
-            }]
+#[derive(Default)]
+struct CompletionReviewProbe {
+    total_requests: AtomicUsize,
+    classification_requests: AtomicUsize,
+    review_requests: AtomicUsize,
+    rereview_requests: AtomicUsize,
+    repair_requests: AtomicUsize,
+    repair_payloads: Mutex<Vec<String>>,
+    request_payloads: Mutex<Vec<String>>,
+}
+
+struct CompletionReviewResponder {
+    ordinary_responses: Mutex<VecDeque<String>>,
+    scenario: ReviewScenario,
+    probe: Arc<CompletionReviewProbe>,
+}
+
+impl Respond for CompletionReviewResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let body_bytes = decode_body_bytes(request);
+        let body: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+        let mut strings = Vec::new();
+        collect_strings(&body, &mut strings);
+        let combined = strings.join("\n");
+        self.probe
+            .request_payloads
+            .lock()
+            .expect("request payload lock")
+            .push(combined.clone());
+        let request_index = self.probe.total_requests.fetch_add(1, Ordering::SeqCst);
+        if let Some(request_text) = strings
+            .iter()
+            .find(|text| text.contains(CLASSIFICATION_REQUEST_MARKER))
+        {
+            self.probe
+                .classification_requests
+                .fetch_add(1, Ordering::SeqCst);
+            let dossier = tagged_json(request_text, "source_ledger");
+            let response = classification_response(
+                &dossier,
+                matches!(&self.scenario, ReviewScenario::ManifestGap),
+            );
+            return sse_response(message_response(
+                &format!("classification-{request_index}"),
+                &format!("classification-message-{request_index}"),
+                &response.to_string(),
+            ));
+        }
+
+        if let Some(request_text) = strings
+            .iter()
+            .find(|text| text.contains(REVIEW_REQUEST_MARKER))
+        {
+            let review_index = self.probe.review_requests.fetch_add(1, Ordering::SeqCst);
+            let dossier = tagged_json(request_text, "completion_dossier");
+            if dossier["rereview"].as_bool().unwrap_or(false) {
+                self.probe.rereview_requests.fetch_add(1, Ordering::SeqCst);
+            }
+            let response = match &self.scenario {
+                ReviewScenario::Malformed => "not-json".to_string(),
+                ReviewScenario::Oversized => json!({
+                    "padding": "word ".repeat(10_000)
+                })
+                .to_string(),
+                ReviewScenario::Clean => review_response(&dossier, ReviewResponseKind::Clean),
+                ReviewScenario::FindingThenClean { summary } => {
+                    if review_index == 0 {
+                        review_response(&dossier, ReviewResponseKind::Finding(summary.as_str()))
+                    } else {
+                        review_response(&dossier, ReviewResponseKind::Clean)
+                    }
+                }
+                ReviewScenario::FindingThenUnresolved { summary } => {
+                    if review_index == 0 {
+                        review_response(&dossier, ReviewResponseKind::Finding(summary.as_str()))
+                    } else {
+                        review_response(&dossier, ReviewResponseKind::Unresolved)
+                    }
+                }
+                ReviewScenario::ManifestGap => {
+                    if review_index == 0 {
+                        review_response(&dossier, ReviewResponseKind::ManifestGap)
+                    } else {
+                        review_response(&dossier, ReviewResponseKind::Clean)
+                    }
+                }
+            };
+            return sse_response(message_response(
+                &format!("review-{request_index}"),
+                &format!("review-message-{request_index}"),
+                &response,
+            ));
+        }
+
+        if combined.contains(REPAIR_MARKER) {
+            self.probe.repair_requests.fetch_add(1, Ordering::SeqCst);
+            self.probe
+                .repair_payloads
+                .lock()
+                .expect("repair payload lock")
+                .push(combined);
+        }
+        let response = self
+            .ordinary_responses
+            .lock()
+            .expect("ordinary response lock")
+            .pop_front()
+            .unwrap_or_else(|| {
+                message_response(
+                    &format!("unexpected-{request_index}"),
+                    &format!("unexpected-message-{request_index}"),
+                    "unexpected request",
+                )
+            });
+        sse_response(response)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReviewResponseKind<'a> {
+    Clean,
+    Finding(&'a str),
+    Unresolved,
+    ManifestGap,
+}
+
+async fn mount_completion_review_sequence(
+    server: &wiremock::MockServer,
+    ordinary_responses: Vec<String>,
+    scenario: ReviewScenario,
+) -> Arc<CompletionReviewProbe> {
+    let probe = Arc::new(CompletionReviewProbe::default());
+    Mock::given(method("POST"))
+        .and(path_regex(".*/responses$"))
+        .respond_with(CompletionReviewResponder {
+            ordinary_responses: Mutex::new(ordinary_responses.into()),
+            scenario,
+            probe: Arc::clone(&probe),
         })
-        .to_string(),
-    )
+        .mount(server)
+        .await;
+    probe
+}
+
+fn decode_body_bytes(request: &wiremock::Request) -> Vec<u8> {
+    let Some(encoding) = request
+        .headers
+        .get("content-encoding")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return request.body.clone();
+    };
+    if encoding
+        .split(',')
+        .any(|entry| entry.trim().eq_ignore_ascii_case("zstd"))
+    {
+        zstd::stream::decode_all(std::io::Cursor::new(&request.body))
+            .unwrap_or_else(|_| request.body.clone())
+    } else {
+        request.body.clone()
+    }
+}
+
+fn collect_strings(value: &Value, strings: &mut Vec<String>) {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::String(text) => strings.push(text.clone()),
+            Value::Array(values) => pending.extend(values),
+            Value::Object(values) => pending.extend(values.values()),
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+}
+
+fn tagged_json(text: &str, tag: &str) -> Value {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = text.find(&start_tag).expect("tag start") + start_tag.len();
+    let end = text[start..].find(&end_tag).expect("tag end") + start;
+    serde_json::from_str(text[start..end].trim()).expect("tagged dossier JSON")
+}
+
+fn empty_text_span() -> Value {
+    json!({
+        "kind": "text",
+        "start": 0,
+        "end": 0,
+        "reference": "",
+        "subreference": "",
+    })
+}
+
+fn source_span(source: &Value) -> Value {
+    let material = source["exact_material"].as_str().unwrap_or_default();
+    match source["source_kind"].as_str().unwrap_or("text") {
+        "image" => json!({
+            "kind": "image",
+            "start": 0,
+            "end": 0,
+            "reference": material,
+            "subreference": "",
+        }),
+        "attachment" => json!({
+            "kind": "attachment",
+            "start": 0,
+            "end": 0,
+            "reference": material,
+            "subreference": "",
+        }),
+        _ => json!({
+            "kind": "text",
+            "start": 0,
+            "end": material.len(),
+            "reference": "",
+            "subreference": "",
+        }),
+    }
+}
+
+fn classification_response(dossier: &Value, classify_as_context: bool) -> Value {
+    let sources = dossier["sources"]
+        .as_array()
+        .expect("classification sources")
+        .iter()
+        .map(|source| {
+            let source_id = source["source_id"].as_str().expect("source ID");
+            if source["availability"].as_str() != Some("available") {
+                return json!({
+                    "source_id": source_id,
+                    "result": "unavailable_or_truncated",
+                    "requirements": [],
+                    "reason": "",
+                });
+            }
+            if classify_as_context {
+                return json!({
+                    "source_id": source_id,
+                    "result": "non_requirement",
+                    "requirements": [],
+                    "reason": "initial classification treated this immutable text as context",
+                });
+            }
+            json!({
+                "source_id": source_id,
+                "result": "requirement_bearing",
+                "requirements": [{
+                    "source_span": source_span(source),
+                    "status": "active",
+                    "superseded_by_source_id": "",
+                    "superseded_by_span": empty_text_span(),
+                }],
+                "reason": "",
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({ "sources": sources })
+}
+
+fn review_response(dossier: &Value, kind: ReviewResponseKind<'_>) -> String {
+    let requirements = dossier["requirements"]
+        .as_array()
+        .expect("review requirements");
+    let finding_requirement_id = requirements
+        .iter()
+        .find(|requirement| requirement["status"].as_str() == Some("active"))
+        .and_then(|requirement| requirement["requirement_id"].as_str());
+    let sources = dossier["sources"]
+        .as_array()
+        .expect("review sources")
+        .iter()
+        .enumerate()
+        .map(|(index, source)| {
+            let source_id = source["source_id"].as_str().expect("source ID");
+            let mapping = &dossier["source_mappings"][source_id];
+            if matches!(kind, ReviewResponseKind::ManifestGap) && index == 0 {
+                return json!({
+                    "source_id": source_id,
+                    "result": "manifest_gap",
+                    "requirement_ids": mapping["requirement_ids"].as_array().cloned().unwrap_or_default(),
+                    "omitted_source_spans": [source_span(source)],
+                    "reason": "",
+                });
+            }
+            let mapping_kind = mapping["kind"].as_str().unwrap_or("non_requirement");
+            json!({
+                "source_id": source_id,
+                "result": mapping_kind,
+                "requirement_ids": mapping["requirement_ids"].as_array().cloned().unwrap_or_default(),
+                "omitted_source_spans": [],
+                "reason": if matches!(mapping_kind, "non_requirement" | "superseded_context") {
+                    mapping["reason"].as_str().unwrap_or("task-specific context classification")
+                } else {
+                    ""
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let requirement_results = requirements
+        .iter()
+        .map(|requirement| {
+            let is_finding = matches!(kind, ReviewResponseKind::Finding(_))
+                && requirement["requirement_id"].as_str() == finding_requirement_id;
+            json!({
+                "requirement_id": requirement["requirement_id"],
+                "status": requirement["status"],
+                "satisfied": !is_finding,
+                "evidence": if is_finding {
+                    "the current candidate omits this active requirement"
+                } else {
+                    "owning code and focused evidence satisfy this manifest entry"
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    let lenses = REVIEW_LENSES
+        .iter()
+        .map(|lens| {
+            json!({
+                "lens": lens,
+                "status": "checked",
+                "surfaces": ["bounded completion-review fixture"],
+                "evidence": "the owning fixture and one-hop behavior were checked",
+                "reason": "",
+            })
+        })
+        .collect::<Vec<_>>();
+    let findings = match kind {
+        ReviewResponseKind::Finding(summary) => vec![json!({
+            "finding_local_ordinal": 1,
+            "requirement_ids": [finding_requirement_id.expect("active requirement")],
+            "lens": REVIEW_LENSES[0],
+            "contract_surface": "completed.txt behavior",
+            "severity": "high",
+            "concrete_evidence": summary,
+            "smallest_correction": "add the omitted requirement to completed.txt",
+            "focused_proof_route": "cargo test -p codex-core completion_review",
+        })],
+        ReviewResponseKind::Clean
+        | ReviewResponseKind::Unresolved
+        | ReviewResponseKind::ManifestGap => Vec::new(),
+    };
+    let dispositions = dossier["original_findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|finding| {
+            json!({
+                "finding_id": finding["finding_id"],
+                "disposition": if matches!(kind, ReviewResponseKind::Unresolved) {
+                    "still_present"
+                } else {
+                    "resolved"
+                },
+                "evidence": if matches!(kind, ReviewResponseKind::Unresolved) {
+                    "the original defect remains after the one correction phase"
+                } else {
+                    "fresh proof covers the correction without regression"
+                },
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "clean": matches!(kind, ReviewResponseKind::Clean),
+        "sources": sources,
+        "requirements": requirement_results,
+        "lenses": lenses,
+        "findings": findings,
+        "original_finding_dispositions": dispositions,
+    })
+    .to_string()
 }
 
 fn reviewer_request_count(requests: &[core_test_support::responses::ResponsesRequest]) -> usize {
@@ -289,21 +669,6 @@ fn reviewer_request_count(requests: &[core_test_support::responses::ResponsesReq
         .iter()
         .filter(|request| request.body_contains_text(REVIEW_REQUEST_MARKER))
         .count()
-}
-
-fn text_occurrences(value: &Value, needle: &str) -> usize {
-    match value {
-        Value::String(text) => text.matches(needle).count(),
-        Value::Array(values) => values
-            .iter()
-            .map(|value| text_occurrences(value, needle))
-            .sum(),
-        Value::Object(values) => values
-            .values()
-            .map(|value| text_occurrences(value, needle))
-            .sum(),
-        _ => 0,
-    }
 }
 
 async fn submit_turn_and_capture_completion(
@@ -375,7 +740,7 @@ async fn assert_no_additional_turn_complete(test: &TestCodex) {
 async fn clean_review_finishes_without_a_repair_continuation() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
-    let response_mock = mount_sse_sequence(
+    let probe = mount_completion_review_sequence(
         &server,
         vec![
             plan_response("plan-start", "plan-start-call", "in_progress"),
@@ -386,11 +751,19 @@ async fn clean_review_finishes_without_a_repair_continuation() -> Result<()> {
             ),
             plan_response("plan-pass", "plan-pass-call", "passed"),
             message_response("candidate", "candidate-message", "implementation complete"),
-            clean_review_response("review-clean"),
         ],
+        ReviewScenario::Clean,
     )
     .await;
-    let mut builder = completion_review_builder();
+    let mut builder = completion_review_builder()
+        .with_model("gpt-5.4")
+        .with_config(|config| {
+            config
+                .features
+                .enable(Feature::Personality)
+                .expect("enable personality for reviewer-isolation proof");
+            config.personality = Some(Personality::Friendly);
+        });
     let test = builder.build(&server).await?;
 
     let completion =
@@ -402,24 +775,34 @@ async fn clean_review_finishes_without_a_repair_continuation() -> Result<()> {
     );
     assert_no_additional_turn_complete(&test).await;
 
-    let requests = response_mock.requests();
-    assert_eq!(requests.len(), 5);
-    assert_eq!(reviewer_request_count(&requests), 1);
+    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 6);
+    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 0);
+    let personality_fragment =
+        "You optimize for team morale and being a supportive teammate as much as code quality.";
+    let payloads = probe.request_payloads.lock().expect("request payloads");
     assert!(
-        !requests
+        payloads
             .iter()
-            .any(|request| request.body_contains_text(REPAIR_MARKER))
+            .any(|payload| payload.contains(personality_fragment)),
+        "the parent request should make the personality isolation assertion sensitive"
     );
+    for reviewer_payload in payloads.iter().filter(|payload| {
+        payload.contains(CLASSIFICATION_REQUEST_MARKER) || payload.contains(REVIEW_REQUEST_MARKER)
+    }) {
+        assert!(!reviewer_payload.contains(personality_fragment));
+        assert!(!reviewer_payload.contains("<personality_spec>"));
+    }
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_review() -> Result<()>
-{
+async fn manifest_gap_rebuilds_the_manifest_and_starts_a_fresh_initial_review() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
-    let finding = "the user requirement was omitted";
-    let response_mock = mount_sse_sequence(
+    let probe = mount_completion_review_sequence(
         &server,
         vec![
             plan_response("plan-start", "plan-start-call", "in_progress"),
@@ -430,7 +813,47 @@ async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_re
             ),
             plan_response("plan-pass", "plan-pass-call", "passed"),
             message_response("candidate", "candidate-message", "implementation complete"),
-            repair_review_response("review-repair", finding),
+        ],
+        ReviewScenario::ManifestGap,
+    )
+    .await;
+    let mut builder = completion_review_builder();
+    let test = builder.build(&server).await?;
+
+    let completion =
+        submit_turn_and_capture_completion(&test, "Implement the requirement in this message")
+            .await?;
+    assert_eq!(
+        completion.completion.as_ref().map(|gate| gate.status),
+        Some(TaskCompletionStatus::Passed)
+    );
+    assert_no_additional_turn_complete(&test).await;
+
+    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 7);
+    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 0);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_review() -> Result<()>
+{
+    skip_if_no_network!(Ok(()));
+    let server = start_mock_server().await;
+    let finding = "the user requirement was omitted";
+    let probe = mount_completion_review_sequence(
+        &server,
+        vec![
+            plan_response("plan-start", "plan-start-call", "in_progress"),
+            patch_response(
+                "initial-patch",
+                "initial-patch-call",
+                "*** Begin Patch\n*** Add File: completed.txt\n+done\n*** End Patch",
+            ),
+            plan_response("plan-pass", "plan-pass-call", "passed"),
+            message_response("candidate", "candidate-message", "implementation complete"),
             patch_response(
                 "repair-patch",
                 "repair-patch-call",
@@ -439,6 +862,9 @@ async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_re
             plan_response("repair-plan-pass", "repair-plan-pass-call", "passed"),
             message_response("repaired", "repaired-message", "repair complete"),
         ],
+        ReviewScenario::FindingThenClean {
+            summary: finding.to_string(),
+        },
     )
     .await;
     let mut builder = completion_review_builder();
@@ -452,20 +878,18 @@ async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_re
     );
     assert_no_additional_turn_complete(&test).await;
 
-    let requests = response_mock.requests();
-    assert_eq!(requests.len(), 8);
-    assert_eq!(reviewer_request_count(&requests), 1);
-    let repair_requests = requests
-        .iter()
-        .filter(|request| request.body_contains_text(REPAIR_MARKER))
-        .collect::<Vec<_>>();
-    assert_eq!(repair_requests.len(), 3);
+    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 10);
+    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 3);
+    let repair_payloads = probe.repair_payloads.lock().expect("repair payloads");
     assert!(
-        repair_requests
+        repair_payloads
             .iter()
-            .all(|request| text_occurrences(&request.body_json(), REPAIR_MARKER) == 1)
+            .all(|payload| payload.matches(REPAIR_MARKER).count() == 1)
     );
-    assert!(repair_requests[0].body_contains_text(finding));
+    assert!(repair_payloads[0].contains(finding));
     assert!(test.workspace_path("completed.txt").is_file());
     Ok(())
 }
@@ -474,7 +898,7 @@ async fn reviewer_finding_injects_one_repair_and_repair_mutation_cannot_rearm_re
 async fn nonpassed_evidence_triggers_repair_even_when_review_is_clean() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
-    let response_mock = mount_sse_sequence(
+    let probe = mount_completion_review_sequence(
         &server,
         vec![
             plan_response("plan-start", "plan-start-call", "in_progress"),
@@ -484,10 +908,10 @@ async fn nonpassed_evidence_triggers_repair_even_when_review_is_clean() -> Resul
                 "*** Begin Patch\n*** Add File: completed.txt\n+done\n*** End Patch",
             ),
             message_response("candidate", "candidate-message", "implementation complete"),
-            clean_review_response("review-clean"),
             plan_response("repair-plan-pass", "repair-plan-pass-call", "passed"),
             message_response("repaired", "repaired-message", "evidence repaired"),
         ],
+        ReviewScenario::Clean,
     )
     .await;
     let mut builder = completion_review_builder();
@@ -501,23 +925,28 @@ async fn nonpassed_evidence_triggers_repair_even_when_review_is_clean() -> Resul
         Some(TaskCompletionStatus::Passed)
     );
 
-    let requests = response_mock.requests();
-    assert_eq!(requests.len(), 6);
-    assert_eq!(reviewer_request_count(&requests), 1);
+    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 8);
+    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 2);
     assert!(
-        requests
+        probe
+            .repair_payloads
+            .lock()
+            .expect("repair payloads")
             .iter()
-            .any(|request| request.body_contains_text("Evidence gap:"))
+            .any(|payload| payload.contains("applicable_proof_routes"))
     );
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reviewer_and_evidence_findings_share_the_single_repair_fragment() -> Result<()> {
+async fn unresolved_rereview_is_partial_without_a_second_correction() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let finding = "reviewer-specific omitted requirement";
-    let response_mock = mount_sse_sequence(
+    let probe = mount_completion_review_sequence(
         &server,
         vec![
             plan_response("plan-start", "plan-start-call", "in_progress"),
@@ -527,10 +956,12 @@ async fn reviewer_and_evidence_findings_share_the_single_repair_fragment() -> Re
                 "*** Begin Patch\n*** Add File: completed.txt\n+done\n*** End Patch",
             ),
             message_response("candidate", "candidate-message", "implementation complete"),
-            repair_review_response("review-repair", finding),
             plan_response("repair-plan-pass", "repair-plan-pass-call", "passed"),
             message_response("repaired", "repaired-message", "combined repair complete"),
         ],
+        ReviewScenario::FindingThenUnresolved {
+            summary: finding.to_string(),
+        },
     )
     .await;
     let mut builder = completion_review_builder();
@@ -543,17 +974,19 @@ async fn reviewer_and_evidence_findings_share_the_single_repair_fragment() -> Re
     .await?;
     assert_eq!(
         completion.completion.as_ref().map(|gate| gate.status),
-        Some(TaskCompletionStatus::Passed)
+        Some(TaskCompletionStatus::Partial)
     );
-
-    let requests = response_mock.requests();
-    assert_eq!(reviewer_request_count(&requests), 1);
-    let repair_request = requests
-        .iter()
-        .find(|request| request.body_contains_text(REPAIR_MARKER))
-        .expect("single repair request");
-    assert!(repair_request.body_contains_text(finding));
-    assert!(repair_request.body_contains_text("Evidence gap:"));
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(probe.rereview_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.repair_requests.load(Ordering::SeqCst), 2);
+    assert!(
+        probe
+            .repair_payloads
+            .lock()
+            .expect("repair payloads")
+            .iter()
+            .all(|payload| payload.contains(finding))
+    );
     Ok(())
 }
 
@@ -561,7 +994,7 @@ async fn reviewer_and_evidence_findings_share_the_single_repair_fragment() -> Re
 async fn malformed_reviewer_output_is_partial_and_never_blocked() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
-    let response_mock = mount_sse_sequence(
+    let probe = mount_completion_review_sequence(
         &server,
         vec![
             plan_response("plan-start", "plan-start-call", "in_progress"),
@@ -572,8 +1005,8 @@ async fn malformed_reviewer_output_is_partial_and_never_blocked() -> Result<()> 
             ),
             plan_response("plan-pass", "plan-pass-call", "passed"),
             message_response("candidate", "candidate-message", "implementation complete"),
-            message_response("review-malformed", "review-message", "not-json"),
         ],
+        ReviewScenario::Malformed,
     )
     .await;
     let mut builder = completion_review_builder();
@@ -588,7 +1021,8 @@ async fn malformed_reviewer_output_is_partial_and_never_blocked() -> Result<()> 
             .iter()
             .any(|reason| reason.contains("malformed"))
     );
-    assert_eq!(reviewer_request_count(&response_mock.requests()), 1);
+    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
@@ -596,7 +1030,7 @@ async fn malformed_reviewer_output_is_partial_and_never_blocked() -> Result<()> 
 async fn oversized_reviewer_output_is_partial_and_never_blocked() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
-    let response_mock = mount_sse_sequence(
+    let probe = mount_completion_review_sequence(
         &server,
         vec![
             plan_response("plan-start", "plan-start-call", "in_progress"),
@@ -607,15 +1041,8 @@ async fn oversized_reviewer_output_is_partial_and_never_blocked() -> Result<()> 
             ),
             plan_response("plan-pass", "plan-pass-call", "passed"),
             message_response("candidate", "candidate-message", "implementation complete"),
-            message_response(
-                "review-oversized",
-                "review-message",
-                &format!(
-                    "{{\"verdict\":\"clean\",\"findings\":[],\"padding\":\"{}\"}}",
-                    "word ".repeat(10_000)
-                ),
-            ),
         ],
+        ReviewScenario::Oversized,
     )
     .await;
     let mut builder = completion_review_builder();
@@ -628,9 +1055,10 @@ async fn oversized_reviewer_output_is_partial_and_never_blocked() -> Result<()> 
     assert!(
         gate.reasons
             .iter()
-            .any(|reason| reason.contains("2,000-token limit"))
+            .any(|reason| reason.contains("private output bound"))
     );
-    assert_eq!(reviewer_request_count(&response_mock.requests()), 1);
+    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
     Ok(())
 }
 
@@ -638,7 +1066,7 @@ async fn oversized_reviewer_output_is_partial_and_never_blocked() -> Result<()> 
 async fn reviewer_spawn_failure_is_partial_and_never_blocked() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
-    let response_mock = mount_sse_sequence(
+    let probe = mount_completion_review_sequence(
         &server,
         vec![
             plan_response("plan-start", "plan-start-call", "in_progress"),
@@ -650,6 +1078,7 @@ async fn reviewer_spawn_failure_is_partial_and_never_blocked() -> Result<()> {
             plan_response("plan-pass", "plan-pass-call", "passed"),
             message_response("candidate", "candidate-message", "implementation complete"),
         ],
+        ReviewScenario::Clean,
     )
     .await;
     let mut builder = completion_review_builder_with_role(false);
@@ -664,12 +1093,14 @@ async fn reviewer_spawn_failure_is_partial_and_never_blocked() -> Result<()> {
             .iter()
             .any(|reason| reason.contains("could not start or complete"))
     );
-    assert_eq!(reviewer_request_count(&response_mock.requests()), 0);
+    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 4);
+    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 0);
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_stop_exits_before_reviewer_invocation() -> Result<()> {
+async fn explicit_stop_exits_before_reviewer_without_a_false_pass() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let response_mock = mount_sse_sequence(
@@ -695,8 +1126,15 @@ async fn explicit_stop_exits_before_reviewer_invocation() -> Result<()> {
         submit_turn_and_capture_completion(&test, "Implement the requested behavior").await?;
     assert_eq!(
         completion.completion.as_ref().map(|gate| gate.status),
-        Some(TaskCompletionStatus::Passed)
+        Some(TaskCompletionStatus::Partial),
+        "unexpected completion gate: {:?}",
+        completion.completion
     );
+    assert!(completion.completion.as_ref().is_some_and(|gate| {
+        gate.reasons
+            .iter()
+            .any(|reason| reason.contains("completion review risk remains unresolved"))
+    }));
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 4);
     assert_eq!(reviewer_request_count(&requests), 0);
@@ -708,7 +1146,7 @@ async fn stop_hook_continuation_runs_before_the_single_reviewer() -> Result<()> 
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
     let continuation = "complete the stop-hook-requested follow-up";
-    let response_mock = mount_sse_sequence(
+    let probe = mount_completion_review_sequence(
         &server,
         vec![
             plan_response("plan-start", "plan-start-call", "in_progress"),
@@ -724,8 +1162,8 @@ async fn stop_hook_continuation_runs_before_the_single_reviewer() -> Result<()> 
                 "stop-continuation-message",
                 "follow-up complete",
             ),
-            clean_review_response("review-clean"),
         ],
+        ReviewScenario::Clean,
     )
     .await;
     let mut builder = completion_review_builder()
@@ -739,13 +1177,16 @@ async fn stop_hook_continuation_runs_before_the_single_reviewer() -> Result<()> 
         completion.completion.as_ref().map(|gate| gate.status),
         Some(TaskCompletionStatus::Passed)
     );
-    let requests = response_mock.requests();
-    assert_eq!(requests.len(), 6);
-    assert_eq!(reviewer_request_count(&requests), 1);
+    assert_eq!(probe.total_requests.load(Ordering::SeqCst), 7);
+    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
     assert!(
-        requests
+        probe
+            .request_payloads
+            .lock()
+            .expect("request payloads")
             .iter()
-            .any(|request| request.body_contains_text(continuation))
+            .any(|payload| payload.contains(continuation))
     );
     Ok(())
 }
@@ -754,7 +1195,7 @@ async fn stop_hook_continuation_runs_before_the_single_reviewer() -> Result<()> 
 async fn reviewer_finishes_before_legacy_after_agent_hook() -> Result<()> {
     skip_if_no_network!(Ok(()));
     let server = start_mock_server().await;
-    let response_mock = mount_sse_sequence(
+    let probe = mount_completion_review_sequence(
         &server,
         vec![
             plan_response("plan-start", "plan-start-call", "in_progress"),
@@ -765,8 +1206,8 @@ async fn reviewer_finishes_before_legacy_after_agent_hook() -> Result<()> {
             ),
             plan_response("plan-pass", "plan-pass-call", "passed"),
             message_response("candidate", "candidate-message", "implementation complete"),
-            clean_review_response("review-clean"),
         ],
+        ReviewScenario::Clean,
     )
     .await;
     let mut builder = completion_review_builder_with_after_agent_probe();
@@ -778,7 +1219,8 @@ async fn reviewer_finishes_before_legacy_after_agent_hook() -> Result<()> {
         completion.completion.as_ref().map(|gate| gate.status),
         Some(TaskCompletionStatus::Passed)
     );
-    assert_eq!(reviewer_request_count(&response_mock.requests()), 1);
+    assert_eq!(probe.classification_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.review_requests.load(Ordering::SeqCst), 1);
 
     let marker = test.home.path().join("after-agent-order.txt");
     for _ in 0..100 {
@@ -821,7 +1263,9 @@ async fn disabled_feature_skips_review_without_changing_the_evidence_gate() -> R
         submit_turn_and_capture_completion(&test, "Implement the requested behavior").await?;
     assert_eq!(
         completion.completion.as_ref().map(|gate| gate.status),
-        Some(TaskCompletionStatus::Passed)
+        Some(TaskCompletionStatus::Passed),
+        "unexpected completion gate: {:?}",
+        completion.completion
     );
     let requests = response_mock.requests();
     assert_eq!(requests.len(), 4);

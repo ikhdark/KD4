@@ -153,6 +153,7 @@ fn require_single_current_time_connection(connection_ids: &[ConnectionId]) -> Re
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use codex_protocol::ThreadId;
     use tokio::sync::mpsc;
@@ -197,6 +198,9 @@ mod tests {
         let thread_state_manager = ThreadStateManager::new();
         let thread_id = ThreadId::new();
         let connection_id = ConnectionId(1);
+        outgoing
+            .connection_opened(connection_id, Arc::new(AtomicBool::new(/*value*/ true)))
+            .await;
         thread_state_manager
             .connection_initialized(connection_id, ConnectionCapabilities::default())
             .await;

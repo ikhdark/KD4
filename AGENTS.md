@@ -23,10 +23,6 @@
 
 ## Instruction scope
 
-Budget is not a constraint. Do not reduce investigation quality, skip code reading
-needed for correctness, or stop early solely to conserve tokens, context, commands,
-or compute.
-
 Read the closest relevant `AGENTS.md`. A nearer file augments this policy and
 takes precedence inside its subtree. Never rely on an instruction file that is
 absent from the working tree.
@@ -120,10 +116,6 @@ path that completes the request correctly.
   to their likely value. State the reason for any unresolved task-relevant
   candidate. Never invent or pad findings to satisfy an expected count.
 * Do not turn a directed fix into a broad fix.
-* After implementation and validation, perform one final self-review of the diff,
-  affected contracts, and validation results. Correct any task-relevant defect
-  found during that review. Do not repeat unchanged validation solely to satisfy
-  this requirement.
 * Fix validation, test, or implementation blockers caused by the change or
   necessary to complete the requested task. For unrelated, pre-existing, or
   concurrently introduced blockers, avoid overwriting other agents' work; record

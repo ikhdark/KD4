@@ -880,9 +880,11 @@ fn validate_avas_webrtc_start(
 }
 
 fn remaining_realtime_startup_context_budget(prompt: &str) -> usize {
-    let separator_tokens = (!prompt.is_empty())
-        .then(|| approx_realtime_token_count("\n\n"))
-        .unwrap_or_default();
+    let separator_tokens = if !prompt.is_empty() {
+        approx_realtime_token_count("\n\n")
+    } else {
+        Default::default()
+    };
     REALTIME_INSTRUCTIONS_TOKEN_BUDGET
         .saturating_sub(approx_realtime_token_count(prompt))
         .saturating_sub(separator_tokens)

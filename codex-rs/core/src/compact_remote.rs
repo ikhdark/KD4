@@ -9,7 +9,7 @@ use crate::compact::compaction_status_from_result;
 use crate::compact::insert_initial_context_before_last_real_user_or_summary;
 use crate::compact_model_fallback::record_model_fallback;
 use crate::compact_model_fallback::should_retry_with_current_model;
-use crate::context::world_state::WorldState;
+use crate::context::world_state::WorldStateSnapshot;
 use crate::context_manager::ContextManager;
 use crate::context_manager::estimate_item_token_count;
 use crate::hook_runtime::PostCompactHookOutcome;
@@ -312,7 +312,7 @@ pub(crate) async fn process_compacted_history(
     turn_context: &TurnContext,
     mut compacted_history: Vec<ResponseItem>,
     initial_context_injection: &InitialContextInjection,
-) -> (Vec<ResponseItem>, Option<Arc<WorldState>>) {
+) -> (Vec<ResponseItem>, Option<WorldStateSnapshot>) {
     // Mid-turn compaction is the only path that must inject initial context above the last user
     // message in the replacement history. Pre-turn compaction instead injects context after the
     // compaction item, but mid-turn compaction keeps the compaction item last for model training.

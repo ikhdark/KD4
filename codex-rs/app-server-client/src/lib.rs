@@ -420,6 +420,17 @@ enum ClientCommand {
     },
 }
 
+impl ClientCommand {
+    /// A request whose caller was cancelled before the worker dequeued it must
+    /// not run later and hold up newer work with a result nobody can receive.
+    fn is_abandoned_request(&self) -> bool {
+        matches!(
+            self,
+            Self::Request { response_tx, .. } if response_tx.is_closed()
+        )
+    }
+}
+
 /// Async facade over the in-process app-server runtime.
 ///
 /// This type owns a worker task that bridges between:
@@ -474,6 +485,7 @@ impl InProcessAppServerClient {
                 tokio::select! {
                     command = command_rx.recv() => {
                         match command {
+                            Some(command) if command.is_abandoned_request() => {}
                             Some(ClientCommand::Request { request, response_tx }) => {
                                 let request_sender = request_sender.clone();
                                 // Request waits happen on a detached task so
@@ -949,6 +961,23 @@ mod tests {
                 .await
                 .expect("default config should load"),
         }
+    }
+
+    #[test]
+    fn cancelled_in_process_request_is_abandoned_before_dispatch() {
+        let (response_tx, response_rx) = oneshot::channel();
+        drop(response_rx);
+        let command = ClientCommand::Request {
+            request: Box::new(ClientRequest::GetAccount {
+                request_id: RequestId::Integer(1),
+                params: codex_app_server_protocol::GetAccountParams {
+                    refresh_token: false,
+                },
+            }),
+            response_tx,
+        };
+
+        assert!(command.is_abandoned_request());
     }
 
     async fn build_test_config_for_codex_home(codex_home: &Path) -> Config {

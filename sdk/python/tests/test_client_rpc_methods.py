@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
 from openai_codex.api import TurnHandle
-from openai_codex.client import CodexClient, _params_dict
-from openai_codex.errors import CodexError
+from openai_codex.client import CodexClient, CodexConfig, _params_dict
+from openai_codex.errors import CodexError, TransportClosedError
 from openai_codex.generated.notification_registry import notification_turn_id
 from openai_codex.generated.v2_all import (
     AgentMessageDeltaNotification,
@@ -21,6 +22,58 @@ from openai_codex.generated.v2_all import (
 from openai_codex.models import Notification, UnknownNotification
 
 ROOT = Path(__file__).resolve().parents[1]
+_STDERR_TAIL_MAX_BYTES = 64 * 1024
+_STDERR_TRUNCATION_MARKER = f"[stderr truncated; showing last {_STDERR_TAIL_MAX_BYTES} bytes]\n"
+_WRITE_NEWLINE_FREE_STDERR = f"""
+payload = b"discard-me" + chr(0x1F642).encode("utf-8") * ({_STDERR_TAIL_MAX_BYTES} // 4 + 2) + b"END"
+sys.stderr.buffer.write(payload)
+sys.stderr.buffer.flush()
+"""
+
+
+def _client_for_script(script: str) -> CodexClient:
+    return CodexClient(
+        CodexConfig(launch_args_override=(sys.executable, "-c", f"import sys\n{script}"))
+    )
+
+
+def test_over_cap_newline_free_stderr_is_drained_on_success() -> None:
+    client = _client_for_script(
+        _WRITE_NEWLINE_FREE_STDERR
+        + 'sys.stdout.write(\'{"method":"diagnostic/noisy","params":{}}\\n\')\n'
+        + "sys.stdout.flush()\n"
+    )
+    try:
+        client.start()
+        notification = client.next_notification(timeout_s=5)
+        assert notification.method == "diagnostic/noisy"
+        assert client._stderr_thread is not None
+        client._stderr_thread.join(timeout=5)
+
+        assert len(client._stderr_tail_bytes) == _STDERR_TAIL_MAX_BYTES
+        rendered = client._stderr_tail()
+        assert rendered.startswith(_STDERR_TRUNCATION_MARKER)
+        assert rendered.endswith("END")
+        assert "discard-me" not in rendered
+        assert "\ufffd" not in rendered
+    finally:
+        client.close()
+
+
+def test_over_cap_newline_free_stderr_is_reported_on_failure() -> None:
+    client = _client_for_script(_WRITE_NEWLINE_FREE_STDERR + "import time\ntime.sleep(0.1)\n")
+    try:
+        client.start()
+        with pytest.raises(TransportClosedError) as exc_info:
+            client.next_notification(timeout_s=5)
+
+        message = str(exc_info.value)
+        assert _STDERR_TRUNCATION_MARKER in message
+        assert message.endswith("END")
+        assert "discard-me" not in message
+        assert "\ufffd" not in message
+    finally:
+        client.close()
 
 
 def test_generated_params_models_are_snake_case_and_dump_by_alias() -> None:

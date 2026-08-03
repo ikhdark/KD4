@@ -86,7 +86,8 @@ mod stage_one {
     pub(super) const PRUNE_BATCH_SIZE: usize = 200;
 
     /// Prompt used for phase 1 extraction.
-    pub(super) const PROMPT: &str = include_str!("../templates/memories/stage_one_system.md");
+    pub(super) const PROMPT: &str =
+        include_str!("../templates/memories/stage_one_system.compact.md");
 
     /// Fallback stage-1 rollout truncation limit (tokens) when model metadata
     /// does not include a valid context window.
@@ -106,6 +107,8 @@ mod stage_two {
     pub(super) const JOB_LEASE_SECONDS: i64 = 3_600;
     pub(super) const JOB_RETRY_DELAY_SECONDS: i64 = 3_600;
     pub(super) const JOB_HEARTBEAT_SECONDS: u64 = 90;
+    pub(super) const BASE_INSTRUCTIONS: &str =
+        include_str!("../templates/memories/consolidation_base.md");
 }
 
 mod workspace_diff {

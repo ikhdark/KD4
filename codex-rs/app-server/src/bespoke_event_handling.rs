@@ -2054,6 +2054,8 @@ fn now_unix_timestamp_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+
     use super::*;
     use crate::CHANNEL_CAPACITY;
     use crate::outgoing_message::ConnectionId;
@@ -3398,6 +3400,9 @@ mod tests {
             tx,
             codex_analytics::AnalyticsEventsClient::disabled(),
         ));
+        outgoing
+            .connection_opened(ConnectionId(1), Arc::new(AtomicBool::new(/*value*/ true)))
+            .await;
         let outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing,
             vec![ConnectionId(1)],

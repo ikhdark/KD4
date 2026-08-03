@@ -1,15 +1,11 @@
 use super::ContextualUserFragment;
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ModelSwitchInstructions {
-    model_instructions: String,
-}
+pub(crate) struct ModelSwitchInstructions;
 
 impl ModelSwitchInstructions {
-    pub(crate) fn new(model_instructions: impl Into<String>) -> Self {
-        Self {
-            model_instructions: model_instructions.into(),
-        }
+    pub(crate) fn new() -> Self {
+        Self
     }
 }
 
@@ -27,9 +23,7 @@ impl ContextualUserFragment for ModelSwitchInstructions {
     }
 
     fn body(&self) -> String {
-        format!(
-            "\nThe user was previously using a different model. Please continue the conversation according to the following instructions:\n\n{}\n",
-            self.model_instructions
-        )
+        "\nThe user was previously using a different model. Continue following the session's existing base instructions. Adapt only to the capabilities and tools available in the current request.\n"
+            .to_string()
     }
 }

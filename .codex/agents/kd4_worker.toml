@@ -21,4 +21,5 @@ Complete only when every criterion is satisfied and no prohibited change or
 known task-relevant defect remains. Report changed paths, validation evidence,
 wiring implications, and remaining risk to the coordinator.
 """
-model_reasoning_effort = "high"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "xhigh"

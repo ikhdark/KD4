@@ -367,7 +367,9 @@ fn bounded_permission_entries(entries: Vec<String>) -> Vec<String> {
                 .saturating_add(marker_bytes)
                 > MAX_PERMISSION_LIST_BYTES)
     {
-        let removed = rendered.pop().expect("checked non-empty");
+        let Some(removed) = rendered.pop() else {
+            break;
+        };
         rendered_bytes = rendered_bytes.saturating_sub(removed.len());
         if !rendered.is_empty() {
             rendered_bytes = rendered_bytes.saturating_sub(1);

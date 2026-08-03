@@ -1003,6 +1003,8 @@ pub(crate) fn build_guardian_review_session_config(
     guardian_config.model_provider.stream_max_retries = Some(1);
     guardian_config.include_skill_instructions = false;
     guardian_config.include_permissions_instructions = false;
+    guardian_config.include_collaboration_mode_instructions = false;
+    guardian_config.include_environment_context = false;
     guardian_config.memories.use_memories = false;
     guardian_config.memories.dedicated_tools = false;
     guardian_config.base_instructions = Some(
@@ -1014,6 +1016,7 @@ pub(crate) fn build_guardian_review_session_config(
     );
     guardian_config.notify = None;
     guardian_config.developer_instructions = None;
+    guardian_config.personality = None;
     guardian_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
     guardian_config
         .permissions
@@ -1052,6 +1055,7 @@ pub(crate) fn build_guardian_review_session_config(
         Feature::CodexHooks,
         Feature::Apps,
         Feature::Plugins,
+        Feature::Personality,
         Feature::WebSearchRequest,
         Feature::WebSearchCached,
     ] {
@@ -1381,9 +1385,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guardian_review_session_config_disables_skill_instructions() {
+    async fn guardian_review_session_config_uses_dedicated_prompt_context() {
         let mut parent_config = crate::config::test_config().await;
         parent_config.include_skill_instructions = true;
+        parent_config.include_permissions_instructions = true;
+        parent_config.include_apps_instructions = true;
+        parent_config.include_collaboration_mode_instructions = true;
+        parent_config.include_environment_context = true;
 
         let guardian_config = build_guardian_review_session_config(
             &parent_config,
@@ -1394,6 +1402,13 @@ mod tests {
         .expect("guardian config");
 
         assert!(!guardian_config.include_skill_instructions);
+        assert!(!guardian_config.include_permissions_instructions);
+        assert!(!guardian_config.include_apps_instructions);
+        assert!(!guardian_config.include_collaboration_mode_instructions);
+        assert!(!guardian_config.include_environment_context);
+        assert_eq!(guardian_config.developer_instructions, None);
+        assert_eq!(guardian_config.personality, None);
+        assert!(!guardian_config.features.enabled(Feature::Personality));
     }
 
     #[tokio::test(flavor = "current_thread")]

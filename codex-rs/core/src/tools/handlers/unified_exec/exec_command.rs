@@ -306,6 +306,12 @@ impl ExecCommandHandler {
             payload,
             ..
         } = invocation;
+        let completion_activity = session
+            .services
+            .agent_control
+            .admit_completion_activity()
+            .await
+            .map_err(FunctionCallError::RespondToModel)?;
 
         let arguments = match payload {
             ToolPayload::Function { arguments } => arguments,
@@ -726,6 +732,7 @@ impl ExecCommandHandler {
                     justification,
                     prefix_rule,
                     workspace_mutation,
+                    completion_activity: Some(completion_activity),
                 },
                 process_id_reservation,
                 &context,

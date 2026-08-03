@@ -148,7 +148,7 @@ struct RunningWorkspaceMutationInner {
     lease: WorkspaceMutationLease,
     stop: CancellationToken,
     lease_lost: CancellationToken,
-    finalized: Mutex<bool>,
+    finalized: Arc<Mutex<bool>>,
     _heartbeat_task: AbortOnDropHandle<()>,
 }
 
@@ -228,7 +228,7 @@ impl RunningWorkspaceMutation {
                 lease,
                 stop,
                 lease_lost,
-                finalized: Mutex::new(false),
+                finalized: Arc::new(Mutex::new(false)),
                 _heartbeat_task: heartbeat_task,
             }),
         }
@@ -244,7 +244,7 @@ impl RunningWorkspaceMutation {
     }
 
     pub(crate) async fn finish(&self) -> Result<(), String> {
-        let mut finalized = self.inner.finalized.lock().await;
+        let mut finalized = Arc::clone(&self.inner.finalized).lock_owned().await;
         if *finalized {
             return Ok(());
         }

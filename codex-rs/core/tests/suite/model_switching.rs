@@ -118,8 +118,13 @@ fn test_model_info(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn model_change_appends_model_instructions_developer_message() -> Result<()> {
+async fn model_change_appends_compact_compatibility_delta() -> Result<()> {
     skip_if_no_network!(Ok(()));
+
+    const INITIAL_MODEL: &str = "gpt-5.2";
+    const NEXT_MODEL: &str = "gpt-5.4";
+    const SESSION_BASE_INSTRUCTIONS: &str = "original session base instructions";
+    const NEXT_MODEL_BASE_INSTRUCTIONS: &str = "distinct next-model base instructions";
 
     let server = MockServer::start().await;
     let resp_mock = mount_sse_sequence(
@@ -128,9 +133,16 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
     )
     .await;
 
-    let mut builder = test_codex().with_model("gpt-5.2");
+    let mut builder = test_codex()
+        .with_model_info_override(NEXT_MODEL, |model_info| {
+            model_info.base_instructions = NEXT_MODEL_BASE_INSTRUCTIONS.to_string();
+            model_info.model_messages = None;
+        })
+        .with_model_info_override(INITIAL_MODEL, |model_info| {
+            model_info.base_instructions = SESSION_BASE_INSTRUCTIONS.to_string();
+            model_info.model_messages = None;
+        });
     let test = builder.build(&server).await?;
-    let next_model = "gpt-5.4";
 
     test.codex
         .submit(read_only_user_turn(
@@ -147,7 +159,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
     core_test_support::submit_thread_settings(
         &test.codex,
         codex_protocol::protocol::ThreadSettingsOverrides {
-            model: Some(next_model.to_string()),
+            model: Some(NEXT_MODEL.to_string()),
             ..Default::default()
         },
     )
@@ -160,7 +172,7 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
                 text: "switch models".into(),
                 text_elements: Vec::new(),
             }],
-            next_model.to_string(),
+            NEXT_MODEL.to_string(),
         ))
         .await?;
     wait_for_event(&test.codex, |ev| matches!(ev, EventMsg::TurnComplete(_))).await;
@@ -168,22 +180,43 @@ async fn model_change_appends_model_instructions_developer_message() -> Result<(
     let requests = resp_mock.requests();
     assert_eq!(requests.len(), 2, "expected two model requests");
 
+    let first_request = requests.first().expect("expected first request");
     let second_request = requests.last().expect("expected second request");
+    let session_base_instructions = first_request.instructions_text();
+    assert_eq!(session_base_instructions, SESSION_BASE_INSTRUCTIONS);
+    assert_eq!(
+        second_request.instructions_text(),
+        session_base_instructions,
+        "model switching should preserve the session base instructions"
+    );
     let developer_texts = second_request.message_input_texts("developer");
     let model_switch_text = developer_texts
         .iter()
         .find(|text| text.contains("<model_switch>"))
         .expect("expected model switch message in developer input");
     assert!(
-        model_switch_text.contains("The user was previously using a different model."),
-        "expected model switch preamble, got: {model_switch_text:?}"
+        model_switch_text.contains("Continue following the session's existing base instructions."),
+        "expected compatibility guidance, got: {model_switch_text:?}"
+    );
+    assert!(
+        model_switch_text.len() < 512,
+        "model switch delta should stay compact, got {} bytes",
+        model_switch_text.len()
+    );
+    assert!(
+        !model_switch_text.contains(session_base_instructions.as_str()),
+        "model switch delta must not duplicate the session base instructions"
+    );
+    assert!(
+        !model_switch_text.contains(NEXT_MODEL_BASE_INSTRUCTIONS),
+        "model switch delta must not embed the next model's complete base instructions"
     );
 
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn model_and_personality_change_only_appends_model_instructions() -> Result<()> {
+async fn model_switch_with_unchanged_personality_omits_personality_delta() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -251,7 +284,7 @@ async fn model_and_personality_change_only_appends_model_instructions() -> Resul
         !developer_texts
             .iter()
             .any(|text| text.contains("<personality_spec>")),
-        "did not expect personality update message when model changed in same turn"
+        "did not expect a separate personality update during the model switch"
     );
 
     Ok(())

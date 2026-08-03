@@ -7,6 +7,7 @@ use anyhow::Result;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerTransportConfig;
 use codex_extension_api::ExtensionData;
+use codex_extension_api::TurnInputContributor;
 use codex_extension_api::TurnItemContributor;
 use codex_features::Feature;
 use codex_login::AuthManager;
@@ -45,6 +46,10 @@ use wiremock::matchers::method;
 use wiremock::matchers::path;
 
 struct RewriteAgentMessageContributor;
+
+struct TurnInputBudgetContributor {
+    text: String,
+}
 
 #[derive(Clone)]
 struct SignalCompletingTask {
@@ -93,6 +98,28 @@ impl TurnItemContributor for RewriteAgentMessageContributor {
     }
 }
 
+impl TurnInputContributor for TurnInputBudgetContributor {
+    fn contribute<'a>(
+        &'a self,
+        _input: TurnInputContext,
+        _session_store: &'a ExtensionData,
+        _thread_store: &'a ExtensionData,
+        _turn_store: &'a ExtensionData,
+    ) -> codex_extension_api::ExtensionFuture<
+        'a,
+        Vec<Box<dyn codex_extension_api::ContextualUserFragment + Send>>,
+    > {
+        Box::pin(async move {
+            vec![
+                Box::new(codex_context_fragments::RenderedContextFragment::new(
+                    "user",
+                    self.text.clone(),
+                )) as Box<dyn codex_extension_api::ContextualUserFragment + Send>,
+            ]
+        })
+    }
+}
+
 fn assistant_output_text(text: &str) -> ResponseItem {
     ResponseItem::Message {
         id: Some(ResponseItemId::with_suffix("msg", "1")),
@@ -103,6 +130,82 @@ fn assistant_output_text(text: &str) -> ResponseItem {
         phase: None,
         internal_chat_message_metadata_passthrough: None,
     }
+}
+
+fn response_input_texts(items: &[ResponseItem]) -> Vec<&str> {
+    let mut texts = Vec::new();
+    for item in items {
+        if let ResponseItem::Message { content, .. } = item {
+            for content_item in content {
+                if let ContentItem::InputText { text } = content_item {
+                    texts.push(text.as_str());
+                }
+            }
+        }
+    }
+    texts
+}
+
+#[test]
+fn legacy_explicit_skill_items_share_one_hard_budget() {
+    let max_bytes = codex_utils_string::approx_bytes_for_tokens(
+        codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
+    );
+    let items = build_bounded_skill_context_items([
+        (
+            "user",
+            format!("legacy-skill-budget-first:{}", "x".repeat(max_bytes)),
+        ),
+        ("user", "legacy-skill-budget-second".to_string()),
+    ]);
+    let texts = response_input_texts(&items);
+
+    assert!(texts.iter().map(|text| text.len()).sum::<usize>() <= max_bytes);
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.starts_with("legacy-skill-budget-first:"))
+    );
+    assert!(
+        texts
+            .iter()
+            .all(|text| !text.contains("legacy-skill-budget-second"))
+    );
+}
+
+#[tokio::test]
+async fn extension_turn_input_contributors_share_one_hard_budget() {
+    let max_bytes = codex_utils_string::approx_bytes_for_tokens(
+        codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
+    );
+    let (mut session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.turn_input_contributor(Arc::new(TurnInputBudgetContributor {
+        text: format!("turn-input-budget-first:{}", "x".repeat(max_bytes)),
+    }));
+    builder.turn_input_contributor(Arc::new(TurnInputBudgetContributor {
+        text: "turn-input-budget-second".to_string(),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+    let session = Arc::new(session);
+
+    let items =
+        build_extension_turn_input_items(&session, &turn_context, &[], &CancellationToken::new())
+            .await
+            .expect("turn-input contributors should render");
+    let texts = response_input_texts(&items);
+
+    assert!(texts.iter().map(|text| text.len()).sum::<usize>() <= max_bytes);
+    assert!(
+        texts
+            .iter()
+            .any(|text| text.starts_with("turn-input-budget-first:"))
+    );
+    assert!(
+        texts
+            .iter()
+            .all(|text| !text.contains("turn-input-budget-second"))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -619,6 +722,10 @@ async fn pending_plan_and_router_reuse_one_step_mcp_inventory_snapshot() -> Resu
     else {
         panic!("stable test inputs should produce a ready pending-turn plan");
     };
+    assert!(
+        plan.pending_token_estimate > estimate_pending_tokens(&input, &[], &[]),
+        "first-turn planning must account for full context before compaction"
+    );
     assert!(plan.step_context.turn.apps_enabled());
     assert_eq!(
         plan.mentioned_apps,

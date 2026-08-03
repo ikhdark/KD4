@@ -400,8 +400,7 @@ async fn run_script_with_timeout_with_args(
         let stderr_overflow = stderr_read.context("Failed to read snapshot command stderr")?;
         if stdout_overflow || stderr_overflow {
             bail!(
-                "Snapshot command output exceeded the {} byte per-stream limit",
-                SNAPSHOT_OUTPUT_LIMIT_BYTES
+                "Snapshot command output exceeded the {SNAPSHOT_OUTPUT_LIMIT_BYTES} byte per-stream limit"
             );
         }
         Ok::<_, anyhow::Error>((status, stdout_bytes, stderr_bytes))

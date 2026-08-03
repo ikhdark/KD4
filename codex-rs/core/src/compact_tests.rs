@@ -1,11 +1,15 @@
 use super::*;
 use crate::session::tests::build_world_state_from_turn_context;
+use codex_extension_api::PreviousWorldStateSection;
+use codex_extension_api::RenderedWorldStateFragment;
+use codex_extension_api::WorldStateSectionContribution;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::DEFAULT_IMAGE_DETAIL;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use pretty_assertions::assert_eq;
+use serde_json::json;
 use std::sync::Arc;
 
 async fn process_compacted_history_with_test_session(
@@ -30,6 +34,42 @@ async fn process_compacted_history_with_test_session(
     )
     .await;
     (refreshed, initial_context)
+}
+
+#[tokio::test]
+async fn compaction_initial_context_carries_only_delivered_world_state_snapshot() {
+    let (session, turn_context) = crate::session::tests::make_session_and_context().await;
+    let mut world_state = WorldState::default();
+    for (index, (id, body)) in [("large_0", 'a'), ("large_1", 'b')].into_iter().enumerate() {
+        world_state.add_extension_section(WorldStateSectionContribution::new(
+            id,
+            json!({"value": index}),
+            move |previous| match previous {
+                PreviousWorldStateSection::Absent => Some(RenderedWorldStateFragment::new(
+                    "developer",
+                    ("", ""),
+                    body.to_string().repeat(30_000),
+                )),
+                _ => None,
+            },
+        ));
+    }
+    let world_state = Arc::new(world_state);
+    let injection = InitialContextInjection::BeforeLastUserMessage(Arc::clone(&world_state));
+
+    let (_, Some(delivered_snapshot)) =
+        build_compaction_initial_context(&session, &turn_context, &injection).await
+    else {
+        panic!("mid-turn compaction should carry a delivered world-state snapshot");
+    };
+
+    assert_eq!(
+        delivered_snapshot.clone().into_value(),
+        json!({"large_0": {"value": 0}})
+    );
+    let (retry, final_snapshot) = world_state.render_diff_with_snapshot(&delivered_snapshot);
+    assert_eq!(retry.len(), 1);
+    assert_eq!(final_snapshot, world_state.snapshot());
 }
 
 fn user_message(text: &str) -> ResponseItem {

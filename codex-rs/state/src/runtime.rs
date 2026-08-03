@@ -17,10 +17,12 @@ use crate::ThreadMetadata;
 use crate::ThreadMetadataBuilder;
 use crate::ThreadsPage;
 use crate::apply_rollout_item;
+use crate::migrations::ensure_kd4_compatibility_indexes;
 use crate::migrations::repair_legacy_recency_migration_version;
 use crate::migrations::runtime_goals_migrator;
 use crate::migrations::runtime_logs_migrator;
 use crate::migrations::runtime_memories_migrator;
+use crate::migrations::runtime_migrator_for_pool;
 use crate::migrations::runtime_state_migrator;
 use crate::model::AgentJobRow;
 use crate::model::ThreadRow;
@@ -452,10 +454,15 @@ async fn open_sqlite(
         .map_err(|source| recovery::RuntimeDbInitError::new(spec.label, "open", path, source))?;
     let started = Instant::now();
     let migrate_result = async {
+        let migrator = runtime_migrator_for_pool(&pool, migrator).await?;
         if matches!(spec.kind, DbKind::State) {
-            repair_legacy_recency_migration_version(&pool, migrator).await?;
+            repair_legacy_recency_migration_version(&pool, &migrator).await?;
         }
-        migrator.run(&pool).await.map_err(anyhow::Error::from)
+        migrator.run(&pool).await.map_err(anyhow::Error::from)?;
+        if matches!(spec.kind, DbKind::State) {
+            ensure_kd4_compatibility_indexes(&pool).await?;
+        }
+        Ok::<(), anyhow::Error>(())
     }
     .await;
     crate::telemetry::record_init_result(

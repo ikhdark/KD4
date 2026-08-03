@@ -231,6 +231,33 @@ pub trait AgentTaskStore: Send + Sync {
         lease: WorkspaceMutationLease,
     ) -> TaskStoreFuture<'a, WorkspaceMutationResult>;
 
+    fn begin_workspace_finalization<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        root_session_id: String,
+    ) -> TaskStoreFuture<'a, crate::WorkspaceFinalizationFence>;
+
+    /// Atomically seals an active, unexpired finalization fence for terminal dispatch.
+    /// Successful sealing refreshes the bounded lease and returns the updated fence.
+    fn seal_workspace_finalization_dispatch<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        fence: crate::WorkspaceFinalizationFence,
+    ) -> TaskStoreFuture<'a, crate::WorkspaceFinalizationFence>;
+
+    fn heartbeat_workspace_finalization<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        fence_id: String,
+        root_session_id: String,
+    ) -> TaskStoreFuture<'a, bool>;
+
+    fn release_workspace_finalization<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        fence: crate::WorkspaceFinalizationFence,
+    ) -> TaskStoreFuture<'a, ()>;
+
     fn assert_workspace_unclaimed<'a>(
         &'a self,
         repo_root: &'a Path,
@@ -238,6 +265,10 @@ pub trait AgentTaskStore: Send + Sync {
     ) -> TaskStoreFuture<'a, ()>;
 
     fn check_quiescence(&self, root_session_id: String) -> TaskStoreFuture<'_, QuiescenceStatus>;
+
+    /// Read the already-reconciled quiescence state without expiring leases,
+    /// releasing claims, or refreshing validation evidence.
+    fn inspect_quiescence(&self, root_session_id: String) -> TaskStoreFuture<'_, QuiescenceStatus>;
 
     fn begin_mutation<'a>(
         &'a self,

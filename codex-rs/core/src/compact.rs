@@ -5,6 +5,7 @@ use crate::Prompt;
 use crate::client::ModelClientSession;
 use crate::client_common::ResponseEvent;
 use crate::context::world_state::WorldState;
+use crate::context::world_state::WorldStateSnapshot;
 use crate::hook_runtime::PostCompactHookOutcome;
 use crate::hook_runtime::PreCompactHookOutcome;
 use crate::hook_runtime::run_post_compact_hooks;
@@ -31,6 +32,7 @@ use codex_protocol::error::CodexErr;
 use codex_protocol::error::Result as CodexResult;
 use codex_protocol::items::ContextCompactionItem;
 use codex_protocol::items::TurnItem;
+use codex_protocol::models::BaseInstructions;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::InternalChatMessageMetadataPassthrough;
 use codex_protocol::models::ResponseInputItem;
@@ -50,6 +52,7 @@ use tracing::error;
 
 use codex_model_provider_info::ModelProviderInfo;
 
+pub use codex_prompts::COMPACTION_BASE_INSTRUCTIONS;
 pub use codex_prompts::SUMMARIZATION_PROMPT;
 pub use codex_prompts::SUMMARY_PREFIX;
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
@@ -78,14 +81,17 @@ pub(crate) async fn build_compaction_initial_context(
     sess: &Session,
     turn_context: &TurnContext,
     initial_context_injection: &InitialContextInjection,
-) -> (Vec<ResponseItem>, Option<Arc<WorldState>>) {
+) -> (Vec<ResponseItem>, Option<WorldStateSnapshot>) {
     // Return the rendered state with its items so history and its baseline stay identical.
     match initial_context_injection {
         InitialContextInjection::BeforeLastUserMessage(world_state) => {
-            let items = sess
-                .build_initial_context_with_world_state(turn_context, world_state.as_ref())
+            let (items, delivered_snapshot) = sess
+                .build_initial_context_with_world_state_and_snapshot(
+                    turn_context,
+                    world_state.as_ref(),
+                )
                 .await;
-            (items, Some(Arc::clone(world_state)))
+            (items, Some(delivered_snapshot))
         }
         InitialContextInjection::DoNotInject => (Vec::new(), None),
     }
@@ -242,7 +248,9 @@ async fn run_compact_task_inner_impl(
         turn_context.model_info.truncation_policy.into(),
     );
 
-    let base_instructions = sess.get_base_instructions().await;
+    let base_instructions = BaseInstructions {
+        text: COMPACTION_BASE_INSTRUCTIONS.trim().to_string(),
+    };
     let max_retries = turn_context.provider.info().stream_max_retries();
     let mut client_session = sess.services.model_client.new_session();
     // Reuse one client session so turn-scoped state (sticky routing, websocket incremental

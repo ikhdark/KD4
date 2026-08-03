@@ -167,11 +167,13 @@ pub(crate) fn spawn_exit_watcher(
     transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
     tracker: Option<SharedTurnDiffTracker>,
+    completion_activity: Option<crate::agent::control::CompletionActivityPermit>,
 ) {
     let exit_token = process.cancellation_token();
     let output_drained = process.output_drained_notify();
 
     tokio::spawn(async move {
+        let _completion_activity = completion_activity;
         exit_token.cancelled().await;
         output_drained.notified().await;
 

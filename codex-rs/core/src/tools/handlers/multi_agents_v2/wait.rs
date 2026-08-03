@@ -319,7 +319,7 @@ async fn nudge_stalled_assignments(
             let _ = store.release_stalled_nudge(binding.assignment_id).await;
             continue;
         };
-        if !is_strict_agent_descendant(&author, &receiver_path.to_string()) {
+        if !is_strict_agent_descendant(&author, receiver_path.as_ref()) {
             let _ = store.release_stalled_nudge(binding.assignment_id).await;
             continue;
         }

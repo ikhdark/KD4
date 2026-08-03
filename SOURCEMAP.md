@@ -33,6 +33,7 @@ an SDK, schema, package, installed binary, or Codex Desktop.
 - [Contracts and generated artifacts](#contracts-and-generated-artifacts)
 - [Build, package, publish, and install paths](#build-package-publish-and-install-paths)
 - [Validation routes](#validation-routes)
+- [Rust workflow reference](#rust-workflow-reference)
 - [Documentation and policy](#documentation-and-policy)
 - [Cross-cutting change routes](#cross-cutting-change-routes)
 
@@ -129,7 +130,6 @@ below.
 | `.npmrc` | npm and pnpm behavior used by the JavaScript workspace |
 | `AGENTS.md`, `SOURCEMAP.md` | Repository-wide editing policy and this cross-cutting ownership contract |
 | `CHANGELOG.md`, `LICENSE`, `NOTICE` | Release history and legal notices |
-| `REPOSITORY_AUDIT.txt`, `WORKING_TREE_AUDIT.txt` | Historical fork-delta and working-tree audit records used as evidence and risk indexes |
 | `flake.nix`, `flake.lock` | Nix development/build environment and its locked inputs |
 | `justfile`, `kd4_features.toml` | Preferred command router and KD4 feature inventory |
 | `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml` | Root maintenance commands, JavaScript dependency state, and workspace membership |
@@ -140,8 +140,8 @@ below.
 | --- | --- |
 | `AGENTS.md` | Entire repository; canonical shared policy plus KD4 project context |
 | `.codex/AGENTS.md` | Repo-local Codex configuration, environments, skills, and harness routing |
-| `codex-rs/AGENTS.md` | Rust workspace routing, safety constraints, build lanes, and validation |
-| `codex-rs/core/AGENTS.md` | Core session, turn, context, tool, evidence, and model-runtime behavior |
+| `codex-rs/AGENTS.md` | Compact Rust-wide invariants; detailed ownership, workflow, and validation routing live in this map |
+| `codex-rs/core/AGENTS.md` | Core-only session, context, diagnostics, compatibility, and validation deltas |
 | `codex-rs/prompts/AGENTS.md` | Model-visible prompt text, templates, and snapshot expectations |
 | `codex-rs/protocol/AGENTS.md` | Shared event, item, configuration, permission, and compatibility types |
 | `codex-rs/shell-command/AGENTS.md` | Shell parsing, environment, execution, and platform compatibility |
@@ -329,6 +329,24 @@ remain required.
 
 Green tooling alone does not prove runtime behavior. Use the focused failing
 test or approved runtime gate for the behavior being changed.
+
+## Rust workflow reference
+
+This section is an on-demand reference for Rust work; it is intentionally not
+duplicated in the automatically loaded `codex-rs/AGENTS.md`.
+
+| Need | Preferred route |
+| --- | --- |
+| File or text discovery | `rg --files`, `rg`, or `fd` when its path filtering is useful |
+| Structured source or data inspection | `ast-grep`, `jq`, `yq`, or the repository's configured parser |
+| Build and test entrypoints | Prefer the owning `just` recipe, then focused Cargo or `cargo nextest`; use an isolated lane when another Rust build is active |
+| Rust build diagnostics and target cleanup | `just rust-build-doctor`, `just target-disk`, and `just target-prune`; never prune while Rust jobs are active |
+| Formatting and configured document checks | `cargo fmt --check`, `taplo`, `dprint`, and `git diff --check` as applicable |
+| Dependency health | `cargo shear`, `cargo audit`, or `cargo deny` when the accepted task touches that risk |
+| Performance or size measurement | `hyperfine` or `tokei` when measurement is part of the accepted task |
+
+Use an available simpler equivalent when a preferred tool is absent. Do not
+install tools or add dependencies solely to follow this reference.
 
 ## Documentation and policy
 

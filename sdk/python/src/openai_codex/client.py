@@ -5,7 +5,6 @@ import subprocess
 import threading
 import uuid
 from _thread import LockType
-from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,6 +65,10 @@ ModelT = TypeVar("ModelT", bound=BaseModel)
 ApprovalHandler = Callable[[str, JsonObject | None], JsonObject]
 RUNTIME_PKG_NAME = "openai-codex-cli-bin"
 _GOAL_START_TIMEOUT_S = 30.0
+_STDERR_TAIL_MAX_BYTES = 64 * 1024
+_STDERR_READ_CHARS = 8 * 1024
+_STDERR_DRAIN_JOIN_TIMEOUT_S = 1.0
+_STDERR_TRUNCATION_MARKER = f"[stderr truncated; showing last {_STDERR_TAIL_MAX_BYTES} bytes]\n"
 
 
 @dataclass(slots=True)
@@ -226,7 +229,9 @@ class CodexClient:
         self._thread_start_locks_guard = threading.Lock()
         self._thread_start_locks: dict[str, _ThreadStartLock] = {}
         self._router = MessageRouter()
-        self._stderr_lines: deque[str] = deque(maxlen=400)
+        self._stderr_lock = threading.Lock()
+        self._stderr_tail_bytes = bytearray()
+        self._stderr_truncated = False
         self._stderr_thread: threading.Thread | None = None
         self._reader_thread: threading.Thread | None = None
 
@@ -266,13 +271,16 @@ class CodexClient:
                 stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
+                errors="replace",
                 cwd=self.config.cwd,
                 env=env,
                 bufsize=1,
             )
             router = MessageRouter()
             self._router = router
-            self._stderr_lines.clear()
+            with self._stderr_lock:
+                self._stderr_tail_bytes.clear()
+                self._stderr_truncated = False
             self._proc = proc
             self._process_epoch += 1
             self._start_stderr_drain_thread(proc)
@@ -815,8 +823,8 @@ class CodexClient:
         stderr = proc.stderr
 
         def _drain() -> None:
-            for line in stderr:
-                self._stderr_lines.append(line.rstrip("\n"))
+            while chunk := stderr.read(_STDERR_READ_CHARS):
+                self._append_stderr(chunk)
 
         self._stderr_thread = threading.Thread(target=_drain, daemon=True)
         self._stderr_thread.start()
@@ -856,8 +864,38 @@ class CodexClient:
         except BaseException as exc:
             active_router.fail_all(exc)
 
-    def _stderr_tail(self, limit: int = 40) -> str:
-        return "\n".join(list(self._stderr_lines)[-limit:])
+    def _append_stderr(self, chunk: str) -> None:
+        encoded = chunk.encode("utf-8")
+        if not encoded:
+            return
+
+        with self._stderr_lock:
+            if len(encoded) >= _STDERR_TAIL_MAX_BYTES:
+                self._stderr_truncated = (
+                    self._stderr_truncated
+                    or bool(self._stderr_tail_bytes)
+                    or len(encoded) > _STDERR_TAIL_MAX_BYTES
+                )
+                self._stderr_tail_bytes = bytearray(encoded[-_STDERR_TAIL_MAX_BYTES:])
+                return
+
+            overflow = len(self._stderr_tail_bytes) + len(encoded) - _STDERR_TAIL_MAX_BYTES
+            if overflow > 0:
+                self._stderr_truncated = True
+                del self._stderr_tail_bytes[:overflow]
+            self._stderr_tail_bytes.extend(encoded)
+
+    def _stderr_tail(self) -> str:
+        with self._stderr_lock:
+            tail = bytes(self._stderr_tail_bytes)
+            truncated = self._stderr_truncated
+
+        start = 0
+        if truncated:
+            while start < min(3, len(tail)) and tail[start] & 0xC0 == 0x80:
+                start += 1
+        rendered = tail[start:].decode("utf-8", errors="replace")
+        return f"{_STDERR_TRUNCATION_MARKER}{rendered}" if truncated else rendered
 
     def _handle_server_request(self, msg: dict[str, JsonValue]) -> JsonObject:
         method = msg["method"]
@@ -886,8 +924,11 @@ class CodexClient:
 
         line = target.stdout.readline()
         if not line:
+            stderr_thread = self._stderr_thread
+            if stderr_thread is not None and stderr_thread is not threading.current_thread():
+                stderr_thread.join(timeout=_STDERR_DRAIN_JOIN_TIMEOUT_S)
             raise TransportClosedError(
-                f"Codex process closed stdout. stderr_tail={self._stderr_tail()[:2000]}"
+                f"Codex process closed stdout. stderr_tail={self._stderr_tail()}"
             )
 
         try:

@@ -1,6 +1,17 @@
 use codex_context_fragments::AdditionalContextDeveloperFragment;
 use codex_context_fragments::AdditionalContextUserFragment;
 use codex_context_fragments::ContextualUserFragment;
+use codex_context_fragments::ModelContextBudget;
+
+#[test]
+fn model_context_budget_enforces_aggregate_limit() {
+    let mut budget = ModelContextBudget::new(4);
+    assert_eq!(budget.take("12345678"), Some("12345678".to_string()));
+    let truncated = budget.take("abcdefghijklmnop").expect("final item");
+    assert!(truncated.len() <= 8);
+    assert_eq!(budget.remaining_bytes(), 0);
+    assert_eq!(budget.take("later"), None);
+}
 
 struct TestFragment {
     body: String,

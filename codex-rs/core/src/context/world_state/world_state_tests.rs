@@ -150,6 +150,44 @@ fn extension_owned_section_uses_its_snapshot_and_renderer() {
 }
 
 #[test]
+fn rendered_sections_share_one_hard_budget() {
+    let mut world_state = WorldState::default();
+    for (index, (id, body)) in [("large_0", 'a'), ("large_1", 'b')].into_iter().enumerate() {
+        world_state.add_extension_section(WorldStateSectionContribution::new(
+            id,
+            json!({"value": index}),
+            move |previous| match previous {
+                PreviousWorldStateSection::Absent => Some(RenderedWorldStateFragment::new(
+                    "developer",
+                    ("", ""),
+                    body.to_string().repeat(30_000),
+                )),
+                _ => None,
+            },
+        ));
+    }
+
+    let (rendered, first_snapshot) = world_state.render_full_with_snapshot();
+    let rendered = rendered
+        .into_iter()
+        .map(|fragment| fragment.render())
+        .collect::<Vec<_>>();
+    assert_eq!(rendered, vec!["a".repeat(30_000)]);
+    assert_eq!(
+        first_snapshot.clone().into_value(),
+        json!({"large_0": {"value": 0}})
+    );
+
+    let (rendered, second_snapshot) = world_state.render_diff_with_snapshot(&first_snapshot);
+    let rendered = rendered
+        .into_iter()
+        .map(|fragment| fragment.render())
+        .collect::<Vec<_>>();
+    assert_eq!(rendered, vec!["b".repeat(30_000)]);
+    assert_eq!(second_snapshot, world_state.snapshot());
+}
+
+#[test]
 fn missing_retained_fragment_is_rendered_again() {
     let mut world_state = WorldState::default();
     world_state.add_extension_section(

@@ -7,6 +7,7 @@ mod review_exit;
 mod review_request;
 
 pub use apply_patch::APPLY_PATCH_TOOL_INSTRUCTIONS;
+pub use compact::COMPACTION_BASE_INSTRUCTIONS;
 pub use compact::SUMMARIZATION_PROMPT;
 pub use compact::SUMMARY_PREFIX;
 pub use goals::budget_limit_prompt;

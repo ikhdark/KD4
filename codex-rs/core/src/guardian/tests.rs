@@ -88,6 +88,21 @@ const GUARDIAN_MEMORY_CONTEXT_PROBE: &str = "guardian memory context probe";
 const GUARDIAN_SKILL_NAME: &str = "guardian-context-probe";
 const GUARDIAN_SKILL_BODY_PROBE: &str = "guardian skill body probe";
 
+#[test]
+fn guardian_policy_is_bounded_without_repeating_structured_schema() {
+    let prompt = guardian_policy_prompt();
+
+    assert!(
+        prompt.len() <= 9_000,
+        "guardian policy grew to {} bytes",
+        prompt.len()
+    );
+    assert!(prompt.contains("Default tenant policy"));
+    assert!(prompt.contains("Return only the structured assessment"));
+    assert!(!prompt.contains("For anything else, use this JSON schema"));
+    assert!(!prompt.contains("\"risk_level\": \"low\" |"));
+}
+
 // The memories extension depends on codex-core, so this probe verifies the nested Guardian config
 // at request assembly without introducing a circular test dependency.
 struct GuardianMemoryContextEnabled(bool);

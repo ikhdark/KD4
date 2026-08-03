@@ -1,5 +1,6 @@
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_core::compact::COMPACTION_BASE_INSTRUCTIONS;
 use codex_core::compact::SUMMARIZATION_PROMPT;
 use codex_core::compact::SUMMARY_PREFIX;
 use codex_core::config::Config;
@@ -563,13 +564,15 @@ async fn summarize_context_three_requests_and_instructions() {
     let body2 = requests[1].body_json();
     let body3 = requests[2].body_json();
 
-    // Manual compact should keep the baseline developer instructions.
+    // Manual compact should use the dedicated bounded compaction instructions.
     let instr1 = body1.get("instructions").and_then(|v| v.as_str()).unwrap();
     let instr2 = body2.get("instructions").and_then(|v| v.as_str()).unwrap();
     assert_eq!(
-        instr1, instr2,
-        "manual compact should keep the standard developer instructions"
+        instr2,
+        COMPACTION_BASE_INSTRUCTIONS.trim(),
+        "manual compact should use the dedicated compaction instructions"
     );
+    assert_ne!(instr1, instr2);
 
     // The summarization request should include the injected user input marker.
     let body2_str = body2.to_string();
@@ -1743,9 +1746,11 @@ async fn auto_compact_runs_after_token_limit_hit() {
         .unwrap_or_default()
         .to_string();
     assert_eq!(
-        instructions, baseline_instructions,
-        "auto compact should keep the standard developer instructions",
+        instructions,
+        COMPACTION_BASE_INSTRUCTIONS.trim(),
+        "auto compact should use the dedicated compaction instructions",
     );
+    assert_ne!(instructions, baseline_instructions);
 
     let input_auto = body_auto.get("input").and_then(|v| v.as_array()).unwrap();
     let last_auto = input_auto

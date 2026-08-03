@@ -139,6 +139,9 @@ pub(crate) struct ExecCommandRequest {
     /// Mutation ownership is moved into the process manager on its first poll.
     /// If the manager future is never polled, `Drop` finalizes this unstarted lease.
     pub workspace_mutation: Option<RunningWorkspaceMutation>,
+    /// Held until the terminal command-evidence event is emitted, including for detached
+    /// processes whose repository lease has already been finalized.
+    pub completion_activity: Option<crate::agent::control::CompletionActivityPermit>,
 }
 
 impl Drop for ExecCommandRequest {

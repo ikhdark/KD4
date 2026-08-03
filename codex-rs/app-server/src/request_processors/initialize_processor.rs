@@ -4,10 +4,9 @@ use std::sync::atomic::Ordering;
 use axum::http::HeaderValue;
 use codex_analytics::AppServerRpcTransport;
 use codex_login::default_client::SetOriginatorError;
-use codex_login::default_client::USER_AGENT_SUFFIX;
 use codex_login::default_client::get_codex_user_agent;
 use codex_login::default_client::set_default_client_residency_requirement;
-use codex_login::default_client::set_default_originator;
+use codex_login::default_client::set_default_process_identity;
 
 use super::*;
 use crate::message_processor::ConnectionSessionState;
@@ -79,7 +78,7 @@ impl InitializeRequestProcessor {
             title: _title,
             version,
         } = params.client_info;
-        // Validate before committing; set_default_originator validates while
+        // Validate before committing; set_default_process_identity validates while
         // mutating process-global metadata.
         if HeaderValue::from_str(&name).is_err() {
             return Err(invalid_request(format!(
@@ -106,20 +105,18 @@ impl InitializeRequestProcessor {
 
         if mutates_global_identity {
             // Only real client initialization may mutate process-global client metadata.
-            if let Err(error) = set_default_originator(originator.clone()) {
-                match error {
-                    SetOriginatorError::InvalidHeaderValue => {
-                        tracing::warn!(
-                            client_info_name = %name,
-                            "validated clientInfo.name was rejected while setting originator"
-                        );
-                    }
-                    SetOriginatorError::AlreadyInitialized => {
-                        // No-op. This is expected to happen if the originator is already set via env var.
-                        // TODO(owen): Once we remove support for CODEX_INTERNAL_ORIGINATOR_OVERRIDE,
-                        // this will be an unexpected state and we can return a JSON-RPC error indicating
-                        // internal server error.
-                    }
+            match set_default_process_identity(originator.clone(), Some(user_agent_suffix)) {
+                Ok(()) => {}
+                Err(SetOriginatorError::InvalidHeaderValue) => {
+                    tracing::warn!(
+                        client_info_name = %name,
+                        "validated clientInfo.name was rejected while setting originator"
+                    );
+                }
+                Err(SetOriginatorError::AlreadyInitialized) => {
+                    // The first originating client owns both process-global identity
+                    // components. Later clients must not replace only the suffix and
+                    // create a mixed originator/User-Agent identity.
                 }
             }
         }
@@ -130,10 +127,6 @@ impl InitializeRequestProcessor {
             self.rpc_transport,
         );
         set_default_client_residency_requirement(self.config.enforce_residency.value());
-        if mutates_global_identity && let Ok(mut suffix) = USER_AGENT_SUFFIX.lock() {
-            *suffix = Some(user_agent_suffix);
-        }
-
         let user_agent = get_codex_user_agent();
         let mut enabled_features: Vec<_> = self
             .config

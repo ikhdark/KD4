@@ -9,8 +9,8 @@ use tracing::warn;
 
 static CONSOLIDATION_PROMPT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {
     parse_embedded_template(
-        include_str!("../templates/memories/consolidation.md"),
-        "memories/consolidation.md",
+        include_str!("../templates/memories/consolidation.compact.md"),
+        "memories/consolidation.compact.md",
     )
 });
 static STAGE_ONE_INPUT_TEMPLATE: LazyLock<Template> = LazyLock::new(|| {

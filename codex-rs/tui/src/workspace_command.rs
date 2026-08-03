@@ -174,13 +174,14 @@ impl WorkspaceCommandExecutor for AppServerWorkspaceCommandRunner {
         Box<dyn Future<Output = Result<WorkspaceCommandOutput, WorkspaceCommandError>> + Send + '_>,
     > {
         Box::pin(async move {
-            let timeout_ms = i64::try_from(command.timeout.as_millis()).unwrap_or(i64::MAX);
+            let command_timeout = command.timeout;
+            let timeout_ms = i64::try_from(command_timeout.as_millis()).unwrap_or(i64::MAX);
             let env = if command.env.is_empty() {
                 None
             } else {
                 Some(command.env)
             };
-            let response: CommandExecResponse = self
+            let request = self
                 .request_handle
                 .request_typed(ClientRequest::OneOffCommandExec {
                     request_id: RequestId::String(format!("workspace-command-{}", Uuid::new_v4())),
@@ -201,8 +202,15 @@ impl WorkspaceCommandExecutor for AppServerWorkspaceCommandRunner {
                         sandbox_policy: None,
                         permission_profile: None,
                     },
-                })
+                });
+            let response: CommandExecResponse = tokio::time::timeout(command_timeout, request)
                 .await
+                .map_err(|_| {
+                    WorkspaceCommandError::new(format!(
+                        "workspace command request timed out after {}ms",
+                        command_timeout.as_millis()
+                    ))
+                })?
                 .map_err(|err| WorkspaceCommandError::new(err.to_string()))?;
 
             Ok(WorkspaceCommandOutput {

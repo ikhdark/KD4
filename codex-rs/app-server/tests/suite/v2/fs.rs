@@ -35,6 +35,7 @@ const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(60);
 #[cfg(not(any(target_os = "macos", windows)))]
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const OPTIONAL_FS_CHANGE_TIMEOUT: Duration = Duration::from_secs(2);
+const READ_FILE_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 
 async fn initialized_mcp(codex_home: &TempDir) -> Result<TestAppServer> {
     let mut mcp = TestAppServer::builder()
@@ -142,6 +143,48 @@ async fn fs_methods_return_error_when_local_environment_is_disabled() -> Result<
         })
         .await?;
     expect_error_message(&mut mcp, read_id, "local filesystem is not configured").await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fs_read_file_enforces_exact_size_limit() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let boundary_path = codex_home.path().join("boundary.bin");
+    let oversized_path = codex_home.path().join("oversized.bin");
+    let boundary_bytes = vec![b'a'; READ_FILE_LIMIT_BYTES];
+    std::fs::write(&boundary_path, &boundary_bytes)?;
+    std::fs::File::create(&oversized_path)?.set_len((READ_FILE_LIMIT_BYTES + 1) as u64)?;
+
+    let mut mcp = initialized_mcp(&codex_home).await?;
+    let boundary_request_id = mcp
+        .send_fs_read_file_request(codex_app_server_protocol::FsReadFileParams {
+            path: absolute_path(boundary_path),
+        })
+        .await?;
+    let boundary_response: FsReadFileResponse = to_response(
+        timeout(
+            DEFAULT_READ_TIMEOUT,
+            mcp.read_stream_until_response_message(RequestId::Integer(boundary_request_id)),
+        )
+        .await??,
+    )?;
+    assert_eq!(
+        STANDARD.decode(boundary_response.data_base64)?,
+        boundary_bytes
+    );
+
+    let oversized_request_id = mcp
+        .send_fs_read_file_request(codex_app_server_protocol::FsReadFileParams {
+            path: absolute_path(oversized_path),
+        })
+        .await?;
+    expect_error_message(
+        &mut mcp,
+        oversized_request_id,
+        "fs/readFile file exceeds maximum size of 10485760 bytes",
+    )
+    .await?;
 
     Ok(())
 }

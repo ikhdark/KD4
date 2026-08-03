@@ -415,6 +415,7 @@ async fn cancelled_startup_keeps_store_and_ledger_until_termination_is_confirmed
         attempt_key,
         process_id,
         None,
+        None,
     );
     registration.attach_process(Arc::clone(&process), None);
     registration.set_initial_exec_command_active(Arc::clone(&active));

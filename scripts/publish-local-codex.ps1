@@ -1807,7 +1807,7 @@ function Restart-CodexDesktop {
     }
 
     if ([string]::IsNullOrWhiteSpace($LocalCliPath)) {
-        Start-Process $desktopPath
+        Start-Process $desktopPath | Out-Null
     }
     else {
         $startInfo = [System.Diagnostics.ProcessStartInfo]::new()

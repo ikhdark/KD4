@@ -31,6 +31,8 @@ use codex_tools::ToolSpec;
 use pretty_assertions::assert_eq;
 use serde_json::json;
 
+use super::code_mode_namespace_descriptions;
+use super::merge_into_namespaces;
 use crate::config::CurrentTimeReminderConfig;
 use crate::session::step_context::StepContext;
 use crate::session::tests::make_session_and_context;
@@ -43,6 +45,54 @@ use crate::tools::router::ToolSuggestCandidates;
 use crate::tools::router::ToolSuggestPresentation;
 
 const MULTI_AGENT_V2_NAMESPACE: &str = "agents";
+
+#[test]
+fn namespace_descriptions_share_one_hard_budget_in_stable_spec_order() {
+    let specs = [("zeta", 'z'), ("alpha", 'a')]
+        .into_iter()
+        .map(|(name, fill)| {
+            ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+                name: name.to_string(),
+                description: fill.to_string().repeat(30_000),
+                tools: Vec::new(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let code_mode_descriptions = code_mode_namespace_descriptions(&specs);
+    assert_eq!(
+        code_mode_descriptions["zeta"].description,
+        "z".repeat(30_000)
+    );
+    assert!(code_mode_descriptions["alpha"].description.len() < 30_000);
+    assert!(
+        code_mode_descriptions
+            .values()
+            .map(|namespace| namespace.description.len())
+            .sum::<usize>()
+            <= 40_000
+    );
+
+    let merged = merge_into_namespaces(specs);
+    let ToolSpec::Namespace(first_namespace) = &merged[0] else {
+        panic!("expected first merged spec to be a namespace");
+    };
+    assert_eq!(first_namespace.name, "zeta");
+    assert_eq!(first_namespace.description, "z".repeat(30_000));
+    let ToolSpec::Namespace(second_namespace) = &merged[1] else {
+        panic!("expected second merged spec to be a namespace");
+    };
+    assert_eq!(second_namespace.name, "alpha");
+    assert!(second_namespace.description.len() < 30_000);
+    let merged_bytes = merged
+        .iter()
+        .map(|spec| match spec {
+            ToolSpec::Namespace(namespace) => namespace.description.len(),
+            _ => 0,
+        })
+        .sum::<usize>();
+    assert!(merged_bytes <= 40_000);
+}
 
 #[derive(Default)]
 struct ToolPlanInputs {
@@ -342,6 +392,40 @@ impl ToolExecutor<ExtensionToolCall> for DeferredExtensionTool {
                 Some(false.into()),
             ),
             output_schema: None,
+        })
+    }
+
+    fn exposure(&self) -> ToolExposure {
+        ToolExposure::Deferred
+    }
+
+    fn handle(&self, _call: ExtensionToolCall) -> codex_tools::ToolExecutorFuture<'_> {
+        Box::pin(async { panic!("spec planning should not execute extension tools") })
+    }
+}
+
+struct DeferredNamespaceExtensionTool {
+    namespace: &'static str,
+    tool_name: &'static str,
+}
+
+impl ToolExecutor<ExtensionToolCall> for DeferredNamespaceExtensionTool {
+    fn tool_name(&self) -> ToolName {
+        ToolName::namespaced(self.namespace, self.tool_name)
+    }
+
+    fn spec(&self) -> ToolSpec {
+        ToolSpec::Namespace(codex_tools::ResponsesApiNamespace {
+            name: self.namespace.to_string(),
+            description: "Test deferred namespace.".to_string(),
+            tools: vec![ResponsesApiNamespaceTool::Function(ResponsesApiTool {
+                name: self.tool_name.to_string(),
+                description: "Test deferred namespace tool.".to_string(),
+                strict: false,
+                defer_loading: None,
+                parameters: codex_tools::JsonSchema::default(),
+                output_schema: None,
+            })],
         })
     }
 
@@ -913,6 +997,56 @@ async fn deferred_extension_tools_are_discoverable_with_tool_search() {
     plan.assert_visible_lacks(&["extension_echo"]);
     plan.assert_registered_contains(&["extension_echo"]);
     assert_eq!(plan.exposure("extension_echo"), ToolExposure::Deferred);
+}
+
+#[tokio::test]
+async fn deferred_web_run_stays_reachable_with_and_without_tool_search() {
+    let web_run = || {
+        Arc::new(DeferredNamespaceExtensionTool {
+            namespace: "web",
+            tool_name: "run",
+        }) as Arc<dyn ToolExecutor<ExtensionToolCall>>
+    };
+
+    let without_tool_search = probe_with(
+        |turn| {
+            set_feature(turn, Feature::StandaloneWebSearch, /*enabled*/ true);
+            set_web_search_mode(turn, WebSearchMode::Live);
+            turn.model_info.supports_search_tool = false;
+        },
+        ToolPlanInputs {
+            extension_tool_executors: vec![web_run()],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    without_tool_search.assert_visible_contains(&["web"]);
+    without_tool_search.assert_visible_lacks(&["tool_search", "web_search"]);
+    assert_eq!(without_tool_search.namespace_function_names("web"), ["run"]);
+    assert_eq!(
+        without_tool_search.exposure(&ToolName::namespaced("web", "run").to_string()),
+        ToolExposure::Direct
+    );
+
+    let with_tool_search = probe_with(
+        |turn| {
+            set_feature(turn, Feature::StandaloneWebSearch, /*enabled*/ true);
+            set_web_search_mode(turn, WebSearchMode::Live);
+            turn.model_info.supports_search_tool = true;
+        },
+        ToolPlanInputs {
+            extension_tool_executors: vec![web_run()],
+            ..ToolPlanInputs::default()
+        },
+    )
+    .await;
+    with_tool_search.assert_visible_contains(&["tool_search"]);
+    with_tool_search.assert_visible_lacks(&["web", "web_search"]);
+    with_tool_search.assert_registered_contains(&[&ToolName::namespaced("web", "run").to_string()]);
+    assert_eq!(
+        with_tool_search.exposure(&ToolName::namespaced("web", "run").to_string()),
+        ToolExposure::Deferred
+    );
 }
 
 #[tokio::test]

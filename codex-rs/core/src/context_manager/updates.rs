@@ -157,9 +157,6 @@ fn build_personality_update_item(
         return None;
     }
     let previous = previous?;
-    if next.model_info.slug != previous.model {
-        return None;
-    }
 
     let personality = next.personality?;
     if Some(personality) == previous.personality {
@@ -189,7 +186,7 @@ pub(crate) fn personality_message_for(
         .filter(|message| !message.is_empty())
 }
 
-pub(crate) fn build_model_instructions_update_item(
+pub(crate) fn build_model_switch_update_item(
     previous_turn_settings: Option<&PreviousTurnSettings>,
     next: &TurnContext,
 ) -> Option<String> {
@@ -198,12 +195,7 @@ pub(crate) fn build_model_instructions_update_item(
         return None;
     }
 
-    let model_instructions = next.model_info.get_model_instructions(next.personality);
-    if model_instructions.is_empty() {
-        return None;
-    }
-
-    Some(ModelSwitchInstructions::new(model_instructions).render())
+    Some(ModelSwitchInstructions::new().render())
 }
 
 pub(crate) fn build_developer_update_item(text_sections: Vec<String>) -> Option<ResponseItem> {
@@ -265,9 +257,9 @@ pub(crate) fn build_settings_update_items(
     // inputs or add explicit replay events so fork/resume can diff everything
     // deterministically.
     let developer_update_sections = [
-        // Keep model-switch instructions first so model-specific guidance is read before
-        // any other context diffs on this turn.
-        build_model_instructions_update_item(previous_turn_settings, next),
+        // Keep the model-switch compatibility note first, followed by independent setting
+        // deltas that remain relevant to the new model.
+        build_model_switch_update_item(previous_turn_settings, next),
         build_permissions_update_item(previous, next, exec_policy),
         build_collaboration_mode_update_item(previous, next),
         build_multi_agent_mode_update_item(previous, next),

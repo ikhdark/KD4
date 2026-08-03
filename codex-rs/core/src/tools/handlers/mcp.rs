@@ -159,14 +159,29 @@ impl McpHandler {
         )
         .await;
         if let Some(raw_server_result) = result.raw_server_result.as_ref() {
-            match session
+            let (evidence_ledger, provenance) = session
                 .services
-                .task_evidence
-                .record_external_mcp_evidence(
+                .agent_control
+                .completion_evidence_target(
+                    &turn.session_source,
+                    session.thread_id,
+                    &session.services.task_evidence,
+                )
+                .await;
+            let implementation_identity_hash =
+                crate::tasks::completion_review::implementation_identity_for_evidence(
+                    session.as_ref(),
+                    &evidence_ledger,
+                )
+                .await;
+            match evidence_ledger
+                .record_external_mcp_evidence_bound_with_provenance(
                     &self.tool_info.server_name,
                     self.tool_info.tool.name.as_ref(),
                     &call_id,
                     raw_server_result,
+                    provenance.as_ref(),
+                    implementation_identity_hash.as_deref(),
                 )
                 .await
             {

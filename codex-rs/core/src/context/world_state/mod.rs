@@ -4,6 +4,8 @@ mod environment;
 mod plugins_instructions;
 
 use crate::context::ContextualUserFragment;
+use codex_context_fragments::ModelContextBudget;
+use codex_context_fragments::RenderedContextFragment;
 use codex_extension_api::PreviousWorldStateSection;
 use codex_extension_api::RenderedWorldStateFragment;
 use codex_extension_api::WorldStateSectionContribution;
@@ -264,6 +266,7 @@ impl WorldState {
             .insert(id, Box::new(ExtensionWorldStateSection(section)));
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> WorldStateSnapshot {
         WorldStateSnapshot {
             sections: self
@@ -279,15 +282,31 @@ impl WorldState {
     }
 
     /// Renders every section as new, without any known previous state.
+    #[cfg(test)]
     pub(crate) fn render_full(&self) -> Vec<Box<dyn ContextualUserFragment>> {
+        self.render_full_with_snapshot().0
+    }
+
+    pub(crate) fn render_full_with_snapshot(
+        &self,
+    ) -> (Vec<Box<dyn ContextualUserFragment>>, WorldStateSnapshot) {
         self.render_with(|_, _| PreviousSectionState::Absent)
     }
 
     /// Renders each section against the exact persisted snapshot when available.
+    #[cfg(test)]
     pub(crate) fn render_diff(
         &self,
         previous: &WorldStateSnapshot,
     ) -> Vec<Box<dyn ContextualUserFragment>> {
+        self.render_diff_with_snapshot(previous).0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn render_diff_with_snapshot(
+        &self,
+        previous: &WorldStateSnapshot,
+    ) -> (Vec<Box<dyn ContextualUserFragment>>, WorldStateSnapshot) {
         self.render_with(|id, _| match previous.sections.get(id) {
             Some(previous) => PreviousSectionState::Known(previous),
             None => PreviousSectionState::Absent,
@@ -295,11 +314,20 @@ impl WorldState {
     }
 
     /// Falls back to retained model history when no exact persisted snapshot is available.
+    #[cfg(test)]
     pub(crate) fn render_history_diff(
         &self,
         previous: Option<&WorldStateSnapshot>,
         items: &[ResponseItem],
     ) -> Vec<Box<dyn ContextualUserFragment>> {
+        self.render_history_diff_with_snapshot(previous, items).0
+    }
+
+    pub(crate) fn render_history_diff_with_snapshot(
+        &self,
+        previous: Option<&WorldStateSnapshot>,
+        items: &[ResponseItem],
+    ) -> (Vec<Box<dyn ContextualUserFragment>>, WorldStateSnapshot) {
         self.render_with(|id, section| {
             if let Some(previous) = previous.and_then(|previous| previous.sections.get(id)) {
                 if section.has_retained_fragment_matcher() && !has_retained_fragment(items, section)
@@ -319,11 +347,43 @@ impl WorldState {
     fn render_with<'a>(
         &self,
         mut previous: impl FnMut(&str, &dyn ErasedWorldStateSection) -> PreviousSectionState<'a, Value>,
-    ) -> Vec<Box<dyn ContextualUserFragment>> {
-        self.sections
-            .iter()
-            .filter_map(|(id, section)| section.render_diff(previous(id, section.as_ref())))
-            .collect()
+    ) -> (Vec<Box<dyn ContextualUserFragment>>, WorldStateSnapshot) {
+        let mut budget = ModelContextBudget::default();
+        let mut fragments = Vec::new();
+        let mut sections = BTreeMap::new();
+        for (id, section) in &self.sections {
+            let previous = previous(id, section.as_ref());
+            let rejected_snapshot = match &previous {
+                PreviousSectionState::Known(previous) => Some((*previous).clone()),
+                PreviousSectionState::Absent | PreviousSectionState::Unknown => None,
+            };
+            let fragment = section.render_diff(previous);
+            let admitted = match fragment {
+                Some(fragment) => {
+                    let rendered = fragment.render();
+                    if !budget.try_take(&rendered) {
+                        false
+                    } else {
+                        let role = fragment.role();
+                        fragments.push(Box::new(RenderedContextFragment::new(role, rendered))
+                            as Box<dyn ContextualUserFragment>);
+                        true
+                    }
+                }
+                None => true,
+            };
+
+            let snapshot = if admitted {
+                section.snapshot()
+            } else {
+                rejected_snapshot
+            };
+            if let Some(snapshot) = snapshot {
+                sections.insert((*id).to_string(), snapshot);
+            }
+        }
+
+        (fragments, WorldStateSnapshot { sections })
     }
 }
 

@@ -200,6 +200,21 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
         environment_id: "turn-env".to_string(),
         cwd: PathUri::parse("file:///workspace").expect("cwd URI"),
     };
+    let estimate_turn_store = ExtensionData::new("turn-estimate");
+    let estimated_sections = registry.context_contributors()[0]
+        .estimate_world_state(WorldStateContributionInput {
+            thread_id: codex_protocol::ThreadId::new(),
+            turn_id: "turn-estimate",
+            environments: std::slice::from_ref(&turn_environment),
+            ready_selected_capability_roots: &selected_roots,
+            session_store: &session_store,
+            thread_store: &thread_store,
+            turn_store: &estimate_turn_store,
+        })
+        .await;
+    assert_eq!(1, estimated_sections.len());
+    assert_eq!(1, list_calls.load(Ordering::Relaxed));
+
     let available_sections = registry.context_contributors()[0]
         .contribute_world_state(WorldStateContributionInput {
             thread_id: codex_protocol::ThreadId::new(),
@@ -212,6 +227,11 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
         })
         .await;
     assert_eq!(1, available_sections.len());
+    assert_eq!(
+        2,
+        list_calls.load(Ordering::Relaxed),
+        "estimate mode must not populate the executor cache"
+    );
     let available_snapshot = available_sections[0].snapshot().clone();
     let available_fragment = available_sections[0]
         .render_diff(PreviousWorldStateSection::Absent)
@@ -251,6 +271,25 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
         )],
         read_request_keys(&read_requests)
     );
+    let cached_estimate_turn_store = ExtensionData::new("turn-cached-estimate");
+    let cached_estimated_sections = registry.context_contributors()[0]
+        .estimate_world_state(WorldStateContributionInput {
+            thread_id: codex_protocol::ThreadId::new(),
+            turn_id: "turn-cached-estimate",
+            environments: std::slice::from_ref(&turn_environment),
+            ready_selected_capability_roots: &selected_roots,
+            session_store: &session_store,
+            thread_store: &thread_store,
+            turn_store: &cached_estimate_turn_store,
+        })
+        .await;
+    assert_eq!(1, cached_estimated_sections.len());
+    assert_eq!(
+        2,
+        list_calls.load(Ordering::Relaxed),
+        "estimate mode should reuse an existing stable cache entry"
+    );
+
     let unavailable_turn_store = ExtensionData::new("turn-2");
     let unavailable_sections = registry.context_contributors()[0]
         .contribute_world_state(WorldStateContributionInput {
@@ -290,7 +329,7 @@ async fn selected_executor_catalog_follows_step_availability_and_reuses_its_cach
         .render_diff(PreviousWorldStateSection::Known(&unavailable_snapshot))
         .ok_or("restored skills should render")?;
     assert!(restored_fragment.body().contains("lint-fix"));
-    assert_eq!(1, list_calls.load(Ordering::Relaxed));
+    assert_eq!(2, list_calls.load(Ordering::Relaxed));
 
     let mut listing_disabled_config = config.clone();
     listing_disabled_config.include_instructions = false;
@@ -455,6 +494,71 @@ async fn skills_list_truncates_catalog_descriptions_in_tool_output() -> TestResu
 
     assert_eq!(rendered_description, "x".repeat(1_021) + "...");
     assert_ne!(rendered_description, description);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn estimate_thread_context_does_not_populate_orchestrator_cache() -> TestResult {
+    let list_calls = Arc::new(AtomicUsize::new(0));
+    let providers =
+        SkillProviders::new().with_orchestrator_provider(Arc::new(StaticSkillProvider {
+            catalog: SkillCatalog {
+                entries: vec![test_entry(
+                    SkillSourceKind::Orchestrator,
+                    "codex_apps",
+                    "orchestrator/first",
+                    "skill://orchestrator/first/SKILL.md",
+                )],
+                warnings: Vec::new(),
+            },
+            read_requests: Arc::new(Mutex::new(Vec::new())),
+            list_calls: Some(Arc::clone(&list_calls)),
+            fail_first_list: false,
+        }));
+    let mut builder = ExtensionRegistryBuilder::new();
+    install_with_providers(&mut builder, providers, skills_extension_config);
+    let registry = builder.build();
+    let session_store = ExtensionData::new("session");
+    let thread_store = ExtensionData::new("thread");
+    let session_source = SessionSource::Cli;
+    let config = default_config();
+    registry.thread_lifecycle_contributors()[0]
+        .on_thread_start(ThreadStartInput {
+            config: &config,
+            session_source: &session_source,
+            persistent_thread_state_available: true,
+            environments: &[],
+            session_store: &session_store,
+            thread_store: &thread_store,
+        })
+        .await;
+
+    let estimated_fragments = registry.context_contributors()[0]
+        .estimate_thread_context(&session_store, &thread_store)
+        .await;
+    assert_eq!(1, estimated_fragments.len());
+    assert_eq!(1, list_calls.load(Ordering::Relaxed));
+
+    let runtime_fragments = registry.context_contributors()[0]
+        .contribute_thread_context(&session_store, &thread_store)
+        .await;
+    assert_eq!(1, runtime_fragments.len());
+    assert_eq!(
+        2,
+        list_calls.load(Ordering::Relaxed),
+        "estimate mode must not populate the orchestrator cache"
+    );
+
+    let cached_runtime_fragments = registry.context_contributors()[0]
+        .contribute_thread_context(&session_store, &thread_store)
+        .await;
+    assert_eq!(1, cached_runtime_fragments.len());
+    assert_eq!(
+        2,
+        list_calls.load(Ordering::Relaxed),
+        "runtime contribution should reuse the cached orchestrator catalog"
+    );
 
     Ok(())
 }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::ModelsManagerConfig;
+use codex_protocol::config_types::Personality;
 use codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT;
 use codex_protocol::openai_models::ApprovalMessages;
 use pretty_assertions::assert_eq;
@@ -36,6 +37,7 @@ fn assert_prompt_rules(label: &str, prompt: &str) {
 
 #[test]
 fn base_instructions_include_prompt_rules_anchors() {
+    assert_eq!(BASE_INSTRUCTIONS, BASE_INSTRUCTIONS_DEFAULT);
     assert_prompt_rules("BASE_INSTRUCTIONS", BASE_INSTRUCTIONS);
 }
 
@@ -77,6 +79,69 @@ fn protocol_default_base_instructions_include_prompt_rules_anchors() {
         "codex_protocol::models::BASE_INSTRUCTIONS_DEFAULT",
         BASE_INSTRUCTIONS_DEFAULT,
     );
+}
+
+#[test]
+fn bundled_catalog_omits_behavior_identical_instruction_templates() {
+    let response = crate::bundled_models_response().expect("bundled models.json should parse");
+    for slug in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.2"] {
+        let model = response
+            .models
+            .iter()
+            .find(|model| model.slug == slug)
+            .unwrap_or_else(|| panic!("bundled models.json should contain {slug}"));
+        assert!(
+            model
+                .model_messages
+                .as_ref()
+                .is_none_or(|messages| messages.instructions_template.is_none()),
+            "{slug} should not duplicate base_instructions in instructions_template"
+        );
+        assert_eq!(model.get_model_instructions(None), model.base_instructions);
+        for personality in [
+            Personality::None,
+            Personality::Friendly,
+            Personality::Pragmatic,
+        ] {
+            assert_eq!(
+                model.get_model_instructions(Some(personality)),
+                model.base_instructions,
+                "{slug} should preserve base rendering for {personality}"
+            );
+        }
+        assert!(!model.supports_personality());
+    }
+}
+
+#[test]
+fn fallback_and_gpt_5_2_prompts_defer_tool_contracts_to_live_specs() {
+    const DUPLICATED_TOOL_CONTRACTS: &[&str] = &[
+        r#"{"command":["apply_patch""#,
+        "## apply_patch",
+        "This is a FREEFORM tool",
+        "## `update_plan`",
+        "(`pending`, `in_progress`, or `completed`)",
+        "Do not jump an item from pending to completed",
+    ];
+
+    let response = crate::bundled_models_response().expect("bundled models.json should parse");
+    let gpt_5_2 = response
+        .models
+        .iter()
+        .find(|model| model.slug == "gpt-5.2")
+        .expect("bundled models.json should contain gpt-5.2");
+
+    for (label, prompt) in [
+        ("fallback", BASE_INSTRUCTIONS_DEFAULT),
+        ("gpt-5.2", gpt_5_2.base_instructions.as_str()),
+    ] {
+        for duplicated_contract in DUPLICATED_TOOL_CONTRACTS {
+            assert!(
+                !prompt.contains(duplicated_contract),
+                "{label} prompt should defer {duplicated_contract:?} to the live tool spec"
+            );
+        }
+    }
 }
 
 #[test]

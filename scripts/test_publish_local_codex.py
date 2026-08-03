@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 
@@ -266,8 +267,6 @@ class PublishLocalCodexHelperBehaviorTest(unittest.TestCase):
             raise unittest.SkipTest("PowerShell is not available")
 
     def test_version_probe_drains_large_stderr_without_deadlock(self) -> None:
-        import tempfile
-
         with tempfile.TemporaryDirectory() as temp_dir:
             helper_exe = Path(temp_dir) / "noisy-version.exe"
             source = (
@@ -307,7 +306,6 @@ class PublishLocalCodexHelperBehaviorTest(unittest.TestCase):
                 f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
             )
             self.assertEqual(result.stdout.strip(), "codex noisy 1.0")
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -361,6 +361,10 @@ async fn memories_startup_phase1_provider_default_drives_request_model() -> anyh
         request.body_json()["model"].as_str(),
         Some(MOCK_PROVIDER_PHASE_ONE_MODEL)
     );
+    assert_eq!(
+        request.body_json()["instructions"].as_str(),
+        Some(crate::stage_one::PROMPT)
+    );
 
     Ok(())
 }
@@ -377,7 +381,43 @@ async fn memories_startup_phase2_provider_default_drives_request_model() -> anyh
         request.body_json()["model"].as_str(),
         Some(MOCK_PROVIDER_PHASE_TWO_MODEL)
     );
+    assert_eq!(
+        request.body_json()["instructions"].as_str(),
+        Some(crate::stage_two::BASE_INSTRUCTIONS.trim())
+    );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn memories_phase2_agent_uses_dedicated_prompt_context() -> anyhow::Result<()> {
+    let server = start_mock_server().await;
+    let home = Arc::new(TempDir::new()?);
+    let test = build_test_codex_with_memories_config(&server, home, startup_test_memories_config())
+        .await?;
+    let provider = Arc::new(MockMemoryModelProvider::new(
+        test.config.model_provider.clone(),
+        Some(test.thread_manager.auth_manager()),
+    ));
+
+    let config = phase2::agent_config_for_test(&test.config, provider.as_ref())
+        .expect("phase-two agent config");
+
+    assert_eq!(
+        config.base_instructions.as_deref(),
+        Some(crate::stage_two::BASE_INSTRUCTIONS.trim())
+    );
+    assert_eq!(config.developer_instructions, None);
+    assert_eq!(config.personality, None);
+    assert!(!config.include_permissions_instructions);
+    assert!(!config.include_apps_instructions);
+    assert!(!config.include_collaboration_mode_instructions);
+    assert!(!config.include_skill_instructions);
+    assert!(!config.include_environment_context);
+    assert!(!config.memories.use_memories);
+    assert!(!config.features.enabled(Feature::Personality));
+
+    shutdown_test_codex(&test).await?;
     Ok(())
 }
 

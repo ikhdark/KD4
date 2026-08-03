@@ -9,6 +9,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ConfigWarningNotification;
 use codex_app_server_protocol::InitializeParams;
+use codex_app_server_protocol::InitializeResponse;
 use codex_app_server_protocol::JSONRPCError;
 use codex_app_server_protocol::JSONRPCMessage;
 use codex_app_server_protocol::JSONRPCNotification;
@@ -99,6 +100,105 @@ async fn websocket_transport_routes_per_connection_handshake_and_responses() -> 
     assert_eq!(ws2_config.id, RequestId::Integer(77));
     assert!(ws1_config.result.get("config").is_some());
     assert!(ws2_config.result.get("config").is_some());
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn websocket_clients_cannot_mix_process_originator_and_user_agent_suffix() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+
+    let (mut process, bind_addr) =
+        spawn_websocket_server_without_originator_override(codex_home.path()).await?;
+    let mut first_client = connect_websocket(bind_addr).await?;
+    let mut second_client = connect_websocket(bind_addr).await?;
+
+    send_initialize_request(&mut first_client, /*id*/ 1, "first_client").await?;
+    let first_response: InitializeResponse =
+        to_response(read_response_for_id(&mut first_client, /*id*/ 1).await?)?;
+    send_initialize_request(&mut second_client, /*id*/ 2, "second_client").await?;
+    let second_response: InitializeResponse =
+        to_response(read_response_for_id(&mut second_client, /*id*/ 2).await?)?;
+
+    assert!(
+        first_response
+            .user_agent
+            .ends_with(" (first_client; 0.1.0)")
+    );
+    assert_eq!(second_response.user_agent, first_response.user_agent);
+    assert!(!second_response.user_agent.contains("second_client"));
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn websocket_originator_override_does_not_adopt_request_client_suffix() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+
+    let (mut process, bind_addr) =
+        spawn_websocket_server_with_originator_override(codex_home.path(), "process_override")
+            .await?;
+    let mut client = connect_websocket(bind_addr).await?;
+
+    send_initialize_request(&mut client, /*id*/ 1, "request_client").await?;
+    let response: InitializeResponse =
+        to_response(read_response_for_id(&mut client, /*id*/ 1).await?)?;
+
+    assert!(response.user_agent.starts_with("process_override/"));
+    assert!(!response.user_agent.contains("request_client"));
+
+    process
+        .kill()
+        .await
+        .context("failed to stop websocket app-server process")?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn websocket_non_originating_clients_never_claim_or_replace_process_identity() -> Result<()> {
+    let server = create_mock_responses_server_sequence_unchecked(Vec::new()).await;
+    let codex_home = TempDir::new()?;
+    create_config_toml(codex_home.path(), &server.uri(), "never")?;
+
+    let (mut process, bind_addr) =
+        spawn_websocket_server_without_originator_override(codex_home.path()).await?;
+    let mut first_daemon = connect_websocket(bind_addr).await?;
+    let mut originating_client = connect_websocket(bind_addr).await?;
+    let mut later_daemon = connect_websocket(bind_addr).await?;
+
+    send_initialize_request(&mut first_daemon, /*id*/ 1, "codex-backend").await?;
+    let daemon_before_identity: InitializeResponse =
+        to_response(read_response_for_id(&mut first_daemon, /*id*/ 1).await?)?;
+    send_initialize_request(&mut originating_client, /*id*/ 2, "real_client").await?;
+    let originating_response: InitializeResponse =
+        to_response(read_response_for_id(&mut originating_client, /*id*/ 2).await?)?;
+    send_initialize_request(&mut later_daemon, /*id*/ 3, "codex-backend").await?;
+    let daemon_after_identity: InitializeResponse =
+        to_response(read_response_for_id(&mut later_daemon, /*id*/ 3).await?)?;
+
+    assert!(!daemon_before_identity.user_agent.contains("codex-backend"));
+    assert!(originating_response.user_agent.starts_with("real_client/"));
+    assert!(
+        originating_response
+            .user_agent
+            .ends_with(" (real_client; 0.1.0)")
+    );
+    assert_eq!(
+        daemon_after_identity.user_agent,
+        originating_response.user_agent
+    );
 
     process
         .kill()
@@ -482,10 +582,56 @@ pub(super) async fn spawn_websocket_server(codex_home: &Path) -> Result<(Child, 
     spawn_websocket_server_with_args(codex_home, "ws://127.0.0.1:0", &[]).await
 }
 
+async fn spawn_websocket_server_without_originator_override(
+    codex_home: &Path,
+) -> Result<(Child, SocketAddr)> {
+    spawn_websocket_server_with_options(
+        codex_home,
+        "ws://127.0.0.1:0",
+        &[],
+        OriginatorOverride::Remove,
+    )
+    .await
+}
+
+async fn spawn_websocket_server_with_originator_override(
+    codex_home: &Path,
+    originator_override: &str,
+) -> Result<(Child, SocketAddr)> {
+    spawn_websocket_server_with_options(
+        codex_home,
+        "ws://127.0.0.1:0",
+        &[],
+        OriginatorOverride::Set(originator_override),
+    )
+    .await
+}
+
 pub(super) async fn spawn_websocket_server_with_args(
     codex_home: &Path,
     listen_url: &str,
     extra_args: &[String],
+) -> Result<(Child, SocketAddr)> {
+    spawn_websocket_server_with_options(
+        codex_home,
+        listen_url,
+        extra_args,
+        OriginatorOverride::Inherit,
+    )
+    .await
+}
+
+enum OriginatorOverride<'a> {
+    Inherit,
+    Remove,
+    Set(&'a str),
+}
+
+async fn spawn_websocket_server_with_options(
+    codex_home: &Path,
+    listen_url: &str,
+    extra_args: &[String],
+    originator_override: OriginatorOverride<'_>,
 ) -> Result<(Child, SocketAddr)> {
     let program = codex_utils_cargo_bin::cargo_bin("codex-app-server")
         .context("should find app-server binary")?;
@@ -499,6 +645,15 @@ pub(super) async fn spawn_websocket_server_with_args(
         .stderr(Stdio::piped())
         .env("CODEX_HOME", codex_home)
         .env("RUST_LOG", "warn");
+    match originator_override {
+        OriginatorOverride::Inherit => {}
+        OriginatorOverride::Remove => {
+            cmd.env_remove("CODEX_INTERNAL_ORIGINATOR_OVERRIDE");
+        }
+        OriginatorOverride::Set(value) => {
+            cmd.env("CODEX_INTERNAL_ORIGINATOR_OVERRIDE", value);
+        }
+    }
     let mut process = cmd
         .kill_on_drop(true)
         .spawn()

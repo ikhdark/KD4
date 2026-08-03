@@ -24,6 +24,7 @@ use crate::StoreError;
 use crate::StoreResult;
 use crate::WorkspaceActorKind;
 use crate::WorkspaceActorRegistration;
+use crate::WorkspaceFinalizationFence;
 use crate::WorkspaceManifestEntry;
 use crate::WorkspaceMutationLease;
 use crate::WorkspaceMutationRequest;
@@ -34,6 +35,27 @@ use crate::scope::RepositoryIdentity;
 use crate::scope::absolute_repo_path;
 use crate::scope::normalize_repo_path;
 use crate::scope::repository_identity;
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_COMPARISON_NOW: chrono::DateTime<Utc>;
+}
+
+fn comparison_now() -> chrono::DateTime<Utc> {
+    #[cfg(test)]
+    if let Ok(now) = TEST_COMPARISON_NOW.try_with(ToOwned::to_owned) {
+        return now;
+    }
+    Utc::now()
+}
+
+#[cfg(test)]
+pub(crate) async fn with_test_comparison_now<T>(
+    now: chrono::DateTime<Utc>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    TEST_COMPARISON_NOW.scope(now, future).await
+}
 
 /// Reserved manifest scope used by core-controlled writers whose shell command cannot be
 /// narrowed to specific repository paths before execution.
@@ -54,6 +76,7 @@ pub(crate) async fn capture_revision(
             .map_err(|error| StoreError::CorruptData(format!("manifest task failed: {error}")))??;
     let mut transaction = pool.begin().await?;
     ensure_workspace_tx(&mut transaction, &repository).await?;
+    expire_finalization_fences_tx(&mut transaction, &repository.workspace_id).await?;
     let epoch =
         reconcile_entries_tx(&mut transaction, &repository, &normalized, &mut entries).await?;
     transaction.commit().await?;
@@ -238,6 +261,7 @@ pub(crate) async fn register_actor(
     let repository = repository_identity(repo_root)?;
     let mut transaction = pool.begin().await?;
     ensure_workspace_tx(&mut transaction, &repository).await?;
+    expire_finalization_fences_tx(&mut transaction, &repository.workspace_id).await?;
     let now = Utc::now();
     sqlx::query(
         "INSERT INTO workspace_actors (
@@ -297,6 +321,21 @@ pub(crate) async fn begin_mutation(
     let mut transaction = pool.begin().await?;
     ensure_workspace_tx(&mut transaction, &repository).await?;
     expire_mutation_leases_tx(&mut transaction, &repository.workspace_id).await?;
+    expire_finalization_fences_tx(&mut transaction, &repository.workspace_id).await?;
+    if let Some(finalizing_root_session_id) = sqlx::query_scalar::<_, String>(
+        "SELECT root_session_id FROM workspace_finalization_fences
+         WHERE workspace_id = ? AND state IN ('active', 'dispatching')
+           AND julianday(json_extract(expires_at, '$')) > julianday('now')
+         LIMIT 1",
+    )
+    .bind(&repository.workspace_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    {
+        return Err(StoreError::WorkspaceFinalizationActive {
+            root_session_id: finalizing_root_session_id,
+        });
+    }
     if request.kind == WorkspaceActorKind::Typed {
         let Some(attempt_id) = request.attempt_id else {
             return Err(StoreError::InvalidAssignment(
@@ -369,7 +408,7 @@ pub(crate) async fn begin_mutation(
         expected
     };
 
-    let now = Utc::now();
+    let now = comparison_now();
     let expires_at = now + Duration::seconds(DEFAULT_WORKSPACE_LEASE_SECONDS);
     let lease_id = Uuid::now_v7().to_string();
     let assignment_id = match request.attempt_id {
@@ -447,6 +486,175 @@ pub(crate) async fn begin_mutation(
         state: LeaseState::Active,
         expires_at,
     })
+}
+
+pub(crate) async fn begin_finalization(
+    pool: &SqlitePool,
+    repo_root: &Path,
+    root_session_id: &str,
+) -> StoreResult<WorkspaceFinalizationFence> {
+    if root_session_id.trim().is_empty() {
+        return Err(StoreError::InvalidAssignment(
+            "workspace finalization requires a root session identity".to_string(),
+        ));
+    }
+    let repository = repository_identity(repo_root)?;
+    let now = comparison_now();
+    let expires_at = now + Duration::seconds(DEFAULT_WORKSPACE_LEASE_SECONDS);
+    let mut transaction = pool.begin().await?;
+    ensure_workspace_tx(&mut transaction, &repository).await?;
+    expire_mutation_leases_tx(&mut transaction, &repository.workspace_id).await?;
+    expire_finalization_fences_tx(&mut transaction, &repository.workspace_id).await?;
+
+    if let Some(finalizing_root_session_id) = sqlx::query_scalar::<_, String>(
+        "SELECT root_session_id FROM workspace_finalization_fences
+         WHERE workspace_id = ? AND state IN ('active', 'dispatching')
+           AND julianday(json_extract(expires_at, '$')) > julianday('now')
+         LIMIT 1",
+    )
+    .bind(&repository.workspace_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    {
+        return Err(StoreError::WorkspaceFinalizationActive {
+            root_session_id: finalizing_root_session_id,
+        });
+    }
+
+    let active_lease_ids = sqlx::query_scalar::<_, String>(
+        "SELECT lease_id FROM workspace_mutation_leases
+         WHERE workspace_id = ? AND state = 'active'
+           AND julianday(json_extract(expires_at, '$')) >= julianday(json_extract(?, '$'))
+         ORDER BY lease_id",
+    )
+    .bind(&repository.workspace_id)
+    .bind(json(&now)?)
+    .fetch_all(&mut *transaction)
+    .await?;
+    if !active_lease_ids.is_empty() {
+        return Err(StoreError::WorkspaceFinalizationNotQuiescent {
+            lease_ids: active_lease_ids,
+        });
+    }
+
+    let fence_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO workspace_finalization_fences (
+            fence_id, workspace_id, root_session_id, state, created_at, expires_at
+         ) VALUES (?, ?, ?, 'active', ?, ?)",
+    )
+    .bind(&fence_id)
+    .bind(&repository.workspace_id)
+    .bind(root_session_id)
+    .bind(json(&now)?)
+    .bind(json(&expires_at)?)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(WorkspaceFinalizationFence {
+        fence_id,
+        repository_id: repository.id,
+        workspace_id: repository.workspace_id,
+        root_session_id: root_session_id.to_string(),
+        expires_at,
+    })
+}
+
+pub(crate) async fn seal_finalization_dispatch(
+    pool: &SqlitePool,
+    repo_root: &Path,
+    mut fence: WorkspaceFinalizationFence,
+) -> StoreResult<WorkspaceFinalizationFence> {
+    let repository = repository_identity(repo_root)?;
+    if repository.id != fence.repository_id || repository.workspace_id != fence.workspace_id {
+        return Err(StoreError::WorkspaceStateInitialization(
+            "workspace finalization fence belongs to a different repository".to_string(),
+        ));
+    }
+    let mut transaction = pool.begin().await?;
+    ensure_workspace_tx(&mut transaction, &repository).await?;
+    expire_finalization_fences_tx(&mut transaction, &repository.workspace_id).await?;
+    let expires_at = Utc::now() + Duration::seconds(DEFAULT_WORKSPACE_LEASE_SECONDS);
+    let updated = sqlx::query(
+        "UPDATE workspace_finalization_fences
+         SET state = 'dispatching', expires_at = ?
+         WHERE fence_id = ? AND workspace_id = ? AND root_session_id = ? AND state = 'active'
+           AND julianday(json_extract(expires_at, '$')) > julianday('now')",
+    )
+    .bind(json(&expires_at)?)
+    .bind(&fence.fence_id)
+    .bind(&fence.workspace_id)
+    .bind(&fence.root_session_id)
+    .execute(&mut *transaction)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(StoreError::WorkspaceLeaseUnavailable(fence.fence_id));
+    }
+    transaction.commit().await?;
+    fence.expires_at = expires_at;
+    Ok(fence)
+}
+
+pub(crate) async fn release_finalization(
+    pool: &SqlitePool,
+    repo_root: &Path,
+    fence: WorkspaceFinalizationFence,
+) -> StoreResult<()> {
+    let repository = repository_identity(repo_root)?;
+    if repository.id != fence.repository_id || repository.workspace_id != fence.workspace_id {
+        return Err(StoreError::WorkspaceStateInitialization(
+            "workspace finalization fence belongs to a different repository".to_string(),
+        ));
+    }
+    let updated = sqlx::query(
+        "UPDATE workspace_finalization_fences
+         SET state = 'released', released_at = ?
+         WHERE fence_id = ? AND workspace_id = ? AND root_session_id = ?
+           AND state IN ('active', 'dispatching')",
+    )
+    .bind(json(&Utc::now())?)
+    .bind(&fence.fence_id)
+    .bind(&fence.workspace_id)
+    .bind(&fence.root_session_id)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() != 1 {
+        return Err(StoreError::WorkspaceLeaseUnavailable(fence.fence_id));
+    }
+    Ok(())
+}
+
+pub(crate) async fn heartbeat_finalization(
+    pool: &SqlitePool,
+    repo_root: &Path,
+    fence_id: &str,
+    root_session_id: &str,
+) -> StoreResult<bool> {
+    if fence_id.trim().is_empty() || root_session_id.trim().is_empty() {
+        return Err(StoreError::InvalidAssignment(
+            "workspace finalization heartbeat requires fence and root identities".to_string(),
+        ));
+    }
+    let repository = repository_identity(repo_root)?;
+    let mut transaction = pool.begin().await?;
+    ensure_workspace_tx(&mut transaction, &repository).await?;
+    expire_finalization_fences_tx(&mut transaction, &repository.workspace_id).await?;
+    let expires_at = Utc::now() + Duration::seconds(DEFAULT_WORKSPACE_LEASE_SECONDS);
+    let updated = sqlx::query(
+        "UPDATE workspace_finalization_fences
+         SET expires_at = ?
+         WHERE fence_id = ? AND workspace_id = ? AND root_session_id = ?
+           AND state IN ('active', 'dispatching')
+           AND julianday(json_extract(expires_at, '$')) > julianday('now')",
+    )
+    .bind(json(&expires_at)?)
+    .bind(fence_id)
+    .bind(&repository.workspace_id)
+    .bind(root_session_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(updated.rows_affected() == 1)
 }
 
 pub(crate) async fn heartbeat_mutation(
@@ -617,7 +825,7 @@ pub(crate) async fn finish_mutation(
         set_epoch_tx(&mut transaction, &repository.workspace_id, next).await?;
         next
     };
-    let now = Utc::now();
+    let now = comparison_now();
     sqlx::query(
         "UPDATE workspace_mutation_leases
          SET state = 'released', released_at = ?, heartbeat_at = ?
@@ -630,7 +838,8 @@ pub(crate) async fn finish_mutation(
     .await?;
     let remaining_expirations = sqlx::query_scalar::<_, String>(
         "SELECT expires_at FROM workspace_mutation_leases
-         WHERE workspace_id = ? AND actor_id = ? AND state = 'active' AND expires_at >= ?",
+         WHERE workspace_id = ? AND actor_id = ? AND state = 'active'
+           AND julianday(json_extract(expires_at, '$')) >= julianday(json_extract(?, '$'))",
     )
     .bind(&repository.workspace_id)
     .bind(&lease.actor_id)
@@ -741,18 +950,28 @@ pub(crate) async fn quiescence(
     }
     transaction.commit().await?;
 
-    let now = Utc::now();
+    let now = comparison_now();
     let encoded_now = json(&now)?;
     sqlx::query(
         "UPDATE workspace_mutation_leases
          SET state = 'expired', released_at = ?
-         WHERE root_session_id = ? AND state = 'active' AND expires_at < ?",
+         WHERE root_session_id = ? AND state = 'active'
+           AND julianday(json_extract(expires_at, '$')) < julianday(json_extract(?, '$'))",
     )
     .bind(&encoded_now)
     .bind(root_session_id)
     .bind(&encoded_now)
     .execute(pool)
     .await?;
+    inspect_quiescence(pool, root_session_id).await
+}
+
+pub(crate) async fn inspect_quiescence(
+    pool: &SqlitePool,
+    root_session_id: &str,
+) -> StoreResult<QuiescenceStatus> {
+    let now = comparison_now();
+    let encoded_now = json(&now)?;
     let active_assignment_ids = query_assignment_ids(
         pool,
         "SELECT DISTINCT assignments.assignment_id
@@ -800,7 +1019,8 @@ pub(crate) async fn quiescence(
     .await?;
     let active_mutation_lease_ids = sqlx::query_scalar::<_, String>(
         "SELECT lease_id FROM workspace_mutation_leases
-         WHERE root_session_id = ? AND state = 'active' AND expires_at >= ?
+         WHERE root_session_id = ? AND state = 'active'
+           AND julianday(json_extract(expires_at, '$')) >= julianday(json_extract(?, '$'))
          ORDER BY lease_id",
     )
     .bind(root_session_id)
@@ -880,7 +1100,7 @@ pub(crate) async fn quiescence(
              JOIN workspace_repositories USING (workspace_id)
              WHERE workspace_mutation_leases.root_session_id <> ?
                AND workspace_mutation_leases.state = 'active'
-               AND workspace_mutation_leases.expires_at >= ?
+               AND julianday(json_extract(workspace_mutation_leases.expires_at, '$')) >= julianday(json_extract(?, '$'))
              ORDER BY workspace_mutation_leases.root_session_id,
                       workspace_mutation_leases.lease_id",
         )
@@ -1441,11 +1661,31 @@ async fn expire_mutation_leases_tx(
     transaction: &mut Transaction<'_, Sqlite>,
     workspace_id: &str,
 ) -> StoreResult<()> {
-    let now = json(&Utc::now())?;
+    let now = json(&comparison_now())?;
     sqlx::query(
         "UPDATE workspace_mutation_leases
          SET state = 'expired', released_at = ?
-         WHERE workspace_id = ? AND state = 'active' AND expires_at < ?",
+         WHERE workspace_id = ? AND state = 'active'
+           AND julianday(json_extract(expires_at, '$')) < julianday(json_extract(?, '$'))",
+    )
+    .bind(&now)
+    .bind(workspace_id)
+    .bind(&now)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn expire_finalization_fences_tx(
+    transaction: &mut Transaction<'_, Sqlite>,
+    workspace_id: &str,
+) -> StoreResult<()> {
+    let now = json(&comparison_now())?;
+    sqlx::query(
+        "UPDATE workspace_finalization_fences
+         SET state = 'expired', released_at = ?
+         WHERE workspace_id = ? AND state IN ('active', 'dispatching')
+           AND julianday(json_extract(expires_at, '$')) <= julianday(json_extract(?, '$'))",
     )
     .bind(&now)
     .bind(workspace_id)

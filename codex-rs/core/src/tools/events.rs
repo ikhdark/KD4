@@ -281,10 +281,23 @@ impl ToolEmitter {
             ) => {
                 let paths = apply_patch_intent_paths(changes);
                 if let Some(cwd) = apply_patch_evidence_cwd(ctx, environment_id.as_deref()) {
-                    ctx.session
+                    let (ledger, provenance) = ctx
+                        .session
                         .services
-                        .task_evidence
-                        .record_edit_intent(ctx.call_id, cwd.as_path(), &paths)
+                        .agent_control
+                        .completion_evidence_target(
+                            &ctx.turn.session_source,
+                            ctx.session.thread_id,
+                            &ctx.session.services.task_evidence,
+                        )
+                        .await;
+                    ledger
+                        .record_edit_intent_with_provenance(
+                            ctx.call_id,
+                            cwd.as_path(),
+                            &paths,
+                            provenance.as_ref(),
+                        )
                         .await;
                 }
                 ctx.session
@@ -657,19 +670,34 @@ async fn emit_exec_end(
                 .map(codex_utils_absolute_path::AbsolutePathBuf::as_path),
         );
     }
-    ctx.session
+    let (ledger, provenance) = ctx
+        .session
         .services
-        .task_evidence
-        .record_command(
+        .agent_control
+        .completion_evidence_target(
+            &ctx.turn.session_source,
+            ctx.session.thread_id,
+            &ctx.session.services.task_evidence,
+        )
+        .await;
+    let implementation_identity_hash = if possible_mutation {
+        None
+    } else {
+        crate::tasks::completion_review::implementation_identity_for_evidence(ctx.session, &ledger)
+            .await
+    };
+    ledger
+        .record_command_bound_with_provenance(
             exec_input.command,
             exec_input.cwd,
             exec_result.exit_code,
             exec_result.timed_out,
             u64::try_from(exec_result.duration.as_millis()).unwrap_or(u64::MAX),
             possible_mutation,
+            provenance.as_ref(),
+            implementation_identity_hash.as_deref(),
         )
         .await;
-
     ctx.session
         .emit_turn_item_completed(
             ctx.turn,
@@ -706,10 +734,18 @@ async fn emit_patch_end(
         PatchApplyStatus::Failed => "failed",
         PatchApplyStatus::Declined => "declined",
     };
-    ctx.session
+    let (ledger, provenance) = ctx
+        .session
         .services
-        .task_evidence
-        .record_edit_result(ctx.call_id, outcome)
+        .agent_control
+        .completion_evidence_target(
+            &ctx.turn.session_source,
+            ctx.session.thread_id,
+            &ctx.session.services.task_evidence,
+        )
+        .await;
+    ledger
+        .record_edit_result_with_provenance(ctx.call_id, outcome, provenance.as_ref())
         .await;
     ctx.session
         .emit_turn_item_completed(

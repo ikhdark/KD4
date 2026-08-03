@@ -17,9 +17,11 @@ use codex_terminal_detection::user_agent;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
 use reqwest::header::USER_AGENT;
+use std::ops::Deref;
+use std::ops::DerefMut;
 use std::sync::LazyLock;
-use std::sync::Mutex;
 use std::sync::RwLock;
+use std::sync::RwLockWriteGuard;
 
 use crate::outbound_proxy::AuthRouteConfig;
 
@@ -38,7 +40,7 @@ use crate::outbound_proxy::AuthRouteConfig;
 /// A space is automatically added between the suffix and the rest of the User-Agent string.
 /// The full user agent string is returned from the mcp initialize response.
 /// Parenthesis will be added by Codex. This should only specify what goes inside of the parenthesis.
-pub static USER_AGENT_SUFFIX: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
+pub static USER_AGENT_SUFFIX: UserAgentSuffix = UserAgentSuffix;
 pub const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 pub const CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
 pub const RESIDENCY_HEADER_NAME: &str = "x-openai-internal-codex-residency";
@@ -50,7 +52,53 @@ pub struct Originator {
     pub value: String,
     pub header_value: HeaderValue,
 }
-static ORIGINATOR: LazyLock<RwLock<Option<Originator>>> = LazyLock::new(|| RwLock::new(None));
+
+#[derive(Default)]
+struct ProcessIdentityState {
+    originator: Option<Originator>,
+    suffix: Option<String>,
+}
+
+#[derive(Clone)]
+struct ProcessIdentitySnapshot {
+    originator: Originator,
+    suffix: Option<String>,
+}
+
+static PROCESS_IDENTITY: LazyLock<RwLock<ProcessIdentityState>> =
+    LazyLock::new(|| RwLock::new(ProcessIdentityState::default()));
+
+pub struct UserAgentSuffix;
+
+#[derive(Debug, Clone, Copy)]
+pub struct UserAgentSuffixLockError;
+
+pub struct UserAgentSuffixGuard<'a> {
+    guard: RwLockWriteGuard<'a, ProcessIdentityState>,
+}
+
+impl UserAgentSuffix {
+    pub fn lock(&self) -> Result<UserAgentSuffixGuard<'static>, UserAgentSuffixLockError> {
+        PROCESS_IDENTITY
+            .write()
+            .map(|guard| UserAgentSuffixGuard { guard })
+            .map_err(|_| UserAgentSuffixLockError)
+    }
+}
+
+impl Deref for UserAgentSuffixGuard<'_> {
+    type Target = Option<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard.suffix
+    }
+}
+
+impl DerefMut for UserAgentSuffixGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard.suffix
+    }
+}
 static REQUIREMENTS_RESIDENCY: LazyLock<RwLock<Option<ResidencyRequirement>>> =
     LazyLock::new(|| RwLock::new(None));
 static ROUTE_AWARE_CLIENT_BUILD_PERMIT: tokio::sync::Semaphore =
@@ -63,10 +111,7 @@ pub enum SetOriginatorError {
 }
 
 fn get_originator_value(provided: Option<String>) -> Originator {
-    let value = std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR)
-        .ok()
-        .or(provided)
-        .unwrap_or(DEFAULT_ORIGINATOR.to_string());
+    let value = provided.unwrap_or(DEFAULT_ORIGINATOR.to_string());
 
     match HeaderValue::from_str(&value) {
         Ok(header_value) => Originator {
@@ -83,19 +128,51 @@ fn get_originator_value(provided: Option<String>) -> Originator {
     }
 }
 
-pub fn set_default_originator(value: String) -> Result<(), SetOriginatorError> {
+fn install_process_identity<F>(
+    state: &RwLock<ProcessIdentityState>,
+    value: String,
+    suffix: Option<Option<String>>,
+    originator_override: F,
+) -> Result<(), SetOriginatorError>
+where
+    F: FnOnce() -> Option<String>,
+{
     if HeaderValue::from_str(&value).is_err() {
         return Err(SetOriginatorError::InvalidHeaderValue);
     }
-    let originator = get_originator_value(Some(value));
-    let Ok(mut guard) = ORIGINATOR.write() else {
+    let Ok(mut guard) = state.write() else {
         return Err(SetOriginatorError::AlreadyInitialized);
     };
-    if guard.is_some() {
+    if guard.originator.is_some() {
         return Err(SetOriginatorError::AlreadyInitialized);
     }
-    *guard = Some(originator);
+    let originator_override = originator_override();
+    guard.originator = Some(get_originator_value(
+        originator_override.clone().or(Some(value)),
+    ));
+    // An environment override owns process identity independently of an
+    // app-server request client. Do not pair it with that client's suffix.
+    if originator_override.is_none()
+        && let Some(suffix) = suffix
+    {
+        guard.suffix = suffix;
+    }
     Ok(())
+}
+
+pub fn set_default_process_identity(
+    value: String,
+    suffix: Option<String>,
+) -> Result<(), SetOriginatorError> {
+    install_process_identity(&PROCESS_IDENTITY, value, Some(suffix), || {
+        std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR).ok()
+    })
+}
+
+pub fn set_default_originator(value: String) -> Result<(), SetOriginatorError> {
+    install_process_identity(&PROCESS_IDENTITY, value, /*suffix*/ None, || {
+        std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR).ok()
+    })
 }
 
 pub fn set_default_client_residency_requirement(enforce_residency: Option<ResidencyRequirement>) {
@@ -106,25 +183,41 @@ pub fn set_default_client_residency_requirement(enforce_residency: Option<Reside
     *guard = enforce_residency;
 }
 
-pub fn originator() -> Originator {
-    if let Ok(guard) = ORIGINATOR.read()
-        && let Some(originator) = guard.as_ref()
+fn process_identity_snapshot_from_state<F>(
+    state: &RwLock<ProcessIdentityState>,
+    originator_override: F,
+) -> ProcessIdentitySnapshot
+where
+    F: FnOnce() -> Option<String>,
+{
+    let Ok(mut guard) = state.write() else {
+        return ProcessIdentitySnapshot {
+            originator: get_originator_value(/*provided*/ None),
+            suffix: None,
+        };
+    };
+    if guard.originator.is_none()
+        && let Some(originator_override) = originator_override()
     {
-        return originator.clone();
+        guard.originator = Some(get_originator_value(Some(originator_override)));
     }
-
-    if std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR).is_ok() {
-        let originator = get_originator_value(/*provided*/ None);
-        if let Ok(mut guard) = ORIGINATOR.write() {
-            match guard.as_ref() {
-                Some(originator) => return originator.clone(),
-                None => *guard = Some(originator.clone()),
-            }
-        }
-        return originator;
+    ProcessIdentitySnapshot {
+        originator: guard
+            .originator
+            .clone()
+            .unwrap_or_else(|| get_originator_value(/*provided*/ None)),
+        suffix: guard.suffix.clone(),
     }
+}
 
-    get_originator_value(/*provided*/ None)
+fn process_identity_snapshot() -> ProcessIdentitySnapshot {
+    process_identity_snapshot_from_state(&PROCESS_IDENTITY, || {
+        std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR).ok()
+    })
+}
+
+pub fn originator() -> Originator {
+    process_identity_snapshot().originator
 }
 
 pub fn is_first_party_originator(originator_value: &str) -> bool {
@@ -138,30 +231,30 @@ pub fn is_first_party_chat_originator(originator_value: &str) -> bool {
     originator_value == "codex_atlas" || originator_value == "codex_chatgpt_desktop"
 }
 
-pub fn get_codex_user_agent() -> String {
+fn codex_user_agent_for_identity(identity: &ProcessIdentitySnapshot) -> String {
     let build_version = env!("CARGO_PKG_VERSION");
     let os_info = os_info::get();
-    let originator = originator();
     let prefix = format!(
         "{}/{build_version} ({} {}; {}) {}",
-        originator.value.as_str(),
+        identity.originator.value.as_str(),
         os_info.os_type(),
         os_info.version(),
         os_info.architecture().unwrap_or("unknown"),
         user_agent()
     );
-    let suffix = USER_AGENT_SUFFIX
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone());
-    let suffix = suffix
+    let suffix = identity
+        .suffix
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map_or_else(String::new, |value| format!(" ({value})"));
 
     let candidate = format!("{prefix}{suffix}");
-    sanitize_user_agent(candidate, &prefix)
+    sanitize_user_agent_with_originator(candidate, &prefix, &identity.originator.value)
+}
+
+pub fn get_codex_user_agent() -> String {
+    codex_user_agent_for_identity(&process_identity_snapshot())
 }
 
 /// Sanitize the user agent string.
@@ -169,7 +262,16 @@ pub fn get_codex_user_agent() -> String {
 /// Invalid characters are replaced with an underscore.
 ///
 /// If the user agent fails to parse, it falls back to fallback and then to ORIGINATOR.
+#[cfg(test)]
 fn sanitize_user_agent(candidate: String, fallback: &str) -> String {
+    sanitize_user_agent_with_originator(candidate, fallback, &originator().value)
+}
+
+fn sanitize_user_agent_with_originator(
+    candidate: String,
+    fallback: &str,
+    originator: &str,
+) -> String {
     if HeaderValue::from_str(candidate.as_str()).is_ok() {
         return candidate;
     }
@@ -192,7 +294,7 @@ fn sanitize_user_agent(candidate: String, fallback: &str) -> String {
         tracing::warn!(
             "Falling back to default Codex originator because base user agent string is invalid"
         );
-        originator().value
+        originator.to_string()
     }
 }
 
@@ -335,9 +437,10 @@ fn auth_http_client_factory(auth_route_config: Option<&AuthRouteConfig>) -> Http
 }
 
 pub fn default_headers() -> HeaderMap {
+    let identity = process_identity_snapshot();
     let mut headers = HeaderMap::new();
-    headers.insert("originator", originator().header_value);
-    if let Ok(user_agent) = HeaderValue::from_str(&get_codex_user_agent()) {
+    headers.insert("originator", identity.originator.header_value.clone());
+    if let Ok(user_agent) = HeaderValue::from_str(&codex_user_agent_for_identity(&identity)) {
         headers.insert(USER_AGENT, user_agent);
     }
     if let Ok(guard) = REQUIREMENTS_RESIDENCY.read()

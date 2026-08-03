@@ -50,6 +50,12 @@ pub(crate) type ClientRequestResult = std::result::Result<Result, JSONRPCErrorEr
 
 const TURN_DELIVERY_RECEIPT_TIMEOUT: Duration = Duration::from_secs(30);
 const TURN_DELIVERY_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const NO_ACTIVE_AUTHORIZED_CONNECTIONS_ERROR: &str =
+    "client request canceled because no active authorized connections are available";
+const NO_INITIALIZED_CONNECTIONS_ERROR: &str =
+    "client request canceled because no initialized connections are available";
+const ALL_AUTHORIZED_CONNECTIONS_DISCONNECTED_ERROR: &str =
+    "client request canceled because all authorized connections disconnected";
 
 /// Stable identifier for a client request scoped to a transport connection.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -109,7 +115,7 @@ pub(crate) enum OutgoingEnvelope {
 pub(crate) struct OutgoingMessageSender {
     next_server_request_id: AtomicI64,
     sender: mpsc::Sender<OutgoingEnvelope>,
-    active_connections: Mutex<HashMap<ConnectionId, Arc<AtomicBool>>>,
+    active_connections: Arc<Mutex<HashMap<ConnectionId, Arc<AtomicBool>>>>,
     request_id_to_callback: Mutex<HashMap<RequestId, PendingCallbackEntry>>,
     /// Incoming requests that are still waiting on a final response or error.
     /// We keep them here because this is where responses, errors, and
@@ -125,6 +131,7 @@ pub(crate) struct OutgoingMessageSender {
 pub(crate) struct ThreadScopedOutgoingMessageSender {
     outgoing: Arc<OutgoingMessageSender>,
     connection_ids: Arc<Vec<ConnectionId>>,
+    experimental_api_connection_ids: Arc<Vec<ConnectionId>>,
     thread_id: ThreadId,
 }
 
@@ -220,9 +227,24 @@ impl ThreadScopedOutgoingMessageSender {
         connection_ids: Vec<ConnectionId>,
         thread_id: ThreadId,
     ) -> Self {
+        Self::new_with_experimental_api_connections(
+            outgoing,
+            connection_ids.clone(),
+            connection_ids,
+            thread_id,
+        )
+    }
+
+    pub(crate) fn new_with_experimental_api_connections(
+        outgoing: Arc<OutgoingMessageSender>,
+        connection_ids: Vec<ConnectionId>,
+        experimental_api_connection_ids: Vec<ConnectionId>,
+        thread_id: ThreadId,
+    ) -> Self {
         Self {
             outgoing,
             connection_ids: Arc::new(connection_ids),
+            experimental_api_connection_ids: Arc::new(experimental_api_connection_ids),
             thread_id,
         }
     }
@@ -231,12 +253,14 @@ impl ThreadScopedOutgoingMessageSender {
         &self,
         payload: ServerRequestPayload,
     ) -> (RequestId, oneshot::Receiver<ClientRequestResult>) {
+        let connection_ids = match &payload {
+            ServerRequestPayload::DynamicToolCall(_) => {
+                self.experimental_api_connection_ids.as_slice()
+            }
+            _ => self.connection_ids.as_slice(),
+        };
         self.outgoing
-            .send_request_to_connections(
-                Some(self.connection_ids.as_slice()),
-                payload,
-                Some(self.thread_id),
-            )
+            .send_request_to_connections(Some(connection_ids), payload, Some(self.thread_id))
             .await
     }
 
@@ -311,7 +335,7 @@ impl OutgoingMessageSender {
         Self {
             next_server_request_id: AtomicI64::new(0),
             sender,
-            active_connections: Mutex::new(HashMap::new()),
+            active_connections: Arc::new(Mutex::new(HashMap::new())),
             request_id_to_callback: Mutex::new(HashMap::new()),
             request_contexts: Mutex::new(HashMap::new()),
             analytics_events_client,
@@ -343,18 +367,18 @@ impl OutgoingMessageSender {
     }
 
     pub(crate) async fn connection_closed(&self, connection_id: ConnectionId) {
-        self.active_connections.lock().await.remove(&connection_id);
-        {
-            let mut request_contexts = self.request_contexts.lock().await;
-            request_contexts.retain(|request_id, _| request_id.connection_id != connection_id);
-        }
         let orphaned_entries = {
+            // Registration and replay use the same active -> callbacks lock order.
+            // Removing the connection while holding the active lock prevents a
+            // later registration from authorizing only this closed connection.
+            let mut active_connections = Arc::clone(&self.active_connections).lock_owned().await;
+            active_connections.remove(&connection_id);
             let mut request_id_to_callback = self.request_id_to_callback.lock().await;
             let orphaned_request_ids = request_id_to_callback
                 .iter_mut()
                 .filter_map(|(request_id, entry)| {
                     let was_authorized = entry.connection_ids.remove(&connection_id);
-                    (was_authorized && entry.connection_ids.is_empty() && entry.thread_id.is_none())
+                    (was_authorized && entry.connection_ids.is_empty())
                         .then_some(request_id.clone())
                 })
                 .collect::<Vec<_>>();
@@ -363,12 +387,16 @@ impl OutgoingMessageSender {
                 .filter_map(|request_id| request_id_to_callback.remove(&request_id))
                 .collect::<Vec<_>>()
         };
+        {
+            let mut request_contexts = self.request_contexts.lock().await;
+            request_contexts.retain(|request_id, _| request_id.connection_id != connection_id);
+        }
         for entry in orphaned_entries {
             let request_id = entry.request.id().clone();
             self.analytics_events_client
                 .track_server_request_aborted(now_unix_timestamp_ms(), request_id.clone());
             if let Err(err) = entry.callback.send(Err(internal_error(
-                "client request canceled because all authorized connections disconnected",
+                ALL_AUTHORIZED_CONNECTIONS_DISCONNECTED_ERROR,
             ))) {
                 warn!("could not notify callback for {request_id:?} due to: {err:?}");
             }
@@ -409,6 +437,11 @@ impl OutgoingMessageSender {
         self.request_contexts.lock().await.len()
     }
 
+    #[cfg(test)]
+    async fn pending_callback_count(&self) -> usize {
+        self.request_id_to_callback.lock().await.len()
+    }
+
     pub(crate) async fn send_request(
         &self,
         request: ServerRequestPayload,
@@ -432,32 +465,40 @@ impl OutgoingMessageSender {
         let id = self.next_request_id();
         let outgoing_message_id = id.clone();
         let request = request.request_with_id(outgoing_message_id.clone());
+        let explicit_recipients = connection_ids.is_some();
         // Keep the active-connection snapshot locked through callback registration.
-        // Otherwise a disconnect can finish cleanup after the snapshot but before
-        // insertion, leaving a callback authorized only for a connection that is
-        // already gone.
-        let (active_connections, target_connection_ids) = match connection_ids {
-            Some(connection_ids) => (None, connection_ids.to_vec()),
-            None => {
-                let active_connections = self.active_connections.lock().await;
-                let target_connection_ids = active_connections
-                    .iter()
-                    .filter_map(|(connection_id, initialized)| {
-                        initialized
-                            .load(Ordering::Acquire)
-                            .then_some(*connection_id)
-                    })
-                    .collect();
-                (Some(active_connections), target_connection_ids)
-            }
+        // Explicit target sets are only a capability/subscription filter; transport
+        // liveness remains authoritative here.
+        let active_connections = Arc::clone(&self.active_connections).lock_owned().await;
+        let target_connection_ids = match connection_ids {
+            Some(connection_ids) => connection_ids
+                .iter()
+                .copied()
+                .filter(|connection_id| {
+                    active_connections
+                        .get(connection_id)
+                        .is_some_and(|initialized| initialized.load(Ordering::Acquire))
+                })
+                .collect::<Vec<_>>(),
+            None => active_connections
+                .iter()
+                .filter_map(|(connection_id, initialized)| {
+                    initialized
+                        .load(Ordering::Acquire)
+                        .then_some(*connection_id)
+                })
+                .collect(),
         };
         let authorized_connection_ids = target_connection_ids.iter().copied().collect();
 
         let (tx_approve, rx_approve) = oneshot::channel();
-        if thread_id.is_none() && target_connection_ids.is_empty() {
-            let _ = tx_approve.send(Err(internal_error(
-                "client request canceled because no initialized connections are available",
-            )));
+        if target_connection_ids.is_empty() {
+            let message = if explicit_recipients {
+                NO_ACTIVE_AUTHORIZED_CONNECTIONS_ERROR
+            } else {
+                NO_INITIALIZED_CONNECTIONS_ERROR
+            };
+            let _ = tx_approve.send(Err(internal_error(message)));
             return (outgoing_message_id, rx_approve);
         }
         {
@@ -510,13 +551,26 @@ impl OutgoingMessageSender {
         &self,
         connection_id: ConnectionId,
         thread_id: ThreadId,
+        experimental_api_enabled: bool,
     ) {
         let requests = {
+            let active_connections = Arc::clone(&self.active_connections).lock_owned().await;
+            let is_active = active_connections
+                .get(&connection_id)
+                .is_some_and(|initialized| initialized.load(Ordering::Acquire));
+            if !is_active {
+                return;
+            }
             let mut request_id_to_callback = self.request_id_to_callback.lock().await;
             request_id_to_callback
                 .values_mut()
                 .filter_map(|entry| {
                     if entry.thread_id != Some(thread_id) {
+                        return None;
+                    }
+                    if matches!(entry.request, ServerRequest::DynamicToolCall { .. })
+                        && !experimental_api_enabled
+                    {
                         return None;
                     }
                     let newly_authorized = entry.connection_ids.insert(connection_id);
@@ -2043,7 +2097,7 @@ mod tests {
     // to force the registration/disconnect interleaving it verifies.
     #[allow(clippy::await_holding_invalid_type)]
     #[tokio::test]
-    async fn broadcast_request_registration_is_atomic_with_disconnect_cleanup() {
+    async fn explicit_request_registration_is_atomic_with_disconnect_cleanup() {
         let (tx, _rx) = mpsc::channel::<OutgoingEnvelope>(4);
         let outgoing = Arc::new(OutgoingMessageSender::new(
             tx,
@@ -2053,18 +2107,26 @@ mod tests {
         outgoing
             .connection_opened(connection_id, Arc::new(AtomicBool::new(/*value*/ true)))
             .await;
+        let thread_id = ThreadId::new();
+        let thread_outgoing =
+            ThreadScopedOutgoingMessageSender::new_with_experimental_api_connections(
+                Arc::clone(&outgoing),
+                vec![connection_id],
+                vec![connection_id],
+                thread_id,
+            );
 
         let callback_guard = outgoing.request_id_to_callback.lock().await;
-        let send_outgoing = Arc::clone(&outgoing);
         let send_task = tokio::spawn(async move {
-            send_outgoing
-                .send_request(ServerRequestPayload::ApplyPatchApproval(
-                    ApplyPatchApprovalParams {
-                        conversation_id: ThreadId::new(),
+            thread_outgoing
+                .send_request(ServerRequestPayload::DynamicToolCall(
+                    DynamicToolCallParams {
+                        thread_id: thread_id.to_string(),
+                        turn_id: "turn-1".to_string(),
                         call_id: "call-id".to_string(),
-                        file_changes: HashMap::new(),
-                        reason: None,
-                        grant_root: None,
+                        namespace: None,
+                        tool: "test_tool".to_string(),
+                        arguments: json!({}),
                     },
                 ))
                 .await
@@ -2098,14 +2160,12 @@ mod tests {
             .expect("disconnect should resolve the callback")
             .expect("callback sender should report a cancellation")
             .expect_err("disconnect should cancel the request");
-        assert_eq!(
-            error.message,
-            "client request canceled because all authorized connections disconnected"
-        );
+        assert_eq!(error.message, ALL_AUTHORIZED_CONNECTIONS_DISCONNECTED_ERROR);
+        assert_eq!(outgoing.pending_callback_count().await, 0);
     }
 
     #[tokio::test]
-    async fn connection_closed_preserves_thread_request_for_replay() {
+    async fn dynamic_tool_replay_authorizes_only_active_experimental_connection() {
         let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
         let outgoing = Arc::new(OutgoingMessageSender::new(
             tx,
@@ -2114,27 +2174,57 @@ mod tests {
         let thread_id = ThreadId::new();
         let original_connection = ConnectionId(41);
         let resumed_connection = ConnectionId(42);
-        let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
-            Arc::clone(&outgoing),
-            vec![original_connection],
-            thread_id,
-        );
+        outgoing
+            .connection_opened(
+                original_connection,
+                Arc::new(AtomicBool::new(/*value*/ true)),
+            )
+            .await;
+        outgoing
+            .connection_opened(
+                resumed_connection,
+                Arc::new(AtomicBool::new(/*value*/ true)),
+            )
+            .await;
+        let thread_outgoing =
+            ThreadScopedOutgoingMessageSender::new_with_experimental_api_connections(
+                Arc::clone(&outgoing),
+                vec![original_connection],
+                vec![original_connection],
+                thread_id,
+            );
         let (request_id, wait_for_result) = thread_outgoing
-            .send_request(ServerRequestPayload::ToolRequestUserInput(
-                ToolRequestUserInputParams {
+            .send_request(ServerRequestPayload::DynamicToolCall(
+                DynamicToolCallParams {
                     thread_id: thread_id.to_string(),
                     turn_id: "turn-1".to_string(),
-                    item_id: "item-1".to_string(),
-                    questions: vec![],
-                    auto_resolution_ms: None,
+                    call_id: "call-1".to_string(),
+                    namespace: None,
+                    tool: "test_tool".to_string(),
+                    arguments: json!({}),
                 },
             ))
             .await;
         let _original_delivery = rx.recv().await.expect("original request delivery");
 
-        outgoing.connection_closed(original_connection).await;
         outgoing
-            .replay_requests_to_connection_for_thread(resumed_connection, thread_id)
+            .replay_requests_to_connection_for_thread(
+                resumed_connection,
+                thread_id,
+                /*experimental_api_enabled*/ false,
+            )
+            .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "stable replay must emit no dynamic tool request"
+        );
+        assert_eq!(outgoing.pending_callback_count().await, 1);
+        outgoing
+            .replay_requests_to_connection_for_thread(
+                resumed_connection,
+                thread_id,
+                /*experimental_api_enabled*/ true,
+            )
             .await;
 
         let replay = timeout(Duration::from_secs(1), rx.recv())
@@ -2145,19 +2235,143 @@ mod tests {
             panic!("replayed request should use targeted delivery");
         };
         assert_eq!(connection_id, resumed_connection);
+        outgoing.connection_closed(original_connection).await;
+        assert_eq!(outgoing.pending_callback_count().await, 1);
+        let expected_result = json!({"contentItems": [], "success": true});
         outgoing
-            .notify_client_response(
-                resumed_connection,
-                request_id,
-                json!({
-                    "answers": {},
-                }),
-            )
+            .notify_client_response(resumed_connection, request_id, expected_result.clone())
             .await;
         let result = wait_for_result
             .await
             .expect("replayed callback sender should remain available");
-        assert_eq!(result, Ok(json!({"answers": {}})));
+        assert_eq!(result, Ok(expected_result));
+        assert_eq!(outgoing.pending_callback_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_request_without_active_experimental_recipient_is_terminal() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let thread_id = ThreadId::new();
+        let stable_connection = ConnectionId(50);
+        outgoing
+            .connection_opened(stable_connection, Arc::new(AtomicBool::new(/*value*/ true)))
+            .await;
+        let thread_outgoing =
+            ThreadScopedOutgoingMessageSender::new_with_experimental_api_connections(
+                Arc::clone(&outgoing),
+                vec![stable_connection],
+                Vec::new(),
+                thread_id,
+            );
+
+        let (_request_id, wait_for_result) = thread_outgoing
+            .send_request(ServerRequestPayload::DynamicToolCall(
+                DynamicToolCallParams {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "turn-1".to_string(),
+                    call_id: "call-0".to_string(),
+                    namespace: None,
+                    tool: "test_tool".to_string(),
+                    arguments: json!({}),
+                },
+            ))
+            .await;
+
+        let error = timeout(Duration::from_secs(1), wait_for_result)
+            .await
+            .expect("zero-recipient request should resolve promptly")
+            .expect("callback sender should return an error")
+            .expect_err("zero-recipient request must be rejected");
+        assert_eq!(error.message, NO_ACTIVE_AUTHORIZED_CONNECTIONS_ERROR);
+        assert!(rx.try_recv().is_err(), "no request envelope may be emitted");
+        assert_eq!(outgoing.pending_callback_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn dynamic_tool_request_only_authorizes_experimental_connections() {
+        let (tx, mut rx) = mpsc::channel::<OutgoingEnvelope>(4);
+        let outgoing = Arc::new(OutgoingMessageSender::new(
+            tx,
+            codex_analytics::AnalyticsEventsClient::disabled(),
+        ));
+        let thread_id = ThreadId::new();
+        let experimental_connection = ConnectionId(51);
+        let stable_connection = ConnectionId(52);
+        outgoing
+            .connection_opened(
+                experimental_connection,
+                Arc::new(AtomicBool::new(/*value*/ true)),
+            )
+            .await;
+        outgoing
+            .connection_opened(stable_connection, Arc::new(AtomicBool::new(/*value*/ true)))
+            .await;
+        let thread_outgoing =
+            ThreadScopedOutgoingMessageSender::new_with_experimental_api_connections(
+                Arc::clone(&outgoing),
+                vec![experimental_connection, stable_connection],
+                vec![experimental_connection],
+                thread_id,
+            );
+
+        let (request_id, wait_for_result) = thread_outgoing
+            .send_request(ServerRequestPayload::DynamicToolCall(
+                DynamicToolCallParams {
+                    thread_id: thread_id.to_string(),
+                    turn_id: "turn-1".to_string(),
+                    call_id: "call-1".to_string(),
+                    namespace: None,
+                    tool: "test_tool".to_string(),
+                    arguments: json!({}),
+                },
+            ))
+            .await;
+
+        let delivery = rx.recv().await.expect("dynamic tool request delivery");
+        let OutgoingEnvelope::ToConnection { connection_id, .. } = delivery else {
+            panic!("dynamic tool request should use targeted delivery");
+        };
+        assert_eq!(connection_id, experimental_connection);
+        assert!(
+            rx.try_recv().is_err(),
+            "stable connection must not receive the dynamic tool request"
+        );
+
+        outgoing
+            .notify_client_response(
+                stable_connection,
+                request_id.clone(),
+                json!({"contentItems": [], "success": false}),
+            )
+            .await;
+        outgoing
+            .notify_client_error(
+                stable_connection,
+                request_id.clone(),
+                internal_error("method not found"),
+            )
+            .await;
+        assert_eq!(
+            outgoing.pending_requests_for_thread(thread_id).await.len(),
+            1
+        );
+        assert_eq!(outgoing.pending_callback_count().await, 1);
+
+        let expected_result = json!({"contentItems": [], "success": true});
+        outgoing
+            .notify_client_response(experimental_connection, request_id, expected_result.clone())
+            .await;
+        assert_eq!(
+            wait_for_result
+                .await
+                .expect("callback should remain available"),
+            Ok(expected_result)
+        );
+        assert_eq!(outgoing.pending_callback_count().await, 0);
     }
 
     #[tokio::test]
@@ -2168,6 +2382,9 @@ mod tests {
             codex_analytics::AnalyticsEventsClient::disabled(),
         ));
         let thread_id = ThreadId::new();
+        outgoing
+            .connection_opened(ConnectionId(1), Arc::new(AtomicBool::new(true)))
+            .await;
         let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing.clone(),
             vec![ConnectionId(1)],
@@ -2231,6 +2448,9 @@ mod tests {
             codex_analytics::AnalyticsEventsClient::disabled(),
         ));
         let thread_id = ThreadId::new();
+        outgoing
+            .connection_opened(ConnectionId(1), Arc::new(AtomicBool::new(true)))
+            .await;
         let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing.clone(),
             vec![ConnectionId(1)],
@@ -2291,6 +2511,12 @@ mod tests {
             OutgoingMessageSender::new(tx, codex_analytics::AnalyticsEventsClient::disabled());
         let allowed_connection = ConnectionId(11);
         let other_connection = ConnectionId(12);
+        outgoing
+            .connection_opened(
+                allowed_connection,
+                Arc::new(AtomicBool::new(/*value*/ true)),
+            )
+            .await;
         let (request_id, wait_for_result) = outgoing
             .send_request_to_connections(
                 Some(&[allowed_connection]),

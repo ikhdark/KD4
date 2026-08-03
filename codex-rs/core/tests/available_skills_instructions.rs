@@ -19,18 +19,15 @@ fn available_skills(skill_root_lines: Vec<String>) -> AvailableSkills {
 }
 
 #[test]
-fn rendered_skill_instructions_include_safe_read_recovery_for_both_path_forms() {
+fn rendered_skill_catalog_does_not_repeat_shared_usage_guidance() {
     for skill_root_lines in [Vec::new(), vec!["- r0: C:\\workspace\\skills".to_string()]] {
-        let rendered = AvailableSkillsInstructions::from_available_skills(
-            &available_skills(skill_root_lines),
-            true,
-        )
-        .render();
+        let rendered =
+            AvailableSkillsInstructions::from_available_skills(&available_skills(skill_root_lines))
+                .render();
 
         assert!(rendered.starts_with("<skills_instructions>"));
         assert!(rendered.ends_with("</skills_instructions>"));
-        assert!(rendered.contains("If a shell read is rejected as potentially mutating"));
-        assert!(rendered.contains("dedicated read-only API or command"));
-        assert!(rendered.contains("required reads must succeed first"));
+        assert!(!rendered.contains("How to use skills"));
+        assert!(!rendered.contains("read the selected `SKILL.md` completely"));
     }
 }

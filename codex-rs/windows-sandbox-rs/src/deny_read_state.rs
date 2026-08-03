@@ -52,11 +52,11 @@ pub unsafe fn sync_persistent_deny_read_acls(
     let mut failed_stale_paths = Vec::new();
     let mut revoke_errors = Vec::new();
     for path in previous_paths {
-        if !desired_keys.contains(&lexical_path_key(&path)) {
-            if let Err(error) = revoke_ace(&path, psid) {
-                revoke_errors.push(format!("{}: {error}", path.display()));
-                failed_stale_paths.push(path);
-            }
+        if !desired_keys.contains(&lexical_path_key(&path))
+            && let Err(error) = revoke_ace(&path, psid)
+        {
+            revoke_errors.push(format!("{}: {error}", path.display()));
+            failed_stale_paths.push(path);
         }
     }
 

@@ -4,6 +4,7 @@ use super::parse_turn_item;
 use crate::context::ContextualUserFragment;
 use crate::context::InternalContextSource;
 use crate::context::InternalModelContextFragment;
+use crate::context::SKILLS_USAGE_INSTRUCTIONS_OPEN_TAG;
 use codex_protocol::ResponseItemId;
 use codex_protocol::items::AgentMessageContent;
 use codex_protocol::items::HookPromptFragment;
@@ -31,6 +32,16 @@ fn recognizes_skills_instructions_as_contextual_developer_content() {
             text: format!("{SKILLS_INSTRUCTIONS_OPEN_TAG}\n## Skills"),
         },
     ]));
+}
+
+#[test]
+fn recognizes_skills_usage_instructions_as_contextual_developer_content() {
+    let content = vec![ContentItem::InputText {
+        text: format!("{SKILLS_USAGE_INSTRUCTIONS_OPEN_TAG}\n## How to use skills"),
+    }];
+
+    assert!(is_contextual_dev_message_content(&content));
+    assert!(!has_non_contextual_dev_message_content(&content));
 }
 
 #[test]

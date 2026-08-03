@@ -23,6 +23,7 @@ use rmcp::model::RequestId;
 use tokio::sync::oneshot;
 
 use crate::agent::control::AgentExecutionGuard;
+use crate::agent::control::CompletionActivityPermit;
 use crate::session::TurnInputQueue;
 use crate::session::turn_context::TurnContext;
 use crate::tasks::AnySessionTask;
@@ -86,6 +87,7 @@ pub(crate) struct RunningTask {
     pub(crate) turn_context: Arc<TurnContext>,
     pub(crate) turn_extension_data: Arc<ExtensionData>,
     pub(crate) _agent_execution_guard: Option<AgentExecutionGuard>,
+    pub(crate) _completion_activity_guard: Option<CompletionActivityPermit>,
 }
 
 #[derive(Debug)]

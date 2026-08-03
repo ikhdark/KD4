@@ -4,6 +4,9 @@ use crate::context::world_state::WorldState;
 use crate::context::world_state::WorldStateSection;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use codex_extension_api::PreviousWorldStateSection;
+use codex_extension_api::RenderedWorldStateFragment;
+use codex_extension_api::WorldStateSectionContribution;
 use codex_protocol::AgentPath;
 use codex_protocol::ResponseItemId;
 use codex_protocol::models::BaseInstructions;
@@ -158,6 +161,64 @@ fn world_state_reconciles_matching_legacy_history_once() {
     let (fragments, rollout_item) = history.update_world_state(&world_state);
     assert!(fragments.is_empty());
     assert_eq!(rollout_item, None);
+}
+
+#[test]
+fn world_state_baseline_retries_a_budget_rejected_section_on_the_next_update() {
+    let world_state = || {
+        let mut state = WorldState::default();
+        for (index, (id, body)) in [("large_0", 'a'), ("large_1", 'b')].into_iter().enumerate() {
+            state.add_extension_section(WorldStateSectionContribution::new(
+                id,
+                serde_json::json!({"value": index}),
+                move |previous| match previous {
+                    PreviousWorldStateSection::Absent => Some(RenderedWorldStateFragment::new(
+                        "developer",
+                        ("", ""),
+                        body.to_string().repeat(30_000),
+                    )),
+                    PreviousWorldStateSection::Unknown | PreviousWorldStateSection::Known(_) => {
+                        None
+                    }
+                },
+            ));
+        }
+        state
+    };
+    let mut history = ContextManager::new();
+
+    let (first_fragments, first_item) = history.update_world_state(&world_state());
+    let (second_fragments, second_item) = history.update_world_state(&world_state());
+    let (third_fragments, third_item) = history.update_world_state(&world_state());
+
+    assert_eq!(
+        first_fragments
+            .into_iter()
+            .map(|fragment| fragment.render())
+            .collect::<Vec<_>>(),
+        vec!["a".repeat(30_000)]
+    );
+    assert_eq!(
+        first_item,
+        Some(WorldStateItem::full(
+            serde_json::json!({"large_0": {"value": 0}})
+        ))
+    );
+    assert_eq!(
+        second_fragments
+            .into_iter()
+            .map(|fragment| fragment.render())
+            .collect::<Vec<_>>(),
+        vec!["b".repeat(30_000)]
+    );
+    assert_eq!(
+        second_item,
+        Some(WorldStateItem::patch(
+            serde_json::json!({"large_1": {"value": 1}})
+        ))
+    );
+    assert!(third_fragments.is_empty());
+    assert_eq!(third_item, None);
 }
 
 fn user_msg(text: &str) -> ResponseItem {

@@ -743,7 +743,7 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn("app-server-schema-check-force owner:", justfile)
         self.assertIn("cargo nextest run -p codex-app-server-protocol -E", justfile)
 
-    def test_agents_current_nested_instruction_layout_is_explicit(
+    def test_agents_current_nested_instruction_layout_and_budget_are_explicit(
         self,
     ) -> None:
         expected_agent_files = [
@@ -799,6 +799,49 @@ class BuildToolingPerformanceTest(unittest.TestCase):
         self.assertIn(
             "Never rely on an instruction file that is absent", normalized_root
         )
+        rust_parent = REPO_ROOT / "codex-rs" / "AGENTS.md"
+        core_policy = REPO_ROOT / "codex-rs" / "core" / "AGENTS.md"
+        source_map = REPO_ROOT / "SOURCEMAP.md"
+        rust_instruction_chain = [
+            REPO_ROOT / "AGENTS.md",
+            rust_parent,
+            core_policy,
+        ]
+        rust_parent_bytes = rust_instruction_chain[1].stat().st_size
+        rust_chain_bytes = sum(
+            path.stat().st_size for path in rust_instruction_chain
+        )
+        rust_parent_text = rust_parent.read_text(encoding="utf-8")
+        core_policy_text = core_policy.read_text(encoding="utf-8")
+        source_map_text = source_map.read_text(encoding="utf-8")
+
+        self.assertLessEqual(
+            rust_parent_bytes,
+            4 * 1024,
+            "codex-rs/AGENTS.md should keep detailed routing in SOURCEMAP.md",
+        )
+        self.assertLessEqual(
+            rust_chain_bytes,
+            16 * 1024,
+            "the root + codex-rs + core automatic instruction chain is too large",
+        )
+        self.assertIn("[`../SOURCEMAP.md`](../SOURCEMAP.md)", rust_parent_text)
+        self.assertIn(
+            "[`../../SOURCEMAP.md`](../../SOURCEMAP.md)", core_policy_text
+        )
+        self.assertEqual(
+            (rust_parent.parent / "../SOURCEMAP.md").resolve(), source_map
+        )
+        self.assertEqual(
+            (core_policy.parent / "../../SOURCEMAP.md").resolve(), source_map
+        )
+        self.assertIn("## Validation routes", source_map_text)
+        self.assertIn("## Rust workflow reference", source_map_text)
+        self.assertIn("just rust-build-doctor", source_map_text)
+        self.assertIn(
+            "Tool-search breadth changes must preserve", core_policy_text
+        )
+        self.assertIn("core_test_support::responses", core_policy_text)
 
 
 if __name__ == "__main__":

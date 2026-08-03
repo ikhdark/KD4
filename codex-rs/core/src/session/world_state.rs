@@ -14,6 +14,23 @@ impl Session {
         &self,
         step_context: &StepContext,
     ) -> WorldState {
+        self.build_world_state_for_step_with_mode(step_context, false)
+            .await
+    }
+
+    pub(crate) async fn estimate_world_state_for_step(
+        &self,
+        step_context: &StepContext,
+    ) -> WorldState {
+        self.build_world_state_for_step_with_mode(step_context, true)
+            .await
+    }
+
+    async fn build_world_state_for_step_with_mode(
+        &self,
+        step_context: &StepContext,
+        estimate: bool,
+    ) -> WorldState {
         let turn_context = step_context.turn.as_ref();
         tracing::trace!(
             selected_capability_root_count = step_context.selected_capability_roots.len(),
@@ -62,18 +79,21 @@ impl Session {
             .map(|root| root.selected_root().clone())
             .collect::<Vec<_>>();
         for contributor in self.services.extensions.context_contributors() {
-            for section in contributor
-                .contribute_world_state(WorldStateContributionInput {
-                    thread_id: self.thread_id(),
-                    turn_id: turn_context.sub_id.as_str(),
-                    environments: &environments,
-                    ready_selected_capability_roots: &ready_selected_capability_roots,
-                    session_store: &self.services.session_extension_data,
-                    thread_store: &self.services.thread_extension_data,
-                    turn_store: turn_context.extension_data.as_ref(),
-                })
-                .await
-            {
+            let input = WorldStateContributionInput {
+                thread_id: self.thread_id(),
+                turn_id: turn_context.sub_id.as_str(),
+                environments: &environments,
+                ready_selected_capability_roots: &ready_selected_capability_roots,
+                session_store: &self.services.session_extension_data,
+                thread_store: &self.services.thread_extension_data,
+                turn_store: turn_context.extension_data.as_ref(),
+            };
+            let sections = if estimate {
+                contributor.estimate_world_state(input).await
+            } else {
+                contributor.contribute_world_state(input).await
+            };
+            for section in sections {
                 world_state.add_extension_section(section);
             }
         }

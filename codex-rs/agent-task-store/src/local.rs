@@ -92,6 +92,27 @@ const NONEXISTENT_SENTINEL: &[u8] = b"CODEX_AGENT_TASK_STORE_NONEXISTENT\n";
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_COMPARISON_NOW: chrono::DateTime<Utc>;
+}
+
+fn comparison_now() -> chrono::DateTime<Utc> {
+    #[cfg(test)]
+    if let Ok(now) = TEST_COMPARISON_NOW.try_with(ToOwned::to_owned) {
+        return now;
+    }
+    Utc::now()
+}
+
+#[cfg(test)]
+pub(crate) async fn with_test_comparison_now<T>(
+    now: chrono::DateTime<Utc>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    TEST_COMPARISON_NOW.scope(now, future).await
+}
+
 enum ReceiptHandoffAction {
     Publish(IsolationHandoff),
     Integrate(Vec<AssignmentId>),
@@ -384,7 +405,7 @@ impl LocalAgentTaskStore {
             .map(|row| decode(row.get::<String, _>("body_json").as_str()))
             .collect::<StoreResult<Vec<_>>>()?;
         let mut validation_calls = sqlx::query(
-            "SELECT body_json FROM validation_calls WHERE attempt_id = ? ORDER BY recorded_at DESC, call_id DESC LIMIT ?",
+            "SELECT body_json FROM validation_calls WHERE attempt_id = ? ORDER BY julianday(json_extract(recorded_at, '$')) DESC, call_id DESC LIMIT ?",
         )
         .bind(current_attempt.attempt_id.to_string())
         .bind(MAX_VALIDATION_CALLS_PER_TASK as i64)
@@ -701,7 +722,7 @@ impl LocalAgentTaskStore {
              JOIN attempts ON attempts.attempt_id = agent_task_bindings.attempt_id
              WHERE agent_task_bindings.root_session_id = ?
              ORDER BY CASE WHEN attempts.state = '\"active\"' THEN 0 ELSE 1 END,
-                      agent_task_bindings.updated_at DESC, agent_path,
+                      julianday(json_extract(agent_task_bindings.updated_at, '$')) DESC, agent_path,
                       agent_task_bindings.assignment_id
              LIMIT ?",
         )
@@ -909,11 +930,12 @@ impl LocalAgentTaskStore {
             let mut is_singleflight_leader = false;
             if call.proof_kind == crate::ValidationProofKind::Focused {
                 let fingerprint = validation_fingerprint(&call)?;
-                let now = encode(&Utc::now())?;
+                let now = encode(&comparison_now())?;
                 if let Some(leader) = sqlx::query_scalar::<_, String>(
                     "SELECT leader_call_id FROM validation_singleflight
                      WHERE workspace_id = ? AND start_epoch = ? AND fingerprint = ?
-                       AND state = 'running' AND lease_expires_at >= ?",
+                       AND state = 'running'
+                       AND julianday(json_extract(lease_expires_at, '$')) >= julianday(json_extract(?, '$'))",
                 )
                 .bind(&assignment_workspace_id_tx(&mut transaction, attempt.assignment_id).await?)
                 .bind(call.evidence.start_epoch as i64)
@@ -958,9 +980,9 @@ impl LocalAgentTaskStore {
                         .lease_expires_at
                         .map(|value| encode(&value))
                         .transpose()?
-                        .unwrap_or_else(|| encode(&Utc::now()).unwrap_or_default()),
+                        .unwrap_or_else(|| encode(&comparison_now()).unwrap_or_default()),
                 )
-                .bind(encode(&Utc::now())?)
+                .bind(encode(&comparison_now())?)
                 .execute(&mut *transaction)
                 .await?;
             }
@@ -978,7 +1000,7 @@ impl LocalAgentTaskStore {
             } else {
                 "terminal"
             })
-            .bind(encode(&Utc::now())?)
+            .bind(encode(&comparison_now())?)
             .bind(&call.call_id)
             .execute(&mut *transaction)
             .await?;
@@ -2058,12 +2080,13 @@ impl LocalAgentTaskStore {
             return Ok(false);
         }
         let workspace_id = assignment_workspace_id_tx(&mut transaction, assignment_id).await?;
-        let now = Utc::now();
+        let now = comparison_now();
         let updated = sqlx::query(
             "UPDATE workspace_actors
              SET nudge_sent_at = ?
              WHERE workspace_id = ? AND attempt_id = ? AND state <> 'terminal'
-               AND last_progress_at <= ? AND nudge_sent_at IS NULL",
+               AND julianday(json_extract(last_progress_at, '$')) <= julianday(json_extract(?, '$'))
+               AND nudge_sent_at IS NULL",
         )
         .bind(encode(&now)?)
         .bind(workspace_id)
@@ -2931,6 +2954,53 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
         )
     }
 
+    fn begin_workspace_finalization<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        root_session_id: String,
+    ) -> TaskStoreFuture<'a, crate::WorkspaceFinalizationFence> {
+        Box::pin(async move {
+            crate::workspace::begin_finalization(&self.pool, repo_root, &root_session_id).await
+        })
+    }
+
+    fn seal_workspace_finalization_dispatch<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        fence: crate::WorkspaceFinalizationFence,
+    ) -> TaskStoreFuture<'a, crate::WorkspaceFinalizationFence> {
+        Box::pin(async move {
+            crate::workspace::seal_finalization_dispatch(&self.pool, repo_root, fence).await
+        })
+    }
+
+    fn heartbeat_workspace_finalization<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        fence_id: String,
+        root_session_id: String,
+    ) -> TaskStoreFuture<'a, bool> {
+        Box::pin(async move {
+            crate::workspace::heartbeat_finalization(
+                &self.pool,
+                repo_root,
+                &fence_id,
+                &root_session_id,
+            )
+            .await
+        })
+    }
+
+    fn release_workspace_finalization<'a>(
+        &'a self,
+        repo_root: &'a Path,
+        fence: crate::WorkspaceFinalizationFence,
+    ) -> TaskStoreFuture<'a, ()> {
+        Box::pin(async move {
+            crate::workspace::release_finalization(&self.pool, repo_root, fence).await
+        })
+    }
+
     fn assert_workspace_unclaimed<'a>(
         &'a self,
         repo_root: &'a Path,
@@ -2950,6 +3020,15 @@ impl crate::AgentTaskStore for LocalAgentTaskStore {
                 .await?;
             crate::workspace::quiescence(&self.pool, &root_session_id).await
         })
+    }
+
+    fn inspect_quiescence(
+        &self,
+        root_session_id: String,
+    ) -> TaskStoreFuture<'_, crate::QuiescenceStatus> {
+        Box::pin(
+            async move { crate::workspace::inspect_quiescence(&self.pool, &root_session_id).await },
+        )
     }
 
     fn begin_mutation<'a>(
@@ -4696,7 +4775,7 @@ pub(crate) async fn release_orphaned_claims_tx(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     workspace_id: &str,
 ) -> StoreResult<Vec<AssignmentId>> {
-    let now = Utc::now();
+    let now = comparison_now();
     let recent_after = now - Duration::seconds(crate::DEFAULT_WORKSPACE_LEASE_SECONDS);
 
     // Acquire SQLite's writer lock before evaluating liveness so a concurrent heartbeat or
@@ -4713,8 +4792,8 @@ pub(crate) async fn release_orphaned_claims_tx(
          WHERE workspace_actors.workspace_id = ?
            AND workspace_actors.state <> 'terminal'
            AND (
-               workspace_actors.lease_expires_at >= ?
-               OR workspace_actors.last_progress_at >= ?
+               julianday(json_extract(workspace_actors.lease_expires_at, '$')) >= julianday(json_extract(?, '$'))
+               OR julianday(json_extract(workspace_actors.last_progress_at, '$')) >= julianday(json_extract(?, '$'))
            )",
     )
     .bind(workspace_id)
@@ -4794,7 +4873,10 @@ pub(crate) async fn release_orphaned_claims_tx(
                    AND assignment_id = ?
                    AND attempt_id = ?
                    AND state <> 'terminal'
-                   AND (lease_expires_at >= ? OR last_progress_at >= ?)
+                   AND (
+                       julianday(json_extract(lease_expires_at, '$')) >= julianday(json_extract(?, '$'))
+                       OR julianday(json_extract(last_progress_at, '$')) >= julianday(json_extract(?, '$'))
+                   )
              )",
         )
         .bind(workspace_id)
@@ -4845,10 +4927,11 @@ async fn workspace_mutation_claim_conflicts_tx(
     let rows = sqlx::query(
         "SELECT actor_id, paths_json, contracts_json
          FROM workspace_mutation_leases
-         WHERE workspace_id = ? AND state = 'active' AND expires_at >= ?",
+         WHERE workspace_id = ? AND state = 'active'
+           AND julianday(json_extract(expires_at, '$')) >= julianday(json_extract(?, '$'))",
     )
     .bind(&assignment.workspace_id)
-    .bind(encode(&Utc::now())?)
+    .bind(encode(&comparison_now())?)
     .fetch_all(&mut **transaction)
     .await?;
     let mut conflicts = BTreeSet::new();

@@ -31,6 +31,10 @@ pub enum StoreError {
     WorkspaceCasMismatch { paths: Vec<String> },
     #[error("workspace mutation lease {0} is unavailable, expired, or already released")]
     WorkspaceLeaseUnavailable(String),
+    #[error("workspace finalization is already active for root session {root_session_id}")]
+    WorkspaceFinalizationActive { root_session_id: String },
+    #[error("workspace finalization cannot begin while mutation leases are active: {lease_ids:?}")]
+    WorkspaceFinalizationNotQuiescent { lease_ids: Vec<String> },
     #[error("workspace state initialization failed: {0}")]
     WorkspaceStateInitialization(String),
     #[error("validation evidence was superseded by workspace changes: {call_ids:?}")]

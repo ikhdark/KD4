@@ -33,6 +33,11 @@ use codex_utils_path_uri::PathUri;
 use std::io;
 use std::sync::Arc;
 
+// Base64 expands responses by roughly one third, so keep the raw file cap low
+// enough to bound both the read buffer and the encoded JSON-RPC response while
+// still accommodating ordinary source and document reads.
+const MAX_READ_FILE_BYTES: usize = 10 * 1024 * 1024;
+
 #[derive(Clone)]
 pub(crate) struct FsRequestProcessor {
     environment_manager: Arc<EnvironmentManager>,
@@ -68,9 +73,14 @@ impl FsRequestProcessor {
         let path = PathUri::from_abs_path(&params.path);
         let bytes = self
             .file_system()?
-            .read_file(&path, /*sandbox*/ None)
+            .read_file_bounded(&path, MAX_READ_FILE_BYTES, /*sandbox*/ None)
             .await
-            .map_err(map_fs_error)?;
+            .map_err(map_fs_error)?
+            .ok_or_else(|| {
+                invalid_request(format!(
+                    "fs/readFile file exceeds maximum size of {MAX_READ_FILE_BYTES} bytes"
+                ))
+            })?;
         Ok(FsReadFileResponse {
             data_base64: STANDARD.encode(bytes),
         })

@@ -504,11 +504,11 @@ retired_paths = ["codex-rs/config/src/coding_budgets.rs"]
 
 [[features]]
 id = "task-evidence-completion-gate"
-version = 4
+version = 5
 status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Persisted schema-v4 plan-status completion evidence with explicit Passed acknowledgement, dependency and generated-artifact checks, reopening after later mutations, and bounded observational completion-review receipts."
+summary = "Persisted schema-v5 task evidence with explicit plan acknowledgement, versioned user-source and requirement manifests, candidate-bound proof identity, atomic completion-review lineage, and migration from v1-v4."
 upstream_equivalent = "none"
 config_keys = []
 
@@ -530,12 +530,12 @@ contains = ".record_plan_update(&requested_args)"
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tools/events.rs"
-contains = ".record_edit_intent(ctx.call_id"
+contains = ".record_edit_intent_with_provenance("
 
 [[features.evidence]]
 kind = "registration"
 path = "codex-rs/core/src/tools/events.rs"
-contains = ".record_command("
+contains = ".record_command_bound_with_provenance("
 
 [[features.evidence]]
 kind = "registration"
@@ -544,8 +544,8 @@ contains = ".task_evidence.completion_gate().await"
 
 [[features.evidence]]
 kind = "registration"
-path = "codex-rs/core/src/tasks/completion_review.rs"
-contains = ".disabled_finalization_advisory()"
+path = "codex-rs/core/src/tasks/completion_review_v2.rs"
+contains = "implementation_identity_for_evidence"
 
 [[features.evidence]]
 kind = "protocol"
@@ -562,19 +562,24 @@ kind = "test"
 path = "codex-rs/core/src/task_evidence_tests.rs"
 contains = "explicit_passed_and_completed_are_authoritative_success_states"
 
+[[features.evidence]]
+kind = "test"
+path = "codex-rs/core/src/task_evidence_tests.rs"
+contains = "frozen_v4_loader_refuses_v5_without_modifying_the_file"
+
 [[features]]
 id = "task-completion-reviewer"
-version = 1
+version = 2
 status = "enabled"
 capability_kind = "runtime"
 owner = "codex-rs/core"
-summary = "Independent bounded KD4 completion review with one turn-local repair continuation and fail-open infrastructure status."
+summary = "Host-enforced KD4 completion review with exact user-source, requirement, and risk-lens coverage, candidate-bound evidence, one automatic correction phase, and one independent rereview."
 upstream_equivalent = "none"
 config_keys = ["features.task_completion_reviewer"]
 
 [[features.evidence]]
 kind = "entrypoint"
-path = "codex-rs/core/src/tasks/completion_review.rs"
+path = "codex-rs/core/src/tasks/completion_review_v2.rs"
 contains = "pub(crate) async fn coordinate_completion_review"
 
 [[features.evidence]]
@@ -585,7 +590,7 @@ contains = "coordinate_completion_review("
 [[features.evidence]]
 kind = "module"
 path = "codex-rs/core/src/tasks/mod.rs"
-contains = "pub(crate) mod completion_review;"
+contains = "#[path = \"completion_review_v2.rs\"]"
 
 [[features.evidence]]
 kind = "config"
@@ -599,8 +604,8 @@ contains = "task_completion_reviewer = true"
 
 [[features.evidence]]
 kind = "test"
-path = "codex-rs/core/src/tasks/completion_review.rs"
-contains = "request_and_history_caps_include_serialization_expansion"
+path = "codex-rs/core/src/tasks/completion_review_v2.rs"
+contains = "host_rejects_incomplete_duplicate_unknown_and_inconsistent_review_output"
 
 [[features]]
 id = "desktop-runtime-receipt"

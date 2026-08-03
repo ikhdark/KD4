@@ -152,6 +152,17 @@ enum RemoteClientCommand {
     },
 }
 
+impl RemoteClientCommand {
+    /// Drop requests cancelled while waiting in the bounded command channel so
+    /// stale work cannot delay newer requests or reach the remote app-server.
+    fn is_abandoned_request(&self) -> bool {
+        matches!(
+            self,
+            Self::Request { response_tx, .. } if response_tx.is_closed()
+        )
+    }
+}
+
 pub struct RemoteAppServerClient {
     command_tx: mpsc::Sender<RemoteClientCommand>,
     event_rx: mpsc::Receiver<AppServerEvent>,
@@ -239,6 +250,9 @@ impl RemoteAppServerClient {
                             let _ = stream.close(None).await;
                             break;
                         };
+                        if command.is_abandoned_request() {
+                            continue;
+                        }
                         match command {
                             RemoteClientCommand::Request { request, response_tx } => {
                                 let request_id = request.id.clone();
@@ -1174,6 +1188,25 @@ fn websocket_close_error_is_already_closed(err: &TungsteniteError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_remote_request_is_abandoned_before_dispatch() {
+        let (response_tx, response_rx) = oneshot::channel();
+        drop(response_rx);
+        let command = RemoteClientCommand::Request {
+            request: Box::new(jsonrpc_request_from_client_request(
+                ClientRequest::GetAccount {
+                    request_id: RequestId::Integer(1),
+                    params: codex_app_server_protocol::GetAccountParams {
+                        refresh_token: false,
+                    },
+                },
+            )),
+            response_tx,
+        };
+
+        assert!(command.is_abandoned_request());
+    }
 
     #[tokio::test]
     async fn shutdown_tolerates_worker_exit_after_command_is_queued() {

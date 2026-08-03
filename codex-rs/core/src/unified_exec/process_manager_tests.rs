@@ -542,6 +542,7 @@ async fn failed_initial_end_for_unstored_process_uses_fallback_output() {
         justification: None,
         prefix_rule: None,
         workspace_mutation: None,
+        completion_activity: None,
     };
 
     let transcript = Arc::new(tokio::sync::Mutex::new(HeadTailBuffer::default()));

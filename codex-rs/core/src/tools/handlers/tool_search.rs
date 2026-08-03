@@ -28,6 +28,7 @@ use tracing::instrument;
 const MAX_TOOL_SEARCH_HANDLER_CACHE: usize = 4;
 const MAX_TOOL_SEARCH_RESULT_CACHE: usize = 32;
 const MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES: usize = 256 * 1024;
+const MAX_TOOL_SEARCH_RESULT_BYTES: usize = 32 * 1024;
 const MAX_TOOL_SEARCH_QUERY_BYTES: usize = 4 * 1024;
 const MAX_TOOL_SEARCH_LIMIT: usize = 64;
 const TOOL_SEARCH_CANDIDATE_MULTIPLIER: usize = 3;
@@ -56,22 +57,22 @@ struct ToolSearchCacheEntry {
     tools: Vec<LoadableToolSpec>,
 }
 
-struct CacheSizeWriter {
+struct ByteBudgetWriter {
     remaining: usize,
 }
 
-impl CacheSizeWriter {
+impl ByteBudgetWriter {
     fn new(limit: usize) -> Self {
         Self { remaining: limit }
     }
 }
 
-impl Write for CacheSizeWriter {
+impl Write for ByteBudgetWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.len() > self.remaining {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::FileTooLarge,
-                "tool search cache entry exceeds its byte budget",
+                "tool search serialization exceeds its byte budget",
             ));
         }
         self.remaining -= buf.len();
@@ -301,9 +302,20 @@ impl ToolSearchHandler {
         &self,
         results: impl IntoIterator<Item = &'a ToolSearchEntry>,
     ) -> Result<Vec<LoadableToolSpec>, FunctionCallError> {
-        Ok(coalesce_loadable_tool_specs(
-            results.into_iter().map(|entry| entry.output.clone()),
-        ))
+        let mut retained_results = Vec::new();
+        let mut retained_tools = Vec::new();
+        for result in results {
+            retained_results.push(result);
+            let tools = coalesce_loadable_tool_specs(
+                retained_results.iter().map(|entry| entry.output.clone()),
+            );
+            if tool_search_result_fits_budget(&tools) {
+                retained_tools = tools;
+            } else {
+                retained_results.pop();
+            }
+        }
+        Ok(retained_tools)
     }
 
     fn cached_search_result(&self, key: &ToolSearchQueryKey) -> Option<Vec<LoadableToolSpec>> {
@@ -403,7 +415,12 @@ fn tool_search_cache_entry_fits_budget(
     let Some(tool_budget) = MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES.checked_sub(key.query.len()) else {
         return false;
     };
-    let mut writer = CacheSizeWriter::new(tool_budget);
+    let mut writer = ByteBudgetWriter::new(tool_budget);
+    serde_json::to_writer(&mut writer, tools).is_ok()
+}
+
+fn tool_search_result_fits_budget(tools: &[LoadableToolSpec]) -> bool {
+    let mut writer = ByteBudgetWriter::new(MAX_TOOL_SEARCH_RESULT_BYTES);
     serde_json::to_writer(&mut writer, tools).is_ok()
 }
 
@@ -713,20 +730,71 @@ mod tests {
     }
 
     #[test]
-    fn search_skips_oversized_cache_entries_before_cloning_them() {
+    fn search_omits_a_definition_that_exceeds_the_result_budget() {
         let mut search_info = search_info("calendar", None, "calendar", "create_event");
         let LoadableToolSpec::Namespace(namespace) = &mut search_info.entry.output else {
             panic!("test search info should be a namespace");
         };
-        namespace.description = "x".repeat(MAX_TOOL_SEARCH_CACHE_ENTRY_BYTES);
+        namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
         let handler = ToolSearchHandler::new(vec![search_info]);
 
         let tools = handler
             .search("calendar", TOOL_SEARCH_DEFAULT_LIMIT)
-            .expect("oversized result should still be returned");
+            .expect("oversized result should be bounded");
+
+        assert!(tools.is_empty());
+        assert_eq!(handler.result_cache_len(), 1);
+    }
+
+    #[test]
+    fn search_skips_lower_ranked_definitions_that_exceed_the_result_budget() {
+        let mut first = search_info("first", None, "first", "run");
+        let mut second = search_info("second", None, "second", "run");
+        for search_info in [&mut first, &mut second] {
+            let LoadableToolSpec::Namespace(namespace) = &mut search_info.entry.output else {
+                panic!("test search info should be a namespace");
+            };
+            namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES / 2);
+        }
+        let handler = ToolSearchHandler::new(vec![first, second]);
+        let results = [
+            &handler.search_infos[0].entry,
+            &handler.search_infos[1].entry,
+        ];
+
+        let tools = handler
+            .search_output_tools(results)
+            .expect("search results should serialize within the budget");
 
         assert_eq!(tools.len(), 1);
-        assert_eq!(handler.result_cache_len(), 0);
+        assert!(
+            serde_json::to_vec(&tools)
+                .expect("bounded search result should serialize")
+                .len()
+                <= MAX_TOOL_SEARCH_RESULT_BYTES
+        );
+    }
+
+    #[test]
+    fn search_keeps_later_matches_after_an_oversized_definition() {
+        let mut oversized = search_info("oversized", None, "oversized", "run");
+        let later = search_info("later", None, "later", "run");
+        let LoadableToolSpec::Namespace(namespace) = &mut oversized.entry.output else {
+            panic!("test search info should be a namespace");
+        };
+        namespace.description = "x".repeat(MAX_TOOL_SEARCH_RESULT_BYTES);
+        let expected = later.entry.output.clone();
+        let handler = ToolSearchHandler::new(vec![oversized, later]);
+        let results = [
+            &handler.search_infos[0].entry,
+            &handler.search_infos[1].entry,
+        ];
+
+        let tools = handler
+            .search_output_tools(results)
+            .expect("later search result should fit within the budget");
+
+        assert_eq!(tools, vec![expected]);
     }
 
     #[test]

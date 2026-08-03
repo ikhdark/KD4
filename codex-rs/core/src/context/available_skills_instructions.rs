@@ -1,11 +1,13 @@
 use codex_core_skills::AvailableSkills;
-use codex_core_skills::SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS;
-use codex_core_skills::SKILLS_HOW_TO_USE_WITH_ALIASES;
+use codex_core_skills::SKILLS_HOW_TO_USE;
 use codex_core_skills::render_available_skills_body;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_CLOSE_TAG;
 use codex_protocol::protocol::SKILLS_INSTRUCTIONS_OPEN_TAG;
 
 use super::ContextualUserFragment;
+
+pub(crate) const SKILLS_USAGE_INSTRUCTIONS_OPEN_TAG: &str = "<skills_usage_instructions>";
+const SKILLS_USAGE_INSTRUCTIONS_CLOSE_TAG: &str = "</skills_usage_instructions>";
 
 /// Model-context fragment describing the skills available to Codex.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,24 +25,36 @@ impl AvailableSkillsInstructions {
         }
     }
 
-    pub fn from_available_skills(
-        available_skills: &AvailableSkills,
-        include_skills_usage_instructions: bool,
-    ) -> Self {
-        let mut skill_lines = available_skills.skill_lines.clone();
-        if include_skills_usage_instructions {
-            skill_lines.push("### How to use skills".to_string());
-            let instructions = if available_skills.skill_root_lines.is_empty() {
-                SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS
-            } else {
-                SKILLS_HOW_TO_USE_WITH_ALIASES
-            };
-            skill_lines.push(instructions.to_string());
-        }
+    pub fn from_available_skills(available_skills: &AvailableSkills) -> Self {
         Self {
             skill_root_lines: available_skills.skill_root_lines.clone(),
-            skill_lines,
+            skill_lines: available_skills.skill_lines.clone(),
         }
+    }
+}
+
+/// Singleton model-context fragment describing how to load and apply skills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SkillsUsageInstructions;
+
+impl ContextualUserFragment for SkillsUsageInstructions {
+    fn role(&self) -> &'static str {
+        "developer"
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        Self::type_markers()
+    }
+
+    fn type_markers() -> (&'static str, &'static str) {
+        (
+            SKILLS_USAGE_INSTRUCTIONS_OPEN_TAG,
+            SKILLS_USAGE_INSTRUCTIONS_CLOSE_TAG,
+        )
+    }
+
+    fn body(&self) -> String {
+        format!("\n## How to use skills\n{SKILLS_HOW_TO_USE}\n")
     }
 }
 

@@ -7,9 +7,10 @@ Runtime orchestration for Phase 1 and Phase 2 still lives in `codex-core` under
 
 ## Crates
 
-- `codex-rs/memories/read` (`codex-memories-read`) owns the read path:
-  memory developer-instruction injection, memory citation parsing, and
-  read-usage telemetry classification.
+- `codex-rs/memories/read` (`codex-memories-read`) owns memory citation parsing
+  and read-usage telemetry classification.
+- `codex-rs/ext/memories` (`codex-memories-extension`) owns memory tools and the
+  bounded memory developer-instruction injection.
 - `codex-rs/memories/write` (`codex-memories-write`) owns the write path:
   Phase 1 and Phase 2 prompt rendering, filesystem artifact helpers,
   workspace diff helpers, and extension resource pruning.
@@ -18,12 +19,12 @@ Runtime orchestration for Phase 1 and Phase 2 still lives in `codex-core` under
 
 Memory prompt templates live with the crate that uses them:
 
-- The undated template files are the canonical latest versions used at runtime:
-  - `read/templates/memories/read_path.md`
-  - `write/templates/memories/stage_one_system.md`
+- The bounded compact templates are the canonical versions used at runtime:
+  - `../ext/memories/templates/memories/read_path.compact.md`
+  - `write/templates/memories/stage_one_system.compact.md`
   - `write/templates/memories/stage_one_input.md`
-  - `write/templates/memories/consolidation.md`
-- In `codex`, edit those undated template files in place.
+  - `write/templates/memories/consolidation.compact.md`
+- In `codex`, edit those runtime template files in place.
 - The dated snapshot-copy workflow is used in the separate `openai/project/agent_memory/write` harness repo, not here.
 
 ## When it runs

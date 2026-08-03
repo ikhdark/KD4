@@ -307,7 +307,15 @@ mod agent {
         agent_config.ephemeral = true;
         agent_config.memories.generate_memories = false;
         agent_config.memories.use_memories = false;
+        agent_config.base_instructions =
+            Some(crate::stage_two::BASE_INSTRUCTIONS.trim().to_string());
+        agent_config.developer_instructions = None;
+        agent_config.personality = None;
+        agent_config.include_permissions_instructions = false;
         agent_config.include_apps_instructions = false;
+        agent_config.include_collaboration_mode_instructions = false;
+        agent_config.include_skill_instructions = false;
+        agent_config.include_environment_context = false;
         agent_config.mcp_servers = Constrained::allow_only(HashMap::new());
         // Approval policy
         agent_config.permissions.approval_policy = Constrained::allow_only(AskForApproval::Never);
@@ -317,6 +325,7 @@ mod agent {
         let _ = agent_config.features.disable(Feature::MemoryTool);
         let _ = agent_config.features.disable(Feature::Apps);
         let _ = agent_config.features.disable(Feature::Plugins);
+        let _ = agent_config.features.disable(Feature::Personality);
         let _ = agent_config
             .features
             .disable(Feature::SkillMcpDependencyInstall);
@@ -574,4 +583,12 @@ fn emit_token_usage_metrics(context: &MemoryStartupContext, token_usage: &TokenU
         token_usage.reasoning_output_tokens.max(0),
         &[("token_type", "reasoning_output")],
     );
+}
+
+#[cfg(test)]
+pub(crate) fn agent_config_for_test(
+    config: &Config,
+    provider: &dyn ModelProvider,
+) -> Option<Config> {
+    agent::get_config(config, provider)
 }

@@ -8413,6 +8413,10 @@ async fn make_multi_agent_v2_usage_hint_test_session(
 
 struct PromptExtensionTestContributor;
 struct PromptExtensionTestState;
+struct AggregateBoundContextTestContributor {
+    thread_text: String,
+    turn_text: String,
+}
 struct TurnContextExtensionTestContributor;
 struct TurnContextExtensionTestState {
     expected_model_context_window: Option<i64>,
@@ -8503,6 +8507,31 @@ impl codex_extension_api::ContextContributor for PromptExtensionTestContributor 
     }
 }
 
+impl codex_extension_api::ContextContributor for AggregateBoundContextTestContributor {
+    fn contribute_thread_context<'a>(
+        &'a self,
+        _session_store: &'a codex_extension_api::ExtensionData,
+        _thread_store: &'a codex_extension_api::ExtensionData,
+    ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        Box::pin(async move {
+            vec![codex_extension_api::PromptFragment::developer_policy(
+                self.thread_text.clone(),
+            )]
+        })
+    }
+
+    fn contribute_turn_context<'a>(
+        &'a self,
+        _input: codex_extension_api::TurnContextContributionInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, Vec<codex_extension_api::PromptFragment>> {
+        Box::pin(async move {
+            vec![codex_extension_api::PromptFragment::developer_policy(
+                self.turn_text.clone(),
+            )]
+        })
+    }
+}
+
 fn prompt_extension_test_registry()
 -> Arc<codex_extension_api::ExtensionRegistry<crate::config::Config>> {
     let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
@@ -8554,6 +8583,45 @@ async fn build_initial_context_includes_prompt_fragments_from_extensions() {
             .flatten()
             .any(|text| *text == "prompt extension enabled"),
         "expected prompt extension developer text, got {developer_messages:?}"
+    );
+}
+
+#[tokio::test]
+async fn extension_prompt_contributors_share_one_hard_budget() {
+    let max_bytes = codex_utils_string::approx_bytes_for_tokens(
+        codex_context_fragments::MAX_MODEL_CONTEXT_TOKENS,
+    );
+    let (mut session, turn_context) = make_session_and_context().await;
+    let mut builder = codex_extension_api::ExtensionRegistryBuilder::new();
+    builder.prompt_contributor(Arc::new(AggregateBoundContextTestContributor {
+        thread_text: format!("extension-budget-first:{}", "x".repeat(max_bytes)),
+        turn_text: "extension-budget-second".to_string(),
+    }));
+    session.services.extensions = Arc::new(builder.build());
+    let turn_context = Arc::new(turn_context);
+
+    let initial_context = build_initial_context(&session, &turn_context).await;
+    let contributed_texts = developer_input_texts(&initial_context)
+        .into_iter()
+        .filter(|text| text.contains("extension-budget-"))
+        .collect::<Vec<_>>();
+
+    assert!(
+        contributed_texts
+            .iter()
+            .map(|text| text.len())
+            .sum::<usize>()
+            <= max_bytes
+    );
+    assert!(
+        contributed_texts
+            .iter()
+            .any(|text| text.starts_with("extension-budget-first:"))
+    );
+    assert!(
+        contributed_texts
+            .iter()
+            .all(|text| !text.contains("extension-budget-second"))
     );
 }
 
@@ -8619,7 +8687,7 @@ async fn turn_context_refresh_polls_contributors_concurrently_and_applies_in_ord
 
     let context_items = timeout(
         Duration::from_secs(5),
-        session.build_turn_context_contribution_items(&turn_context),
+        session.build_turn_context_contribution_items(&turn_context, false),
     )
     .await
     .expect("turn context contributors should be polled concurrently");

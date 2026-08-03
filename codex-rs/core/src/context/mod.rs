@@ -39,6 +39,8 @@ pub(crate) use approved_command_prefix_saved::ApprovedCommandPrefixSaved;
 pub(crate) use apps_instructions::AppsInstructions;
 pub(crate) use available_plugins_instructions::AvailablePluginsInstructions;
 pub use available_skills_instructions::AvailableSkillsInstructions;
+pub(crate) use available_skills_instructions::SKILLS_USAGE_INSTRUCTIONS_OPEN_TAG;
+pub(crate) use available_skills_instructions::SkillsUsageInstructions;
 pub(crate) use codex_context_fragments::AdditionalContextDeveloperFragment;
 pub(crate) use codex_context_fragments::AdditionalContextUserFragment;
 pub use codex_context_fragments::ContextualUserFragment;

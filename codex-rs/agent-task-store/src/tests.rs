@@ -38,6 +38,32 @@ impl Fixture {
     }
 }
 
+fn fixed_time(value: &str) -> chrono::DateTime<Utc> {
+    chrono::DateTime::parse_from_rfc3339(value)
+        .expect("fixed timestamp parses")
+        .with_timezone(&Utc)
+}
+
+fn json_time(value: &str) -> String {
+    serde_json::to_string(value).expect("fixed timestamp serializes")
+}
+
+async fn coordination_pool(fixture: &Fixture) -> sqlx::SqlitePool {
+    let database_path = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination")
+        .join("agent_tasks.sqlite");
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(database_path)
+        .foreign_keys(true);
+    sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("coordination database opens")
+}
+
 async fn expire_workspace_actor_leases(fixture: &Fixture, attempt_ids: &[AttemptId]) {
     let database_path = fixture
         .state
@@ -69,6 +95,62 @@ async fn expire_workspace_actor_leases(fixture: &Fixture, attempt_ids: &[Attempt
         assert_eq!(updated.rows_affected(), 1);
     }
     pool.close().await;
+}
+
+async fn expire_workspace_finalization_fence(fixture: &Fixture, fence_id: &str) {
+    let database_path = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination")
+        .join("agent_tasks.sqlite");
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(database_path)
+        .foreign_keys(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("coordination database opens");
+    let expired_at = Utc::now() - Duration::seconds(1);
+    let encoded_expired_at =
+        serde_json::to_string(&expired_at).expect("expired fence time serializes");
+    let updated = sqlx::query(
+        "UPDATE workspace_finalization_fences
+         SET expires_at = ?
+         WHERE fence_id = ? AND state IN ('active', 'dispatching')",
+    )
+    .bind(encoded_expired_at)
+    .bind(fence_id)
+    .execute(&pool)
+    .await
+    .expect("workspace finalization fence expires");
+    assert_eq!(updated.rows_affected(), 1);
+    pool.close().await;
+}
+
+async fn workspace_finalization_fence_state(fixture: &Fixture, fence_id: &str) -> String {
+    let database_path = fixture
+        .state
+        .codex_home()
+        .join("agent-task-coordination")
+        .join("agent_tasks.sqlite");
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(database_path)
+        .foreign_keys(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("coordination database opens");
+    let state = sqlx::query_scalar::<_, String>(
+        "SELECT state FROM workspace_finalization_fences WHERE fence_id = ?",
+    )
+    .bind(fence_id)
+    .fetch_one(&pool)
+    .await
+    .expect("workspace finalization fence state reads");
+    pool.close().await;
+    state
 }
 
 async fn remove_workspace_actor(fixture: &Fixture, attempt_id: AttemptId) {
@@ -3065,6 +3147,770 @@ async fn nudge_leases_quiescence_and_restart_are_durable() {
     assert!(terminal_quiescence.pending_gate_assignment_ids.is_empty());
     assert!(terminal_quiescence.active_claim_assignment_ids.is_empty());
     assert!(terminal_quiescence.active_mutation_lease_ids.is_empty());
+}
+
+#[tokio::test]
+async fn workspace_finalization_fence_blocks_writers_and_allows_read_only_quiescence() {
+    let fixture = Fixture::new().await;
+    std::fs::write(fixture.repo.path().join("tracked.txt"), "before\n").expect("workspace fixture");
+    let root_session_id = "finalization-root".to_string();
+    fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["tracked.txt".to_string()])
+        .await
+        .expect("initial workspace revision");
+
+    let fence = fixture
+        .store
+        .begin_workspace_finalization(fixture.repo.path(), root_session_id.clone())
+        .await
+        .expect("workspace finalization fence");
+    let quiescence = fixture
+        .store
+        .inspect_quiescence(root_session_id.clone())
+        .await
+        .expect("read-only quiescence under fence");
+    assert!(quiescence.quiescent);
+    assert!(
+        fixture
+            .store
+            .heartbeat_workspace_finalization(
+                fixture.repo.path(),
+                fence.fence_id.clone(),
+                root_session_id.clone(),
+            )
+            .await
+            .expect("owner heartbeat")
+    );
+    assert!(
+        !fixture
+            .store
+            .heartbeat_workspace_finalization(
+                fixture.repo.path(),
+                fence.fence_id.clone(),
+                "wrong-root".to_string(),
+            )
+            .await
+            .expect("wrong-owner heartbeat is a clean miss")
+    );
+    assert!(
+        fixture
+            .store
+            .begin_workspace_finalization(fixture.repo.path(), root_session_id.clone())
+            .await
+            .is_err(),
+        "a second finalization fence must not overlap"
+    );
+    assert!(
+        fixture
+            .store
+            .capture_workspace_revision(fixture.repo.path(), vec!["tracked.txt".to_string()],)
+            .await
+            .is_err(),
+        "workspace revision writes are fenced"
+    );
+    assert!(
+        fixture
+            .store
+            .register_workspace_actor(
+                fixture.repo.path(),
+                WorkspaceActorRegistration {
+                    root_session_id: root_session_id.clone(),
+                    actor_id: "root-actor".to_string(),
+                    kind: WorkspaceActorKind::Root,
+                    assignment_id: None,
+                    attempt_id: None,
+                    strategy: WorkspaceStrategy::Shared,
+                },
+            )
+            .await
+            .is_err(),
+        "actor registration is fenced"
+    );
+
+    fixture
+        .store
+        .release_workspace_finalization(fixture.repo.path(), fence)
+        .await
+        .expect("owner releases fence");
+    fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["tracked.txt".to_string()])
+        .await
+        .expect("workspace revision resumes after release");
+    fixture
+        .store
+        .register_workspace_actor(
+            fixture.repo.path(),
+            WorkspaceActorRegistration {
+                root_session_id,
+                actor_id: "root-actor".to_string(),
+                kind: WorkspaceActorKind::Root,
+                assignment_id: None,
+                attempt_id: None,
+                strategy: WorkspaceStrategy::Shared,
+            },
+        )
+        .await
+        .expect("actor registration resumes after release");
+}
+
+#[tokio::test]
+async fn workspace_finalization_dispatch_seal_blocks_mutations_and_releases() {
+    let fixture = Fixture::new().await;
+    let root_session_id = "dispatch-seal-root".to_string();
+    std::fs::write(fixture.repo.path().join("tracked.txt"), "before\n").expect("workspace fixture");
+    fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["tracked.txt".to_string()])
+        .await
+        .expect("initial workspace revision");
+    let fence = fixture
+        .store
+        .begin_workspace_finalization(fixture.repo.path(), root_session_id.clone())
+        .await
+        .expect("workspace finalization fence");
+
+    let sealed = fixture
+        .store
+        .seal_workspace_finalization_dispatch(fixture.repo.path(), fence.clone())
+        .await
+        .expect("active finalization fence seals for dispatch");
+    assert_eq!(sealed.fence_id, fence.fence_id);
+    assert!(sealed.expires_at >= fence.expires_at);
+    assert_eq!(
+        workspace_finalization_fence_state(&fixture, &sealed.fence_id).await,
+        "dispatching"
+    );
+    assert!(
+        fixture
+            .store
+            .heartbeat_workspace_finalization(
+                fixture.repo.path(),
+                sealed.fence_id.clone(),
+                root_session_id.clone(),
+            )
+            .await
+            .expect("dispatching fence heartbeat")
+    );
+    assert!(
+        fixture
+            .store
+            .begin_workspace_finalization(fixture.repo.path(), root_session_id.clone())
+            .await
+            .is_err(),
+        "dispatching fences remain exclusive"
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .begin_workspace_mutation(
+                fixture.repo.path(),
+                WorkspaceMutationRequest {
+                    root_session_id: "competing-dispatch-root".to_string(),
+                    actor_id: "root:competing-dispatch-root".to_string(),
+                    kind: WorkspaceActorKind::Root,
+                    attempt_id: None,
+                    paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                    contracts: Vec::new(),
+                    expected_manifest: Vec::new(),
+                },
+            )
+            .await,
+        Err(StoreError::WorkspaceFinalizationActive { .. })
+    ));
+    assert!(
+        fixture
+            .store
+            .capture_workspace_revision(fixture.repo.path(), vec!["tracked.txt".to_string()])
+            .await
+            .is_err(),
+        "dispatching fences block trigger-protected workspace writes"
+    );
+
+    fixture
+        .store
+        .release_workspace_finalization(fixture.repo.path(), sealed)
+        .await
+        .expect("dispatching fence releases");
+    fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["tracked.txt".to_string()])
+        .await
+        .expect("workspace writes resume after dispatching release");
+}
+
+#[tokio::test]
+async fn workspace_finalization_dispatch_seal_rejects_wrong_or_expired_identity() {
+    let fixture = Fixture::new().await;
+    let fence = fixture
+        .store
+        .begin_workspace_finalization(fixture.repo.path(), "dispatch-owner".to_string())
+        .await
+        .expect("workspace finalization fence");
+    let mut wrong_owner = fence.clone();
+    wrong_owner.root_session_id = "wrong-dispatch-owner".to_string();
+    assert!(matches!(
+        fixture
+            .store
+            .seal_workspace_finalization_dispatch(fixture.repo.path(), wrong_owner)
+            .await,
+        Err(StoreError::WorkspaceLeaseUnavailable(_))
+    ));
+
+    expire_workspace_finalization_fence(&fixture, &fence.fence_id).await;
+    assert!(
+        !fixture
+            .store
+            .heartbeat_workspace_finalization(
+                fixture.repo.path(),
+                fence.fence_id.clone(),
+                fence.root_session_id.clone(),
+            )
+            .await
+            .expect("expired finalization heartbeat is a clean miss")
+    );
+    assert!(matches!(
+        fixture
+            .store
+            .seal_workspace_finalization_dispatch(fixture.repo.path(), fence)
+            .await,
+        Err(StoreError::WorkspaceLeaseUnavailable(_))
+    ));
+}
+
+#[tokio::test]
+async fn expired_dispatching_finalization_fence_recovers_after_crash() {
+    let fixture = Fixture::new().await;
+    std::fs::write(fixture.repo.path().join("tracked.txt"), "before\n").expect("workspace fixture");
+    fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["tracked.txt".to_string()])
+        .await
+        .expect("initial workspace revision");
+    let fence = fixture
+        .store
+        .begin_workspace_finalization(fixture.repo.path(), "crashed-dispatch-root".to_string())
+        .await
+        .expect("workspace finalization fence");
+    let sealed = fixture
+        .store
+        .seal_workspace_finalization_dispatch(fixture.repo.path(), fence)
+        .await
+        .expect("finalization fence seals for dispatch");
+    expire_workspace_finalization_fence(&fixture, &sealed.fence_id).await;
+
+    let recovered_lease = fixture
+        .store
+        .begin_workspace_mutation(
+            fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "recovered-mutation-root".to_string(),
+                actor_id: "root:recovered-mutation-root".to_string(),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("expired dispatching fence does not strand mutation admission");
+    fixture
+        .store
+        .finish_workspace_mutation(fixture.repo.path(), recovered_lease)
+        .await
+        .expect("recovered workspace mutation finishes");
+
+    let replacement = fixture
+        .store
+        .begin_workspace_finalization(fixture.repo.path(), "replacement-root".to_string())
+        .await
+        .expect("expired dispatching fence does not strand finalization");
+    assert_eq!(
+        workspace_finalization_fence_state(&fixture, &sealed.fence_id).await,
+        "expired"
+    );
+    fixture
+        .store
+        .release_workspace_finalization(fixture.repo.path(), replacement)
+        .await
+        .expect("replacement finalization releases");
+    fixture
+        .store
+        .capture_workspace_revision(fixture.repo.path(), vec!["tracked.txt".to_string()])
+        .await
+        .expect("workspace writes resume after simulated dispatch crash");
+}
+
+#[tokio::test]
+async fn expired_workspace_finalization_fence_does_not_strand_task_writes() {
+    let fixture = Fixture::new().await;
+    let root_session_id = "expired-finalization-root";
+    let mut draft = worker_draft(root_session_id, "first");
+    draft.required_evidence = vec!["focused test".to_string()];
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), draft)
+        .await
+        .expect("worker assignment");
+    let fence = fixture
+        .store
+        .begin_workspace_finalization(fixture.repo.path(), root_session_id.to_string())
+        .await
+        .expect("workspace finalization fence");
+
+    let binding_error = fixture
+        .store
+        .bind_agent_task(AgentTaskBindingDraft {
+            assignment_id: assignment.assignment_id,
+            attempt_id: attempt.attempt_id,
+            agent_path: "/root/expired-finalization".to_string(),
+            task_name: "expired-finalization".to_string(),
+            thread_id: Some("expired-finalization-thread".to_string()),
+        })
+        .await
+        .expect_err("live finalization fence blocks bindings");
+    assert!(
+        binding_error
+            .to_string()
+            .contains("workspace finalization active")
+    );
+    let gate_error = fixture
+        .store
+        .set_agent_gate(
+            TaskActor::Root,
+            assignment.assignment_id,
+            GateKind::Review,
+            GateStatus::Pending,
+            "review required".to_string(),
+        )
+        .await
+        .expect_err("live finalization fence blocks gates");
+    assert!(
+        gate_error
+            .to_string()
+            .contains("workspace finalization active")
+    );
+    let validation_error = fixture
+        .store
+        .record_validation_call(ValidationCall {
+            call_id: "expired-finalization-validation".to_string(),
+            attempt_id: attempt.attempt_id,
+            command_summary: "focused test".to_string(),
+            resolved_executable: resolved_test_executable(),
+            proof_kind: ValidationProofKind::Focused,
+            evidence: ValidationEvidence::default(),
+            status: ValidationCallStatus::Running,
+            recorded_at: Utc::now(),
+        })
+        .await
+        .expect_err("live finalization fence blocks validation writes");
+    assert!(
+        validation_error
+            .to_string()
+            .contains("workspace finalization active")
+    );
+
+    expire_workspace_finalization_fence(&fixture, &fence.fence_id).await;
+
+    bind_test_agent(
+        &fixture.store,
+        assignment.assignment_id,
+        attempt.attempt_id,
+        root_session_id,
+    )
+    .await;
+    fixture
+        .store
+        .set_agent_gate(
+            TaskActor::Root,
+            assignment.assignment_id,
+            GateKind::Review,
+            GateStatus::Pending,
+            "review required".to_string(),
+        )
+        .await
+        .expect("expired fence allows gate writes");
+    let validation = start_focused_validation(
+        &fixture.store,
+        attempt.attempt_id,
+        "expired-finalization-validation",
+        "focused test",
+    )
+    .await;
+    finish_focused_validation(&fixture.store, validation).await;
+    fixture
+        .store
+        .submit_agent_receipt(
+            attempt.attempt_id,
+            completed_receipt(vec!["expired-finalization-validation".to_string()]),
+        )
+        .await
+        .expect("expired fence allows receipt and attempt writes");
+    fixture
+        .store
+        .create_assignment(fixture.repo.path(), worker_draft(root_session_id, "second"))
+        .await
+        .expect("expired fence allows new attempt writes");
+    let replacement = fixture
+        .store
+        .begin_workspace_finalization(fixture.repo.path(), "replacement-active-root".to_string())
+        .await
+        .expect("expired active fence does not strand finalization");
+    fixture
+        .store
+        .release_workspace_finalization(fixture.repo.path(), replacement)
+        .await
+        .expect("replacement active finalization releases");
+}
+
+#[tokio::test]
+async fn json_timestamps_order_validation_calls_and_bindings_by_instant() {
+    let fixture = Fixture::new().await;
+    let (assignment, attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("timestamp-order-root", "validation"),
+        )
+        .await
+        .expect("validation ordering assignment");
+    let timestamp_variants = [
+        ("order-d", "2099-01-01T00:00:00Z"),
+        ("order-a", "2099-01-01T00:00:00.000Z"),
+        ("order-c", "2099-01-01T00:00:00.000000Z"),
+        ("order-b", "2099-01-01T00:00:00.000000000Z"),
+    ];
+    for (call_id, _) in timestamp_variants {
+        fixture
+            .store
+            .record_validation_call(ValidationCall {
+                call_id: call_id.to_string(),
+                attempt_id: attempt.attempt_id,
+                command_summary: "legacy ordering probe".to_string(),
+                resolved_executable: None,
+                proof_kind: ValidationProofKind::LegacyUnclassified,
+                evidence: ValidationEvidence::default(),
+                status: ValidationCallStatus::Running,
+                recorded_at: fixed_time("2099-01-01T00:00:00Z"),
+            })
+            .await
+            .expect("ordering validation call starts");
+    }
+
+    let pool = coordination_pool(&fixture).await;
+    for (call_id, timestamp) in timestamp_variants {
+        sqlx::query("UPDATE validation_calls SET recorded_at = ? WHERE call_id = ?")
+            .bind(json_time(timestamp))
+            .bind(call_id)
+            .execute(&pool)
+            .await
+            .expect("validation timestamp width updates");
+    }
+    let validation_ids = fixture
+        .store
+        .get_agent_task(assignment.assignment_id, Some(0))
+        .await
+        .expect("ordered validation task reads")
+        .validation_calls
+        .into_iter()
+        .map(|call| call.call_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        validation_ids,
+        vec!["order-a", "order-b", "order-c", "order-d"]
+    );
+
+    let binding_variants = [
+        ("/root/order-d", "2099-01-01T00:00:00Z"),
+        ("/root/order-a", "2099-01-01T00:00:00.000Z"),
+        ("/root/order-c", "2099-01-01T00:00:00.000000Z"),
+        ("/root/order-b", "2099-01-01T00:00:00.000000000Z"),
+    ];
+    for (index, (agent_path, timestamp)) in binding_variants.into_iter().enumerate() {
+        let (binding_assignment, binding_attempt) = fixture
+            .store
+            .create_assignment(
+                fixture.repo.path(),
+                worker_draft("timestamp-binding-root", &format!("binding/{index}")),
+            )
+            .await
+            .expect("binding ordering assignment");
+        fixture
+            .store
+            .bind_agent_task(AgentTaskBindingDraft {
+                assignment_id: binding_assignment.assignment_id,
+                attempt_id: binding_attempt.attempt_id,
+                agent_path: agent_path.to_string(),
+                task_name: format!("order-{index}"),
+                thread_id: Some(format!("order-thread-{index}")),
+            })
+            .await
+            .expect("ordering binding persists");
+        sqlx::query("UPDATE agent_task_bindings SET updated_at = ? WHERE assignment_id = ?")
+            .bind(json_time(timestamp))
+            .bind(binding_assignment.assignment_id.to_string())
+            .execute(&pool)
+            .await
+            .expect("binding timestamp width updates");
+    }
+    pool.close().await;
+
+    let binding_paths = fixture
+        .store
+        .list_agent_task_bindings("timestamp-binding-root".to_string(), None)
+        .await
+        .expect("ordered bindings read")
+        .into_iter()
+        .map(|binding| binding.agent_path)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        binding_paths,
+        vec![
+            "/root/order-a",
+            "/root/order-b",
+            "/root/order-c",
+            "/root/order-d"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn json_timestamp_comparisons_cover_mixed_precision_boundaries() {
+    let fixture = Fixture::new().await;
+    let mut first_draft = worker_draft("timestamp-singleflight-root", "singleflight/first");
+    first_draft.required_evidence = vec!["focused test".to_string()];
+    let (_, first_attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), first_draft)
+        .await
+        .expect("first singleflight assignment");
+    let mut second_draft = worker_draft("timestamp-singleflight-root", "singleflight/second");
+    second_draft.required_evidence = vec!["focused test".to_string()];
+    let (second_assignment, second_attempt) = fixture
+        .store
+        .create_assignment(fixture.repo.path(), second_draft)
+        .await
+        .expect("second singleflight assignment");
+    let comparison_now = fixed_time("2099-01-01T00:00:00.001Z");
+    crate::local::with_test_comparison_now(
+        comparison_now,
+        fixture.store.record_validation_call(ValidationCall {
+            call_id: "fraction-leader".to_string(),
+            attempt_id: first_attempt.attempt_id,
+            command_summary: "focused test".to_string(),
+            resolved_executable: resolved_test_executable(),
+            proof_kind: ValidationProofKind::Focused,
+            evidence: ValidationEvidence {
+                lease_expires_at: Some(fixed_time("2099-01-01T00:00:00Z")),
+                ..ValidationEvidence::default()
+            },
+            status: ValidationCallStatus::Running,
+            recorded_at: comparison_now,
+        }),
+    )
+    .await
+    .expect("zero-width leader starts");
+    crate::local::with_test_comparison_now(
+        comparison_now,
+        fixture.store.record_validation_call(ValidationCall {
+            call_id: "fraction-successor".to_string(),
+            attempt_id: second_attempt.attempt_id,
+            command_summary: "focused test".to_string(),
+            resolved_executable: resolved_test_executable(),
+            proof_kind: ValidationProofKind::Focused,
+            evidence: ValidationEvidence::default(),
+            status: ValidationCallStatus::Running,
+            recorded_at: comparison_now,
+        }),
+    )
+    .await
+    .expect("expired leader is replaced");
+    let successor = fixture
+        .store
+        .get_agent_task(second_assignment.assignment_id, Some(0))
+        .await
+        .expect("successor task reads")
+        .validation_calls
+        .into_iter()
+        .find(|call| call.call_id == "fraction-successor")
+        .expect("successor validation call exists");
+    assert_eq!(successor.evidence.shared_from_call_id, None);
+
+    let (nudge_assignment, nudge_attempt) = fixture
+        .store
+        .create_assignment(
+            fixture.repo.path(),
+            worker_draft("timestamp-nudge-root", "nudge"),
+        )
+        .await
+        .expect("nudge assignment");
+    let pool = coordination_pool(&fixture).await;
+    sqlx::query(
+        "UPDATE workspace_actors
+         SET state = 'active', last_progress_at = ?, nudge_sent_at = NULL
+         WHERE attempt_id = ?",
+    )
+    .bind(json_time("2099-01-01T00:00:00.100000Z"))
+    .bind(nudge_attempt.attempt_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("six-digit nudge timestamp updates");
+    pool.close().await;
+    let nudge_boundary = fixed_time("2099-01-01T00:00:00.100000001Z");
+    assert!(
+        crate::local::with_test_comparison_now(
+            nudge_boundary,
+            fixture
+                .store
+                .reserve_stalled_nudge(nudge_assignment.assignment_id, nudge_boundary),
+        )
+        .await
+        .expect("nine-digit nudge boundary evaluates")
+    );
+}
+
+#[tokio::test]
+async fn json_timestamp_comparisons_preserve_lease_liveness_and_fence_behavior() {
+    let lease_fixture = Fixture::new().await;
+    std::fs::write(lease_fixture.repo.path().join("tracked.txt"), "before\n")
+        .expect("lease fixture file");
+    let lease = lease_fixture
+        .store
+        .begin_workspace_mutation(
+            lease_fixture.repo.path(),
+            WorkspaceMutationRequest {
+                root_session_id: "timestamp-lease-root".to_string(),
+                actor_id: "root:timestamp-lease-root".to_string(),
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec!["tracked.txt".to_string()],
+                contracts: Vec::new(),
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .expect("timestamp lease starts");
+    let pool = coordination_pool(&lease_fixture).await;
+    sqlx::query("UPDATE workspace_mutation_leases SET expires_at = ? WHERE lease_id = ?")
+        .bind(json_time("2099-01-01T00:00:00.001Z"))
+        .bind(&lease.lease_id)
+        .execute(&pool)
+        .await
+        .expect("three-digit lease expiration updates");
+    pool.close().await;
+    let lease_now = fixed_time("2099-01-01T00:00:00Z");
+    let claim_result = crate::local::with_test_comparison_now(
+        lease_now,
+        lease_fixture.store.create_assignment(
+            lease_fixture.repo.path(),
+            worker_draft("timestamp-lease-worker", "tracked.txt"),
+        ),
+    )
+    .await;
+    assert!(
+        claim_result.is_err(),
+        "live mutation lease must block claims"
+    );
+    let quiescence = crate::workspace::with_test_comparison_now(
+        lease_now,
+        lease_fixture
+            .store
+            .inspect_quiescence("timestamp-lease-root".to_string()),
+    )
+    .await
+    .expect("live mixed-width lease remains visible");
+    assert_eq!(
+        quiescence.active_mutation_lease_ids,
+        vec![lease.lease_id.clone()]
+    );
+    assert!(matches!(
+        crate::workspace::with_test_comparison_now(
+            lease_now,
+            lease_fixture.store.begin_workspace_finalization(
+                lease_fixture.repo.path(),
+                "timestamp-finalization-root".to_string(),
+            ),
+        )
+        .await,
+        Err(StoreError::WorkspaceFinalizationNotQuiescent { .. })
+    ));
+
+    let liveness_fixture = Fixture::new().await;
+    let (owner, owner_attempt) = liveness_fixture
+        .store
+        .create_assignment(
+            liveness_fixture.repo.path(),
+            worker_draft("timestamp-owner-root", "owned"),
+        )
+        .await
+        .expect("timestamp owner assignment");
+    let pool = coordination_pool(&liveness_fixture).await;
+    sqlx::query(
+        "UPDATE workspace_actors
+         SET state = 'active', lease_expires_at = ?, last_progress_at = ?
+         WHERE attempt_id = ?",
+    )
+    .bind(json_time("2099-01-01T00:00:00Z"))
+    .bind(json_time("2098-01-01T00:00:00Z"))
+    .bind(owner_attempt.attempt_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("owner liveness timestamps update");
+    pool.close().await;
+    let liveness_now = fixed_time("2099-01-01T00:00:00.001Z");
+    crate::local::with_test_comparison_now(
+        liveness_now,
+        liveness_fixture.store.create_assignment(
+            liveness_fixture.repo.path(),
+            worker_draft("timestamp-replacement-root", "owned"),
+        ),
+    )
+    .await
+    .expect("chronologically expired owner releases its claim");
+    assert_eq!(
+        liveness_fixture
+            .store
+            .get_agent_task(owner.assignment_id, Some(0))
+            .await
+            .expect("expired owner task reads")
+            .current_attempt
+            .state,
+        AttemptState::NeedsMain
+    );
+
+    let fence_fixture = Fixture::new().await;
+    let fence = fence_fixture
+        .store
+        .begin_workspace_finalization(
+            fence_fixture.repo.path(),
+            "timestamp-fence-owner".to_string(),
+        )
+        .await
+        .expect("timestamp fence starts");
+    let pool = coordination_pool(&fence_fixture).await;
+    sqlx::query("UPDATE workspace_finalization_fences SET expires_at = ? WHERE fence_id = ?")
+        .bind(json_time("2099-01-01T00:00:00Z"))
+        .bind(&fence.fence_id)
+        .execute(&pool)
+        .await
+        .expect("zero-width fence expiration updates");
+    pool.close().await;
+    let replacement = crate::workspace::with_test_comparison_now(
+        fixed_time("2099-01-01T00:00:00.001Z"),
+        fence_fixture.store.begin_workspace_finalization(
+            fence_fixture.repo.path(),
+            "timestamp-fence-replacement".to_string(),
+        ),
+    )
+    .await
+    .expect("chronologically expired fence permits replacement");
+    fence_fixture
+        .store
+        .release_workspace_finalization(fence_fixture.repo.path(), replacement)
+        .await
+        .expect("replacement fence releases");
 }
 
 #[tokio::test]

@@ -3,6 +3,19 @@ use codex_models_manager::model_info::model_info_from_slug;
 use tempfile::tempdir;
 
 #[test]
+fn stage_one_prompt_is_bounded_and_relies_on_the_structured_schema() {
+    assert!(
+        crate::stage_one::PROMPT.len() <= 8_000,
+        "stage-one prompt grew to {} bytes",
+        crate::stage_one::PROMPT.len()
+    );
+    assert!(crate::stage_one::PROMPT.contains("Treat the rollout"));
+    assert!(crate::stage_one::PROMPT.contains("Prefer a complete no-op"));
+    assert!(crate::stage_one::PROMPT.contains("Choose exactly one coherent primary task group"));
+    assert!(!crate::stage_one::PROMPT.contains("Return exactly one valid JSON object"));
+}
+
+#[test]
 fn build_stage_one_input_message_truncates_rollout_using_model_context_window() {
     let input = format!("{}{}{}", "a".repeat(700_000), "middle", "z".repeat(700_000));
     let mut model_info = model_info_from_slug("gpt-5.3-codex");
@@ -68,4 +81,12 @@ fn build_consolidation_prompt_points_to_workspace_diff_and_extension_tree() {
         memory_extensions_root.display()
     )));
     assert!(prompt.contains("workspace diff shows deleted extension resource files"));
+    assert!(
+        prompt.len() <= 16_000,
+        "consolidation prompt grew to {} bytes",
+        prompt.len()
+    );
+    assert!(prompt.contains("three most recent"));
+    assert!(prompt.contains("distinct dates"));
+    assert!(prompt.contains("Creating no skill is the default"));
 }

@@ -1,6 +1,7 @@
-model_context_window = 372000
-
 approval_policy = "never"
+
+sandbox_mode = "danger-full-access"
+allow_login_shell = false
 
 [features]
 task_completion_reviewer = true
@@ -10,7 +11,7 @@ max_depth = 1
 
 [features.multi_agent_v2]
 enabled = true
-max_concurrent_threads_per_session = 5
+max_concurrent_threads_per_session = 6
 
 [agents.kd4_explorer]
 description = "Produces binding read-only KD4 implementation contracts for risky work."

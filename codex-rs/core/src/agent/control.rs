@@ -16,6 +16,8 @@ use crate::session::emit_subagent_session_started;
 use crate::session_prefix::format_inter_agent_completion_message;
 use crate::session_prefix::format_subagent_context_line;
 use crate::session_prefix::format_subagent_notification_message;
+use crate::task_evidence::ChildEvidenceProvenance;
+use crate::task_evidence::TaskEvidenceLedger;
 use crate::thread_manager::ResumeThreadWithHistoryOptions;
 use crate::thread_manager::ThreadManagerState;
 use crate::thread_rollout_truncation::truncate_rollout_to_last_n_fork_turns;
@@ -45,6 +47,11 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use tokio::sync::OwnedRwLockReadGuard;
+use tokio::sync::OwnedRwLockWriteGuard;
+use tokio::sync::RwLock;
 use tokio::sync::watch;
 use tracing::warn;
 
@@ -54,6 +61,51 @@ use self::residency::V2Residency;
 
 const ROOT_LAST_TASK_MESSAGE: &str = "Main thread";
 const TYPED_ACTOR_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const COMPLETION_FINALIZATION_DRAIN_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+#[derive(Clone, Default)]
+struct CompletionFinalizationAdmission {
+    finalizing: Arc<AtomicBool>,
+    activities: Arc<RwLock<()>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CompletionActivityPermit {
+    _guard: Arc<OwnedRwLockReadGuard<()>>,
+}
+
+impl std::fmt::Debug for CompletionActivityPermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CompletionActivityPermit")
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) struct CompletionFinalizationPermit {
+    admission: CompletionFinalizationAdmission,
+    _guard: OwnedRwLockWriteGuard<()>,
+}
+
+struct PendingCompletionFinalization {
+    admission: CompletionFinalizationAdmission,
+    committed: bool,
+}
+
+impl Drop for PendingCompletionFinalization {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.admission.finalizing.store(false, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for CompletionFinalizationPermit {
+    fn drop(&mut self) {
+        self.admission.finalizing.store(false, Ordering::Release);
+    }
+}
 
 mod execution;
 mod legacy;
@@ -194,6 +246,7 @@ pub(crate) struct AgentControl {
     rollout_budget: Arc<RolloutBudget>,
     /// Durable typed-task state shared by the root thread and all of its sub-agents.
     task_coordinator: AgentTaskCoordinator,
+    completion_finalization: CompletionFinalizationAdmission,
     #[cfg(test)]
     test_hooks: Arc<AgentControlTestHooks>,
 }
@@ -232,6 +285,125 @@ impl AgentControl {
 
     pub(crate) fn task_coordinator(&self) -> &AgentTaskCoordinator {
         &self.task_coordinator
+    }
+
+    pub(crate) async fn admit_completion_activity(
+        &self,
+    ) -> Result<CompletionActivityPermit, String> {
+        let admission = &self.completion_finalization;
+        if admission.finalizing.load(Ordering::Acquire) {
+            return Err("completion finalization is already in progress".to_string());
+        }
+        let guard = Arc::clone(&admission.activities).read_owned().await;
+        if admission.finalizing.load(Ordering::Acquire) {
+            drop(guard);
+            return Err("completion finalization began before activity admission".to_string());
+        }
+        Ok(CompletionActivityPermit {
+            _guard: Arc::new(guard),
+        })
+    }
+
+    pub(crate) async fn default_child_completion_activity(
+        &self,
+        session_source: &SessionSource,
+    ) -> CodexResult<Option<CompletionActivityPermit>> {
+        if !session_source.is_non_root_agent()
+            || self
+                .task_coordinator()
+                .binding_for_source(session_source)
+                .is_some()
+        {
+            return Ok(None);
+        }
+        self.admit_completion_activity()
+            .await
+            .map(Some)
+            .map_err(CodexErr::UnsupportedOperation)
+    }
+
+    pub(crate) async fn completion_evidence_target(
+        &self,
+        session_source: &SessionSource,
+        source_thread_id: ThreadId,
+        own_ledger: &TaskEvidenceLedger,
+    ) -> (TaskEvidenceLedger, Option<ChildEvidenceProvenance>) {
+        let Some(agent_path) = session_source.get_agent_path() else {
+            return (own_ledger.clone(), None);
+        };
+        if !session_source.is_non_root_agent()
+            || self
+                .task_coordinator()
+                .binding_for_agent_path(&agent_path)
+                .is_some()
+        {
+            return (own_ledger.clone(), None);
+        }
+        let Some(root_thread_id) = self.state.agent_id_for_path(&AgentPath::root()) else {
+            return (own_ledger.clone(), None);
+        };
+        let Ok(manager) = self.upgrade() else {
+            return (own_ledger.clone(), None);
+        };
+        let Ok(root_thread) = manager.get_thread(root_thread_id).await else {
+            return (own_ledger.clone(), None);
+        };
+        (
+            root_thread.codex.session.services.task_evidence.clone(),
+            Some(ChildEvidenceProvenance {
+                source_thread_id: source_thread_id.to_string(),
+                source_agent_path: agent_path.to_string(),
+            }),
+        )
+    }
+
+    pub(crate) async fn begin_completion_finalization(
+        &self,
+    ) -> Result<CompletionFinalizationPermit, String> {
+        let admission = self.completion_finalization.clone();
+        admission
+            .finalizing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "completion finalization is already in progress".to_string())?;
+        let mut pending = PendingCompletionFinalization {
+            admission: admission.clone(),
+            committed: false,
+        };
+        let guard = tokio::time::timeout(
+            COMPLETION_FINALIZATION_DRAIN_TIMEOUT,
+            Arc::clone(&admission.activities).write_owned(),
+        )
+        .await
+        .map_err(|_| {
+            "completion activity did not quiesce before the finalization deadline".to_string()
+        })?;
+        pending.committed = true;
+        Ok(CompletionFinalizationPermit {
+            admission,
+            _guard: guard,
+        })
+    }
+
+    pub(crate) async fn default_children_quiescence(&self) -> (bool, Vec<String>) {
+        let mut active = Vec::new();
+        for metadata in self.state.live_agents() {
+            let (Some(agent_path), Some(thread_id)) = (metadata.agent_path, metadata.agent_id)
+            else {
+                continue;
+            };
+            if self
+                .task_coordinator()
+                .binding_for_agent_path(&agent_path)
+                .is_some()
+            {
+                continue;
+            }
+            let status = self.get_status(thread_id).await;
+            if !is_final(&status) {
+                active.push(format!("{agent_path} ({status:?})"));
+            }
+        }
+        (active.is_empty(), active)
     }
 
     pub(crate) fn start_typed_actor_heartbeat_watcher(

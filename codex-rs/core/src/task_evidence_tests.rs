@@ -2,6 +2,82 @@ use super::*;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use pretty_assertions::assert_eq;
 
+// Frozen schema-admission boundary from `task_evidence.rs` at
+// 7930b330a54c86adbdaea37ecbda77977df2a74e. This deliberately does not call
+// the current loader: changing v5 cannot change both sides of the downgrade
+// refusal proof. The original v4 loader performed no write before this check.
+mod frozen_v4 {
+    use serde_json::Value;
+    use std::io;
+    use std::path::Path;
+
+    const TASK_EVIDENCE_SCHEMA_VERSION: u32 = 4;
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum Admission {
+        Missing,
+        Accepted,
+        NewerSchema { schema_version: u64 },
+        Rejected { kind: &'static str, reason: String },
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum LoadOutcome {
+        Active,
+        Disabled,
+    }
+
+    pub(super) async fn admit(path: &Path) -> Admission {
+        let bytes = match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Admission::Missing,
+            Err(err) => {
+                return Admission::Rejected {
+                    kind: "unreadable",
+                    reason: format!("could not read evidence: {err}"),
+                };
+            }
+        };
+        let value = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => value,
+            Err(err) => {
+                return Admission::Rejected {
+                    kind: "corrupt",
+                    reason: format!("invalid JSON: {err}"),
+                };
+            }
+        };
+        let schema_version = match value.get("schema_version").and_then(Value::as_u64) {
+            Some(schema_version) => schema_version,
+            None => {
+                return Admission::Rejected {
+                    kind: "incompatible",
+                    reason: "missing numeric schema_version".to_string(),
+                };
+            }
+        };
+        if schema_version > u64::from(TASK_EVIDENCE_SCHEMA_VERSION) {
+            return Admission::NewerSchema { schema_version };
+        }
+        if schema_version == 0 {
+            return Admission::Rejected {
+                kind: "incompatible",
+                reason: format!("unsupported schema version {schema_version}"),
+            };
+        }
+        Admission::Accepted
+    }
+
+    pub(super) async fn load(path: &Path) -> LoadOutcome {
+        match admit(path).await {
+            Admission::NewerSchema { .. } => LoadOutcome::Disabled,
+            Admission::Missing | Admission::Accepted | Admission::Rejected { .. } => {
+                LoadOutcome::Active
+            }
+        }
+    }
+}
+
 async fn ledger_fixture() -> (tempfile::TempDir, PathBuf, TaskEvidenceLedger) {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
@@ -15,6 +91,58 @@ async fn ledger_fixture() -> (tempfile::TempDir, PathBuf, TaskEvidenceLedger) {
     let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("absolute repo");
     let ledger = TaskEvidenceLedger::load_or_new(codex_home, ThreadId::new(), cwd.as_path()).await;
     (temp, repo, ledger)
+}
+
+fn text_input(text: &str) -> UserInput {
+    UserInput::Text {
+        text: text.to_string(),
+        text_elements: Vec::new(),
+    }
+}
+
+async fn classified_requirement_fixture() -> (
+    tempfile::TempDir,
+    PathBuf,
+    TaskEvidenceLedger,
+    CompletionReviewDossier,
+) {
+    let (temp, repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .await;
+    assert!(
+        ledger
+            .record_user_sources("message-1", &[text_input("implement alpha")])
+            .await
+    );
+    let dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("unclassified dossier");
+    let source = dossier.sources.first().expect("captured source");
+    assert!(matches!(
+        ledger
+            .apply_source_classification(
+                &dossier,
+                vec![ClassifiedSource {
+                    source_id: source.source_id.clone(),
+                    kind: ClassifiedSourceKind::RequirementBearing,
+                    requirements: vec![ClassifiedRequirement {
+                        source_span: SourceSpan::Text { start: 0, end: 15 },
+                        status: RequirementStatus::Active,
+                        superseded_by: None,
+                    }],
+                    reason: None,
+                }],
+            )
+            .await,
+        AtomicReviewTransition::Persisted(())
+    ));
+    let dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("classified dossier");
+    (temp, repo, ledger, dossier)
 }
 
 fn legacy_task_evidence_fixture(
@@ -773,7 +901,9 @@ async fn trimming_and_persistence_failure_cleanup_external_evidence_artifacts() 
     for (call_id, result) in [("first", &first), ("second", &second)] {
         assert_eq!(
             ledger
-                .record_external_mcp_evidence_with_limit("server", "tool", call_id, result, 1,)
+                .record_external_mcp_evidence_with_limit(
+                    "server", "tool", call_id, result, None, None, 1,
+                )
                 .await,
             ExternalEvidenceCapture::Stored
         );
@@ -825,7 +955,9 @@ async fn trimming_and_persistence_failure_cleanup_external_evidence_artifacts() 
     ledger.evidence_path = Some(blocked_parent.join("evidence.json"));
     assert!(matches!(
         ledger
-            .record_external_mcp_evidence_with_limit("server", "tool", "failed", &first, 1)
+            .record_external_mcp_evidence_with_limit(
+                "server", "tool", "failed", &first, None, None, 1,
+            )
             .await,
         ExternalEvidenceCapture::Warning(_)
     ));
@@ -1018,6 +1150,13 @@ fn command_receipt(id: &str) -> CommandReceipt {
         timed_out: false,
         duration_ms: 1,
         possible_mutation: false,
+        host_mutation_revision: None,
+        manifest_revision: None,
+        user_source_ledger_hash: None,
+        requirement_manifest_hash: None,
+        implementation_identity_hash: None,
+        source_thread_id: None,
+        source_agent_path: None,
     }
 }
 
@@ -1040,6 +1179,13 @@ async fn completion_review_summary_distinguishes_command_receipts_from_validatio
                 timed_out: false,
                 duration_ms: 1,
                 possible_mutation: false,
+                host_mutation_revision: None,
+                manifest_revision: None,
+                user_source_ledger_hash: None,
+                requirement_manifest_hash: None,
+                implementation_identity_hash: None,
+                source_thread_id: None,
+                source_agent_path: None,
             },
             CommandReceipt {
                 id: "timed-out".to_string(),
@@ -1052,6 +1198,13 @@ async fn completion_review_summary_distinguishes_command_receipts_from_validatio
                 timed_out: true,
                 duration_ms: 1,
                 possible_mutation: true,
+                host_mutation_revision: None,
+                manifest_revision: None,
+                user_source_ledger_hash: None,
+                requirement_manifest_hash: None,
+                implementation_identity_hash: None,
+                source_thread_id: None,
+                source_agent_path: None,
             },
             CommandReceipt {
                 id: "stale".to_string(),
@@ -1064,6 +1217,13 @@ async fn completion_review_summary_distinguishes_command_receipts_from_validatio
                 timed_out: false,
                 duration_ms: 1,
                 possible_mutation: false,
+                host_mutation_revision: None,
+                manifest_revision: None,
+                user_source_ledger_hash: None,
+                requirement_manifest_hash: None,
+                implementation_identity_hash: None,
+                source_thread_id: None,
+                source_agent_path: None,
             },
         ];
     }
@@ -1453,7 +1613,7 @@ async fn generated_artifact_gate_checks_current_file_state() {
         .completion_gate()
         .await
         .expect("missing gate");
-    assert_eq!(missing_gate.status, TaskCompletionStatus::Blocked);
+    assert_eq!(missing_gate.status, TaskCompletionStatus::Partial);
     assert!(
         missing_gate
             .reasons
@@ -1489,7 +1649,7 @@ async fn generated_artifact_gate_checks_current_file_state() {
         .completion_gate()
         .await
         .expect("deleted gate");
-    assert_eq!(deleted_gate.status, TaskCompletionStatus::Blocked);
+    assert_eq!(deleted_gate.status, TaskCompletionStatus::Partial);
     let guard = present_ledger.document.lock().await;
     assert_eq!(
         guard.as_ref().expect("document").plan[0].status,
@@ -1591,7 +1751,7 @@ async fn generated_artifact_gate_rejects_repository_escape_paths() {
         step.generated_artifacts = vec![artifact];
         ledger.record_plan_update(&plan_with(vec![step])).await;
         let gate = ledger.completion_gate().await.expect("escape gate");
-        assert_eq!(gate.status, TaskCompletionStatus::Blocked);
+        assert_eq!(gate.status, TaskCompletionStatus::Partial);
         assert!(
             gate.reasons
                 .iter()
@@ -1755,7 +1915,7 @@ async fn v3_obsolete_validation_state_is_discarded_during_shape_migration() {
 }
 
 #[tokio::test]
-async fn v3_to_v4_discards_obsolete_repair_counter_without_reopening_passed_work() {
+async fn v3_to_current_discards_obsolete_repair_counter_without_reopening_passed_work() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     ledger
         .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
@@ -1811,7 +1971,10 @@ async fn v3_to_v4_discards_obsolete_repair_counter_without_reopening_passed_work
             .expect("persisted v4 evidence"),
     )
     .expect("valid persisted v4 evidence");
-    assert_eq!(persisted["schema_version"], serde_json::json!(4));
+    assert_eq!(
+        persisted["schema_version"],
+        serde_json::json!(TASK_EVIDENCE_SCHEMA_VERSION)
+    );
     assert!(persisted.get("repair_turns_used").is_none());
 }
 
@@ -1867,6 +2030,342 @@ async fn completion_review_receipts_are_bounded_and_never_change_completion_cont
 }
 
 #[tokio::test]
+async fn frozen_v4_loader_refuses_v5_without_modifying_the_file() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .await;
+    let evidence_path = ledger
+        .evidence_path
+        .as_ref()
+        .expect("evidence path")
+        .clone();
+    let document = ledger
+        .document
+        .lock()
+        .await
+        .as_ref()
+        .expect("document")
+        .clone();
+    let mut future = serde_json::to_value(document).expect("serialize");
+    future["schema_version"] = serde_json::json!(5);
+    let future_bytes = serde_json::to_vec_pretty(&future).expect("serialize v5 evidence");
+    tokio::fs::write(&evidence_path, &future_bytes)
+        .await
+        .expect("write v5 evidence");
+
+    assert_eq!(
+        frozen_v4::admit(&evidence_path).await,
+        frozen_v4::Admission::NewerSchema { schema_version: 5 }
+    );
+    assert_eq!(
+        frozen_v4::load(&evidence_path).await,
+        frozen_v4::LoadOutcome::Disabled
+    );
+    assert_eq!(
+        tokio::fs::read(&evidence_path)
+            .await
+            .expect("untouched v5 evidence"),
+        future_bytes
+    );
+}
+
+#[tokio::test]
+async fn rich_v4_to_v5_migration_preserves_evidence_and_seeds_terminal_lineage() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    let home = temp.path().join("home");
+    tokio::fs::create_dir_all(repo.join(".git"))
+        .await
+        .expect("git directory");
+    tokio::fs::create_dir_all(repo.join("src"))
+        .await
+        .expect("source directory");
+    tokio::fs::create_dir_all(repo.join("generated"))
+        .await
+        .expect("generated directory");
+    tokio::fs::write(repo.join("kd4_features.toml"), "# fixture")
+        .await
+        .expect("manifest");
+    let owned_bytes = b"pub fn migrated() {}\n";
+    let generated_bytes = br#"{"schema":4}"#;
+    tokio::fs::write(repo.join("src/owned.rs"), owned_bytes)
+        .await
+        .expect("owned file");
+    tokio::fs::write(repo.join("generated/out.json"), generated_bytes)
+        .await
+        .expect("generated artifact");
+
+    let thread_id = ThreadId::new();
+    let evidence_path = home.join("task-evidence").join(format!("{thread_id}.json"));
+    tokio::fs::create_dir_all(evidence_path.parent().expect("evidence parent"))
+        .await
+        .expect("evidence directory");
+    let mut v4 = legacy_task_evidence_fixture(
+        FROZEN_TASK_EVIDENCE_V4_SCHEMA_VERSION,
+        &thread_id.to_string(),
+        &repo,
+        "passed",
+    );
+    v4["revision"] = serde_json::json!(41);
+    v4["evidence_epoch"] = serde_json::json!(7);
+    v4["host_mutation_revision"] = serde_json::json!(3);
+    v4["last_mutation_at"] = serde_json::json!("2026-07-31T23:59:00Z");
+    v4["plan"] = serde_json::json!([
+        {
+            "id": "prepare",
+            "step": "prepare the owned contract",
+            "status": "passed",
+            "depends_on": [],
+            "acceptance_criteria": ["owned behavior is present"],
+            "runtime_paths": ["core/runtime/prepare"],
+            "generated_artifacts": ["generated/out.json"],
+            "risks": ["preserve the v4 contract"],
+            "requires_desktop_activation": false,
+            "edit_paths": ["src/owned.rs"]
+        },
+        {
+            "id": "verify",
+            "step": "verify the migrated contract",
+            "status": "passed",
+            "depends_on": ["prepare"],
+            "acceptance_criteria": ["proof remains attributable"],
+            "runtime_paths": ["core/runtime/verify"],
+            "generated_artifacts": [],
+            "risks": [],
+            "requires_desktop_activation": false,
+            "edit_paths": []
+        }
+    ]);
+    v4["active_step_id"] = Value::Null;
+    v4["edit_intents"] = serde_json::json!([{
+        "call_id": "edit-call",
+        "step_id": "prepare",
+        "started_at": "2026-07-31T23:58:00Z",
+        "completed_at": "2026-07-31T23:58:01Z",
+        "outcome": "success",
+        "files": [{
+            "path": "src/owned.rs",
+            "sha1": null,
+            "exists": false,
+            "read_error": null
+        }]
+    }]);
+    v4["edit_receipts"] = serde_json::json!([{
+        "id": "edit-1",
+        "call_id": "edit-call",
+        "step_id": "prepare",
+        "recorded_at": "2026-07-31T23:58:01Z",
+        "epoch": 7,
+        "outcome": "success",
+        "files": [{
+            "path": "src/owned.rs",
+            "before_sha1": null,
+            "after_sha1": sha1_hex(owned_bytes),
+            "before_exists": false,
+            "after_exists": true,
+            "before_read_error": null,
+            "after_read_error": null
+        }]
+    }]);
+    v4["command_receipts"] = serde_json::json!([{
+        "id": "command-1",
+        "recorded_at": "2026-07-31T23:58:02Z",
+        "epoch": 7,
+        "step_id": "verify",
+        "command": ["cargo", "test", "focused"],
+        "cwd": repo.to_string_lossy(),
+        "exit_code": 0,
+        "timed_out": false,
+        "duration_ms": 12,
+        "possible_mutation": false
+    }]);
+    v4["completion_review_receipts"] = serde_json::json!([{
+        "turn_id": "legacy-review-turn",
+        "recorded_at": "2026-07-31T23:58:03Z",
+        "evidence_epoch": 7,
+        "outcome": "clean",
+        "failure_category": null,
+        "finding_summary": [],
+        "repair_injected": false
+    }]);
+    v4["generated_artifact_requirements"] = serde_json::json!([{
+        "id": "prepare:generated:0",
+        "step_id": "prepare",
+        "path": "generated/out.json"
+    }]);
+    v4["latest_generated_artifact_hashes"] = serde_json::json!({
+        "generated/out.json": {
+            "path": "generated/out.json",
+            "sha1": sha1_hex(generated_bytes),
+            "exists": true,
+            "read_error": null
+        }
+    });
+    v4["latest_file_hashes"] = serde_json::json!({
+        "src/owned.rs": {
+            "path": "src/owned.rs",
+            "sha1": sha1_hex(owned_bytes),
+            "exists": true,
+            "read_error": null
+        }
+    });
+    v4["risks"] = serde_json::json!([{
+        "id": "legacy-observed-risk",
+        "description": "legacy risk was explicitly resolved",
+        "source": "command",
+        "blocking": false,
+        "resolved": true,
+        "epoch": 7
+    }]);
+    v4["desktop_activation_receipt"] = serde_json::json!({
+        "epoch": 7,
+        "recorded_at": "2026-07-31T23:58:04Z",
+        "process_path": "C:/legacy/codex.exe",
+        "binary_sha1": "0123456789abcdef0123456789abcdef01234567",
+        "runtime_evidence": "legacy desktop restarted"
+    });
+    v4["next_edit_receipt_sequence"] = serde_json::json!(2);
+    v4["next_command_receipt_sequence"] = serde_json::json!(2);
+    v4["next_external_evidence_receipt_sequence"] = serde_json::json!(1);
+    v4["completion"] = serde_json::json!({
+        "status": "passed",
+        "reasons": [],
+        "evidence_path": evidence_path.to_string_lossy()
+    });
+    tokio::fs::write(
+        &evidence_path,
+        serde_json::to_vec_pretty(&v4).expect("serialize rich v4 fixture"),
+    )
+    .await
+    .expect("write rich v4 fixture");
+
+    let migrated = TaskEvidenceLedger::load_or_new(home.clone(), thread_id, &repo).await;
+    {
+        let guard = migrated.document.lock().await;
+        let document = guard.as_ref().expect("migrated document");
+        assert_eq!(document.schema_version, TASK_EVIDENCE_SCHEMA_VERSION);
+        assert_eq!(document.evidence_epoch, 7);
+        assert_eq!(document.host_mutation_revision, 3);
+        assert_eq!(
+            document.last_mutation_at.as_deref(),
+            Some("2026-07-31T23:59:00Z")
+        );
+        assert_eq!(document.plan.len(), 2);
+        assert_eq!(document.plan[1].depends_on, ["prepare"]);
+        assert_eq!(
+            document.plan[0].acceptance_criteria,
+            ["owned behavior is present"]
+        );
+        assert_eq!(document.plan[0].runtime_paths, ["core/runtime/prepare"]);
+        assert_eq!(document.plan[0].generated_artifacts, ["generated/out.json"]);
+        assert_eq!(document.plan[0].risks, ["preserve the v4 contract"]);
+        assert_eq!(document.edit_intents.len(), 1);
+        assert_eq!(document.edit_receipts.len(), 1);
+        assert_eq!(document.command_receipts.len(), 1);
+        assert!(
+            document.command_receipts[0]
+                .implementation_identity_hash
+                .is_none()
+        );
+        assert_eq!(document.completion_review_receipts.len(), 1);
+        let owned_hash = sha1_hex(owned_bytes);
+        assert_eq!(
+            document.latest_file_hashes["src/owned.rs"].sha1.as_deref(),
+            Some(owned_hash.as_str())
+        );
+        let generated_hash = sha1_hex(generated_bytes);
+        assert_eq!(
+            document.latest_generated_artifact_hashes["generated/out.json"]
+                .sha1
+                .as_deref(),
+            Some(generated_hash.as_str())
+        );
+        assert!(
+            document
+                .risks
+                .iter()
+                .any(|risk| { risk.id == "legacy-observed-risk" && risk.resolved })
+        );
+        let activation = document
+            .desktop_activation_receipt
+            .as_ref()
+            .expect("legacy activation receipt");
+        assert_eq!(
+            activation.process_path.as_deref(),
+            Some("C:/legacy/codex.exe")
+        );
+        assert_eq!(
+            activation.binary_sha1.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
+        assert_eq!(
+            activation.runtime_evidence.as_deref(),
+            Some("legacy desktop restarted")
+        );
+        assert!(!desktop_activation_receipt_is_complete(activation));
+        assert_eq!(
+            document.completion.as_ref().map(|gate| gate.status),
+            Some(TaskCompletionStatus::Passed)
+        );
+        let review = document.completion_review_v2.as_ref().expect("V2 ledger");
+        assert_eq!(review.receipts.len(), 2);
+        assert_eq!(review.next_review_sequence, 3);
+        assert_eq!(
+            review.receipts[0].attempt_kind,
+            CompletionReviewAttemptKind::InitialReview
+        );
+        assert_eq!(
+            review.receipts[1].attempt_kind,
+            CompletionReviewAttemptKind::TerminalClosure
+        );
+        assert_eq!(
+            review.receipts[1].parent_review_id.as_deref(),
+            Some(review.receipts[0].review_id.as_str())
+        );
+        assert_eq!(
+            review.active_review_cycle.as_ref().map(|cycle| cycle.phase),
+            Some(CompletionReviewCyclePhase::Closed)
+        );
+        assert!(!review.review_risk.unresolved);
+        assert_eq!(
+            review.last_terminal_closure.as_deref(),
+            Some(review.receipts[1].review_id.as_str())
+        );
+    }
+    drop(migrated);
+
+    match load_existing_document(&evidence_path, &thread_id.to_string(), &repo).await {
+        ExistingDocument::Loaded { .. } => {}
+        ExistingDocument::Rejected { kind, reason } => {
+            panic!("migrated v5 evidence was rejected as {kind}: {reason}")
+        }
+        ExistingDocument::NewerSchema { schema_version } => {
+            panic!("migrated v5 evidence was treated as schema {schema_version}")
+        }
+        ExistingDocument::Missing => panic!("migrated v5 evidence disappeared"),
+    }
+    let reloaded = TaskEvidenceLedger::load_or_new(home, thread_id, &repo).await;
+    let guard = reloaded.document.lock().await;
+    let document = guard.as_ref().expect("reloaded migrated document");
+    assert_eq!(document.schema_version, TASK_EVIDENCE_SCHEMA_VERSION);
+    assert_eq!(document.plan.len(), 2);
+    assert_eq!(
+        document
+            .completion_review_v2
+            .as_ref()
+            .expect("reloaded V2 ledger")
+            .receipts
+            .len(),
+        2
+    );
+    assert_eq!(
+        document.completion.as_ref().map(|gate| gate.status),
+        Some(TaskCompletionStatus::Passed)
+    );
+}
+
+#[tokio::test]
 async fn newer_schema_payload_disables_ledger_without_modifying_the_file() {
     let (_temp, repo, ledger) = ledger_fixture().await;
     ledger
@@ -1887,22 +2386,22 @@ async fn newer_schema_payload_disables_ledger_without_modifying_the_file() {
         .expect("document")
         .clone();
     let mut legacy = serde_json::to_value(document).expect("serialize");
-    legacy["schema_version"] = serde_json::json!(5);
+    legacy["schema_version"] = serde_json::json!(6);
     legacy["lifecycle"] = serde_json::json!({
         "phase": "ready",
         "outcome": "passed",
         "mutation_revision": 1,
         "accepted_evidence_revision": 1
     });
-    let legacy_bytes = serde_json::to_vec_pretty(&legacy).expect("serialize v5 evidence");
+    let legacy_bytes = serde_json::to_vec_pretty(&legacy).expect("serialize v6 evidence");
     tokio::fs::write(&evidence_path, &legacy_bytes)
         .await
-        .expect("write v5 evidence");
+        .expect("write v6 evidence");
     drop(ledger);
 
     assert!(matches!(
         load_existing_document(&evidence_path, &thread_id, &repo).await,
-        ExistingDocument::NewerSchema { schema_version: 5 }
+        ExistingDocument::NewerSchema { schema_version: 6 }
     ));
 
     let reloaded = TaskEvidenceLedger::load_or_new(
@@ -1915,7 +2414,7 @@ async fn newer_schema_payload_disables_ledger_without_modifying_the_file() {
     assert_eq!(
         tokio::fs::read(&evidence_path)
             .await
-            .expect("untouched v5 evidence"),
+            .expect("untouched v6 evidence"),
         legacy_bytes
     );
 
@@ -1998,7 +2497,7 @@ async fn storage_failure_is_tracked_and_fail_closed() {
     }
 
     let gate = ledger.completion_gate().await.expect("fail-closed gate");
-    assert_eq!(gate.status, TaskCompletionStatus::Blocked);
+    assert_eq!(gate.status, TaskCompletionStatus::Partial);
     assert!(
         gate.reasons
             .iter()
@@ -2086,7 +2585,7 @@ async fn wait_persistence_barrier(barrier: Arc<std::sync::Barrier>) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn completion_persistence_failure_blocks_then_recovers_when_storage_returns() {
+async fn completion_persistence_failure_is_partial_then_recovers_when_storage_returns() {
     let (_temp, _repo, ledger) = ledger_fixture().await;
     ledger
         .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
@@ -2103,7 +2602,7 @@ async fn completion_persistence_failure_blocks_then_recovers_when_storage_return
         .expect("completion task")
         .expect("completion gate");
 
-    assert_eq!(gate.status, TaskCompletionStatus::Blocked);
+    assert_eq!(gate.status, TaskCompletionStatus::Partial);
     assert!(
         gate.reasons
             .iter()
@@ -2117,7 +2616,7 @@ async fn completion_persistence_failure_blocks_then_recovers_when_storage_return
             .iter()
             .find(|risk| risk.source == "task_evidence_storage")
             .expect("storage risk");
-        assert!(storage_risk.blocking);
+        assert!(!storage_risk.blocking);
         assert!(!storage_risk.resolved);
         assert_eq!(
             document
@@ -2125,7 +2624,7 @@ async fn completion_persistence_failure_blocks_then_recovers_when_storage_return
                 .as_ref()
                 .expect("cached completion")
                 .status,
-            TaskCompletionStatus::Blocked
+            TaskCompletionStatus::Partial
         );
     }
 
@@ -2321,4 +2820,1150 @@ fn unreadable_risk_ids_are_stable() {
     assert!(edit_outcome_succeeded("completed"));
     assert!(!edit_outcome_succeeded(" completed "));
     assert!(!edit_outcome_succeeded("failed"));
+}
+
+#[test]
+fn legacy_self_asserted_desktop_activation_receipts_never_satisfy_completion() {
+    let receipt = DesktopActivationReceipt {
+        epoch: 7,
+        activation_timestamp: "2026-08-02T12:00:01Z".to_string(),
+        process_path: None,
+        binary_sha1: None,
+        runtime_evidence: None,
+        expected_installed_executable_path: "C:/local/codex.exe".to_string(),
+        installed_executable_sha256: "b".repeat(64),
+        running_process_id: 4101,
+        running_process_identity: "self-asserted running process".to_string(),
+        observed_running_executable_path: "C:/local/codex.exe".to_string(),
+        desktop_process_id: 4100,
+        desktop_process_identity: "self-asserted Desktop process".to_string(),
+        desktop_executable_path: "C:/local/Codex.exe".to_string(),
+        post_restart_initialization_observation: "self-asserted initialization".to_string(),
+        observation_timestamp: "2026-08-02T12:00:01Z".to_string(),
+        implementation_identity_hash: Some("a".repeat(64)),
+    };
+
+    assert!(!desktop_activation_receipt_is_complete(&receipt));
+}
+
+#[tokio::test]
+async fn local_user_source_capture_hashes_across_multiple_bounded_chunks() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    let image = repo.join("multi-chunk-review-image.png");
+    let bytes = (0..FILE_HASH_CHUNK_SIZE * 2 + 17)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    tokio::fs::write(&image, &bytes)
+        .await
+        .expect("multi-chunk image fixture");
+
+    assert!(
+        ledger
+            .record_user_sources(
+                "message-with-multi-chunk-image",
+                &[UserInput::LocalImage {
+                    path: image,
+                    detail: None,
+                }],
+            )
+            .await
+    );
+    let dossier = ledger
+        .completion_review_dossier(None, &[], &[], &[], true, true)
+        .await
+        .expect("completion review dossier");
+    let source = dossier.sources.first().expect("captured image source");
+    assert_eq!(source.availability, UserSourceAvailability::Available);
+    assert!(
+        source
+            .exact_material
+            .ends_with(&format!("#sha256={:x}", Sha256::digest(&bytes)))
+    );
+}
+
+#[tokio::test]
+async fn unavailable_local_image_is_preserved_as_an_unavailable_user_source() {
+    let (_temp, repo, ledger) = ledger_fixture().await;
+    let missing_image = repo.join("missing-review-image.png");
+    assert!(
+        ledger
+            .record_user_sources(
+                "message-with-missing-image",
+                &[UserInput::LocalImage {
+                    path: missing_image.clone(),
+                    detail: None,
+                }],
+            )
+            .await
+    );
+
+    let dossier = ledger
+        .completion_review_dossier(None, &[], &[], &[], true, true)
+        .await
+        .expect("completion review dossier");
+    let source = dossier.sources.first().expect("captured image source");
+    assert_eq!(source.source_kind, UserSourceKind::Image);
+    assert_eq!(source.availability, UserSourceAvailability::Unavailable);
+    assert!(source.exact_material.contains("missing-review-image.png"));
+
+    assert!(matches!(
+        ledger
+            .apply_source_classification(
+                &dossier,
+                vec![ClassifiedSource {
+                    source_id: source.source_id.clone(),
+                    kind: ClassifiedSourceKind::UnavailableOrTruncated,
+                    requirements: Vec::new(),
+                    reason: None,
+                }],
+            )
+            .await,
+        AtomicReviewTransition::Persisted(())
+    ));
+    let classified = ledger
+        .completion_review_dossier(None, &[], &[], &[], true, true)
+        .await
+        .expect("classified completion review dossier");
+    assert!(matches!(
+        classified.source_mappings.get(&source.source_id),
+        Some(SourceMapping::UnavailableOrTruncated)
+    ));
+}
+
+#[tokio::test]
+async fn source_classification_rejects_supersession_cycles_before_persistence() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    assert!(
+        ledger
+            .record_user_sources("message-1", &[text_input("alpha"), text_input("beta")])
+            .await
+    );
+    let dossier = ledger
+        .completion_review_dossier(None, &[], &[], &[], true, true)
+        .await
+        .expect("completion review dossier");
+    let alpha = dossier
+        .sources
+        .iter()
+        .find(|source| source.exact_material == "alpha")
+        .expect("alpha source");
+    let beta = dossier
+        .sources
+        .iter()
+        .find(|source| source.exact_material == "beta")
+        .expect("beta source");
+    let alpha_ref = ClassifiedRequirementRef {
+        source_id: alpha.source_id.clone(),
+        source_span: SourceSpan::Text { start: 0, end: 5 },
+    };
+    let beta_ref = ClassifiedRequirementRef {
+        source_id: beta.source_id.clone(),
+        source_span: SourceSpan::Text { start: 0, end: 4 },
+    };
+    let classifications = |beta_status, beta_superseded_by| {
+        vec![
+            ClassifiedSource {
+                source_id: alpha.source_id.clone(),
+                kind: ClassifiedSourceKind::RequirementBearing,
+                requirements: vec![ClassifiedRequirement {
+                    source_span: alpha_ref.source_span.clone(),
+                    status: RequirementStatus::Superseded,
+                    superseded_by: Some(beta_ref.clone()),
+                }],
+                reason: None,
+            },
+            ClassifiedSource {
+                source_id: beta.source_id.clone(),
+                kind: ClassifiedSourceKind::RequirementBearing,
+                requirements: vec![ClassifiedRequirement {
+                    source_span: beta_ref.source_span.clone(),
+                    status: beta_status,
+                    superseded_by: beta_superseded_by,
+                }],
+                reason: None,
+            },
+        ]
+    };
+
+    assert_eq!(
+        ledger
+            .apply_source_classification(
+                &dossier,
+                classifications(RequirementStatus::Superseded, Some(alpha_ref.clone())),
+            )
+            .await,
+        AtomicReviewTransition::Failed
+    );
+    assert!(matches!(
+        ledger
+            .apply_source_classification(
+                &dossier,
+                classifications(RequirementStatus::Active, None),
+            )
+            .await,
+        AtomicReviewTransition::Persisted(())
+    ));
+}
+
+#[test]
+fn supersession_graph_validation_rejects_self_and_multi_node_cycles() {
+    let requirement = |id: &str, superseded_by: Option<&str>| RequirementRecord {
+        requirement_id: id.to_string(),
+        source_id: format!("source-{id}"),
+        source_content_hash: "hash".to_string(),
+        source_span: SourceSpan::Text { start: 0, end: 1 },
+        exact_material: id.to_string(),
+        status: if superseded_by.is_some() {
+            RequirementStatus::Superseded
+        } else {
+            RequirementStatus::Active
+        },
+        superseded_by: superseded_by.map(str::to_string),
+    };
+    assert!(!requirement_supersession_is_acyclic(&[requirement(
+        "A",
+        Some("A")
+    )]));
+    assert!(!requirement_supersession_is_acyclic(&[
+        requirement("A", Some("B")),
+        requirement("B", Some("A")),
+    ]));
+    assert!(requirement_supersession_is_acyclic(&[
+        requirement("A", Some("B")),
+        requirement("B", None),
+    ]));
+}
+
+#[tokio::test]
+async fn proof_accumulation_changes_dossier_but_not_implementation_identity() {
+    let (_temp, repo, ledger, before) = classified_requirement_fixture().await;
+    let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo path");
+    ledger
+        .record_command_bound_with_provenance(
+            &["proof-a".to_string()],
+            &PathUri::from_abs_path(&cwd),
+            0,
+            false,
+            1,
+            false,
+            None,
+            Some(&before.implementation_identity_hash),
+        )
+        .await;
+    let after_a = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("dossier after proof A");
+    ledger
+        .record_command_bound_with_provenance(
+            &["proof-b".to_string()],
+            &PathUri::from_abs_path(&cwd),
+            0,
+            false,
+            1,
+            false,
+            None,
+            Some(&before.implementation_identity_hash),
+        )
+        .await;
+    let after_b = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("dossier after proof B");
+
+    assert_eq!(
+        before.implementation_identity_hash,
+        after_a.implementation_identity_hash
+    );
+    assert_eq!(
+        after_a.implementation_identity_hash,
+        after_b.implementation_identity_hash
+    );
+    assert_ne!(before.dossier_snapshot_id, after_a.dossier_snapshot_id);
+    assert_ne!(after_a.dossier_snapshot_id, after_b.dossier_snapshot_id);
+    assert_eq!(
+        before.reviewer_visible_evidence["proofReceipts"]
+            .as_array()
+            .expect("proof list")
+            .len(),
+        0
+    );
+    assert_eq!(
+        after_a.reviewer_visible_evidence["proofReceipts"]
+            .as_array()
+            .expect("proof list")
+            .len(),
+        1
+    );
+    let proofs = after_b.reviewer_visible_evidence["proofReceipts"]
+        .as_array()
+        .expect("proof list");
+    assert_eq!(proofs.len(), 2);
+    assert!(proofs.iter().all(|proof| {
+        proof["boundImplementationIdentity"].as_str()
+            == Some(after_b.implementation_identity_hash.as_str())
+    }));
+}
+
+#[tokio::test]
+async fn terminal_closure_is_atomic_and_reload_preserves_v2_lineage() {
+    let (temp, repo, ledger, initial_dossier) = classified_requirement_fixture().await;
+    let ledger = Arc::new(ledger);
+    assert!(matches!(
+        ledger.begin_completion_review_cycle(&initial_dossier).await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+    let review_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("review dossier");
+    assert_eq!(
+        initial_dossier.implementation_identity_hash,
+        review_dossier.implementation_identity_hash
+    );
+    assert_eq!(
+        initial_dossier.dossier_snapshot_id,
+        review_dossier.dossier_snapshot_id
+    );
+    let recorded = match ledger
+        .record_completion_review_attempt_v2(
+            &review_dossier,
+            CompletionReviewAttemptInput {
+                attempt_kind: CompletionReviewAttemptKind::InitialReview,
+                parent_review_id: review_dossier.cycle_parent_review_id.clone(),
+                superseded_review_id: None,
+                findings: Vec::new(),
+                dispositions: Vec::new(),
+                manifest_gaps: Vec::new(),
+                repair_instruction: None,
+                repair_instruction_hash: None,
+                infrastructure_outcome: "ok".to_string(),
+                review_clean: true,
+                terminal_outcome: None,
+            },
+        )
+        .await
+    {
+        AtomicReviewTransition::Persisted(recorded) => recorded,
+        other => panic!("clean initial review did not persist: {other:?}"),
+    };
+    let closure_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("terminal dossier");
+    assert_eq!(
+        review_dossier.implementation_identity_hash,
+        closure_dossier.implementation_identity_hash
+    );
+    assert_eq!(
+        review_dossier.dossier_snapshot_id,
+        closure_dossier.dossier_snapshot_id
+    );
+    let evidence_path = ledger
+        .evidence_path
+        .as_ref()
+        .expect("evidence path")
+        .clone();
+    let bytes_before_failed_closure = tokio::fs::read(&evidence_path)
+        .await
+        .expect("evidence before failed closure");
+    let receipts_before_failed_closure = {
+        let guard = ledger.document.lock().await;
+        guard
+            .as_ref()
+            .expect("task evidence")
+            .completion_review_v2
+            .as_ref()
+            .expect("V2 ledger")
+            .receipts
+            .len()
+    };
+    let (started, release) = install_persistence_test_control(&ledger, true);
+    let failed_ledger = Arc::clone(&ledger);
+    let failed_dossier = closure_dossier.clone();
+    let failed_closure = tokio::spawn(async move {
+        failed_ledger
+            .finalize_completion_review(&failed_dossier)
+            .await
+    });
+    wait_persistence_barrier(started).await;
+    wait_persistence_barrier(release).await;
+    assert!(matches!(
+        failed_closure.await.expect("failed closure task"),
+        AtomicReviewTransition::Failed
+    ));
+    assert_eq!(
+        tokio::fs::read(&evidence_path)
+            .await
+            .expect("evidence after failed closure"),
+        bytes_before_failed_closure
+    );
+    {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("task evidence");
+        let review = document.completion_review_v2.as_ref().expect("V2 ledger");
+        assert_eq!(review.receipts.len(), receipts_before_failed_closure);
+        assert!(review.review_risk.unresolved);
+        assert_eq!(
+            review.active_review_cycle.as_ref().map(|cycle| cycle.phase),
+            Some(CompletionReviewCyclePhase::ProvisionalClean)
+        );
+        assert_ne!(
+            document.completion.as_ref().map(|gate| gate.status),
+            Some(TaskCompletionStatus::Passed)
+        );
+    }
+    set_persistence_test_failure(&ledger, false);
+    let gate = match ledger.finalize_completion_review(&closure_dossier).await {
+        AtomicReviewTransition::Persisted(gate) => gate,
+        other => panic!("terminal closure did not persist: {other:?}"),
+    };
+    assert_eq!(gate.status, TaskCompletionStatus::Passed);
+
+    let thread_id = ledger.thread_id.clone().expect("thread ID");
+    {
+        let guard = ledger.document.lock().await;
+        let document = guard.as_ref().expect("task evidence");
+        let review = document.completion_review_v2.as_ref().expect("V2 ledger");
+        let terminal = review.receipts.last().expect("terminal receipt");
+        assert_eq!(
+            terminal.attempt_kind,
+            CompletionReviewAttemptKind::TerminalClosure
+        );
+        assert_eq!(
+            terminal.parent_review_id.as_deref(),
+            Some(recorded.review_id.as_str())
+        );
+        assert_eq!(terminal.terminal_outcome.as_deref(), Some("passed"));
+        assert!(!review.review_risk.unresolved);
+        assert_eq!(
+            review.last_terminal_closure.as_deref(),
+            Some(terminal.review_id.as_str())
+        );
+        assert_eq!(
+            review.active_review_cycle.as_ref().map(|cycle| cycle.phase),
+            Some(CompletionReviewCyclePhase::Closed)
+        );
+    }
+    drop(ledger);
+
+    let reloaded = TaskEvidenceLedger::load_or_new(
+        temp.path().join("home"),
+        ThreadId::from_string(&thread_id).expect("thread ID parses"),
+        &repo,
+    )
+    .await;
+    let dossier = reloaded
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("reloaded dossier");
+    assert!(reloaded.passed_completion_matches_dossier(&dossier).await);
+}
+
+#[tokio::test]
+async fn rereview_infrastructure_failure_survives_v5_reload() {
+    let (temp, repo, ledger, initial_dossier) = classified_requirement_fixture().await;
+    assert!(matches!(
+        ledger.begin_completion_review_cycle(&initial_dossier).await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+    let review_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("review dossier");
+    let requirement_id = review_dossier.requirements[0].requirement_id.clone();
+    let initial_review = match ledger
+        .record_completion_review_attempt_v2(
+            &review_dossier,
+            CompletionReviewAttemptInput {
+                attempt_kind: CompletionReviewAttemptKind::InitialReview,
+                parent_review_id: review_dossier.cycle_parent_review_id.clone(),
+                superseded_review_id: None,
+                findings: vec![CompletionReviewFindingInput {
+                    local_ordinal: 1,
+                    requirement_ids: vec![requirement_id],
+                    lens: COMPLETION_REVIEW_LENSES[0].to_string(),
+                    contract_surface: "bounded owner".to_string(),
+                    severity: "high".to_string(),
+                    evidence: "the active requirement is not met".to_string(),
+                    smallest_correction: "implement the missing behavior".to_string(),
+                    proof_route: "cargo test focused_case".to_string(),
+                }],
+                dispositions: Vec::new(),
+                manifest_gaps: Vec::new(),
+                repair_instruction: Some("fix the complete finding set".to_string()),
+                repair_instruction_hash: None,
+                infrastructure_outcome: "ok".to_string(),
+                review_clean: false,
+                terminal_outcome: None,
+            },
+        )
+        .await
+    {
+        AtomicReviewTransition::Persisted(recorded) => recorded,
+        other => panic!("initial finding review did not persist: {other:?}"),
+    };
+    let correction_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("correction dossier");
+    assert!(matches!(
+        ledger
+            .record_completion_review_attempt_v2(
+                &correction_dossier,
+                CompletionReviewAttemptInput {
+                    attempt_kind: CompletionReviewAttemptKind::CorrectionEvidence,
+                    parent_review_id: Some(initial_review.review_id.clone()),
+                    superseded_review_id: None,
+                    findings: Vec::new(),
+                    dispositions: Vec::new(),
+                    manifest_gaps: Vec::new(),
+                    repair_instruction: None,
+                    repair_instruction_hash: correction_dossier
+                        .initial_repair_instruction_hash
+                        .clone(),
+                    infrastructure_outcome: "ok".to_string(),
+                    review_clean: false,
+                    terminal_outcome: None,
+                },
+            )
+            .await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+    let rereview_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("rereview dossier");
+    let failed_rereview = match ledger
+        .record_completion_review_attempt_v2(
+            &rereview_dossier,
+            CompletionReviewAttemptInput {
+                attempt_kind: CompletionReviewAttemptKind::Rereview,
+                parent_review_id: Some(initial_review.review_id),
+                superseded_review_id: None,
+                findings: Vec::new(),
+                dispositions: Vec::new(),
+                manifest_gaps: Vec::new(),
+                repair_instruction: None,
+                repair_instruction_hash: None,
+                infrastructure_outcome: "timeout".to_string(),
+                review_clean: false,
+                terminal_outcome: Some("partial".to_string()),
+            },
+        )
+        .await
+    {
+        AtomicReviewTransition::Persisted(recorded) => recorded,
+        other => panic!("failed rereview did not persist: {other:?}"),
+    };
+
+    let thread_id = ledger.thread_id.clone().expect("thread ID");
+    drop(ledger);
+    let reloaded = TaskEvidenceLedger::load_or_new(
+        temp.path().join("home"),
+        ThreadId::from_string(&thread_id).expect("thread ID parses"),
+        &repo,
+    )
+    .await;
+    let guard = reloaded.document.lock().await;
+    let document = guard.as_ref().expect("reloaded v5 evidence");
+    assert_eq!(
+        document.completion.as_ref().map(|gate| gate.status),
+        Some(TaskCompletionStatus::Partial)
+    );
+    let review = document
+        .completion_review_v2
+        .as_ref()
+        .expect("reloaded V2 ledger");
+    let receipt = review
+        .receipts
+        .iter()
+        .find(|receipt| receipt.review_id == failed_rereview.review_id)
+        .expect("failed rereview receipt");
+    assert_eq!(receipt.infrastructure_outcome, "timeout");
+    assert!(receipt.findings.is_empty());
+    assert!(receipt.dispositions.is_empty());
+    let terminal = review.receipts.last().expect("partial terminal closure");
+    assert_eq!(
+        terminal.parent_review_id.as_deref(),
+        Some(failed_rereview.review_id.as_str())
+    );
+    assert_eq!(terminal.terminal_outcome.as_deref(), Some("partial"));
+}
+
+#[tokio::test]
+async fn last_second_mutation_invalidates_a_provisional_clean_review() {
+    let (_temp, repo, ledger, initial_dossier) = classified_requirement_fixture().await;
+    assert!(matches!(
+        ledger.begin_completion_review_cycle(&initial_dossier).await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+    let review_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("review dossier");
+    assert!(matches!(
+        ledger
+            .record_completion_review_attempt_v2(
+                &review_dossier,
+                CompletionReviewAttemptInput {
+                    attempt_kind: CompletionReviewAttemptKind::InitialReview,
+                    parent_review_id: review_dossier.cycle_parent_review_id.clone(),
+                    superseded_review_id: None,
+                    findings: Vec::new(),
+                    dispositions: Vec::new(),
+                    manifest_gaps: Vec::new(),
+                    repair_instruction: None,
+                    repair_instruction_hash: None,
+                    infrastructure_outcome: "ok".to_string(),
+                    review_clean: true,
+                    terminal_outcome: None,
+                },
+            )
+            .await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+    let stale_terminal_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("provisional terminal dossier");
+    let cwd = AbsolutePathBuf::from_absolute_path(&repo).expect("repo path");
+    ledger
+        .record_command(
+            &["late-mutating-command".to_string()],
+            &PathUri::from_abs_path(&cwd),
+            0,
+            false,
+            1,
+            true,
+        )
+        .await;
+
+    assert_eq!(
+        ledger
+            .finalize_completion_review(&stale_terminal_dossier)
+            .await,
+        AtomicReviewTransition::Superseded
+    );
+    let gate = ledger.completion_gate().await.expect("completion gate");
+    assert_eq!(gate.status, TaskCompletionStatus::Partial);
+    let guard = ledger.document.lock().await;
+    let review = guard
+        .as_ref()
+        .expect("task evidence")
+        .completion_review_v2
+        .as_ref()
+        .expect("V2 ledger");
+    assert!(review.review_risk.unresolved);
+    assert!(review.last_terminal_closure.is_none());
+}
+
+#[tokio::test]
+async fn after_agent_reentry_requires_fresh_review_and_preserves_correction_use() {
+    let (_temp, _repo, ledger, initial_dossier) = classified_requirement_fixture().await;
+    assert!(matches!(
+        ledger.begin_completion_review_cycle(&initial_dossier).await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+    let review_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("review dossier");
+    assert!(matches!(
+        ledger
+            .record_completion_review_attempt_v2(
+                &review_dossier,
+                CompletionReviewAttemptInput {
+                    attempt_kind: CompletionReviewAttemptKind::InitialReview,
+                    parent_review_id: review_dossier.cycle_parent_review_id.clone(),
+                    superseded_review_id: None,
+                    findings: Vec::new(),
+                    dispositions: Vec::new(),
+                    manifest_gaps: Vec::new(),
+                    repair_instruction: None,
+                    repair_instruction_hash: None,
+                    infrastructure_outcome: "ok".to_string(),
+                    review_clean: true,
+                    terminal_outcome: None,
+                },
+            )
+            .await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+    assert!(matches!(
+        ledger
+            .prepare_after_agent_completion_review_reentry(true)
+            .await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+
+    let guard = ledger.document.lock().await;
+    let document = guard.as_ref().expect("task evidence");
+    let review = document.completion_review_v2.as_ref().expect("V2 ledger");
+    let cycle = review.active_review_cycle.as_ref().expect("active cycle");
+    assert_eq!(
+        cycle.phase,
+        CompletionReviewCyclePhase::InitialReviewPending
+    );
+    assert!(cycle.correction_consumed);
+    assert!(cycle.accepted_review_id.is_none());
+    assert!(cycle.accepted_dossier_snapshot_id.is_none());
+    assert!(review.review_risk.unresolved);
+    assert_ne!(
+        document.completion.as_ref().map(|gate| gate.status),
+        Some(TaskCompletionStatus::Passed)
+    );
+}
+
+#[tokio::test]
+async fn manifest_gap_replacement_review_links_to_superseded_receipt_across_reload() {
+    let (temp, repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .await;
+    assert!(
+        ledger
+            .record_user_sources("message-1", &[text_input("implement alpha and beta")])
+            .await
+    );
+    let unclassified = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("unclassified dossier");
+    let source = unclassified.sources.first().expect("captured source");
+    assert!(matches!(
+        ledger
+            .apply_source_classification(
+                &unclassified,
+                vec![ClassifiedSource {
+                    source_id: source.source_id.clone(),
+                    kind: ClassifiedSourceKind::RequirementBearing,
+                    requirements: vec![ClassifiedRequirement {
+                        source_span: SourceSpan::Text { start: 0, end: 15 },
+                        status: RequirementStatus::Active,
+                        superseded_by: None,
+                    }],
+                    reason: None,
+                }],
+            )
+            .await,
+        AtomicReviewTransition::Persisted(())
+    ));
+    let initial = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("initial dossier");
+    assert!(matches!(
+        ledger.begin_completion_review_cycle(&initial).await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+    let gap_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("gap review dossier");
+    let gap_review = match ledger
+        .record_completion_review_attempt_v2(
+            &gap_dossier,
+            CompletionReviewAttemptInput {
+                attempt_kind: CompletionReviewAttemptKind::InitialReview,
+                parent_review_id: gap_dossier.cycle_parent_review_id.clone(),
+                superseded_review_id: None,
+                findings: Vec::new(),
+                dispositions: Vec::new(),
+                manifest_gaps: vec![ManifestGapInput {
+                    source_id: source.source_id.clone(),
+                    omitted_spans: vec![SourceSpan::Text { start: 15, end: 24 }],
+                }],
+                repair_instruction: None,
+                repair_instruction_hash: None,
+                infrastructure_outcome: "ok".to_string(),
+                review_clean: false,
+                terminal_outcome: None,
+            },
+        )
+        .await
+    {
+        AtomicReviewTransition::Persisted(recorded) => recorded,
+        other => panic!("manifest gap review did not persist: {other:?}"),
+    };
+
+    let replacement_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("replacement initial dossier");
+    assert_eq!(
+        replacement_dossier.manifest_revision,
+        initial.manifest_revision.saturating_add(1)
+    );
+    assert_eq!(replacement_dossier.requirements.len(), 2);
+    assert_eq!(
+        replacement_dossier.cycle_superseded_review_id.as_deref(),
+        Some(gap_review.review_id.as_str())
+    );
+    let replacement = CompletionReviewAttemptInput {
+        attempt_kind: CompletionReviewAttemptKind::InitialReview,
+        parent_review_id: replacement_dossier.cycle_parent_review_id.clone(),
+        superseded_review_id: replacement_dossier.cycle_superseded_review_id.clone(),
+        findings: Vec::new(),
+        dispositions: Vec::new(),
+        manifest_gaps: Vec::new(),
+        repair_instruction: None,
+        repair_instruction_hash: None,
+        infrastructure_outcome: "ok".to_string(),
+        review_clean: true,
+        terminal_outcome: None,
+    };
+    let mut missing_link = replacement.clone();
+    missing_link.superseded_review_id = None;
+    assert!(matches!(
+        ledger
+            .record_completion_review_attempt_v2(&replacement_dossier, missing_link)
+            .await,
+        AtomicReviewTransition::Failed
+    ));
+    let replacement_review = match ledger
+        .record_completion_review_attempt_v2(&replacement_dossier, replacement)
+        .await
+    {
+        AtomicReviewTransition::Persisted(recorded) => recorded,
+        other => panic!("replacement initial review did not persist: {other:?}"),
+    };
+
+    let thread_id = ledger.thread_id.clone().expect("thread ID");
+    drop(ledger);
+    let reloaded = TaskEvidenceLedger::load_or_new(
+        temp.path().join("home"),
+        ThreadId::from_string(&thread_id).expect("thread ID parses"),
+        &repo,
+    )
+    .await;
+    let reloaded_dossier = reloaded
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("reloaded replacement dossier");
+    assert_eq!(
+        reloaded_dossier.cycle_superseded_review_id.as_deref(),
+        Some(gap_review.review_id.as_str())
+    );
+    let guard = reloaded.document.lock().await;
+    let review = guard
+        .as_ref()
+        .expect("task evidence")
+        .completion_review_v2
+        .as_ref()
+        .expect("V2 ledger");
+    let receipt = review
+        .receipts
+        .iter()
+        .find(|receipt| receipt.review_id == replacement_review.review_id)
+        .expect("replacement review receipt");
+    assert_eq!(
+        receipt.superseded_review_id.as_deref(),
+        Some(gap_review.review_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn rereview_manifest_gap_starts_a_linked_initial_review_and_survives_reload() {
+    let (temp, repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Passed)]))
+        .await;
+    assert!(
+        ledger
+            .record_user_sources("message-1", &[text_input("implement alpha and beta")])
+            .await
+    );
+    let unclassified = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("unclassified dossier");
+    let source_id = unclassified.sources[0].source_id.clone();
+    assert!(matches!(
+        ledger
+            .apply_source_classification(
+                &unclassified,
+                vec![ClassifiedSource {
+                    source_id: source_id.clone(),
+                    kind: ClassifiedSourceKind::RequirementBearing,
+                    requirements: vec![ClassifiedRequirement {
+                        source_span: SourceSpan::Text { start: 0, end: 15 },
+                        status: RequirementStatus::Active,
+                        superseded_by: None,
+                    }],
+                    reason: None,
+                }],
+            )
+            .await,
+        AtomicReviewTransition::Persisted(())
+    ));
+    let initial = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("initial dossier");
+    let requirement_id = initial.requirements[0].requirement_id.clone();
+    assert!(matches!(
+        ledger.begin_completion_review_cycle(&initial).await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+    let review_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("review dossier");
+    let initial_review = match ledger
+        .record_completion_review_attempt_v2(
+            &review_dossier,
+            CompletionReviewAttemptInput {
+                attempt_kind: CompletionReviewAttemptKind::InitialReview,
+                parent_review_id: review_dossier.cycle_parent_review_id.clone(),
+                superseded_review_id: None,
+                findings: vec![CompletionReviewFindingInput {
+                    local_ordinal: 1,
+                    requirement_ids: vec![requirement_id],
+                    lens: COMPLETION_REVIEW_LENSES[0].to_string(),
+                    contract_surface: "bounded owner".to_string(),
+                    severity: "high".to_string(),
+                    evidence: "alpha needs a focused correction".to_string(),
+                    smallest_correction: "correct alpha".to_string(),
+                    proof_route: "cargo test alpha".to_string(),
+                }],
+                dispositions: Vec::new(),
+                manifest_gaps: Vec::new(),
+                repair_instruction: Some("correct alpha and prove it".to_string()),
+                repair_instruction_hash: None,
+                infrastructure_outcome: "ok".to_string(),
+                review_clean: false,
+                terminal_outcome: None,
+            },
+        )
+        .await
+    {
+        AtomicReviewTransition::Persisted(recorded) => recorded,
+        other => panic!("initial finding review did not persist: {other:?}"),
+    };
+    let correction_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("correction dossier");
+    assert!(matches!(
+        ledger
+            .record_completion_review_attempt_v2(
+                &correction_dossier,
+                CompletionReviewAttemptInput {
+                    attempt_kind: CompletionReviewAttemptKind::CorrectionEvidence,
+                    parent_review_id: Some(initial_review.review_id.clone()),
+                    superseded_review_id: None,
+                    findings: Vec::new(),
+                    dispositions: Vec::new(),
+                    manifest_gaps: Vec::new(),
+                    repair_instruction: None,
+                    repair_instruction_hash: correction_dossier
+                        .initial_repair_instruction_hash
+                        .clone(),
+                    infrastructure_outcome: "ok".to_string(),
+                    review_clean: false,
+                    terminal_outcome: None,
+                },
+            )
+            .await,
+        AtomicReviewTransition::Persisted(_)
+    ));
+    let rereview_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("rereview dossier");
+    let gap_rereview = match ledger
+        .record_completion_review_attempt_v2(
+            &rereview_dossier,
+            CompletionReviewAttemptInput {
+                attempt_kind: CompletionReviewAttemptKind::Rereview,
+                parent_review_id: Some(initial_review.review_id.clone()),
+                superseded_review_id: None,
+                findings: Vec::new(),
+                dispositions: vec![CompletionReviewDispositionReceipt {
+                    finding_id: initial_review.findings[0].finding_id.clone(),
+                    disposition: "resolved".to_string(),
+                    evidence: "fresh proof resolves the original finding".to_string(),
+                }],
+                manifest_gaps: vec![ManifestGapInput {
+                    source_id,
+                    omitted_spans: vec![SourceSpan::Text { start: 15, end: 24 }],
+                }],
+                repair_instruction: None,
+                repair_instruction_hash: None,
+                infrastructure_outcome: "ok".to_string(),
+                review_clean: false,
+                terminal_outcome: None,
+            },
+        )
+        .await
+    {
+        AtomicReviewTransition::Persisted(recorded) => recorded,
+        other => panic!("rereview manifest gap did not persist: {other:?}"),
+    };
+
+    let replacement_dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("replacement dossier");
+    assert!(replacement_dossier.correction_consumed);
+    assert_eq!(replacement_dossier.requirements.len(), 2);
+    assert_eq!(
+        replacement_dossier.cycle_superseded_review_id.as_deref(),
+        Some(gap_rereview.review_id.as_str())
+    );
+    let replacement_review = match ledger
+        .record_completion_review_attempt_v2(
+            &replacement_dossier,
+            CompletionReviewAttemptInput {
+                attempt_kind: CompletionReviewAttemptKind::InitialReview,
+                parent_review_id: replacement_dossier.cycle_parent_review_id.clone(),
+                superseded_review_id: replacement_dossier.cycle_superseded_review_id.clone(),
+                findings: Vec::new(),
+                dispositions: Vec::new(),
+                manifest_gaps: Vec::new(),
+                repair_instruction: None,
+                repair_instruction_hash: None,
+                infrastructure_outcome: "ok".to_string(),
+                review_clean: true,
+                terminal_outcome: None,
+            },
+        )
+        .await
+    {
+        AtomicReviewTransition::Persisted(recorded) => recorded,
+        other => panic!("replacement initial review did not persist: {other:?}"),
+    };
+
+    let thread_id = ledger.thread_id.clone().expect("thread ID");
+    drop(ledger);
+    let reloaded = TaskEvidenceLedger::load_or_new(
+        temp.path().join("home"),
+        ThreadId::from_string(&thread_id).expect("thread ID parses"),
+        &repo,
+    )
+    .await;
+    let guard = reloaded.document.lock().await;
+    let review = guard
+        .as_ref()
+        .expect("task evidence")
+        .completion_review_v2
+        .as_ref()
+        .expect("V2 ledger");
+    let receipt = review
+        .receipts
+        .iter()
+        .find(|receipt| receipt.review_id == replacement_review.review_id)
+        .expect("replacement review receipt");
+    assert_eq!(
+        receipt.superseded_review_id.as_deref(),
+        Some(gap_rereview.review_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn reclassification_cannot_erase_a_previously_mapped_requirement() {
+    let (_temp, _repo, ledger) = ledger_fixture().await;
+    ledger
+        .record_plan_update(&plan_with(vec![plan_item("step", StepStatus::Implemented)]))
+        .await;
+    assert!(
+        ledger
+            .record_user_sources("message-1", &[text_input("implement alpha")])
+            .await
+    );
+    let unclassified = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("unclassified dossier");
+    let source_id = unclassified.sources[0].source_id.clone();
+    assert!(matches!(
+        ledger
+            .apply_source_classification(
+                &unclassified,
+                vec![ClassifiedSource {
+                    source_id,
+                    kind: ClassifiedSourceKind::RequirementBearing,
+                    requirements: vec![ClassifiedRequirement {
+                        source_span: SourceSpan::Text { start: 0, end: 15 },
+                        status: RequirementStatus::Active,
+                        superseded_by: None,
+                    }],
+                    reason: None,
+                }],
+            )
+            .await,
+        AtomicReviewTransition::Persisted(())
+    ));
+    let classified = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("classified dossier");
+    let prior_source = classified.sources[0].clone();
+    let prior_requirement = classified.requirements[0].clone();
+    assert!(
+        ledger
+            .record_user_sources("message-2", &[text_input("background context")])
+            .await
+    );
+    let dossier = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("reclassification dossier");
+    let new_source = dossier
+        .sources
+        .iter()
+        .find(|source| source.message_id == "message-2")
+        .expect("new source")
+        .clone();
+    let context = ClassifiedSource {
+        source_id: new_source.source_id.clone(),
+        kind: ClassifiedSourceKind::NonRequirement,
+        requirements: Vec::new(),
+        reason: Some("background context only".to_string()),
+    };
+    assert!(matches!(
+        ledger
+            .apply_source_classification(
+                &dossier,
+                vec![
+                    ClassifiedSource {
+                        source_id: prior_source.source_id.clone(),
+                        kind: ClassifiedSourceKind::SupersededContext,
+                        requirements: Vec::new(),
+                        reason: Some("incorrectly treated as context".to_string()),
+                    },
+                    context.clone(),
+                ],
+            )
+            .await,
+        AtomicReviewTransition::Failed
+    ));
+
+    assert!(matches!(
+        ledger
+            .apply_source_classification(
+                &dossier,
+                vec![
+                    ClassifiedSource {
+                        source_id: prior_source.source_id,
+                        kind: ClassifiedSourceKind::RequirementBearing,
+                        requirements: vec![ClassifiedRequirement {
+                            source_span: prior_requirement.source_span.clone(),
+                            status: RequirementStatus::Active,
+                            superseded_by: None,
+                        }],
+                        reason: None,
+                    },
+                    context,
+                ],
+            )
+            .await,
+        AtomicReviewTransition::Persisted(())
+    ));
+    let refreshed = ledger
+        .completion_review_dossier(Some("candidate complete"), &[], &[], &[], true, true)
+        .await
+        .expect("refreshed dossier");
+    assert_eq!(refreshed.requirements, vec![prior_requirement]);
 }

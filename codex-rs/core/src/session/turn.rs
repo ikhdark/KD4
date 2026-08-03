@@ -86,6 +86,8 @@ use codex_analytics::TrackEventsContext;
 use codex_analytics::TurnResolvedConfigFact;
 use codex_analytics::build_track_events_context;
 use codex_async_utils::OrCancelExt;
+use codex_context_fragments::ModelContextBudget;
+use codex_context_fragments::RenderedContextFragment;
 use codex_core_plugins::RecommendedPluginCandidatesInput;
 use codex_core_skills::injection::InjectedHostSkillPrompts;
 use codex_core_skills::injection::PlannedSkillInjections;
@@ -164,7 +166,17 @@ pub(crate) async fn run_turn(
     prewarmed_client_session: Option<ModelClientSession>,
     cancellation_token: CancellationToken,
 ) -> CodexResult<Option<String>> {
-    let initial_host_mutation_revision = sess.services.task_evidence.host_mutation_revision().await;
+    let completion_review_turn_baseline = if turn_context
+        .config
+        .features
+        .enabled(Feature::TaskCompletionReviewer)
+        && sess.services.task_evidence.allows_kd4_completion()
+    {
+        Box::pin(crate::tasks::completion_review::capture_completion_review_turn_baseline(&sess))
+            .await
+    } else {
+        None
+    };
     let mut completion_review_state =
         crate::tasks::completion_review::CompletionReviewState::default();
     let mut preparation_timing_guard = Some(
@@ -262,7 +274,7 @@ pub(crate) async fn run_turn(
 
     let mut next_step_context = Some(first_step_context);
     let mut first_router = Some(first_router);
-    loop {
+    'sampling_loop: loop {
         // Note that pending_input would be something like a message the user
         // submitted through the UI while the model was running. Though the UI
         // may support this, the model might not.
@@ -426,13 +438,35 @@ pub(crate) async fn run_turn(
 
                 if !needs_follow_up {
                     last_agent_message = sampling_request_last_agent_message;
-                    let stop_outcome = run_turn_stop_hooks(
+                    let observed_stop_outcome = run_turn_stop_hooks(
                         &sess,
                         &turn_context,
                         stop_hook_active,
                         last_agent_message.clone(),
                     )
                     .await;
+                    if let Some(reason) = observed_stop_outcome.observation_error {
+                        let turn_state = {
+                            let active_turn = sess.active_turn.lock().await;
+                            active_turn
+                                .as_ref()
+                                .map(|active_turn| Arc::clone(&active_turn.turn_state))
+                        };
+                        if let Some(turn_state) = turn_state {
+                            turn_state
+                                .lock()
+                                .await
+                                .record_completion_review_partial_reason(format!(
+                                    "Stop completion observation failed: {reason}"
+                                ));
+                        }
+                    }
+                    if observed_stop_outcome.workspace_changed {
+                        trace!(
+                            "Stop hook workspace mutation will be included in completion review"
+                        );
+                    }
+                    let stop_outcome = observed_stop_outcome.stop;
                     if stop_outcome.should_block {
                         if let Some(hook_prompt_message) =
                             build_hook_prompt_message(&stop_outcome.continuation_fragments)
@@ -457,48 +491,121 @@ pub(crate) async fn run_turn(
                     if stop_outcome.should_stop {
                         break;
                     }
-                    let review_outcome =
+                    let review_outcome = Box::pin(
                         crate::tasks::completion_review::coordinate_completion_review(
                             &sess,
                             &turn_context,
                             &cancellation_token,
-                            initial_host_mutation_revision,
+                            completion_review_turn_baseline.as_ref(),
                             last_agent_message.as_deref(),
                             &mut completion_review_state,
-                        )
-                        .await?;
-                    if let Some(warning) = review_outcome.advisory {
-                        sess.send_event(
-                            &turn_context,
-                            EventMsg::Warning(WarningEvent { message: warning }),
-                        )
+                        ),
+                    )
+                    .await?;
+                    let (_, repair_injected) =
+                        report_completion_review_outcome(&sess, &turn_context, review_outcome)
+                            .await;
+                    if repair_injected {
+                        continue 'sampling_loop;
+                    }
+                    let correction_consumed = sess
+                        .services
+                        .task_evidence
+                        .completion_review_correction_consumed()
                         .await;
-                    }
-                    if !review_outcome.partial_reasons.is_empty() {
-                        let turn_state = {
-                            let active_turn = sess.active_turn.lock().await;
-                            active_turn
-                                .as_ref()
-                                .map(|active_turn| Arc::clone(&active_turn.turn_state))
-                        };
-                        if let Some(turn_state) = turn_state {
-                            let mut turn_state = turn_state.lock().await;
-                            for reason in review_outcome.partial_reasons {
-                                turn_state.record_completion_review_partial_reason(reason);
-                            }
-                        }
-                    }
-                    if review_outcome.repair_injected {
-                        continue;
-                    }
-                    if run_legacy_after_agent_hook(
+                    let after_agent_outcome = run_legacy_after_agent_hook(
                         &sess,
                         &turn_context,
                         &sampling_request_input,
                         last_agent_message.clone(),
                     )
-                    .await
-                    {
+                    .await;
+                    if let Some(reason) = after_agent_outcome.observation_error {
+                        record_completion_review_partial_reason(
+                            &sess,
+                            format!("AfterAgent completion observation failed: {reason}"),
+                        )
+                        .await;
+                    } else if after_agent_outcome.workspace_changed {
+                        if !matches!(
+                            sess.services
+                                .task_evidence
+                                .prepare_after_agent_completion_review_reentry(correction_consumed)
+                                .await,
+                            crate::task_evidence::AtomicReviewTransition::Persisted(())
+                        ) {
+                            record_completion_review_partial_reason(
+                                &sess,
+                                "the completion review could not durably re-enter after AfterAgent mutation"
+                                    .to_string(),
+                            )
+                            .await;
+                        } else {
+                            if after_agent_outcome.aborted {
+                                return Ok(None);
+                            }
+
+                            let observed_stop_outcome = run_turn_stop_hooks(
+                                &sess,
+                                &turn_context,
+                                stop_hook_active,
+                                last_agent_message.clone(),
+                            )
+                            .await;
+                            if let Some(reason) = observed_stop_outcome.observation_error {
+                                record_completion_review_partial_reason(
+                                    &sess,
+                                    format!("Stop completion observation failed: {reason}"),
+                                )
+                                .await;
+                            }
+                            if observed_stop_outcome.workspace_changed {
+                                trace!(
+                                    "Stop hook workspace mutation will be included in refreshed completion review"
+                                );
+                            }
+                            let stop_outcome = observed_stop_outcome.stop;
+                            if stop_outcome.should_block
+                                && let Some(hook_prompt_message) =
+                                    build_hook_prompt_message(&stop_outcome.continuation_fragments)
+                            {
+                                sess.record_response_item_and_emit_turn_item(
+                                    &turn_context,
+                                    hook_prompt_message,
+                                )
+                                .await;
+                                stop_hook_active = true;
+                                continue 'sampling_loop;
+                            }
+                            if stop_outcome.should_stop {
+                                break 'sampling_loop;
+                            }
+
+                            completion_review_state =
+                                crate::tasks::completion_review::CompletionReviewState::default();
+                            let refreshed_review = Box::pin(
+                                crate::tasks::completion_review::coordinate_completion_review(
+                                    &sess,
+                                    &turn_context,
+                                    &cancellation_token,
+                                    completion_review_turn_baseline.as_ref(),
+                                    last_agent_message.as_deref(),
+                                    &mut completion_review_state,
+                                ),
+                            )
+                            .await?;
+                            let (_, repair_injected) = report_completion_review_outcome(
+                                &sess,
+                                &turn_context,
+                                refreshed_review,
+                            )
+                            .await;
+                            if repair_injected {
+                                continue 'sampling_loop;
+                            }
+                        }
+                    }
+                    if after_agent_outcome.aborted {
                         return Ok(None);
                     }
                     break;
@@ -546,6 +653,39 @@ pub(crate) async fn run_turn(
     }
 
     Ok(last_agent_message)
+}
+
+async fn record_completion_review_partial_reason(sess: &Session, reason: String) {
+    let turn_state = {
+        let active_turn = sess.active_turn.lock().await;
+        active_turn
+            .as_ref()
+            .map(|active_turn| Arc::clone(&active_turn.turn_state))
+    };
+    if let Some(turn_state) = turn_state {
+        turn_state
+            .lock()
+            .await
+            .record_completion_review_partial_reason(reason);
+    }
+}
+
+async fn report_completion_review_outcome(
+    sess: &Session,
+    turn_context: &TurnContext,
+    outcome: crate::tasks::completion_review::CompletionReviewCoordinatorOutcome,
+) -> (bool, bool) {
+    if let Some(warning) = outcome.advisory {
+        sess.send_event(
+            turn_context,
+            EventMsg::Warning(WarningEvent { message: warning }),
+        )
+        .await;
+    }
+    for reason in outcome.partial_reasons {
+        record_completion_review_partial_reason(sess, reason).await;
+    }
+    (outcome.provisional_clean, outcome.repair_injected)
 }
 
 #[instrument(level = "trace", skip_all)]
@@ -635,13 +775,14 @@ async fn build_pure_pending_turn_plan(
     );
 
     if crate::guardian::is_guardian_reviewer_source(&turn_context.session_source) {
-        let (history_items, first_router) = tokio::join!(
+        let (history_items, first_router, context_update_items) = tokio::join!(
             async {
                 sess.clone_history()
                     .await
                     .for_prompt(&turn_context.model_info.input_modalities)
             },
-            built_tools(sess.as_ref(), step_context.as_ref(), cancellation_token)
+            built_tools(sess.as_ref(), step_context.as_ref(), cancellation_token),
+            sess.estimate_context_update_items(step_context.as_ref()),
         );
         let first_router = first_router?;
         let identity = PlanningSnapshotIdentity {
@@ -652,6 +793,7 @@ async fn build_pure_pending_turn_plan(
                 connectors: &[],
                 plugins: &[],
                 injection_items: &[],
+                context_update_items: &context_update_items,
                 user_input: &user_input,
                 router: first_router.as_ref(),
                 history_items: &history_items,
@@ -663,7 +805,7 @@ async fn build_pure_pending_turn_plan(
             first_router,
             injection_items: Vec::new(),
             explicitly_enabled_connectors: HashSet::new(),
-            pending_token_estimate: estimate_pending_tokens(input, &[]),
+            pending_token_estimate: estimate_pending_tokens(input, &[], &context_update_items),
             mcp_dependency_effect: None,
             warnings: Vec::new(),
             skill_plan: PlannedSkillInjections::default(),
@@ -726,17 +868,27 @@ async fn build_pure_pending_turn_plan(
         plan_mcp_dependencies(sess, turn_context, &mentioned_skills),
         plan_skill_injections(&mentioned_skills, Some(skills_outcome))
     );
-    let skill_items = skill_plan
+    let rendered_skill_items = skill_plan
         .injections
         .items
         .iter()
-        .map(|skill| ContextualUserFragment::into(crate::context::SkillInstructions::from(skill)))
-        .collect::<Vec<ResponseItem>>();
+        .map(|skill| {
+            let fragment = crate::context::SkillInstructions::from(skill);
+            (fragment.role(), fragment.render())
+        })
+        .collect::<Vec<_>>();
+    let skill_connector_items = rendered_skill_items
+        .iter()
+        .map(|(role, text)| {
+            ContextualUserFragment::into(RenderedContextFragment::new(role, text.clone()))
+        })
+        .collect::<Vec<_>>();
     let skill_connector_ids = collect_explicit_app_ids_from_skill_items(
-        &skill_items,
+        &skill_connector_items,
         &available_connectors,
         &skill_name_counts_lower,
     );
+    let skill_items = build_bounded_skill_context_items(rendered_skill_items);
     let plugin_items = build_plugin_injections(
         &mentioned_plugins,
         mcp_tools,
@@ -768,15 +920,17 @@ async fn build_pure_pending_turn_plan(
         .extension_data
         .get::<InjectedHostSkillPrompts>();
     let mut injection_items = match injected_host_skill_prompts {
-        Some(injected_host_skill_prompts) => skill_plan
-            .injections
-            .items
-            .iter()
-            .filter(|skill| !injected_host_skill_prompts.contains_path(&skill.path))
-            .map(|skill| {
-                ContextualUserFragment::into(crate::context::SkillInstructions::from(skill))
-            })
-            .collect::<Vec<_>>(),
+        Some(injected_host_skill_prompts) => build_bounded_skill_context_items(
+            skill_plan
+                .injections
+                .items
+                .iter()
+                .filter(|skill| !injected_host_skill_prompts.contains_path(&skill.path))
+                .map(|skill| {
+                    let fragment = crate::context::SkillInstructions::from(skill);
+                    (fragment.role(), fragment.render())
+                }),
+        ),
         None => skill_items,
     };
     injection_items.extend(plugin_items);
@@ -784,13 +938,14 @@ async fn build_pure_pending_turn_plan(
 
     // Final read-only DAG leaves: capture the model-visible history and build the
     // router concurrently, then validate the generation before accepting either.
-    let (history_items, first_router) = tokio::join!(
+    let (history_items, first_router, context_update_items) = tokio::join!(
         async {
             sess.clone_history()
                 .await
                 .for_prompt(&turn_context.model_info.input_modalities)
         },
-        built_tools(sess.as_ref(), step_context.as_ref(), cancellation_token)
+        built_tools(sess.as_ref(), step_context.as_ref(), cancellation_token),
+        sess.estimate_context_update_items(step_context.as_ref()),
     );
     let first_router = first_router?;
     if sess.services.planning_generation() != generation {
@@ -806,6 +961,7 @@ async fn build_pure_pending_turn_plan(
             connectors: &available_connectors,
             plugins: &mentioned_plugins,
             injection_items: &injection_items,
+            context_update_items: &context_update_items,
             user_input: &user_input,
             router: first_router.as_ref(),
             history_items: &history_items,
@@ -815,7 +971,11 @@ async fn build_pure_pending_turn_plan(
         identity,
         step_context,
         first_router,
-        pending_token_estimate: estimate_pending_tokens(input, &injection_items),
+        pending_token_estimate: estimate_pending_tokens(
+            input,
+            &injection_items,
+            &context_update_items,
+        ),
         injection_items,
         explicitly_enabled_connectors,
         mcp_dependency_effect: planned_mcp.effect,
@@ -1119,6 +1279,7 @@ struct PlanningStateDigestInput<'a> {
     connectors: &'a [connectors::AppInfo],
     plugins: &'a [PluginCapabilitySummary],
     injection_items: &'a [ResponseItem],
+    context_update_items: &'a [ResponseItem],
     user_input: &'a [UserInput],
     router: &'a ToolRouter,
     history_items: &'a [ResponseItem],
@@ -1131,6 +1292,7 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
         connectors,
         plugins,
         injection_items,
+        context_update_items,
         user_input,
         router,
         history_items,
@@ -1159,6 +1321,7 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
         serde_json::to_vec(mcp_tools),
         serde_json::to_vec(connectors),
         serde_json::to_vec(injection_items),
+        serde_json::to_vec(context_update_items),
         serde_json::to_vec(user_input),
         serde_json::to_vec(&router.model_visible_specs()),
         serde_json::to_vec(history_items),
@@ -1172,7 +1335,11 @@ fn planning_state_digest(input: PlanningStateDigestInput<'_>) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn estimate_pending_tokens(input: &[TurnInput], injection_items: &[ResponseItem]) -> i64 {
+fn estimate_pending_tokens(
+    input: &[TurnInput],
+    injection_items: &[ResponseItem],
+    context_update_items: &[ResponseItem],
+) -> i64 {
     let input_bytes = input.iter().fold(0usize, |bytes, item| {
         let item_bytes = match item {
             TurnInput::UserInput { content, .. } => serde_json::to_vec(content),
@@ -1185,12 +1352,32 @@ fn estimate_pending_tokens(input: &[TurnInput], injection_items: &[ResponseItem]
         .unwrap_or_default();
         bytes.saturating_add(item_bytes)
     });
-    let bytes = input_bytes.saturating_add(
-        serde_json::to_vec(injection_items)
-            .map(|value| value.len())
-            .unwrap_or_default(),
-    );
+    let bytes = input_bytes
+        .saturating_add(
+            serde_json::to_vec(injection_items)
+                .map(|value| value.len())
+                .unwrap_or_default(),
+        )
+        .saturating_add(
+            serde_json::to_vec(context_update_items)
+                .map(|value| value.len())
+                .unwrap_or_default(),
+        );
     i64::try_from(bytes.div_ceil(4)).unwrap_or(i64::MAX)
+}
+
+fn build_bounded_skill_context_items(
+    rendered_skill_items: impl IntoIterator<Item = (&'static str, String)>,
+) -> Vec<ResponseItem> {
+    let mut budget = ModelContextBudget::default();
+    rendered_skill_items
+        .into_iter()
+        .filter_map(|(role, text)| {
+            budget
+                .take(&text)
+                .map(|text| ContextualUserFragment::into(RenderedContextFragment::new(role, text)))
+        })
+        .collect()
 }
 
 #[tracing::instrument(
@@ -1252,13 +1439,15 @@ async fn build_extension_turn_input_items(
         });
     }
     let mut items = Vec::new();
+    let mut budget = ModelContextBudget::default();
     while let Some(contributed_fragments) = pending.next().await {
         let contributed_fragments = contributed_fragments?;
-        items.extend(
-            contributed_fragments
-                .into_iter()
-                .map(ContextualUserFragment::into_boxed_response_item),
-        );
+        items.extend(contributed_fragments.into_iter().filter_map(|fragment| {
+            let role = fragment.role();
+            budget
+                .take(&fragment.render())
+                .map(|text| ContextualUserFragment::into(RenderedContextFragment::new(role, text)))
+        }));
     }
 
     Ok(items)
@@ -1689,7 +1878,6 @@ async fn run_sampling_request(
         Some(router) => router,
         None => built_tools(sess.as_ref(), step_context.as_ref(), &cancellation_token).await?,
     };
-
     let base_instructions = sess.get_base_instructions().await;
 
     let tool_runtime = ToolCallRuntime::new(

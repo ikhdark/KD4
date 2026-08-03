@@ -74,6 +74,16 @@ pub trait McpServerContributor<C: Sync>: Send + Sync {
 /// fragment: thread/session context for stable inputs, and turn context for
 /// fragments that depend on turn-local host state.
 pub trait ContextContributor: Send + Sync {
+    /// Read-only preview used by pre-turn context accounting. Implementations that emit events or
+    /// mutate extension stores in `contribute_thread_context` must override this method.
+    fn estimate_thread_context<'a>(
+        &'a self,
+        session_store: &'a ExtensionData,
+        thread_store: &'a ExtensionData,
+    ) -> ExtensionFuture<'a, Vec<PromptFragment>> {
+        self.contribute_thread_context(session_store, thread_store)
+    }
+
     fn contribute_thread_context<'a>(
         &'a self,
         session_store: &'a ExtensionData,
@@ -87,6 +97,14 @@ pub trait ContextContributor: Send + Sync {
         })
     }
 
+    /// Read-only preview used by pre-turn context accounting.
+    fn estimate_turn_context<'a>(
+        &'a self,
+        input: TurnContextContributionInput<'a>,
+    ) -> ExtensionFuture<'a, Vec<PromptFragment>> {
+        self.contribute_turn_context(input)
+    }
+
     fn contribute_turn_context<'a>(
         &'a self,
         input: TurnContextContributionInput<'a>,
@@ -96,6 +114,15 @@ pub trait ContextContributor: Send + Sync {
             let _input = input;
             Vec::new()
         })
+    }
+
+    /// Read-only preview used by pre-turn context accounting. Implementations that mutate the
+    /// turn store in `contribute_world_state` must override this method.
+    fn estimate_world_state<'a>(
+        &'a self,
+        input: WorldStateContributionInput<'a>,
+    ) -> ExtensionFuture<'a, Vec<WorldStateSectionContribution>> {
+        self.contribute_world_state(input)
     }
 
     fn contribute_world_state<'a>(

@@ -44,6 +44,9 @@ const INTERNAL_ORIGINATOR_ENV = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
 const TYPESCRIPT_SDK_ORIGINATOR = "codex_sdk_ts";
 const CODEX_NPM_NAME = "@openai/codex";
 const CHILD_TERMINATION_GRACE_MS = 1_000;
+const STDERR_TAIL_MAX_BYTES = 64 * 1024;
+const STDERR_DRAIN_GRACE_MS = 1_000;
+const STDERR_TRUNCATION_MARKER = `[stderr truncated; showing last ${STDERR_TAIL_MAX_BYTES} bytes]\n`;
 
 const PLATFORM_PACKAGE_BY_TARGET: Record<string, string> = {
   "x86_64-unknown-linux-musl": "@openai/codex-linux-x64",
@@ -199,11 +202,19 @@ export class CodexExec {
       child.kill();
       throw new Error("Child process has no stdout");
     }
-    const stderrChunks: Buffer[] = [];
+    const stderrTail = new StderrTail();
+    const stderr = child.stderr;
+    const stderrDrainedPromise = stderr
+      ? new Promise<void>((resolve) => {
+          stderr.once("end", resolve);
+          stderr.once("close", resolve);
+          stderr.once("error", resolve);
+        })
+      : Promise.resolve();
 
-    if (child.stderr) {
-      child.stderr.on("data", (data) => {
-        stderrChunks.push(data);
+    if (stderr) {
+      stderr.on("data", (data) => {
+        stderrTail.append(data);
       });
     }
 
@@ -230,9 +241,9 @@ export class CodexExec {
       if (spawnError) throw spawnError;
       const { code, signal } = await exitPromise;
       if (code !== 0 || signal) {
-        const stderrBuffer = Buffer.concat(stderrChunks);
+        await resolvesBeforeDeadline(stderrDrainedPromise, STDERR_DRAIN_GRACE_MS);
         const detail = signal ? `signal ${signal}` : `code ${code ?? 1}`;
-        throw new Error(`Codex Exec exited with ${detail}: ${stderrBuffer.toString("utf8")}`);
+        throw new Error(`Codex Exec exited with ${detail}: ${stderrTail.render()}`);
       }
     } finally {
       rl.close();
@@ -259,6 +270,48 @@ export class CodexExec {
       }
       child.removeAllListeners();
     }
+  }
+}
+
+class StderrTail {
+  private bytes = Buffer.alloc(0);
+  private truncated = false;
+
+  append(data: unknown): void {
+    const chunk =
+      typeof data === "string"
+        ? Buffer.from(data, "utf8")
+        : Buffer.isBuffer(data)
+          ? data
+          : Buffer.from(data as Uint8Array);
+    if (chunk.length === 0) {
+      return;
+    }
+
+    if (chunk.length >= STDERR_TAIL_MAX_BYTES) {
+      this.truncated ||= this.bytes.length > 0 || chunk.length > STDERR_TAIL_MAX_BYTES;
+      this.bytes = Buffer.from(chunk.subarray(chunk.length - STDERR_TAIL_MAX_BYTES));
+      return;
+    }
+
+    const overflow = this.bytes.length + chunk.length - STDERR_TAIL_MAX_BYTES;
+    if (overflow > 0) {
+      this.truncated = true;
+      this.bytes = Buffer.concat([this.bytes.subarray(overflow), chunk], STDERR_TAIL_MAX_BYTES);
+    } else {
+      this.bytes = Buffer.concat([this.bytes, chunk]);
+    }
+  }
+
+  render(): string {
+    let start = 0;
+    if (this.truncated) {
+      while (start < Math.min(3, this.bytes.length) && (this.bytes[start]! & 0xc0) === 0x80) {
+        start += 1;
+      }
+    }
+    const text = this.bytes.subarray(start).toString("utf8");
+    return this.truncated ? STDERR_TRUNCATION_MARKER + text : text;
   }
 }
 

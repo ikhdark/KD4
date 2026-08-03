@@ -248,6 +248,7 @@ pub(super) struct PendingProcessRegistration {
     attempt_key: crate::tools::command_execution::CommandAttemptKey,
     process_id: i32,
     workspace_mutation: Option<crate::tools::command_execution::RunningWorkspaceMutation>,
+    completion_activity: Option<crate::agent::control::CompletionActivityPermit>,
     pending_spawns: PendingSpawnRegistration,
     primary_process: Option<Arc<UnifiedExecProcess>>,
     network_approval: Option<DeferredNetworkApproval>,
@@ -265,6 +266,7 @@ struct PendingProcessCleanup {
     processes: Vec<PendingProcessToTerminate>,
     primary_process: Option<Arc<UnifiedExecProcess>>,
     network_approval: Option<DeferredNetworkApproval>,
+    _completion_activity: Option<crate::agent::control::CompletionActivityPermit>,
 }
 
 #[derive(Clone)]
@@ -280,6 +282,7 @@ impl PendingProcessRegistration {
         attempt_key: crate::tools::command_execution::CommandAttemptKey,
         process_id: i32,
         workspace_mutation: Option<crate::tools::command_execution::RunningWorkspaceMutation>,
+        completion_activity: Option<crate::agent::control::CompletionActivityPermit>,
     ) -> Self {
         Self {
             process_store,
@@ -287,6 +290,7 @@ impl PendingProcessRegistration {
             attempt_key,
             process_id,
             workspace_mutation,
+            completion_activity,
             pending_spawns: PendingSpawnRegistration::default(),
             primary_process: None,
             network_approval: None,
@@ -343,6 +347,7 @@ impl PendingProcessRegistration {
             processes,
             primary_process: self.primary_process.clone(),
             network_approval: self.network_approval.clone(),
+            _completion_activity: self.completion_activity.clone(),
         }
     }
 
@@ -353,6 +358,7 @@ impl PendingProcessRegistration {
         cleanup_pending_process_registration(self.cleanup_payload()).await?;
         self.committed = true;
         self.workspace_mutation.take();
+        self.completion_activity.take();
         self.pending_spawns.clear();
         Ok(())
     }
@@ -685,12 +691,14 @@ impl UnifiedExecProcessManager {
     ) -> Result<ExecCommandToolOutput, UnifiedExecError> {
         debug_assert_eq!(request.process_id, process_id_reservation.process_id());
         let workspace_mutation = request.workspace_mutation.take();
+        let completion_activity = request.completion_activity.take();
         let mut registration = PendingProcessRegistration::new(
             Arc::clone(&self.process_store),
             context,
             request.attempt_key.clone(),
             request.process_id,
             workspace_mutation,
+            completion_activity,
         );
         let result = self
             .exec_command_inner(
@@ -853,7 +861,7 @@ impl UnifiedExecProcessManager {
             emit_failed_initial_exec_end_if_unstored(
                 process_started_alive,
                 context,
-                &request,
+                request,
                 cwd.clone(),
                 Arc::clone(&transcript),
                 text.clone(),
@@ -873,7 +881,7 @@ impl UnifiedExecProcessManager {
             emit_failed_initial_exec_end_if_unstored(
                 process_started_alive,
                 context,
-                &request,
+                request,
                 cwd.clone(),
                 Arc::clone(&transcript),
                 text.clone(),
@@ -924,7 +932,7 @@ impl UnifiedExecProcessManager {
                 emit_failed_initial_exec_end_if_unstored(
                     process_started_alive,
                     context,
-                    &request,
+                    request,
                     cwd.clone(),
                     Arc::clone(&transcript),
                     text.clone(),
@@ -1307,6 +1315,7 @@ impl UnifiedExecProcessManager {
             transcript,
             started_at,
             context.tracker.clone(),
+            registration.completion_activity.take(),
         );
         registration.commit();
         Ok(())
@@ -1356,6 +1365,7 @@ impl UnifiedExecProcessManager {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn open_session_with_prepared_exec_env(
         &self,
         process_id: i32,

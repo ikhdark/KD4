@@ -2,9 +2,17 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_agent_task_store::AgentTaskStore;
+use codex_agent_task_store::REPOSITORY_WIDE_PATH;
+use codex_agent_task_store::WorkspaceActorKind;
+use codex_agent_task_store::WorkspaceMutationLease;
+use codex_agent_task_store::WorkspaceMutationRequest;
 use codex_analytics::CompactionTrigger;
 use codex_analytics::HookRunFact;
 use codex_analytics::build_track_events_context;
+use codex_context_fragments::ModelContextBudget;
+use codex_context_fragments::RenderedContextFragment;
+use codex_features::Feature;
 use codex_hooks::PermissionRequestDecision;
 use codex_hooks::PermissionRequestOutcome;
 use codex_hooks::PermissionRequestRequest;
@@ -56,6 +64,19 @@ pub(crate) struct HookRuntimeOutcome {
 pub(crate) enum PreToolUseHookResult {
     Continue { updated_input: Option<Value> },
     Blocked(String),
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LegacyAfterAgentHookOutcome {
+    pub(crate) aborted: bool,
+    pub(crate) workspace_changed: bool,
+    pub(crate) observation_error: Option<String>,
+}
+
+pub(crate) struct TurnStopHookOutcome {
+    pub(crate) stop: StopOutcome,
+    pub(crate) workspace_changed: bool,
+    pub(crate) observation_error: Option<String>,
 }
 
 struct ContextInjectingHookOutcome {
@@ -300,7 +321,9 @@ pub(crate) async fn run_turn_stop_hooks(
     turn_context: &Arc<TurnContext>,
     stop_hook_active: bool,
     last_assistant_message: Option<String>,
-) -> StopOutcome {
+) -> TurnStopHookOutcome {
+    let workspace_observation =
+        begin_completion_hook_workspace_observation(sess, turn_context, "Stop").await;
     // Resolve the stop hook kind from the session source before building the
     // request. Root turns run Stop; thread-spawned child turns run SubagentStop.
     let (target, transcript_path) = match &turn_context.session_source {
@@ -342,7 +365,15 @@ pub(crate) async fn run_turn_stop_hooks(
         }
         // Internal/synthetic subagents do not expose user-configured lifecycle
         // hooks, so there is no Stop or SubagentStop request to dispatch.
-        SessionSource::SubAgent(_) => return StopOutcome::default(),
+        SessionSource::SubAgent(_) => {
+            let (workspace_changed, observation_error) =
+                finish_completion_hook_workspace_observation(workspace_observation, "Stop").await;
+            return TurnStopHookOutcome {
+                stop: StopOutcome::default(),
+                workspace_changed,
+                observation_error,
+            };
+        }
         _ => (StopHookTarget::Stop, sess.hook_transcript_path().await),
     };
     let request = codex_hooks::StopRequest {
@@ -362,7 +393,13 @@ pub(crate) async fn run_turn_stop_hooks(
 
     let mut outcome = hooks.run_stop(request).await;
     emit_hook_completed_events(sess, turn_context, std::mem::take(&mut outcome.hook_events)).await;
-    outcome
+    let (workspace_changed, observation_error) =
+        finish_completion_hook_workspace_observation(workspace_observation, "Stop").await;
+    TurnStopHookOutcome {
+        stop: outcome,
+        workspace_changed,
+        observation_error,
+    }
 }
 
 pub(crate) async fn run_pre_compact_hooks(
@@ -435,7 +472,9 @@ pub(crate) async fn run_legacy_after_agent_hook(
     turn_context: &Arc<TurnContext>,
     input: &[ResponseItem],
     last_assistant_message: Option<String>,
-) -> bool {
+) -> LegacyAfterAgentHookOutcome {
+    let workspace_observation =
+        begin_completion_hook_workspace_observation(sess, turn_context, "AfterAgent").await;
     let mut abort_message = None;
     let input_messages = input
         .iter()
@@ -486,15 +525,108 @@ pub(crate) async fn run_legacy_after_agent_hook(
             ));
         }
     }
-    let Some(message) = abort_message else {
-        return false;
+    let (workspace_changed, observation_error) =
+        finish_completion_hook_workspace_observation(workspace_observation, "AfterAgent").await;
+    if let Some(message) = abort_message {
+        let event = EventMsg::Error(codex_protocol::protocol::ErrorEvent {
+            message,
+            codex_error_info: Some(CodexErrorInfo::Other),
+        });
+        sess.send_event(turn_context, event).await;
+        LegacyAfterAgentHookOutcome {
+            aborted: true,
+            workspace_changed,
+            observation_error,
+        }
+    } else {
+        LegacyAfterAgentHookOutcome {
+            aborted: false,
+            workspace_changed,
+            observation_error,
+        }
+    }
+}
+
+type CompletionHookWorkspaceObservation = Result<
+    Option<(
+        Arc<dyn AgentTaskStore>,
+        std::path::PathBuf,
+        WorkspaceMutationLease,
+    )>,
+    String,
+>;
+
+async fn begin_completion_hook_workspace_observation(
+    sess: &Session,
+    turn_context: &TurnContext,
+    hook_name: &'static str,
+) -> CompletionHookWorkspaceObservation {
+    if turn_context.session_source.is_non_root_agent()
+        || !turn_context
+            .config
+            .features
+            .enabled(Feature::TaskCompletionReviewer)
+        || !sess.services.task_evidence.allows_kd4_completion()
+    {
+        return Ok(None);
+    }
+    let coordinator = sess.services.agent_control.task_coordinator();
+    let Some(store) = coordinator.store() else {
+        return Err(format!(
+            "the {hook_name} workspace observer has no durable task store"
+        ));
     };
-    let event = EventMsg::Error(codex_protocol::protocol::ErrorEvent {
-        message,
-        codex_error_info: Some(CodexErrorInfo::Other),
-    });
-    sess.send_event(turn_context, event).await;
-    true
+    let Some(root_session_id) = coordinator.root_session_id() else {
+        return Err(format!(
+            "the {hook_name} workspace observer has no root task identity"
+        ));
+    };
+    let Some(repo_root) = sess.services.task_evidence.repository_root() else {
+        return Err(format!(
+            "the {hook_name} workspace observer has no repository root"
+        ));
+    };
+    let repo_root = repo_root.to_path_buf();
+    let lease = store
+        .begin_workspace_mutation(
+            &repo_root,
+            WorkspaceMutationRequest {
+                actor_id: format!("root:{root_session_id}"),
+                root_session_id,
+                kind: WorkspaceActorKind::Root,
+                attempt_id: None,
+                paths: vec![REPOSITORY_WIDE_PATH.to_string()],
+                contracts: vec![format!(
+                    "kd4-completion-review-{}",
+                    hook_name.to_ascii_lowercase()
+                )],
+                expected_manifest: Vec::new(),
+            },
+        )
+        .await
+        .map_err(|error| format!("the {hook_name} workspace observer could not start: {error}"))?;
+    Ok(Some((store, repo_root, lease)))
+}
+
+async fn finish_completion_hook_workspace_observation(
+    observation: CompletionHookWorkspaceObservation,
+    hook_name: &'static str,
+) -> (bool, Option<String>) {
+    match observation {
+        Ok(Some((store, repo_root, lease))) => {
+            match store.finish_workspace_mutation(&repo_root, lease).await {
+                Ok(result) => (!result.changed_paths.is_empty(), None),
+                Err(error) => (
+                    false,
+                    Some(format!(
+                        "the {hook_name} workspace observer could not finish: {error}"
+                    )),
+                ),
+            }
+        }
+        Ok(None) => (false, None),
+        Err(error) => (false, Some(error)),
+    }
 }
 
 pub(crate) async fn inspect_pending_input(
@@ -607,10 +739,15 @@ pub(crate) async fn record_additional_contexts(
 }
 
 fn additional_context_messages(additional_contexts: Vec<String>) -> Vec<ResponseItem> {
+    let mut budget = ModelContextBudget::default();
     additional_contexts
         .into_iter()
         .map(HookAdditionalContext::new)
-        .map(ContextualUserFragment::into)
+        .filter_map(|fragment| {
+            budget.take(&fragment.render()).map(|text| {
+                ContextualUserFragment::into(RenderedContextFragment::new("developer", text))
+            })
+        })
         .collect()
 }
 
@@ -826,6 +963,25 @@ mod tests {
                 ("developer", "second tide note".to_string()),
             ],
         );
+    }
+
+    #[test]
+    fn additional_context_messages_share_one_hard_budget() {
+        let messages = additional_context_messages(vec!["a".repeat(30_000), "b".repeat(30_000)]);
+        let rendered_bytes = messages
+            .iter()
+            .map(|message| match message {
+                codex_protocol::models::ResponseItem::Message { content, .. } => content
+                    .iter()
+                    .map(|item| match item {
+                        ContentItem::InputText { text } => text.len(),
+                        _ => 0,
+                    })
+                    .sum::<usize>(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        assert!(rendered_bytes <= 40_000);
     }
 
     #[tokio::test]

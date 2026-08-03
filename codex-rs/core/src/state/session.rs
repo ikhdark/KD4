@@ -117,6 +117,7 @@ impl SessionState {
         self.history.clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn last_passed_root_completion_turn_id(&self) -> Option<String> {
         self.last_passed_root_completion_turn_id.clone()
     }

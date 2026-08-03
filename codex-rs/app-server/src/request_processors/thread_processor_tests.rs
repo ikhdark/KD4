@@ -236,6 +236,7 @@ mod thread_processor_behavior_tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
 
     fn dynamic_tool(
@@ -1237,6 +1238,9 @@ mod thread_processor_behavior_tests {
             outgoing_tx,
             codex_analytics::AnalyticsEventsClient::disabled(),
         ));
+        outgoing
+            .connection_opened(connection_id, Arc::new(AtomicBool::new(/*value*/ true)))
+            .await;
         let thread_outgoing = ThreadScopedOutgoingMessageSender::new(
             outgoing.clone(),
             vec![connection_id],
@@ -1541,6 +1545,7 @@ mod thread_processor_behavior_tests {
                 unrelated_supported_connection,
                 ConnectionCapabilities {
                     request_attestation: true,
+                    ..Default::default()
                 },
             )
             .await;
@@ -1549,6 +1554,7 @@ mod thread_processor_behavior_tests {
                 earlier_supported_connection,
                 ConnectionCapabilities {
                     request_attestation: true,
+                    ..Default::default()
                 },
             )
             .await;
@@ -1557,6 +1563,7 @@ mod thread_processor_behavior_tests {
                 later_supported_connection,
                 ConnectionCapabilities {
                     request_attestation: true,
+                    ..Default::default()
                 },
             )
             .await;
